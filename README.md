@@ -34,8 +34,8 @@ export TIE_LIB_ROOT=$PWD
 <stage0>/tiec.exe tools/tiec/src/driver.tie -l2 -t0 --no-warn --no-cache \
       -o _local_only/bin/tiec.exe
 
-# 1. 运行时（编译器链接用）
-_local_only/bin/tiec.exe lib/rt/src/runtime/tl_runtime.tie -o lib/rt/trm_lite.a --no-warn
+# 1. 运行时（编译器链接用；须在 lib/rt 内构建）
+(cd lib/rt && ../../_local_only/bin/tiec.exe src/trm_lite.run.tie -o trm_lite.a --no-warn)
 export TIE_TRM_LITE_LIB=$PWD/lib/rt/trm_lite.a
 
 # 2. LLVM-C 薄垫片（C ABI）

@@ -12,7 +12,7 @@ type tie<tsh>
 
 func bstr(b: bool) -> string { if b { return "T" } return "F" }
 
-var tiec = ".\\compiler\\tiec.exe"
+var tiec = ".\\_local_only\\bin\\tiec.exe"
 if arg_count() >= 1 && !is_empty(arg_at(0)) { tiec = arg_at(0) }
 
 var root = cwd()
@@ -104,7 +104,7 @@ for fn in lang {
 }
 
 println("=== 5. tests/language 负例（应拒绝） ===")
-var neg_tmp = root + "\\compiler\\neg_tmp.exe"
+var neg_tmp = root + "\\_local_only\\neg_tmp.exe"
 var rc9: i64 = 0
 for fn in lang {
     if has_suffix(fn, ".tie") && contains(fn, "_neg") {
@@ -130,7 +130,7 @@ var lf_n = ["linefix_err.tie", "linefix_warn.tie"]
 var lf_want = ["[E00832] @6:21:", "@6:5: 可变绑定未修改"]
 var lf_i: i64 = 0
 for fn in lf_n {
-    var lf_exe = root + "\\compiler\\lf_tmp.exe"
+    var lf_exe = root + "\\_local_only\\lf_tmp.exe"
     if file_exists(lf_exe) { remove_file(lf_exe) }
     exec_code("cmd /c " + tiec + " " + lf_dir + fn + " -o " + lf_exe + " -w --no-cache > \"" + lf_tmp + "\" 2>&1")
     var lf_txt = file_read(lf_tmp)
@@ -141,7 +141,7 @@ for fn in lf_n {
     }
     lf_i = lf_i + 1
 }
-if file_exists(root + "\\compiler\\lf_tmp.exe") { remove_file(root + "\\compiler\\lf_tmp.exe") }
+if file_exists(root + "\\_local_only\\lf_tmp.exe") { remove_file(root + "\\_local_only\\lf_tmp.exe") }
 
 // 6c. td（tie:data）合规（规范 §17.1）：**头部可选**，且非 td 语法必须被拒。
 //     我连错两次的正是这条（信了「某文件自称 td」「探针注释说会失败」而不是规范与实测），

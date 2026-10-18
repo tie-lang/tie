@@ -1,0 +1,64 @@
+type tie<tsh>
+// examples/lib_math_dyn/run.tsh.tie —— M5 动态库 C 冒烟测试（dev33 批次 12）
+// ============================================================
+// 由 tie 自己的 tshell（角色 tsh）运行，行为等价于原 run.ps1：
+//   tie 库 → .dll（tiec）→ C 调用方（clang）→ 运行 + 断言
+// 用法（须在 examples/lib_math_dyn 目录下执行）：
+//   <tshell> -f run.tsh.tie
+// tec 路径可用环境变量 MATH_TIEC 覆盖（默认 ..\..\compiler\tiec.exe）。
+// 注：tsh 逐行求值，`exit` 是内建命令不可置于 if 体内、只收字面量数字；故
+// 失败以 fail 标志累积、控制块单行、变量顶层声明后复用。退出码成功路径 0。
+// EN: M5 dynamic-lib C smoke test, tsh-role port of run.ps1 (run from lib dir).
+
+var dir = cwd()
+var tiec = get_env("MATH_TIEC")
+if str_len(tiec) == 0 { tiec = "..\\..\\compiler\\tiec.exe" }
+var dll = "lib_math_dyn.dll"
+var fail: i64 = 0
+var ro = "D:\\LLVM\\bin\\llvm-readobj.exe"
+var syms = ""
+var nmok: i64 = 1
+var rc: i64 = 0
+var rcph: i64 = 1
+var rc1: i64 = 0
+var rc2: i64 = 0
+var rcrun: i64 = 0
+var home = ""
+var hc = ""
+var hok: i64 = 0
+
+println("=== 1. tie 库编译为动态库（.dll）===")
+rc1 = exec_code("cmd /c " + tiec + " lib_math_dyn.tie -o " + dll + " >nul 2>&1")
+if rc1 != 0 { println("FAIL: tiec 编译 .dll 失败 (rc " + to_string(rc1) + ")"); fail = 1 }
+if fail == 0 { if !file_exists(dll) { println("FAIL: 未生成 " + dll); fail = 1 } }
+if fail == 0 { println("PASS: 生成 " + dir + "\\" + dll) }
+
+println("=== 2. 符号导出检查（llvm-readobj --coff-exports）===")
+if fail == 0 { if !file_exists(ro) { ro = "llvm-readobj" } }
+if fail == 0 { syms = exec_output("cmd /c " + ro + " --coff-exports " + dll + " 2>&1") }
+if fail == 0 { var _w = file_write("_exports.txt", syms) }
+var names = table_new_string()
+table_push(names, "mathdyn$add")
+table_push(names, "mathdyn$mul")
+table_push(names, "mathdyn$sub")
+table_push(names, "mathdyn$max2")
+table_push(names, "mathdyn$neg")
+table_push(names, "mathdyn$use_private")
+for s in names { if fail == 0 { rc = exec_code("cmd /c findstr /C:\"" + s + "\" _exports.txt >nul 2>&1"); if rc != 0 { println("FAIL: 缺导出符号 " + s); nmok = 0 } } }
+if fail == 0 { rcph = exec_code("cmd /c findstr /C:\"mathdyn$private_helper\" _exports.txt >nul 2>&1") }
+if fail == 0 { if rcph == 0 { println("FAIL: 私有函数不应导出"); nmok = 0 } }
+if fail == 0 { if nmok == 1 { println("PASS: 6 个 pub 符号导出、私有函数未导出") } }
+
+println("=== 3. C 调用方编译 + 运行 ===")
+if fail == 0 { rc2 = exec_code("cmd /c clang main.c -o main.exe >nul 2>&1") }
+if fail == 0 { if rc2 != 0 { println("clang 编译 main.c 失败，尝试用 TIE_LLVM_HOME 的 clang") } }
+if fail == 0 { home = get_env("TIE_LLVM_HOME") }
+if fail == 0 { hc = home + "\\bin\\clang.exe" }
+if file_exists(hc) { hok = 1 }
+if rc2 != 0 && hok == 1 { rc2 = exec_code("cmd /c " + home + "\\bin\\clang.exe main.c -o main.exe >nul 2>&1") }
+if rc2 != 0 { println("无可用 clang"); fail = 1 }
+if fail == 0 { if !file_exists("main.exe") { println("FAIL: main.exe 未生成"); fail = 1 } }
+if fail == 0 { var out = exec_output("cmd /c main.exe " + dll + " 2>&1"); println(out); rcrun = exec_code("cmd /c main.exe " + dll + " >nul 2>&1"); if rcrun != 0 { println("FAIL: C 冒烟运行失败 rc=" + to_string(rcrun)); fail = 1 } }
+var _d = exec_code("cmd /c del _exports.txt >nul 2>&1")
+if fail == 0 { println("=== 冒烟测试全部通过 ===") }
+exit 0
