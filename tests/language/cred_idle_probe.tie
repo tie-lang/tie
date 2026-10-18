@@ -1,0 +1,103 @@
+type tie<logic>
+// cred_idle_probe.tie —— W00030「凭据挂空」告警探针（2026-10-02）
+// ============================================================================
+// 依据：tie-main/docs/designs/unsafe-credential-lock.md §3「凭据规则」——
+// 「作用域内未使用对应域构造的凭据 → 编译告警（凭据挂空）」。
+//
+// 本探针覆盖**三种持证形态**的挂空判定：
+//   ① 块级 unsafe with(域) —— 声明即持证，块内无本域操作 ⇒ 挂空
+//   ② 块级 unsafe use g    —— 持 g 的域，块内无本域操作 ⇒ 挂空
+//   ③ 函数级 #[unsafe.域]  —— 整函数持证，函数体内无本域操作 ⇒ 挂空
+// 并给出同形态的**正例**（确有本域操作）以确认不误报。
+//
+// 注意：裸 `unsafe.get(域)` 取值而从不使用，属「未使用变量」范畴，由既有
+// W00005 覆盖；本告警针对的是「凭据已进入某作用域、但该域的操作一次没出现」，
+// 那正是 W00005 抓不到的情形（`unsafe use g` 里 g 是被读过的）。
+// 编译用 `-w`，期望看到 5 条 W00030（① ② ③ 各挂空项）与正例处无告警。
+
+// ---- ① 块级 unsafe with：挂空 ----
+unsafe func idle_with_lock() -> i64 {
+    var x: i64 = 0
+    unsafe with(lock) {
+        x = 1                     // 无表访问 ⇒ lock 凭据挂空
+    }
+    return x
+}
+
+// ---- ① 块级 unsafe with：正例（有表访问）----
+unsafe func used_with_lock() -> i64 {
+    var t: table<i64> = [7, 8]
+    var v: i64 = 0
+    unsafe with(lock) {
+        v = t[0]                  // 表访问 ⇒ lock 用到，不告警
+    }
+    return v
+}
+
+// ---- ① 块级 unsafe with(mem)：挂空 ----
+unsafe func idle_with_mem() -> i64 {
+    var x: i64 = 0
+    unsafe with(mem) {
+        x = 2                     // 无 mem 操作 ⇒ 挂空
+    }
+    return x
+}
+
+// ---- ① 块级 unsafe with(mem)：正例（有解引用）----
+unsafe func used_with_mem() -> i64 {
+    var x: i64 = 3
+    var v: i64 = 0
+    unsafe with(mem) {
+        var p: ptr<i64> = addr_of(x)
+        v = deref(p)              // mem 操作 ⇒ 不告警
+    }
+    return v
+}
+
+// ---- ② 块级 unsafe use g：挂空 ----
+unsafe func idle_use_lock() -> i64 {
+    var g: guard<lock> = unsafe.get(lock)
+    var x: i64 = 0
+    unsafe use g {
+        x = 4                     // 无表访问 ⇒ 挂空
+    }
+    return x
+}
+
+// ---- ② 块级 unsafe use g：正例 ----
+unsafe func used_use_lock() -> i64 {
+    var g: guard<lock> = unsafe.get(lock)
+    var t: table<i64> = [9]
+    var v: i64 = 0
+    unsafe use g {
+        v = t[0]                  // 表访问 ⇒ 不告警
+    }
+    return v
+}
+
+// ---- ③ 函数级属性：挂空 ----
+#[unsafe.ext]
+unsafe func idle_fn_ext() -> i64 {
+    return 5                      // 无 ext 操作 ⇒ 挂空
+}
+
+// ---- ③ 函数级属性：正例 ----
+#[unsafe.ext]
+unsafe func used_fn_ext() -> i64 {
+    return load_library("kernel32.dll")    // ext 操作 ⇒ 不告警
+}
+
+func main() {
+    var s: i64 = 0
+    unsafe {
+        s = s + idle_with_lock()
+        s = s + used_with_lock()
+        s = s + idle_with_mem()
+        s = s + used_with_mem()
+        s = s + idle_use_lock()
+        s = s + used_use_lock()
+        s = s + idle_fn_ext()
+        s = s + used_fn_ext()
+    }
+    println("cred-idle probe done " + to_string(s > 0))
+}

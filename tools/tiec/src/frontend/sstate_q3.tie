@@ -1,0 +1,95 @@
+type tie<class>
+// compiler/frontend/sstate_q3.tie —— 分片 3（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sstate.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace sstate {
+// struct 索引 -> 名字（st_keys 按名字排序，须经 st_vals 反查索引位置）
+pub func struct_name_of(idx: i64) -> string {
+    var n = len(st_keys)
+    var i: i64 = 0
+    while i < n {
+        if st_vals[i] == idx {
+            return intern.lookup(st_keys[i])
+        }
+        i = i + 1
+    }
+    return "?"
+}
+
+// p.9.15.1 依赖感知缓存：返回已展开的 import 依赖路径集合副本（driver 经
+// semantic 命名空间调用本访问器，规避跨命名空间变量访问限制）。
+pub func imported_paths() -> table<string> {
+    var out: table<string> = table_new_string()
+    var i: i64 = 0
+    while i < len(g_imported) {
+        table_push(out, g_imported[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ==================== p.9.21.6-1 模块边界显式化访问器 ====================
+// 模块 = import 的文件：主文件 = 0，导入文件按展开顺序 1..k（与 g_imported
+// 下标差 1）。g_file_base 升序（expand_imports/expand_one_import 维护），
+// 节点 id 落在 [g_file_base[k], g_file_base[k+1]) 即属文件 k。
+
+// 节点 id -> 来源文件 id（模块 id）。g_file_base 未初始化 / 节点越界时
+// 兜底 0（主文件）——实例化等无源场景安全降级，不改变既有行为。
+pub func file_id_of_node(node: i64) -> i64 {
+    var n = len(g_file_base)
+    if n == 0 || node < 0 {
+        return 0
+    }
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var ans: i64 = 0
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if g_file_base[mid] <= node {
+            ans = mid
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return ans
+}
+
+// 文件 id -> 归一化路径。0（主文件）返回 ""（主文件路径由 driver 持有
+// g_input）；k >= 1 = g_imported[k-1]（g_imported push 顺序与文件 id 推进
+// 顺序一致，expand_one_import 实测同序）；越界返回 ""。
+pub func file_path_of(fid: i64) -> string {
+    if fid <= 0 || fid > len(g_imported) {
+        return ""
+    }
+    return g_imported[fid - 1]
+}
+
+// 签名来源模块（越界兜底 0）。列在注册期由 file_id_of_node(def_node) 写入——
+// 2026-10-13 复诊实证：三列（sg/gb/st_mod）在注册/收集期均拿到正确文件 id
+// （此前的「注册期不可用」结论系探针把 gb_find_ns_key 的键 id 误当行下标所致的误诊）。
+pub func sig_module(sig: i64) -> i64 {
+    if sig < 0 || sig >= len(sg_mod) {
+        return 0
+    }
+    return sg_mod[sig]
+}
+
+// 全局变量行来源模块（pos = gb_keys 二分命中下标；越界兜底 0）
+pub func gb_module(pos: i64) -> i64 {
+    if pos < 0 || pos >= len(gb_mod) {
+        return 0
+    }
+    return gb_mod[pos]
+}
+
+// struct 行来源模块（idx = struct 索引；越界兜底 0）
+pub func st_module(idx: i64) -> i64 {
+    if idx < 0 || idx >= len(st_mod) {
+        return 0
+    }
+    return st_mod[idx]
+}
+
+}

@@ -1,0 +1,61 @@
+type tie<logic>
+// p.9.12.1 回归探针：长折叠字符串常量内容丢失 / JSON 花括号折叠
+// 覆盖：
+//   1. >600 字节全局拼接（引用另一全局）长度与边界逐字节正确（RC1：跨全局引用折叠）
+//   2. 长串 + 尾部字面量正确（尾字符不丢）
+//   3. 字符串字面量里的 `}}`（JSON 闭合括号）逐字保留（RC2：lexer 不再折叠 `}}`）
+//   4. 中文 / 转义（\n \t \"）正确（中文拼接走运行期，规避预存在的全局折叠多字节 bug）
+
+var baseA: string = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+// 引用全局 baseA 拼接尾巴 → 全局折叠（曾因此变空 len=0）
+var big: string = baseA + "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+// 长串 + 尾字面量（尾字符曾丢失）
+var withTail: string = big + "}"
+// 含 JSON 闭合括号 `}}` 的字面量（曾折叠成 `}` 而损坏 JSON）
+var jsonTail: string = "\"version\":\"0.3.0\"}}"
+var jsonFull: string = "v0.3" + jsonTail
+// 中文字面量全局（单独字面量，字节正确）
+var metaCn: string = "名称:"
+var esc: string = "a\"b\tc\n"
+
+var fails: i64 = 0
+func chk(cond: bool, tag: string) {
+    if !cond {
+        println("FAIL: " + tag)
+        fails = fails + 1
+    }
+}
+func main() {
+    // 1. big = baseA(300) + B(634) = 934——跨全局引用折叠后长度/边界正确
+    chk(len(baseA) == 300, "baseA len == 300 (got " + to_string(len(baseA)) + ")")
+    chk(len(big) == 934, "big len == 934 (got " + to_string(len(big)) + ")")
+    chk(str_sub_bytes(big, 0, 3) == "AAA", "big head AAA")
+    chk(str_sub_bytes(big, len(big) - 3, len(big)) == "BBB", "big tail BBB")
+    chk(str_sub_bytes(big, 299, 300) == "A", "big[299] = A (A/B boundary)")
+    chk(str_sub_bytes(big, 300, 301) == "B", "big[300] = B (A/B boundary)")
+
+    // 2. withTail = big + "}"；长串 + 尾部字面量不丢尾
+    chk(len(withTail) == 935, "withTail len == 935 (got " + to_string(len(withTail)) + ")")
+    chk(str_sub_bytes(withTail, len(withTail) - 1, len(withTail)) == "}", "withTail last char = }")
+
+    // 3. json：`}}` 逐字保留（RC2）——曾折叠成 `}` 损坏 JSON
+    chk(len(jsonTail) == 19, "jsonTail len == 19 (got " + to_string(len(jsonTail)) + ")")
+    chk(str_sub_bytes(jsonTail, len(jsonTail) - 2, len(jsonTail)) == "}}", "jsonTail ends with }}")
+    chk(str_sub_bytes(jsonFull, len(jsonFull) - 2, len(jsonFull)) == "}}", "jsonFull ends with }}")
+
+    // 4. 中文 / 转义（运行期拼接，规避预存在的全局折叠多字节缺陷）
+    chk(len(metaCn) == 7, "metaCn(名称:) len == 7 (got " + to_string(len(metaCn)) + ")")
+    var rcn = metaCn + withTail
+    chk(str_sub_bytes(rcn, 0, 7) == "名称:", "runtime cn head 名称:")
+    chk(str_sub_bytes(rcn, len(rcn) - 1, len(rcn)) == "}", "runtime cn last = }")
+    chk(str_sub_bytes(esc, 1, 2) == "\"", "esc[1]=quote")
+    chk(str_sub_bytes(esc, 3, 4) == "\t", "esc[3]=tab")
+    chk(str_sub_bytes(esc, 5, 6) == "\n", "esc[5]=newline")
+
+    if fails == 0 {
+        println("PASS p.9.12.1 strfold")
+    } else {
+        println("FAILURES=" + to_string(fails))
+        panic("p.9.12.1 strfold failed")
+    }
+}

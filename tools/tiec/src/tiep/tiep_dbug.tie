@@ -1,0 +1,236 @@
+type tie<class>
+// compiler/interp/interp_dbug.tie —— 自举 v4 工具链共享仪器
+//（p.9.2.1 崩溃诊断 / p.9.2.3 DAP 调试 / p.9.2.4 剖析 的共享底层）
+// ============================================================
+// 范式：与 interp_call.tie 同——`namespace tiep` 跨文件闭合并集覆盖
+// call_fn / exec_stmt，顶层 var 全局可见、默认关闭（dbg_on=false），零行为
+// 侵入——不启用时 call_fn / exec_stmt 只多一个 `if dbg_on` 分支（常量假），
+// 编进 tiec.exe 不改变任何默认语义（自举不动点前提）。
+//
+// 记录一条**里程碑事件流**（每函数调用 C/R + 每语句 S），三者共享：
+//   - 崩溃诊断：panic 时把当前调用栈（dbg_stack）符号化挂到错误消息，
+//     并写崩溃日志文件；
+//   - DAP 调试：按函数/语句里程碑做断点/单步/调用栈/变量；
+//   - 剖析器：C/R 的调用计数 + time_now(秒) 归因，输出折叠栈与火焰图。
+//
+// 时间口径：使用 time_now()（libc time(0)，秒级 i64）——本文件随 interp
+// 并入 tiec.exe（经 mexpand），**不得**声明任何 unsafe extern C 桥
+// （compiler/frontend/semantic.tie 注：extern 不允许跨文件重复定义，driver 已
+// 声明 clock）。若要毫秒级剖析时钟，在**独立工具**里自声明 clock() 扩展
+// （剖析接口预留，见 profiler.tie 头注释）。
+
+// ==================== 共享状态（顶层 var，全局可见） ====================
+pub var dbg_on: bool = false;          // 总开关（默认关）
+var dbg_sample: bool = false;      // 是否记录时间戳（剖析用；成本更高，可独立开）
+// 调用栈（当前深度 = len(dbg_stack_f)）
+var dbg_stack_f: table<string>;    // 帧函数名
+var dbg_stack_l: table<i64>;       // 帧入口行（函数体首行）
+// 里程碑事件流
+var dbg_evk: table<string>;        // 事件类型 "C"/"R"/"S"（call/return/statement）
+var dbg_evn: table<string>;        // C/R 的函数名；S 为空
+var dbg_evl: table<i64>;           // 事件行（C=函数体首行，S=语句行，R=-1）
+var dbg_evt: table<i64>;           // time_now() 时间戳；dbg_sample=关时 -1
+var dbg_evd: table<i64>;           // 事件时调用栈深度
+// 崩溃诊断：w_err 首次置位时的最内层调用栈快照（dbg_leave 捕获一次）
+var dbg_err_captured: bool = false;
+var dbg_err_stack_f: table<string>;   // 崩溃点调用栈（自外向内）
+var dbg_err_stack_l: table<i64>;
+
+namespace tiep {
+
+// 清空仪器状态并关闭（重置后复用；interp.reset 不自动清，工具显式调）。
+pub func dbg_reset() {
+    dbg_on = false
+    dbg_sample = false
+    dbg_stack_f = table_new_string()
+    dbg_stack_l = table_new_i64()
+    dbg_evk = table_new_string()
+    dbg_evn = table_new_string()
+    dbg_evl = table_new_i64()
+    dbg_evt = table_new_i64()
+    dbg_evd = table_new_i64()
+    dbg_err_captured = false
+    dbg_err_stack_f = table_new_string()
+    dbg_err_stack_l = table_new_i64()
+}
+
+// 开启记录。sample=true 时给 C/R 事件打 time_now() 时间戳（剖析用）。
+pub func dbg_start(sample: bool) {
+    dbg_on = true
+    dbg_sample = sample
+    dbg_stack_f = table_new_string()
+    dbg_stack_l = table_new_i64()
+}
+
+// 关闭记录。
+pub func dbg_stop() {
+    dbg_on = false
+    dbg_sample = false
+}
+
+// ---------- 内部挂钩（call_fn / exec_stmt 调用） ----------
+
+// 函数调用进入：压帧 + 记录 C 事件。call_fn 用户函数分支执行函数体前调用。
+func dbg_enter(name: string, line: i64) {
+    if !dbg_on {
+        return
+    }
+    table_push(dbg_stack_f, name)
+    table_push(dbg_stack_l, line)
+    table_push(dbg_evk, "C")
+    table_push(dbg_evn, name)
+    table_push(dbg_evl, line)
+    if dbg_sample {
+        table_push(dbg_evt, time_now())
+    } else {
+        table_push(dbg_evt, -1)
+    }
+    table_push(dbg_evd, len(dbg_stack_f))
+}
+
+// 函数调用退出：弹帧 + 记录 R 事件。call_fn 函数体执行后调用。
+func dbg_leave() {
+    if !dbg_on {
+        return
+    }
+    var depth_before = len(dbg_stack_f)
+    if depth_before > 0 {
+        // 崩溃诊断：捕获首次 w_err 置位时的最内层调用栈（跳过顶层空栈）
+        if w_err != "" && !dbg_err_captured {
+            dbg_err_captured = true
+            dbg_err_stack_f = slice_str_to(dbg_stack_f, depth_before)
+            dbg_err_stack_l = slice_i64_to(dbg_stack_l, depth_before)
+        }
+        dbg_stack_f = slice_str_to(dbg_stack_f, depth_before - 1)
+        dbg_stack_l = slice_i64_to(dbg_stack_l, depth_before - 1)
+    }
+    table_push(dbg_evk, "R")
+    table_push(dbg_evn, "")
+    table_push(dbg_evl, -1)
+    if dbg_sample {
+        table_push(dbg_evt, time_now())
+    } else {
+        table_push(dbg_evt, -1)
+    }
+    table_push(dbg_evd, depth_before)
+}
+
+// 语句执行：记录 S 事件（line = 语句行）。exec_stmt 开头调用。
+func dbg_stmt_hook(id: i64) {
+    if !dbg_on {
+        return
+    }
+    table_push(dbg_evk, "S")
+    table_push(dbg_evn, "")
+    table_push(dbg_evl, isess.nline(id))
+    table_push(dbg_evt, -1)
+    table_push(dbg_evd, len(dbg_stack_f))
+}
+
+// ---------- 读取接口（工具侧） ----------
+
+// 当前调用栈深度。
+pub func dbg_stack_depth() -> i64 {
+    return len(dbg_stack_f)
+}
+// 调用栈第 i 帧（0=最外层）函数名。
+pub func dbg_stack_name(i: i64) -> string {
+    if i < 0 || i >= len(dbg_stack_f) {
+        return ""
+    }
+    return dbg_stack_f[i]
+}
+// 调用栈第 i 帧入口行。
+pub func dbg_stack_line(i: i64) -> i64 {
+    if i < 0 || i >= len(dbg_stack_l) {
+        return -1
+    }
+    return dbg_stack_l[i]
+}
+// 调用栈符号化文本：`main -> a -> b (行N, 行M)` 形式，自外向内。
+pub func dbg_backtrace_str() -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < len(dbg_stack_f) {
+        if out != "" {
+            out = out + " -> "
+        }
+        out = out + dbg_stack_f[i] + "(" + to_string(dbg_stack_l[i]) + ")"
+        i = i + 1
+    }
+    return out
+}
+// 崩溃点调用栈深度（未崩溃或未捕获为 0）。
+pub func dbg_err_depth() -> i64 {
+    return len(dbg_err_stack_f)
+}
+// 崩溃点调用栈第 i 帧（0=最外层）函数名。
+pub func dbg_err_name(i: i64) -> string {
+    if i < 0 || i >= len(dbg_err_stack_f) {
+        return ""
+    }
+    return dbg_err_stack_f[i]
+}
+// 崩溃点调用栈第 i 帧入口行。
+pub func dbg_err_line(i: i64) -> i64 {
+    if i < 0 || i >= len(dbg_err_stack_l) {
+        return -1
+    }
+    return dbg_err_stack_l[i]
+}
+// 事件总数。
+pub func dbg_ev_count() -> i64 {
+    return len(dbg_evk)
+}
+pub func dbg_ev_kind(i: i64) -> string {
+    if i < 0 || i >= len(dbg_evk) {
+        return ""
+    }
+    return dbg_evk[i]
+}
+pub func dbg_ev_name(i: i64) -> string {
+    if i < 0 || i >= len(dbg_evn) {
+        return ""
+    }
+    return dbg_evn[i]
+}
+pub func dbg_ev_line(i: i64) -> i64 {
+    if i < 0 || i >= len(dbg_evl) {
+        return -1
+    }
+    return dbg_evl[i]
+}
+pub func dbg_ev_t(i: i64) -> i64 {
+    if i < 0 || i >= len(dbg_evt) {
+        return -1
+    }
+    return dbg_evt[i]
+}
+pub func dbg_ev_d(i: i64) -> i64 {
+    if i < 0 || i >= len(dbg_evd) {
+        return 0
+    }
+    return dbg_evd[i]
+}
+
+// ---------- 内部工具（表截断） ----------
+func slice_str_to(t: table<string>, n: i64) -> table<string> {
+    var r = table_new_string()
+    var i: i64 = 0
+    while i < n {
+        table_push(r, t[i])
+        i = i + 1
+    }
+    return r
+}
+func slice_i64_to(t: table<i64>, n: i64) -> table<i64> {
+    var r = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(r, t[i])
+        i = i + 1
+    }
+    return r
+}
+
+}   // namespace tiep

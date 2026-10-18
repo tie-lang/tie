@@ -1,0 +1,274 @@
+type tie<class>
+// compiler/backend/irgen_msgrt.tie —— 生成器 L3：消息系统与随机数运行时辅助（msg_*、rng_reg、rand_range）
+// ============================================================
+// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// 惰性登记 msg 全局槽（首次 msg_* 调用时；幂等）
+func tig_msg_reg_globals() {
+    if g_msg_reg_done == 1 {
+        return
+    }
+    g_msg_reg_done = 1
+    llvmgen.global_scalar_reg("__msg_lang", types.named(TK_STR))
+    llvmgen.global_table_reg("__msg_keys")
+    llvmgen.global_table_reg("__msg_langs")
+    llvmgen.global_table_reg("__msg_texts")
+}
+// 读全局槽（load，OK_GLOBAL 3；标量/表指针共用）
+func tig_msg_gload(nm: string, ty: i64) -> i64 {
+    var addr = interner.intern("@" + nm)
+    var inst = ir.new_inst(g_cur_block, 21, ty)
+    ir.add_operand(inst, addr, 3)
+    return ir.get_value(inst)
+}
+// 写全局槽（store，opnd：ty / val / OK_GLOBAL）
+func tig_msg_gstore(nm: string, ty: i64, v: i64) {
+    var addr = interner.intern("@" + nm)
+    var st = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st, ty, 2)
+    ir.add_operand(st, v, 0)
+    ir.add_operand(st, addr, 3)
+}
+// 惰性建表 guard：@__msg_keys 为 null → 三表各建一次；返回 keys 表 ptr（非空）。
+// 每次 msg 操作入口调用（循环内冗余但正确；msg 使用稀少，开销可忽略）。
+func tig_msg_ensure() -> i64 {
+    var TS = types.named(TK_STR)
+    var T64 = types.named(TK_I64)
+    var cur = tig_msg_gload("__msg_keys", TS)
+    var isnull = tig_cmp_zero(cur, 0)  // icmp eq ptr, null
+    var initb = ir.new_block(g_cur_func, interner.intern("msg.i"))
+    var useb = ir.new_block(g_cur_func, interner.intern("msg.u"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, isnull, 0)
+    ir.add_operand(cb, initb, 1)
+    ir.add_operand(cb, useb, 1)
+    g_cur_block = initb
+    var esz = tig_int_lit_ty(elem_size(TS), T64)
+    var k = s21_table_new(esz)
+    tig_msg_gstore("__msg_keys", TS, k)
+    var l = s21_table_new(esz)
+    tig_msg_gstore("__msg_langs", TS, l)
+    var t = s21_table_new(esz)
+    tig_msg_gstore("__msg_texts", TS, t)
+    var b1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b1, useb, 1)
+    g_cur_block = useb
+    return tig_msg_gload("__msg_keys", TS)
+}
+// strcmp(a, b) == 0 → i1
+func tig_msg_str_eq(a: i64, b: i64) -> i64 {
+    var cmp = tig_ext_call2("strcmp", a, types.named(TK_STR), b, types.named(TK_STR), types.named(TK_I32))
+    var eq = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(eq, cmp, 0)
+    ir.add_operand(eq, 0, 2)  // IMM 0（i32 宽度与 strcmp 结果一致）
+    ir.add_operand(eq, 0, 2)  // cc eq
+    return ir.get_value(eq)
+}
+// msg_register(key, lang, content)：线性扫 (key, lang) 命中覆盖 texts[i]，未命中三表 append。
+func tig_msg_register(key: i64, lang: i64, content: i64) {
+    tig_msg_reg_globals()
+    var TS = types.named(TK_STR)
+    var T64 = types.named(TK_I64)
+    var keys = tig_msg_ensure()
+    var langs = tig_msg_gload("__msg_langs", TS)
+    var texts = tig_msg_gload("__msg_texts", TS)
+    var n = s21_table_len(keys)
+    // 槽：i / found（-1=未命中）/ ok（table_at 出参）
+    var i_s = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(i_s, T64, 2)
+    var i_p = ir.get_value(i_s)
+    s21_store(i_p, tig_int_lit(0), T64)
+    var f_s = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(f_s, T64, 2)
+    var f_p = ir.get_value(f_s)
+    s21_store(f_p, tig_int_lit(-1), T64)
+    var ok_s = ir.new_inst(g_cur_block, 20, types.named(TK_I8))
+    ir.add_operand(ok_s, types.named(TK_I8), 2)
+    var ok_p = ir.get_value(ok_s)
+    // 循环：cond → body → (hit|nxt) → cond；exit 汇合
+    var cond = ir.new_block(g_cur_func, interner.intern("mrg.c"))
+    var body = ir.new_block(g_cur_func, interner.intern("mrg.b"))
+    var hit = ir.new_block(g_cur_func, interner.intern("mrg.h"))
+    var nxt = ir.new_block(g_cur_func, interner.intern("mrg.n"))
+    var exit = ir.new_block(g_cur_func, interner.intern("mrg.x"))
+    var b0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b0, cond, 1)
+    g_cur_block = cond
+    var ilt = tig_icmp_c(s21_load(i_p, T64), n, 2)  // i < n
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, ilt, 0)
+    ir.add_operand(cb, body, 1)
+    ir.add_operand(cb, exit, 1)
+    g_cur_block = body
+    var iv = s21_load(i_p, T64)
+    var kk = s21_table_at(keys, iv, ok_p, TS)
+    var ll = s21_table_at(langs, iv, ok_p, TS)
+    var both = tig_and_i1(tig_msg_str_eq(kk, key), tig_msg_str_eq(ll, lang))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, both, 0)
+    ir.add_operand(cb2, hit, 1)
+    ir.add_operand(cb2, nxt, 1)
+    g_cur_block = hit
+    s21_store(f_p, iv, T64)
+    var bh = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bh, exit, 1)
+    g_cur_block = nxt
+    s21_store(i_p, s21_bin(0, iv, tig_int_lit(1)), T64)
+    var bn = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bn, cond, 1)
+    // exit：found != -1 → 覆盖 texts[f]；否则三表 append
+    g_cur_block = exit
+    var fv = s21_load(f_p, T64)
+    var isf = tig_icmp_c(fv, tig_int_lit(-1), 1)  // != -1
+    var fb = ir.new_block(g_cur_func, interner.intern("mrg.f"))
+    var ab = ir.new_block(g_cur_func, interner.intern("mrg.a"))
+    var fin = ir.new_block(g_cur_func, interner.intern("mrg.d"))
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, isf, 0)
+    ir.add_operand(cb3, fb, 1)
+    ir.add_operand(cb3, ab, 1)
+    g_cur_block = fb
+    s21_table_set(texts, fv, TS, content)
+    var bf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bf, fin, 1)
+    g_cur_block = ab
+    s21_table_push(texts, TS, content)
+    s21_table_push(langs, TS, lang)
+    s21_table_push(keys, TS, key)
+    var ba = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(ba, fin, 1)
+    g_cur_block = fin
+}
+// msg_t / msg_t_lang 查表：按 (key, lang) 线性扫，命中返 texts[i]，未命中返 fallback。
+func tig_msg_find(key: i64, lang: i64, fallback: i64) -> i64 {
+    tig_msg_reg_globals()
+    var TS = types.named(TK_STR)
+    var T64 = types.named(TK_I64)
+    var keys = tig_msg_ensure()
+    var langs = tig_msg_gload("__msg_langs", TS)
+    var texts = tig_msg_gload("__msg_texts", TS)
+    var n = s21_table_len(keys)
+    // 结果槽（默认 fallback）/ i 槽 / ok 槽
+    var r_s = ir.new_inst(g_cur_block, 20, TS)
+    ir.add_operand(r_s, TS, 2)
+    var r_p = ir.get_value(r_s)
+    s21_store(r_p, fallback, TS)
+    var i_s = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(i_s, T64, 2)
+    var i_p = ir.get_value(i_s)
+    s21_store(i_p, tig_int_lit(0), T64)
+    var ok_s = ir.new_inst(g_cur_block, 20, types.named(TK_I8))
+    ir.add_operand(ok_s, types.named(TK_I8), 2)
+    var ok_p = ir.get_value(ok_s)
+    var cond = ir.new_block(g_cur_func, interner.intern("msgt.c"))
+    var body = ir.new_block(g_cur_func, interner.intern("msgt.b"))
+    var hit = ir.new_block(g_cur_func, interner.intern("msgt.h"))
+    var nxt = ir.new_block(g_cur_func, interner.intern("msgt.n"))
+    var exit = ir.new_block(g_cur_func, interner.intern("msgt.x"))
+    var b0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b0, cond, 1)
+    g_cur_block = cond
+    var ilt = tig_icmp_c(s21_load(i_p, T64), n, 2)  // i < n
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, ilt, 0)
+    ir.add_operand(cb, body, 1)
+    ir.add_operand(cb, exit, 1)
+    g_cur_block = body
+    var iv = s21_load(i_p, T64)
+    var kk = s21_table_at(keys, iv, ok_p, TS)
+    var ll = s21_table_at(langs, iv, ok_p, TS)
+    var both = tig_and_i1(tig_msg_str_eq(kk, key), tig_msg_str_eq(ll, lang))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, both, 0)
+    ir.add_operand(cb2, hit, 1)
+    ir.add_operand(cb2, nxt, 1)
+    g_cur_block = hit
+    var tt = s21_table_at(texts, iv, ok_p, TS)
+    s21_store(r_p, tt, TS)
+    var bh = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bh, exit, 1)
+    g_cur_block = nxt
+    s21_store(i_p, s21_bin(0, iv, tig_int_lit(1)), T64)
+    var bn = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bn, cond, 1)
+    g_cur_block = exit
+    return s21_load(r_p, TS)
+}
+// rand_range：i64 半开区间 [min,max)。p.6.4.10 修复——原内联经 CRT rand()
+//（RAND_MAX=32767），span>32768 时上端不可达；改用 **64 位 LCG**（MMIX 常量
+// state*6364136223846793005 + 1442695040888963407，mul/add 天然模 2^64 环绕，
+// 无需移位、无逻辑右移偏差），状态存运行期程序全局槽 @__rng_state（惰性登记，
+// 送 std/random.tie 的 rnd 语义——原 Rust 桥 tie_rand_range 即系统时间播种，两次
+// 运行不同序列）。首调 @__rng_state==0 时用 time(NULL)|1 播种。span 用 64 位
+// urem（无符号取模），任意 span 全区间均匀覆盖。非密码学安全。
+func tig_rng_reg() {
+    if g_rng_reg_done == 1 {
+        return
+    }
+    g_rng_reg_done = 1
+    llvmgen.global_scalar_reg("__rng_state", types.named(TK_I64))
+}
+func tig_rand_range(min: i64, max: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    tig_rng_reg()
+    var span = s21_bin(1, max, min)           // max - min
+    var bad = tig_icmp_c(span, tig_int_lit(1), 2)   // span < 1（≤0 → 退化）
+    var slot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(slot, T64, 2)
+    var sv = ir.get_value(slot)
+    var bt = ir.new_block(g_cur_func, interner.intern("rr.b"))
+    var be = ir.new_block(g_cur_func, interner.intern("rr.ok"))
+    var mg = ir.new_block(g_cur_func, interner.intern("rr.m"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, bad, 0)
+    ir.add_operand(cb, bt, 1)
+    ir.add_operand(cb, be, 1)
+    g_cur_block = bt
+    s21_store(sv, min, T64)
+    var br1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br1, mg, 1)
+    g_cur_block = be
+    var nulp = tig_null_ptr()
+    // 种子槽：@__rng_state==0 → time(NULL)|1 播种；否则沿用既有状态
+    var st_a = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(st_a, T64, 2)
+    var st_p = ir.get_value(st_a)
+    var cur = tig_msg_gload("__rng_state", T64)
+    var isz = tig_icmp_c(cur, tig_int_lit(0), 0)   // eq 0（未播种）
+    var b_sd = ir.new_block(g_cur_func, interner.intern("rr.sd"))
+    var b_cu = ir.new_block(g_cur_func, interner.intern("rr.cu"))
+    var b_mg = ir.new_block(g_cur_func, interner.intern("rr.mu"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, isz, 0)
+    ir.add_operand(cb2, b_sd, 1)
+    ir.add_operand(cb2, b_cu, 1)
+    g_cur_block = b_sd
+    var tt = tig_ext_call1("time", nulp, P8, T64)  // time(NULL) 厘秒（time_t）
+    var seed = s21_bin(7, tt, tig_int_lit(1))       // time | 1（保证非零/奇）
+    s21_store(st_p, seed, T64)
+    var brs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs, b_mg, 1)
+    g_cur_block = b_cu
+    s21_store(st_p, cur, T64)
+    var brc = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brc, b_mg, 1)
+    // 推进 64 位 LCG 并取 [0, span)
+    g_cur_block = b_mg
+    var state = s21_load(st_p, T64)
+    var MUL = tig_int_lit(6364136223846793005)
+    var INC = tig_int_lit(1442695040888963407)
+    var st2 = s21_bin(0, s21_bin(2, state, MUL), INC)   // state*MUL + INC（回绕）
+    tig_msg_gstore("__rng_state", T64, st2)
+    var rmod = s21_urem(st2, span)                        // 无符号取模 → [0, span)
+    var rres = s21_bin(0, min, rmod)                      // min + rmod
+    s21_store(sv, rres, T64)
+    var br2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br2, mg, 1)
+    g_cur_block = mg
+    return s21_load(sv, T64)
+}
+}

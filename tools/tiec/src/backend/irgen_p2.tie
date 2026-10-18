@@ -1,0 +1,885 @@
+type tie<class>
+// compiler/backend/irgen_p2.tie —— irgen 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 irgen.tie。
+namespace irgen {
+// S10：strict pod struct 判定（跨动态库边界的 repr(C) pod）。
+// tie struct 后端即 C 布局；repr(C) 标记未传播到类型注册表，故此处按
+// 「全部字段为标量（int/float/bool/trit/char）」做保守 pod 校验——布局确定、
+// 无指针/slice/嵌套，可安全序列化跨边界。含任何非标量字段 → false。
+func is_repr_c_pod(t: i64) -> bool {
+    if types.kind(t) != K_STRUCT {
+        return false
+    }
+    var idx = t - BASE_STRUCT
+    if idx < 0 || idx >= len(cls_nfld) {
+        return false
+    }
+    var n = cls_nfld[idx]
+    if n <= 0 {
+        return false
+    }
+    var off = cls_fldoff[idx]
+    var k: i64 = 0
+    while k < n {
+        var ft = fld_tys[off + k]
+        var pod: bool = false
+        if types.is_int(ft) || types.is_float(ft) {
+            pod = true
+        } else if ft == types.named(TK_BOOL) || ft == types.named(TK_TRIT) || ft == types.named(TK_CHAR) {
+            pod = true
+        }
+        if !pod {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// 平台名匹配：全等（三元组直写）或架构前缀（"x86_64" 匹配 "x86_64-*"）。
+// 任务17 asm! 平台条件编译：target("arch") 按 g_asm_target 匹配。
+func asm_target_matches(arch: string) -> bool {
+    if str_len(g_asm_target) == 0 {
+        return false
+    }
+    if g_asm_target == arch {
+        return true
+    }
+    return has_prefix(g_asm_target, arch + "-")
+}
+
+// 字符字面量 → 码点（全局初值折叠用，纯函数无 IR 副作用）。
+// 解码逻辑与 tig_char_lit 一致：去引号 + 转义 → char_code（r.1.1.2）。
+func fold_char_code(name_id: i64) -> i64 {
+    var raw = interner.lookup(name_id)
+    var n: i64 = str_len(raw)
+    if n >= 3 && str_char(raw, 0) == "'" && str_char(raw, n - 1) == "'" {
+        raw = str_slice(raw, 1, n - 1)
+    }
+    var ch: string = ""
+    var m: i64 = str_len(raw)
+    if m >= 2 && str_char(raw, 0) == "\\" {
+        var e = str_char(raw, 1)
+        if e == "n" {
+            ch = "\n"
+        } else if e == "t" {
+            ch = "\t"
+        } else if e == "r" {
+            ch = "\r"
+        } else if e == "\\" {
+            ch = "\\"
+        } else if e == "'" {
+            ch = "'"
+        } else if e == "0" {
+            // r.1.1.8：同 tig_char_lit——sb_append_byte(0) 字节构建 NUL 字符
+            var fc0 = string_builder()
+            sb_append_byte(fc0, 0)
+            ch = sb_build(fc0)
+        } else {
+            ch = e
+        }
+    } else {
+        ch = str_char(raw, 0)
+    }
+    return char_code(ch)
+}
+
+// p.9.0-S.7 规范 §3.3：floor 整除与成对取余（全局 const 折叠用，纯算术）。
+// 定义与 AOT（tig_floor_divmod）/ 解释器（idiv_floor_i64）/ consteval（cv_*）
+// 三处一致：先取截断结果，余数非零且与除数异号时调整一格。
+func gif_idiv_floor(a: i64, b: i64) -> i64 {
+    var q = a / b
+    var r = a % b
+    if r != 0 {
+        if (r < 0 && b > 0) || (r > 0 && b < 0) {
+            return q - 1
+        }
+    }
+    return q
+}
+func gif_floormod(a: i64, b: i64) -> i64 {
+    var r = a % b
+    if r != 0 {
+        if (r < 0 && b > 0) || (r > 0 && b < 0) {
+            return r + b
+        }
+    }
+    return r
+}
+
+// 顶层标量初始化的**编译期常量折叠**（bounded subset）：
+// 支持 INT_LIT / FLOAT_LIT / CHAR_LIT / BOOL_LIT / STR_LIT（经
+// str_unescape_quoted 去引号反转义）/ UNARY 取负（整数/浮点）/
+// BINARY + - * / % \ %%（字符串 + 走拼接；整数走算术）。跨全局引用（S_N_VAR
+// 节点）
+// p.9.12.1：对先前已折叠的标量全局做引用折叠（`var B = A + lit` 正确继承
+// A 而非变空/零）；未登记的全局/表全局不折叠 → 返回 has=false（保持原语义）。
+// 返回 (has, is_str, is_fp, intv, sid)：is_str 用 sid（纯文本池 id）；
+// is_fp 用 sid（浮点字面量文本池 id，原文）；否则 intv（整数/码点/bool 0-1）。
+func global_init_fold(id: i64) -> (bool, bool, bool, i64, i64) {
+    if id < 0 {
+        return (false, false, false, 0, -1)
+    }
+    var tag = s_tags[id]
+    if tag == S_N_VAR {
+        // p.9.12.1：跨全局引用折叠。`var B = A + "..."/A` 中 A 是先前定义的
+        // 标量全局（字符串/整型/浮点）——解析其已折叠初值，使 B 正确继承而非
+        // 变空/零。若 A 尚未登记（后置引用/表全局）→ 不折叠（保持原语义）。
+        var nid = interner.intern(sstate.name_str(id))
+        var (fok, fkind, fval) = llvmgen.global_folded_of(nid)
+        if fok == 1 {
+            if fkind == 1 {
+                return (true, true, false, 0, fval)
+            }
+            if fkind == 2 {
+                return (true, false, true, 0, fval)
+            }
+            return (true, false, false, fval, -1)
+        }
+        return (false, false, false, 0, -1)
+    }
+    if tag == 0 {
+        // INT_LIT
+        return (true, false, false, s_vals[id], -1)
+    }
+    if tag == 1 {
+        // FLOAT_LIT（r.1.1.2）：浮点字面量原文（lexeme 存池，无引号）
+        return (true, false, true, 0, s_names[id])
+    }
+    if tag == 2 {
+        // STR_LIT：名称 id 存 s_names，先解码（去引号 + 反转义，与 tig_str_lit 一致）
+        return (true, true, false, 0, str_unescape_quoted(s_names[id]))
+    }
+    if tag == 3 {
+        // CHAR_LIT（r.1.1.2）：码点
+        return (true, false, false, fold_char_code(s_names[id]), -1)
+    }
+    if tag == 4 {
+        // BOOL_LIT（r.1.1.2）：0/1
+        return (true, false, false, s_vals[id], -1)
+    }
+    if tag == 8 {
+        // UNARY：取负（op=0）与整数按位取反（U_BIT_NOT=6）。
+        var op = s_vals[id]
+        if op == 0 {
+            var (h, hs, hf, iv, sid2) = global_init_fold(sstate.child(id, 0))
+            if h && hs == false {
+                if hf {
+                    // 浮点取负：前缀 '-' 于字面量原文（r.1.1.2）
+                    return (true, false, true, 0, interner.intern("-" + interner.lookup(sid2)))
+                }
+                return (true, false, false, 0 - iv, -1)
+            }
+        } else if op == U_BIT_NOT {
+            var (h2, hs2, hf2, iv2, sid3) = global_init_fold(sstate.child(id, 0))
+            if h2 && hs2 == false && hf2 == false {
+                return (true, false, false, 0 - iv2 - 1, -1)
+            }
+        }
+        return (false, false, false, 0, -1)
+    }
+    if tag == 9 {
+        // BINARY：op 在 s_vals；string 加法（B_ADD=0）双目折叠
+        var op2 = s_vals[id]
+        var (l1, ls1, lf1, li1, lsd1) = global_init_fold(sstate.child(id, 0))
+        var (l2, ls2, lf2, li2, lsd2) = global_init_fold(sstate.child(id, 1))
+        if l1 && l2 {
+            if op2 == 0 {
+                // 字符串拼接（双侧均为字符串字面量）
+                if ls1 && ls2 {
+                    var sb = string_builder()
+                    var b: i64 = 0
+                    var t1 = interner.lookup(lsd1)
+                    while b < str_len(t1) {
+                        sb_append_byte(sb, str_byte(t1, b))
+                        b = b + 1
+                    }
+                    b = 0
+                    var t2 = interner.lookup(lsd2)
+                    while b < str_len(t2) {
+                        sb_append_byte(sb, str_byte(t2, b))
+                        b = b + 1
+                    }
+                    return (true, true, false, 0, interner.intern(sb_build(sb)))
+                }
+                // 整数加法（字符串+整数语义上不允许，semantic 已拦）
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 + li2, -1)
+                }
+            } else if op2 == 1 {
+                // B_SUB
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 - li2, -1)
+                }
+            } else if op2 == 2 {
+                // B_MUL
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 * li2, -1)
+                }
+            } else if op2 == 3 {
+                // B_DIV（除 0 不折叠 → 零值）
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false && li2 != 0 {
+                    return (true, false, false, li1 / li2, -1)
+                }
+            } else if op2 == 4 {
+                // B_MOD（模 0 不折叠）
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false && li2 != 0 {
+                    return (true, false, false, li1 % li2, -1)
+                }
+            } else if op2 == 24 {
+                // p.9.0-S.7 整除 `\`（规范 §3.3 floor 商）。此前**本分支缺失** →
+                // has=false → 调用方静默取零值（与 D1 B_BITAND 同族缺陷）。
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false && li2 != 0 {
+                    return (true, false, false, gif_idiv_floor(li1, li2), -1)
+                }
+            } else if op2 == 26 {
+                // p.9.0-S.7 成对取余 `%%`（与 `\` 配对，余数符号跟随除数）
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false && li2 != 0 {
+                    return (true, false, false, gif_floormod(li1, li2), -1)
+                }
+            } else if op2 == 5 {
+                // B_EQ（p.8.1.1 比较折叠：整数相等 / 字符串同文——池 id 相同）
+                if ls1 && ls2 {
+                    return (true, false, false, lsd1 == lsd2 ? 1 : 0, -1)
+                }
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 == li2 ? 1 : 0, -1)
+                }
+            } else if op2 == 6 {
+                if ls1 && ls2 {
+                    return (true, false, false, lsd1 != lsd2 ? 1 : 0, -1)
+                }
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 != li2 ? 1 : 0, -1)
+                }
+            } else if op2 == 7 {
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 < li2 ? 1 : 0, -1)
+                }
+            } else if op2 == 8 {
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 > li2 ? 1 : 0, -1)
+                }
+            } else if op2 == 9 {
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 <= li2 ? 1 : 0, -1)
+                }
+            } else if op2 == 10 {
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 >= li2 ? 1 : 0, -1)
+                }
+            } else if op2 == 11 {
+                // B_AND（逻辑与：短路语义由折叠值判定）
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, (li1 != 0 && li2 != 0) ? 1 : 0, -1)
+                }
+            } else if op2 == 12 {
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, (li1 != 0 || li2 != 0) ? 1 : 0, -1)
+                }
+            } else if op2 == 13 {
+                // B_BITAND（p.9.23 D1：此前缺失 → has=false → 调用方静默取零值）
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 & li2, -1)
+                }
+            } else if op2 == 14 {
+                // B_BITOR
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 | li2, -1)
+                }
+            } else if op2 == 15 {
+                // B_BITXOR
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false {
+                    return (true, false, false, li1 ^ li2, -1)
+                }
+            } else if op2 == 16 {
+                // B_SHL（位移量越界不折叠）
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false && li2 >= 0 && li2 < 64 {
+                    return (true, false, false, li1 << li2, -1)
+                }
+            } else if op2 == 17 {
+                // B_SHR
+                if ls1 == false && ls2 == false && lf1 == false && lf2 == false && li2 >= 0 && li2 < 64 {
+                    return (true, false, false, li1 >> li2, -1)
+                }
+            }
+        }
+        return (false, false, false, 0, -1)
+    }
+    if tag == 10 {
+        // N_TERNARY（p.8.1.1）：cond ? a : b——条件折叠为整值后取分支折叠
+        var (h0, s0, f0, i0, d0) = global_init_fold(sstate.child(id, 0))
+        if h0 && s0 == false && f0 == false {
+            var br: i64 = sstate.child(id, 1)
+            if i0 == 0 {
+                br = sstate.child(id, 2)
+            }
+            return global_init_fold(br)
+        }
+        return (false, false, false, 0, -1)
+    }
+    if tag == 7 {
+        // p.8.1.1 const fn 编译期求值：全局初始化中的 const fn 调用 → 实参全部
+        // 折叠后经 consteval 求值器算出结果常量落位（静态元编程基础）。任何一步
+        // 失败（非 const fn / 参数含不支持操作 / 未定义）→ 不折叠（零值语义保持）。
+        // 顶层会话进入前重置求值器全局状态；const fn 递归内部（g_depth>0）不重置。
+        var fnm = sinfer.resolve_call_name(sstate.name_str(id))
+        var off = sstate.slot_off(id)
+        var nc = sstate.nchild(id) - off
+        var a_str: table<i64> = table_new_i64()
+        var a_iv: table<i64> = table_new_i64()
+        var a_sid: table<i64> = table_new_i64()
+        var k: i64 = 0
+        while k < nc {
+            var (h, hs, hf, iv, sid) = global_init_fold(sstate.child(id, off + k))
+            if !h {
+                return (false, false, false, 0, -1)
+            }
+            table_push(a_str, hs == true ? 1 : 0)
+            table_push(a_iv, iv)
+            table_push(a_sid, sid)
+            k = k + 1
+        }
+        if !consteval.in_session() {
+            consteval.consteval_reset()
+        }
+        return consteval.eval_const_call(fnm, a_str, a_iv, a_sid)
+    }
+    return (false, false, false, 0, -1)
+}
+
+// 按全局名池 id 查表字面量初值节点（-1 = 无；r.1.1.3）。
+func g_ginit_node_of(nid: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_ginit_names) {
+        if g_ginit_names[i] == nid {
+            return g_ginit_nodes[i]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 顶层全局变量声明（tag 100）：登记到 llvmgen 全局段。
+// 表全局 → @g = global ptr null（main 入口运行时创建，对齐 T0.4）；
+//   非空表字面量初值（r.1.1.3）→ 记录节点，main 入口创建后逐元素 push。
+// 标量全局 → @g = global T <折叠初值>。
+// 全局变量 IR 登记（p.9.12.4：full 参数 = 登记全名——顶层传裸名；
+// 命名空间内 const 传 "ns::NAME" 全名，llvmgen 发射时 ns_replace 转 $）
+func tig_global_var(s: i64, full: string) -> i64 {
+    var nm = full
+    var ty = sgen.parse_generic_type_node(sstate.child(s, 0))
+    if ty < 0 {
+        ty = types.named(TK_I64)  // 无标注：语义已推断，兜底 i64
+    }
+    var telem = sinfer.gb_telem_of(intern.intern(nm))
+    // p.9.12.6 边界：全局行池 table<R> v1 不支持（列式行池需每字段列 @g 全局，成本高，
+    // 先局部；显式拒绝，不静默降级为单表语义）
+    if types.is_table(ty) {
+        var gtr = types.table_elem(ty)
+        if gtr > 0 && types.kind(gtr) == K_STRUCT {
+            sm_err_msg = "行池 table<R> 全局变量 v1 暂不支持（p.9.12.6 边界；仅局部行池可用）"
+            return -1
+        }
+    }
+    // 表全局登记：llvmgen 输出 global ptr null + main 入口初始化
+    if types.is_table(ty) || telem >= 0 {
+        llvmgen.global_table_reg(nm)
+        // r.1.1.3：非空表字面量初值 → 记录，main 入口创建后整体构造（逐元素 push）
+        var ginit = sstate.child(s, 1)
+        if ginit >= 0 && s_tags[ginit] == S_N_TABLE_LIT && sstate.nchild(ginit) > 0 {
+            table_push(g_ginit_names, intern.intern(nm))
+            table_push(g_ginit_nodes, ginit)
+        }
+    } else {
+        llvmgen.global_scalar_reg(nm, ty)
+        // 标量初值编译期折叠（否则 @g = global T 零值，顶层初值静默丢失）。
+        // 根治（2026-09-04，三连坑）：①此前仅 const+裸 INT_LIT 被采纳——var 的
+        // 正/负整数初值全丢；②负字面量（UNARY 取负）折叠为 0；③字符串初值直传
+        // 原始 lexeme（带引号未反转义）且拼接/算术表达式不折叠。
+        // r.1.1.2 扩展：bool/char/浮点（含负浮点）字面量初值同样折叠落位。
+        var (hf, hstr, hfp, hv, hsid) = global_init_fold(sstate.child(s, 1))
+        if hf {
+            if hstr {
+                llvmgen.global_str_init(nm, hsid)
+            } else if hfp {
+                llvmgen.global_fp_init(nm, hsid)
+            } else {
+                llvmgen.global_scalar_init(nm, hv)
+            }
+        }
+        // 2026-10-13 聚合全局初值物化：struct/enum 初值（构造器/调用形态）无法
+        // 静态折叠——登记到聚合 init 列表，main 入口求值存回（槽零初始化兜底）。
+        // 与"表全局 main 入口创建"同构。
+        var gk2 = types.kind(ty)
+        if gk2 == K_STRUCT || gk2 == K_ENUM {
+            var ainit = sstate.child(s, 1)
+            if ainit >= 0 {
+                table_push(g_agginit_names, intern.intern(nm))
+                table_push(g_agginit_nodes, ainit)
+                table_push(g_agginit_tys, ty)
+            }
+        }
+    }
+}
+
+// 命名空间递归：生成体内全部函数（全名 = prefix::函数名）。
+// ns_node 为 N_NAMESPACE 节点：children=[Segment...]+[体 StmtList]。
+func tig_ns(ns_node: i64, prefix: string) -> i64 {
+    var segs: table<string> = table_new_string()
+    var nseg = s_aux[ns_node]
+    var k: i64 = 0
+    while k < nseg {
+        var seg = sstate.child(ns_node, k)
+        table_push(segs, sstate.name_str(seg))
+        k = k + 1
+    }
+    var body = sstate.child(ns_node, nseg)
+    // 本命名空间全名前缀 = 外层 prefix + 本段
+    var full_pre: string = prefix
+    var j: i64 = 0
+    while j < len(segs) {
+        if full_pre != "" {
+            full_pre = full_pre + "::"
+        }
+        full_pre = full_pre + segs[j]
+        j = j + 1
+    }
+    // 遍历命名空间体：FnDef → 全名生成；嵌套 Namespace → 递归
+    var nb = sstate.nchild(body)
+    var i: i64 = 0
+    while i < nb {
+        var st = sstate.child(body, i)
+        var tag = s_tags[st]
+        if tag == 101 {
+            var r = tig_fn_def(st, full_pre)
+            if r < 0 {
+                if str_len(sm_err_msg) == 0 {
+                    sm_err_msg = "命名空间 " + full_pre + " 的函数 " + sstate.name_str(st) + " 生成失败"
+                }
+                return -1
+            }
+        } else if tag == 112 {
+            var nr = tig_ns(st, full_pre)
+            if nr < 0 {
+                return -1
+            }
+        } else if tag == 100 {
+            // p.9.12.4：命名空间内 const 常量 → 全名登记全局（@ns$NAME 发射）
+            var gr = tig_global_var(st, full_pre + "::" + sstate.name_str(st))
+            if gr < 0 {
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 函数定义 → tie-IR 函数。prefix 为命名空间前缀（顶层函数传 ""）。
+// 函数全名 = prefix::name（命名空间函数）；LLVM 符号由 llvmgen 转 $。
+// --dll-export 白名单匹配：full_name（"ns::fn"）按导出名形态（"ns$fn"）与
+// 逗号分隔的名单做精确比较（名单为空时不应调用——调用方已判空）。
+func dll_export_hit(full_name: string) -> bool {
+    // 构造导出名：:: → $
+    var sb = string_builder()
+    var i: i64 = 0
+    var n = str_len(full_name)
+    while i < n {
+        if i + 1 < n && str_byte(full_name, i) == 58 && str_byte(full_name, i + 1) == 58 {
+            sb_append(sb, "$")
+            i = i + 2
+        } else {
+            sb_append_byte(sb, str_byte(full_name, i))
+            i = i + 1
+        }
+    }
+    var ex = sb_build(sb)
+    // 名单逐段精确比较（逗号分隔；末段无逗号）
+    var m = str_len(g_dll_export)
+    var st: i64 = 0
+    var j: i64 = 0
+    while j <= m {
+        if j == m || str_byte(g_dll_export, j) == 44 {
+            var seg = j - st
+            if seg == str_len(ex) {
+                var eq = true
+                var k: i64 = 0
+                while k < seg {
+                    if str_byte(g_dll_export, st + k) != str_byte(ex, k) {
+                        eq = false
+                        break
+                    }
+                    k = k + 1
+                }
+                if eq {
+                    return true
+                }
+            }
+            st = j + 1
+        }
+        j = j + 1
+    }
+    return false
+}
+
+func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
+    // 泛型模板声明（children[0] == N_TYPE_PARAMS）：T3b 单态化前不生成 IR——
+    // 模板体内 TypeVar 类型（"T"）无法静态编码，生成会报"类 'T' 未定义"。
+    // 语义层已把模板登记进 gt_* 表并跳过普通函数检查；此处对称跳过生成。
+    if sstate.nchild(fn_node) > 0 {
+        var slot0 = sstate.child(fn_node, 0)
+        if slot0 >= 0 && s_tags[slot0] == S_N_TYPE_PARAMS {
+            return 0
+        }
+    }
+    var bare = sstate.name_str(fn_node)
+    var full_name: string = str.clone(bare)
+    if prefix != "" {
+        full_name = prefix + "::" + bare
+    }
+    g_cur_fn_name = str.clone(full_name)
+    // p.6.1.4：登记当前函数名（ir.add_operand 交错诊断定位用）
+    ir.set_cur_fn(full_name)
+    // 每函数重置变量作用域（跨函数不串用；同层函数同名参数/局部正常遮蔽）
+    g_sc_keys = table_new_i64()
+    g_sc_allocas = table_new_i64()
+    g_sc_tys = table_new_i64()
+    g_sc_top = 0
+    g_lp_labels = table_new_i64()
+    g_lp_breaks = table_new_i64()
+    g_lp_cont = table_new_i64()
+    g_lp_top = 0
+    // p.9.11.4 defer：每函数重置 defer 注册表与作用域计数
+    g_def_bodies = table_new_i64()
+    g_def_flags = table_new_i64()
+    g_def_scopes = table_new_i64()
+    g_def_cnt = 0
+    g_block_lvl = 0
+    g_in_fn_body = 0
+    // 三期 goto（§7.1.5）：每函数重置 goto 标签块表（标签块 = 跳转目标）
+    g_gt_names = table_new_i64()
+    g_gt_blks = table_new_i64()
+    g_tv_keys = table_new_i64()
+    g_tv_elems = table_new_i64()
+    // r.1.6.7：显式 lock 凭据深度按函数清零（随后按 `#[unsafe.lock]` 属性或
+    // 文件级授权重新 lock_enter）。命名函数是顶层单元，无需保存/恢复。
+    lock_reset()
+    // r.1.6.7：逃逸分析状态同样按「每函数」重置——闭包体/方法体是独立函数，
+    // 其内候选集与外层互不串用（外层候选在本函数体内不成立：捕获变量的所有权
+    // 可能落在另一执行流）。注意此处是**清空**而非保存/恢复：闭包体生成发生在外层
+    // 函数的生成过程中，若恢复外层状态会把「已被闭包捕获 ⇒ 可能被并发访问」的表
+    // 重新判为独占 —— 方向必须偏向保守。
+    esc_reset()
+    g_param_nids = table_new_i64()
+    g_shared_param_nids = table_new_i64()
+    g_ownparam_slots = table_new_i64()
+    g_tblcand_allocas = table_new_i64()
+    g_aggcand_allocas = table_new_i64()
+    g_aggcand_tys = table_new_i64()
+    g_clov_nids = table_new_i64()
+    g_clov_slots = table_new_i64()
+    g_clov_cids = table_new_i64()
+    g_sb_keys = table_new_i64()
+    g_sb_hv = table_new_i64()
+    g_cbs_keys = table_new_i64()
+    g_cbs_acc = table_new_i64()
+    var nparams = s_aux[fn_node]
+    // 返回类型：children[slot_off]（新布局 children[0]=泛型槽→偏移 1；
+    // 旧布局无槽→children[0]=返回类型。slot_off 统一判定保证自举双兼容）
+    var ret_ty = sgen.parse_generic_type_node(sstate.child(fn_node, sstate.slot_off(fn_node)))
+    if ret_ty < 0 {
+        if str_len(sm_err_msg) == 0 {
+            sm_err_msg = "函数 " + full_name + " 返回类型解析失败"
+        }
+        return -1
+    }
+    g_cur_ret_ty = ret_ty  // Return 生成期 trit 适配用
+    // p.9.11.15 生成器函数（含 yield）：返回类型 = 签名表类型 table<elem>
+    // （scollect 已登记；parse_generic_type_node 得到的是声明元素类型）。
+    // LLVM 函数返回 ptr（表句柄）；g_cur_ret_ty 同步（Return 生成期适配）。
+    var g_sig0 = sstate.fn_sig(full_name)
+    g_gen_tbl = -1
+    g_gen_elem = -1
+    if g_sig0 >= 0 && sstate.is_gen(g_sig0) == 1 {
+        ret_ty = sg_ret[g_sig0]
+        g_cur_ret_ty = ret_ty
+    }
+    // M5 动态库导出面（dev33 批次 12）：顶层函数恒公有；命名空间函数仅 pub
+    // func 导出（N_FN_DEF val bit0 = is_pub，对齐 parser）。导出标记登记进 IR
+    // 供 llvmgen 在动态库模式输出 dllexport；动态库模式下对导出函数做边界检查。
+    var is_pub: i64 = 1
+    if prefix != "" {
+        is_pub = s_vals[fn_node] & 1
+    }
+    // --dll-export 白名单（空 = 不过滤）：只导出名单内的函数（导出名 "ns$fn" 精确匹配）
+    if g_dynlib && is_pub == 1 && str_len(g_dll_export) > 0 {
+        if !dll_export_hit(full_name) {
+            is_pub = 0
+        }
+    }
+    if g_dynlib && is_pub == 1 {
+        var rberr = dynlib_ty_ok(ret_ty)
+        if str_len(rberr) > 0 {
+            sm_err_msg = "动态库边界错误: 导出函数 " + full_name + " 返回" + rberr
+            return -1
+        }
+    }
+    // 参数类型收集（T0.3 by_ref + M2.1.8 struct 首参自动 ref：ref 参数 LLVM
+    // 形参声明为 ptr——按值声明聚合类型（%struct.Counter）会与调用方传的
+    // 槽地址不匹配。表 ref 原本 table id → llvm ptr 恰好一致；struct 需显式 ptr）
+    var params: table<i64> = table_new_i64()
+    var sig0_pre = sstate.fn_sig(full_name)
+    var sig_off_pre: i64 = -1
+    if sig0_pre >= 0 {
+        sig_off_pre = sg_off[sig0_pre]
+    }
+    var i: i64 = 0
+    while i < nparams {
+        // 第 i 个参数：children[slot_off + 1 + i]
+        var p = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + i)
+        var pt = sgen.parse_generic_type_node(sstate.child(p, 0))
+        if pt < 0 {
+            if str_len(sm_err_msg) == 0 {
+                sm_err_msg = "函数 " + full_name + " 参数类型解析失败"
+            }
+            return -1
+        }
+        var is_ref_pre = 0
+        if sig0_pre >= 0 && sig_off_pre + i < len(sp_refs) {
+            is_ref_pre = sp_refs[sig_off_pre + i]
+        }
+        // 变参参数：签名类型为 table<T>（parser 的 AST 类型节点只有元素类型 T，
+        // 必须用语义层已解析的签名类型——LLVM 形参声明为 ptr 表指针）
+        if sig0_pre >= 0 && sig_off_pre + i < len(sp_vars) {
+            if sp_vars[sig_off_pre + i] == 1 {
+                pt = sp_tys[sig_off_pre + i]
+            }
+        }
+        // M5 动态库边界（任务 36）：导出函数参数仅标量/string——表/struct 等堆
+        // 布局跨语言不可见，ref 表参数/变参（表打包）亦在此拦截
+        if g_dynlib && is_pub == 1 {
+            var pberr = dynlib_ty_ok(pt)
+            if str_len(pberr) > 0 {
+                sm_err_msg = "动态库边界错误: 导出函数 " + full_name + " 参数" + pberr
+                return -1
+            }
+        }
+        if is_ref_pre == 1 {
+            table_push(params, types.named(TK_STR))  // 引用 → ptr 形参
+        } else {
+            table_push(params, pt)
+        }
+        i = i + 1
+    }
+    var fid = ir.new_func(intern.intern(full_name), ret_ty, params)
+    // M5 动态库导出面：登记导出标记（llvmgen gen_func 读 ir.func_exported 输出
+    // dllexport；非动态库模式下该标记不影响生成）
+    ir.func_export_set(fid, is_pub)
+    // p.9.11.10 inline fn：N_FN_DEF val bit5 = is_inline（parser 已登记）。llvmgen
+    // gen_func 读 ir.func_inline 在 define 头附加 alwaysinline 属性。
+    ir.func_inline_set(fid, (s_vals[fn_node] >> 5) & 1)
+    g_cur_func = fid
+    var entry = ir.new_block(fid, interner.intern("entry"))
+    g_entry_block = entry     // p.6.10.3：entry 级表变量析构候选登记用
+    // r.1.6.14：每函数重置「值语义形参」释放候选（其出口释放只该覆盖本函数形参）
+    g_ownparam_slots = table_new_i64()
+    g_cur_block = entry
+    // 参数入作用域（alloca + store；T0.3 by_ref 参数不 alloca，直接绑定参数寄存器）
+    var off = ir.func_params_off(fid)
+    var sig0 = sstate.fn_sig(full_name)
+    // sig0 < 0（签名缺失异常兜底）时禁取 sg_off[-1]——负索引垃圾值会误判 ref
+    var sig_off = 0
+    if sig0 >= 0 {
+        sig_off = sg_off[sig0]
+    }
+    i = 0
+    while i < nparams {
+        // 第 i 个参数：children[slot_off + 1 + i]
+        var p = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + i)
+        var pname = sstate.name_str(p)
+        var pty = params[i]
+        // p.9.12.6 边界：行池 table<R> 不能作函数形参（含 ref 形参；无值形态）
+        if types.is_table(pty) {
+            var tep = types.table_elem(pty)
+            if tep > 0 && types.kind(tep) == K_STRUCT {
+                sm_err_msg = "行池 table<R> 不能作函数形参/ref 形参（p.9.12.6 边界，函数 " + full_name + "）"
+                return -1
+            }
+        }
+        // by_ref 标志：sstate sp_refs（语义层已收集）。
+        // sig0 < 0（函数签名缺失，如命名空间函数拼接异常）时禁止取 sg_off[-1]——
+        // 负索引垃圾值会误判参数为 ref，绑定参数寄存器导致运行时崩溃
+        var is_ref = 0
+        if sig0 >= 0 && sig_off + i < len(sp_refs) {
+            is_ref = sp_refs[sig_off + i]
+        }
+        var av: i64 = -1
+        if is_ref == 1 {
+            // T0.3 by_ref：绑定参数寄存器（实参槽地址）。读取 → load ptr, ptr %N；
+            // 重绑定赋值 → store ptr, %N 直接写回调用方实参槽
+            av = ir.param_val(fid, i)
+        } else {
+            var alloca = ir.new_inst(g_cur_block, 20, pty)  // alloca
+            ir.add_operand(alloca, pty, 2)
+            av = ir.get_value(alloca)
+            var st = ir.new_inst(g_cur_block, 22, -1)  // store 参数
+            ir.add_operand(st, pty, 2)
+            // 参数值 id（ir.param_val 取 ir_ops 参数段——曾误用 off+i 段偏移，
+            // 与 llvmgen 形参映射 param_ref 不匹配导致 %N 未定义）
+            ir.add_operand(st, ir.param_val(fid, i), 0)
+            ir.add_operand(st, av, 0)
+        }
+        scope_put(interner.intern(pname), av, pty)
+        // p.6.10.3：登记参数名（表参数借用、不析构不 release——所有权在调用方）
+        table_push(g_param_nids, interner.intern(pname))
+        // r.1.6.14：**跳过 COW 的名字**登记（表名 g_shared_param_nids，语义已扩为
+        // 「写路径不做分离」）。两类：
+        //   · `ref` 形参（bit0）——可写借用的定义就是「写回调用方」⇒ 必须跳过，
+        //     否则分离后写只落在本地副本，借用语义失效。
+        //   · `shared` 形参（bit5）——显式共享、零拷贝就地改。
+        if (s_vals[p] & 1) != 0 || (s_vals[p] & 32) != 0 {
+            table_push(g_shared_param_nids, interner.intern(pname))
+        }
+        // r.1.6.11 `deep` 形参：入口对表字段做值语义分离（rc>1 才克隆，rc=1 零成本）。
+        // N_PARAM val bit4 = deep（parser 登记）。by_ref 形参的 av 是**实参槽地址**，
+        // 对它 seal 会改到调用方，故只对按值形参做（deep 与 ref 本应互斥）。
+        if (s_vals[p] & 16) != 0 && is_ref == 0 {
+            var sev = tig_deep_param_seal(av, pty)
+            if sev < 0 {
+                return -1
+            }
+        }
+        // r.1.6.14 值语义形参：非 `shared` / 非 `ref` 的表形参在**入口 retain**
+        // （让 rc 计入本次调用这一份持有）并在**出口 release**（成对）。
+        // 于是 callee 内的写触发 COW 分离（rc=2 ⇒ 克隆），调用方不受影响；
+        // `shared` 形参跳过（纯借用 + 就地改，这就是它的高性能语义）。
+        // 默认（开关关）整段不发射 ⇒ 逐指令等价。
+        if tbl_value_on() && is_ref == 0 && (s_vals[p] & 32) == 0 &&
+            types.is_table(pty) && pty != types.named(TK_ANY) {
+            var pv0 = s21_load(av, types.named(TK_STR))
+            tig_tbl_retain_call(pv0)
+            table_push(g_ownparam_slots, av)
+        }
+        i = i + 1
+    }
+    // p.9.11.15 生成器 prologue：创建产出表（table<elem>，句柄 ptr 存槽）。
+    // 元素 LLVM 槽类型对齐 tig_for_table 的 elem_llvm_ty 推导（结构/enum/fn/
+    // 元组/any 用类型 id 本身，表/map/port → ptr，string/bool/f64 特判）。
+    if g_sig0 >= 0 && sstate.is_gen(g_sig0) == 1 {
+        var gelem = types.table_elem(ret_ty)
+        if gelem < 0 {
+            gelem = types.named(TK_I64)
+        }
+        var g_llvm = gelem
+        var g_suf = bridge_suffix(gelem)
+        var g_k = types.kind(gelem)
+        if g_k == K_STRUCT || g_k == K_ENUM || g_k == K_FN || g_k == K_TUPLE || gelem == types.named(TK_ANY) {
+            g_llvm = gelem
+        } else if types.is_table(gelem) || types.is_map(gelem) || types.kind(gelem) == K_PORT {
+            g_llvm = types.named(TK_STR)
+        } else if g_suf == "string" {
+            g_llvm = types.named(TK_STR)
+        } else if g_suf == "bool" {
+            g_llvm = types.named(TK_BOOL)
+        } else if g_suf == "f64" {
+            g_llvm = types.named(TK_F64)
+        } else {
+            g_llvm = types.named(TK_I64)
+        }
+        var gesz_v = tig_int_lit_ty(elem_size(gelem), types.named(TK_I64))
+        var gtbl = s21_table_new_ty(gelem, gesz_v)
+        if gtbl < 0 {
+            return -1
+        }
+        var gslot = ir.new_inst(g_cur_block, 20, types.named(TK_STR))  // alloca ptr
+        ir.add_operand(gslot, types.named(TK_STR), 2)
+        var gst = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(gst, types.named(TK_STR), 2)
+        ir.add_operand(gst, gtbl, 0)
+        ir.add_operand(gst, ir.get_value(gslot), 0)
+        g_gen_tbl = ir.get_value(gslot)
+        g_gen_elem = g_llvm
+    }
+    // 全局表 main 初始化：@g = global ptr null → main 入口 tie_table_new + store
+    // （阶段 A 表全局，Rust 版同路径；缺此则 len(g) 对 null 崩溃 0xC0000005）。
+    // r.1.1.3：非空表字面量初值 → tig_table_lit 整体构造（含逐元素 push）；
+    // 无初值/空表 → 运行时建空表（既有路径，元素宽由标注决定）。
+    // 注：--shared 库无 main，此初始化改经 tie$rt_init 模块构造器执行
+    //（见 tig_shared_rt_init）。
+    if is_entry_name(full_name) {
+        var eer = gen_global_tbl_init()
+        if eer < 0 {
+            return -1
+        }
+    }
+    // 函数体：children[slot_off + 1 + nparams]
+    var body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams)
+    // p.9.11.4 defer：标记正在生成命名函数体（其最外层块末尾跑函数级 defer）
+    g_in_fn_body = 1
+    // r.1.6.7：函数级去锁作用域——`#[unsafe.lock] func f`（函数级持证）或
+    // 文件级 `type tie<logic, unsafe:lock>`（整文件授权）⇒ 函数体内表访问走免锁。
+    // 双锁仍成立：`#[unsafe.lock]` 属性本身即「门禁 + 域」的声明；文件级授权同理
+    // （见 unsafe-credential-lock.md §3：函数级/文件级都是「隐式持证」形态）。
+    // 函数级 `#[unsafe.lock]` 与文件级授权都已在 parser 侧登记进该表（文件级按
+    // 「本文件」展开为逐函数登记）。此处**不再**判全局文件标志——用全局标志会把
+    // import 的模块一并去锁，范围过宽且危险。
+    var lock_fn = sstate.lock_fn_is(fn_node)
+    if lock_fn {
+        lock_enter()
+    }
+    var r = tig_block_stmts(body)
+    if r < 0 {
+        return -1
+    }
+    // p.6.10.3：隐式函数尾析构——body 后、补 ret 前，释放本函数非参数局部表
+    //（表参数借用不析构；引用计数由外传点 retain 守恒）
+    if !block_terminated() {
+        tig_tbl_exit_release()
+    }
+    // 末尾补 ret：main → ret i32 0（void main）；其余 void → ret void
+    if s_tags[body] == 122 {
+        var has_ret = false
+        // 简化：检查最后一条语句是否 Return
+        var nb = sstate.nchild(body)
+        if nb > 0 {
+            var last = sstate.child(body, nb - 1)
+            if s_tags[last] == 104 {
+                has_ret = true
+            }
+        }
+        // 当前块已终止（switch 各 case return 后 exit 块已由 default ret 结束；
+        // if 两分支都 return 后 merge 块不可达）→ 不补 ret（曾补死代码
+        // `ret ptr %0` 到已终止块，LLVM 报类型错）
+        if !has_ret && !block_terminated() {
+            if g_sig0 >= 0 && sstate.is_gen(g_sig0) == 1 {
+                // p.9.11.15 生成器自然结束：返回产出表（load 槽 + ret table）
+                var gv = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load
+                ir.add_operand(gv, g_gen_tbl, 0)
+                var gre = ir.new_inst(g_cur_block, 32, ret_ty)
+                ir.add_operand(gre, ir.get_value(gv), 0)
+            } else if is_entry_name(full_name) {
+                // main 补 ret i32 0：ty 必须显式 i32（llvmgen 按 ins_ty 输出 ret 类型，
+                // ty=-1 会生成 ret ptr 0 / ret void 与 define i32 @main 不匹配）
+                var ret = ir.new_inst(g_cur_block, 32, types.named(TK_I32))  // ret i32
+                ir.add_operand(ret, 0, 2)  // 立即数 0
+            } else if ret_ty == types.named(TK_VOID) {
+                var ret = ir.new_inst(g_cur_block, 32, -1)  // ret void
+            } else {
+                // 非 void 缺 return：按返回类型补零值（曾一律补 ret void——
+                // i64 函数 define i64 以 ret void 结束类型不匹配）。
+                // string/ptr 用空串常量（曾用 IMM 0——llvmgen ret 的 to_ptr
+                // 把字面量 0 误当值 id 0 → ret ptr %0 类型错）。
+                // **先建常量再建 ret**：ret 指令会终止块，其后不能追加指令
+                var dv = tig_default_val(ret_ty)
+                var ret = ir.new_inst(g_cur_block, 32, ret_ty)
+                ir.add_operand(ret, dv, 0)
+            }
+        }
+    }
+    return 0
+}
+
+}

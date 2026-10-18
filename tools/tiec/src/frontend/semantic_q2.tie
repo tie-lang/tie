@@ -1,0 +1,36 @@
+type tie<class>
+// compiler/frontend/semantic_q2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 semantic.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace semantic {
+// ==================== check_debug：可读输出 ====================
+// 返回可读的语义摘要（函数签名/struct/全局变量/节点类型表计数）
+pub func check_debug(ast_text: string) -> string {
+    var r = check(ast_text)
+    var out: string = "语义检查: " + r + "\n"
+    out = out + "函数签名 (" + to_string(len(fn_keys)) + "):\n"
+    var i: i64 = 0
+    while i < len(fn_keys) {
+        var sig = fn_vals[i]
+        out = out + "  " + intern.lookup(fn_keys[i]) + "(" + to_string(sg_nparams[sig]) + " 参数) -> " + types.type_name(sg_ret[sig]) + "\n"
+        i = i + 1
+    }
+    out = out + "struct (" + to_string(len(st_keys)) + "):\n"
+    i = 0
+    while i < len(st_keys) {
+        var si = st_vals[i]
+        out = out + "  " + intern.lookup(st_keys[i]) + " (" + to_string(cls_nfld[si]) + " 字段)\n"
+        i = i + 1
+    }
+    out = out + "全局变量 (" + to_string(len(gb_keys)) + "):\n"
+    i = 0
+    while i < len(gb_keys) {
+        out = out + "  " + intern.lookup(gb_keys[i]) + ": " + types.type_name(gb_vals[i]) + "\n"
+        i = i + 1
+    }
+    out = out + "节点类型表 (" + to_string(g_typed) + " 条目)\n"
+    return out
+}
+
+}

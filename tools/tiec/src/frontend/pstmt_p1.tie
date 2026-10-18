@@ -1,0 +1,133 @@
+type tie<class>
+// compiler/frontend/pstmt_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 pstmt.tie。
+namespace pstmt {
+// 元组解构声明：`var (q, r) = expr;` → _tmpN + 逐字段声明（StmtList）
+// p.9.11.8 剩余解构：`var (a, ...rest) = t`（源=数组）。rest 收集剩余元素为新表。
+//    脱糖（复用既有 N_INDEX/N_SLICE，零新增运行时）：
+//      var _tmpN = t
+//      var a = _tmpN[0]; var b = _tmpN[1]; ...        （前导名按位置取元素）
+//      var rest = _tmpN[k..]                          （k=前导名个数；子表=剩余）
+//   判定：...rest 仅允许出现在解构列表**末位**（非末位 → 诊断 E）；多重 rest 拒绝。
+//   rest 形态 → 走索引/切片脱糖（数组）；无 rest → 既有 ItemN 字段脱糖（元组）。
+//   记录/map 形态（按位置取键名）零成本不可得，留待（裁决注明）。
+func parse_tuple_destructure(line: i64, col: i64, is_const: i64) -> i64 {
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var names: table<i64> = table_new_i64()
+    var rest_name: i64 = -1
+    if putil.eat(lex_rparen) {
+        putil.set_err(line, col, "空解构 () 不支持")
+        return -1
+    }
+    var d = false
+    while !d {
+        if putil.peek_tag() == lex_ellipsis {
+            // p.9.11.8 剩余槽：`...rest`
+            if rest_name >= 0 {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "剩余解构 '...rest' 只能出现一次")
+                return -1
+            }
+            putil.advance()   // '...'
+            rest_name = putil.expect_ident()
+            if rest_name < 0 {
+                return -1
+            }
+            // rest 必须位于末位：其后只能是 ')'；若是 ',' → 诊断
+            if putil.peek_tag() == lex_comma {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "剩余解构 '...rest' 必须位于解构列表末位")
+                return -1
+            }
+            if !putil.expect(lex_rparen, "')'") {
+                return -1
+            }
+            d = true
+        } else {
+            var nm = putil.expect_ident()
+            if nm < 0 {
+                return -1
+            }
+            table_push(names, nm)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    if !putil.expect(lex_eq, "'='") {
+        return -1
+    }
+    var init = pexpr.parse_expr()
+    if init < 0 {
+        return -1
+    }
+    if !putil.expect_stmt_end() {
+        return -1
+    }
+    var tmp_name = interner.intern("_tmp" + to_string(g_tmp))
+    g_tmp = g_tmp + 1
+    var list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    var decls: table<i64> = table_new_i64()
+    // 第一条：临时变量持有源值（可写）
+    var tv = ast.new_node(N_VAR_DECL, tmp_name, 0, -1, line, col)
+    var tkids: table<i64> = table_new_i64()
+    table_push(tkids, -1)
+    table_push(tkids, init)
+    ast.set_children(tv, tkids)
+    table_push(decls, tv)
+    var has_rest: bool = (rest_name >= 0)
+    // 逐前导名声明
+    var i: i64 = 0
+    while i < len(names) {
+        var var_node = ast.new_node(N_VAR, tmp_name, -1, -1, line, col)
+        var value_node: i64 = -1
+        if has_rest {
+            // 数组按位置取元素：tmp[i]（N_INDEX）
+            value_node = ast.new_node(N_INDEX, -1, -1, -1, line, col)
+            var ividx: table<i64> = table_new_i64()
+            table_push(ividx, var_node)
+            table_push(ividx, ast.new_node(N_INT_LIT, -1, i, -1, line, col))
+            ast.set_children(value_node, ividx)
+        } else {
+            // 元组字段访问：tmp.Item{i+1}（既有路径）
+            value_node = ast.new_node(N_FIELD_ACCESS, interner.intern("Item" + to_string(i + 1)), -1, -1, line, col)
+            var fkids: table<i64> = table_new_i64()
+            table_push(fkids, var_node)
+            ast.set_children(value_node, fkids)
+        }
+        var fv = ast.new_node(N_VAR_DECL, names[i], is_const, -1, line, col)
+        var vkids: table<i64> = table_new_i64()
+        table_push(vkids, -1)
+        table_push(vkids, value_node)
+        ast.set_children(fv, vkids)
+        table_push(decls, fv)
+        i = i + 1
+    }
+    if has_rest {
+        // rest = tmp[<前导数>..]（子表，复用切片）
+        var rv = ast.new_node(N_VAR, tmp_name, -1, -1, line, col)
+        var sl = ast.new_node(N_SLICE, -1, -1, -1, line, col)
+        var slkids: table<i64> = table_new_i64()
+        table_push(slkids, rv)
+        table_push(slkids, ast.new_node(N_INT_LIT, -1, len(names), -1, line, col))
+        table_push(slkids, -1)   // end 缺省 → len
+        ast.set_children(sl, slkids)
+        var restv = ast.new_node(N_VAR_DECL, rest_name, is_const, -1, line, col)
+        var rkids: table<i64> = table_new_i64()
+        table_push(rkids, -1)
+        table_push(rkids, sl)
+        ast.set_children(restv, rkids)
+        table_push(decls, restv)
+    }
+    ast.set_children(list, decls)
+    return list
+}
+
+}

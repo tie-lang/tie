@@ -1,0 +1,17 @@
+type tie<logic, unsafe:mem>
+// cred_idle_file_probe.tie —— W00030 文件粒度挂空探针（2026-10-02）
+// ============================================================================
+// 文件级授权（`type tie<角色, unsafe:域>`）的**作用域是整个文件**，故挂空判定
+// 也按文件粒度：整个文件都没用到被授权的域 ⇒ 该文件级授权是空授权。
+//
+// 本文件授权 mem 域，但全文件没有任何 mem 域操作（解引用 / alloc / memcpy…），
+// 故 `-w` 编译应报 1 条 W00030（位置 @1:1，指向文件头授权处）。
+// 对照：同目录的 cred_idle_probe.tie 覆盖块级与函数级的挂空判定。
+
+func helper() -> i64 {
+    return 42
+}
+
+func main() {
+    println("idle-file probe " + to_string(helper()))
+}

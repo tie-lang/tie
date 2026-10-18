@@ -1,0 +1,802 @@
+type tie<class>
+// compiler/backend/llvmgen_p1.tie —— llvmgen 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 llvmgen.tie。
+namespace llvmgen {
+func tail_marked(inst_id: i64) -> i64 {
+    if g_tail_enable == 0 {
+        return 0
+    }
+    var i: i64 = 0
+    while i < len(g_tail_ids) {
+        if g_tail_ids[i] == inst_id {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 本地字符串切片 [start, end)（码点级；对齐 irgen.ig_slice）。
+// 历史 bug：global_ref 曾调用未定义的裸 `slice`，导致所有 import 本模块的
+// 程序（driver-lite/driver）编译报"未定义的函数 'slice'"。本辅助补齐。
+func l_slice(s: string, start: i64, end: i64) -> string {
+    // 性能重写（O(n)）：字节定位 + StringBuilder 拷贝（旧逐字符拼接 O(n²)）
+    var n: i64 = str_len(s)
+    if start < 0 {
+        start = 0
+    }
+    if end > n {
+        end = n
+    }
+    if start >= end {
+        return ""
+    }
+    // 一次码点扫描：顺路记录 start 的字节偏移（bstart），扫到 end 得字节偏移（b）
+    var b: i64 = 0
+    var i: i64 = 0
+    var bstart: i64 = 0
+    while i < end {
+        if i == start {
+            bstart = b
+        }
+        b = b + utf8_seq_len(s, b)
+        i = i + 1
+    }
+    // 字节区间拷贝（start < end 保证 bstart 已被赋值）
+    var sb = string_builder()
+    var k: i64 = bstart
+    while k < b {
+        sb_append_byte(sb, str_byte(s, k))
+        k = k + 1
+    }
+    return sb_build(sb)
+}
+
+// 查找字符串中第一个指定字符的下标（-1 = 无）。
+// 历史 bug：const_f 曾调用未定义的裸 `find_char`，本辅助补齐。
+func l_find_char(s: string, c: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 全局表是否已登记（irgen 查表变量语义类型用）
+func global_is_table(nm: string) -> i64 {
+    var nid = interner.intern(nm)
+    var i: i64 = 0
+    while i < len(g_global_names) {
+        if g_global_names[i] == nid {
+            return g_global_is_table[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 输出聚合类型段（模块头 declare 之后、全局变量之前）：
+// 遍历语义层已登记的 struct（st_keys/st_vals + cls_* + fld_*），
+// 输出 `%struct.<名> = type { 字段类型... }`（元组内联在 llvm_ty，无需定义）。
+func emit_agg_types() {
+    var n = len(st_vals)
+    var i: i64 = 0
+    while i < n {
+        var si = st_vals[i]
+        var off = cls_fldoff[si]
+        var cnt = cls_nfld[si]
+        var out: string = "%struct." + intern.lookup(st_keys[i]) + " = type {"
+        var j: i64 = 0
+        while j < cnt {
+            if j > 0 {
+                out = out + ","
+            }
+            out = out + " " + llvm_ty(fld_tys[off + j])
+            j = j + 1
+        }
+        out = out + " }"
+        line(out)
+        i = i + 1
+    }
+    // enum 类型输出（2026-08-15 enum 语言特性）：`%enum.<名> = type { i64, i64×K }`。
+    // 布局：槽 0 = tag（变体号 i64），槽 1..K = payload（K = en_nslot[ei]，
+    // 所有变体 payload 字段数最大值）。**循环独立于 st_vals**——en_vals 是
+    // 按 enum 名升序排列的索引表（与 en_keys 并行），不可复用上面 st_vals 循环。
+    var ne = len(en_vals)
+    var ei2: i64 = 0
+    while ei2 < ne {
+        var eidx = en_vals[ei2]
+        var eout: string = "%enum." + sstate.enum_name_of(eidx) + " = type { i64"
+        var k2: i64 = 0
+        while k2 < en_nslot[eidx] {
+            eout = eout + ", i64"
+            k2 = k2 + 1
+        }
+        eout = eout + " }"
+        line(eout)
+        ei2 = ei2 + 1
+    }
+    // fn 函数值类型输出（S2.2）：`%fn.<签名索引> = type { ptr, ptr }`——
+    // 闭包值 = { env 指针, entry 函数指针 }（见 closure-model.md C2）。
+    // fn_ret 是 types 命名空间外的全局签名表（fn 类型低负载 = 签名表行号）。
+    var nfn = len(fn_ret)
+    var fi: i64 = 0
+    while fi < nfn {
+        line("%fn." + to_string(fi) + " = type { ptr, ptr }")
+        fi = fi + 1
+    }
+    if len(st_vals) > 0 || len(en_vals) > 0 || len(fn_ret) > 0 {
+        line("")
+    }
+}
+
+// 输出全局变量段（模块头 declare 之后、函数 define 之前）：
+//   @g = global ptr null            （表全局，main 入口运行时创建）
+//   @g = global T <零值>             （标量；i64→0 / bool→false / string→null / f64→0.0）
+// 有符号整数类型（负字面量常量允许输出为 LLVM 有符号字面量）。
+func is_signed_int(t: i64) -> bool {
+    return t == 0 || t == 1 || t == 2 || t == 3 || t == 21
+}
+
+// 2026-10-07：全局段**按下标排序**输出（名字升序）。
+// 为何必须：全局声明的顺序原为「登记序」，而登记发生在 IR 构建期 ——
+// 缓存命中时被导入模块的 IR 装载序不同 ⇒ 同一输入两路径得到不同的全局顺序
+//（实测差异 2 行：`@tl_loopf_*` 哨兵全局互换位置），使 .ll 字节级不可复现。
+// 全局**声明**的先后在 LLVM 无语义（引用一律按名字），排序安全。
+// 生成期编号不受影响（只在输出序上生效）。
+func glob_order() -> table<i64> {
+    var n = len(g_global_names)
+    var txts = table_new_string()
+    var t: i64 = 0
+    while t < n {
+        table_push(txts, intern.lookup(g_global_names[t]))
+        t = t + 1
+    }
+    var ord = table_new_i64()
+    t = 0
+    while t < n {
+        table_push(ord, t)
+        t = t + 1
+    }
+    var k: i64 = 1
+    while k < n {
+        var cur = ord[k]
+        var cs = txts[cur]
+        var j = k - 1
+        var stop: bool = false
+        while j >= 0 && !stop {
+            if txts[ord[j]] > cs {
+                ord[j + 1] = ord[j]
+                j = j - 1
+            } else {
+                stop = true
+            }
+        }
+        ord[j + 1] = cur
+        k = k + 1
+    }
+    return ord
+}
+
+func emit_globals() {
+    var ord = glob_order()
+    var oi: i64 = 0
+    while oi < len(ord) {
+        var i = ord[oi]
+        var nm = intern.lookup(g_global_names[i])
+        // p.9.12.4：命名空间内 const 以全名 "ns::NAME" 登记 → LLVM 符号经
+        // ns_replace 转 $（@ns$NAME），对齐命名空间函数符号规则
+        var lv_nm = ns_replace(nm)
+        if g_global_is_table[i] == 1 {
+            line("@" + lv_nm + " = global ptr null")
+        } else {
+            var ty = llvm_ty(g_global_tys[i])
+            var init = "0"
+            // p.9.17.2：聚合类型全局（enum/struct，LLVM 类型名以 % 开头）零初始化
+            // 必须发 zeroinitializer——整型字面量 0 对聚合类型非法（LLVM 拒绝：
+            // "integer constant must have integer type"，实测 @g = global %enum.Value 0）。
+            // 零位模式 = Nil/默认变体（tag 0），与运行期 main 入口的初值求值衔接一致。
+            if sstate.has_prefix_str(ty, "%") {
+                init = "zeroinitializer"
+            }
+            // 整数/字符折叠初值（const/var 均采纳；r.1.1.2 起以 inits_ok 区分
+            // "折叠出 -1"与"无折叠值"——旧实现把无初值的 signed 全局输出成 -1）。
+            // 旧实现仅 ty=="i64" 应用 → i8/i16/i32/u* 等 const 全局恒为 0
+            //（GetSystemMetrics(1 的 const i32) 传成 0 一类值破坏 bug）。
+            // 负值守卫（2026-09-04）：原 `>= 0` 使顶层负字面量初值回退 "0"
+            //（折叠为 0）；现对**有符号**整型直接输出负字面量，无符号保持零值。
+            if i < len(g_global_inits) && g_global_inits_ok[i] == 1 &&
+                (types.is_int(g_global_tys[i]) || g_global_tys[i] == TK_CHAR) {
+                var iv = g_global_inits[i]
+                if iv >= 0 || is_signed_int(g_global_tys[i]) {
+                    init = to_string(iv)
+                }
+            }
+            if ty == "ptr" {
+                // 函数地址初值（(b) 方案静态空闭包 env）：直接写 `@fn`——LLVM 允许
+                // 以函数名作指针常量，故无运行期初始化。
+                if i < len(g_global_fns) && g_global_fns[i] >= 0 {
+                    line("@" + lv_nm + " = global ptr @" + ns_replace(intern.lookup(g_global_fns[i])))
+                    oi = oi + 1
+                    continue
+                }
+                // string 全局默认空串常量（null 会被 strcmp 段错误）；
+                // const 字符串全局有初始字面量 → 指向该字面量常量
+                if g_global_tys[i] == TK_STR {
+                    var eslot = 0
+                    if i < len(g_global_strs) && g_global_strs[i] >= 0 {
+                        eslot = str_slot(g_global_strs[i])
+                    } else {
+                        var empty_id = interner.intern("")
+                        eslot = str_slot(empty_id)
+                    }
+                    line("@" + lv_nm + " = global ptr " + str_data_ref(eslot))
+                    oi = oi + 1
+                    continue
+                }
+                init = "null"
+            } else if ty == "i1" {
+                // r.1.1.2：bool 折叠初值（true → 1 → "true"；false/无折叠 → "false"）
+                if i < len(g_global_inits) && g_global_inits[i] == 1 {
+                    init = "true"
+                } else {
+                    init = "false"
+                }
+            } else if ty == "double" || ty == "float" {
+                // r.1.1.2：浮点折叠初值（字面量原文；无折叠 → 0.0）
+                init = "0.0"
+                if i < len(g_global_fps) && g_global_fps[i] >= 0 {
+                    init = intern.lookup(g_global_fps[i])
+                }
+            }
+            line("@" + lv_nm + " = global " + ty + " " + init)
+        }
+        oi = oi + 1
+    }
+    if len(g_global_names) > 0 {
+        line("")
+    }
+}
+
+// 输出 SSO 短串池全局段（emit_globals 之后）：仅 g_sso_enabled 时输出。
+//   @s21_sso_pool      = 256KB 静态线性池（.bss，零运行时初始化）
+//   @s21_sso_off       = 当前 bump 偏移（p.6.7.1 起 atomicrmw 单调推进）
+//   @s21_sso_malloc_cnt = 池满回退 malloc 的累计次数（验收探针断言 = 0）
+// 并定义短串池分配 helper @tie_sso_alloc(i64 %n) -> ptr：
+//   参数 n = 数据长度（UTF-8 字节）；返回块基址（头位置，调用方写头后取数据）。
+//   块 = n + 41（8 头 + 数据 + \0 + 32 尾部填充，漏洞 B 安全余量不变）。
+//   p.6.7.1 并发安全：bump 改 atomicrmw（off = fetch_add(need)）——各线程拿到
+//   唯一不重叠块偏移（旧值）；本块落池判定用块尾 noff = off+need ≤ CAP。
+//   短串（n ≤ 31 且块尾 ≤ 池容量）→ 池 bump（零 malloc）；否则回退 malloc 计数。
+//   供 llvmgen op56（str_cat）与 gen_ext_str_scan（FFI 收方向）内联调用——
+//   与 irgen s21_sso_alloc 逻辑同构（共用 @s21_sso_off / @s21_sso_malloc_cnt）。
+func emit_sso_globals() {
+    // SSO 短串池段（仅 g_sso_enabled）
+    if g_sso_enabled == 1 {
+        line("@s21_sso_pool = private global [262144 x i8] zeroinitializer, align 8")
+        line("@s21_sso_off = private global i64 0, align 8")
+        line("@s21_sso_malloc_cnt = private global i64 0, align 8")
+        line("define private ptr @tie_sso_alloc(i64 %n) {")
+        line("  %short = icmp sle i64 %n, 31")
+        line("  %need = add i64 %n, 41")
+        line("  %off = atomicrmw add ptr @s21_sso_off, i64 %need seq_cst")
+        line("  %noff = add i64 %off, %need")
+        line("  %space = icmp sle i64 %noff, 262144")
+        line("  %ok = and i1 %short, %space")
+        line("  br i1 %ok, label %sso.pool, label %sso.heap")
+        line("sso.pool:")
+        line("  %pb = ptrtoint ptr @s21_sso_pool to i64")
+        line("  %p = add i64 %pb, %off")
+        line("  %pp = inttoptr i64 %p to ptr")
+        line("  ret ptr %pp")
+        line("sso.heap:")
+        line("  %cnt = atomicrmw add ptr @s21_sso_malloc_cnt, i64 1 seq_cst")
+        line("  %m = call ptr @malloc(i64 %need)")
+        line("  ret ptr %m")
+        line("}")
+        // p.6.7.5 生命周期确定性：链式临时串释放 helper——str_cat 拼接链
+        // （a+b+c 等纯表达式临时，op56 操作数直引前一 str_cat 结果且全函数
+        // 仅此一处使用）在结果就绪后调用本函数：数据长 > 31（池外，malloc
+        // 回退）→ free(块基址 = 数据指针 - 8)；否则池内短串只读不释放。
+        line("define private void @tie_str_free_if_heap(i64 %dp, i64 %len) {")
+        line("  %heap = icmp sgt i64 %len, 31")
+        line("  br i1 %heap, label %sf.h, label %sf.d")
+        line("sf.h:")
+        line("  %p = inttoptr i64 %dp to ptr")
+        line("  %b = getelementptr i8, ptr %p, i64 -8")
+        // p.9.17.1：str_char 缓存失效钩子——malloc 复用同址同长块会让
+        // (ptr,len) 键命中陈旧偏移表，free 前清缓存槽根治（仅 sc 启用时）。
+        if g_sc_enabled == 1 {
+            line("  call void @tie_sc_inval(ptr %p)")
+        }
+        line("  call void @free(ptr %b)")
+        line("  ret void")
+        line("sf.d:")
+        line("  ret void")
+        line("}")
+        line("")
+    }
+    // 可捕获 panic 全局（仅 g_catch_enabled）：jmp_buf（256B，对齐 clang
+    // [16 x _SETJMP_FLOAT128]）/ 捕获激活标记（i1）。捕获的 panic 消息由
+    // 受捕路径直接 printf 打印（宿主以 catch_panic 返回值判定捕获与否）。
+    if g_catch_enabled == 1 {
+        line("@tie_panic_jb = private global [256 x i8] zeroinitializer, align 16")
+        line("@tie_panic_active = private global i1 false")
+        line("")
+    }
+    // p.6.4.5：Winsock2 一次性初始化标志（WSAStartup 幂等守卫）——net_* 内联
+    // IR 经 @g_wsock_init 全局引用；仅内联过 net_*（tig_wsa_init 置位）的程序输出，
+    // 纯程序不引入（保持自举 fixpoint）。
+    if g_wsock_enabled == 1 {
+        line("@g_wsock_init = private global i64 0")
+        line("")
+    }
+}
+
+// 输出 vtable 全局常量段（emit_globals 之后）：方法函数指针按 port 方法序。
+// LLVM：`@vt.Drawable.Button = global { ptr, ptr } { ptr @Button$draw, ... }`
+//（函数前向引用合法；方法函数同模块 define，无需 declare）
+func emit_vtables() {
+    var i: i64 = 0
+    while i < len(g_vt_names) {
+        var nm = interner.lookup(g_vt_names[i])
+        var ty = interner.lookup(g_vt_tys[i])
+        var out = "@" + nm + " = global " + ty + " {"
+        var off = g_vt_off[i]
+        var n = g_vt_n[i]
+        var j: i64 = 0
+        while j < n {
+            if j > 0 {
+                out = out + ","
+            }
+            var sym = interner.lookup(g_vt_syms[off + j])
+            out = out + " ptr @" + ns_replace(sym)
+            j = j + 1
+        }
+        out = out + " }"
+        line(out)
+        i = i + 1
+    }
+    if len(g_vt_names) > 0 {
+        line("")
+    }
+}
+
+// 查找子串位置（-1 = 无）
+func find_sub(s: string, sub: string) -> i64 {
+    var n = str_len(s)
+    var m = str_len(sub)
+    if m == 0 || n < m {
+        return -1
+    }
+    var i: i64 = 0
+    while i + m <= n {
+        var j: i64 = 0
+        var ok = true
+        while j < m {
+            if str_char(s, i + j) != str_char(sub, j) {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if ok {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 命名空间全名 → LLVM 符号：全部 `::` 转 `$`（sstate::child → sstate$child）
+func ns_replace(s: string) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    var n = str_len(s)
+    while i < n {
+        if i + 1 < n && str_char(s, i) == ":" && str_char(s, i + 1) == ":" {
+            out = out + "$"
+            i = i + 2
+        } else {
+            out = out + str_char(s, i)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+func line(s: string) {
+    // 函数级缓冲（gen_func 期间）：alloca 提升 + 重编号在函数级完成后再并入
+    if g_fn_mode == 1 {
+        table_push(g_fn_lines, s)
+        return
+    }
+    table_push(out_lines, s)
+}
+
+// 行首去空白（重编号判定用；llvmgen 不 import std/string 避免菱形 import，
+// 这里只剥空格/制表符）。
+// 性能重构（emit ren 7.4s 热点）：旧版第 2 循环 `sub = sub + str_char(s, i)`
+// 逐码点拼接 O(n²)（每次 str_cat 分配新串），且重编号路径每行调用 2 次
+// （renumber_lines no_num 判定 + renumber_line lead_def 判定）。IR 行纯 ASCII
+// → 字节索引 == 码点索引，改字节探测（O(1) str_byte）+ str_sub_bytes 单次
+// memcpy（O(n)），消除 O(n²)。
+func str_trim_left(s: string) -> string {
+    var n = len(s)
+    var i: i64 = 0
+    while i < n {
+        var b = str_byte(s, i)
+        if b == 32 || b == 9 {   // 空格 / 制表符
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if i >= n {
+        return ""
+    }
+    return str_sub_bytes(s, i, n)
+}
+
+// 前缀判定：s 是否以 pre 开头（str_char 逐字符比较，不依赖 std/string）
+func str_prefix(s: string, pre: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(pre)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 行级重编号：把函数体的 %N 值编号重映射为 1..N 连续（对齐 Rust renumber_ir）。
+// 背景：alloca 提升到 entry 后，其值 id 可能大于后续块指令的值 id（alloca 在
+// 循环体中创建，值 id 分配晚于 entry 早期指令），LLVM 解析要求块内指令编号
+// 严格递增——倒挂行报 "instruction expected to be numbered '%N' or greater"。
+// 按行扫描：无编号行（标签/注释/空行/define 等）原样保留；有编号行
+// `%N = ...` 首现分配新号，行内其余 %N 引用复用映射。str_cat 的 %scN / printf
+// 的 %extN 为独立命名空间（非纯数字），不受影响。
+func renumber_lines() {
+    var out = table_new_string()
+    // 每函数独立重编号：印章序号 +1（映射表跨函数持久，见 g_ren_stamp 注释），
+    // 新编号从形参占位基数 g_ren_base 起
+    //（普通函数 = g_pcnt：形参值 id 占 0..N-1，定义行保留原样 %0..%N-1，
+    // 指令新编号从 %N 起避免撞号；r.1.6.3 Linux main 带 i32 %0, ptr %1 两个
+    // 附加形参，g_ren_base 由 gen_func 置 2，防止指令重编号为 %0 撞形参）。
+    g_ren_fn = g_ren_fn + 1
+    g_ren_next = g_ren_base
+    var n = len(g_fn_lines)
+    var i: i64 = 0
+    while i < n {
+        var ln = g_fn_lines[i]
+        var t = str_trim_left(ln)
+        // 元行（无 %N 操作数，整行跳过）：define 首行、块标签 bbN:、注释、空行。
+        // br/store/ret/call void 等指令行仍有 %N 操作数 → 走 renumber_line
+        // （引用复用映射；行首无 %N 定义则不产生新编号——对齐 Rust 实现）。
+        // 性能：no_num 判定一次逐字节扫描（str_byte 轻量）替代 str_char + 4 次
+        // str_prefix（每行 53 万行累积）；前缀互斥（; ( ) / d / b / u）一次判完。
+        var no_num: bool = false
+        var tn = str_len(t)
+        if tn == 0 {
+            no_num = true
+        } else {
+            var c0 = str_byte(t, 0)
+            if c0 == 59 || c0 == 40 || c0 == 41 {  // ';' '(' ')'
+                no_num = true
+            } else if c0 == 100 {  // 'd' → "define"
+                no_num = tn >= 6 && str_byte(t, 1) == 101 && str_byte(t, 2) == 102 &&
+                    str_byte(t, 3) == 105 && str_byte(t, 4) == 110 && str_byte(t, 5) == 101
+            } else if c0 == 98 {  // 'b' → "bb"（块标签）
+                no_num = tn >= 2 && str_byte(t, 1) == 98
+            } else if c0 == 117 {  // 'u' → "unreacha"（unreachable 指令）
+                no_num = tn >= 8 && str_byte(t, 1) == 110 && str_byte(t, 2) == 114 &&
+                    str_byte(t, 3) == 101 && str_byte(t, 4) == 97 && str_byte(t, 5) == 99 &&
+                    str_byte(t, 6) == 104 && str_byte(t, 7) == 97
+            }
+        }
+        // 有编号行：`%N = ...` —— 首 %N 是定义（分配新号），其余 %N 引用复用。
+        // 但需注意：定义行开头 `%N =` 的 %N 也要重映射（它不是立即数/非数字）。
+        if no_num {
+            table_push(out, ln)
+        } else {
+            // 传已 trim 行 t：renumber_line 内部不再二次 str_trim_left（消除
+            // 每行双 trim 的重复扫描）。
+            var rebuilt = renumber_line(ln, t)
+            table_push(out, rebuilt)
+        }
+        i = i + 1
+    }
+    g_fn_lines = out
+}
+
+// 本地 i64 → StringBuilder（性能重构）：按位数分支直接输出 ASCII 字节。
+// 替代 to_string——to_string 是 irgen 内联的整段除法循环 IR（每次 ~40 条
+// 指令 + 运行时分配），renumber_line 每 %N 一次，53 万行 × 每行 1-2 个 %N
+// = 上百万次 IR 爆炸（emit 阶段 ren 7.3s 的根源）。值编号恒 ≥0 小整数。
+func sb_append_i64(sb: i64, v: i64) {
+    if v < 10 {
+        sb_append_byte(sb, 48 + v)
+    } else if v < 100 {
+        sb_append_byte(sb, 48 + v / 10)
+        sb_append_byte(sb, 48 + v % 10)
+    } else if v < 1000 {
+        sb_append_byte(sb, 48 + v / 100)
+        sb_append_byte(sb, 48 + (v / 10) % 10)
+        sb_append_byte(sb, 48 + v % 10)
+    } else if v < 10000 {
+        sb_append_byte(sb, 48 + v / 1000)
+        sb_append_byte(sb, 48 + (v / 100) % 10)
+        sb_append_byte(sb, 48 + (v / 10) % 10)
+        sb_append_byte(sb, 48 + v % 10)
+    } else {
+        // 通用回退（值 ≥10000，极少触发）：逆序收集再正序输出
+        var digits = table_new_i64()
+        var x = v
+        while x > 0 {
+            table_push(digits, 48 + x % 10)
+            x = x / 10
+        }
+        var k = len(digits) - 1
+        while k >= 0 {
+            sb_append_byte(sb, digits[k])
+            k = k - 1
+        }
+    }
+}
+
+// 单行重编号：行内每个 `%N`（N 为纯数字）重映射；`%scN`/`%extN` 非纯数字不动。
+// 定义/引用区分（关键）：行首 `%N = ...` 的 %N 是**指令定义**（总是分配新号，
+// 即使 N < g_pcnt——函数体值 id 每函数从 0 起，alloca %0 可能与形参位置 %0
+// 撞号）；行内其余 %N 引用按 ren_ref：N < g_pcnt 是形参位置引用（原样保留，
+// define 形参列表 %0..%N-1 不变），否则复用指令映射。
+// 参数 t：已 str_trim_left 的行（renumber_lines 已 trim，传参避免二次扫描）。
+func renumber_line(ln: string, t: string) -> string {
+    // 性能重构（段拷贝）：探测仍逐字节 str_byte（O(1) 轻量），但非 % 的普通
+    // 字节连续段用 str_sub_bytes 一次整拷入 sb（O(段长) 单次 memcpy）。sb 调用
+    // 次数 = 行内 %N 数 + 1，而非字节数——消除逐字节 sb_append_byte 的增长检查
+    // 与写回开销（emit ren 7.5s 主因）。值编号用小整数分支转写（免 to_string
+    // 内联 IR 爆炸）。定义/引用区分优先按「行首 %N =」模式判定。
+    var n = len(ln)
+    var tn = len(t)
+    // 检测行首定义：trim 后以 % 开头且首 %N 后跟 " ="
+    var lead_def: bool = false
+    var lead_end: i64 = -1  // 定义 %N 在原始 ln 中的结束下标（字节）
+    if tn > 0 && str_byte(t, 0) == 37 {
+        var dj: i64 = 1
+        var dcnt: i64 = 0
+        while dj < tn {
+            var dc = str_byte(t, dj)
+            if dc >= 48 && dc <= 57 {
+                dcnt = dcnt + 1
+                dj = dj + 1
+            } else {
+                break
+            }
+        }
+        if dcnt > 0 && dj < tn && str_byte(t, dj) == 32 {
+            var ek = dj + 1
+            while ek < tn && str_byte(t, ek) == 32 {
+                ek = ek + 1
+            }
+            if ek < tn && str_byte(t, ek) == 61 {
+                lead_def = true
+                lead_end = (len(ln) - tn) + dj
+            }
+        }
+    }
+    var sb = string_builder()
+    var i: i64 = 0
+    var seg: i64 = 0  // 当前未拷贝字节段起点
+    while i < n {
+        var b = str_byte(ln, i)
+        if b == 37 && i + 1 < n {
+            // 具名族 `%smN` / `%spN`（2026-10-07）：后缀是**构造期 id**（指令 id /
+            // 值 id），随编译路径变（缓存命中与否）⇒ 必须与 %N 一样按函数重编号，
+            // 否则 .ll 字节级不可复现（实测 952 行差异全在此）。prefix 原样保留，
+            // 只把后缀数字换成函数内的新号。
+            if str_byte(ln, i + 1) == 115 && i + 3 < n {   // 's'
+                var pb2 = str_byte(ln, i + 2)
+                if pb2 == 109 || pb2 == 112 {              // 'm' / 'p'
+                    var q3 = i + 3
+                    var v3: i64 = 0
+                    var n3: i64 = 0
+                    while q3 < n {
+                        var d3 = str_byte(ln, q3)
+                        if d3 >= 48 && d3 <= 57 {
+                            v3 = v3 * 10 + (d3 - 48)
+                            n3 = n3 + 1
+                            q3 = q3 + 1
+                        } else {
+                            break
+                        }
+                    }
+                    // 后缀数字之后不得紧跟标识符字节（防 `%sm5x` 之类误改）
+                    var okb: bool = q3 >= n
+                    if !okb {
+                        var cb3 = str_byte(ln, q3)
+                        if !((cb3 >= 48 && cb3 <= 57) || (cb3 >= 65 && cb3 <= 90) ||
+                             (cb3 >= 97 && cb3 <= 122) || cb3 == 95 || cb3 == 36) {
+                            okb = true
+                        }
+                    }
+                    if n3 > 0 && okb {
+                        if i > seg {
+                            sb_append(sb, str_sub_bytes(ln, seg, i))
+                        }
+                        sb_append_byte(sb, 37)
+                        sb_append_byte(sb, 115)
+                        sb_append_byte(sb, pb2)
+                        sb_append_i64(sb, ren_named(v3))
+                        i = q3
+                        seg = q3
+                        continue
+                    }
+                }
+            }
+            // 尝试读纯数字后缀（值累算）
+            var j = i + 1
+            var val: i64 = 0
+            var nd: i64 = 0
+            while j < n {
+                var d = str_byte(ln, j)
+                if d >= 48 && d <= 57 {
+                    val = val * 10 + (d - 48)
+                    nd = nd + 1
+                    j = j + 1
+                } else {
+                    break
+                }
+            }
+            if nd > 0 {
+                // 先整拷 [seg, i) 前缀普通字节段
+                if i > seg {
+                    sb_append(sb, str_sub_bytes(ln, seg, i))
+                }
+                var new_v: i64 = -1
+                // 定义位置：%N 后紧跟空格+等号才可能是定义；lead_end == j 时
+                // 恰是行首定义 %N（首字符 %，无前导空白）
+                if lead_def && i == 0 && j == lead_end {
+                    new_v = ren_def(val)
+                } else {
+                    new_v = ren_ref(val)
+                }
+                sb_append_byte(sb, 37)   // '%'
+                sb_append_i64(sb, new_v)
+                i = j
+                seg = j
+                continue
+            }
+        }
+        i = i + 1
+    }
+    // 尾段 [seg, n)
+    if n > seg {
+        sb_append(sb, str_sub_bytes(ln, seg, n))
+    }
+    return sb_build(sb)
+}
+
+// 指令定义重映射：总是分配新号（查表复用）。
+// 性能重写（p.9.14.3）：印章表方案（见 g_ren_stamp 注释）——旧值 id 全编译
+// 单调递增，旧方案每函数把映射表增长到全局基址（Σ base_k = 平方）；
+// 现跨函数持久 + 每函数印章比对，增长全程仅 O(总指令)。
+func ren_def(old: i64) -> i64 {
+    while len(g_ren_stamp) <= old {
+        table_push(g_ren_stamp, -1)
+        table_push(g_ren_val, -1)
+    }
+    if g_ren_stamp[old] == g_ren_fn {
+        return g_ren_val[old]
+    }
+    var v = g_ren_next
+    g_ren_stamp[old] = g_ren_fn
+    g_ren_val[old] = v
+    g_ren_next = g_ren_next + 1
+    return v
+}
+
+// 具名族（`%smN` / `%spN`）重映射：与 ren_def 同构，但用独立的印章表 ——
+// 这两族的后缀是**构造期 id**（不同 id 空间），不能与数值 id 共用映射。
+// 每次调用复用 `g_ren_next`：同一函数内两族共享计数器 ⇒ 各族内编号必唯一
+//（族前缀本身就区分两族），且编号只由**函数自身的行序**决定 ⇒ 与缓存路径无关。
+func ren_named(old: i64) -> i64 {
+    while len(g_renn_stamp) <= old {
+        table_push(g_renn_stamp, -1)
+        table_push(g_renn_val, -1)
+    }
+    if g_renn_stamp[old] == g_ren_fn {
+        return g_renn_val[old]
+    }
+    var v = g_ren_next
+    g_renn_stamp[old] = g_ren_fn
+    g_renn_val[old] = v
+    g_ren_next = g_ren_next + 1
+    return v
+}
+
+// 引用重映射：形参位置（old < g_pcnt）原样保留；否则复用/分配指令映射。
+func ren_ref(old: i64) -> i64 {
+    if old < g_pcnt {
+        return old
+    }
+    return ren_def(old)
+}
+
+// 行表 → 完整 .ll 文本：分治两两合并。
+// 每层合并拷贝总量 ≈ 最终大小，共 log₂N 层（总拷贝 O(total·log N)），
+// 且每行只参与 log N 次拼接——相比逐行追加的 O(N²) 全量拷贝是数量级差异。
+// 行语义与旧 line() 一致：每行自带尾随 "\n"（N 行 = N 个换行）。
+func join_lines() -> string {
+    var cur = out_lines
+    var n = len(cur)
+    if n == 0 {
+        return ""
+    }
+    while n > 1 {
+        var nxt = table_new_string()
+        var i: i64 = 0
+        while i + 1 < n {
+            table_push(nxt, cur[i] + "\n" + cur[i + 1])
+            i = i + 2
+        }
+        if i < n {
+            table_push(nxt, cur[i])
+        }
+        cur = nxt
+        n = len(cur)
+    }
+    return cur[0] + "\n"
+}
+
+func build_inst_blk() {
+    // p.9.21.11 §5.1：归属逻辑统一到 ir.blk_attr_fill（区间回填、表序后者
+    // 覆盖——与原内联回填逐位一致；空 sel 表 = 全部块参与）。
+    g_inst_blk = ir.blk_attr_fill(ir.inst_count(), table_new_i64())
+    build_fn_inst_ranges()
+    g_inst_blk_ready = 1
+}
+
+// 构建每函数指令区间（O(B) 一次）：遍历块表取每函数 min start / max end。
+// 用 min/max 而非「首块 start / 末块 end」，稳健不假设块创建序与函数序一致；
+// 区间 [lo, hi) 覆盖函数全部指令（含 alloca 与内联展开指令——它们都按
+// new_inst 顺序落在本函数段内）。
+func build_fn_inst_ranges() {
+    var nf = ir.func_count()
+    var big = ir.inst_count()
+    g_fn_inst_lo = table_new_i64()
+    g_fn_inst_hi = table_new_i64()
+    var i: i64 = 0
+    while i < nf {
+        table_push(g_fn_inst_lo, big)
+        table_push(g_fn_inst_hi, 0)
+        i = i + 1
+    }
+    var nb = ir.block_count()
+    var bi: i64 = 0
+    while bi < nb {
+        var fid = ir.block_func(bi)
+        var st = ir.block_start(bi)
+        var en = ir.block_end(bi)
+        if st < g_fn_inst_lo[fid] {
+            g_fn_inst_lo[fid] = st
+        }
+        if en > g_fn_inst_hi[fid] {
+            g_fn_inst_hi[fid] = en
+        }
+        bi = bi + 1
+    }
+}
+
+}

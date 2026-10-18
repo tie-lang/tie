@@ -1,0 +1,746 @@
+type tie<class>
+// compiler/frontend/putil_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 putil.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace putil {
+// ---------- 错误槽位 ----------
+// 记录语法错误（line/col 1 起；msg 为 errors 表消息或格式函数结果）
+pub func set_err(line: i64, col: i64, msg: string) {
+    p_err_line = line
+    p_err_col = col
+    p_err_msg = msg
+}
+
+// 组装错误协议文本：ERR:<line> <col> <message>（errors 模块统一拼装）
+pub func err_protocol() -> string {
+    return errors.err_lex_err(p_err_line, p_err_col, p_err_msg)
+}
+
+// ---------- p.8.2.9 控制流条件上下文守卫 ----------
+// `while i < n { }` / `if f { }` 等控制流块开括号 `{` 与尾随闭包（通常裸函数
+// 名/裸变量后跟 `{`）在语法上完全同形。控制流条件 parse 期间置本守卫，让
+// pexpr 的尾随闭包判定（maybe_trailing_closure）知晓当前在条件表达式内，
+// 从而不把随后的 `{` 误吞为闭包块。条件表达式可嵌套（&&/|| 内的子调用等），
+// 用计数器进出配对。计数器 g_ctl_cond 声明于 pst.tie（模块全局）。
+pub func enter_cond() {
+    g_ctl_cond = g_ctl_cond + 1
+}
+
+pub func exit_cond() {
+    g_ctl_cond = g_ctl_cond - 1
+}
+
+pub func in_cond() -> bool {
+    return g_ctl_cond > 0
+}
+
+// ---------- token 流加载（新增：正式版直接消费 lexer 列式表）----------
+// 从 lexer 列式 token 表一次性加载到 pst 队列（替代 proto 的协议文本 re-parse）。
+// run_lex 成功后调用；随后 putil 的 peek/advance 全走 pst 队列。
+pub func fill_pending() {
+    g_pending = table_new_i64()
+    g_pending_lines = table_new_i64()
+    g_pending_cols = table_new_i64()
+    g_pending_lexemes = table_new_i64()
+    g_pos = 0
+    g_pending_idx = 0
+    g_last_tag = -1
+    g_last_line = -1
+    g_ctl_cond = 0   // p.8.2.9 控制流条件守卫计数清零
+    // S2.2：清空延迟闭包登记（闭包函数体快照，见 defer_closure_*）
+    g_defer_nodes = table_new_i64()
+    g_defer_done = 0   // 已回填游标清零（嵌套闭包防重复回填）
+    g_defer_pos = table_new_i64()
+    g_defer_idx = table_new_i64()
+    g_defer_pending = table_new_i64()
+    g_defer_pending_lines = table_new_i64()
+    g_defer_pending_cols = table_new_i64()
+    g_defer_pending_lexemes = table_new_i64()
+    g_defer_err_line = table_new_i64()
+    g_defer_err_col = table_new_i64()
+    g_defer_err_msg = table_new_i64()
+    // S3.3：清空延迟准引用块登记（块体快照，见 defer_code_*）
+    g_defer_code_nodes = table_new_i64()
+    g_defer_code_done = 0   // 已回填游标清零（嵌套准引用防重复回填）
+    g_defer_code_pos = table_new_i64()
+    g_defer_code_idx = table_new_i64()
+    g_defer_code_pending = table_new_i64()
+    g_defer_code_pending_lines = table_new_i64()
+    g_defer_code_pending_cols = table_new_i64()
+    g_defer_code_pending_lexemes = table_new_i64()
+    g_defer_code_err_line = table_new_i64()
+    g_defer_code_err_col = table_new_i64()
+    g_defer_code_err_msg = table_new_i64()
+    var n = lexer.token_count()
+    var i: i64 = 0
+    while i < n {
+        table_push(g_pending, lexer.token_tag(i))
+        table_push(g_pending_lines, lexer.token_line(i))
+        table_push(g_pending_cols, lexer.token_col(i))
+        table_push(g_pending_lexemes, lexer.token_lexeme_id(i))
+        i = i + 1
+    }
+    g_pend_n = n
+    g_j_n = 0
+}
+
+// 待消费虚拟 token 个数
+pub func pending_n() -> i64 {
+    return g_pend_n - g_pending_idx
+}
+
+// 当前有效 token tag（先消费 pending 队列，再消费真实 token 流）
+pub func peek_tag() -> i64 {
+    if g_pending_idx < g_pend_n {
+        return g_pending[g_pending_idx]
+    }
+    return lexer.token_tag(g_pos)
+}
+
+// 当前有效 token 行号
+pub func peek_line() -> i64 {
+    if g_pending_idx < g_pend_n {
+        return g_pending_lines[g_pending_idx]
+    }
+    return lexer.token_line(g_pos)
+}
+
+// 当前有效 token 列号
+pub func peek_col() -> i64 {
+    if g_pending_idx < g_pend_n {
+        return g_pending_cols[g_pending_idx]
+    }
+    return lexer.token_col(g_pos)
+}
+
+// 当前有效 token 的 lexeme 文本（虚拟 token 无 lexeme 返回空串）
+pub func peek_lexeme() -> string {
+    if g_pending_idx < g_pend_n {
+        return interner.lookup(g_pending_lexemes[g_pending_idx])
+    }
+    return lexer.token_lexeme(g_pos)
+}
+
+// 推进游标：优先消费 pending 队列，队列空时消费真实 token 流
+pub func advance() {
+    // 记录最近已消费 token 的 tag/行（expect_stmt_end 用：'}' 后换行补结束）
+    g_last_tag = peek_tag()
+    g_last_line = peek_line()
+    if g_pending_idx < g_pend_n {
+        g_pending_idx = g_pending_idx + 1
+    } else {
+        g_pos = g_pos + 1
+    }
+}
+
+// 消费当前 token 若匹配 tag；返回是否消费
+pub func eat(tag: i64) -> bool {
+    if peek_tag() == tag {
+        advance()
+        return true
+    }
+    return false
+}
+
+// 第 n 个后续 token 的 tag（n=0 当前，1 下一…；合并 pending 与真实流的合成视图）
+pub func peek_n(n: i64) -> i64 {
+    var pn = pending_n()
+    if n < pn {
+        return g_pending[g_pending_idx + n]
+    }
+    var k = g_pos + (n - pn)
+    var total = lexer.token_count()
+    if k >= total {
+        k = total - 1
+    }
+    return lexer.token_tag(k)
+}
+
+// 当前 token 的可读描述（对齐 Rust describe；错误消息用）
+pub func describe(tag: i64) -> string {
+    if tag == lex_ident {
+        return "标识符 '" + peek_lexeme() + "'"
+    }
+    if tag == lex_int {
+        return "整数 " + peek_lexeme()
+    }
+    if tag == lex_float {
+        return "浮点数 " + peek_lexeme()
+    }
+    if tag == lex_str {
+        return "字符串"
+    }
+    if tag == lex_typekw {
+        return "类型 '" + peek_lexeme() + "'"
+    }
+    if tag == lex_semi {
+        return "分号"
+    }
+    if tag == lex_eof {
+        return "文件结束"
+    }
+    return pnames.tok_debug_name(tag)
+}
+
+// 期望当前 token 为指定 tag；失败报「期望 {what}，实际是 {describe}」
+pub func expect(tag: i64, what: string) -> bool {
+    if peek_tag() == tag {
+        advance()
+        return true
+    }
+    set_err(peek_line(), peek_col(), errors.syn_expect(what, describe(peek_tag())))
+    return false
+}
+
+// 期望语句结束符（分号）。ASI 不给块闭合 '}' 后补分号——当语句以闭包字面量
+// '}' 收尾（'}' 后换行无分号）或单行闭包体内语句紧跟 '}'（return … }）时，
+// '}' 即语句结束。规则：分号 / 当前 '}'（块闭合，Bug2）/ 上一 token 为 '}' 且
+// 当前在新行（闭包字面量收尾语句，Bug1）→ 语句结束。
+pub func expect_stmt_end() -> bool {
+    if peek_tag() == lex_semi {
+        advance()
+        return true
+    }
+    // 块闭合 '}' 即语句结束：单行闭包体内 `return … }` / `stmt }` 的 '}' 前无分号
+    if peek_tag() == lex_rbrace {
+        return true
+    }
+    // 新行即语句边界：两处 ASI 不给分号——① 语句以闭包字面量 '}' 收尾后换行；
+    // ② 闭包体 re-parse 时外层多行调用使 paren_depth>0，ASI 抑制了体内行尾分号
+    //（如 spawn(func() { spawn(..) 换行 return 0 }））。tie 的 ASI 除括号内不
+    // 支持跨行续行，表达式解析器已消费完续行，此处新行即真语句结束，接受安全。
+    if peek_line() > g_last_line {
+        return true
+    }
+    // 2026-10-13 修复：文件结束（EOF）即语句结束——顶层 var/const 恰为文件最后
+    // 一行（末尾带换行）时，此前会误报「期望 语句结束符，实际是 文件结束」。
+    if peek_tag() == lex_eof {
+        return true
+    }
+    set_err(peek_line(), peek_col(), errors.syn_expect("语句结束符", describe(peek_tag())))
+    return false
+}
+
+// 期望当前为标识符；成功返回其字符串池 id，失败返回 -1
+pub func expect_ident() -> i64 {
+    if peek_tag() == lex_ident {
+        var id = interner.intern(peek_lexeme())
+        advance()
+        return id
+    }
+    set_err(peek_line(), peek_col(), errors.syn_expect_ident(describe(peek_tag())))
+    return -1
+}
+
+// 类型参数闭括号 '>'（支持 Shr/Ge/ShrEq 复合 token 分裂）
+pub func expect_type_gt(what: string) -> bool {
+    var tag = peek_tag()
+    if tag == lex_gt {
+        advance()
+        return true
+    }
+    if tag == lex_shr {
+        split_current_gt(lex_gt)
+        return true
+    }
+    if tag == lex_ge {
+        split_current_gt(lex_eq)
+        return true
+    }
+    if tag == lex_shreq {
+        split_current_gt(lex_ge)
+        return true
+    }
+    set_err(peek_line(), peek_col(), errors.syn_expect(what, describe(tag)))
+    return false
+}
+
+// ---------- token 位置保存/恢复（泛型调用 try 探测回退，2026-08-14）----------
+// save_pos 快照真实游标 g_pos + pending 队列完整内容 + 语法错误槽；
+// restore_pos 恢复到保存时刻。泛型调用点 `<` 歧义处理（`a < b` vs `max<i64>(...)`）
+// 用「尝试解析 + 失败回退」：探测期间 split_current_gt 可能原位覆盖 pending 元素
+// 或往队尾 push 虚拟 token，restore 必须整体还原。
+// p.9.14.3 性能重写（O(1)）：旧实现每次复制剩余整个 token 流（4 表 × O(文件)），
+// 而探测点 = 每个 '<' / '?' / 泛型调用——O(文件×探测次数) 即 parse build 的平方
+// 主源。现改为「水位线 + 覆盖日志」：save 记 4 个标量 O(1)；restore 逆序回放
+// 本探测的原位覆盖日志 + 水位线截断（表无截断原语，逻辑长度即水位线）。
+pub func save_pos() {
+    g_save_pos = g_pos
+    g_save_idx = g_pending_idx
+    g_save_pend_n = g_pend_n
+    g_save_j = g_j_n
+    g_save_err_line = p_err_line
+    g_save_err_col = p_err_col
+    g_save_err_msg = p_err_msg
+}
+
+// 恢复 token 流与错误槽到最近一次 save_pos 时刻（日志回放 + 水位线截断）。
+pub func restore_pos() {
+    // 逆序回放本次探测期间的原位覆盖（日志中 >= g_save_j 的条目）
+    var j = g_j_n
+    while j > g_save_j {
+        j = j - 1
+        var a = g_j_idx[j]
+        g_pending[a] = g_j_tag[j]
+        g_pending_lines[a] = g_j_line[j]
+        g_pending_cols[a] = g_j_col[j]
+        g_pending_lexemes[a] = g_j_lex[j]
+    }
+    g_j_n = g_save_j
+    g_pend_n = g_save_pend_n
+    g_pos = g_save_pos
+    g_pending_idx = g_save_idx
+    p_err_line = g_save_err_line
+    p_err_col = g_save_err_col
+    p_err_msg = g_save_err_msg
+}
+
+// 登记当前 token 流快照 + 待回填节点（节点一一对应快照）
+pub func defer_closure_push(node: i64) {
+    table_push(g_defer_nodes, node)
+    table_push(g_defer_pos, g_pos)
+    table_push(g_defer_idx, g_pending_idx)
+    var snap: table<i64> = table_new_i64()
+    var snap_lines: table<i64> = table_new_i64()
+    var snap_cols: table<i64> = table_new_i64()
+    var snap_lexemes: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < g_pend_n {
+        table_push(snap, g_pending[i])
+        table_push(snap_lines, g_pending_lines[i])
+        table_push(snap_cols, g_pending_cols[i])
+        table_push(snap_lexemes, g_pending_lexemes[i])
+        i = i + 1
+    }
+    table_push(g_defer_pending, snap)
+    table_push(g_defer_pending_lines, snap_lines)
+    table_push(g_defer_pending_cols, snap_cols)
+    table_push(g_defer_pending_lexemes, snap_lexemes)
+    table_push(g_defer_err_line, p_err_line)
+    table_push(g_defer_err_col, p_err_col)
+    table_push(g_defer_err_msg, p_err_msg)
+}
+
+// 已登记的延迟闭包个数
+pub func defer_closure_count() -> i64 {
+    return len(g_defer_nodes)
+}
+
+// 第 i 个待回填节点 id
+pub func defer_closure_node_at(i: i64) -> i64 {
+    return g_defer_nodes[i]
+}
+
+// 恢复第 i 个闭包登记时的 token 流快照（游标回到函数体起始 '{' 处）
+pub func defer_closure_restore(i: i64) {
+    g_pos = g_defer_pos[i]
+    g_pending_idx = g_defer_idx[i]
+    g_pending = table_new_i64()
+    g_pending_lines = table_new_i64()
+    g_pending_cols = table_new_i64()
+    g_pending_lexemes = table_new_i64()
+    var k: i64 = 0
+    while k < len(g_defer_pending[i]) {
+        table_push(g_pending, g_defer_pending[i][k])
+        table_push(g_pending_lines, g_defer_pending_lines[i][k])
+        table_push(g_pending_cols, g_defer_pending_cols[i][k])
+        table_push(g_pending_lexemes, g_defer_pending_lexemes[i][k])
+        k = k + 1
+    }
+    g_pend_n = len(g_defer_pending[i])
+    g_j_n = 0
+    p_err_line = g_defer_err_line[i]
+    p_err_col = g_defer_err_col[i]
+    p_err_msg = g_defer_err_msg[i]
+}
+
+// 登记当前 token 流快照 + 待回填节点（节点一一对应快照）
+pub func defer_code_push(node: i64) {
+    table_push(g_defer_code_nodes, node)
+    table_push(g_defer_code_pos, g_pos)
+    table_push(g_defer_code_idx, g_pending_idx)
+    var snap: table<i64> = table_new_i64()
+    var snap_lines: table<i64> = table_new_i64()
+    var snap_cols: table<i64> = table_new_i64()
+    var snap_lexemes: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < g_pend_n {
+        table_push(snap, g_pending[i])
+        table_push(snap_lines, g_pending_lines[i])
+        table_push(snap_cols, g_pending_cols[i])
+        table_push(snap_lexemes, g_pending_lexemes[i])
+        i = i + 1
+    }
+    table_push(g_defer_code_pending, snap)
+    table_push(g_defer_code_pending_lines, snap_lines)
+    table_push(g_defer_code_pending_cols, snap_cols)
+    table_push(g_defer_code_pending_lexemes, snap_lexemes)
+    table_push(g_defer_code_err_line, p_err_line)
+    table_push(g_defer_code_err_col, p_err_col)
+    table_push(g_defer_code_err_msg, p_err_msg)
+}
+
+// 已登记的延迟准引用块个数
+pub func defer_code_count() -> i64 {
+    return len(g_defer_code_nodes)
+}
+
+// 第 i 个待回填节点 id
+pub func defer_code_node_at(i: i64) -> i64 {
+    return g_defer_code_nodes[i]
+}
+
+// 恢复第 i 个准引用块登记时的 token 流快照（游标回到块体起始 '{' 处）
+pub func defer_code_restore(i: i64) {
+    g_pos = g_defer_code_pos[i]
+    g_pending_idx = g_defer_code_idx[i]
+    g_pending = table_new_i64()
+    g_pending_lines = table_new_i64()
+    g_pending_cols = table_new_i64()
+    g_pending_lexemes = table_new_i64()
+    var k: i64 = 0
+    while k < len(g_defer_code_pending[i]) {
+        table_push(g_pending, g_defer_code_pending[i][k])
+        table_push(g_pending_lines, g_defer_code_pending_lines[i][k])
+        table_push(g_pending_cols, g_defer_code_pending_cols[i][k])
+        table_push(g_pending_lexemes, g_defer_code_pending_lexemes[i][k])
+        k = k + 1
+    }
+    g_pend_n = len(g_defer_code_pending[i])
+    g_j_n = 0
+    p_err_line = g_defer_code_err_line[i]
+    p_err_col = g_defer_code_err_col[i]
+    p_err_msg = g_defer_code_err_msg[i]
+    // S3.3：进入准引用块体解析上下文（块内 `func name()` 按函数定义解析；
+    // 块体解析完成后由 parse_deferred_code_blocks 复位）
+    g_in_quasi_block = 1
+}
+
+// 准引用上下文中的「名字或插值名」：普通标识符 → 池 id；
+// `$name`（S3.3 标识符插值）→ 返回 "$name" 文本的池 id（构造 code 值时
+// 把 `$` 前缀名替换为变量的字符串值——gensym 结果作函数/变量名）。
+// 只在准引用块（`` `{ ... } `` 延迟解析）与宏体内需要；普通代码里出现
+// `$name` 也解析为插值名，语义层对非宏上下文报错。
+pub func expect_ident_quasi() -> i64 {
+    if peek_tag() == lex_ident {
+        var id = interner.intern(peek_lexeme())
+        advance()
+        return id
+    }
+    if peek_tag() == lex_dollar {
+        if peek_n(1) == lex_ident {
+            var nm = "$" + peek_lexeme_n(1)
+            var id = interner.intern(nm)
+            advance()
+            advance()
+            return id
+        }
+    }
+    set_err(peek_line(), peek_col(), errors.syn_expect_ident(describe(peek_tag())))
+    return -1
+}
+
+// 第 n 个后续 token 的 lexeme（n=0 当前，1 下一…；expect_ident_quasi 用）
+pub func peek_lexeme_n(n: i64) -> string {
+    var pn = pending_n()
+    if n < pn {
+        return interner.lookup(g_pending_lexemes[g_pending_idx + n])
+    }
+    var k = g_pos + (n - pn)
+    var total = lexer.token_count()
+    if k >= total {
+        k = total - 1
+    }
+    return lexer.token_lexeme(k)
+}
+
+// 当前是否为「泛型调用前缀」：`< 完整类型实参列表 > (`。
+// 返回 true 时当前位置（'<'）未消费，由调用方决定正式解析。
+pub func is_generic_call_ahead() -> bool {
+    if peek_tag() != lex_lt {
+        return false
+    }
+    save_pos()
+    advance()   // 消费 '<'
+    var ok = scan_type_arg_list()
+    if ok {
+        ok = peek_tag() == lex_lparen
+    }
+    restore_pos()
+    return ok
+}
+
+// 类型关键字文本 → TyKw 索引（对齐 Rust TyKw 枚举顺序）
+pub func typekw_index(s: string) -> i64 {
+    switch s {
+        case "i8": return 0
+        case "i16": return 1
+        case "i32": return 2
+        case "i64": return 3
+        case "u8": return 4
+        case "u16": return 5
+        case "u32": return 6
+        case "u64": return 7
+        case "f32": return 8
+        case "f64": return 9
+        case "bool": return 10
+        case "trit": return 11
+        case "char": return 12
+        case "string": return 13
+        case "void": return 14
+        case "code": return 15
+        case "num": return 16
+        case "text": return 17
+        case "misc": return 18
+        case "table": return 19
+        case "map": return 20
+        case "i128": return 21
+        case "u128": return 22
+        case "any": return 23
+        default: return -1
+    }
+}
+
+// 整数字面量 lexeme → i64 值（支持十进制/0x/0b/0o/0t 前缀）
+pub func parse_int_lit(lex: string) -> i64 {
+    var n = str_len(lex)
+    var base: i64 = 10
+    var start: i64 = 0
+    if n >= 2 {
+        var c0 = str_char(lex, 0)
+        var c1 = str_char(lex, 1)
+        if c0 == "0" {
+            if c1 == "x" || c1 == "X" {
+                base = 16
+                start = 2
+            } else if c1 == "b" || c1 == "B" {
+                base = 2
+                start = 2
+            } else if c1 == "o" || c1 == "O" {
+                base = 8
+                start = 2
+            } else if c1 == "t" || c1 == "T" {
+                base = 3
+                start = 2
+            }
+        }
+    }
+    var val: i64 = 0
+    var i = start
+    while i < n {
+        var c = str_char(lex, i)
+        // p.9.11.19 数字分隔符 `_` 跳过（lexeme 保留 `_`，解析忽略）
+        if c == "_" {
+            i = i + 1
+            continue
+        }
+        var d = digit_val(c)
+        if d < 0 {
+            break
+        }
+        if d >= base {
+            break
+        }
+        val = val * base + d
+        i = i + 1
+    }
+    return val
+}
+
+// 批次 2：整数字面量溢出检测——parse_int_lit 返回 i64，超范围静默回绕；
+// i128/u128 常量经 `add i128 0, i64值` 构造，回绕值符号扩展会得错误高位。
+// 返回 true = 字面量超出 i64 可表示范围（与 parse_int_lit 同款进制/截断逻辑）。
+pub func int_lit_overflow(lex: string) -> bool {
+    var n = str_len(lex)
+    var base: i64 = 10
+    var start: i64 = 0
+    if n >= 2 {
+        var c0 = str_char(lex, 0)
+        var c1 = str_char(lex, 1)
+        if c0 == "0" {
+            if c1 == "x" || c1 == "X" {
+                base = 16
+                start = 2
+            } else if c1 == "b" || c1 == "B" {
+                base = 2
+                start = 2
+            } else if c1 == "o" || c1 == "O" {
+                base = 8
+                start = 2
+            } else if c1 == "t" || c1 == "T" {
+                base = 3
+                start = 2
+            }
+        }
+    }
+    var val: i64 = 0
+    var i = start
+    while i < n {
+        var c = str_char(lex, i)
+        // p.9.11.19 数字分隔符 `_` 跳过（与 parse_int_lit 同规则）
+        if c == "_" {
+            i = i + 1
+            continue
+        }
+        var d = digit_val(c)
+        if d < 0 {
+            break
+        }
+        if d >= base {
+            break
+        }
+        // 溢出检测：val * base + d > I64_MAX（9223372036854775807）
+        if val > (9223372036854775807 - d) / base {
+            return true
+        }
+        val = val * base + d
+        i = i + 1
+    }
+    return false
+}
+
+// ---------- S1.3 L3 字面量后缀 ----------
+// 字面量尾部类型后缀 → TyKw 索引（i8/i16/i32/i64/i128/u8/u16/u32/u64/u128/
+// f32/f64；无后缀返回 -1）。仅匹配精确后缀串（数字后的字母序列）。
+// 批次 2：i128/u128 为 4 字符后缀（123i128 / 7u128）。
+pub func parse_lit_suffix(lex: string) -> i64 {
+    var n = str_len(lex)
+    if n < 2 {
+        return -1
+    }
+    var last2 = slice_str(lex, n - 2, n)
+    if last2 == "i8" {
+        return 0
+    }
+    if last2 == "u8" {
+        return 4
+    }
+    if n < 3 {
+        return -1
+    }
+    var last3 = slice_str(lex, n - 3, n)
+    if last3 == "i16" {
+        return 1
+    }
+    if last3 == "i32" {
+        return 2
+    }
+    if last3 == "i64" {
+        return 3
+    }
+    if last3 == "u16" {
+        return 5
+    }
+    if last3 == "u32" {
+        return 6
+    }
+    if last3 == "u64" {
+        return 7
+    }
+    if last3 == "f32" {
+        return 8
+    }
+    if last3 == "f64" {
+        return 9
+    }
+    if n < 4 {
+        return -1
+    }
+    var last4 = slice_str(lex, n - 4, n)
+    if last4 == "i128" {
+        return 21
+    }
+    if last4 == "u128" {
+        return 22
+    }
+    return -1
+}
+
+// 剥离字面量尾部类型后缀，返回纯数字文本（无后缀原样返回）。
+// 浮点字面量 lexeme 带 f32/f64 后缀时 llvmgen 无法直接输出，须剥离。
+// 批次 2：i128/u128 为 4 字符后缀（剥离 4 字符）。
+pub func strip_lit_suffix(lex: string) -> string {
+    var n = str_len(lex)
+    var sfx = parse_lit_suffix(lex)
+    if sfx >= 0 {
+        if sfx == 0 || sfx == 4 {
+            return slice_str(lex, 0, n - 2)
+        }
+        if sfx == 21 || sfx == 22 {
+            return slice_str(lex, 0, n - 4)
+        }
+        return slice_str(lex, 0, n - 3)
+    }
+    return lex
+}
+
+// p.9.11.19 去数字分隔符 `_`：浮点字面量文本（LLVM 输出用）剥离 `_`
+//（`1_000.5` → `1000.5`；整数 lexeme 保留 `_`，parse_int_lit 解析忽略）。
+// 仅删除 `_` 字符，其余原样。
+pub func strip_underscores(s: string) -> string {
+    var sb = string_builder()
+    var i: i64 = 0
+    while i < str_len(s) {
+        var c = str_char(s, i)
+        if c != "_" {
+            sb_append_byte(sb, str_byte(s, i))
+        }
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// trit 字面量判定（trit 优化 L1）：-1t/0t/1t，末尾为 t/T 后缀且数字部分为纯十进制。
+// 词法层已将后缀并入 lexeme（lex_int），此处复核并供 pexpr 分支用。
+pub func is_trit_lit(lex: string) -> bool {
+    var n = str_len(lex)
+    if n < 2 {
+        return false
+    }
+    var last = str_char(lex, n - 1)
+    if !(last == "t" || last == "T") {
+        return false
+    }
+    var i: i64 = 0
+    while i < n - 1 {
+        var c = str_char(lex, i)
+        if c < "0" || c > "9" {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 类型节点是否为表类型（table<T> 或裸 table；VarDecl 省略初始化器判定用）
+pub func is_table_type(ty: i64) -> bool {
+    if ty < 0 {
+        return false
+    }
+    var tag = ast.tag(ty)
+    if tag == N_TABLE_TYPE {
+        return true
+    }
+    if tag == N_NAMED_TYPE {
+        if ast.val(ty) == 19 {
+            return true
+        }
+    }
+    return false
+}
+
+// 是否赋值运算符 token（快速路径预探测，不消费）
+pub func is_assign_op_tag(tag: i64) -> bool {
+    if tag == lex_eq {
+        return true
+    }
+    if tag >= lex_pluseq {
+        if tag <= lex_shreq {
+            return true
+        }
+    }
+    return false
+}
+
+}

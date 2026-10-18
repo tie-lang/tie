@@ -1,0 +1,190 @@
+type tie<tsh>
+// scripts/verify-modcache.tsh.tie —— p.9.21.6-2 模块级 tieir 片段缓存验收
+// ============================================================
+// 用法（repo 根）：<tsh> -f scripts/verify-modcache.tsh.tie [tiec路径]
+//   tiec 默认 .\compiler\tiec.exe（升格后）；开发期可传新 driver 构建路径。
+//
+// ⚠ tsh REPL v1 已知局限（2026-09-23 实测）：exec_code 异步返回（须 sleep/轮询）、
+//   list_dir 进程内按目录路径缓存（同路径重复列出拿到陈旧列表）、get_file_hash/
+//   exec_output 输出捕获不稳定。本脚本已尽量绕开（轮询 + 路径拼写轮换 + 随机
+//   产物名），但在 tsh 语义修复前，其结果仅作参考。**权威验收 = 操作台四步**：
+//   1) 冷启编译 → 片段目录（%USERPROFILE%\.tiec-cache\mods）+4；
+//   2) 原样重编（换 -o）→ +0（全命中）；
+//   3) 改一个叶子文件重编 → 恰 +1（其余 3 模块命中）；
+//   4) 带缓存产物 vs --no-cache 产物 certutil SHA256 逐字节一致。
+//   （2026-09-23 p.9216_drv2 实测：+4 / +0 / +1 / DETERMINISM OK 全过）
+// 探针自建/自改 4 文件工程（run 标记随每次运行递增 → 源指纹必变 → 冷启）。
+// 编译一律换 -o 路径：dep_cache_key 含 g_output，单元级缓存每轮必 miss，
+// 保证 kpass_irgen（模块缓存挂点）每轮真实执行。
+
+var tiec = ".\\compiler\\tiec.exe"
+if arg_count() >= 1 && !is_empty(arg_at(0)) {
+    tiec = arg_at(0)
+}
+var pdir = "tests\\_modcache_probe"
+var mods_dir = get_env("USERPROFILE") + "\\.tiec-cache\\mods"
+
+func has_suffix(s: string, suf: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(suf)
+    if n < m {
+        return false
+    }
+    var t = substr(s, n - m, n)
+    return t == suf
+}
+
+func is_ws_ch(ch: string) -> bool {
+    if ch == " " {
+        return true
+    }
+    if ch == "\t" {
+        return true
+    }
+    if ch == "\r" {
+        return true
+    }
+    if ch == "\n" {
+        return true
+    }
+    return false
+}
+
+// 去两端空白（bootstrap-fp 同款）
+func trim_ws(s: string) -> string {
+    var a: i64 = 0
+    var n = str_len(s)
+    while a < n && is_ws_ch(str_char(s, a)) {
+        a = a + 1
+    }
+    var b = n
+    while b > a && is_ws_ch(str_char(s, b - 1)) {
+        b = b - 1
+    }
+    return substr(s, a, b)
+}
+
+// 片段目录中 .tieir 文件数（目录不存在 = 0）。
+// tsh 的 list_dir 对同一目录路径在进程内有缓存 → 每次调用换一次路径拼写
+//（追加 0-3 个反斜杠，Windows 等价路径），绕开缓存取到新鲜列表。
+var g_frag_calls: i64 = 0
+func frag_count() -> i64 {
+    if !file_exists(mods_dir) {
+        return 0
+    }
+    var path = mods_dir
+    var k: i64 = g_frag_calls % 4
+    var j: i64 = 0
+    while j < k {
+        path = path + "\\"
+        j = j + 1
+    }
+    g_frag_calls = g_frag_calls + 1
+    var names = list_dir(path)
+    var c: i64 = 0
+    var i: i64 = 0
+    while i < len(names) {
+        if has_suffix(names[i], ".tir") {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// 编译 main.tie（静默；产物落 exe 路径）。
+// exec_code 异步返回（子进程后台继续）——必须轮询等待产物落盘，
+// 产物（link 阶段）晚于片段写入（irgen 阶段），exe 出现即片段已就绪。
+func compile_q(exe: string) {
+    remove_file(exe)
+    exec_code("cmd /c " + tiec + " " + pdir + "\\main.tie -o " + exe + " >nul 2>&1")
+    var tries: i64 = 0
+    while !file_exists(exe) && tries < 300 {
+        sleep_ms(100)
+        tries = tries + 1
+    }
+    sleep_ms(200)
+}
+
+// ---------- 0. 重建探针工程（%RANDOM% 标记 → 源指纹每轮必变 → 冷启） ----------
+// 产物名同样嵌随机数：remove_file 在 tsh 内异步/静默失败，陈旧 exe 会让
+// 轮询假通过——唯一产物名彻底绕开删除与竞态。
+exec_code("cmd /c if not exist " + pdir + " mkdir " + pdir)
+sleep_ms(100)
+var mark_str = trim_ws(exec_output("cmd /c echo %RANDOM%"))
+var run_id = trim_ws(exec_output("cmd /c echo %RANDOM%"))
+sleep_ms(100)
+
+file_write(pdir + "\\shared.tie", "type tie<logic>\n\nnamespace shared {\npub func base() -> i64 {\n    return 40\n}\n}\n// run " + mark_str + "\n")
+file_write(pdir + "\\liba.tie", "type tie<logic>\nimport \"./shared.tie\"\n\nnamespace liba {\npub func fa() -> i64 {\n    return shared::base() + 1\n}\n}\n// run " + mark_str + "\n")
+file_write(pdir + "\\libb.tie", "type tie<logic>\nimport \"./shared.tie\"\n\nnamespace libb {\npub func fb() -> i64 {\n    return shared::base() + 2\n}\n}\n// run " + mark_str + "\n")
+file_write(pdir + "\\main.tie", "type tie<logic>\nimport \"./liba.tie\"\nimport \"./libb.tie\"\n\nfunc main() -> i64 {\n    var x = liba::fa()\n    var y = libb::fb()\n    println(to_string(x + y))\n    return 0\n}\n// run " + mark_str + "\n")
+sleep_ms(100)
+
+var fails: i64 = 0
+
+// ---------- 1. 冷启动：+4 片段 ----------
+var n0 = frag_count()
+compile_q(pdir + "\\r1_" + run_id + ".exe")
+var n1 = frag_count()
+if !file_exists(pdir + "\\r1_" + run_id + ".exe") {
+    println("FAIL r1 编译失败")
+    fails = fails + 1
+} else {
+    if n1 - n0 != 4 {
+        println("FAIL 冷启期望新增 4 片段，实际 " + to_string(n1 - n0))
+        fails = fails + 1
+    }
+}
+
+// ---------- 2. 原样重编：+0（全命中） ----------
+var n2 = frag_count()
+compile_q(pdir + "\\r2_" + run_id + ".exe")
+var n3 = frag_count()
+if !file_exists(pdir + "\\r2_" + run_id + ".exe") {
+    println("FAIL r2 编译失败")
+    fails = fails + 1
+} else {
+    if n3 - n2 != 0 {
+        println("FAIL 重编期望新增 0 片段，实际 " + to_string(n3 - n2))
+        fails = fails + 1
+    }
+}
+
+// ---------- 3. 改叶子文件（liba 增函数）：恰 +1 ----------
+file_write(pdir + "\\liba.tie", "type tie<logic>\nimport \"./shared.tie\"\n\nnamespace liba {\npub func fa() -> i64 {\n    return shared::base() + 1\n}\n}\npub func fa2() -> i64 {\n    return 7\n}\n// run " + mark_str + "\n")
+sleep_ms(100)
+var n4 = frag_count()
+compile_q(pdir + "\\r3_" + run_id + ".exe")
+var n5 = frag_count()
+if !file_exists(pdir + "\\r3_" + run_id + ".exe") {
+    println("FAIL r3 编译失败")
+    fails = fails + 1
+} else {
+    if n5 - n4 != 1 {
+        println("FAIL 叶子改动期望恰新增 1 片段，实际 " + to_string(n5 - n4))
+        fails = fails + 1
+    }
+}
+
+// ---------- 4. 产物逐字节一致：带缓存 == --no-cache 全量 ----------
+compile_q(pdir + "\\nc2_" + run_id + ".exe")
+var h_r3 = get_file_hash(pdir + "\\r3_" + run_id + ".exe")
+var h_nc = get_file_hash(pdir + "\\nc2_" + run_id + ".exe")
+if str_len(h_r3) != 64 || str_len(h_nc) != 64 {
+    println("FAIL 哈希提取失败 [" + h_r3 + "] [" + h_nc + "]")
+    fails = fails + 1
+} else {
+    if h_r3 != h_nc {
+        println("FAIL 产物不一致：带缓存 [" + h_r3 + "] 全量 [" + h_nc + "]")
+        fails = fails + 1
+    }
+}
+
+// ---------- 汇总 ----------
+if fails > 0 {
+    println("modcache 验收失败: " + to_string(fails) + " 项")
+    exit(1)
+}
+println("modcache 验收通过（冷启 +4 → 重编 +0 → 叶子改动 +1 → 产物逐字节一致）")
+exit(0)

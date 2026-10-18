@@ -1,0 +1,14 @@
+type tie<logic>
+// 域匹配负例：持 mem 凭据去做 ext 域操作 ⇒ 域不匹配
+unsafe func bad() -> i64 {
+    var h: i64 = 0
+    unsafe with(mem) {
+        h = load_library("kernel32.dll")
+    }
+    return h
+}
+func main() {
+    var r: i64 = 0
+    unsafe { r = bad() }
+    println(to_string(r))
+}

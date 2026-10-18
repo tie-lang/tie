@@ -1,0 +1,63 @@
+type tie<logic>
+// tests/_p91128_retelide_probe/retelide_probe.tie —— p.9.11.28 return 可省验收
+// 验收点：①等号体（-> R = expr）②单表达式体（体恰 1 条表达式语句）
+// ③void 等号体（值丢弃）④? 收尾……泛型/多语句负例在语义层报错（另测）。
+
+func add(x: i64, y: i64) -> i64 = x + y
+
+func twice(x: i64) -> i64 {
+    x * 2
+}
+
+func greet(name: string) -> string = "hi, " + name
+
+func shout(name: string) -> string {
+    name + "!"
+}
+
+func log1(x: i64) -> void = println("log:" + to_string(x))
+
+func side(x: i64) -> i64 {
+    println("side:" + to_string(x))
+    x + 1
+}
+
+func no_eli(x: i64) -> i64 {
+    var a = x * 3
+    return a
+}
+
+func main() {
+    if add(2, 3) == 5 {
+        println("r:OK1")
+    } else {
+        println("r:FAIL1")
+    }
+    if twice(4) == 8 {
+        println("r:OK2")
+    } else {
+        println("r:FAIL2")
+    }
+    if greet("tie") == "hi, tie" {
+        println("r:OK3")
+    } else {
+        println("r:FAIL3")
+    }
+    if shout("go") == "go!" {
+        println("r:OK4")
+    } else {
+        println("r:FAIL4")
+    }
+    log1(9)
+    // side 体长 2（println + x+1）→ 按设计不触发省略，返回值非 11
+    if side(10) != 11 {
+        println("r:OK5")
+    } else {
+        println("r:FAIL5")
+    }
+    if no_eli(3) == 9 {
+        println("r:OK6")
+    } else {
+        println("r:FAIL6")
+    }
+}

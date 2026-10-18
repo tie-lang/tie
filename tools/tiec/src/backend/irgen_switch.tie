@@ -1,0 +1,301 @@
+type tie<class>
+// compiler/backend/irgen_switch.tie —— 生成器 L3：switch 表达式生成（tig_switch_expr）
+// ============================================================
+// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// p.9.10.1 match/switch 表达式（表达式位模式匹配）。
+// 布局：N_SWITCH_EXPR[aux=ncases, val=1=含 `_` 通配臂,
+//   children=[subject, caseExpr1..caseExprN, defaultExpr 或 -1]]；
+//   caseExpr = [N_PATTERN_LIST, when 或 -1, bodyExpr]。
+// 语义：subject 求值（含 any/枚举 tag 提取）→ 逐模式短路比较链 → 命中分支
+// 求分支表达式 → 各分支值经 merge phi 汇合为表达式结果（对齐 tig_ternary）。
+// 复用 tig_case_bind_body / tig_case_struct_bind_body（payload 解构绑定）。
+func tig_switch_expr(id: i64) -> i64 {
+var subject = sstate.child(id, 0)
+var sv = tig_expr(subject)
+if sv < 0 {
+    return -1
+}
+var subj_ty = node_types[subject]
+var subj_is_str = subj_ty == types.named(TK_STR)
+var subj_is_enum = types.kind(subj_ty) == K_ENUM
+var subj_is_any = subj_ty == types.named(TK_ANY)
+var enum_tag_v: i64 = -1
+if subj_is_enum {
+    var eaddr = tig_agg_addr(subject, subj_ty)
+    if eaddr < 0 {
+        return -1
+    }
+    var egp = ir.new_inst(g_cur_block, 27, subj_ty)
+    ir.add_operand(egp, eaddr, 0)
+    ir.add_operand(egp, 0, 2)
+    var egpp = ir.get_value(egp)
+    var eld = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+    ir.add_operand(eld, egpp, 0)
+    enum_tag_v = ir.get_value(eld)
+}
+var any_tag_v: i64 = -1
+if subj_is_any {
+    var aaddr = tig_agg_addr(subject, subj_ty)
+    if aaddr < 0 {
+        return -1
+    }
+    var agp = ir.new_inst(g_cur_block, 27, subj_ty)
+    ir.add_operand(agp, aaddr, 0)
+    ir.add_operand(agp, 0, 2)
+    var agpp = ir.get_value(agp)
+    var ald = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+    ir.add_operand(ald, agpp, 0)
+    any_tag_v = ir.get_value(ald)
+}
+var ncases = s_aux[id]
+// 表达式统一类型（sinfer 按隐式拓宽方向定好）：各臂值 phi 前 tig_coerce 对齐
+//（2026-10-09 修，与 tig_ternary 同判据——此前混宽两臂产 LLVM phi 类型不一致）。
+var rty = node_types[id]
+if rty < 0 {
+    rty = types.named(TK_I64)
+}
+var merge_blk = ir.new_block(g_cur_func, interner.intern("swe.merge"))
+var val_tab: table<i64> = table_new_i64()
+var blk_tab: table<i64> = table_new_i64()
+var k: i64 = 0
+while k < ncases {
+    var case_node = sstate.child(id, 1 + k)
+    var pl = sstate.child(case_node, 0)
+    var body_expr = sstate.child(case_node, 2)
+    var body_blk = ir.new_block(g_cur_func, interner.intern("swe.body"))
+    var next_blk = ir.new_block(g_cur_func, interner.intern("swe.next"))
+    var when_n = sstate.child(case_node, 1)
+    var has_guard: bool = when_n >= 0
+    var guard_blk: i64 = -1
+    if has_guard {
+        guard_blk = ir.new_block(g_cur_func, interner.intern("swe.gd"))
+    }
+    var npat = sstate.nchild(pl)
+    var i: i64 = 0
+    while i < npat {
+        var pat = sstate.child(pl, i)
+        var eq_v: i64 = -1
+        var pat_is_bind: bool = false
+        if subj_is_any && s_tags[pat] == S_N_TYPE_LIT {
+            var tynode = sstate.child(pat, 0)
+            var cmt = types.named(s_vals[tynode])
+            var exp_tag2: i64 = -1
+            if types.is_int(cmt) {
+                exp_tag2 = 0
+            } else if types.is_float(cmt) {
+                exp_tag2 = 1
+            } else if cmt == types.named(TK_BOOL) {
+                exp_tag2 = 2
+            } else if cmt == types.named(TK_STR) {
+                exp_tag2 = 3
+            } else if cmt == types.named(TK_CHAR) {
+                exp_tag2 = 4
+            }
+            if exp_tag2 < 0 {
+                sm_err_msg = "case 类型匹配（" + types.type_name(cmt) + "）不是可装箱类型（函数 " + g_cur_fn_name + "）"
+                return -1
+            }
+            var pv3 = tig_int_lit_ty(exp_tag2, types.named(TK_I64))
+            var is_eq3 = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+            ir.add_operand(is_eq3, any_tag_v, 0)
+            ir.add_operand(is_eq3, pv3, 0)
+            ir.add_operand(is_eq3, 0, 2)
+            eq_v = ir.get_value(is_eq3)
+        } else if subj_is_any && (s_tags[pat] == S_N_VAR || s_tags[pat] == N_CASE_BIND) {
+            var sref = pat
+            if s_tags[pat] == N_CASE_BIND {
+                sref = sstate.child(pat, 0)
+                pat_is_bind = true
+            }
+            var sname2 = sstate.name_str(sref)
+            var sidx2 = sstate.bs_find(st_keys, interner.intern(sname2))
+            if sidx2 < 0 {
+                sm_err_msg = "case 值 '" + sname2 + "' 不是 struct（函数 " + g_cur_fn_name + "）"
+                return -1
+            }
+            var s_ty2 = types.struct_of(st_vals[sidx2])
+            var pv4 = tig_int_lit_ty(s_ty2, types.named(TK_I64))
+            var is_eq4 = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+            ir.add_operand(is_eq4, any_tag_v, 0)
+            ir.add_operand(is_eq4, pv4, 0)
+            ir.add_operand(is_eq4, 0, 2)
+            eq_v = ir.get_value(is_eq4)
+        } else if subj_is_enum {
+            var ptag = enum_case_tag(pat, subj_ty)
+            if ptag < 0 {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "case 值不是枚举 '" + types.type_name(subj_ty) + "' 的变体引用（函数 " + g_cur_fn_name + "）"
+                return -1
+            }
+            var pv2 = tig_int_lit_ty(ptag, types.named(TK_I64))
+            var is_eq2 = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+            ir.add_operand(is_eq2, enum_tag_v, 0)
+            ir.add_operand(is_eq2, pv2, 0)
+            ir.add_operand(is_eq2, 0, 2)
+            eq_v = ir.get_value(is_eq2)
+        } else if s_tags[pat] == 11 {
+            var rs = tig_expr(sstate.child(pat, 0))
+            if rs < 0 {
+                return -1
+            }
+            var re = tig_expr(sstate.child(pat, 1))
+            if re < 0 {
+                return -1
+            }
+            var ge = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+            ir.add_operand(ge, sv, 0)
+            ir.add_operand(ge, rs, 0)
+            ir.add_operand(ge, 5, 2)
+            var ge_v = ir.get_value(ge)
+            var lt = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+            ir.add_operand(lt, sv, 0)
+            ir.add_operand(lt, re, 0)
+            if s_vals[pat] == 1 {
+                ir.add_operand(lt, 4, 2)  // sle
+            } else {
+                ir.add_operand(lt, 2, 2)  // slt
+            }
+            var lt_v = ir.get_value(lt)
+            var and = ir.new_inst(g_cur_block, 6, types.named(TK_BOOL))
+            ir.add_operand(and, ge_v, 0)
+            ir.add_operand(and, lt_v, 0)
+            eq_v = ir.get_value(and)
+        } else {
+            var pv = tig_expr(pat)
+            if pv < 0 {
+                return -1
+            }
+            if subj_is_str {
+                var cmp = tig_ext_call2("strcmp", sv, types.named(TK_STR), pv, types.named(TK_STR), types.named(TK_I32))
+                if cmp < 0 {
+                    return -1
+                }
+                var is_eq = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+                ir.add_operand(is_eq, cmp, 0)
+                ir.add_operand(is_eq, 0, 2)
+                ir.add_operand(is_eq, 0, 2)
+                eq_v = ir.get_value(is_eq)
+            } else {
+                var is_eq = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+                ir.add_operand(is_eq, sv, 0)
+                ir.add_operand(is_eq, pv, 0)
+                ir.add_operand(is_eq, 0, 2)
+                eq_v = ir.get_value(is_eq)
+            }
+        }
+        var np_blk = ir.new_block(g_cur_func, interner.intern("swe.np"))
+        if subj_is_enum && s_tags[pat] == N_CASE_BIND {
+            var bind_blk = ir.new_block(g_cur_func, interner.intern("swe.bind"))
+            var cb = ir.new_inst(g_cur_block, 31, -1)
+            ir.add_operand(cb, eq_v, 0)
+            ir.add_operand(cb, bind_blk, 1)
+            ir.add_operand(cb, np_blk, 1)
+            g_cur_block = bind_blk
+            var bb2 = tig_case_bind_body(subject, subj_ty, pat)
+            if bb2 < 0 {
+                return -1
+            }
+            var brb = ir.new_inst(g_cur_block, 30, -1)
+            ir.add_operand(brb, has_guard ? guard_blk : body_blk, 1)
+            g_cur_block = np_blk
+        } else if subj_is_any && pat_is_bind {
+            var sbind_blk = ir.new_block(g_cur_func, interner.intern("swe.sbind"))
+            var cb2 = ir.new_inst(g_cur_block, 31, -1)
+            ir.add_operand(cb2, eq_v, 0)
+            ir.add_operand(cb2, sbind_blk, 1)
+            ir.add_operand(cb2, np_blk, 1)
+            g_cur_block = sbind_blk
+            var sb2 = tig_case_struct_bind_body(subject, subj_ty, pat)
+            if sb2 < 0 {
+                return -1
+            }
+            var brb2 = ir.new_inst(g_cur_block, 30, -1)
+            ir.add_operand(brb2, has_guard ? guard_blk : body_blk, 1)
+            g_cur_block = np_blk
+        } else {
+            var cb = ir.new_inst(g_cur_block, 31, -1)
+            ir.add_operand(cb, eq_v, 0)
+            ir.add_operand(cb, has_guard ? guard_blk : body_blk, 1)
+            ir.add_operand(cb, np_blk, 1)
+            g_cur_block = np_blk
+        }
+        i = i + 1
+    }
+    if !block_terminated() {
+        var bnx = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(bnx, next_blk, 1)
+    }
+    if has_guard {
+        g_cur_block = guard_blk
+        var gv = tig_expr(when_n)
+        if gv < 0 {
+            return -1
+        }
+        var gty = node_types[when_n]
+        var gcond = tig_cond_to_bool(gv, gty)
+        var cbg = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cbg, gcond, 0)
+        ir.add_operand(cbg, body_blk, 1)
+        ir.add_operand(cbg, next_blk, 1)
+    }
+    g_cur_block = body_blk
+    var bv = tig_expr(body_expr)
+    if bv < 0 {
+        return -1
+    }
+    bv = tig_coerce(bv, node_types[body_expr], rty)
+    var bv_blk = g_cur_block
+    table_push(val_tab, bv)
+    table_push(blk_tab, bv_blk)
+    if !block_terminated() {
+        var br1 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br1, merge_blk, 1)
+    }
+    g_cur_block = next_blk
+    k = k + 1
+}
+// 通配 `_`（default 臂）：在最后一个 next_blk（各 case 均未命中后流入的
+// 块）求值并汇入 merge。无通配臂时（非枚举/枚举已穷尽覆盖）该回退路径
+// 仍须提供 phi 入边值（零值），保证 merge 的 phi 入边与所有前驱一致。
+var has_wild = s_vals[id] == 1
+if has_wild {
+    var dflt = sstate.child(id, 1 + ncases)
+    if dflt >= 0 {
+        var dv = tig_expr(dflt)
+        if dv < 0 {
+            return -1
+        }
+        dv = tig_coerce(dv, node_types[dflt], rty)
+        var dv_blk = g_cur_block
+        table_push(val_tab, dv)
+        table_push(blk_tab, dv_blk)
+    }
+} else {
+    var fb = tig_coerce(tig_int_lit(0), types.named(TK_I64), rty)
+    var fb_blk = g_cur_block
+    table_push(val_tab, fb)
+    table_push(blk_tab, fb_blk)
+}
+if !block_terminated() {
+    var brd = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brd, merge_blk, 1)
+}
+g_cur_block = merge_blk
+var pty = node_types[id]
+if pty < 0 {
+    pty = types.named(TK_I64)
+}
+var phi = ir.new_inst(g_cur_block, 33, pty)
+var m: i64 = 0
+while m < len(val_tab) {
+    ir.add_operand(phi, val_tab[m], 0)
+    ir.add_operand(phi, blk_tab[m], 1)
+    m = m + 1
+}
+return ir.get_value(phi)
+}
+}

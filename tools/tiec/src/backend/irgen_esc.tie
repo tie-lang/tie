@@ -1,0 +1,477 @@
+type tie<class>
+// compiler/backend/irgen_esc.tie —— 编译期「独占局部表」逃逸分析（r.1.6.7）
+// ============================================================================
+// 目标：对**可证独占**的局部表生成免锁访问，跳过 tl_tbl 的每表 CRITICAL_SECTION
+// （实测 `t[i]` 27–28ns 中锁占 20ns）。
+//
+// 【为什么必须是编译期判据】r.1.6.6 曾试**运行期**逃逸标志（esc@48，由 tbl_retain
+// 置位），被判据实验**证伪并回滚**：表可经**全局变量 / 堆槽**被多线程共享而**不触发
+// 任何 retain**（worker 读全局槽取句柄直接 push，读共享不复制句柄）⇒ 标志恒为
+// 「未逃逸」⇒ 漏锁 ⇒ 真实数据竞争。**「句柄是否被复制」≠「表是否可能被并发访问」**。
+// 静态判据没有运行期窗口，是本问题唯一可靠的形态。
+// 详见 trm-lite `docs/2026-09-29-tie-perf-safety-and-startup.md` §3.3 / §2.2。
+//
+// 【判据（保守：宁可少优化，绝不漏判）】局部变量 v 在某程序点可证独占 ⟺
+//   (1) v 是当前函数的**局部**变量（参数与全局一律不算——所有权在调用方 / 全局槽）；
+//   (2) v 的初值是**新鲜分配**（table_new_i64/string/f64/bool、表字面量、byte_read
+//       ——编译器新建缓冲，不可能与既有表互为别名）；
+//   (3) 从声明点到该程序点，**v 的句柄值从未离开本次函数调用**。
+//
+// 「离开本次调用」的泄漏点（全部按保守方向判定）：
+//   · 作为**任意调用**的实参（含方法调用 / 间接调用）——被调方可能存入全局或闭包；
+//     **唯一例外**：容器内建且 v 在第 0 实参位（那些位置正是本分析要优化的，且
+//     内建只改容器自身、不把句柄存到别处）；
+//   · 作为**被存入的值**（表/元组字面量元素、下标写右值、`table_push(另一表, v)`）；
+//   · 被**闭包字面量捕获**（闭包可能被 spawn / 存全局 ⇒ 另一执行流可达该表）；
+//   · 作为 `return` 的值；
+//   · 被**赋给别的变量**（别名可再流向上述任一泄漏点）。
+//
+// 【控制流处理】
+//   · 顺序语句：**流敏感**——生成某语句前先扫描其整棵子树，命中泄漏点即**立即置死**
+//     （单调，不回生）；于是「泄漏点之前的访问」仍享快路径。
+//   · **循环**：进入循环语句时先扫描**整个循环子树**（含条件、嵌套）⇒ 命中即提前
+//     置死。这一步是必需的：循环体只生成一次，而「本轮泄漏 → 下一轮误用快路径」
+//     正是运行期标志翻车的同一陷阱，必须由「提前置死」堵住。
+//   · 分支（if/switch）：按生成顺序单调置死，比执行顺序更保守（只会少优化，不会多）。
+//   · 闭包体：作为独立函数生成，其内候选集由 esc_reset 独立重置；被捕获变量在
+//     **外层**按泄漏处理（见上「被闭包字面量捕获」）。
+//
+// 【同名声影】候选表按**名池 id** 索引，而不同作用域可有同名变量 ⇒ 每次 VarDecl
+//   都要**覆盖**该名的状态（新鲜 → 存活；非新鲜 → 立即置死），避免外层同名候选把
+//   内层（可能来自参数的）表误判为独占。块退出不回滚状态（保守方向）。
+//
+// 【审计】--esc-audit 打印每一处被判定为独占的访问（变量名 + 行号 + 位置），
+//   用于人工核对不变量：「全局变量 / 函数参数 / 已泄漏变量**从不**出现在快路径」。
+
+namespace irgen {
+
+// 注：g_esc_names / g_esc_live / g_esc_audit / g_esc_hits 四个全局的**声明**在
+// 主文件 irgen.tie（同 namespace 跨文件的约定：顶层全局 var 与 import 树留主文件），
+// 本文件只放函数。
+
+// 打开/关闭审计输出（driver --esc-audit 注入）。
+pub func set_esc_audit(v: bool) {
+    g_esc_audit = v
+}
+
+// 本次编译中判定为独占的访问次数（供 driver 汇总打印 / 回归探针断言）。
+pub func esc_hits() -> i64 {
+    return g_esc_hits
+}
+
+// 每函数重置（挂在 g_tv_keys 重置点旁；跨函数不串用）。
+func esc_reset() {
+    g_esc_names = table_new_i64()
+    g_esc_live = table_new_i64()
+    g_esc_depth = 0
+}
+
+// 名 → 下标；未登记 -1。
+func esc_find(nm: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_esc_names) {
+        if g_esc_names[i] == nm {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 该名是否是**全局变量**。全局槽可被任意函数/线程经名字直接触及 ⇒ 永远不可能是
+// 独占的 ⇒ 一律不参与候选。
+//
+// 两个独立判据（任一命中即为全局），互为冗余：
+//   · global_ty(nid) ≥ 0 —— 语义层全局登记表（gb_keys，irgen 阶段已完成语义）
+//   · scope_get_global(nid) ≥ 0 —— irgen 侧全局槽查询
+//
+// **为什么必须有这道闸**（审计实测抓到）：全局变量可以被**重新赋一个新鲜初值**
+// （`g_x = table_new_i64()`），而「新鲜初值 ⇒ 可登记为候选」的规则若不加限制，
+// 就会把一个**全局**登记成独占 —— 于是该全局的全部访问都走了免锁路径。这正是
+// 运行期 esc 标志翻车的同一个坑（全局共享无法从「句柄是否新鲜」看出），故此处
+// 必须在**最上游**把全局挡掉，而不是靠后续的泄漏扫描。
+func esc_is_global_name(nid: i64) -> bool {
+    if global_ty(nid) >= 0 {
+        return true
+    }
+    if scope_get_global(nid) >= 0 {
+        return true
+    }
+    return false
+}
+
+// 登记候选并置为存活（VarDecl 初值为新鲜分配时调用）。
+func esc_cand(nm: i64) {
+    // 全局永不独占 —— **这是判据的第一道闸**（详见 esc_is_global_name 注释）。
+    if esc_is_global_name(nm) {
+        esc_kill(nm)
+        return
+    }
+    var k = esc_find(nm)
+    if k < 0 {
+        table_push(g_esc_names, nm)
+        table_push(g_esc_live, 1)
+        return
+    }
+    g_esc_live[k] = 1
+}
+
+// 置死（单调，不回生）。未见过的名字也登记为死——它以后若被声明为候选，
+// esc_cand 会重新置活，符合「声明点重置同名状态」的语义。
+func esc_kill(nm: i64) {
+    var k = esc_find(nm)
+    if k < 0 {
+        table_push(g_esc_names, nm)
+        table_push(g_esc_live, 0)
+        return
+    }
+    g_esc_live[k] = 0
+}
+
+// 查询：该名在当前程序点是否可证独占。
+func esc_is_live(nm: i64) -> bool {
+    var k = esc_find(nm)
+    if k < 0 {
+        return false
+    }
+    return g_esc_live[k] == 1
+}
+
+// ==================== 显式 lock 凭据（语法层去锁，r.1.6.7） ====================
+// 与上面的**自动独占分析**并列的第二条去锁路径：用户显式持 `guard<lock>` 凭据
+// 时，凭据作用域内的表访问直接走免锁入口。两条路径的关系：
+//   · 自动路径：编译器**能证明**独占 ⇒ 免费去锁（保守、覆盖率低）；
+//   · 显式路径：**开发者声明**「我知道这里没有并发访问」⇒ 去锁（责任归开发者）。
+// 二者都在**双锁**约束下：显式路径要求 `unsafe` 上下文（门禁）+ `guard<lock>`
+// 凭据（能力域）。语法承载见 unsafe-credential-lock.md §3 的三种持证形态：
+//   · 块级临时凭据 `unsafe with(lock) { ... }`；
+//   · 块级绑证 `unsafe use g { ... }`（g 的类型须为 guard<lock>）；
+//   · 函数级 `#[unsafe.lock] func f`；
+//   · 文件级 `type tie<logic, unsafe:lock>`。
+
+// 进入/退出「持 lock 凭据」的作用域（嵌套计数；退块自动回收，与 guard 生命周期一致）。
+func lock_enter() {
+    g_lock_depth = g_lock_depth + 1
+}
+
+func lock_leave() {
+    g_lock_depth = g_lock_depth - 1
+}
+
+// 取消所有 lock 作用域（每函数重置用：闭包体/方法体是独立函数，凭据不跨函数继承）。
+func lock_reset() {
+    g_lock_depth = 0
+}
+
+// 保存/恢复 lock 深度。闭包体、port 方法体是**独立函数**，其内不继承外层凭据：
+//   · 若不清零 ⇒ 闭包体沿用外层的去锁状态，而闭包**可能被 spawn / 存全局**
+//     ⇒ 该闭包在另一执行流里对同一张表做免锁访问 ⇒ **真实数据竞争**；
+//   · 但又不能简单清零后不管 ⇒ 生成完闭包体后外层还要继续（外层仍持凭据）。
+// 故用保存/恢复：进入独立函数体生成前 save+reset，退出后 restore。
+func lock_save() -> i64 {
+    return g_lock_depth
+}
+
+func lock_restore(v: i64) {
+    g_lock_depth = v
+}
+
+// 当前是否处于持 lock 凭据的作用域内。
+func lock_active() -> bool {
+    return g_lock_depth > 0
+}
+
+// 文件级授权（`type tie<logic, unsafe:lock>`）：整文件所有函数的 lock 作用域初值。
+pub func set_file_lock(v: bool) {
+    g_file_lock = v
+}
+
+// 便利：AST 节点若是「裸变量」→ 返回其名池 id；否则 -1。
+func esc_var_id(n: i64) -> i64 {
+    if n < 0 || s_tags[n] != S_N_VAR {
+        return 0 - 1
+    }
+    return interner.intern(sstate.name_str(n))
+}
+
+// 只查询（不计审计计数/不再打印）——供同一处访问的第二次查询（如读旧值）使用，
+// 避免把一次访问计成两次。
+func esc_var_live(n: i64) -> bool {
+    var nm = esc_var_id(n)
+    if nm < 0 {
+        return false
+    }
+    return esc_is_live(nm)
+}
+
+// **去锁判定唯一入口**：该访问点是否对节点 n 指向的表走免锁路径。
+// 两条来源：① 编译器静态证明独占（自动）；② 处于持 lock 凭据的作用域（显式）。
+// 任一成立即免锁；均不成立则走加锁入口（默认、也是绝大多数情况）。
+func esc_take(n: i64, site: string) -> bool {
+    // ② 显式凭据路径优先判定（与变量是否可证独占无关——用户已声明承担责任）
+    if lock_active() {
+        g_lock_hits = g_lock_hits + 1
+        if g_esc_audit {
+            var ln2: i64 = 0
+            if n >= 0 && n < len(s_lines) {
+                ln2 = s_lines[n]
+            }
+            var vn = ""
+            if esc_var_id(n) >= 0 {
+                vn = sstate.name_str(n)
+            }
+            println("[esc] 凭据去锁 " + site + " 变量=" + vn +
+                " 函数=" + g_cur_fn_name + " 行=" + to_string(ln2))
+        }
+        return true
+    }
+    // ① 自动独占路径
+    var nm = esc_var_id(n)
+    if nm < 0 {
+        return false
+    }
+    if !esc_is_live(nm) {
+        return false
+    }
+    g_esc_hits = g_esc_hits + 1
+    if g_esc_audit {
+        var ln: i64 = 0
+        if n >= 0 && n < len(s_lines) {
+            ln = s_lines[n]
+        }
+        println("[esc] 独占免锁 " + site + " 变量=" + sstate.name_str(n) +
+            " 函数=" + g_cur_fn_name + " 行=" + to_string(ln))
+    }
+    return true
+}
+
+// 只查询版本（读旧值等第二次查询）：同样计入两条来源，但不重复计数/打印。
+func esc_live_or_lock(n: i64) -> bool {
+    if lock_active() {
+        return true
+    }
+    return esc_var_live(n)
+}
+
+// 初值是否为**新鲜分配**（无别名，绝不可能已在别处被共享）。
+func esc_is_fresh(e: i64) -> bool {
+    if e < 0 {
+        return false
+    }
+    var tg = s_tags[e]
+    if tg == S_N_TABLE_LIT {
+        return true          // 表/键值表字面量：编译器新建容器
+    }
+    if tg == S_N_CALL {
+        var nm = sstate.name_str(e)
+        if nm == "table_new_i64" || nm == "table_new_string" ||
+            nm == "table_new_f64" || nm == "table_new_bool" {
+            return true
+        }
+        // byte_read：编译器内联实现，读入 u8 缓冲后**新建**表并采纳（无别名）
+        if nm == "byte_read" {
+            return true
+        }
+    }
+    return false
+}
+
+// 容器内建白名单：第 0 实参是「被操作的容器」而非「被交出去的句柄」——
+// 这些内建只改/读容器自身，绝不把句柄存到全局或闭包。
+// 刻意**最小化**：每多收一个名字都增加判据不成立的风险，故只列确知者。
+func esc_container_builtin(nm: string) -> bool {
+    if nm == "table_push" || nm == "table_append" || nm == "table_pop" ||
+        nm == "table_remove" || nm == "table_insert" || nm == "table_clear" ||
+        nm == "table_truncate" || nm == "table_reserve" || nm == "table_set_len" {
+        return true
+    }
+    return nm == "len"
+}
+
+// 扫描模式：0 = 此位置的裸变量即**泄漏**；1 = 只读位置（保留）；
+//           2 = 闭包体内部（其内一切引用都是「捕获」= 泄漏）。
+// 树遍历：未知构造一律按「泄漏」递归（保守默认），只有明确认识的只读结构
+// （下标读的 base / 调用实参的容器位）才降级为保留。
+func esc_scan(n: i64, mode: i64) {
+    if n < 0 || n >= len(s_tags) {
+        return
+    }
+    // ★ 递归深度上限（2026-10-03）：逃逸扫描是**无 visited 集**的纯递归，遇到
+    // 畸形 AST（子树里出现 id 越界的槽位被当节点、进而读出垃圾 tag 再递归）会
+    // 无限递归爆栈 ⇒ 编译器段错误、零输出。上限只是**兜底**：正常 AST 深度远小于
+    // 此值；触到即停止该子树扫描（方向保守——少优化，不影响正确性）。
+    if g_esc_depth > 4000 {
+        return
+    }
+    g_esc_depth = g_esc_depth + 1
+    esc_scan_dispatch(n, mode)
+    g_esc_depth = g_esc_depth - 1
+}
+
+func esc_scan_dispatch(n: i64, mode: i64) -> i64 {
+    var tg = s_tags[n]
+    // N_CASE_BIND（`case Ok(v)` 解构，tag 140）：children = [变体引用**节点**,
+    // 绑定名 intern id, 绑定名 intern id, ...]（见 pstmt_flow_p2 的 bkids 构造）。
+    // ★ 第 1 个之后的槽**不是 AST 节点**——必须只扫 child(0)。此前缺本分支，
+    //   落到末尾的 esc_scan_children 默认兜底 ⇒ 把 interned 名 id 当节点 id 递归
+    //   ⇒ 读出垃圾 tag ⇒ 无限递归爆栈。症状：`if let N(x) = o { }`（p.9.10.2 脱糖
+    //   成 switch + N_CASE_BIND）编译 tiec 时段错误、**零输出**（连诊断都来不及写）。
+    if tg == N_CASE_BIND {
+        esc_scan(sstate.child(n, 0), mode)
+        return 0
+    }
+    // 裸变量
+    if tg == S_N_VAR {
+        if mode != 1 {
+            esc_kill(interner.intern(sstate.name_str(n)))
+        }
+        return 0
+    }
+    // 闭包体内（mode 2）：**一切**变量引用都是捕获 ⇒ 统统置死，不再区分只读位。
+    // （必须置于位置规则之前：否则 `len(t)` 这类「容器内建只读位」会把捕获漏掉 ——
+    //  实测就是这条漏洞让被闭包捕获的表仍被判定为独占。）
+    if mode == 2 {
+        esc_kill_vars_in(n)
+        return 0
+    }
+    // 闭包字面量：children 里含**闭包体**（child(slot_off+1+nparams)，见
+    // irgen_closure.tig_closure_entry_fn）⇒ 按其体内引用做捕获置死。
+    if tg == S_N_FN_LIT {
+        esc_scan_children(n, 2)
+        return 0
+    }
+    // 调用（tag 7）：实参一律按泄漏处理，唯一例外是容器内建的第 0 实参。
+    if tg == S_N_CALL {
+        esc_scan_call(n)
+        return 0
+    }
+    // 方法调用（tag 18）/ P2a 调用表达式（148）：布局不由本处假设 ——
+    // 一律按「全部子节点皆泄漏」处理（保守方向；只会少优化）。
+    if tg == S_N_METHOD_CALL || tg == S_N_CALL_EXPR {
+        esc_scan_children(n, 0)
+        return 0
+    }
+    // for 迭代：children=[iter, body]。iter 是**只读**位置（遍历读 len/元素，
+    // 不会把表的句柄存到别处）；body 按传入模式。
+    if tg == S_N_FOR {
+        var it0 = sstate.child(n, 0)
+        if mode == 2 {
+            esc_scan(it0, 2)
+        } else {
+            esc_scan(it0, 1)
+        }
+        esc_scan(sstate.child(n, 1), mode)
+        return 0
+    }
+    // 下标读 t[i]：base 只读（保留）；下标按泄漏。
+    if tg == S_N_INDEX {
+        esc_scan(sstate.child(n, 0), 1)
+        esc_scan(sstate.child(n, 1), 0)
+        return 0
+    }
+    // 表/元组字面量：元素被**存入新容器** ⇒ 泄漏
+    if tg == S_N_TABLE_LIT || tg == S_N_TUPLE_LIT {
+        esc_scan_children(n, 0)
+        return 0
+    }
+    // 语句级：目标名被重新赋值 ⇒ 该名状态重置（非新鲜即死）
+    if tg == S_N_ASSIGN {
+        var val = sstate.child(n, 0)
+        if esc_is_fresh(val) {
+            esc_cand(interner.intern(sstate.name_str(n)))
+        } else {
+            esc_kill(interner.intern(sstate.name_str(n)))
+        }
+        esc_scan(val, 0)
+        return 0
+    }
+    // 下标写 t[i] = v：base 只读（保留，写容器自身不泄漏容器）；下标与右值泄漏
+    if tg == S_N_INDEX_ASSIGN {
+        var tgt = sstate.child(n, 0)
+        esc_scan(sstate.child(tgt, 0), 1)
+        esc_scan(sstate.child(tgt, 1), 0)
+        esc_scan(sstate.child(n, 1), 0)
+        return 0
+    }
+    // 变量声明：初值新鲜 ⇒ 登记候选；否则该名立即置死（覆盖同名外层候选）。
+    if tg == S_N_VAR_DECL {
+        var init = sstate.child(n, 1)
+        if esc_is_fresh(init) {
+            esc_cand(interner.intern(sstate.name_str(n)))
+        } else {
+            esc_kill(interner.intern(sstate.name_str(n)))
+        }
+        esc_scan(init, 0)
+        return 0
+    }
+    // 其余（含 return / 表达式语句 / 二元 / 一元 / 三元 / 字段访问 / 分支 / 循环…）
+    // 一律按泄漏递归 —— 保守默认，未知构造不会放过泄漏点。
+    esc_scan_children(n, mode)
+}
+
+// 把子树里出现的**每一个**变量名都置死（闭包捕获 / 无法判定时的兜底）。
+// 不看位置语义——捕获与位置无关：闭包体内读到的任何外部变量都会被装入闭包环境。
+func esc_kill_vars_in(n: i64) {
+    // 同 esc_scan：越界 id 与深度上限兜底（该函数同样是无 visited 集递归）。
+    if n < 0 || n >= len(s_tags) || g_esc_depth > 4000 {
+        return
+    }
+    g_esc_depth = g_esc_depth + 1
+    if s_tags[n] == S_N_VAR {
+        esc_kill(interner.intern(sstate.name_str(n)))
+    }
+    var nc = sstate.nchild(n)
+    var i: i64 = 0
+    while i < nc {
+        esc_kill_vars_in(sstate.child(n, i))
+        i = i + 1
+    }
+    g_esc_depth = g_esc_depth - 1
+}
+
+// 把所有当前候选一律置死（用于「无法判定」的保守兜底，只损失优化、不影响正确性）。
+func esc_kill_all() {
+    var i: i64 = 0
+    while i < len(g_esc_live) {
+        g_esc_live[i] = 0
+        i = i + 1
+    }
+}
+
+// 子节点遍历（保持给定模式）。
+func esc_scan_children(n: i64, mode: i64) {
+    var nc = sstate.nchild(n)
+    var i: i64 = 0
+    while i < nc {
+        esc_scan(sstate.child(n, i), mode)
+        i = i + 1
+    }
+}
+
+// 调用节点：callee 名取 `sstate.name_str(node)`（tag 7 的约定），实参自 slot_off 起。
+func esc_scan_call(n: i64) {
+    var cname = sstate.name_str(n)
+    var off = sstate.slot_off(n)
+    var nc = sstate.nchild(n)
+    var k: i64 = 0
+    while off + k < nc {
+        var a = sstate.child(n, off + k)
+        if k == 0 && esc_container_builtin(cname) {
+            // 容器位：只读（不泄漏容器句柄）
+            esc_scan(a, 1)
+        } else {
+            esc_scan(a, 0)
+        }
+        k = k + 1
+    }
+}
+
+// 语句前置钩子：生成语句前扫描其整棵子树。
+// 一次调用同时覆盖两种流敏感语义：
+//   · 顺序语句 —— 泄漏点**之前**的访问仍是独占（流敏感）；
+//   · 循环语句 —— 子树里的泄漏点被**提前**置死，堵住「本轮泄漏 / 下一轮误用」。
+func esc_stmt_pre(stmt: i64) {
+    esc_scan(stmt, 0)
+}
+
+}

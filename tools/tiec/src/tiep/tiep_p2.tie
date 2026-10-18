@@ -1,0 +1,789 @@
+type tie<class>
+// compiler/interp/interp_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 interp.tie。
+namespace tiep {
+// For：name=迭代变量，aux=循环标签，children=[iter, body]。
+func exec_stmt_for(id: i64) {
+    var var_name = isess.nname_str(id)
+    var label = isess.naux_label(id)
+    var iter_node = isess.nchild_at(id, 0)
+    var body = isess.nchild_at(id, 1)
+    var iter = gen_expr(iter_node)
+    if w_err != "" {
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return
+    }
+    var last: Value = Value.Nil
+    var has_last: bool = false
+    g_consume_outer = FL_NORMAL
+    g_consume_outer_val = Value.Nil
+    g_loop_label = label
+    var it = vval.type_of(iter)
+    if it == W_RANGE {
+        // 范围迭代：逐值绑定循环变量
+        var start = vval.range_start(iter)
+        var end = vval.range_end(iter)
+        var inclusive = vval.range_inclusive(iter) == 1
+        var i = start
+        while (inclusive && i <= end) || (!inclusive && i < end) {
+            var rc = for_iterate(body, var_name, vval.new_int(i))
+            if w_err != "" {
+                g_flow = FL_NORMAL
+                g_lastval = Value.Nil
+                g_has_last = false
+                return
+            }
+            if rc == 0 {
+                break
+            } else {
+                if rc == 1 && g_has_last {
+                    last = g_lastval
+                    has_last = true
+                }
+                if inclusive && i == end {
+                    break
+                }
+                i = i + 1
+            }
+        }
+    } else if it == W_TABLE {
+        // 表遍历：逐元素绑定循环变量
+        var cnt = vval.elem_count(iter)
+        var i: i64 = 0
+        while i < cnt {
+            var rc = for_iterate(body, var_name, vval.elem_at(iter, i))
+            if w_err != "" {
+                g_flow = FL_NORMAL
+                g_lastval = Value.Nil
+                g_has_last = false
+                return
+            }
+            if rc == 0 {
+                i = cnt
+            } else {
+                if rc == 1 && g_has_last {
+                    last = g_lastval
+                    has_last = true
+                }
+                i = i + 1
+            }
+        }
+    } else if it == W_STR {
+        // 字符串码点迭代（`.chars()`，dev33 批次4）：str_len 码点数，str_char 逐码点取单字符
+        var s = vval.str_val(iter)
+        var n = str_len(s)
+        var i: i64 = 0
+        while i < n {
+            var rc = for_iterate(body, var_name, vval.new_str(str_char(s, i)))
+            if w_err != "" {
+                g_flow = FL_NORMAL
+                g_lastval = Value.Nil
+                g_has_last = false
+                return
+            }
+            if rc == 0 {
+                i = n
+            } else {
+                if rc == 1 && g_has_last {
+                    last = g_lastval
+                    has_last = true
+                }
+                i = i + 1
+            }
+        }
+    } else {
+        w_err = "for 的迭代对象必须是范围（0..10）、表或字符串迭代器"
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return
+    }
+    if g_consume_outer != FL_NORMAL {
+        g_flow = g_consume_outer
+        if g_consume_outer == FL_RETURN {
+            g_flow_val = g_consume_outer_val
+        }
+    } else {
+        g_flow = FL_NORMAL
+    }
+    g_lastval = last
+    g_has_last = has_last
+}
+
+// 单次 for 迭代：压作用域绑定循环变量 → 执行体 → 消费 flow。
+// 返回 consume_flow 的迭代码（0=停止 1=正常迭代 2=continue 跳过）。
+func for_iterate(body: i64, var_name: string, v: Value) -> i64 {
+    isess.scope_push()
+    isess.var_declare(var_name, v)
+    exec_block(body)
+    isess.scope_pop()
+    if w_err != "" {
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return 0
+    }
+    return consume_flow()
+}
+
+// 消费循环体 flow（对齐 Rust while/for 的 step 判定语义）：
+//   0 = 停止迭代（break 消费 / return / 标签不匹配——均不更新 last）
+//   1 = 正常迭代结束（调用方更新 last）
+//   2 = continue 消费（继续下一次迭代，**不更新 last**）
+// return → 记录上抛（g_consume_outer）；break/continue 标签匹配本循环 →
+// 消费（break 停 / continue 继续）；标签不匹配 → 记录上抛并停。
+func consume_flow() -> i64 {
+    if g_flow == FL_RETURN {
+        g_consume_outer = FL_RETURN
+        g_consume_outer_val = g_flow_val
+        return 0
+    }
+    if g_flow == FL_BREAK {
+        if g_flow_label == "" || g_flow_label == g_loop_label {
+            g_flow = FL_NORMAL
+            return 0
+        }
+        g_consume_outer = FL_BREAK
+        return 0
+    }
+    if g_flow == FL_CONTINUE {
+        if g_flow_label == "" || g_flow_label == g_loop_label {
+            g_flow = FL_NORMAL
+            return 2
+        }
+        g_consume_outer = FL_CONTINUE
+        return 0
+    }
+    return 1
+}
+
+// Switch：aux=ncases，children=[subject]+cases...+[default StmtList]。
+// 顺序匹配每个 case —— 任一 pattern 命中 且 when 守卫为真才执行；
+// 全不匹配 → default（恒存在，可能为空体）。
+func exec_stmt_switch(id: i64) {
+    var subject = gen_expr(isess.nchild_at(id, 0))
+    if w_err != "" {
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return
+    }
+    var ncases = isess.naux(id)
+    var last: Value = Value.Nil
+    var has_last: bool = false
+    var matched: bool = false
+    var ci: i64 = 0
+    while ci < ncases {
+        var c = isess.nchild_at(id, 1 + ci)
+        // 逐个 pattern 匹配（多值：任一命中即本 case 命中）
+        var hit: bool = false
+        var pl = isess.nchild_at(c, 0)
+        var pi: i64 = 0
+        while pi < isess.nchild(pl) {
+            if pat_matches(isess.nchild_at(pl, pi), subject) {
+                hit = true
+                pi = isess.nchild(pl)
+            } else {
+                if w_err != "" {
+                    g_flow = FL_NORMAL
+                    g_lastval = Value.Nil
+                    g_has_last = false
+                    return
+                }
+                pi = pi + 1
+            }
+        }
+        if !hit {
+            ci = ci + 1
+            continue
+        }
+        // when 守卫：值为真才进入（守卫不满足 → 落入下一个 case）
+        var when_node = isess.nchild_at(c, 1)
+        if when_node >= 0 {
+            var wv = gen_expr(when_node)
+            if w_err != "" {
+                g_flow = FL_NORMAL
+                g_lastval = Value.Nil
+                g_has_last = false
+                return
+            }
+            var wt = vval.is_truthy(wv)
+            if w_err != "" {
+                g_flow = FL_NORMAL
+                g_lastval = Value.Nil
+                g_has_last = false
+                return
+            }
+            if !wt {
+                ci = ci + 1
+                continue
+            }
+        }
+        // 执行分支体；return/break/continue 均向上传播
+        exec_block(isess.nchild_at(c, 2))
+        if w_err != "" {
+            g_flow = FL_NORMAL
+            g_lastval = Value.Nil
+            g_has_last = false
+            return
+        }
+        if g_flow != FL_NORMAL {
+            g_lastval = last
+            g_has_last = has_last
+            return
+        }
+        if g_has_last {
+            last = g_lastval
+            has_last = true
+        }
+        matched = true
+        ci = ncases
+    }
+    // 全不匹配 → default 分支（恒存在）
+    if !matched {
+        exec_block(isess.nchild_at(id, 1 + ncases))
+        if w_err != "" {
+            g_flow = FL_NORMAL
+            g_lastval = Value.Nil
+            g_has_last = false
+            return
+        }
+        if g_flow != FL_NORMAL {
+            g_lastval = last
+            g_has_last = has_last
+            return
+        }
+        if g_has_last {
+            last = g_lastval
+            has_last = true
+        }
+    }
+    g_flow = FL_NORMAL
+    g_lastval = last
+    g_has_last = has_last
+}
+
+// 单个 pattern 匹配：区间 / 类型匹配 / 字面量 == 比较。
+// 命中返回 true；失败置 w_err 返回 false。
+func pat_matches(pat: i64, subject: Value) -> bool {
+    var ptag = isess.ntag(pat)
+    if ptag == N_RANGE {
+        // 区间 pattern：start ≤ subject < end（左闭右开，整数/字符）
+        var sv = range_bound(isess.nchild_at(pat, 0))
+        if w_err != "" {
+            return false
+        }
+        var ev = range_bound(isess.nchild_at(pat, 1))
+        if w_err != "" {
+            return false
+        }
+        var st = vval.type_of(subject)
+        if st != W_INT && st != W_CHAR {
+            return false  // 类型不匹配 → 不命中（对齐 Rust continue）
+        }
+        var v = vval.int_val(subject)
+        if isess.nval(pat) == 1 {
+            return v >= sv && v <= ev
+        }
+        return v >= sv && v < ev
+    }
+    if ptag == N_TYPE_LIT {
+        // 类型匹配 pattern：按 Value 变体匹配（动态类型）
+        return value_matches_ty(subject, isess.nchild_at(pat, 0))
+    }
+    // 字面量 pattern：== 比较
+    var pv = gen_expr(pat)
+    if w_err != "" {
+        return false
+    }
+    var eq = eval_binary(B_EQ, subject, pv)
+    if w_err != "" {
+        return false
+    }
+    return vval.type_of(eq) == W_BOOL && vval.int_val(eq) != 0
+}
+
+// case 区间端点：整数/字符 → i64；否则报错（对齐 Rust 文本）。
+func range_bound(node: i64) -> i64 {
+    var v = gen_expr(node)
+    if w_err != "" {
+        return 0
+    }
+    var t = vval.type_of(v)
+    if t == W_INT || t == W_CHAR {
+        return vval.int_val(v)
+    }
+    w_err = "case 区间起点必须是整数或字符"
+    return 0
+}
+
+// 类型匹配：Value 动态类型是否等于类型节点（switch 的 case 类型匹配）。
+// 对齐 Rust value_matches_ty（TyKw 索引见 types.tie 56 行起）。
+func value_matches_ty(v: Value, ty_node: i64) -> bool {
+    var ttag = isess.ntag(ty_node)
+    if ttag == N_TABLE_TYPE {
+        return vval.type_of(v) == W_TABLE
+    }
+    if ttag == N_MAP_TYPE {
+        return vval.type_of(v) == W_MAP
+    }
+    if ttag != N_NAMED_TYPE {
+        return false  // 元组/struct/code：interp 无对应值
+    }
+    var kw = isess.nval(ty_node)
+    var vt = vval.type_of(v)
+    if kw >= 0 && kw <= 7 {
+        return vt == W_INT
+    }
+    if kw == 8 || kw == 9 {
+        return vt == W_FLOAT
+    }
+    if kw == 10 {
+        return vt == W_BOOL
+    }
+    if kw == 11 {
+        return vt == W_TRIT
+    }
+    if kw == 12 {
+        return vt == W_CHAR
+    }
+    if kw == 13 {
+        return vt == W_STR
+    }
+    if kw == 14 {
+        return vt == W_VOID
+    }
+    if kw == 16 {
+        return vt == W_INT || vt == W_FLOAT
+    }
+    if kw == 17 {
+        return vt == W_STR || vt == W_CHAR
+    }
+    if kw == 18 {
+        return vt != W_INT && vt != W_FLOAT && vt != W_BOOL && vt != W_CHAR && vt != W_STR
+    }
+    if kw == 23 {
+        // TK_ANY：`v is any` 恒真（any 装箱值必为某类型的值；对齐 AOT tig_is_check）
+        return true
+    }
+    return false
+}
+
+// IndexAssign：val=op 码，children=[目标, 值]。
+// 目标 = Index{base, index}：键值表 m["k"]=v 或表 t[i]=v（复合赋值读旧值）。
+func exec_stmt_index_assign(id: i64) {
+    var op = isess.nval(id)
+    var target = isess.nchild_at(id, 0)
+    var value_node = isess.nchild_at(id, 1)
+    // 键值表下标赋值：m["k"] = v（base 是 map 变量、下标是字符串）
+    if isess.ntag(target) == N_INDEX {
+        var base = isess.nchild_at(target, 0)
+        var index = isess.nchild_at(target, 1)
+        if isess.ntag(base) == N_VAR {
+            var idxv = gen_expr(index)
+            if w_err != "" {
+                g_flow = FL_NORMAL
+                g_lastval = Value.Nil
+                g_has_last = false
+                return
+            }
+            var mname = isess.nname_str(base)
+            if vval.type_of(idxv) == W_STR {
+                var cur = isess.lookup(mname)
+                if w_err == "" {
+                    if vval.type_of(cur) == W_MAP {
+                        var key_id = interner.intern(vval.str_val(idxv))
+                        var newv = Value.Nil
+                        if op >= 0 {
+                            // 复合赋值：读旧值（键不存在 → 0）
+                            var old = vval.map_get_opt(cur, key_id)
+                            var rv = gen_expr(value_node)
+                            if w_err != "" {
+                                g_flow = FL_NORMAL
+                                g_lastval = Value.Nil
+                                g_has_last = false
+                                return
+                            }
+                            newv = eval_binary(op, old, rv)
+                            if w_err != "" {
+                                g_flow = FL_NORMAL
+                                g_lastval = Value.Nil
+                                g_has_last = false
+                                return
+                            }
+                        } else {
+                            newv = gen_expr(value_node)
+                            if w_err != "" {
+                                g_flow = FL_NORMAL
+                                g_lastval = Value.Nil
+                                g_has_last = false
+                                return
+                            }
+                        }
+                        w_ms_key = key_id
+                        var nm = vval.new_map()
+                        var nmap = vval.map_set(nm, cur, newv)
+                        if isess.assign(mname, nmap) < 0 {
+                            g_flow = FL_NORMAL
+                            g_lastval = Value.Nil
+                            g_has_last = false
+                            return
+                        }
+                        g_flow = FL_NORMAL
+                        g_lastval = Value.Nil
+                        g_has_last = false
+                        return
+                    }
+                }
+            }
+        }
+    }
+    // 普通表下标赋值（resolve_index_target 路径）
+    if isess.ntag(target) != N_INDEX {
+        w_err = "下标赋值的目标必须是表元素访问（t[i]）"
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return
+    }
+    var base = isess.nchild_at(target, 0)
+    if isess.ntag(base) != N_VAR {
+        w_err = "下标赋值暂只支持单层表变量（t[i]）；二维表元素暂不支持写"
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return
+    }
+    var tname = isess.nname_str(base)
+    var cur = isess.lookup(tname)
+    if w_err != "" {
+        // lookup miss 已置同文本错误（变量未声明）
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return
+    }
+    if vval.type_of(cur) != W_TABLE {
+        w_err = "下标赋值的对象必须是表，实际是 " + vval.type_name(cur)
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return
+    }
+    var idxv = gen_expr(isess.nchild_at(target, 1))
+    if w_err != "" {
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return
+    }
+    if vval.type_of(idxv) != W_INT {
+        w_err = "下标必须是整数"
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return
+    }
+    var idx = vval.int_val(idxv)
+    var cnt = vval.elem_count(cur)
+    // 越界写：负数或超出长度 → 报错（与读取越界同文本）
+    if idx < 0 || idx >= cnt {
+        w_err = "运行时错误: table_at 下标越界：索引 " + to_string(idx) + " 超出长度 " +
+            to_string(cnt)
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return
+    }
+    var newv = Value.Nil
+    if op >= 0 {
+        // 复合赋值：读旧值
+        var old = vval.elem_at(cur, idx)
+        var rv = gen_expr(value_node)
+        if w_err != "" {
+            g_flow = FL_NORMAL
+            g_lastval = Value.Nil
+            g_has_last = false
+            return
+        }
+        newv = eval_binary(op, old, rv)
+        if w_err != "" {
+            g_flow = FL_NORMAL
+            g_lastval = Value.Nil
+            g_has_last = false
+            return
+        }
+    } else {
+        newv = gen_expr(value_node)
+        if w_err != "" {
+            g_flow = FL_NORMAL
+            g_lastval = Value.Nil
+            g_has_last = false
+            return
+        }
+    }
+    var nt = vval.table_set_at(cur, idx, newv)
+    if isess.assign(tname, nt) < 0 {
+        g_flow = FL_NORMAL
+        g_lastval = Value.Nil
+        g_has_last = false
+        return
+    }
+    g_flow = FL_NORMAL
+    g_lastval = Value.Nil
+    g_has_last = false
+}
+
+// 求值表达式：返回 Value；失败置 w_err 返回 Value.Nil（p.9.17.2 拆箱值模型）。
+func gen_expr(id: i64) -> Value {
+    var t = isess.ntag(id)
+    if t == N_INT_LIT {
+        return vval.new_int(isess.nval(id))
+    }
+    if t == N_FLOAT_LIT {
+        // 浮点字面量：lexeme 在名字字段（带引号除外），parse_float 解析
+        return vval.new_float(parse_float(isess.nname_str(id)))
+    }
+    if t == N_STR_LIT {
+        // 字符串字面量：lexeme 带引号，反转义后取纯文本
+        return vval.new_str(vval.unescape_str(isess.nname_str(id)))
+    }
+    if t == N_CHAR_LIT {
+        // 字符字面量：lexeme 带引号 → 码点
+        return vval.new_char(vval.unescape_char(isess.nname_str(id)))
+    }
+    if t == N_BOOL_LIT {
+        return vval.new_bool(isess.nval(id) != 0)
+    }
+    if t == N_TRIT_LIT {
+        return vval.new_trit(isess.nval(id))
+    }
+    if t == N_VAR {
+        // p.9.17.3：直接用 interned id 查找（整数键），错误文本延迟到冷分支才还原
+        var v = isess.lookup_nid(isess.nname(id))
+        if w_err != "" {
+            // lookup_nid miss 已置同文本错误（变量未声明）
+            return Value.Nil
+        }
+        return v
+    }
+    if t == N_UNARY {
+        return gen_unary(id)
+    }
+    if t == N_BINARY {
+        var l = gen_expr(isess.nchild_at(id, 0))
+        if w_err != "" {
+            return Value.Nil
+        }
+        var r = gen_expr(isess.nchild_at(id, 1))
+        if w_err != "" {
+            return Value.Nil
+        }
+        return eval_binary(isess.nval(id), l, r)
+    }
+    if t == N_TERNARY {
+        // 三目运算：短路求值（只求所选分支）
+        var c = gen_expr(isess.nchild_at(id, 0))
+        if w_err != "" {
+            return Value.Nil
+        }
+        var tr = vval.is_truthy(c)
+        if w_err != "" {
+            return Value.Nil
+        }
+        if tr {
+            return gen_expr(isess.nchild_at(id, 1))
+        }
+        return gen_expr(isess.nchild_at(id, 2))
+    }
+    if t == N_RANGE {
+        var s = range_endpoint(isess.nchild_at(id, 0))
+        if w_err != "" {
+            return Value.Nil
+        }
+        var e = range_endpoint(isess.nchild_at(id, 1))
+        if w_err != "" {
+            return Value.Nil
+        }
+        return vval.new_range(s, e, isess.nval(id))
+    }
+    if t == N_IS {
+        // p.9.11 `is` 类型判定（规范 §3.16）：动态类型按 Value 变体匹配
+        //（复用 case 类型 pattern 的 value_matches_ty；child(1) 是类型节点）。
+        var subj = gen_expr(isess.nchild_at(id, 0))
+        if w_err != "" {
+            return Value.Nil
+        }
+        return vval.new_bool(value_matches_ty(subj, isess.nchild_at(id, 1)))
+    }
+    if t == N_BLOCK_PIPE {
+        // p.9.13.4 块管道 `x -> { v -> expr }`（此前仅 AOT 有分派，interp 侧缺
+        // ⇒ 同程序两引擎行为不一致）。语义 = 内联绑定非闭包：压作用域把数据值
+        // 绑定到节点名（对齐 AOT tig_block_pipe 的 scope_put(s_names[id])）→
+        // 求值体 → 弹域。
+        var pdata = gen_expr(isess.nchild_at(id, 0))
+        if w_err != "" {
+            return Value.Nil
+        }
+        isess.scope_push()
+        isess.var_declare(isess.nname_str(id), pdata)
+        var bres = gen_expr(isess.nchild_at(id, 1))
+        isess.scope_pop()
+        if w_err != "" {
+            return Value.Nil
+        }
+        return bres
+    }
+    if t == N_CALL {
+        return gen_call(id)
+    }
+    if t == N_CODE_LIT {
+        // S3.3：准引用求值 → code 值（AST 协议文本）
+        return gen_code_lit(id)
+    }
+    if t == N_CODE_INTERP {
+        // S3.3：插值表达式求值（准引用外的 `$x` = 读取变量 x 的 code/字符串值）
+        var v = isess.lookup_nid(isess.nname(id))
+        if w_err != "" {
+            return Value.Nil
+        }
+        return v
+    }
+    if t == N_INDEX {
+        var b = gen_expr(isess.nchild_at(id, 0))
+        if w_err != "" {
+            return Value.Nil
+        }
+        var i = gen_expr(isess.nchild_at(id, 1))
+        if w_err != "" {
+            return Value.Nil
+        }
+        return eval_index(b, i)
+    }
+    if t == N_TABLE_LIT {
+        return gen_table_lit(id)
+    }
+    if t == N_METHOD_CALL {
+        return gen_method_call(id)
+    }
+    if t == N_TUPLE_LIT {
+        w_err = "REPL v1 暂不支持元组"
+        return Value.Nil
+    }
+    if t == N_FIELD_ACCESS {
+        w_err = "REPL v1 暂不支持字段访问（类/元组）"
+        return Value.Nil
+    }
+    if t == N_TYPE_LIT {
+        w_err = "类型字面量只能用作 switch 的 case 类型匹配"
+        return Value.Nil
+    }
+    if t == N_PATH {
+        w_err = "命名空间路径 '" + path_text(id) + "' 不能作为值使用（只能用于调用）"
+        return Value.Nil
+    }
+    w_err = "内部错误: 未知表达式节点 tag " + to_string(t)
+    return Value.Nil
+}
+
+// 范围表达式端点：必须是整数，否则报错（对齐 Rust "范围起点必须是整数"）。
+func range_endpoint(node: i64) -> i64 {
+    var v = gen_expr(node)
+    if w_err != "" {
+        return 0
+    }
+    if vval.type_of(v) != W_INT {
+        w_err = "范围起点必须是整数"
+        return 0
+    }
+    return vval.int_val(v)
+}
+
+// 一元运算：0=Neg 1=Not 2-5=自增自减（M4）。
+func gen_unary(id: i64) -> Value {
+    var op = isess.nval(id)
+    var operand = isess.nchild_at(id, 0)
+    if op >= 2 && op <= 5 {
+        // 自增/自减：操作数必须是变量（load 当前值 → ±1 → assign 写回）
+        if isess.ntag(operand) != N_VAR {
+            w_err = "自增/自减只支持变量"
+            return Value.Nil
+        }
+        return eval_inc_dec(op, operand)
+    }
+    var v = gen_expr(operand)
+    if w_err != "" {
+        return Value.Nil
+    }
+    if op == 0 {
+        // 一元负号：整数/浮点/trit（trit 平衡取反 -1↔1，0 保持）
+        if vval.type_of(v) == W_TRIT {
+            return vval.new_trit(0 - vval.int_val(v))
+        }
+        if vval.type_of(v) == W_INT {
+            return vval.new_int(0 - vval.int_val(v))
+        }
+        if vval.type_of(v) == W_FLOAT {
+            return vval.new_float(0.0 - vval.float_val(v))
+        }
+        w_err = "一元负号只能作用于数字"
+        return Value.Nil
+    }
+    if op == U_BIT_NOT {
+        if vval.type_of(v) == W_INT {
+            return vval.new_int(0 - vval.int_val(v) - 1)
+        }
+        w_err = "按位取反只能作用于整数"
+        return Value.Nil
+    }
+    // 逻辑非：布尔取反；trit 取反（-1↔1，0 保持）
+    if vval.type_of(v) == W_BOOL {
+        return vval.new_bool(vval.int_val(v) == 0)
+    }
+    if vval.type_of(v) == W_TRIT {
+        return vval.new_trit(0 - vval.int_val(v))
+    }
+    w_err = "逻辑非只能作用于布尔"
+    return Value.Nil
+}
+
+// 自增/自减（M4）：前缀返回新值，后缀返回旧值。
+func eval_inc_dec(op: i64, operand: i64) -> Value {
+    var nm = isess.nname_str(operand)
+    var cur = isess.lookup(nm)
+    if w_err != "" {
+        // lookup miss 已置同文本错误（变量未声明）
+        return Value.Nil
+    }
+    var newv = Value.Nil
+    var delta: i64 = 1
+    if op == 3 || op == 5 {
+        delta = -1
+    }
+    if vval.type_of(cur) == W_INT {
+        newv = vval.new_int(vval.int_val(cur) + delta)
+    } else if vval.type_of(cur) == W_FLOAT {
+        if delta == 1 {
+            newv = vval.new_float(vval.float_val(cur) + 1.0)
+        } else {
+            newv = vval.new_float(vval.float_val(cur) - 1.0)
+        }
+    } else {
+        w_err = "自增/自减只能作用于数字"
+        return Value.Nil
+    }
+    if isess.assign(nm, newv) < 0 {
+        return Value.Nil
+    }
+    // 前缀（++x/--x）返回新值，后缀（x++/x--）返回旧值
+    if op == 2 || op == 3 {
+        return newv
+    }
+    return cur
+}
+
+}

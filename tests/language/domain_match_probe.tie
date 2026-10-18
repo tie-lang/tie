@@ -1,0 +1,85 @@
+type tie<logic>
+// domain_match_probe.tie —— 域匹配（双锁）正例：四种持证形态 × 五域
+// ============================================================================
+// 域匹配 = 「unsafe = 门禁上下文 + 域凭据」的后半句终于兑现：
+//   · 锁一（门禁）  g_unsafe_depth > 0 —— 必须在 unsafe 块 / unsafe fn 内
+//   · 锁二（凭据）  g_held_caps 含该构造所属域 —— 进了门还要有该域的钥匙
+// 四种持证形态（本文件全部覆盖，故意**不**用文件级授权，以便与负例同形）：
+//   函数级 `#[unsafe.<域>]` · 块级 `unsafe with(<域>) { }` · 块级 `unsafe use g`
+//   （g: guard<域>）· 文件级（见其它测试的文件头 `type tie<角色, unsafe:...>`）
+// 负例见同目录 domain_match_*_neg.tie。
+
+// ---- ① 函数级：#[unsafe.mem] ----
+#[unsafe.mem]
+func fn_level_mem() -> i64 {
+    unsafe {
+        var p = alloc(16)
+        free(p)
+    }
+    return 11
+}
+
+// ---- ② 块级 unsafe with(mem) ----
+unsafe func blk_with_mem() -> i64 {
+    var r: i64 = 0
+    unsafe with(mem) {
+        var p = alloc(16)
+        free(p)
+        r = 22
+    }
+    return r
+}
+
+// ---- ③ 块级 unsafe use g（g: guard<mem>）----
+unsafe func blk_use_mem() -> i64 {
+    var g: guard<mem> = unsafe.get(mem)
+    var r: i64 = 0
+    unsafe use g {
+        var p = alloc(16)
+        free(p)
+        r = 33
+    }
+    return r
+}
+
+// ---- ④ ext 域（块级）----
+unsafe func blk_ext() -> i64 {
+    var h: i64 = 0
+    unsafe with(ext) {
+        h = load_library("kernel32.dll")
+    }
+    return h
+}
+
+// ---- ⑤ raw 域（块级）----
+unsafe func blk_raw() -> i64 {
+    var x: i64 = 0
+    var r: i64 = 0
+    unsafe with(raw) {
+        var p: ptr<i64> = addr_of(x)
+        volatile_store(p, 5)
+        r = volatile_load(p)
+    }
+    return r
+}
+
+func main() {
+    var a: i64 = 0
+    var b: i64 = 0
+    var c: i64 = 0
+    var h: i64 = 0
+    var v: i64 = 0
+    unsafe {
+        a = fn_level_mem()
+        b = blk_with_mem()
+        c = blk_use_mem()
+        h = blk_ext()
+        v = blk_raw()
+    }
+    if a == 11 && b == 22 && c == 33 && h != 0 && v == 5 {
+        println("domain-match PASS (fn 11 with 22 use 33 ext ok raw 5)")
+    } else {
+        println("domain-match FAIL (" + to_string(a) + " " + to_string(b) + " " +
+            to_string(c) + " " + to_string(h) + " " + to_string(v) + ")")
+    }
+}

@@ -1,0 +1,92 @@
+type tie<logic>
+// vparam_deep.tie —— `deep` 值语义形参修饰符（r.1.6.11）
+// ============================================================================
+// 背景：tie 的形参默认**按值**（§13.1），但 struct 里的表字段是指向同一张堆表的
+// **句柄**，于是「改表内容」调用方看得见（惯用法），「改字段本身」看不见——同一处
+// 传参上两种相反的可见性。`deep` 让前者也变成本地行为：
+//
+//   func f(s: S)        s.t 与调用方共享 —— 经句柄改内容，调用方**看得见**
+//   func f(deep s: S)   s.t 是入口克隆的私有副本 —— 改内容也**看不见**
+//
+// 实现：入口对每个表字段**无条件克隆**（tl_tbl$tbl_clone）。不用按 rc 分流的 tbl_cow，
+// 因为 struct 按值拷贝**不会 retain 其表字段**（实测按值传参发射整 struct 的 store，
+// 不含逐字段 retain），rc 不等于别名数，会漏判成「独占」而不克隆。
+//
+// 期望输出（逐行）：
+//   plain: ret=3 len=3 n=0        (默认仍共享)
+//   deep: ret=3 len=2 n=0         (独立)
+//   deep-read: 3
+//   deep-rebind: len=1
+//   VPDEEP PASS
+// ============================================================================
+
+struct S {
+    var n: i64 = 0;
+    var t: table<i64> = [];
+}
+
+// 默认（无修饰）：共享语义不变
+func plain(s: S) -> i64 {
+    var h = s.t
+    table_push(h, 99)
+    return len(h)
+}
+
+// deep：函数内改表内容不影响调用方
+func deepv(deep s: S) -> i64 {
+    var h = s.t
+    table_push(h, 99)
+    s.n = 77
+    return len(h)
+}
+
+// deep + 只读：正常工作（不因修饰而变化）
+func deep_read(deep s: S) -> i64 {
+    return len(s.t)
+}
+
+// deep + 字段重绑定：本来就不外泄（按值传参），加了 deep 仍不外泄
+func deep_rebind(deep s: S) {
+    s.t = table_new_i64()
+    var h = s.t
+    table_push(h, 7)
+}
+
+func main() -> i64 {
+    var fails: i64 = 0
+
+    var a = S(0, [1, 2])
+    var r1 = plain(a)
+    println("plain: ret=" + to_string(r1) + " len=" + to_string(len(a.t)) + " n=" + to_string(a.n))
+    if r1 != 3 || len(a.t) != 3 {
+        fails = fails + 1
+    }
+
+    var b = S(0, [1, 2])
+    var r2 = deepv(b)
+    println("deep: ret=" + to_string(r2) + " len=" + to_string(len(b.t)) + " n=" + to_string(b.n))
+    if r2 != 3 || len(b.t) != 2 || b.n != 0 {
+        fails = fails + 1
+    }
+
+    var c = S(5, [1, 2, 3])
+    var r3 = deep_read(c)
+    println("deep-read: " + to_string(r3))
+    if r3 != 3 {
+        fails = fails + 1
+    }
+
+    var d = S(0, [1])
+    deep_rebind(d)
+    println("deep-rebind: len=" + to_string(len(d.t)))
+    if len(d.t) != 1 {
+        fails = fails + 1
+    }
+
+    if fails > 0 {
+        println("VPDEEP FAIL(" + to_string(fails) + ")")
+    } else {
+        println("VPDEEP PASS")
+    }
+    return 0
+}

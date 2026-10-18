@@ -1,0 +1,152 @@
+type tie<class>
+// compiler/dbug/dbgem_diag.tie —— 结构化输出·diag 阶段 dump（p.9.22.4）
+// ============================================================
+// 诊断列式投影（设计稿 §3：文本报错 = 诊断 record 的一种渲染投影）：
+//   200 codes（E/W 标号）· 201 severity（0=E 1=W）· 202 line · 203 col ·
+//   204 end_line · 205 end_col（v1：无结束位模型，= line/col 近似）·
+//   206 arg_off（args 段偏移）· 207 args（可变尾段，扁平）·
+//   208 fix_hints（警告建议；错误恒空）· 209 names（消息名）·
+//   210 file_ids（警告所属模块；错误 = 检查时模块或 0）·
+//   211 rendered（每条诊断的完整渲染文本——消费端（LSP 等）直接取用的 message）
+// 行序：主错误（如有）在前，警告按语义收集序随后；211 与行序一一对应。
+
+namespace dbgem {
+
+// 解析 "ERR:<line> <col> <msg>" → 本槽（driver 解析失败路径注入；
+// 也接受任意非 ERR 文本 = 整串当消息、位置 -1）。
+pub func set_err_proto(proto: string) {
+    dg_err_line = -1
+    dg_err_col = -1
+    dg_err_msg = ""
+    var n = str_len(proto)
+    if n == 0 {
+        return
+    }
+    if n <= 4 || str_char(proto, 0) != "E" || str_char(proto, 1) != "R" || str_char(proto, 2) != "R" || str_char(proto, 3) != ":" {
+        dg_err_msg = proto
+        return
+    }
+    var i: i64 = 4
+    var lv: i64 = 0
+    var okd: i64 = 0
+    while i < n {
+        var d = char_code(str_char(proto, i))
+        if d < 48 || d > 57 {
+            break
+        }
+        lv = lv * 10 + (d - 48)
+        okd = okd + 1
+        i = i + 1
+    }
+    if okd == 0 || i >= n || str_char(proto, i) != " " {
+        dg_err_msg = proto
+        return
+    }
+    i = i + 1
+    var cv: i64 = 0
+    var okc: i64 = 0
+    while i < n {
+        var d2 = char_code(str_char(proto, i))
+        if d2 < 48 || d2 > 57 {
+            break
+        }
+        cv = cv * 10 + (d2 - 48)
+        okc = okc + 1
+        i = i + 1
+    }
+    if okc == 0 || i >= n || str_char(proto, i) != " " {
+        dg_err_msg = proto
+        return
+    }
+    dg_err_line = lv
+    dg_err_col = cv
+    dg_err_msg = str.slice(proto, i + 1, n)
+}
+
+// diag 阶段列构建。
+pub func build_diag() {
+    cols_reset()
+    var nw = semantic.warn_count()
+    // 主错误来源优先级：解析错误槽 > 语义错误槽
+    var emsg = ""
+    var eline: i64 = -1
+    var ecol: i64 = -1
+    var efid: i64 = 0
+    if str_len(dg_err_msg) > 0 {
+        emsg = dg_err_msg
+        eline = dg_err_line
+        ecol = dg_err_col
+    } else if str_len(sm_err_msg) > 0 {
+        emsg = sm_err_msg
+        eline = sm_err_line
+        ecol = sm_err_col
+        if sm_cur_file > 0 {
+            efid = sm_cur_file
+        }
+    }
+    var has_err: i64 = 0
+    if str_len(emsg) > 0 {
+        has_err = 1
+    }
+    var codes: table<string> = table_new_string()
+    var sevs: table<i64> = table_new_i64()
+    var lns: table<i64> = table_new_i64()
+    var cls: table<i64> = table_new_i64()
+    var elns: table<i64> = table_new_i64()
+    var ecls: table<i64> = table_new_i64()
+    var aoffs: table<i64> = table_new_i64()
+    var args: table<string> = table_new_string()
+    var tips: table<string> = table_new_string()
+    var nms: table<string> = table_new_string()
+    var fids: table<i64> = table_new_i64()
+    var rs: table<string> = table_new_string()
+    if has_err == 1 {
+        table_push(codes, diagcode.code_of(emsg))
+        table_push(sevs, 0)
+        table_push(lns, eline)
+        table_push(cls, ecol)
+        table_push(elns, eline)
+        table_push(ecls, ecol)
+        table_push(aoffs, len(args))
+        var tl = diagcode.tail_of(emsg)
+        if str_len(tl) > 0 {
+            table_push(args, tl)
+        }
+        table_push(tips, "")
+        table_push(nms, diagcode.name_of(emsg))
+        table_push(fids, efid)
+        table_push(rs, diagcode.render_error(eline, ecol, emsg))
+    }
+    var i: i64 = 0
+    while i < nw {
+        var m = semantic.warn_msg_at(i)
+        var l = semantic.warn_line_at(i)
+        var c = semantic.warn_col_at(i)
+        table_push(codes, diagcode.warn_code_of(m))
+        table_push(sevs, 1)
+        table_push(lns, l)
+        table_push(cls, c)
+        table_push(elns, l)
+        table_push(ecls, c)
+        table_push(aoffs, len(args))
+        table_push(tips, diagcode.warn_tip_of(m))
+        table_push(nms, diagcode.warn_name_of(m))
+        table_push(fids, semantic.warn_file_at(i))
+        table_push(rs, diagcode.render_warning(l, c, m))
+        i = i + 1
+    }
+    push_col_str_text(200, "codes", codes)
+    push_col_i64(201, "severity", sevs)
+    push_col_i64(202, "line", lns)
+    push_col_i64(203, "col", cls)
+    push_col_i64(204, "end_line", elns)
+    push_col_i64(205, "end_col", ecls)
+    push_col_i64(206, "arg_off", aoffs)
+    push_col_str_text(207, "args", args)
+    push_col_str_text(208, "fix_hints", tips)
+    push_col_str_text(209, "names", nms)
+    push_col_i64(210, "file_ids", fids)
+    push_col_str_text(211, "rendered", rs)
+}
+
+}   // namespace dbgem

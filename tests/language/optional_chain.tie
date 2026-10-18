@@ -1,0 +1,61 @@
+type tie<logic>
+
+// ============================================================
+// p.8.1.5 + p.8.2.1 可空链验收（路线 2：增强 Option，不引入 T?，保「无 null」）：
+//   `?:` 安全默认值 / `a?[i]` 安全索引 / 链式传播（unwrap 糖 = `?` 解包 + `?:`）
+//
+// 覆盖场景：
+//   1. `?:` 默认值：Option<i64> ?: T（Some 解包 / None 用默认值）
+//   2. `?:` 默认值：Option<string>
+//   3. `a?[i]` 安全索引：Some 且界内 → Option.Some(v)；越界 → Option.None
+//   4. `a?[i]` None 传播：Option.None 安全索引 → Option.None
+//   5. 嵌套可空链：Option<table<table<i64>>> 二级 `?[i]?[j]`（越界逐级 None）
+//   6. `?:` 与三目 `cond ? a : b` 语法不冲突
+//   7. unwrap 语法糖：`?` 解包（Option 函数内）与 `?:` 默认值组合
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   42 / -1 / hi / def / 20 / -1 / -1 / 5 / -1 / 100 / 7 / -1
+// ============================================================
+import "/std/result.tie"
+
+// 可空链结果作为函数返回（Option 传播）
+func safe_first2(t: Option<table<i64>>) -> Option<i64> {
+    return t?[0]
+}
+
+func main() {
+    // 1. ?: 默认值（i64）
+    var o1: Option<i64> = Option.Some(42)
+    var o2: Option<i64> = Option.None
+    println(o1 ?: -1)   // 42
+    println(o2 ?: -1)   // -1
+    // 2. ?: 默认值（string）
+    var s1: Option<string> = Option.Some("hi")
+    var s2: Option<string> = Option.None
+    println(s1 ?: "def")  // hi
+    println(s2 ?: "def")  // def
+    // 3-4. a?[i] 安全索引（Some 界内 / 越界 / None）
+    var t1: Option<table<i64>> = Option.Some([10, 20, 30])
+    var t2: Option<table<i64>> = Option.None
+    println(t1?[1] ?: -1)  // 20
+    println(t1?[9] ?: -1)  // -1（越界 → None）
+    println(t2?[0] ?: -1)  // -1（None 传播）
+    // 5. 嵌套可空链：二级安全索引
+    var g: Option<table<table<i64>>> = Option.Some([[1, 2], [3, 4, 5]])
+    println(g?[1]?[2] ?: -1)  // 5
+    println(g?[0]?[9] ?: -1)  // -1（内层越界）
+    // 6. 三元不受影响
+    var c = 5 > 3 ? 100 : 200
+    println(c)  // 100
+    // 7. 链式：可空链结果再 ? 解包（Option 返回函数内）
+    var t3: Option<table<i64>> = Option.Some([7])
+    switch safe_first2(t3) {
+        case Some(v): println(v)  // 7
+        case None: println(-1)
+    }
+    var t4: Option<table<i64>> = Option.None
+    switch safe_first2(t4) {
+        case Some(v): println(v)
+        case None: println(-1)   // -1（None 传播到函数返回）
+    }
+}

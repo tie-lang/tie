@@ -1,0 +1,558 @@
+type tie<class>
+// compiler/backend/irgen_archive.tie —— 生成器 L3：归档格式辅助（gzip 头、tar 解包、untar_gz、zip EOCD、unzip）
+// ============================================================
+// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// tar 数据块 512 字节对齐填充
+func tig_pad512(size: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    return s21_bin(2, s21_bin(3, s21_bin(0, size, tig_int_lit(511)), tig_int_lit(512)), tig_int_lit(512))
+}
+// a + "/" + b（路径拼接，'/' 兼容 Windows）
+func tig_join_slash(a: i64, b: i64) -> i64 {
+    var hv = s21_sb_new()
+    s21_sb_append(hv, a)
+    s21_sb_append_byte(hv, tig_int_lit(47))
+    s21_sb_append(hv, b)
+    return s21_sb_build(hv)
+}
+// 取目录名：p 中最后一个 '/' 或 '\' 之前的子串（无分隔符 → ""）
+func tig_dirname(p: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var ST = types.named(TK_STR)
+    var n = s21_str_head_len(p)
+    var rs = ir.new_inst(g_cur_block, 20, ST)
+    ir.add_operand(rs, ST, 2)
+    var rp = ir.get_value(rs)
+    s21_store(rp, tig_str_lit(interner.intern("\"\"")), ST)
+    var ia = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ia, T64, 2)
+    var ip = ir.get_value(ia)
+    s21_store(ip, s21_bin(1, n, tig_int_lit(1)), T64)  // n-1
+    var hd = ir.new_block(g_cur_func, interner.intern("dn.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("dn.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("dn.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var iv = s21_load(ip, T64)
+    var ige = tig_icmp_c(iv, tig_int_lit(0), 5)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, ige, 0)
+    ir.add_operand(cb, bd, 1)
+    ir.add_operand(cb, ex, 1)
+    g_cur_block = bd
+    var iv2 = s21_load(ip, T64)
+    var b = s21_str_byte(p, iv2)
+    var s1 = tig_icmp_c(b, tig_int_lit(47), 0)
+    var s2 = tig_icmp_c(b, tig_int_lit(92), 0)
+    var issep = tig_or_i1(s1, s2)
+    var bF = ir.new_block(g_cur_func, interner.intern("dn.f"))
+    var bI = ir.new_block(g_cur_func, interner.intern("dn.i"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, issep, 0)
+    ir.add_operand(cb2, bF, 1)
+    ir.add_operand(cb2, bI, 1)
+    g_cur_block = bF
+    s21_store(rp, s21_str_sub_bytes(p, tig_int_lit(0), iv2), ST)
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, ex, 1)
+    g_cur_block = bI
+    s21_store(ip, s21_bin(1, iv2, tig_int_lit(1)), T64)  // i--
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)
+    g_cur_block = ex
+    return s21_load(rp, ST)
+}
+// gzip 头跳过（RFC 1952）：magic 1f 8b + CM=8；解析可选字段（FEXTRA bit2 /
+// FNAME bit3 / FCOMMENT bit4 / FHCRC bit1）返回 DEFLATE 数据偏移。
+// 无分支（select 折算游标前进量）；srclen 约束 cstr_len 读界。游标槽 psp。
+func tig_gzip_skip_header(src: i64, srclen: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var ps = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ps, T64, 2)
+    var psp = ir.get_value(ps)
+    s21_store(psp, tig_int_lit(10), T64)
+    // FLG = src[3]（固定头 10 字节：ID1 ID2 CM FLG MTIME[4] XFL OS）
+    var flg = s21_zext(s21_load(s21_gep(src, 3, true), I8), I8)
+    // FEXTRA（bit2）：u16 XLEN@10；跳过 2+XLEN（无该位时读出值被 select 丢弃）
+    var hasExtra = tig_icmp_c(s21_bin(6, flg, tig_int_lit(4)), tig_int_lit(0), 1)
+    var xlen = tig_le_u16(src, tig_int_lit(10))
+    var skipE = tig_select_i(hasExtra, s21_bin(0, tig_int_lit(2), xlen), tig_int_lit(0), T64)
+    var pos1 = s21_load(psp, T64)
+    s21_store(psp, s21_bin(0, pos1, skipE), T64)
+    // FNAME（bit3）：NUL 终止串；跳过 len+1
+    var hasName = tig_icmp_c(s21_bin(6, flg, tig_int_lit(8)), tig_int_lit(0), 1)
+    var pos2 = s21_load(psp, T64)
+    var max2 = s21_bin(1, srclen, pos2)  // srclen - pos2（读界）
+    var nlen = tig_cstr_len(src, pos2, max2)
+    var skipN = tig_select_i(hasName, s21_bin(0, nlen, tig_int_lit(1)), tig_int_lit(0), T64)
+    s21_store(psp, s21_bin(0, pos2, skipN), T64)
+    // FCOMMENT（bit4）：NUL 终止串；跳过 len+1
+    var hasCmt = tig_icmp_c(s21_bin(6, flg, tig_int_lit(16)), tig_int_lit(0), 1)
+    var pos3 = s21_load(psp, T64)
+    var max3 = s21_bin(1, srclen, pos3)
+    var clen = tig_cstr_len(src, pos3, max3)
+    var skipC = tig_select_i(hasCmt, s21_bin(0, clen, tig_int_lit(1)), tig_int_lit(0), T64)
+    s21_store(psp, s21_bin(0, pos3, skipC), T64)
+    // FHCRC（bit1）：2 字节 CRC16
+    var hasCrc = tig_icmp_c(s21_bin(6, flg, tig_int_lit(2)), tig_int_lit(0), 1)
+    var pos4 = s21_load(psp, T64)
+    var skipH = tig_select_i(hasCrc, tig_int_lit(2), tig_int_lit(0), T64)
+    s21_store(psp, s21_bin(0, pos4, skipH), T64)
+    return s21_load(psp, T64)
+}
+// tar（ustar）容器解析：data[0..dlen) 逐 512B 头；结果 i1 写 rs_p。
+// 支持 typeflag：'0'/'\0' 文件、'5' 目录、'L' GNU 长名、其它跳过。
+func tig_tar_extract(data: i64, dlen: i64, dest: i64, rs_p: i64) {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var ST = types.named(TK_STR)
+    var TB = types.named(TK_BOOL)
+    s21_store(rs_p, tig_bool_lit(0), TB)
+    tig_mkdir_all(dest)
+    var os = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(os, T64, 2)
+    var osp = ir.get_value(os)
+    var ps = ir.new_inst(g_cur_block, 20, ST)
+    ir.add_operand(ps, ST, 2)
+    var psp = ir.get_value(ps)
+    var hp = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(hp, T64, 2)
+    var hpp = ir.get_value(hp)
+    var ns = ir.new_inst(g_cur_block, 20, ST)
+    ir.add_operand(ns, ST, 2)
+    var nsp = ir.get_value(ns)
+    s21_store(osp, tig_int_lit(0), T64)
+    s21_store(psp, tig_int_lit(0), ST)
+    s21_store(hpp, tig_int_lit(0), T64)
+    s21_store(nsp, tig_str_lit(interner.intern("\"\"")), ST)
+    var hd = ir.new_block(g_cur_func, interner.intern("tx.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("tx.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("tx.x"))
+    var bProc = ir.new_block(g_cur_func, interner.intern("tx.p"))
+    var bL = ir.new_block(g_cur_func, interner.intern("tx.l"))
+    var bNotL = ir.new_block(g_cur_func, interner.intern("tx.nl"))
+    var bUseP = ir.new_block(g_cur_func, interner.intern("tx.up"))
+    var bUseH = ir.new_block(g_cur_func, interner.intern("tx.uh"))
+    var bName = ir.new_block(g_cur_func, interner.intern("tx.nm"))
+    var bPf = ir.new_block(g_cur_func, interner.intern("tx.pf"))
+    var bNoPf = ir.new_block(g_cur_func, interner.intern("tx.np"))
+    var bDir = ir.new_block(g_cur_func, interner.intern("tx.d"))
+    var bNotDir = ir.new_block(g_cur_func, interner.intern("tx.nd"))
+    var bFile = ir.new_block(g_cur_func, interner.intern("tx.f"))
+    var bSkip = ir.new_block(g_cur_func, interner.intern("tx.s"))
+    var bAdv = ir.new_block(g_cur_func, interner.intern("tx.a"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var ov = s21_load(osp, T64)
+    var room = tig_icmp_c(s21_bin(0, ov, tig_int_lit(512)), dlen, 4)  // off+512 <= dlen
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, room, 0)
+    ir.add_operand(cb, bd, 1)
+    ir.add_operand(cb, ex, 1)
+    g_cur_block = bd
+    var ov2 = s21_load(osp, T64)
+    var nb = s21_zext(s21_load(s21_gep(data, ov2, false), I8), I8)
+    var zflag = tig_icmp_c(nb, tig_int_lit(0), 0)
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, zflag, 0)
+    ir.add_operand(cb2, ex, 1)
+    ir.add_operand(cb2, bProc, 1)
+    // 处理头
+    g_cur_block = bProc
+    var ov3 = s21_load(osp, T64)
+    var tf = s21_zext(s21_load(s21_gep(data, s21_bin(0, ov3, tig_int_lit(156)), false), I8), I8)
+    var size = tig_parse_octal(data, s21_bin(0, ov3, tig_int_lit(124)), tig_int_lit(12))
+    var data_off = s21_bin(0, ov3, tig_int_lit(512))
+    var isL = tig_icmp_c(tf, tig_int_lit(76), 0)  // 'L'
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, isL, 0)
+    ir.add_operand(cb3, bL, 1)
+    ir.add_operand(cb3, bNotL, 1)
+    // 'L'：读长名
+    g_cur_block = bL
+    var nmlen = tig_cstr_len(data, data_off, size)
+    var longname = tig_bytes_sub(data, data_off, nmlen)
+    s21_store(psp, longname, ST)
+    s21_store(hpp, tig_int_lit(1), T64)
+    var padl = tig_pad512(size)
+    s21_store(osp, s21_bin(0, s21_bin(0, ov3, tig_int_lit(512)), padl), T64)
+    var brl = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brl, hd, 1)
+    // 非 'L'：名字来源
+    g_cur_block = bNotL
+    var hv = s21_load(hpp, T64)
+    var hasp = tig_icmp_c(hv, tig_int_lit(0), 1)
+    var cb4 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb4, hasp, 0)
+    ir.add_operand(cb4, bUseP, 1)
+    ir.add_operand(cb4, bUseH, 1)
+    g_cur_block = bUseP
+    s21_store(nsp, s21_load(psp, ST), ST)
+    s21_store(hpp, tig_int_lit(0), T64)
+    var bru = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bru, bName, 1)
+    g_cur_block = bUseH
+    var pfxlen = tig_cstr_len(data, s21_bin(0, ov3, tig_int_lit(345)), tig_int_lit(155))
+    var nm0 = tig_cstr_len(data, ov3, tig_int_lit(100))
+    var hdrname = tig_bytes_sub(data, ov3, nm0)
+    var pfx = tig_bytes_sub(data, s21_bin(0, ov3, tig_int_lit(345)), pfxlen)
+    var pfxgt = tig_icmp_c(pfxlen, tig_int_lit(0), 3)
+    var cb5 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb5, pfxgt, 0)
+    ir.add_operand(cb5, bPf, 1)
+    ir.add_operand(cb5, bNoPf, 1)
+    g_cur_block = bPf
+    s21_store(nsp, tig_join_slash(pfx, hdrname), ST)
+    var brp = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brp, bName, 1)
+    g_cur_block = bNoPf
+    s21_store(nsp, hdrname, ST)
+    var brn2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brn2, bName, 1)
+    // 名字就绪：构造 dest/name，按 typeflag 处理
+    g_cur_block = bName
+    var nmv = s21_load(nsp, ST)
+    var full = tig_join_slash(dest, nmv)
+    var isdir = tig_icmp_c(tf, tig_int_lit(53), 0)  // '5'
+    var cb6 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb6, isdir, 0)
+    ir.add_operand(cb6, bDir, 1)
+    ir.add_operand(cb6, bNotDir, 1)
+    g_cur_block = bDir
+    tig_mkdir_all(full)
+    var brd2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brd2, bAdv, 1)
+    g_cur_block = bNotDir
+    var isf0 = tig_icmp_c(tf, tig_int_lit(48), 0)  // '0'
+    var isfn = tig_icmp_c(tf, tig_int_lit(0), 0)   // '\0'
+    var isfile = tig_or_i1(isf0, isfn)
+    var cb7 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb7, isfile, 0)
+    ir.add_operand(cb7, bFile, 1)
+    ir.add_operand(cb7, bSkip, 1)
+    g_cur_block = bFile
+    var parent = tig_dirname(full)
+    tig_mkdir_all(parent)
+    tig_write_region(full, data, data_off, size)
+    var brf5 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf5, bAdv, 1)
+    g_cur_block = bSkip
+    var brs2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs2, bAdv, 1)
+    // 推进
+    g_cur_block = bAdv
+    var pad = tig_pad512(size)
+    s21_store(osp, s21_bin(0, s21_bin(0, ov3, tig_int_lit(512)), pad), T64)
+    var bra = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bra, hd, 1)
+    g_cur_block = ex
+    s21_store(rs_p, tig_bool_lit(1), TB)
+}
+// untar_gz(tar_gz_path, dest_dir) → bool：gzip 解压 + tar 提取。
+// 流程：读文件 → 检 gzip magic（1f 8b）→ gzip 则跳过头 + inflate_raw →
+// tar_extract 解出数据；非 gzip 则按未压缩 tar 兜底直解。成功 true 失败 false。
+func tig_untar_gz(tar_path: i64, dest: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var ST = types.named(TK_STR)
+    var TB = types.named(TK_BOOL)
+    var rslt = ir.new_inst(g_cur_block, 20, TB)
+    ir.add_operand(rslt, TB, 2)
+    var rv = ir.get_value(rslt)
+    s21_store(rv, tig_bool_lit(0), TB)
+    var fdata = tig_read_file(tar_path)
+    var flen = s21_str_head_len(fdata)
+    // 空文件/读取失败 → false（保持失败返回语义）
+    var nz = tig_icmp_c(flen, tig_int_lit(0), 3)  // flen > 0
+    var bNz = ir.new_block(g_cur_func, interner.intern("ut.nz"))
+    var bEm = ir.new_block(g_cur_func, interner.intern("ut.em"))
+    var bM = ir.new_block(g_cur_func, interner.intern("ut.m"))
+    var cb0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb0, nz, 0)
+    ir.add_operand(cb0, bNz, 1)
+    ir.add_operand(cb0, bEm, 1)
+    g_cur_block = bEm
+    s21_store(rv, tig_bool_lit(0), TB)
+    var brE = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brE, bM, 1)
+    g_cur_block = bNz
+    // gzip magic：b0==0x1F && b1==0x8B
+    var b0 = s21_zext(s21_load(s21_gep(fdata, 0, true), I8), I8)
+    var b1 = s21_zext(s21_load(s21_gep(fdata, 1, true), I8), I8)
+    var m0 = tig_icmp_c(b0, tig_int_lit(31), 0)   // 0x1F
+    var m1 = tig_icmp_c(b1, tig_int_lit(139), 0)  // 0x8B
+    var isgz = tig_and_i1(m0, m1)
+    var bGz = ir.new_block(g_cur_func, interner.intern("ut.gz"))
+    var bTar = ir.new_block(g_cur_func, interner.intern("ut.tar"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, isgz, 0)
+    ir.add_operand(cb, bGz, 1)
+    ir.add_operand(cb, bTar, 1)
+    // ---- gzip 路径：跳过头 → inflate_raw → tar_extract ----
+    g_cur_block = bGz
+    var dstart = tig_gzip_skip_header(fdata, flen)
+    var dlen = s21_bin(1, s21_bin(1, flen, tig_int_lit(8)), dstart)  // flen-8-dstart（尾 CRC32+ISIZE）
+    var osb = s21_sb_new()
+    var ok = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ok, T64, 2)
+    var okp = ir.get_value(ok)
+    s21_store(okp, tig_int_lit(0), T64)
+    tig_inflate_raw(s21_gep(fdata, dstart, false), dlen, osb, okp)
+    var okv = s21_load(okp, T64)
+    var oknz = tig_icmp_c(okv, tig_int_lit(0), 1)
+    var bIok = ir.new_block(g_cur_func, interner.intern("ut.io"))
+    var bIbad = ir.new_block(g_cur_func, interner.intern("ut.ib"))
+    var bTx = ir.new_block(g_cur_func, interner.intern("ut.tx"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, oknz, 0)
+    ir.add_operand(cb2, bIok, 1)
+    ir.add_operand(cb2, bIbad, 1)
+    // inflate 成功：解出数据 → tar 提取
+    g_cur_block = bIok
+    var outs = s21_sb_build(osb)
+    var olen = s21_str_head_len(outs)
+    var okr = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(okr, T64, 2)
+    var okrp = ir.get_value(okr)
+    s21_store(okrp, tig_int_lit(0), T64)
+    tig_tar_extract(outs, olen, dest, okrp)
+    var okrv = s21_load(okrp, T64)
+    var okrnz = tig_icmp_c(okrv, tig_int_lit(0), 1)
+    s21_store(rv, okrnz, TB)
+    var brI = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brI, bTx, 1)
+    // inflate 失败：false
+    g_cur_block = bIbad
+    s21_store(rv, tig_bool_lit(0), TB)
+    var brB = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brB, bTx, 1)
+    g_cur_block = bTx
+    var brTx = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brTx, bM, 1)
+    // ---- tar 兜底路径（非 gzip：未压缩 tar 直解）----
+    g_cur_block = bTar
+    var okr2 = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(okr2, T64, 2)
+    var okr2p = ir.get_value(okr2)
+    s21_store(okr2p, tig_int_lit(0), T64)
+    tig_tar_extract(fdata, flen, dest, okr2p)
+    var okr2v = s21_load(okr2p, T64)
+    var okr2nz = tig_icmp_c(okr2v, tig_int_lit(0), 1)
+    s21_store(rv, okr2nz, TB)
+    var brB2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brB2, bM, 1)
+    // ---- 结束 ----
+    g_cur_block = bM
+    return s21_load(rv, TB)
+}
+// 从文件尾部向前找 EOCD 签名 "PK\x05\x06"；返回偏移（-1 未找到）
+func tig_zip_find_eocd(data: i64, dlen: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var rs = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(rs, T64, 2)
+    var rp = ir.get_value(rs)
+    var ia = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ia, T64, 2)
+    var ip = ir.get_value(ia)
+    s21_store(rp, tig_int_lit(-1), T64)
+    s21_store(ip, s21_bin(1, dlen, tig_int_lit(22)), T64)  // dlen-22
+    var hd = ir.new_block(g_cur_func, interner.intern("ze.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("ze.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("ze.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var iv = s21_load(ip, T64)
+    var ige = tig_icmp_c(iv, tig_int_lit(0), 5)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, ige, 0)
+    ir.add_operand(cb, bd, 1)
+    ir.add_operand(cb, ex, 1)
+    g_cur_block = bd
+    var iv2 = s21_load(ip, T64)
+    var s0 = tig_icmp_c(s21_zext(s21_load(s21_gep(data, iv2, false), I8), I8), tig_int_lit(80), 0)  // 'P'
+    var s1 = tig_icmp_c(s21_zext(s21_load(s21_gep(data, s21_bin(0, iv2, tig_int_lit(1)), false), I8), I8), tig_int_lit(75), 0)  // 'K'
+    var s2 = tig_icmp_c(s21_zext(s21_load(s21_gep(data, s21_bin(0, iv2, tig_int_lit(2)), false), I8), I8), tig_int_lit(5), 0)
+    var s3 = tig_icmp_c(s21_zext(s21_load(s21_gep(data, s21_bin(0, iv2, tig_int_lit(3)), false), I8), I8), tig_int_lit(6), 0)
+    var sig = tig_and_i1(tig_and_i1(tig_and_i1(s0, s1), s2), s3)
+    var bF = ir.new_block(g_cur_func, interner.intern("ze.f"))
+    var bI = ir.new_block(g_cur_func, interner.intern("ze.i"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, sig, 0)
+    ir.add_operand(cb2, bF, 1)
+    ir.add_operand(cb2, bI, 1)
+    g_cur_block = bF
+    s21_store(rp, iv2, T64)
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, ex, 1)
+    g_cur_block = bI
+    s21_store(ip, s21_bin(1, iv2, tig_int_lit(1)), T64)
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)
+    g_cur_block = ex
+    return s21_load(rp, T64)
+}
+// unzip(zip_path, dest_dir) → bool：EOCD + 中央目录 + 本地头；stored/deflate 提取
+func tig_unzip(zip_path: i64, dest: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var ST = types.named(TK_STR)
+    var TB = types.named(TK_BOOL)
+    var rslt = ir.new_inst(g_cur_block, 20, TB)
+    ir.add_operand(rslt, TB, 2)
+    var rv = ir.get_value(rslt)
+    s21_store(rv, tig_bool_lit(0), TB)
+    var fdata = tig_read_file(zip_path)
+    var flen = s21_str_head_len(fdata)
+    var eocd = tig_zip_find_eocd(fdata, flen)
+    var eok = tig_icmp_c(eocd, tig_int_lit(0), 5)
+    var bOk = ir.new_block(g_cur_func, interner.intern("uz.ok"))
+    var bBad = ir.new_block(g_cur_func, interner.intern("uz.b"))
+    var bM = ir.new_block(g_cur_func, interner.intern("uz.m"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, eok, 0)
+    ir.add_operand(cb, bOk, 1)
+    ir.add_operand(cb, bBad, 1)
+    g_cur_block = bBad
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, bM, 1)
+    // 解析中央目录
+    g_cur_block = bOk
+    var cd_off = tig_le_u32(fdata, s21_bin(0, eocd, tig_int_lit(16)))
+    var entries = tig_le_u16(fdata, s21_bin(0, eocd, tig_int_lit(10)))
+    tig_mkdir_all(dest)
+    var ef = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ef, T64, 2)
+    var efp = ir.get_value(ef)
+    var cp = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(cp, T64, 2)
+    var cpp = ir.get_value(cp)
+    var ki = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ki, T64, 2)
+    var kip = ir.get_value(ki)
+    s21_store(efp, tig_int_lit(0), T64)
+    s21_store(cpp, cd_off, T64)
+    s21_store(kip, tig_int_lit(0), T64)
+    var hd = ir.new_block(g_cur_func, interner.intern("uz.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("uz.b2"))
+    var ex = ir.new_block(g_cur_func, interner.intern("uz.x"))
+    var bDir = ir.new_block(g_cur_func, interner.intern("uz.d"))
+    var bND = ir.new_block(g_cur_func, interner.intern("uz.nd"))
+    var bSt = ir.new_block(g_cur_func, interner.intern("uz.st"))
+    var bNst = ir.new_block(g_cur_func, interner.intern("uz.ns"))
+    var bDf = ir.new_block(g_cur_func, interner.intern("uz.df"))
+    var bUn = ir.new_block(g_cur_func, interner.intern("uz.un"))
+    var bDo = ir.new_block(g_cur_func, interner.intern("uz.do"))
+    var bDff = ir.new_block(g_cur_func, interner.intern("uz.df2"))
+    var bDfd = ir.new_block(g_cur_func, interner.intern("uz.dd"))
+    var bAdv = ir.new_block(g_cur_func, interner.intern("uz.a"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var kv = s21_load(kip, T64)
+    var klt = tig_icmp_c(kv, entries, 2)
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, klt, 0)
+    ir.add_operand(cb2, bd, 1)
+    ir.add_operand(cb2, ex, 1)
+    g_cur_block = bd
+    var pos = s21_load(cpp, T64)
+    var method = tig_le_u16(fdata, s21_bin(0, pos, tig_int_lit(10)))
+    var csize = tig_le_u32(fdata, s21_bin(0, pos, tig_int_lit(20)))
+    var fname_len = tig_le_u16(fdata, s21_bin(0, pos, tig_int_lit(28)))
+    var extra_len = tig_le_u16(fdata, s21_bin(0, pos, tig_int_lit(30)))
+    var comment_len = tig_le_u16(fdata, s21_bin(0, pos, tig_int_lit(32)))
+    var local_off = tig_le_u32(fdata, s21_bin(0, pos, tig_int_lit(42)))
+    var lfname_len = tig_le_u16(fdata, s21_bin(0, local_off, tig_int_lit(26)))
+    var lextra_len = tig_le_u16(fdata, s21_bin(0, local_off, tig_int_lit(28)))
+    var nm = tig_bytes_sub(fdata, s21_bin(0, local_off, tig_int_lit(30)), lfname_len)
+    var data_off = s21_bin(0, s21_bin(0, s21_bin(0, local_off, tig_int_lit(30)), lfname_len), lextra_len)
+    var nlen = s21_str_head_len(nm)
+    var ngt = tig_icmp_c(nlen, tig_int_lit(0), 3)
+    var lastb = s21_str_byte(nm, s21_bin(1, nlen, tig_int_lit(1)))
+    var issl = tig_icmp_c(lastb, tig_int_lit(47), 0)
+    var isdir = tig_and_i1(ngt, issl)
+    var full = tig_join_slash(dest, nm)
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, isdir, 0)
+    ir.add_operand(cb3, bDir, 1)
+    ir.add_operand(cb3, bND, 1)
+    g_cur_block = bDir
+    tig_mkdir_all(full)
+    var brd = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brd, bAdv, 1)
+    g_cur_block = bND
+    var parent = tig_dirname(full)
+    tig_mkdir_all(parent)
+    var m0 = tig_icmp_c(method, tig_int_lit(0), 0)
+    var cb4 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb4, m0, 0)
+    ir.add_operand(cb4, bSt, 1)
+    ir.add_operand(cb4, bNst, 1)
+    g_cur_block = bSt
+    tig_write_region(full, fdata, data_off, csize)
+    var brs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs, bAdv, 1)
+    g_cur_block = bNst
+    var m8 = tig_icmp_c(method, tig_int_lit(8), 0)
+    var cb5 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb5, m8, 0)
+    ir.add_operand(cb5, bDf, 1)
+    ir.add_operand(cb5, bUn, 1)
+    g_cur_block = bUn
+    s21_store(efp, tig_int_lit(1), T64)
+    var bru = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bru, bAdv, 1)
+    // deflate 条目
+    g_cur_block = bDf
+    var osb = s21_sb_new()
+    var ok = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ok, T64, 2)
+    var okp = ir.get_value(ok)
+    s21_store(okp, tig_int_lit(0), T64)
+    tig_inflate_raw(s21_gep(fdata, data_off, false), csize, osb, okp)
+    var okv = s21_load(okp, T64)
+    var oknz = tig_icmp_c(okv, tig_int_lit(0), 1)
+    var cb6 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb6, oknz, 0)
+    ir.add_operand(cb6, bDo, 1)
+    ir.add_operand(cb6, bDff, 1)
+    g_cur_block = bDo
+    var outs = s21_sb_build(osb)
+    tig_write_file(full, outs, false)
+    var brd2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brd2, bDfd, 1)
+    g_cur_block = bDff
+    s21_store(efp, tig_int_lit(1), T64)
+    var brdf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brdf, bDfd, 1)
+    g_cur_block = bDfd
+    var brdd = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brdd, bAdv, 1)
+    // 推进
+    g_cur_block = bAdv
+    var npos = s21_bin(0, s21_bin(0, s21_bin(0, s21_bin(0, pos, tig_int_lit(46)), fname_len), extra_len), comment_len)
+    s21_store(cpp, npos, T64)
+    var kk = s21_load(kip, T64)
+    s21_store(kip, s21_bin(0, kk, tig_int_lit(1)), T64)
+    var bra = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bra, hd, 1)
+    // 结束
+    g_cur_block = ex
+    var efv = s21_load(efp, T64)
+    var okall = tig_icmp_c(efv, tig_int_lit(0), 0)
+    s21_store(rv, okall, TB)
+    var brx = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brx, bM, 1)
+    g_cur_block = bM
+    return s21_load(rv, TB)
+}
+}

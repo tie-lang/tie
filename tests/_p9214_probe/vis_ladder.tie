@@ -1,0 +1,16 @@
+// tests/_p9214_probe/vis_ladder.tie —— p.9.21.4 II1 可见性梯度试点探针
+// ============================================================
+// 复现形态：顶层 main 调用命名空间内**非 pub** 函数。
+//   --visibility=a1a  → 编译通过（A1a 全开放）
+//   默认 / a1b / a1c / a1d → E00332（ns 级私有拦截）
+// 该文件同时记录「顶层函数豁免不适用于跨 ns 调用」的语义边界：
+// 豁免只针对**定义在顶层**的函数被跨 ns 调用，不针对 ns 内私有函数。
+namespace util {
+    func helper() -> i64 {
+        return 7
+    }
+}
+
+func main() -> i64 {
+    return util.helper()
+}

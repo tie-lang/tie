@@ -1,0 +1,20 @@
+type tie<logic>
+// tests/_array_probe/array_bad_probe.tie —— L1 负例探针（每项应编译失败）
+// 逐项启用验证编译期拒绝；正常时应全部报错。
+
+func fill(z: ref array<f32, 8>) {
+    z[0] = 1.0
+}
+
+func main() {
+    var a: array<f32, 8> = array_init(0.0)
+    // 1. 元素个数不匹配（3 个元素 vs 长度 2）
+    var b: array<f32, 2> = [1.0, 2.0, 3.0]
+    b[0] = 1.0
+    // 3. 元素类型不匹配（string 赋给 f32 数组）
+    var c: array<f32, 2> = ["x", "y"]
+    c[0] = 1.0
+    // 4. 长度为 0
+    var d: array<f32, 0> = array_init(0.0)
+    d[0] = 1.0
+}

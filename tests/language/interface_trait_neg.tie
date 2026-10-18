@@ -1,0 +1,30 @@
+type tie<logic>
+
+// ============================================================
+// p.9.11.21 负例：struct 缺少 interface 方法 → 泛型约束不满足报错
+// error[E#####]：类型 'Bad' 未实现 interface 'Drawable'（缺少方法 'draw'）
+// ============================================================
+
+interface Drawable {
+    pub func draw(self)
+    pub func area(self) -> i64
+}
+
+struct Bad {
+    var x: i64 = 0
+}
+namespace Bad {
+    // 只实现 area，缺 draw → 不满足 Drawable
+    pub func area(self: Bad) -> i64 {
+        return self.x
+    }
+}
+
+func area_of<T: Drawable>(x: T) -> i64 {
+    return x.area()
+}
+
+func main() {
+    var b = Bad()
+    println(area_of(b))
+}

@@ -1,0 +1,77 @@
+type tie<class>
+// compiler/frontend/sinfer_ret_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sinfer_ret.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace sinfer {
+// ---------- S1.3 checked_* 返回元组登记 ----------
+// (T, bool) 二元组类型 id：查重（已登记直接返回）或追加登记
+// （tup_offs/tup_n/tup_names/tup_tys/tuple_tys 为 sstate 顶层全局，
+// 与 stype.parse_type_node 的 tuple 登记同布局）。irgen 的 cmpxchg 提取也复用。
+pub func tuple2_of(t0: i64, t1: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(tuple_tys) {
+        var off = tup_offs[i]
+        if tup_n[i] == 2 && tup_tys[off] == t0 && tup_tys[off + 1] == t1 {
+            return tuple_tys[i]
+        }
+        i = i + 1
+    }
+    var idx = len(tuple_tys)
+    var off2 = len(tup_names)
+    table_push(tup_offs, off2)
+    table_push(tup_n, 2)
+    table_push(tuple_tys, types.tuple_of(idx))
+    table_push(tup_names, -1)
+    table_push(tup_tys, t0)
+    table_push(tup_names, -1)
+    table_push(tup_tys, t1)
+    return types.tuple_of(idx)
+}
+
+// P2a 调用表达式 `t[0](5)`：被调者为 fn 值表达式（children[0]）。
+// 校验：被调者类型是 fn；实参个数/类型逐个匹配；返回类型 = fn 返回类型。
+pub func infer_call_expr(id: i64) -> i64 {
+    var cal = sstate.child(id, 0)
+    var fty = infer_expr(cal)
+    if fty < 0 {
+        return -1
+    }
+    if !types.is_fn(fty) {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "调用表达式要求被调者为函数类型，实际是 " + types.type_name(fty)
+        return -1
+    }
+    var nc = sstate.nchild(id)
+    var nargs = nc - 1
+    var fn_np = types.fn_nparams_of(fty)
+    if nargs != fn_np {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "调用表达式期望 " + to_string(fn_np) + " 个参数，实际 " + to_string(nargs)
+        return -1
+    }
+    var kf: i64 = 1
+    while kf < nc {
+        var want = types.fn_param_of(fty, kf - 1)
+        var at = infer_expr(sstate.child(id, kf))
+        if at < 0 {
+            return -1
+        }
+        if !stype.types_compatible(want, at) && !stype.types_match(want, at, sstate.child(id, kf)) &&
+            !stype.types_narrow_int(want, at, sstate.child(id, kf)) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "调用表达式第 " + to_string(kf) + " 个实参类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+            return -1
+        }
+        kf = kf + 1
+    }
+    var frt = types.fn_ret_ty(fty)
+    node_types[id] = frt
+    g_typed = g_typed + 1
+    return frt
+}
+
+}

@@ -1,0 +1,51 @@
+type tie<logic>
+
+// 全局表（无 esc 独占证明 ⇒ 编译期走**带锁**入口，不经 push 内联快路径）
+var g_src: table<i64> = [1, 2, 3, 4, 5]
+var g_dst: table<i64> = []
+var g_z: table<i64> = []
+var g_k: table<i64> = []
+// appfuse_ext_probe.tie —— appfuse 扩展形状行为探针（带锁形状 + 常量填充）
+// ============================================================
+// 覆盖（结果口径；融合与否都必须给出同一结果）：
+//   * 安全代码（无 unsafe:lock）的拷贝循环 / 零填充循环（带锁变体）
+//   * 常量填充循环（K≠0；i64 常量）
+//   * unsafe:lock 下的常量填充（_nl 变体）
+// 期望输出（逐行精确）：
+//   cp=5:1,5
+//   z=7:0
+//   k=5:42,42
+//   k2=4:7,100
+// 审计参考（TIEC_APFUSE_AUDIT=1）：全局零填充循环应打印 "P2 zeros locked"；
+// 局部（_nl）形状因 push 已由 codegen 内联而不再进入融合（见 passes_p3.tie 头注释）。
+func main() {
+    // ---- 安全代码：全局目标拷贝循环（带锁 append_tbl）----
+    var i1: i64 = 0
+    while i1 < len(g_src) {
+        table_push(g_dst, g_src[i1])
+        i1 = i1 + 1
+    }
+    println("cp=" + to_string(len(g_dst)) + ":" + to_string(g_dst[0]) + "," + to_string(g_dst[4]))
+    // ---- 安全代码：全局目标零填充循环（带锁 append_zeros）----
+    var i2: i64 = 0
+    while i2 < 7 {
+        table_push(g_z, 0)
+        i2 = i2 + 1
+    }
+    println("z=" + to_string(len(g_z)) + ":" + to_string(g_z[6]))
+    // ---- 安全代码：全局目标常量填充（K≠0；带锁 repeat_v）----
+    var i3: i64 = 0
+    while i3 < 5 {
+        table_push(g_k, 42)
+        i3 = i3 + 1
+    }
+    println("k=" + to_string(len(g_k)) + ":" + to_string(g_k[0]) + "," + to_string(g_k[4]))
+    // ---- 非 0 起点追加（局部表，_nl 内联路径，结果口径一致）----
+    var k2: table<i64> = [7]
+    var i4: i64 = 0
+    while i4 < 3 {
+        table_push(k2, 100)
+        i4 = i4 + 1
+    }
+    println("k2=" + to_string(len(k2)) + ":" + to_string(k2[0]) + "," + to_string(k2[3]))
+}

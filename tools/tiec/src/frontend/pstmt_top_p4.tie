@@ -1,0 +1,104 @@
+type tie<class>
+// compiler/frontend/pstmt_top_p4.tie —— 分片 4（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 pstmt_top.tie。
+namespace pstmt_top {
+// `enum Name [<T1, T2>] { VariantA VariantB(i64, string) }`（ADT 枚举，2026-08-15）
+// 泛型（对齐 struct）：enum 名后紧跟类型参数列表；产出 N_ENUM
+// children = [泛型槽(-1或N_TYPE_PARAMS), EnumVariant...]。
+// 每个变体 = N_ENUM_VARIANT[name=变体名, children=[payload 类型...]]；
+// 无 payload 变体 children 为空。p.9.12.5：变体分隔符放宽为可选——`;` / `,` /
+// 无（空格或直接空位，下一变体名或 '}' 前）三种均可，语义互不影响；原有换行
+// 分隔由 ASI 自动补 `;`（lexer finish_line）照旧工作。payload 类型逐个用
+// pexpr_type.parse_type() 解析（可为内建泛型/struct 引用，一期白名单由语义层
+// 校验；payload 括号内逗号已在 parse_type 循环消费，变体间逗号是括号外上下文，
+// 安全区分）。
+func parse_enum() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // enum
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    var type_params = -1
+    if putil.peek_tag() == lex_lt {
+        type_params = parse_type_params()
+        if type_params < 0 {
+            return -1
+        }
+    }
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var variants: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if tag == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else {
+            // 变体：`VariantA` 或 `VariantB(i64, string)`
+            var vline = putil.peek_line()
+            var vcol = putil.peek_col()
+            var vname = putil.expect_ident()
+            if vname < 0 {
+                return -1
+            }
+            var ptys: table<i64> = table_new_i64()
+            if putil.eat(lex_lparen) {
+                if !putil.eat(lex_rparen) {
+                    var d = false
+                    while !d {
+                        var pty = pexpr_type.parse_type()
+                        if pty < 0 {
+                            return -1
+                        }
+                        table_push(ptys, pty)
+                        if putil.eat(lex_comma) {
+                            // 继续
+                        } else {
+                            if !putil.expect(lex_rparen, "')'") {
+                                return -1
+                            }
+                            d = true
+                        }
+                    }
+                }
+            }
+            // p.9.12.5：变体分隔符可选——`;` / `,` / 无（空格或下一变体名/`}` 前
+            // 直接空位）三种均可。换行分隔由 ASI 自动补 `;`，此处 eat 即消费；
+            // 逗号分隔显式 eat（payload 括号内逗号已被 parse_type 消费完，不会误吞）；
+            // 二者都没有则直接进入下一轮循环（同行空格分隔 / `}` 前无分隔符）。
+            // 非法 token（如 `A = 5`）不进 eat 分支，由下一轮 expect_ident 给出
+            // 清晰诊断「期望标识符，实际是 …」。
+            if putil.eat(lex_semi) {
+                // 分号分隔
+            } else if putil.eat(lex_comma) {
+                // 逗号分隔
+            }
+            var v = ast.new_node(N_ENUM_VARIANT, vname, -1, -1, vline, vcol)
+            ast.set_children(v, ptys)
+            table_push(variants, v)
+        }
+    }
+    var e = ast.new_node(N_ENUM, name, -1, -1, line, col)
+    var ekids: table<i64> = table_new_i64()
+    table_push(ekids, type_params)
+    var vi: i64 = 0
+    while vi < len(variants) {
+        table_push(ekids, variants[vi])
+        vi = vi + 1
+    }
+    ast.set_children(e, ekids)
+    return e
+}
+
+}

@@ -1,0 +1,158 @@
+type tie<logic>
+// tests/wav_probe/wav_probe.tie —— p.9.1.1.7 验收：ext/audio/wav（纯 tie 全量）。
+// 全离线确定性探针：
+//   1. PCM16 往返：encode_pcm(16bit) → decode → 头字段 + read_raw 逐样本一致；
+//   2. PCM 8/24/32 往返（read_raw 一致，含 8 位无符号）；
+//   3. float32 往返：encode_f32 → decode → samples 与原值误差 < 1e-4；
+//   4. 混音 mix / 增益 gain（钳位）行为；
+//   5. 非法/截断输入返回 ok=false。
+// 期望全部 PASS / exit 0。
+import "/ext/audio/wav.tie" as wav
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func feqd(a: f64, b: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = -d
+    }
+    return d < 0.0001
+}
+
+// ==================== 1) PCM16 往返 ====================
+func section_pcm16() {
+    var ints = table_new_i64()
+    table_push(ints, 0)
+    table_push(ints, 16384)
+    table_push(ints, -32768)
+    table_push(ints, 32767)
+    table_push(ints, -8192)
+    table_push(ints, 12345)
+    var bytes = wav.encode_pcm(ints, 2, 44100, 16)
+    var w = wav.decode(bytes)
+    check(w.ok, "pcm16 decode ok")
+    check(w.channels == 2 && w.rate == 44100, "pcm16 channels/rate")
+    check(w.bits == 16 && w.fmt == 1, "pcm16 bits/fmt")
+    check(w.sample_count == len(ints), "pcm16 sample_count")
+    var allsame = true
+    var i: i64 = 0
+    while i < len(ints) {
+        if wav.read_raw(w, i) != ints[i] {
+            allsame = false
+        }
+        i = i + 1
+    }
+    check(allsame, "pcm16 read_raw all samples identical")
+    // 归一化核对：32767 → ~0.99997
+    check(feqd(w.samples[3], 32767.0 / 32768.0), "pcm16 normalized sample[3]")
+}
+
+// ==================== 2) PCM 8/24/32 往返 ====================
+func section_pcm_others() {
+    // 8 位无符号
+    var b8 = table_new_i64()
+    table_push(b8, 0)
+    table_push(b8, 128)
+    table_push(b8, 255)
+    var w8 = wav.decode(wav.encode_pcm(b8, 1, 8000, 8))
+    check(w8.ok && w8.bits == 8, "pcm8 decode ok/bits")
+    check(w8.sample_count == 3 && wav.read_raw(w8, 0) == 0 && wav.read_raw(w8, 2) == 255, "pcm8 read_raw")
+    // 24 位有符号
+    var b24 = table_new_i64()
+    table_push(b24, 0)
+    table_push(b24, 8388607)
+    table_push(b24, -8388608)
+    table_push(b24, 123456)
+    var w24 = wav.decode(wav.encode_pcm(b24, 1, 48000, 24))
+    check(w24.ok && w24.bits == 24, "pcm24 decode ok/bits")
+    check(wav.read_raw(w24, 0) == 0 && wav.read_raw(w24, 1) == 8388607 &&
+          wav.read_raw(w24, 2) == -8388608 && wav.read_raw(w24, 3) == 123456, "pcm24 read_raw all")
+    // 32 位有符号
+    var b32 = table_new_i64()
+    table_push(b32, -2147483648)
+    table_push(b32, 2147483647)
+    table_push(b32, 0)
+    var w32 = wav.decode(wav.encode_pcm(b32, 1, 96000, 32))
+    check(w32.ok && wav.read_raw(w32, 0) == -2147483648 && wav.read_raw(w32, 1) == 2147483647, "pcm32 read_raw")
+}
+
+// ==================== 3) float32 往返 ====================
+func section_float32() {
+    var fs = table_new_f64()
+    table_push(fs, 0.5)
+    table_push(fs, -0.25)
+    table_push(fs, 0.3333)
+    table_push(fs, 1.0)
+    table_push(fs, -1.0)
+    var bytes = wav.encode_f32(fs, 1, 22050)
+    var w = wav.decode(bytes)
+    check(w.ok, "float32 decode ok")
+    check(w.fmt == 3 && w.bits == 32 && w.rate == 22050, "float32 fmt/bits/rate")
+    check(w.sample_count == len(fs), "float32 sample_count")
+    var okc = true
+    var i: i64 = 0
+    while i < len(fs) {
+        if feqd(w.samples[i], fs[i]) == false {
+            okc = false
+        }
+        i = i + 1
+    }
+    check(okc, "float32 roundtrip samples matched (|diff|<1e-4)")
+}
+
+// ==================== 4) 混音 / 增益 ====================
+func section_mixgain() {
+    var a = table_new_f64()
+    table_push(a, 0.6)
+    table_push(a, 0.8)
+    var b = table_new_f64()
+    table_push(b, 0.6)
+    table_push(b, 0.5)
+    var m = wav.mix(a, b)
+    check(len(m) == 2 && feqd(m[0], 1.0) && feqd(m[1], 1.0), "mix clamps at 1.0")
+    var g = wav.gain(a, 2.0)
+    check(feqd(g[0], 1.0) && feqd(g[1], 1.0), "gain clamps at 1.0")
+    var g2 = wav.gain(m, 0.5)
+    check(feqd(g2[0], 0.5) && feqd(g2[1], 0.5), "gain scales and clamps")
+}
+
+// ==================== 5) 非法 / 截断 ====================
+func section_invalid() {
+    var e1 = wav.decode(table_new_i64())
+    check(e1.ok == false && str_len(e1.err) > 0, "decode empty -> ok=false")
+    var bad = table_new_i64()
+    var i: i64 = 0
+    while i < 16 {
+        table_push(bad, 0x11)
+        i = i + 1
+    }
+    var e2 = wav.decode(bad)
+    check(e2.ok == false, "decode junk magic -> ok=false")
+    // 非法位深编码返回空表
+    var e3 = wav.encode_pcm(table_new_i64(), 1, 44100, 12)
+    check(len(e3) == 0, "encode_pcm bad bits -> empty")
+}
+
+func main() {
+    println("start")
+    section_pcm16()
+    section_pcm_others()
+    section_float32()
+    section_mixgain()
+    section_invalid()
+    if fails == 0 {
+        println("PASS")
+    } else {
+        println("FAIL count=" + to_string(fails))
+    }
+    println("done")
+}

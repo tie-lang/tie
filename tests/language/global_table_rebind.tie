@@ -1,0 +1,52 @@
+type tie<logic>
+// global_table_rebind.tie —— p.9.16 全局表重绑定的引用计数正确性（回归探针）
+// ============================================================
+// 背景（RCA）：`irgen_stmt_gen_p2.tie` 的表赋值插桩原判据含 `tgt_global <= 0`
+// ——「全局目标永驻不 release」⇒ 每次「全局表被重新赋值」泄漏整张旧表
+// （隔离实测：峰值 2.43 GB / 30 万次）。修好后**必须同时**守住另一半：
+// 全局表被重绑定时，**别名方仍持有旧表** ⇒ 旧值 release 后不得被提前释放（悬垂）。
+//
+// 断言（逐项独立，最后汇总）：
+//   ① 别名可读：`var a = g` 后 `g = <新表>`，a 仍持有旧表且内容不变；
+//   ② 新值可读：g 指向新表且内容正确；
+//   ③ 循环内反复重绑定 1000 次后结果稳定（既验证不崩，也覆盖泄漏路径）。
+func main() -> i64 {
+    var g: table<i64> = []
+    table_push(g, 1)
+    var a = g                     // 别名：a 与 g 共享（retain）
+    table_push(a, 7)
+    g = table_new_i64()           // 覆盖 g：旧表归 a 持有，不得释放
+    table_push(g, 8)
+
+    var ok: i64 = 0
+    if len(a) == 2 {
+        if a[0] == 1 {
+            if a[1] == 7 {
+                ok = ok + 1
+            }
+        }
+    }
+    if len(g) == 1 {
+        if g[0] == 8 {
+            ok = ok + 1
+        }
+    }
+    var i: i64 = 0
+    while i < 1000 {
+        var t = table_new_i64()
+        table_push(t, i)
+        g = t
+        i = i + 1
+    }
+    if len(g) == 1 {
+        if g[0] == 999 {
+            ok = ok + 1
+        }
+    }
+    if ok == 3 {
+        println("PASS: global_table_rebind（别名安全 + 重绑定 1000 次结果稳定）")
+        return 0
+    }
+    println("FAIL: global_table_rebind ok=" + to_string(ok) + " (期望 3)")
+    return 1
+}

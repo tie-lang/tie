@@ -1,0 +1,669 @@
+type tie<class>
+// compiler/middle/tieir_slice.tie —— p.9.21.6-2 模块级 tieir 片段（模块化缓存写侧）
+// ============================================================
+// 把当前单元的 IR 按「来源模块」切分序列化：单模块的函数 + 其块/指令/操作数/
+// 关联符号与导出行。p.9.21.11 起片段为 **v3 紧凑二进制**（u32 小端 + UTF-8
+// 字符串，见 tieir_fmt_v3.tie 头注）——与全量 v2 .tir 格式分轨，读侧只有
+// 装配器 asm_parse_slice（v3 片段不可经 tieir.read 反序列化）。
+//
+// # 片段重建原理（重映射表；函数表按模块**不**连续——菱形导入使展开顺序
+//   main→a→shared→b 的函数表序为 [main, shared, a, b]，模块 id 序与表序
+//   不一致，故不能纯算术平移）
+//   - 函数：按原序取 frag_fn_mods == mod_id 的子集 → 新 id = 子集序号；
+//   - 块：按原序取「所属函数被选中」的子集 → 新 id 独立重编（映射表）；
+//   - 指令：按原序取「属于选中块」的子集 → 新 id 独立重编（映射表）；
+//     块的新 start/end = 其指令段的新区间（预扫累计）；
+//   - 值：SSA 值函数局部（参数在 new_func 领号、结果随指令领号，函数内
+//     连续）→ 每函数独立平移：new = vbase(i) + (old - v_start(i))，其中
+//     v_start = 参数段首值（无参取首个结果值），vbase = 前序选中函数的
+//     值数累计；与 tieir.deserialize 的自然重建逐字段一致（offsets/值编号
+//     是 roundtrip 校验项，公式见 tieir_ser.deserialize 段 5）；
+//   - 操作数：kind 0（值）按所属函数平移；kind 1（块）查块映射；其余
+//     （立即数/池 id/全局名）原样。
+//   跨函数值引用（SSA 违例）→ 拒绝写入（err_msg），driver 侧降级为该模块
+//   片段缺失，单元级缓存不受影响。
+//
+// # 归属注入（语言边界）
+//   中端不 import driver：driver 计算函数归属（ir.func_name → sstate.fn_sig →
+//   sig_module）后经 set_fn_mods 注入平行表（表按值传参拷贝，函数数规模）。
+//   未注入或规模不符 → 拒绝写入。
+//
+// # 过滤池说明（p.9.21.8）
+//   片段字符串池 = **引用过滤 + 保序压缩**（不再全量快照）：被引用池 id 来自
+//   函数名/块名、符号表选中行（name/sig）、导出表选中行（name/sig）、指令
+//   操作数 kind 3（OK_GLOBAL 全局名）、以及 kind 0 载荷池 id 的操作数①
+//   （const_str(62)/const_f(51)/call(35)/extern_call(36)/call_vararg(41)——
+//   与 llvmgen collect_strings/collect_externs 的消费清单对齐）。写入时全部
+//   池 id 同步重映射到片段内新下标（保序压缩），未标记 id 触响亮失败。
+//
+// # pub 方法全集（增删须同步 ROAD）
+//   set_fn_mods(m)（driver 注入归属）/ write_mod_slice(path, mod_id, src_path,
+//   src_fp) -> bool / err_msg 转承 tieir_ser。
+//
+// 自检：middle/tieir_test.tie 追加片段 roundtrip 用例（2 函数 2 模块 →
+// 写模块 1 片段 → 反序列化 → 结构断言）。
+
+import "./tieir_ser.tie"
+import "./tieir_fmt_v3.tie"
+import "./ir_blkattr.tie"
+
+// 函数归属平行表（下标 = ir 函数 id，值 = 来源模块 id；空表 = 未注入）。
+var frag_fn_mods: table<i64>;
+
+namespace tieir {
+
+// driver 注入归属平行表（表按值传参，整表拷贝一次，函数数规模）。
+pub func set_fn_mods(m: table<i64>) {
+    frag_fn_mods = m
+}
+
+// 池引用标记（收集阶段）：合法 id 置 used[id]=1；越界/负 id 记错误返回 0
+//（防御：kind 3 / 池载荷操作数①必须携带合法池 id，否则响亮失败）。
+// used 须 ref 传参（tie 表按值传参——值语义下标记写进副本即丢失）。
+func pool_mark(used: ref table<i64>, id: i64) -> i64 {
+    if id < 0 || id >= len(used) {
+        set_err("片段池引用越界（池 id " + to_string(id) + "）")
+        return 0
+    }
+    used[id] = 1
+    return 1
+}
+
+// 池 id 重映射写入（写入阶段）：id 经 pool_map 映射后写 u32 v3；越界/未标记
+// 记错误返回 0（调用方立即中止写入——不允许静默错位）。
+func wr_pool_mapped(t: ref table<i64>, pm: table<i64>, id: i64) -> i64 {
+    if id < 0 || id >= len(pm) {
+        set_err("片段池引用越界（池 id " + to_string(id) + "）")
+        return 0
+    }
+    if pm[id] < 0 {
+        set_err("片段池引用未标记（池 id " + to_string(id) + "）")
+        return 0
+    }
+    wr_u32(t, pm[id])
+    return 1
+}
+
+// 写模块 mod_id 的 tieir 片段到 path。src_path/src_fp 写入模块头依赖段
+// （片段自述来源）。成功 true；失败 false（err_msg 取因）。
+pub func write_mod_slice(path: string, mod_id: i64, src_path: string, src_fp: string) -> bool {
+    tieir_err = ""
+    var nf = ir.func_count()
+    if len(frag_fn_mods) != nf {
+        set_err("片段归属表未注入或规模不符（" + to_string(len(frag_fn_mods)) + "/" + to_string(nf) + "）")
+        return false
+    }
+    // ---- 选中函数集（原序）----
+    var sel_fn: table<i64> = table_new_i64()
+    var fi: i64 = 0
+    while fi < nf {
+        if frag_fn_mods[fi] == mod_id {
+            table_push(sel_fn, fi)
+        }
+        fi = fi + 1
+    }
+    var n_sel = len(sel_fn)
+    // 函数重映射表（原 id → 子集序号；未选中 = -1）
+    var fn_new: table<i64> = table_new_i64()
+    fi = 0
+    while fi < nf {
+        table_push(fn_new, -1)
+        fi = fi + 1
+    }
+    var i: i64 = 0
+    while i < n_sel {
+        fn_new[sel_fn[i]] = i
+        i = i + 1
+    }
+    // ---- 块/指令重映射 + 每函数值信息（预扫）----
+    // 选中块的平行表（原 id 顺 / 新 id 顺）与其新指令区间
+    var blk_new: table<i64> = table_new_i64()   // 原 id → 新 id（未选中 -1）
+    var bi: i64 = 0
+    var nb = ir.block_count()
+    while bi < nb {
+        table_push(blk_new, -1)
+        bi = bi + 1
+    }
+    var inst_new: table<i64> = table_new_i64()  // 原 id → 新 id（未选中 -1）
+    var ii: i64 = 0
+    var ni = ir.inst_count()
+    while ii < ni {
+        table_push(inst_new, -1)
+        ii = ii + 1
+    }
+    // 每选中函数：v_start（值起点=最小值 id）/ v_max（最大值 id）/ 值数 / 操作数总数
+    // p.9.21.10：值域跨度（max-min+1）替代值数（count）作压缩基数——irgen 交错
+    // 生成时他函数的值会插进本函数值域内部（span > count），按 count 累计的
+    // f_vbase 会让相邻函数的片段值域**交叠**（值 id 碰撞 → 装配错值）。
+    var f_vstart: table<i64> = table_new_i64()
+    var f_vmax: table<i64> = table_new_i64()
+    var f_vsize: table<i64> = table_new_i64()
+    var f_opcnt: table<i64> = table_new_i64()
+    var f_vset: table<i64> = table_new_i64()    // v_start 是否已定（0/1）
+    i = 0
+    while i < n_sel {
+        table_push(f_vstart, -1)
+        table_push(f_vmax, -1)
+        table_push(f_vsize, 0)
+        table_push(f_opcnt, 0)
+        table_push(f_vset, 0)
+        i = i + 1
+    }
+    // 块预扫（表序）：选中块分配新 id。
+    var sel_blk_cnt: i64 = 0
+    var sel_inst_cnt: i64 = 0
+    var blk_nstart: table<i64> = table_new_i64()
+    var blk_nend: table<i64> = table_new_i64()
+    bi = 0
+    while bi < nb {
+        var bf = ir.block_func(bi)
+        var si = -1
+        if bf >= 0 && bf < nf {
+            si = fn_new[bf]
+        }
+        if si >= 0 {
+            blk_new[bi] = sel_blk_cnt
+            sel_blk_cnt = sel_blk_cnt + 1
+        }
+        bi = bi + 1
+    }
+    // p.9.21.10（D5 根治，方案 A）：指令流改**按指令 id 序（= 创建序）**写，
+    // 块归属由「选中块区间回填」唯一确定（勘察：区间互不交叠，每指令恰属
+    // 一块；irgen 乱序建块只造成块表序 ≠ id 序，不再需要拒写护栏）。
+    // 归属表（inst_total 大小，-1 = 非本模块指令）：同指令被两个选中块同时
+    // 认领（= 区间交叠，irgen 缺陷，C' 断言正常应拦截）→ 拒写。
+    // p.9.21.11 §5.1：归属逻辑统一到 ir.blk_attr_fill（区间回填、表序后者
+    // 覆盖）；交叠/越界经访问器读取——片段写要求唯一归属（D5 检测器语义
+    // 逐位保留：越界/交叠均拒写，错误定位信息一致）。
+    var n_inst = ir.inst_count()
+    var sel_flag: table<i64> = table_new_i64()
+    bi = 0
+    while bi < nb {
+        if blk_new[bi] >= 0 {
+            table_push(sel_flag, 1)
+        } else {
+            table_push(sel_flag, 0)
+        }
+        bi = bi + 1
+    }
+    var sel_of: table<i64> = ir.blk_attr_fill(n_inst, sel_flag)
+    if ir.blk_attr_badrange_cnt() > 0 {
+        set_err("片段块区间越界（块 " + to_string(ir.blk_attr_badrange_blk()) + "）")
+        return false
+    }
+    if ir.blk_attr_overlap_cnt() > 0 {
+        set_err("片段块区间交叠（指令 " + to_string(ir.blk_attr_overlap_inst()) + " 双重归属）")
+        return false
+    }
+    // id 序单遍：新流序号 + 每函数统计（v_start 取最小值——不再依赖遍历序）
+    var ii4: i64 = 0
+    while ii4 < n_inst {
+        var ba = sel_of[ii4]
+        if ba >= 0 {
+            var sfi2 = fn_new[ir.block_func(ba)]
+            inst_new[ii4] = sel_inst_cnt
+            sel_inst_cnt = sel_inst_cnt + 1
+            var iv2 = ir.ins_val(ii4)
+            if iv2 >= 0 {
+                if f_vset[sfi2] == 0 || iv2 < f_vstart[sfi2] {
+                    f_vstart[sfi2] = iv2
+                    f_vset[sfi2] = 1
+                }
+                if f_vmax[sfi2] < 0 || iv2 > f_vmax[sfi2] {
+                    f_vmax[sfi2] = iv2
+                }
+                f_vsize[sfi2] = f_vsize[sfi2] + 1
+            }
+            f_opcnt[sfi2] = f_opcnt[sfi2] + ir.ins_ops_cnt(ii4)
+        }
+        ii4 = ii4 + 1
+    }
+    // 选中块的新指令区间（新流中各块指令连续；空块记 -1）
+    bi = 0
+    while bi < nb {
+        if blk_new[bi] >= 0 {
+            var bs3 = ir.block_start(bi)
+            var be3 = ir.block_end(bi)
+            if bs3 == be3 {
+                table_push(blk_nstart, -1)
+                table_push(blk_nend, -1)
+            } else {
+                table_push(blk_nstart, inst_new[bs3])
+                table_push(blk_nend, inst_new[be3 - 1] + 1)
+            }
+        }
+        bi = bi + 1
+    }
+    // 参数计值（v_start 无参时取 param_val；v_size 含参数）
+    i = 0
+    while i < n_sel {
+        var f = sel_fn[i]
+        var pc = ir.func_params_cnt(f)
+        if pc > 0 {
+            // 参数在 new_func 时先于本函数任何结果值领号 → v_start 恒为参数段首值
+            f_vstart[i] = ir.param_val(f, 0)
+            f_vset[i] = 1
+            if f_vmax[i] < f_vstart[i] + pc - 1 {
+                f_vmax[i] = f_vstart[i] + pc - 1
+            }
+            f_vsize[i] = f_vsize[i] + pc
+            f_opcnt[i] = f_opcnt[i] + pc
+        } else {
+            if f_vset[i] == 0 {
+                // 无参无结果：值域空，v_start 置 -1（无值引用可发生）
+                f_vstart[i] = -1
+                f_vset[i] = 1
+            }
+        }
+        i = i + 1
+    }
+    // 每函数值基址/操作数基址累计（p.9.21.10：值基址按**跨度**累计）
+    var f_vbase: table<i64> = table_new_i64()
+    var f_obase: table<i64> = table_new_i64()
+    var vcum: i64 = 0
+    var ocum: i64 = 0
+    i = 0
+    while i < n_sel {
+        table_push(f_vbase, vcum)
+        table_push(f_obase, ocum)
+        // 跨度 = v_max - v_start + 1（无值 = 0）；各函数片段值域因此互不交叠
+        if f_vstart[i] >= 0 && f_vmax[i] >= f_vstart[i] {
+            vcum = vcum + (f_vmax[i] - f_vstart[i] + 1)
+        }
+        ocum = ocum + f_opcnt[i]
+        i = i + 1
+    }
+    // ---- 池过滤（p.9.21.8）：引用收集 → 保序压缩映射 ----
+    // 收集范围（与 llvmgen collect_strings/collect_externs 消费清单对齐）：
+    //   函数名/块名；符号表选中行 name/sig；导出表选中行 name/sig；
+    //   操作数 kind 3（全局名）；kind 0 载荷池 id 的操作数①
+    //   （const_str(62)/const_f(51)/call(35)/extern_call(36)/call_vararg(41)）。
+    var pc_pool_n = interner.len()
+    var pc_used: table<i64> = table_new_i64()
+    var pc_i: i64 = 0
+    while pc_i < pc_pool_n {
+        table_push(pc_used, 0)
+        pc_i = pc_i + 1
+    }
+    // 函数名（选中函数）
+    pc_i = 0
+    while pc_i < n_sel {
+        if pool_mark(pc_used, ir.func_name(sel_fn[pc_i])) == 0 {
+            return false
+        }
+        pc_i = pc_i + 1
+    }
+    // 块名（选中块）
+    var pc_bi: i64 = 0
+    while pc_bi < nb {
+        if blk_new[pc_bi] >= 0 {
+            if pool_mark(pc_used, ir.block_name(pc_bi)) == 0 {
+                return false
+            }
+        }
+        pc_bi = pc_bi + 1
+    }
+    // 选中指令操作数：kind 3 / 池载荷操作数①（kind 0 + 特定 opcode）
+    pc_bi = 0
+    while pc_bi < nb {
+        if blk_new[pc_bi] >= 0 {
+            var pc_bs = ir.block_start(pc_bi)
+            var pc_be = ir.block_end(pc_bi)
+            var pc_ii = pc_bs
+            while pc_ii < pc_be {
+                var pc_op = ir.ins_op(pc_ii)
+                var pc_ok: i64 = 0
+                while pc_ok < ir.ins_ops_cnt(pc_ii) {
+                    var pc_kd = ir.ins_opnd_kind(pc_ii, pc_ok)
+                    var pc_is_pool: i64 = 0
+                    if pc_kd == 3 {
+                        pc_is_pool = 1
+                    }
+                    if pc_kd == 0 && pc_ok == 0 {
+                        if pc_op == 62 || pc_op == 51 || pc_op == 35 || pc_op == 36 || pc_op == 41 {
+                            pc_is_pool = 1
+                        }
+                    }
+                    if pc_is_pool == 1 {
+                        if pool_mark(pc_used, ir.ins_opnd(pc_ii, pc_ok)) == 0 {
+                            return false
+                        }
+                    }
+                    pc_ok = pc_ok + 1
+                }
+                pc_ii = pc_ii + 1
+            }
+        }
+        pc_bi = pc_bi + 1
+    }
+    // 符号表选中行 name/sig
+    var pc_si: i64 = 0
+    while pc_si < ir_meta.sym_count() {
+        var pc_m: bool = false
+        if n_sel > 0 {
+            var pc_fk = 0
+            while pc_fk < n_sel {
+                if ir_meta.sym_name(pc_si) == ir.func_name(sel_fn[pc_fk]) {
+                    pc_m = true
+                }
+                pc_fk = pc_fk + 1
+            }
+        }
+        if pc_m {
+            if pool_mark(pc_used, ir_meta.sym_name(pc_si)) == 0 {
+                return false
+            }
+            if pool_mark(pc_used, ir_meta.sym_sig(pc_si)) == 0 {
+                return false
+            }
+        }
+        pc_si = pc_si + 1
+    }
+    // 导出表选中行 name/sig
+    var pc_ei: i64 = 0
+    while pc_ei < ir_meta.export_count() {
+        var pc_m2: bool = false
+        if n_sel > 0 {
+            var pc_fk2 = 0
+            while pc_fk2 < n_sel {
+                if ir_meta.exp_name(pc_ei) == ir.func_name(sel_fn[pc_fk2]) {
+                    pc_m2 = true
+                }
+                pc_fk2 = pc_fk2 + 1
+            }
+        }
+        if pc_m2 {
+            if pool_mark(pc_used, ir_meta.exp_name(pc_ei)) == 0 {
+                return false
+            }
+            if pool_mark(pc_used, ir_meta.exp_sig(pc_ei)) == 0 {
+                return false
+            }
+        }
+        pc_ei = pc_ei + 1
+    }
+    // 保序压缩映射：pool_map[旧 id] = 新 id（未引用 -1）；pool_new_old[新 id] = 旧 id
+    var pool_map: table<i64> = table_new_i64()
+    var pool_new_old: table<i64> = table_new_i64()
+    pc_i = 0
+    while pc_i < pc_pool_n {
+        if pc_used[pc_i] == 1 {
+            table_push(pool_map, len(pool_new_old))
+            table_push(pool_new_old, pc_i)
+        } else {
+            table_push(pool_map, 0 - 1)
+        }
+        pc_i = pc_i + 1
+    }
+    var pool_new_n = len(pool_new_old)
+    // ---- 序列化（v3 紧凑二进制：u32 小端 + UTF-8 字符串；布局见 tieir_fmt_v3 头注） ----
+    tieir_out = table_new_i64()
+    // 段 1：魔数 + v3 版本（u32 LE = 3；与全量 v2 的 8B 大端版本天然可区分）
+    table_push(tieir_out, TIEIR_MAGIC0)
+    table_push(tieir_out, TIEIR_MAGIC1)
+    table_push(tieir_out, TIEIR_MAGIC2)
+    table_push(tieir_out, TIEIR_MAGIC3)
+    table_push(tieir_out, TIEIR_MAGIC4)
+    wr_u32(tieir_out, SLICE_VERSION)
+    // 段 2：模块头（包名标片段；依赖段 = 来源路径 + 指纹，片段自述）
+    var hp = wr_sec3_head(tieir_out, SEC_HEAD)
+    var hs = len(tieir_out)
+    wr_str3(tieir_out, "tiec-modslice")
+    wr_str3(tieir_out, "mod:" + to_string(mod_id))
+    wr_u32(tieir_out, ir_meta.get_ir_version())
+    wr_str3(tieir_out, pool_str(ir_meta.get_compiler_version()))
+    wr_u32(tieir_out, ir_meta.get_tie_opt())
+    wr_u32(tieir_out, ir_meta.get_pass_ver())
+    wr_u32(tieir_out, 1)
+    wr_str3(tieir_out, src_path)
+    wr_str3(tieir_out, src_fp)
+    wr_sec3_end(tieir_out, hp, hs)
+    // 段 3：字符串池（引用过滤 + 保序压缩；新 id = 片段内下标）
+    var sp = wr_sec3_head(tieir_out, SEC_STRPOOL)
+    var ss = len(tieir_out)
+    wr_u32(tieir_out, pool_new_n)
+    var pi: i64 = 0
+    while pi < pool_new_n {
+        wr_str3(tieir_out, interner.name_str(pool_new_old[pi]))
+        pi = pi + 1
+    }
+    wr_sec3_end(tieir_out, sp, ss)
+    // 段 4：符号表（选中函数同名行子集）
+    var yp = wr_sec3_head(tieir_out, SEC_SYMTAB)
+    var ys = len(tieir_out)
+    var sym_sel: i64 = 0
+    var si: i64 = 0
+    while si < ir_meta.sym_count() {
+        var matched: bool = false
+        if n_sel > 0 {
+            var fk = 0
+            while fk < n_sel {
+                if ir_meta.sym_name(si) == ir.func_name(sel_fn[fk]) {
+                    matched = true
+                }
+                fk = fk + 1
+            }
+        }
+        if matched {
+            sym_sel = sym_sel + 1
+        }
+        si = si + 1
+    }
+    wr_u32(tieir_out, sym_sel)
+    si = 0
+    while si < ir_meta.sym_count() {
+        var matched2: bool = false
+        if n_sel > 0 {
+            var fk2 = 0
+            while fk2 < n_sel {
+                if ir_meta.sym_name(si) == ir.func_name(sel_fn[fk2]) {
+                    matched2 = true
+                }
+                fk2 = fk2 + 1
+            }
+        }
+        if matched2 {
+            if wr_pool_mapped(tieir_out, pool_map, ir_meta.sym_name(si)) == 0 {
+                return false
+            }
+            if wr_pool_mapped(tieir_out, pool_map, ir_meta.sym_sig(si)) == 0 {
+                return false
+            }
+            wr_u32(tieir_out, ir_meta.sym_kind(si))
+            wr_u32(tieir_out, ir_meta.sym_vis(si))
+            wr_u32p1(tieir_out, ir_meta.sym_line(si))
+            wr_u32p1(tieir_out, ir_meta.sym_col(si))
+        }
+        si = si + 1
+    }
+    wr_sec3_end(tieir_out, yp, ys)
+    // 段 5：IR 主体（选中子集 + 重映射）
+    var ip = wr_sec3_head(tieir_out, SEC_IRBODY)
+    var is_ = len(tieir_out)
+    // 函数表
+    wr_u32(tieir_out, n_sel)
+    i = 0
+    while i < n_sel {
+        var f = sel_fn[i]
+        if wr_pool_mapped(tieir_out, pool_map, ir.func_name(f)) == 0 {
+            return false
+        }
+        // ret/参数类型：+1 偏置（类型 id 域 -1 起防御）
+        wr_u32p1(tieir_out, ir.func_ret(f))
+        // params_off 新值 = 前序选中函数的参数+操作数累计（与重建自然偏移一致）
+        wr_u32(tieir_out, f_obase[i])
+        wr_u32(tieir_out, ir.func_params_cnt(f))
+        // 入口块重映射（-1 = 无块 → +1 偏置）
+        var en = ir.func_entry(f)
+        if en >= 0 {
+            en = blk_new[en]
+        }
+        wr_u32p1(tieir_out, en)
+        wr_u32(tieir_out, ir.func_inst_total(f))
+        wr_u32(tieir_out, ir.func_exported(f))
+        var pk: i64 = 0
+        while pk < ir.func_params_cnt(f) {
+            wr_u32p1(tieir_out, ir.func_param_ty(f, pk))
+            pk = pk + 1
+        }
+        i = i + 1
+    }
+    // 块表
+    wr_u32(tieir_out, sel_blk_cnt)
+    bi = 0
+    while bi < nb {
+        if blk_new[bi] >= 0 {
+            wr_u32(tieir_out, fn_new[ir.block_func(bi)])
+            if wr_pool_mapped(tieir_out, pool_map, ir.block_name(bi)) == 0 {
+                return false
+            }
+            wr_u32p1(tieir_out, blk_nstart[blk_new[bi]])
+            wr_u32p1(tieir_out, blk_nend[blk_new[bi]])
+        }
+        bi = bi + 1
+    }
+    // 指令表（p.9.21.10：按指令 id 序 = 创建序单遍；own = 真归属块新 id——
+    // 与全量 serialize 的规范形态一致，装配重放无前向引用）
+    wr_u32(tieir_out, sel_inst_cnt)
+    // 每函数操作数游标（重算：走选中函数序，逐步累加）
+    var f_ocur: table<i64> = table_new_i64()
+    i = 0
+    while i < n_sel {
+        table_push(f_ocur, f_obase[i] + ir.func_params_cnt(sel_fn[i]))
+        i = i + 1
+    }
+    var ii5: i64 = 0
+    while ii5 < n_inst {
+        var ba2 = sel_of[ii5]
+        if ba2 >= 0 {
+            var sfi = fn_new[ir.block_func(ba2)]
+            wr_u32(tieir_out, blk_new[ba2])
+            wr_u32(tieir_out, ir.ins_op(ii5))
+            wr_u32p1(tieir_out, ir.ins_ty(ii5))
+            // 结果值平移（-1 = 无结果，+1 偏置）
+            var vv = ir.ins_val(ii5)
+            if vv >= 0 {
+                if f_vstart[sfi] < 0 || vv < f_vstart[sfi] || vv > f_vmax[sfi] {
+                    set_err("片段值引用越界（指令 " + to_string(ii5) + " 值 " + to_string(vv) + "）")
+                    return false
+                }
+                vv = f_vbase[sfi] + (vv - f_vstart[sfi])
+            }
+            wr_u32p1(tieir_out, vv)
+            // 操作数偏移：函数内顺序累计（与重建自然偏移一致）
+            wr_u32(tieir_out, f_ocur[sfi])
+            f_ocur[sfi] = f_ocur[sfi] + ir.ins_ops_cnt(ii5)
+            wr_u32(tieir_out, ir.ins_ops_cnt(ii5))
+            var iop3 = ir.ins_op(ii5)
+            var ok: i64 = 0
+            while ok < ir.ins_ops_cnt(ii5) {
+                var ov = ir.ins_opnd(ii5, ok)
+                var kd = ir.ins_opnd_kind(ii5, ok)
+                // kind 0 = SSA 值（函数内平移）；但池载荷操作数①
+                //（const_str(62)/const_f(51)/call(35)/extern_call(36)/
+                // call_vararg(41)）走池重映射；1 = 块（查表）；
+                // 2 = 立即数（全值域 i64 LE）；3 = 全局名（池重映射）
+                var is_pool = 0
+                if kd == 3 {
+                    is_pool = 1
+                }
+                if kd == 0 && ok == 0 {
+                    if iop3 == 62 || iop3 == 51 || iop3 == 35 || iop3 == 36 || iop3 == 41 {
+                        is_pool = 1
+                    }
+                }
+                // v3 操作数序 = [kind, payload]（payload 宽度依赖 kind）
+                wr_u32(tieir_out, kd)
+                if is_pool == 1 {
+                    if wr_pool_mapped(tieir_out, pool_map, ov) == 0 {
+                        return false
+                    }
+                } else {
+                    if kd == 0 {
+                        if ov < f_vstart[sfi] || ov > f_vmax[sfi] {
+                            set_err("片段值操作数越界（指令 " + to_string(ii5) + " 值 " + to_string(ov) + "）")
+                            return false
+                        }
+                        ov = f_vbase[sfi] + (ov - f_vstart[sfi])
+                        wr_u32(tieir_out, ov)
+                    } else {
+                        if kd == 1 {
+                            if ov < 0 || ov >= nb || blk_new[ov] < 0 {
+                                set_err("片段块操作数越界（指令 " + to_string(ii5) + " 块 " + to_string(ov) + "）")
+                                return false
+                            }
+                            wr_u32(tieir_out, blk_new[ov])
+                        } else {
+                            // 立即数及其他未知 kind：全值域 i64 小端
+                            wr_i64_le(tieir_out, ov)
+                        }
+                    }
+                }
+                ok = ok + 1
+            }
+            // v3 写侧响亮中断：任一 wr_* 越界（set_err）后立即中止——绝不允许
+            // 错位字节流继续写（首版缺陷：ty 野值越界后仍线性推进，产物损坏
+            // 且写入"成功"，装配端 deserialize 到远处才炸，定位极难）。
+            if tieir_err != "" {
+                return false
+            }
+        }
+        ii5 = ii5 + 1
+    }
+    wr_sec3_end(tieir_out, ip, is_)
+    // 段 6：导出表（选中函数同名行子集）
+    var ep = wr_sec3_head(tieir_out, SEC_EXPORT)
+    var es = len(tieir_out)
+    var exp_sel: i64 = 0
+    var ei: i64 = 0
+    while ei < ir_meta.export_count() {
+        var m3: bool = false
+        if n_sel > 0 {
+            var fk3 = 0
+            while fk3 < n_sel {
+                if ir_meta.exp_name(ei) == ir.func_name(sel_fn[fk3]) {
+                    m3 = true
+                }
+                fk3 = fk3 + 1
+            }
+        }
+        if m3 {
+            exp_sel = exp_sel + 1
+        }
+        ei = ei + 1
+    }
+    wr_u32(tieir_out, exp_sel)
+    ei = 0
+    while ei < ir_meta.export_count() {
+        var m4: bool = false
+        if n_sel > 0 {
+            var fk4 = 0
+            while fk4 < n_sel {
+                if ir_meta.exp_name(ei) == ir.func_name(sel_fn[fk4]) {
+                    m4 = true
+                }
+                fk4 = fk4 + 1
+            }
+        }
+        if m4 {
+            if wr_pool_mapped(tieir_out, pool_map, ir_meta.exp_name(ei)) == 0 {
+                return false
+            }
+            if wr_pool_mapped(tieir_out, pool_map, ir_meta.exp_sig(ei)) == 0 {
+                return false
+            }
+            wr_u32p1(tieir_out, ir_meta.exp_line(ei))
+            wr_u32p1(tieir_out, ir_meta.exp_col(ei))
+        }
+        ei = ei + 1
+    }
+    wr_sec3_end(tieir_out, ep, es)
+    // 段 7（span）：v3 整体移除——片段 span 恒为全 0 冗余、装配器从不消费
+    //（findings §9 勘误；全量路径 span 段亦恒空，语义无损）。
+    if tieir_err != "" {
+        return false
+    }
+    return bytes.write(path, tieir_out)
+}
+
+}   // namespace tieir

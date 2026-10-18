@@ -1,0 +1,114 @@
+type tie<logic>
+// compiler/lib/columnar_test.tie —— tie.columnar 库独立自检（p.9.21 G7 库资格②）
+// ============================================================
+// 无 driver 可跑：本文件即入口（tie<logic>），只 import 被测库，
+// 覆盖 columnar.tie 注释头声明的全部契约：
+//   - bs_find_i64：升序表二分命中/未命中（-1）、空表、边界（首/尾键）；
+//   - sorted_insert_i64：有序插入 + 并行表对齐 + 返回插入位置；
+//   - find_pair：命中取并行值，未命中返回调用方哨兵 dflt；
+//   - set_pair_i64：存在即覆盖（返回原下标），不存在即插入（返回新下标）；
+//   - push_pair_i64：无序追加（返回新下标）；
+//   - row_count：与 keys 长度一致。
+// 全部通过输出「columnar 自检通过」exit 0；任一失败打印明细 exit 1。
+//
+// # 语言边界应用
+//   - ref table<i64> 实参必须是变量（局部表变量即可，见 D2）；
+//   - 本文件不定义本地常量（import 内联后与本库同作用域）；
+//   - 前缀调用（columnar.xxx）。
+//
+// 运行（repo 根）：
+//   compiler\tiec.exe compiler\lib\columnar_test.tie -o <tmp>\columntest.exe
+//   <tmp>\columntest.exe     # -> 「columnar 自检通过」exit 0
+
+import "./columnar.tie"
+
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+func main() {
+    var ok: bool = true
+
+    // ---------- 空表 ----------
+    var keys: table<i64> = table_new_i64()
+    var vals: table<i64> = table_new_i64()
+    if !check(columnar.bs_find_i64(keys, 7) == -1, "空表二分未命中返回 -1") {
+        ok = false
+    }
+    if !check(columnar.find_pair(keys, vals, 7, -99) == -99, "空表 find_pair 返回 dflt") {
+        ok = false
+    }
+    if !check(columnar.row_count(keys) == 0, "空表 row_count 为 0") {
+        ok = false
+    }
+
+    // ---------- 有序插入 ----------
+    var p0 = columnar.sorted_insert_i64(keys, vals, 30, 300)
+    var p1 = columnar.sorted_insert_i64(keys, vals, 10, 100)
+    var p2 = columnar.sorted_insert_i64(keys, vals, 20, 200)
+    if !check(p0 == 0 && p1 == 0 && p2 == 1, "插入位置符合升序（10,20,30）") {
+        ok = false
+    }
+    if !check(columnar.row_count(keys) == 3, "插入后行数 3") {
+        ok = false
+    }
+    if !check(keys[0] == 10 && keys[1] == 20 && keys[2] == 30, "keys 保持升序") {
+        ok = false
+    }
+    if !check(vals[0] == 100 && vals[1] == 200 && vals[2] == 300, "vals 与 keys 并行对齐") {
+        ok = false
+    }
+
+    // ---------- 二分：命中 / 边界 / 未命中 ----------
+    if !check(columnar.bs_find_i64(keys, 10) == 0, "二分命中首键") {
+        ok = false
+    }
+    if !check(columnar.bs_find_i64(keys, 30) == 2, "二分命中尾键") {
+        ok = false
+    }
+    if !check(columnar.bs_find_i64(keys, 20) == 1, "二分命中中键") {
+        ok = false
+    }
+    if !check(columnar.bs_find_i64(keys, 15) == -1, "二分未命中返回 -1") {
+        ok = false
+    }
+
+    // ---------- find_pair ----------
+    if !check(columnar.find_pair(keys, vals, 20, -1) == 200, "find_pair 命中取并行值") {
+        ok = false
+    }
+    if !check(columnar.find_pair(keys, vals, 99, -7) == -7, "find_pair 未命中返回 dflt") {
+        ok = false
+    }
+
+    // ---------- set_pair：覆盖 / 插入 ----------
+    var up = columnar.set_pair_i64(keys, vals, 20, 250)
+    if !check(up == 1 && vals[1] == 250, "set_pair 已存在键覆盖并返回原下标") {
+        ok = false
+    }
+    var ins = columnar.set_pair_i64(keys, vals, 15, 150)
+    if !check(ins == 1 && keys[1] == 15 && vals[1] == 150, "set_pair 新键有序插入") {
+        ok = false
+    }
+    if !check(columnar.row_count(keys) == 4, "覆盖不改行数、插入 +1") {
+        ok = false
+    }
+
+    // ---------- push_pair：无序追加 ----------
+    var q = columnar.push_pair_i64(keys, vals, 5, 50)
+    if !check(q == 4 && keys[4] == 5, "push_pair 追加到尾部并返回新下标") {
+        ok = false
+    }
+    if !check(columnar.row_count(keys) == 5, "追加后行数 5") {
+        ok = false
+    }
+
+    // ---------- 汇总 ----------
+    if !ok {
+        exit(1)
+    }
+    println("columnar 自检通过")
+}

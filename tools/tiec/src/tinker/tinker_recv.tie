@@ -1,0 +1,148 @@
+type tie<class>
+// compiler/tinker/tinker_recv.tie —— 接收入口（p.9.22.11）
+// ============================================================
+// --tink-in：stdin 全量读入 → 逐帧 frame_next（CRC 校验；拒帧报错退出非 0，
+// 不静默传递损坏数据）；--tink-in-file：同解析路径读帧文件（离线回放）。
+// 信封 kind 分派（design §5）：
+//   hello(1)    → 回 hello-ack(2)（入回执缓冲；--tink 时随发送出口写出）
+//   stage(3)    → --tink-save 落 <dir>/<name>，否则透传下一出口
+//   artifact(4) → 落文件（同 stage），否则透传
+//   diag(5)     → 渲染 stderr（name = 渲染文本）
+//   未知 kind   → 跳帧计数，收尾摘要报告（不致命）
+// 安全：落盘名做白名单清洗（拒路径分隔/上跳/超长），只允许落在 --tink-save
+// 目录内——帧来自不受信来源，绝不允许写出目录。
+
+namespace tinker {
+
+// 落盘名清洗：仅保留 [A-Za-z0-9._-]，去首点，限长 128；非法 → 空串拒绝。
+func safe_name(s: string) -> string {
+    // ★ 按字节遍历（len = 字节数；str_len 是码点数）——白名单只收 ASCII 单字节。
+    var n = len(s)
+    if n == 0 || n > 128 {
+        return ""
+    }
+    var sb = string_builder()
+    var i: i64 = 0
+    while i < n {
+        var b = str_byte(s, i)
+        var ok = false
+        if b >= 65 && b <= 90 {
+            ok = true
+        } else if b >= 97 && b <= 122 {
+            ok = true
+        } else if b >= 48 && b <= 57 {
+            ok = true
+        } else if b == 46 || b == 95 || b == 45 {
+            ok = true
+        }
+        if !ok {
+            return ""
+        }
+        sb_append_byte(sb, b)
+        i = i + 1
+    }
+    var out = sb_build(sb)
+    if str_char(out, 0) == "." {
+        return ""
+    }
+    return out
+}
+
+// 落盘（stage/artifact）：返回 0 成功 / -1 失败（错误已打印）。
+func save_payload(name: string, data: table<i64>) -> i64 {
+    var sn = safe_name(name)
+    if str_len(sn) == 0 {
+        print_err("[tink-in] 拒落盘：非法名 '" + name + "'（允许 [A-Za-z0-9._-]，≤128）\n")
+        return -1
+    }
+    var dir = g_tink_save
+    mkdir_all(dir)
+    var path = dir + "/" + sn
+    if !byte_write(path, data) {
+        print_err("[tink-in] 落盘失败: " + path + "\n")
+        return -1
+    }
+    dbg_txt("[tink-in] 已保存 " + path + "（" + to_string(len(data)) + " 字节）")
+    return 0
+}
+
+// stdin 全量读（循环至 EOF；EOF 空表终止）。
+func read_all_stdin() -> table<i64> {
+    var buf = table_new_i64()
+    var chunk = stdin_read(65536)
+    while len(chunk) > 0 {
+        buf = byte_concat(buf, chunk)
+        chunk = stdin_read(65536)
+    }
+    return buf
+}
+
+// 接收阶段。返回 0 成功 / 非 0 失败（拒帧等，调用方以该码退出）。
+pub func run_recv() -> i64 {
+    var buf = table_new_i64()
+    if str_len(g_tink_in_file) > 0 {
+        buf = byte_read(g_tink_in_file)
+        if len(buf) == 0 {
+            print_err("[tink-in] 读取帧文件失败: " + g_tink_in_file + "\n")
+            return 1
+        }
+    } else {
+        buf = read_all_stdin()
+    }
+    var pos: i64 = 0
+    var nfr: i64 = 0
+    var nst: i64 = 0
+    var nar: i64 = 0
+    var ndg: i64 = 0
+    var nhl: i64 = 0
+    var nuk: i64 = 0
+    while pos < len(buf) {
+        var fr = frame_next(buf, pos)
+        var pl = fr.0
+        var nx = fr.1
+        if nx < 0 {
+            print_err("[tink-in] 拒帧（CRC 不符/长度越界，偏移 " + to_string(pos) + "）\n")
+            return 1
+        }
+        if env_decode(pl) < 0 {
+            print_err("[tink-in] 拒帧（信封解码失败，偏移 " + to_string(pos) + "）\n")
+            return 1
+        }
+        var kind = tk_kind
+        if kind == 1 {
+            // hello → hello-ack（入出站缓冲——FIFO 先于发送阶段帧；--tink 时随
+            // 发送出口一次写出）
+            send_append(2, 0, "hello-ack", table_new_i64())
+            nhl = nhl + 1
+        } else if kind == 3 {
+            if str_len(g_tink_save) > 0 {
+                save_payload(tk_name, tk_pl)
+            } else {
+                send_append(kind, tk_stage, tk_name, tk_pl)
+            }
+            nst = nst + 1
+        } else if kind == 4 {
+            if str_len(g_tink_save) > 0 {
+                save_payload(tk_name, tk_pl)
+            } else {
+                send_append(kind, tk_stage, tk_name, tk_pl)
+            }
+            nar = nar + 1
+        } else if kind == 5 {
+            print_err("[tink-in] " + tk_name + "\n")
+            ndg = ndg + 1
+        } else {
+            nuk = nuk + 1
+        }
+        pos = nx
+        nfr = nfr + 1
+    }
+    dbg_txt("[tink-in] 收帧 " + to_string(nfr) + "（hello " + to_string(nhl) + " / stage " + to_string(nst) +
+        " / artifact " + to_string(nar) + " / diag " + to_string(ndg) + " / 未知 " + to_string(nuk) + "）")
+    if nuk > 0 {
+        dbg_txt("[tink-in] 未知 kind 已跳过（前向兼容）")
+    }
+    return 0
+}
+
+}   // namespace tinker

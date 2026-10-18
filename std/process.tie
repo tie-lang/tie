@@ -1,0 +1,285 @@
+type tie<class, unsafe:mem>
+// process.tie：标准库——进程原语（命名空间 process，自举 T0.7）
+// 作用：用 extern 声明（链接期 libc 符号）重新实现进程原语，替代/补充
+// 内置 exec_code/exec_output 的 C ABI 桥——0-Rust 路径（阶段 4）的关键证明：
+// tie 程序直接声明并调用 libc 函数，不再依赖 Rust 桥实现。
+//
+// extern 声明（T0.7 语言特性）：`extern fn system(cmd: string) -> i32;`——
+// 声明链接期符号 system（libc system，Windows msvcrt 默认已链），无函数体，
+// 编译路径由 IR 层发射 LLVM `declare`，调用点生成普通 call，clang 链接时
+// 自动解析 msvcrt 符号。解释路径不支持调用 extern（报"仅编译路径可用"）。
+//
+// 返回类型说明：system 的 C 原型是 `int system(const char*)`——用 i32 声明
+// 与原型精确匹配。i64 声明在负退出码（如 -1）时有 RAX 高位未定义风险
+// （x86-64 写 eax 清零高 32 位是架构保证，但依赖实现细节不严谨）；且 tie
+// 无 i32→i64 隐式转换，包装函数与 extern 保持同类型最简。
+//
+// 为什么 exec_output 不用 popen？tie 无指针类型——popen 返回 FILE*、fgets
+// 需要 char* 缓冲区，tie 无法声明 ptr 参数/返回值、也无法解引用指针读取
+// 缓冲内容（extern 参数限标量）。故用「重定向 + 文件读回」等价实现：
+// `cmd > tmpfile 2>&1` → file_read(tmpfile) → file_delete(tmpfile)。
+//
+// 调用：import 后 process.exec_code(...) / process.exec_output(...)
+// 命名规范：命名空间内函数不加 process_ 前缀；pub func 显式导出。
+
+// extern 声明：libc system（执行命令，返回退出码）。仅顶层裸名（无命名空间限定）。
+unsafe extern fn system(cmd: string) -> i32;
+
+// ============================================================================
+// p.9.1.1.17 进程超时强杀：kernel32 进程控制直绑（CreateProcessW 系）。
+// 直绑理由：libc _spawn 系返回的"进程句柄"是 int 宽度（HANDLE 截断），无法可靠
+// 传给 WaitForSingleObject/CloseHandle 的 64 位 HANDLE；直接绑定 kernel32 的
+// CreateProcessW/WaitForSingleObject/GetExitCodeProcess/CloseHandle 拿到完整
+// 64 位进程句柄（PROCESS_INFORMATION.hProcess）最直接。
+// x64 上 __stdcall 与 __cdecl 统一，故普通 extern fn 声明即可链接（同 sys/win32.tie
+// 直绑 Reg*W 的既有范式）；kernel32 为 MSVC 默认库自动链入，无需额外 -l。
+// 强杀手段说明（设计裁决）：**TerminateProcess 不在编译器 is_libc_sym 白名单**
+// （irgen.is_libc_sym，仅 CreateProcessW/WaitForSingleObject/CloseHandle/
+// GetExitCodeProcess……登记）——直绑 TerminateProcess 会把纯 libc 程序误判为
+// interp 桥、要求 tie_interp.lib 而编译失败。故超时强杀改经 PROCESS_INFORMATION
+// .dwProcessId 取真实 PID + `taskkill /F /T /PID <pid>`（system 同步执行）强制
+// 结束**整个进程树**（/T 连子代 ping 一并终止）。同样是"真实强杀"，语义等价于
+// TerminateProcess，且零编译器改动。约定：exit_code=-1 表示"未能启动"或"超时被杀"
+// （此时以 timed_out 区分）。
+// ============================================================================
+unsafe extern fn CreateProcessW(lpApplicationName: ptr<u8>, lpCommandLine: ptr<u8>,
+    lpProcessAttributes: i64, lpThreadAttributes: i64, bInheritHandles: i32,
+    dwCreationFlags: u32, lpEnvironment: i64, lpCurrentDirectory: i64,
+    lpStartupInfo: ptr<u8>, lpProcessInformation: ptr<u8>) -> i32
+unsafe extern fn WaitForSingleObject(hHandle: i64, dwMilliseconds: u32) -> u32
+unsafe extern fn GetExitCodeProcess(hProcess: i64, lpExitCode: ptr<u8>) -> i32
+unsafe extern fn CloseHandle(hObject: i64) -> i32
+
+namespace process {
+// 执行命令并返回退出码（0 = 成功，非 0 = 失败；Windows 上为命令的退出码）。
+// 包装 libc system（extern 声明，编译路径走 LLVM declare + clang 链接 msvcrt）。
+pub func exec_code(cmd: string) -> i32 {
+    unsafe {
+        return system(cmd)
+    }
+}
+
+// 执行命令并返回其全部输出（stdout + stderr 合并；输出为空返回空串）。
+// 实现：重定向到唯一临时文件 → file_read 读回 → 删除临时文件。
+// 失败场景（命令不存在、文件读写失败）→ 返回空串（与内置 exec_output
+// 的桥实现差异：桥失败时报运行时错误；此处尽力而为返回已读内容）。
+pub func exec_output(cmd: string) -> string {
+    // 唯一临时文件名：时间戳（秒）+ 随机数（10000..99999）拼接，避免并发冲突
+    var tmp = ".tie_exec_" + to_string(time_now()) + "_" + to_string(rand_range(10000, 99999)) + ".tmp"
+    // 重定向命令 stdout + stderr 到临时文件（cmd.exe 的 `2>&1` 语法）
+    var full = cmd + " > " + tmp + " 2>&1"
+    unsafe {
+        system(full)
+    }
+    var out = file_read(tmp)
+    file_delete(tmp)
+    return out
+}
+
+// ============================================================================
+// 双向管道增强（p.9.1.1.16）：spawn 子进程 + stdin 写 + stdout/stderr 读 + 退出码。
+// 说明：tie 无指针类型，无法解引用 libc `_popen` 返回的 FILE* 读缓冲，故沿用
+// 「重定向 + 临时文件读写回」的等价实现（与 exec_output 一致）提供双向语义。
+// 全部向后兼容：在既有 exec_code/exec_output 上新增函数。
+// ============================================================================
+
+// 生成唯一临时文件名（时间戳+随机数，避免并发冲突）。
+func tmpfile(tag: string) -> string {
+    return ".tie_pipe_" + tag + "_" + to_string(time_now()) + "_" + to_string(rand_range(10000, 99999)) + ".tmp"
+}
+
+// 便捷双向管道：把 input 写入子进程 stdin，捕获其退出码与输出（stdout+stderr 合并）。
+// 返回 (exit_code, stdout_str)；命令不存在等失败时退出码非 0、输出为已读内容。
+pub func pipe_run(cmd: string, input: string) -> (i32, string) {
+    var infile = tmpfile("in")
+    var out = tmpfile("out")
+    file_write(infile, input)
+    // `< in > out 2>&1`：stdin 重定向进，stdout+stderr 重定向出
+    var full = cmd + " < " + infile + " > " + out + " 2>&1"
+    var rc: i32 = 0
+    unsafe {
+        rc = system(full)
+    }
+    var result = file_read(out)
+    file_delete(infile)
+    file_delete(out)
+    return (rc, result)
+}
+
+// 只投喂 stdin（不捕获输出），返回退出码。
+pub func exec_stdin(cmd: string, input: string) -> i32 {
+    var infile = tmpfile("in")
+    file_write(infile, input)
+    var full = cmd + " < " + infile
+    var rc: i32 = 0
+    unsafe {
+        rc = system(full)
+    }
+    file_delete(infile)
+    return rc
+}
+
+// 双向管道 + stdout/stderr 分开捕获：返回 (exit_code, stdout, stderr)。
+pub func run_capture(cmd: string, input: string) -> (i32, string, string) {
+    var infile = tmpfile("in")
+    var out = tmpfile("out")
+    var err = tmpfile("err")
+    file_write(infile, input)
+    var full = cmd + " < " + infile + " > " + out + " 2> " + err
+    var rc: i32 = 0
+    unsafe {
+        rc = system(full)
+    }
+    var so = file_read(out)
+    var se = file_read(err)
+    file_delete(infile)
+    file_delete(out)
+    file_delete(err)
+    return (rc, so, se)
+}
+
+// 执行命令并单独捕获其 stderr（不投喂 stdin）。
+pub func read_stderr(cmd: string) -> string {
+    var err = tmpfile("err")
+    var full = cmd + " 2> " + err
+    unsafe {
+        system(full)
+    }
+    var se = file_read(err)
+    file_delete(err)
+    return se
+}
+
+// ============================================================================
+// 进程超时强杀（p.9.1.1.17）：exec_code_timeout / timeout_run 真实现。
+// CreateProcessW（经 cmd.exe /c 派生子命令）+ WaitForSingleObject(ms) +
+// 超时 TerminateProcess 强杀。返回 (exit_code, timed_out)：
+//   - timed_out=false：进程在 ms 内自然结束，exit_code 为退出码；
+//   - timed_out=true：超时被强杀（exit_code 置 -1）；
+//   - 启动失败：返回 (-1, false)（timer 无从谈起）。
+// 说明：tie 无指针入参给 lpApplicationName 传空不方便，故一律显式用
+// cmd.exe 的绝对路径作 lpApplicationName、lpCommandLine 拼 "cmd.exe /c <cmd>"，
+// 使任意系统命令（ping/echo/...）都可达且环境一致。
+// ============================================================================
+
+// 命令超时执行主入口（同 exec_code_timeout；二名等价，均向后兼容新增）。
+pub func exec_code_timeout(cmd: string, ms: i64) -> (i32, bool) {
+    return spawn_timeout(cmd, ms)
+}
+
+// 别名：timeout_run(cmd, ms) -> (exit_code, timed_out)。
+pub func timeout_run(cmd: string, ms: i64) -> (i32, bool) {
+    return spawn_timeout(cmd, ms)
+}
+
+// 实际实现（命名空间私有）。
+func spawn_timeout(cmd: string, ms: i64) -> (i32, bool) {
+    unsafe {
+        var cmdpath = "C:\\Windows\\System32\\cmd.exe"
+        var app = wcstr(cmdpath)
+        var cl = wcstr("\"" + cmdpath + "\" /c " + cmd)
+        var si = zalloc(68)      // STARTUPINFOW（x64）固定 68 字节，cb 置 68，余零
+        wr_u32(si, 0, 68)
+        var pi = zalloc(24)      // PROCESS_INFORMATION：hProcess@0 hThread@8 pid@16 tid@20
+        var created = CreateProcessW(app, cl, 0, 0, 0, 0, 0, 0, si, pi)
+        if created == 0 {
+            return (to_i32(-1), false)
+        }
+        var hProc = rd_u64(pi, 0)
+        var hThr = rd_u64(pi, 8)
+        var pid = rd_u32(pi, 16)   // PROCESS_INFORMATION.dwProcessId（强杀用）
+        var wst = WaitForSingleObject(hProc, to_u32(ms))
+        if wst == 0x102 {        // WAIT_TIMEOUT → 强杀进程树
+            // taskkill /F /T 强制结束并连子进程（/T）一起，同步等待其返回
+            system("taskkill /F /T /PID " + to_string(pid))
+            CloseHandle(hProc)
+            CloseHandle(hThr)
+            return (to_i32(-1), true)
+        }
+        var cbuf = zalloc(4)
+        GetExitCodeProcess(hProc, cbuf)
+        var xitcode = rd_u32(cbuf, 0)
+        CloseHandle(hProc)
+        CloseHandle(hThr)
+        return (to_i32(xitcode), false)
+    }
+}
+
+// ---- 内部：进程控制所需的宽字符 / 缓冲 / 小端读写辅助（自包含，不依赖 sys/win32）----
+
+// 字符串 → UTF-16LE 字节表（含代理对拆分）。
+func wide16(s: string) -> table<i64> {
+    var out = table_new_i64()
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var cp = char_code(str_char(s, i))
+        if cp > 0xFFFF {
+            var v = cp - 0x10000
+            var hi = 0xD800 + (v >> 10)
+            table_push(out, hi & 0xFF)
+            table_push(out, (hi >> 8) & 0xFF)
+            var lo = 0xDC00 + (v & 0x3FF)
+            table_push(out, lo & 0xFF)
+            table_push(out, (lo >> 8) & 0xFF)
+        } else {
+            table_push(out, cp & 0xFF)
+            table_push(out, (cp >> 8) & 0xFF)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// UTF-16LE 宽 C 串（带尾双 0）→ 自 alloc 缓冲。
+unsafe fn wcstr(s: string) -> ptr<u8> {
+    var b = wide16(s)
+    var p = alloc(len(b) + 2)
+    var i: i64 = 0
+    while i < len(b) {
+        deref_write(ptr_add(p, i), to_u8(b[i]))
+        i = i + 1
+    }
+    deref_write(ptr_add(p, len(b)), to_u8(0))
+    deref_write(ptr_add(p, len(b) + 1), to_u8(0))
+    return p
+}
+
+// 零填充 alloc（STARTUPINFO/PROCESS_INFORMATION 需清零）。
+unsafe fn zalloc(n: i64) -> ptr<u8> {
+    var p = alloc(n)
+    var i: i64 = 0
+    while i < n {
+        deref_write(ptr_add(p, i), to_u8(0))
+        i = i + 1
+    }
+    return p
+}
+
+// 小端 u32 写缓冲。
+unsafe fn wr_u32(p: ptr<u8>, off: i64, v: i64) {
+    deref_write(ptr_add(p, off), to_u8(v & 0xFF))
+    deref_write(ptr_add(p, off + 1), to_u8((v >> 8) & 0xFF))
+    deref_write(ptr_add(p, off + 2), to_u8((v >> 16) & 0xFF))
+    deref_write(ptr_add(p, off + 3), to_u8((v >> 24) & 0xFF))
+}
+
+// 小端 u32 读缓冲。
+unsafe fn rd_u32(p: ptr<u8>, off: i64) -> i64 {
+    return to_i64(deref(ptr_add(p, off))) |
+        (to_i64(deref(ptr_add(p, off + 1))) << 8) |
+        (to_i64(deref(ptr_add(p, off + 2))) << 16) |
+        (to_i64(deref(ptr_add(p, off + 3))) << 24)
+}
+
+// 小端 8 字节（HANDLE/指针）读缓冲。
+unsafe fn rd_u64(p: ptr<u8>, off: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        v = v | (to_i64(deref(ptr_add(p, off + k))) << (8 * k))
+        k = k + 1
+    }
+    return v
+}
+}

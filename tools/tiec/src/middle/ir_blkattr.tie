@@ -1,0 +1,79 @@
+type tie<class>
+// compiler/middle/ir_blkattr.tie —— p.9.21.11 §5.1：块归属统一工具
+// ============================================================
+// 「指令 id → 所属块」归属表的三处实现（llvmgen.build_inst_blk /
+// tieir_ser.serialize 段 5 / tieir_slice sel_of 回填）统一到本工具，
+// 规范语义 = **区间回填、表序后者覆盖**（p.9.21.10 D5 规范）：
+//   1. 预填 n_inst 个 -1（= 无归属）；
+//   2. 按块表序逐块回填自己的指令区间 [block_start, block_end)；
+//   3. 同指令被 ≥2 块认领（区间交叠，irgen 缺陷信号，C' 断言应拦截）
+//      → 计数并记录首个交叠指令 id（调用方据此拒写/告警/忽略）；
+//   4. 区间越界（end > n_inst 或 start < 0）同样计数记录。
+// 性能：O(n_inst + nb)，表预填一次 + 每指令一次写（表序后者覆盖 =
+// 后块写覆盖先块写，与既有三处行为逐位一致）。
+import "./ir.tie"
+
+// 交叠/越界记录（blk_attr_fill 每次调用重置；全局变量须在 namespace 外）
+var attr_overlap_cnt: i64 = 0;   // 双重归属指令数
+var attr_overlap_inst: i64 = -1; // 首个双重归属指令 id
+var attr_badrange_cnt: i64 = 0;  // 区间越界块数
+var attr_badrange_blk: i64 = -1; // 首个越界块 id
+
+namespace ir {
+
+pub func blk_attr_overlap_cnt() -> i64 { return attr_overlap_cnt }
+pub func blk_attr_overlap_inst() -> i64 { return attr_overlap_inst }
+pub func blk_attr_badrange_cnt() -> i64 { return attr_badrange_cnt }
+pub func blk_attr_badrange_blk() -> i64 { return attr_badrange_blk }
+
+// 构建归属表：sel = 每块参与标记（len == block_count；空表 = 全部块参与）。
+// 返回归属表（t[inst] = 块 id，-1 = 无归属）。交叠/越界经访问器读取。
+pub func blk_attr_fill(n_inst: i64, sel: table<i64>) -> table<i64> {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < n_inst {
+        table_push(t, -1)
+        i = i + 1
+    }
+    attr_overlap_cnt = 0
+    attr_overlap_inst = -1
+    attr_badrange_cnt = 0
+    attr_badrange_blk = -1
+    var all = len(sel) == 0
+    var nb = block_count()
+    var bi: i64 = 0
+    while bi < nb {
+        var go = all
+        if !all {
+            if sel[bi] != 0 {
+                go = true
+            }
+        }
+        if go {
+            var bs = block_start(bi)
+            var be = block_end(bi)
+            if bs < 0 || be > n_inst {
+                attr_badrange_cnt = attr_badrange_cnt + 1
+                if attr_badrange_blk < 0 {
+                    attr_badrange_blk = bi
+                }
+            } else {
+                var k: i64 = bs
+                while k < be {
+                    if t[k] != -1 {
+                        attr_overlap_cnt = attr_overlap_cnt + 1
+                        if attr_overlap_inst < 0 {
+                            attr_overlap_inst = k
+                        }
+                    }
+                    t[k] = bi
+                    k = k + 1
+                }
+            }
+        }
+        bi = bi + 1
+    }
+    return t
+}
+
+}   // namespace ir

@@ -1,0 +1,154 @@
+type tie<class>
+// compiler/frontend/textutil.tie —— frontend 纯文本工具（p.9.16.1 迁入）
+// ============================================================
+// 原居 `driver/util.tie`（flat 顶层函数）。迁入理由（实证）：
+//   · frontend 有 7 处**裸名依赖**这些文本工具（sstate_q1 / consteval 等）；
+//   · 但 frontend 树**不能依赖 driver**（p.9.21.1 依赖方向契约）：LSP（tsp）
+//     只编译 `frontend/` 树、不编译 `driver/` ⇒ 这些函数缺失，LSP 编译直接
+//     失败（实测 `E00489 未定义的函数 has_prefix/slice`）。
+//   · 迁到 frontend 后：frontend 自足（这是它们真正的归属——工具只依赖
+//     str_char/str_len/sb_* 原语），driver 侧经同编译单元照旧可见，
+//     **零调用点改动**；两处定义的可能性也随之消失（单一出处）。
+// 依赖：无（仅 str 原语与 string_builder）。
+// 由 `frontend/parser.tie` 在 pstmt_top 之前 import ⇒ 全 frontend 树可见。
+
+// 剥离头部区的文件类型声明行（`type tie` / `type tie<X>`），返回清理后源码。
+// 新声明是真语法行，必须从正文中移除（旧 `// tie:` 是注释由 lexer 跳过，无需剥离）。
+// 头部区 = 文件最前连续行（允许空行），遇第一个非空非声明行即停止；
+// 声明行之外的行（含空行/注释/缩进）原样保留，\n 重连。
+// 性能重写（O(n)）：旧实现 out = out + ln 逐行拼接，每行复制全串 → O(n²)
+// （10k+ 行大文件显著）。改为单 StringBuilder 累积，语义逐字节等价：
+// 仅当此前已输出过非空行时才补 "\n"（等价于旧判据 str_len(out) > 0）。
+pub func strip_type_header(src: string) -> string {
+    var lines = split_lines(src)
+    var n: i64 = len(lines)
+    var sb = string_builder()
+    var in_header = true
+    var i: i64 = 0
+    while i < n {
+        var ln = lines[i]
+        var t = trim(str.clone(ln))
+        if in_header {
+            if str_len(t) == 0 {
+                // 头部区空行：保留
+            } else if has_prefix(t, "type tie") {
+                // ★ 保行剥离（2026-10-07）：把声明行**替换为空行**而非删除，使正文
+                //   行号与用户所写的源文件逐行对齐。原先直接删除 ⇒ 正文整体上移
+                //   一行，而诊断行号没有行映射 ⇒ 主文件所有告警/错误行号 −1
+                //   （用户按报的行号改会改错行）。
+                //   不置 in_header = false ⇒ 与原先一致地继续剥离后续头部声明行。
+                ln = ""
+            } else {
+                in_header = false
+            }
+        }
+        // 逐行原样拼接：不再用 emitted 丢前导空行（丢空行同样会移动行号）。
+        if i > 0 {
+            sb_append(sb, "\n")
+        }
+        sb_append(sb, ln)
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+// 按 \n 拆行（去行尾 \r）。
+// 性能重写（O(n)）：旧实现 line + c 拼接（每行 O(len²)）× str_char(s,i)
+// 从头扫（O(i)）三重平方。新实现字节级扫描（\n/\r 为 ASCII 单字节）+
+// StringBuilder 累积，语义不变（连续 \n 产空行；尾部无 \n 的末行保留）。
+func split_lines(s: string) -> table<string> {
+    // 性能修复：用单个 sb + sb_reset 复用，替代每行新建 string_builder——
+    // 大文件（irgen_expr 10k+ 行）下每行新建 builder 的构造/释放累积成
+    // O(n²) 字符处理病源（自举 prep 卡 11s+ 的主因）。sb_reset 已由编译器
+    // 认识（irgen_str s21_sb_reset），旧编译器可无障碍编译。
+    var rows = table_new_string()
+    var n: i64 = len(s)
+    var i: i64 = 0
+    var sb = string_builder()
+    while i < n {
+        var b = str_byte(s, i)
+        if b == 10 {
+            // \n：行结束（sb_reset 复用缓冲，消除每行新建）
+            table_push(rows, sb_build(sb))
+            sb_reset(sb)
+        } else if b != 13 {
+            // 非 \r：追加字节（二进制安全）
+            sb_append_byte(sb, b)
+        }
+        i = i + 1
+    }
+    // 尾部无 \n 的末行（非空才保留——与原实现一致）
+    var tail = sb_build(sb)
+    if tail != "" {
+        table_push(rows, tail)
+    }
+    return rows
+}
+// 判断 s 是否以 prefix 开头。
+// `immut` = 只读借用（规范 §13.4：调用方继续用、只读取 ⇒ 声明 immut）。
+// 不写修饰符时形参按「值传递」处理，移动检查会认为调用方把值交了出去，
+// 于是调用方再用同一个变量就被判「已移动」——只读函数必须显式声明 immut。
+pub func has_prefix(immut s: string, immut prefix: string) -> bool {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(prefix)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+// 找字符串中首个 ch 的位置；未找到 -1。
+pub func find_char(immut s: string, immut ch: string) -> i64 {
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == ch {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+// 取字符串 [start, end) 子串（码点级）。
+pub func slice(immut s: string, start: i64, end: i64) -> string {
+    var sb = string_builder()
+    var i: i64 = start
+    while i < end {
+        sb_append(sb, str_char(s, i))
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+// 去除字符串首尾空白（空格/制表）。
+pub func trim(immut s: string) -> string {
+    var n: i64 = str_len(s)
+    var start: i64 = 0
+    var end: i64 = n
+    while start < end && (str_char(s, start) == " " || str_char(s, start) == "\t") {
+        start = start + 1
+    }
+    while end > start && (str_char(s, end - 1) == " " || str_char(s, end - 1) == "\t") {
+        end = end - 1
+    }
+    return slice(s, start, end)
+}
+pub func split_char(s: string, sep: string) -> table<string> {
+    var out = table_new_string()
+    var n = str_len(s)
+    var start: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == sep {
+            table_push(out, slice(s, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    table_push(out, slice(s, start, n))
+    return out
+}

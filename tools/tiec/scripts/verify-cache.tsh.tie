@@ -1,0 +1,79 @@
+type tie<tsh>
+// scripts/verify-cache.tsh.tie —— p.9.1.3 编译缓存验收（tsh-role 移植 verify-cache.ps1）
+// 用法（仓库根目录）: <tsh> -f scripts/verify-cache.tsh.tie [tiec路径]
+// 验收点：1) 首次=未命中入缓存 2) 再次=命中且产物一致 3) 篡改源码=重编
+//         4) --no-cache 强制重编。全部通过输出 "CACHE-VERIFY OK"；失败 exit 1。
+// 运行于仓库根目录（cwd = 仓库根，对齐 .ps1 的 Set-Location $root）。
+
+var tiec = ".\\compiler\\tiec.exe"
+if arg_count() >= 1 && !is_empty(arg_at(0)) { tiec = arg_at(0) }
+
+var root = cwd()
+var probe = root + "\\examples\\_cache_probe.tie"
+var out = root + "\\examples\\_cache_probe.exe"
+
+// 复制 examples/hello.tie → _cache_probe.tie（文本直接读写，等价 Copy-Item）
+var hello = file_read(root + "\\examples\\hello.tie")
+var _w = file_write(probe, hello)
+
+// 预清理该工程缓存条目与产物（remove_dir_all 内建确定清空，规避 exec del 的 flake）
+var home = get_env("USERPROFILE")
+var cache = home + "\\.tiec-cache"
+var _cd = remove_dir_all(cache)
+var _mk = mkdir_all(cache)
+var _d2 = exec_code("cmd /c del /Q \"" + out + "\" >nul 2>&1")
+
+var fail: i64 = 0
+
+// 1) 首次：未命中 → 入缓存
+var r1 = exec_output("cmd /c " + tiec + " " + probe + " -o " + out + " 2>&1")
+if contains(r1, "已缓存编译产物") {
+    println("[1] miss->cache OK")
+} else {
+    println("[1] MISS-SHOULD-CACHE FAIL"); fail = 1
+}
+
+// 产物一致性基准（第 2 次命中前后应指向同一产物）
+var h_base = get_file_hash(out)
+
+// 2) 再次：命中
+var r2 = exec_output("cmd /c " + tiec + " " + probe + " -o " + out + " 2>&1")
+if contains(r2, "缓存命中") {
+    println("[2] hit OK")
+} else {
+    println("[2] HIT-SHOULD-HIT FAIL"); fail = 1
+}
+var h_hit = get_file_hash(out)
+if h_base == h_hit {
+    println("[2] product-identical OK")
+} else {
+    println("[2] HIT-PRODUCT-DIVERGED FAIL"); fail = 1
+}
+
+// 3) 篡改输入 → 缓存键变，重编（不命中）
+var tamper = "// tamper-" + to_string(time_now()) + "\n"
+var _a = file_append(probe, tamper)
+var r3 = exec_output("cmd /c " + tiec + " " + probe + " -o " + out + " 2>&1")
+if contains(r3, "缓存命中") {
+    println("[3] TAMPER-SHOULD-RECOMPILE FAIL"); fail = 1
+} else {
+    println("[3] tamper->recompile OK")
+}
+
+// 4) --no-cache：即使命中键存在也强制重编（不命中）
+var r4 = exec_output("cmd /c " + tiec + " " + probe + " --no-cache -o " + out + " 2>&1")
+if contains(r4, "缓存命中") {
+    println("[4] NOCACHE-SHOULD-RECOMPILE FAIL"); fail = 1
+} else {
+    println("[4] --no-cache forces recompile OK")
+}
+
+// 清理
+var _c1 = exec_code("cmd /c del /Q \"" + probe + "\" " + out + " >nul 2>&1")
+
+if fail == 0 {
+    println("CACHE-VERIFY OK")
+    exit(0)
+}
+println("CACHE-VERIFY FAILED")
+exit(1)

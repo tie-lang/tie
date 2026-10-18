@@ -1,0 +1,77 @@
+type tie<class>
+// compiler/dbug/dbgem_env.tie —— 结构化输出·信封与 zd 记录组装（p.9.22.1）
+// ============================================================
+// 统一信封（design §3，字段号只追加）：
+//   1 schema（=1）· 2 stage（1=tokens 2=ast 3=symtab 4=diag）· 3 unit（源单元路径）
+//   4 strings（interner 池全量，id=下标）· 5 files（0=主输入，k>=1=imports）
+// 阶段列段接在信封之后（字段号升序；构建器按升序登记列）。
+// zd 字段 = varint(fno<<3|2) + varint(载荷字节数) + 载荷（见 dbgem_colzd）。
+
+namespace dbgem {
+
+// 输出路径：<input>.<stage>.<fmt>。
+pub func emit_path(stage_name: string, fmt: string) -> string {
+    return g_input + "." + stage_name + "." + fmt
+}
+
+// zd 字段封装。
+func zd_field(fno: i64, payload: table<i64>) -> table<i64> {
+    var head = zdw.concat(zdw.varint(fno * 8 + 2), zdw.varint(len(payload)))
+    return zdw.concat(head, payload)
+}
+
+// 全池字符串列（id=下标）。
+func col_pool() -> table<i64> {
+    var out = table_new_i64()
+    push_array_head(out, interner.len())
+    var i: i64 = 0
+    while i < interner.len() {
+        push_str(out, interner.name_str(i))
+        i = i + 1
+    }
+    return out
+}
+
+// 文件表列。
+func col_files() -> table<i64> {
+    var out = table_new_i64()
+    var n = len(g_file_base)
+    if n < 1 {
+        n = 1
+    }
+    push_array_head(out, n)
+    push_str(out, g_input)
+    var k: i64 = 1
+    while k < n {
+        push_str(out, sstate.file_path_of(k))
+        k = k + 1
+    }
+    return out
+}
+
+// 记录组装（信封 1-5 + 列段升序）→ zd 字节表。
+pub func zd_record(stage: i64) -> table<i64> {
+    var out = table_new_i64()
+    out = byte_concat(out, zd_field(1, zdw.enc_i64(1)))
+    out = byte_concat(out, zd_field(2, zdw.enc_i64(stage)))
+    out = byte_concat(out, zd_field(3, zdw.enc_string(g_input)))
+    out = byte_concat(out, zd_field(4, col_pool()))
+    out = byte_concat(out, zd_field(5, col_files()))
+    var c: i64 = 0
+    while c < len(dc_fno) {
+        if dc_kind[c] == 0 {
+            out = byte_concat(out, zd_field(dc_fno[c], col_zd_i64(c)))
+        } else {
+            out = byte_concat(out, zd_field(dc_fno[c], col_zd_str(c)))
+        }
+        c = c + 1
+    }
+    return out
+}
+
+// zd 落盘。
+pub func zd_write(stage: i64, path: string) -> bool {
+    return byte_write(path, zd_record(stage))
+}
+
+}   // namespace dbgem

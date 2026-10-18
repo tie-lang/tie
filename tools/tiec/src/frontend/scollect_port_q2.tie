@@ -1,0 +1,582 @@
+type tie<class>
+// compiler/frontend/scollect_port_q2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 scollect_port.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace scollect {
+// 顶层全局变量收集（p.9.12.4：full 参数 = 登记全名——顶层传裸名；
+// 命名空间内 const 传 ns_full_name 拼接的全名 "ns::NAME"，与命名空间
+// 函数同前缀规则，引用端 ns::NAME / 裸名+前缀补全命中）
+pub func collect_global_var(v: i64, full: string) -> i64 {
+    var nm = full
+    // val bit0 = is_const（p.9.21.5 II2 起 bit1 = ispub——`pub const`；按位取，
+    // 勿用等值判断：val=3（pub const）曾因 == 1 等值判断被误判为非 const，
+    // 导致 ns::NAME 值引用落 E00393）
+    var is_const = s_vals[v] & 1
+    // val bit1 = ispub（`pub const`）——编进 gb_const 槽：bit0=const，bit1=pub
+    // （A2b：常量可见性跟随 L1 梯度；护栏读 bit1）
+    var is_pub: i64 = 0
+    if (s_vals[v] & 2) == 2 {
+        is_pub = 1
+    }
+    var ty_node = sstate.child(v, 0)
+    var init = sstate.child(v, 1)
+    // 必须显式标注类型
+    if ty_node < 0 {
+        sm_err_line = s_lines[v]
+        sm_err_col = s_cols[v]
+        sm_err_msg = "全局变量 '" + nm + "' 必须显式标注类型（如 var x: i64）"
+        return -1
+    }
+    var ty = sgen.parse_generic_type_node(ty_node)
+    if ty < 0 {
+        return -1
+    }
+    // S2.4：全局 port 对象变量暂不支持（提升需要 unsafe 上下文 + 生命周期
+    // 责任在程序员；全局提升的初始化时机/生命周期难以自证，第一版拒绝）
+    if types.kind(ty) == K_PORT {
+        sm_err_line = s_lines[v]
+        sm_err_col = s_cols[v]
+        sm_err_msg = "全局 port 对象变量暂不支持（第一版请用局部变量提升：unsafe { var d: " + types.type_name(ty) + " = 具体实例 }）"
+        return -1
+    }
+    // 2026-10-13 安全加固：**不可安全承载的聚合全局拒绝**。定档依据（实测）：
+    //   · fn 全局   → 读出野 entry 调用即**段错误**（红线）——拒绝；
+    //   · tuple/array 全局 → 后端报错——拒绝（干净报错优于后端炸）；
+    //   · struct/enum 全局 → 内存安全但初始化**物化缺陷**（global_init_fold
+    //     无聚合分支，init 值静默丢失、槽零初始化；tiec 自源 interp 的
+    //     `Value = new_void()` 即靠 Nil≡0 巧合可用）——暂留（物化修复另批）。
+    var gk = types.kind(ty)
+    if gk == K_FN || gk == K_TUPLE || gk == K_ARRAY || gk == K_ACTOR || gk == K_FUTURE {
+        sm_err_line = s_lines[v]
+        sm_err_col = s_cols[v]
+        sm_err_msg = "全局 " + types.type_name(ty) + " 变量暂不支持（该形态全局槽不可安全承载）；请改用标量/string/表类型，或降为局部变量"
+        return -1
+    }
+    var nid = intern.intern(nm)
+    if sstate.bs_find(gb_keys, nid) >= 0 {
+        sm_err_line = s_lines[v]
+        sm_err_col = s_cols[v]
+        sm_err_msg = "全局变量 '" + nm + "' 重复定义"
+        return -1
+    }
+    if sstate.bs_find(fn_keys, nid) >= 0 {
+        sm_err_line = s_lines[v]
+        sm_err_col = s_cols[v]
+        sm_err_msg = "全局变量 '" + nm + "' 与函数名冲突"
+        return -1
+    }
+    var k = types.kind(ty)
+    if k == K_TABLE || k == K_MAP || ty == TK_TABLE || ty == TK_MAP {
+        // 表全局：const 支持（内容修改如 table_push 允许，整变量重绑定由
+        // scheck 的 gb_const_of 拦截）。初始化：
+        //   - 参数化 table<T>/map<V>：允许表字面量（空/非空）——r.1.1.3 起
+        //     支持字面量静态初始化（irgen main 入口创建 + 逐元素 push）
+        //   - 裸 table/map：仅空表 []（元素类型未知，非空字面量无类型依据）
+        if init >= 0 {
+            var itag = s_tags[init]
+            if itag == S_N_TABLE_LIT {
+                if sstate.nchild(init) == 0 {
+                    // 空表 []：node_types 引导（元素宽由标注决定，irgen 选句柄）
+                    if types.is_table(ty) || types.is_map(ty) {
+                        node_types[init] = ty
+                    }
+                } else {
+                    // 非空字面量：仅参数化表/映射允许（元素类型可标注推导）
+                    if !(k == K_TABLE || k == K_MAP) {
+                        sm_err_line = s_lines[v]
+                        sm_err_col = s_cols[v]
+                        sm_err_msg = "全局表 '" + nm + "' 的非空字面量初始化仅支持参数化 table<T>/map<V>（元素类型由标注决定）"
+                        return -1
+                    }
+                    var it = sinfer.infer_expr(init)
+                    if it < 0 {
+                        return -1
+                    }
+                    if !stype.types_match(ty, it, init) && !stype.types_compatible(ty, it) {
+                        sm_err_line = s_lines[v]
+                        sm_err_col = s_cols[v]
+                        sm_err_msg = "全局表 '" + nm + "' 字面量初始化类型不匹配：期望 " + types.type_name(ty) + "，实际 " + types.type_name(it)
+                        return -1
+                    }
+                }
+            } else {
+                sm_err_line = s_lines[v]
+                sm_err_col = s_cols[v]
+                sm_err_msg = "全局表 '" + nm + "' 的初始化必须是表字面量 []（元素类型由标注决定）"
+                return -1
+            }
+        }
+        var elem: i64 = -1
+        if ty == TK_TABLE {
+            elem = types.named(TK_STR)
+        } else if k == K_TABLE {
+            elem = types.table_elem(ty)
+        } else {
+            elem = types.named(TK_STR)
+        }
+
+        sstate.sorted_insert_gb(gb_keys, gb_vals, gb_const, gb_telem, gb_mod, nid, ty, is_const + is_pub * 2, elem, sstate.file_id_of_node(v))
+        // p.9.22.6 全量符号表：全局表变量声明登记（kind 4）。
+        xref.reg_decl(nid, 4, ty, v)
+        return 0
+    }
+    // 标量全局：字面量初始化 + 类型匹配。
+    // p.9.17.2 缺陷 #4a：检查**延迟**到 check_deferred_global_inits()（collect_all_enums
+    // 之后）——本阶段 enum 变体表尚未填充，enum 变体常量初始化器会误报 E00506。
+    if init >= 0 {
+        table_push(gd_nodes, v)
+        table_push(gd_tys, ty)
+        table_push(gd_nms, full)
+    }
+
+    sstate.sorted_insert_gb(gb_keys, gb_vals, gb_const, gb_telem, gb_mod, nid, ty, is_const + is_pub * 2, -1, sstate.file_id_of_node(v))
+    // p.9.22.6 全量符号表：全局标量声明登记（kind 4）。
+    xref.reg_decl(nid, 4, ty, v)
+    return 0
+}
+
+// 延迟的全局标量初始化类型检查（semantic 主流程在 collect_all_enums() 之后调用）。
+// 逐项 infer_expr + types_match；错误文本与原即时检查一致。
+pub func check_deferred_global_inits() -> i64 {
+    var i: i64 = 0
+    while i < len(gd_nodes) {
+        var v = gd_nodes[i]
+        var ty = gd_tys[i]
+        var nm = gd_nms[i]
+        var init = sstate.child(v, 1)
+        if init >= 0 {
+            var it = sinfer.infer_expr(init)
+            if it < 0 {
+                return -1
+            }
+            if !stype.types_match(ty, it, init) {
+                sm_err_line = s_lines[v]
+                sm_err_col = s_cols[v]
+                sm_err_msg = "全局变量 '" + nm + "' 初始化类型不匹配：期望 " + types.type_name(ty) + "，实际 " + types.type_name(it)
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 一期并发 A1/A2 语法层：actor 声明收集。
+// 登记 actor 名到 actor 表（防重名 + 句柄类型解析依据）；校验结构约束
+// （内部方法必须 pub、async 必须 void 返回）+ 登记消息方法签名（A3 转发依据）。
+// 返回 0 成功 / -1 错误。children = [字段 N_CLASS_FIELD..., 方法 N_FN_DEF...]。
+pub func collect_actor_decl(s: i64) -> i64 {
+    var nm = sstate.name_str(s)
+    var aidx = sstate.reg_actor(nm)
+    if aidx < 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        return -1
+    }
+    var n = s_aux[s]   // items 总数
+    var i: i64 = 0
+    // 私有状态字段：从记录固定头后（B 组布局，见 irgen tig_actor_run）开始。
+    // p.9.5.x T2 多槽 mailbox 固定头（状态零锁，原子队列内嵌 record）：
+    // @0 magic|@8 保留|@16 保留|@24 当前 mid|@32 args[0..8)|@96 result|@104 done
+    // |@112 dispatch_addr|@120 fail|@128 mq_head|@136 mq_resv|@144 mq_pub|
+    // @152 mq_act|@160 mq_sync|@168 mq_mid[64]|@680 mq_arg[64][8]|@4776 mq_syncf[64]
+    // |@5288 字段区起 = FIELD_BASE（与 irgen_rt tig_actor_run 同步）。
+    var field_base: i64 = 5288
+    var field_off: i64 = field_base
+    while i < n {
+        var item = sstate.child(s, i)
+        var itag = s_tags[item]
+        if itag == N_CLASS_FIELD {   // `var name: Ty [= def]`
+            var fname = sstate.name_str(item)
+            var fty = sgen.parse_generic_type_node(sstate.child(item, 0))
+            if fty < 0 {
+                sm_err_line = s_lines[item]
+                sm_err_col = s_cols[item]
+                return -1
+            }
+            var fdef = sstate.child(item, 1)
+            if fdef >= 0 {
+                // p.8.3.1 / p.9.0-L.3：actor 字段初值 = 字面量或 const 白名单
+                //（const 全局引用 / 常量算术——is_const_default_expr 单源）。
+                var dtag = s_tags[fdef]
+                if dtag != S_N_INT_LIT && dtag != S_N_FLOAT_LIT && dtag != S_N_BOOL_LIT &&
+                    dtag != S_N_CHAR_LIT && dtag != S_N_STR_LIT && dtag != S_N_TABLE_LIT &&
+                    !is_const_default_expr(fdef, 0) {
+                    sm_err_line = s_lines[item]
+                    sm_err_col = s_cols[item]
+                    sm_err_msg = "actor 字段初值必须是字面量或编译期常量表达式（const 引用/常量算术）"
+                    return -1
+                }
+            }
+            if sstate.reg_actor_field(aidx, fname, fty, fdef, field_off) < 0 {
+                sm_err_line = s_lines[item]
+                sm_err_col = s_cols[item]
+                return -1
+            }
+            field_off = field_off + 8
+        }
+        if itag == S_N_FN_DEF {
+            // 消息方法必须 pub（非 pub 方法收不到消息，除非显式 unsafe 网关，
+            // 一期一律要求 pub——对齐 design §5 默认同步方法形态）
+            if s_vals[item] % 2 == 0 {
+                sm_err_line = s_lines[item]
+                sm_err_col = s_cols[item]
+                sm_err_msg = "actor 消息方法 '" + sstate.name_str(item) + "' 必须声明为 pub"
+                return -1
+            }
+            var mname = sstate.name_str(item)
+            var nparams = s_aux[item]
+            // 返回类型：FnDef children[slot_off]（同 collect_fn）
+            var rt_node = sstate.child(item, sstate.slot_off(item))
+            var ret_ty = sgen.parse_generic_type_node(rt_node)
+            if ret_ty < 0 {
+                return -1
+            }
+            // 参数类型：children[slot_off + 1 .. +nparams]
+            var ptys: table<i64> = table_new_i64()
+            var k: i64 = 0
+            while k < nparams {
+                var pnode = sstate.child(item, sstate.slot_off(item) + 1 + k)
+                var pty = sgen.parse_generic_type_node(sstate.child(pnode, 0))
+                if pty < 0 {
+                    return -1
+                }
+                table_push(ptys, pty)
+                k = k + 1
+            }
+            var mr = sstate.reg_actor_method(aidx, mname, ptys, ret_ty)
+            if mr < 0 {
+                sm_err_line = s_lines[item]
+                sm_err_col = s_cols[item]
+                return -1
+            }
+            // ★★ actor 方法体也必须进**正常前端流水线**（2026-10-03）。
+            // 语义主流程按 `fn_keys` 逐个 `check_fn_walk` 检查函数体（类型推断 +
+            // 门禁）；`reg_actor_method` 只登记**消息方法签名**（ac_* 表，供
+            // 句柄转发的类型匹配用），方法体从未被登记 ⇒ 前端从未 infer 过它。
+            // 后果（实测）：方法体内的闭包字面量 `node_types = -1`，后端
+            // `tig_stmt_b_100_VarDecl` 按默认 **i64** 开槽，而闭包字面量值是
+            // `%fn.0 = {ptr,ptr}` 聚合 ⇒ `store i64 %12` 类型错 ⇒ opt 阶段
+            // E00883「'%12' defined with type '%fn.0' but expected 'i64'」。
+            // 修法：以内部全名 `actor$<aidx>::<mname>` 再登记一份函数签名，
+            // 让方法体随主流程一起被 check_fn_walk 遍历（该名字用户不可见、
+            // 不与任何用户标识符冲突；`$` 与 ns 名非法字符一致，不可能被写出）。
+            // sp_defs/sp_vars 填 -1（无默认值/无可变参数）：actor 方法不经裸名
+            // 调用（只能经句柄转发），故这些列不会被 call site 消费。
+            var mfull = "actor$" + to_string(aidx) + "::" + mname
+            var p_refs2: table<i64> = table_new_i64()
+            var p_defs2: table<i64> = table_new_i64()
+            var p_vars2: table<i64> = table_new_i64()
+            var k3: i64 = 0
+            while k3 < nparams {
+                // sp_refs 只取 bit0（by_ref）——其余位在 collect_fn 里也不是这么传的，
+                // 混传整个 s_vals 会把 immut 等声明位误当 by_ref。
+                table_push(p_refs2, s_vals[sstate.child(item, sstate.slot_off(item) + 1 + k3)] % 2)
+                table_push(p_defs2, -1)
+                table_push(p_vars2, -1)
+                k3 = k3 + 1
+            }
+            // is_pub 传 s_vals[item] 原值（含各标志位，与 collect_fn 一致）。
+            // 生成器方法（体内 yield）不在此路径：collect_fn 会登记
+            // gen_marks=1 并把返回类型改写为 table<elem>；actor 消息方法两侧
+            // （ac_mrets 与此处）保持同一 ret_ty，不做改写。
+            if sstate.reg_fn(mfull, s_vals[item], nparams, nparams, ret_ty, ptys, p_refs2, p_defs2, p_vars2, item) < 0 {
+                sm_err_line = s_lines[item]
+                sm_err_col = s_cols[item]
+                return -1
+            }
+            // 副表登记：内部全名 → actor 索引，供 check_fn 把该 actor 的私有字段
+            // 绑进方法体作用域（见 sstate.afn_keys 注释）。
+            table_push(afn_keys, intern.intern(mfull))
+            table_push(afn_actor, aidx)
+            // 登记 async 标志（与 ac_mrets 同位对齐；s_vals bit2 = async）
+            if s_vals[item] / 4 % 2 == 1 {
+                table_push(ac_masync, 1)
+            } else {
+                table_push(ac_masync, 0)
+            }
+            // 登记 reentrant 标志（规范 §10.7 重入；s_vals bit6 = reentrant）
+            if s_vals[item] / 64 % 2 == 1 {
+                table_push(ac_mreent, 1)
+            } else {
+                table_push(ac_mreent, 0)
+            }
+            // p.9.11 async 返回值（规范 §10.6）：async 方法允许 **i64/u64 或
+            // ptr 表示类型（string/table/map/port）** 返回 ⇒ 调用产生 future<T>
+            // 凭据，await 取值（错误与结果同路径）。async void 维持
+            // fire-and-forget。其余（f64/bool/narrow int/struct/tuple/array）
+            // 仍拒绝——result@96 是单 i64 槽，窄整型/f64 的槽型适配与聚合值的
+            // 消息结果表示未接通（2026-10-09 修复后 ptr 表示已经
+            // dispatch ptrtoint / 调用方 inttoptr 打通，见 irgen_rt_p3）。
+            if s_vals[item] / 4 % 2 == 1 {
+                var ret_node = rt_node
+                var ret_is_void = false
+                var ret_abi_ok = false
+                if ret_node >= 0 {
+                    if s_tags[ret_node] == S_N_NAMED_TYPE {
+                        if s_vals[ret_node] == 14 {
+                            ret_is_void = true
+                        }
+                        var tkv = s_vals[ret_node]
+                        // 64 位整数：i64=3 / u64=7（result@96 原生 i64 槽）
+                        if tkv == 3 || tkv == 7 {
+                            ret_abi_ok = true
+                        }
+                    } else {
+                        var rty3 = sgen.parse_generic_type_node(ret_node)
+                        if rty3 >= 0 {
+                            // ptr 表示：string / table / map / port（结果槽存
+                            // 句柄 i64，await 侧 inttoptr 还原）
+                            if rty3 == types.named(TK_STR) || types.is_table(rty3) ||
+                                types.is_map(rty3) || types.kind(rty3) == K_PORT {
+                                ret_abi_ok = true
+                            }
+                        }
+                    }
+                }
+                if !ret_is_void && !ret_abi_ok {
+                    var tyn = "不支持"
+                    if ret_node >= 0 {
+                        var rty2 = sgen.parse_generic_type_node(ret_node)
+                        if rty2 >= 0 {
+                            tyn = types.type_name(rty2)
+                        }
+                    }
+                    sm_err_line = s_lines[item]
+                    sm_err_col = s_cols[item]
+                    sm_err_msg = "async 消息方法 '" + mname + "' 的返回类型 " + tyn + " 不支持（须 void / i64 / u64 / string / table / map / port；其余类型的消息结果表示待接通）"
+                    return -1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 收集全部顶层语句（第一子遍）：遍历 g_extra_tops（semantic 主入口
+// import 展开后填充：主文件顶层 + 全部被导入文件顶层）。
+// 返回 0 成功 / -1 错误
+pub func collect_top() -> i64 {
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            var full = sstate.name_str(s)
+            var r = collect_fn(s, full)
+            if r < 0 {
+                return -1
+            }
+        } else if tag == S_N_NAMESPACE {
+            var r = collect_ns(s)
+            if r < 0 {
+                return -1
+            }
+        } else if tag == S_N_STRUCT {
+            // 泛型 struct 模板 / 普通 struct 统一分派登记
+            var rd = collect_struct_decl(s)
+            if rd < 0 {
+                return -1
+            }
+        } else if tag == S_N_ENUM {
+            // 泛型 enum 模板 / 普通 enum 统一分派登记
+            var re = collect_enum_decl(s)
+            if re < 0 {
+                return -1
+            }
+        } else if tag == S_N_PORT {
+            // S2.4：port 声明收集（方法签名登记）
+            var rp = collect_port(s)
+            if rp < 0 {
+                return -1
+            }
+        } else if tag == S_N_IMPL {
+            // S2.4：impl 块暂存（struct 可能声明在后，统一处理在
+            // collect_top 之后由 semantic 主流程调 collect_impl_fns）
+            table_push(g_impl_pending, s)
+        } else if tag == S_N_ACTOR {
+            // 一期并发：actor 声明（A1 语法层仅接受节点）
+            var ra = collect_actor_decl(s)
+            if ra < 0 {
+                return -1
+            }
+        } else if tag == S_N_VAR_DECL {
+            var r = collect_global_var(s, sstate.name_str(s))
+            if r < 0 {
+                return -1
+            }
+        } else if tag == S_N_EXTERN {
+            var full = sstate.name_str(s)
+            var nparams = s_aux[s]
+            // S1.2 E3 强制：extern 声明必须带 unsafe 标注（val = 1）
+            if s_vals[s] == 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "extern 声明必须标注 unsafe（`unsafe extern fn " + full + "(...)`），安全代码禁止直接调用外部符号"
+                return -1
+            }
+            var ret_ty = sgen.parse_generic_type_node(sstate.child(s, 0))
+            if ret_ty < 0 {
+                return -1
+            }
+            // extern 返回类型必须是标量/string/ptr/slice（is_extern_ok_t）或 void
+            var ret_ok: bool = false
+            if ret_ty == TK_VOID || is_extern_ok_t(ret_ty) {
+                ret_ok = true
+            }
+            if !ret_ok {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "extern 函数 '" + full + "' 的返回类型必须是标量/string/ptr/slice 或 void，实际是 " + types.type_name(ret_ty)
+                return -1
+            }
+            var p_tys: table<i64> = table_new_i64()
+            var p_refs: table<i64> = table_new_i64()
+            var p_defs: table<i64> = table_new_i64()
+            var p_vars: table<i64> = table_new_i64()
+            var k: i64 = 0
+            while k < nparams {
+                var p = sstate.child(s, 1 + k)
+                var pt = sgen.parse_generic_type_node(sstate.child(p, 0))
+                if pt < 0 {
+                    return -1
+                }
+                // extern 参数必须是标量/string/ptr/slice 或 repr(C) struct（p.6.8.3
+                // 扩展：repr(C) struct 按引用传指针；其余容器堆布局无法映射 C ABI）
+                if !is_extern_param_ok_t(pt) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    if types.kind(pt) == K_STRUCT {
+                        sm_err_msg = "extern 函数 '" + full + "' 的参数 '" + sstate.name_str(p) + "' 必须是标量/string/ptr/slice 类型，或 repr(C) struct（按引用传指针）；'" + types.type_name(pt) + "' 不是 repr(C)，需显式标注 repr(C)"
+                    } else {
+                        sm_err_msg = "extern 函数 '" + full + "' 的参数 '" + sstate.name_str(p) + "' 必须是标量/string/ptr/slice 类型，实际是 " + types.type_name(pt)
+                    }
+                    return -1
+                }
+                table_push(p_tys, pt)
+                table_push(p_refs, 0)
+                table_push(p_defs, 0)
+                table_push(p_vars, 0)
+                k = k + 1
+            }
+            // 2026-10-13：同名 extern 重声明——签名全同 = 合法重声明（库组合常态，
+            // 如 window/polite 同 extern kernel32 Sleep），静默共享既有登记；
+            // 签名不同或旧登记非 extern（普通函数）仍拒 E00039。
+            var old_sig = sstate.fn_sig(full)
+            var redecl_ok = false
+            if old_sig >= 0 {
+                var old_node = sstate.fn_def_node(full)
+                if old_node >= 0 && s_tags[old_node] == S_N_EXTERN &&
+                    sg_nparams[old_sig] == nparams && types.type_name(sg_ret[old_sig]) == types.type_name(ret_ty) {
+                    // 参数逐位按**渲染名**等价（类型 id 为解析期行号分配、跨相位不可比——
+                    // 2026-10-13 实测：同一 i64 两次解析得 14 与 2）
+                    redecl_ok = true
+                    var ooff = sg_off[old_sig]
+                    var q: i64 = 0
+                    while q < nparams {
+                        if types.type_name(sp_tys[ooff + q]) != types.type_name(p_tys[q]) {
+                            redecl_ok = false
+                            q = nparams
+                        } else {
+                            q = q + 1
+                        }
+                    }
+                }
+                if !redecl_ok {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "extern 函数 '" + full + "' 与已有函数重复定义"
+                    return -1
+                }
+            }
+            // 合法重声明（redecl_ok）：共享既有登记，**不 return**——collect_top 的
+            // 分支内联于 while 循环，return 会整函数退出、吞掉后续全部顶层语句
+            //（2026-10-13 实测：s5/main 未登记 → irgen sig=-1 OOB）。
+            if !redecl_ok {
+            // S1.2：extern 签名登记为 unsafe（pub 位 + unsafe 位，sg_pub 组合标志）
+            if sstate.reg_fn(full, 1 + s_vals[s] * 2, nparams, nparams, ret_ty, p_tys, p_refs, p_defs, p_vars, s) < 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                return -1
+            }
+            // extern 名集合（语义登记）
+            sstate.sorted_insert(ext_keys, ext_keys, intern.intern(full), 0)
+            }
+        } else if tag == S_N_IMPORT {
+            // import 展开在 semantic 主入口处理（读文件 + 递归）
+        } else if tag == S_N_TYPE_ALIAS {
+            // p.9.11.32 类型别名登记：名 → S_N_TYPE_ALIAS 节点（展开在
+            // sgen.parse_generic_type_node 命中别名时做）
+            var anm = s_names[s]
+            if sstate.bs_find(alias_keys, anm) >= 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "类型别名 '" + sstate.name_str(s) + "' 重复定义"
+                return -1
+            }
+            sstate.sorted_insert(alias_keys, alias_vals, anm, s)
+            // p.9.22.6 全量符号表：类型别名声明登记（kind 3）。
+            xref.reg_decl(anm, 3, -1, s)
+        } else if tag == S_N_MACRO_DEF {
+            // S3.3：跨文件宏未支持——主文件宏定义已在 mexpand 展开 pass 中
+            // 收集并从顶层移除；此处残留说明宏定义来自被导入文件。
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "宏定义 '" + sstate.name_str(s) + "' 只能出现在主文件中（跨文件宏暂不支持，S3.3 第一版限制）"
+            return -1
+        } else if tag == S_N_USING {
+            // 收集 using 引入的命名空间段（裸调用补全候选）
+            var nsegs = s_aux[s]
+            var k2: i64 = 0
+            while k2 < nsegs {
+                var seg = sstate.child(s, k2)
+                table_push(using_prefixes, s_names[seg])
+                k2 = k2 + 1
+            }
+            table_push(using_lens, nsegs)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 查找函数定义节点（顶层 + 命名空间递归）
+// 顶层遍历 g_extra_tops（import 展开后的全部文件顶层）；namespace 内递归。
+pub func find_fn_node(full: string) -> i64 {
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            if sstate.ns_full_name(sstate.name_str(s)) == full {
+                return s
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var j: i64 = 0
+            while j < nsegs {
+                var seg = sstate.child(s, j)
+                sstate.ns_push(s_names[seg])
+                j = j + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var found = find_fn_in_ns(body, full)
+            j = 0
+            while j < nsegs {
+                ns_top = ns_top - 1
+                j = j + 1
+            }
+            if found >= 0 {
+                return found
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+}

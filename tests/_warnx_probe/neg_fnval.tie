@@ -1,0 +1,23 @@
+type tie<logic>
+// 负例探针：fn 值被「调用」即属读取，不得报 W00005（未使用变量）/ W00011（参数未使用）。
+// 回归守护点：diag_walk 必须把 S_N_CALL 的被调名（children[0]）登记为读取——
+// 函数值调用 fv(args) 的被调名不是 S_N_VAR 节点，漏记会把仅被调用的 fn 值
+// 变量 / fn 形参误判为未使用（曾误报 tests/language/fn_type.tie 3 处 W00005 +
+// 1 处 W00011）。本文件断言：0 条 W00005、0 条 W00011。
+// （允许出现 2 条 W00015：g / cl 声明为 var 且从未重赋值，应改 const——那是
+//  既有警告的真阳性，与本回归守护点无关。）
+func inc(x: i64) -> i64 { return x + 1 }
+
+// 形参形态：fn 值形参仅被调用（守住 W00011）
+func apply(f: fn(i64) -> i64, x: i64) -> i64 { return f(x) }
+
+func main() {
+    // 形态 1：fn 值变量，仅被调用（守住 W00005）
+    var g: fn(i64) -> i64 = inc
+    println(g(41))
+    // 形态 2：闭包赋给 fn 值变量，仅被调用
+    var cl: fn(i64) -> i64 = func(x: i64) -> i64 { return x * 2 }
+    println(cl(1))
+    // 形态 3：fn 值作实参传入，形参仅被调用
+    println(apply(inc, 5))
+}

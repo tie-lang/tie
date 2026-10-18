@@ -1,0 +1,15 @@
+type tie<logic>
+// 域匹配负例：凭据**不跨函数继承** —— 外层持 mem，闭包体是独立函数，
+// 其内调 alloc 不应继承外层的凭据（与 lock 域的去锁作用域同一规则）
+#[unsafe.mem]
+func bad() -> i64 {
+    var f = func() -> i64 {
+        unsafe {
+            var p = alloc(8)
+            free(p)
+        }
+        return 0
+    }
+    return f()
+}
+func main() { println(to_string(bad())) }

@@ -1,0 +1,758 @@
+type tie<class>
+// compiler/backend/irgen_dir.tie —— 生成器 L3：目录遍历辅助（mkdir_all/remove_dir_all/copy_dir/list_dir/blob_push/walk_dir）
+// ============================================================
+// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+func tig_mkdir_all(p: i64) -> i64 {
+    // r.1.6.2 Linux：分隔符循环逻辑与 Win32 共用（issep 已同时识别 / 与 \），
+    // 仅建目录调用改走 tig_mkdir_utf8（Linux mkdir UTF-8 直通）。
+    var T64 = types.named(TK_I64)
+    var pn = s21_str_head_len(p)
+    var islt = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(islt, T64, 2)
+    var isv = ir.get_value(islt)
+    s21_store(isv, tig_int_lit(0), T64)
+    var hd = ir.new_block(g_cur_func, interner.intern("mk.h"))
+    var bd2 = ir.new_block(g_cur_func, interner.intern("mk.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("mk.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var ic = tig_icmp_c(s21_load(isv, T64), pn, 2)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, ic, 0)
+    ir.add_operand(cb, bd2, 1)
+    ir.add_operand(cb, ex, 1)
+    g_cur_block = bd2
+    var iv = s21_load(isv, T64)
+    var b = s21_str_byte(p, iv)
+    var issep = tig_or_i1(tig_icmp_c(b, tig_int_lit(0x2F), 0), tig_icmp_c(b, tig_int_lit(0x5C), 0))
+    var bSep = ir.new_block(g_cur_func, interner.intern("mk.sep"))
+    var bNo = ir.new_block(g_cur_func, interner.intern("mk.no"))
+    var bInc = ir.new_block(g_cur_func, interner.intern("mk.inc"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, issep, 0)
+    ir.add_operand(cb2, bSep, 1)
+    ir.add_operand(cb2, bNo, 1)
+    g_cur_block = bSep
+    var pref = s21_str_sub_bytes(p, tig_int_lit(0), iv)
+    var pf = tig_icmp_c(s21_str_head_len(pref), tig_int_lit(0), 3)
+    var bP = ir.new_block(g_cur_func, interner.intern("mk.p"))
+    var bPe = ir.new_block(g_cur_func, interner.intern("mk.pe"))
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, pf, 0)
+    ir.add_operand(cb3, bP, 1)
+    ir.add_operand(cb3, bPe, 1)
+    g_cur_block = bP
+    tig_mkdir_utf8(pref)
+    var brp = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brp, bPe, 1)
+    g_cur_block = bPe
+    var brs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs, bInc, 1)
+    g_cur_block = bNo
+    var brn = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brn, bInc, 1)
+    g_cur_block = bInc
+    s21_store(isv, s21_bin(0, iv, tig_int_lit(1)), T64)
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)
+    g_cur_block = ex
+    tig_mkdir_utf8(p)
+    return tig_bool_lit(1)
+}
+func tig_remove_dir_all(p: i64) -> i64 {
+    // r.1.6.2 Linux 分支：迭代 DFS 递归删除（unlink 文件 + 后序 rmdir 目录）。
+    // 工作清单（待展开目录）+ 删除清单（后进先出 → 子目录先于父目录 rmdir）。
+    if tig_is_linux() {
+        var T64 = types.named(TK_I64)
+        var I32 = types.named(TK_I32)
+        var I8 = types.named(TK_I8)
+        var P8 = types.ptr_of(I8)
+        var rs = ir.new_inst(g_cur_block, 20, types.named(TK_BOOL))
+        ir.add_operand(rs, types.named(TK_BOOL), 2)
+        var rp = ir.get_value(rs)
+        s21_store(rp, tig_bool_lit(1), types.named(TK_BOOL))
+        var wbh = s21_raw_alloc_str(tig_int_lit(24))
+        s21_store(s21_gep(wbh, 0, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(wbh, 8, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(wbh, 16, true), tig_int_lit(0), types.named(TK_STR))
+        tig_blob_push(wbh, p)
+        var dbh = s21_raw_alloc_str(tig_int_lit(24))
+        s21_store(s21_gep(dbh, 0, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(dbh, 8, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(dbh, 16, true), tig_int_lit(0), types.named(TK_STR))
+        // 外层循环：while work.len > 0
+        var hd = ir.new_block(g_cur_func, interner.intern("rd.h"))
+        var bd = ir.new_block(g_cur_func, interner.intern("rd.b"))
+        var ex = ir.new_block(g_cur_func, interner.intern("rd.x"))
+        var br0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br0, hd, 1)
+        g_cur_block = hd
+        var wl = s21_load(s21_gep(wbh, 8, true), T64)
+        var wgt = tig_icmp_c(wl, tig_int_lit(0), 3)  // wl > 0
+        var cb0 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb0, wgt, 0)
+        ir.add_operand(cb0, bd, 1)
+        ir.add_operand(cb0, ex, 1)
+        // body：pop 目录 + 登记后序删除
+        g_cur_block = bd
+        var wld = s21_load(s21_gep(wbh, 8, true), T64)
+        var wdat = s21_load(s21_gep(wbh, 16, true), types.named(TK_STR))
+        var popdir = s21_load(s21_gep(wdat, s21_bin(2, s21_bin(1, wld, tig_int_lit(1)), tig_int_lit(8)), false), types.named(TK_STR))
+        s21_store(s21_gep(wbh, 8, true), s21_bin(1, wld, tig_int_lit(1)), T64)
+        tig_blob_push(dbh, popdir)
+        // 遍历该目录（opendir/readdir）
+        var dp = tig_ext_call1("opendir", popdir, types.named(TK_STR), P8)
+        var ok = tig_cmp_zero(dp, 1)  // dp != null
+        var bSkip = ir.new_block(g_cur_func, interner.intern("rd.sk"))
+        var bScan = ir.new_block(g_cur_func, interner.intern("rd.sc"))
+        var cb = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb, ok, 0)
+        ir.add_operand(cb, bScan, 1)
+        ir.add_operand(cb, bSkip, 1)
+        g_cur_block = bSkip
+        var brs = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brs, hd, 1)
+        g_cur_block = bScan
+        var top = ir.new_block(g_cur_func, interner.intern("rd.t"))
+        var bri = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(bri, top, 1)
+        g_cur_block = top
+        var ent = tig_ext_call1("readdir", dp, P8, P8)
+        var isend = tig_cmp_zero(ent, 0)  // ent == null → 结束
+        var bEnd = ir.new_block(g_cur_func, interner.intern("rd.en"))
+        var bProc = ir.new_block(g_cur_func, interner.intern("rd.pr"))
+        var cb2 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb2, isend, 0)
+        ir.add_operand(cb2, bEnd, 1)
+        ir.add_operand(cb2, bProc, 1)
+        g_cur_block = bProc
+        var namep = s21_gep(ent, tig_int_lit(19), false)  // d_name@19
+        var nlen = tig_ext_call1("strlen", namep, P8, T64)
+        var nm = tig_bytes_to_tie(namep, nlen)
+        var ndv = tig_not_i1(tig_is_dotname(nm))
+        var bChk = ir.new_block(g_cur_func, interner.intern("rd.ch"))
+        var bNxt = ir.new_block(g_cur_func, interner.intern("rd.nx"))
+        var cb3 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb3, ndv, 0)
+        ir.add_operand(cb3, bChk, 1)
+        ir.add_operand(cb3, bNxt, 1)
+        g_cur_block = bChk
+        var full = tig_join_path(popdir, nm)
+        var dt = s21_zext(s21_load(s21_gep(ent, 18, true), I8), I8)  // d_type@18
+        var isdir = tig_icmp_c(dt, tig_int_lit(4), 0)  // DT_DIR
+        var bPush = ir.new_block(g_cur_func, interner.intern("rd.ps"))
+        var bUnl = ir.new_block(g_cur_func, interner.intern("rd.un"))
+        var bAdv = ir.new_block(g_cur_func, interner.intern("rd.ad"))
+        var cb4 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb4, isdir, 0)
+        ir.add_operand(cb4, bPush, 1)
+        ir.add_operand(cb4, bUnl, 1)
+        g_cur_block = bPush
+        tig_blob_push(wbh, full)  // 子目录压入工作清单（后序 rmdir）
+        var brp = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brp, bAdv, 1)
+        g_cur_block = bUnl
+        tig_ext_call1("unlink", full, types.named(TK_STR), I32)
+        var bru = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(bru, bAdv, 1)
+        g_cur_block = bNxt
+        var brn = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brn, bAdv, 1)
+        g_cur_block = bAdv
+        var brb = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brb, top, 1)
+        g_cur_block = bEnd
+        tig_ext_call1("closedir", dp, P8, I32)
+        var brh = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brh, hd, 1)
+        // 外层结束：后序 rmdir（删除清单后进先出 → 子目录先删）
+        g_cur_block = ex
+        var hd2 = ir.new_block(g_cur_func, interner.intern("rd.h2"))
+        var bd2 = ir.new_block(g_cur_func, interner.intern("rd.b2"))
+        var ex2 = ir.new_block(g_cur_func, interner.intern("rd.x2"))
+        var br02 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br02, hd2, 1)
+        g_cur_block = hd2
+        var dl = s21_load(s21_gep(dbh, 8, true), T64)
+        var dgt = tig_icmp_c(dl, tig_int_lit(0), 3)  // dl > 0
+        var cb5 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb5, dgt, 0)
+        ir.add_operand(cb5, bd2, 1)
+        ir.add_operand(cb5, ex2, 1)
+        g_cur_block = bd2
+        var dld = s21_load(s21_gep(dbh, 8, true), T64)
+        var ddat = s21_load(s21_gep(dbh, 16, true), types.named(TK_STR))
+        var ddir = s21_load(s21_gep(ddat, s21_bin(2, s21_bin(1, dld, tig_int_lit(1)), tig_int_lit(8)), false), types.named(TK_STR))
+        s21_store(s21_gep(dbh, 8, true), s21_bin(1, dld, tig_int_lit(1)), T64)
+        tig_ext_call1("rmdir", ddir, types.named(TK_STR), I32)
+        var brb2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brb2, hd2, 1)
+        g_cur_block = ex2
+        return s21_load(rp, types.named(TK_BOOL))
+    }
+    return tig_sh_op(3, p, p)
+}
+// copy_dir(src, dst)：迭代式递归复制（src/dst 成对工作清单，无递归函数）。
+// 每个目录：先建 dst 目录，遍历 src 直接条目——文件 CopyFileW，子目录建目并
+// 压入工作清单继续。UTF-16 路径安全。整体成功 → i1 true。
+func tig_copy_dir(a: i64, b: i64) -> i64 {
+    // r.1.6.2 Linux 分支：迭代式递归复制（src/dst 成对工作清单）——opendir/
+    // readdir 遍历（d_type/d_name 直读），子目录 mkdir+压栈，文件走
+    // tig_posix_copy_file。路径 join 用 '/'。整体成功 → true。
+    if tig_is_linux() {
+        var T64 = types.named(TK_I64)
+        var I32 = types.named(TK_I32)
+        var I8 = types.named(TK_I8)
+        var P8 = types.ptr_of(I8)
+        var srcW = s21_raw_alloc_str(tig_int_lit(24))
+        s21_store(s21_gep(srcW, 0, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(srcW, 8, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(srcW, 16, true), tig_int_lit(0), types.named(TK_STR))
+        var dstW = s21_raw_alloc_str(tig_int_lit(24))
+        s21_store(s21_gep(dstW, 0, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(dstW, 8, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(dstW, 16, true), tig_int_lit(0), types.named(TK_STR))
+        tig_blob_push(srcW, a)
+        tig_blob_push(dstW, b)
+        tig_mkdir_utf8(b)  // 根 dst 目录
+        var hd = ir.new_block(g_cur_func, interner.intern("cdl.h"))
+        var bd4 = ir.new_block(g_cur_func, interner.intern("cdl.b"))
+        var ex = ir.new_block(g_cur_func, interner.intern("cdl.x"))
+        var br0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br0, hd, 1)
+        g_cur_block = hd
+        var sl0 = s21_load(s21_gep(srcW, 8, true), T64)
+        var sgt = tig_icmp_c(sl0, tig_int_lit(0), 3)  // srcW.len > 0
+        var cb0 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb0, sgt, 0)
+        ir.add_operand(cb0, bd4, 1)
+        ir.add_operand(cb0, ex, 1)
+        // body：弹出成对 (s, d)
+        g_cur_block = bd4
+        var sl1 = s21_load(s21_gep(srcW, 8, true), T64)
+        var srcs = s21_load(s21_gep(srcW, 16, true), types.named(TK_STR))
+        var s = s21_load(s21_gep(srcs, s21_bin(2, s21_bin(1, sl1, tig_int_lit(1)), tig_int_lit(8)), false), types.named(TK_STR))
+        s21_store(s21_gep(srcW, 8, true), s21_bin(1, sl1, tig_int_lit(1)), T64)
+        var dl1 = s21_load(s21_gep(dstW, 8, true), T64)
+        var dsts = s21_load(s21_gep(dstW, 16, true), types.named(TK_STR))
+        var d = s21_load(s21_gep(dsts, s21_bin(2, s21_bin(1, dl1, tig_int_lit(1)), tig_int_lit(8)), false), types.named(TK_STR))
+        s21_store(s21_gep(dstW, 8, true), s21_bin(1, dl1, tig_int_lit(1)), T64)
+        tig_mkdir_utf8(d)  // 当前 dst 目录（已存在则忽略）
+        // 遍历 src 目录（opendir/readdir）
+        var dp = tig_ext_call1("opendir", s, types.named(TK_STR), P8)
+        var ok = tig_cmp_zero(dp, 1)  // dp != null
+        var bSkip = ir.new_block(g_cur_func, interner.intern("cdl.sk"))
+        var bScan = ir.new_block(g_cur_func, interner.intern("cdl.sc"))
+        var cb = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb, ok, 0)
+        ir.add_operand(cb, bScan, 1)
+        ir.add_operand(cb, bSkip, 1)
+        g_cur_block = bSkip
+        var brsk = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brsk, hd, 1)
+        g_cur_block = bScan
+        var top = ir.new_block(g_cur_func, interner.intern("cdl.t"))
+        var bri = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(bri, top, 1)
+        g_cur_block = top
+        var ent = tig_ext_call1("readdir", dp, P8, P8)
+        var isend = tig_cmp_zero(ent, 0)  // ent == null → 结束
+        var bEnd = ir.new_block(g_cur_func, interner.intern("cdl.en"))
+        var bPr = ir.new_block(g_cur_func, interner.intern("cdl.pr"))
+        var cb2 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb2, isend, 0)
+        ir.add_operand(cb2, bEnd, 1)
+        ir.add_operand(cb2, bPr, 1)
+        g_cur_block = bPr
+        var namep = s21_gep(ent, tig_int_lit(19), false)  // d_name@19
+        var nlen = tig_ext_call1("strlen", namep, P8, T64)
+        var name = tig_bytes_to_tie(namep, nlen)
+        var ndw = tig_not_i1(tig_is_dotname(name))
+        var bPr2 = ir.new_block(g_cur_func, interner.intern("cdl.p2"))
+        var bSk2 = ir.new_block(g_cur_func, interner.intern("cdl.s2"))
+        var bAd2 = ir.new_block(g_cur_func, interner.intern("cdl.a2"))
+        var cb3 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb3, ndw, 0)
+        ir.add_operand(cb3, bPr2, 1)
+        ir.add_operand(cb3, bSk2, 1)
+        g_cur_block = bPr2
+        var sItem = tig_join_path(s, name)
+        var dItem = tig_join_path(d, name)
+        var dt = s21_zext(s21_load(s21_gep(ent, 18, true), I8), I8)  // d_type@18
+        var dirf = tig_icmp_c(dt, tig_int_lit(4), 0)  // DT_DIR
+        var bDir = ir.new_block(g_cur_func, interner.intern("cdl.dr"))
+        var bFil = ir.new_block(g_cur_func, interner.intern("cdl.fl"))
+        var bAd3 = ir.new_block(g_cur_func, interner.intern("cdl.ad"))
+        var cb4 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb4, dirf, 0)
+        ir.add_operand(cb4, bDir, 1)
+        ir.add_operand(cb4, bFil, 1)
+        // 子目录：建 dst 子目录 + 压入工作清单
+        g_cur_block = bDir
+        tig_mkdir_utf8(dItem)
+        tig_blob_push(srcW, sItem)
+        tig_blob_push(dstW, dItem)
+        var brd = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brd, bAd3, 1)
+        // 文件：POSIX 复制
+        g_cur_block = bFil
+        tig_posix_copy_file(sItem, dItem)
+        var brf2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brf2, bAd3, 1)
+        g_cur_block = bSk2
+        var brs2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brs2, bAd3, 1)
+        g_cur_block = bAd3
+        var brb = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brb, top, 1)
+        g_cur_block = bEnd
+        tig_ext_call1("closedir", dp, P8, I32)
+        var brh = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brh, hd, 1)
+        g_cur_block = ex
+        return tig_bool_lit(1)
+    }
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var I8 = types.named(TK_I8)
+    var P8 = types.ptr_of(I8)
+    // src/dst 成对工作清单（增长式字符串数组）
+    var srcW = s21_raw_alloc_str(tig_int_lit(24))
+    s21_store(s21_gep(srcW, 0, true), tig_int_lit(0), T64)
+    s21_store(s21_gep(srcW, 8, true), tig_int_lit(0), T64)
+    s21_store(s21_gep(srcW, 16, true), tig_int_lit(0), types.named(TK_STR))
+    var dstW = s21_raw_alloc_str(tig_int_lit(24))
+    s21_store(s21_gep(dstW, 0, true), tig_int_lit(0), T64)
+    s21_store(s21_gep(dstW, 8, true), tig_int_lit(0), T64)
+    s21_store(s21_gep(dstW, 16, true), tig_int_lit(0), types.named(TK_STR))
+    tig_blob_push(srcW, a)
+    tig_blob_push(dstW, b)
+    tig_mkdir_w(tig_wide16(b))  // 根 dst 目录
+    // 外层循环：while srcW.len > 0
+    var hd = ir.new_block(g_cur_func, interner.intern("cd.h"))
+    var bd4 = ir.new_block(g_cur_func, interner.intern("cd.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("cd.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var sl0 = s21_load(s21_gep(srcW, 8, true), T64)
+    var sgt = tig_icmp_c(sl0, tig_int_lit(0), 3)
+    var cb0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb0, sgt, 0)
+    ir.add_operand(cb0, bd4, 1)
+    ir.add_operand(cb0, ex, 1)
+    // body：弹出成对 (s, d)
+    g_cur_block = bd4
+    var sl1 = s21_load(s21_gep(srcW, 8, true), T64)
+    var srcs = s21_load(s21_gep(srcW, 16, true), types.named(TK_STR))
+    var s = s21_load(s21_gep(srcs, s21_bin(2, s21_bin(1, sl1, tig_int_lit(1)), tig_int_lit(8)), false), types.named(TK_STR))
+    s21_store(s21_gep(srcW, 8, true), s21_bin(1, sl1, tig_int_lit(1)), T64)
+    var dl1 = s21_load(s21_gep(dstW, 8, true), T64)
+    var dsts = s21_load(s21_gep(dstW, 16, true), types.named(TK_STR))
+    var d = s21_load(s21_gep(dsts, s21_bin(2, s21_bin(1, dl1, tig_int_lit(1)), tig_int_lit(8)), false), types.named(TK_STR))
+    s21_store(s21_gep(dstW, 8, true), s21_bin(1, dl1, tig_int_lit(1)), T64)
+    // 创建当前 dst 目录（已存在则忽略）
+    tig_mkdir_w(tig_wide16(d))
+    // 遍历 src 目录条目
+    var pw = tig_wide16(tig_wildpath(s))
+    var fd = s21_raw_alloc_str(tig_int_lit(592))
+    var hf = tig_find_first_w(pw, fd)
+    var inv = tig_icmp_c(tig_p2i(hf), tig_int_lit(-1), 0)
+    var bInv2 = ir.new_block(g_cur_func, interner.intern("cd.iv"))
+    var bMv2 = ir.new_block(g_cur_func, interner.intern("cd.mv"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, inv, 0)
+    ir.add_operand(cb, bInv2, 1)
+    ir.add_operand(cb, bMv2, 1)
+    g_cur_block = bInv2
+    tig_ext_call1("free", fd, types.named(TK_STR), -1)
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)
+    // 内层循环
+    g_cur_block = bMv2
+    var top = ir.new_block(g_cur_func, interner.intern("cd.t"))
+    var bri = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bri, top, 1)
+    g_cur_block = top
+    var name = tig_from_wide16(s21_gep(fd, 44, true))
+    var ndw = tig_not_i1(tig_is_dotname(name))
+    var bPr2 = ir.new_block(g_cur_func, interner.intern("cd.pr"))
+    var bSk2 = ir.new_block(g_cur_func, interner.intern("cd.sp"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, ndw, 0)
+    ir.add_operand(cb2, bPr2, 1)
+    ir.add_operand(cb2, bSk2, 1)
+    g_cur_block = bPr2
+    var sItem = tig_join_path(s, name)
+    var dItem = tig_join_path(d, name)
+    var attr = s21_zext(s21_load(s21_gep(fd, 0, true), I32), I32)
+    var dirf = tig_icmp_c(s21_bin(6, attr, tig_int_lit(0x10)), tig_int_lit(0), 1)
+    var bAd3 = ir.new_block(g_cur_func, interner.intern("cd.ad"))
+    var bDir = ir.new_block(g_cur_func, interner.intern("cd.dr"))
+    var bFil = ir.new_block(g_cur_func, interner.intern("cd.fl"))
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, dirf, 0)
+    ir.add_operand(cb3, bDir, 1)
+    ir.add_operand(cb3, bFil, 1)
+    // 子目录：建 dst 子目录 + 压入工作清单
+    g_cur_block = bDir
+    tig_mkdir_w(tig_wide16(dItem))
+    tig_blob_push(srcW, sItem)
+    tig_blob_push(dstW, dItem)
+    var brd = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brd, bAd3, 1)
+    // 文件：CopyFileW(sItem, dItem, 0)
+    g_cur_block = bFil
+    var sw = tig_wide16(sItem)
+    var dw = tig_wide16(dItem)
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8);  table_push(avs, sw)
+    table_push(ats, P8);  table_push(avs, dw)
+    table_push(ats, I32); table_push(avs, tig_int_lit_ty(0, I32))
+    tig_ext_call_typed("CopyFileW", ats, avs, I32)
+    var brf2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf2, bAd3, 1)
+    g_cur_block = bSk2
+    var brs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs, bAd3, 1)
+    // adv + 推进
+    g_cur_block = bAd3
+    var cont = tig_win_ok(tig_find_next_w(hf, fd))
+    var bEnd = ir.new_block(g_cur_func, interner.intern("cd.en"))
+    var cb4 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb4, cont, 0)
+    ir.add_operand(cb4, top, 1)
+    ir.add_operand(cb4, bEnd, 1)
+    g_cur_block = bEnd
+    tig_find_close(hf)
+    tig_ext_call1("free", fd, types.named(TK_STR), -1)
+    var brh = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brh, hd, 1)
+    // 完成：整体成功
+    g_cur_block = ex
+    return tig_bool_lit(1)
+}
+func tig_list_dir(p: i64) -> i64 {
+    // r.1.6.2 Linux：opendir/readdir 收集条目名（tig_posix_list_names）
+    if tig_is_linux() {
+        return tig_posix_list_names(p)
+    }
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var pw = tig_wide16(tig_wildpath(p))
+    var fd = s21_raw_alloc_str(tig_int_lit(592))
+    var hf = tig_find_first_w(pw, fd)
+    var inv = tig_icmp_c(tig_p2i(hf), tig_int_lit(-1), 0)
+    var rslt = ir.new_inst(g_cur_block, 20, types.named(TK_STR))
+    ir.add_operand(rslt, types.named(TK_STR), 2)
+    var sv = ir.get_value(rslt)
+    s21_store(sv, tig_fill_table(s21_raw_alloc_str(tig_int_lit(8)), tig_int_lit(0), tig_int_lit(0)), types.named(TK_STR))
+    var bBad = ir.new_block(g_cur_func, interner.intern("ls.bad"))
+    var bC = ir.new_block(g_cur_func, interner.intern("ls.c"))
+    var bM = ir.new_block(g_cur_func, interner.intern("ls.m"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, inv, 0)
+    ir.add_operand(cb, bBad, 1)
+    ir.add_operand(cb, bC, 1)
+    g_cur_block = bBad
+    tig_ext_call1("free", fd, types.named(TK_STR), -1)
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, bM, 1)
+    g_cur_block = bC
+    var cnt = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(cnt, T64, 2)
+    var cslot = ir.get_value(cnt)
+    s21_store(cslot, tig_int_lit(0), T64)
+    var top = ir.new_block(g_cur_func, interner.intern("ls.t"))
+    var brc = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brc, top, 1)
+    g_cur_block = top
+    var nm = tig_from_wide16(s21_gep(fd, 44, true))
+    var ndv = tig_not_i1(tig_is_dotname(nm))
+    var bInc = ir.new_block(g_cur_func, interner.intern("ls.inc"))
+    var bSkip = ir.new_block(g_cur_func, interner.intern("ls.sk"))
+    var bAdv = ir.new_block(g_cur_func, interner.intern("ls.adv"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, ndv, 0)
+    ir.add_operand(cb2, bInc, 1)
+    ir.add_operand(cb2, bSkip, 1)
+    g_cur_block = bInc
+    s21_store(cslot, s21_bin(0, s21_load(cslot, T64), tig_int_lit(1)), T64)
+    var bri = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bri, bAdv, 1)
+    g_cur_block = bSkip
+    var brs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs, bAdv, 1)
+    g_cur_block = bAdv
+    var cont = tig_win_ok(tig_find_next_w(hf, fd))
+    var bDone = ir.new_block(g_cur_func, interner.intern("ls.done"))
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, cont, 0)
+    ir.add_operand(cb3, top, 1)
+    ir.add_operand(cb3, bDone, 1)
+    g_cur_block = bDone
+    var n = s21_load(cslot, T64)
+    var data = s21_raw_alloc_str(s21_bin(2, n, tig_int_lit(8)))
+    tig_find_close(hf)
+    var hf2 = tig_find_first_w(pw, fd)
+    var idx = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(idx, T64, 2)
+    var islot = ir.get_value(idx)
+    s21_store(islot, tig_int_lit(0), T64)
+    var top2 = ir.new_block(g_cur_func, interner.intern("ls.t2"))
+    var brc2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brc2, top2, 1)
+    g_cur_block = top2
+    var nm2 = tig_from_wide16(s21_gep(fd, 44, true))
+    var nd2 = tig_not_i1(tig_is_dotname(nm2))
+    var bFill = ir.new_block(g_cur_func, interner.intern("ls.fil"))
+    var bSkp = ir.new_block(g_cur_func, interner.intern("ls.s2"))
+    var bAd2 = ir.new_block(g_cur_func, interner.intern("ls.a2"))
+    var cb4 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb4, nd2, 0)
+    ir.add_operand(cb4, bFill, 1)
+    ir.add_operand(cb4, bSkp, 1)
+    g_cur_block = bFill
+    var iv2 = s21_load(islot, T64)
+    s21_store(s21_gep(data, s21_bin(2, iv2, tig_int_lit(8)), false), nm2, types.named(TK_STR))
+    s21_store(islot, s21_bin(0, iv2, tig_int_lit(1)), T64)
+    var brf2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf2, bAd2, 1)
+    g_cur_block = bSkp
+    var brj = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brj, bAd2, 1)
+    g_cur_block = bAd2
+    var cont2 = tig_win_ok(tig_find_next_w(hf2, fd))
+    var bMat = ir.new_block(g_cur_func, interner.intern("ls.mt"))
+    var cb5 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb5, cont2, 0)
+    ir.add_operand(cb5, top2, 1)
+    ir.add_operand(cb5, bMat, 1)
+    g_cur_block = bMat
+    s21_store(sv, tig_fill_table(data, n, s21_load(islot, T64)), types.named(TK_STR))
+    tig_find_close(hf2)
+    tig_ext_call1("free", fd, types.named(TK_STR), -1)
+    var brd = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brd, bM, 1)
+    g_cur_block = bM
+    return s21_load(sv, types.named(TK_STR))
+}
+func tig_walk_dir(p: i64) -> i64 {
+    // r.1.6.2 Linux 分支：迭代 DFS（工作清单）+ opendir/readdir；结果表收集
+    // 全部条目完整路径（join 用 '/'）。失败返回空表。
+    if tig_is_linux() {
+        var T64 = types.named(TK_I64)
+        var I32 = types.named(TK_I32)
+        var I8 = types.named(TK_I8)
+        var P8 = types.ptr_of(I8)
+        var rslt = ir.new_inst(g_cur_block, 20, types.named(TK_STR))
+        ir.add_operand(rslt, types.named(TK_STR), 2)
+        var sv = ir.get_value(rslt)
+        var rbh = s21_raw_alloc_str(tig_int_lit(24))
+        s21_store(s21_gep(rbh, 0, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(rbh, 8, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(rbh, 16, true), tig_int_lit(0), types.named(TK_STR))
+        var wbh = s21_raw_alloc_str(tig_int_lit(24))
+        s21_store(s21_gep(wbh, 0, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(wbh, 8, true), tig_int_lit(0), T64)
+        s21_store(s21_gep(wbh, 16, true), tig_int_lit(0), types.named(TK_STR))
+        tig_blob_push(wbh, p)  // 种子：根目录
+        var hd = ir.new_block(g_cur_func, interner.intern("wkl.h"))
+        var bd3 = ir.new_block(g_cur_func, interner.intern("wkl.b"))
+        var ex = ir.new_block(g_cur_func, interner.intern("wkl.x"))
+        var br0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br0, hd, 1)
+        g_cur_block = hd
+        var wl = s21_load(s21_gep(wbh, 8, true), T64)
+        var wgt = tig_icmp_c(wl, tig_int_lit(0), 3)  // wl > 0
+        var cb0 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb0, wgt, 0)
+        ir.add_operand(cb0, bd3, 1)
+        ir.add_operand(cb0, ex, 1)
+        // body：弹出工作清单栈顶目录
+        g_cur_block = bd3
+        var wld = s21_load(s21_gep(wbh, 8, true), T64)
+        var wdat = s21_load(s21_gep(wbh, 16, true), types.named(TK_STR))
+        var popdir = s21_load(s21_gep(wdat, s21_bin(2, s21_bin(1, wld, tig_int_lit(1)), tig_int_lit(8)), false), types.named(TK_STR))
+        s21_store(s21_gep(wbh, 8, true), s21_bin(1, wld, tig_int_lit(1)), T64)
+        // 列出该目录的直接条目（opendir/readdir）
+        var dp = tig_ext_call1("opendir", popdir, types.named(TK_STR), P8)
+        var ok = tig_cmp_zero(dp, 1)  // dp != null
+        var bSkip = ir.new_block(g_cur_func, interner.intern("wkl.sk"))
+        var bScan = ir.new_block(g_cur_func, interner.intern("wkl.sc"))
+        var cb = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb, ok, 0)
+        ir.add_operand(cb, bScan, 1)
+        ir.add_operand(cb, bSkip, 1)
+        g_cur_block = bSkip
+        var brsk = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brsk, hd, 1)
+        g_cur_block = bScan
+        var top = ir.new_block(g_cur_func, interner.intern("wkl.t"))
+        var bri = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(bri, top, 1)
+        g_cur_block = top
+        var ent = tig_ext_call1("readdir", dp, P8, P8)
+        var isend = tig_cmp_zero(ent, 0)  // ent == null → 结束
+        var bEnd = ir.new_block(g_cur_func, interner.intern("wkl.en"))
+        var bProc = ir.new_block(g_cur_func, interner.intern("wkl.pr"))
+        var cb2 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb2, isend, 0)
+        ir.add_operand(cb2, bEnd, 1)
+        ir.add_operand(cb2, bProc, 1)
+        g_cur_block = bProc
+        var namep = s21_gep(ent, tig_int_lit(19), false)  // d_name@19
+        var nlen = tig_ext_call1("strlen", namep, P8, T64)
+        var name = tig_bytes_to_tie(namep, nlen)
+        var ndw = tig_not_i1(tig_is_dotname(name))
+        var bProc2 = ir.new_block(g_cur_func, interner.intern("wkl.p2"))
+        var bSkp2 = ir.new_block(g_cur_func, interner.intern("wkl.s2"))
+        var bAd2 = ir.new_block(g_cur_func, interner.intern("wkl.a2"))
+        var cb3 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb3, ndw, 0)
+        ir.add_operand(cb3, bProc2, 1)
+        ir.add_operand(cb3, bSkp2, 1)
+        g_cur_block = bProc2
+        var full = tig_join_path(popdir, name)
+        tig_blob_push(rbh, full)
+        var dt = s21_zext(s21_load(s21_gep(ent, 18, true), I8), I8)  // d_type@18
+        var dirf = tig_icmp_c(dt, tig_int_lit(4), 0)  // DT_DIR
+        var bPush2 = ir.new_block(g_cur_func, interner.intern("wkl.ps"))
+        var bAd = ir.new_block(g_cur_func, interner.intern("wkl.ad"))
+        var cb4 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb4, dirf, 0)
+        ir.add_operand(cb4, bPush2, 1)
+        ir.add_operand(cb4, bAd, 1)
+        g_cur_block = bPush2
+        tig_blob_push(wbh, full)  // 子目录压入工作清单
+        var brp = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brp, bAd, 1)
+        g_cur_block = bSkp2
+        var brs = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brs, bAd, 1)
+        g_cur_block = bAd
+        var brb = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brb, top, 1)
+        g_cur_block = bEnd
+        tig_ext_call1("closedir", dp, P8, I32)
+        var brh = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brh, hd, 1)
+        // 外层循环结束：组装结果表
+        g_cur_block = ex
+        var cap = s21_load(s21_gep(rbh, 0, true), T64)
+        var lenn = s21_load(s21_gep(rbh, 8, true), T64)
+        var dat = s21_load(s21_gep(rbh, 16, true), types.named(TK_STR))
+        s21_store(sv, tig_fill_table(dat, cap, lenn), types.named(TK_STR))
+        return s21_load(sv, types.named(TK_STR))
+    }
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var I8 = types.named(TK_I8)
+    var P8 = types.ptr_of(I8)
+    var rslt = ir.new_inst(g_cur_block, 20, types.named(TK_STR))
+    ir.add_operand(rslt, types.named(TK_STR), 2)
+    var sv = ir.get_value(rslt)
+    // 结果表 blob（增长式字符串指针数组）
+    var rbh = s21_raw_alloc_str(tig_int_lit(24))
+    s21_store(s21_gep(rbh, 0, true), tig_int_lit(0), T64)
+    s21_store(s21_gep(rbh, 8, true), tig_int_lit(0), T64)
+    s21_store(s21_gep(rbh, 16, true), tig_int_lit(0), types.named(TK_STR))
+    // 目录工作清单 blob（迭代式 DFS，避免生成中途嵌套递归函数）
+    var wbh = s21_raw_alloc_str(tig_int_lit(24))
+    s21_store(s21_gep(wbh, 0, true), tig_int_lit(0), T64)
+    s21_store(s21_gep(wbh, 8, true), tig_int_lit(0), T64)
+    s21_store(s21_gep(wbh, 16, true), tig_int_lit(0), types.named(TK_STR))
+    tig_blob_push(wbh, p)  // 种子：根目录
+    // 外层循环：while work.len > 0
+    var hd = ir.new_block(g_cur_func, interner.intern("wk.h"))
+    var bd3 = ir.new_block(g_cur_func, interner.intern("wk.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("wk.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var wl = s21_load(s21_gep(wbh, 8, true), T64)
+    var wgt = tig_icmp_c(wl, tig_int_lit(0), 3)  // wl > 0
+    var cb0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb0, wgt, 0)
+    ir.add_operand(cb0, bd3, 1)
+    ir.add_operand(cb0, ex, 1)
+    // body：弹出工作清单栈顶目录
+    g_cur_block = bd3
+    var wld = s21_load(s21_gep(wbh, 8, true), T64)
+    var wdat = s21_load(s21_gep(wbh, 16, true), types.named(TK_STR))
+    var popdir = s21_load(s21_gep(wdat, s21_bin(2, s21_bin(1, wld, tig_int_lit(1)), tig_int_lit(8)), false), types.named(TK_STR))
+    s21_store(s21_gep(wbh, 8, true), s21_bin(1, wld, tig_int_lit(1)), T64)
+    // 列出该目录的直接条目
+    var pw = tig_wide16(tig_wildpath(popdir))
+    var fd = s21_raw_alloc_str(tig_int_lit(592))
+    var hf = tig_find_first_w(pw, fd)
+    var inv = tig_icmp_c(tig_p2i(hf), tig_int_lit(-1), 0)
+    var bInvb = ir.new_block(g_cur_func, interner.intern("wk.iv"))
+    var bMv = ir.new_block(g_cur_func, interner.intern("wk.mv"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, inv, 0)
+    ir.add_operand(cb, bInvb, 1)
+    ir.add_operand(cb, bMv, 1)
+    g_cur_block = bInvb
+    tig_ext_call1("free", fd, types.named(TK_STR), -1)
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)  // 空目录 → 回外层循环
+    // 内层循环：遍历条目
+    g_cur_block = bMv
+    var top = ir.new_block(g_cur_func, interner.intern("wk.t"))
+    var bri = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bri, top, 1)
+    g_cur_block = top
+    var name = tig_from_wide16(s21_gep(fd, 44, true))
+    var ndw = tig_not_i1(tig_is_dotname(name))
+    var bProc = ir.new_block(g_cur_func, interner.intern("wk.pr"))
+    var bSkp = ir.new_block(g_cur_func, interner.intern("wk.sp"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, ndw, 0)
+    ir.add_operand(cb2, bProc, 1)
+    ir.add_operand(cb2, bSkp, 1)
+    g_cur_block = bProc
+    var full = tig_join_path(popdir, name)
+    tig_blob_push(rbh, full)
+    var attr = s21_zext(s21_load(s21_gep(fd, 0, true), I32), I32)
+    var dirf = tig_icmp_c(s21_bin(6, attr, tig_int_lit(0x10)), tig_int_lit(0), 1)
+    var bPush2 = ir.new_block(g_cur_func, interner.intern("wk.ps"))
+    var bAd = ir.new_block(g_cur_func, interner.intern("wk.ad"))
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, dirf, 0)
+    ir.add_operand(cb3, bPush2, 1)
+    ir.add_operand(cb3, bAd, 1)
+    g_cur_block = bPush2
+    tig_blob_push(wbh, full)  // 子目录压入工作清单
+    var brp = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brp, bAd, 1)
+    g_cur_block = bSkp
+    var brs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs, bAd, 1)
+    g_cur_block = bAd
+    var cont = tig_win_ok(tig_find_next_w(hf, fd))
+    var bEnd = ir.new_block(g_cur_func, interner.intern("wk.en"))
+    var cb4 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb4, cont, 0)
+    ir.add_operand(cb4, top, 1)
+    ir.add_operand(cb4, bEnd, 1)
+    g_cur_block = bEnd
+    tig_find_close(hf)
+    tig_ext_call1("free", fd, types.named(TK_STR), -1)
+    var brh = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brh, hd, 1)  // 该目录遍历完 → 回外层循环
+    // 外层循环结束：组装结果表
+    g_cur_block = ex
+    var cap = s21_load(s21_gep(rbh, 0, true), T64)
+    var lenn = s21_load(s21_gep(rbh, 8, true), T64)
+    var dat = s21_load(s21_gep(rbh, 16, true), types.named(TK_STR))
+    s21_store(sv, tig_fill_table(dat, cap, lenn), types.named(TK_STR))
+    return s21_load(sv, types.named(TK_STR))
+}
+}

@@ -1,0 +1,103 @@
+type tie<logic>
+// ============================================================================
+// tests/regex21_probe/regex21_probe.tie：std/regex 交替与替换语义探针（p.9.1.1.21）。
+// Regex alternation & replacement probe (p.9.1.1.21).
+//
+// 背景：windows findstr 的正则子集不支持 `|` 交替（`|` 被视为字面字符），
+// 本里程碑为 std/regex 补全交替语义与替换（regex_replace，含 $1 组引用），
+// 使 findstr 风格模式可表达"或"。与 std/regexpx（p.9.1.1.9）共享同一引擎。
+//
+// 覆盖（Coverage）：
+//   - 交替 `|`：cat|dog / (foo|bar)baz 左右分支命中；
+//   - findstr 兼容用例：用交替表达 findstr 无法表达的"多词之一"检索；
+//   - regex_replace 别名 + $1/$2 组引用（前移/包裹/选择）；
+//   - find_all 在交替上的多命中；
+//   - 顺序优先（leftmost-first）：短前者优先。
+// 数据平面：全 string/bool/i64。夹具内联。
+// 编译运行：compiler\tiec.exe tests\regex21_probe\regex21_probe.tie
+// ============================================================================
+import "/std/regex.tie" as regex
+
+func chk_true(name: string, v: bool) {
+    if v {
+        println("PASS " + name)
+    } else {
+        println("FAIL " + name + " expected true")
+        exit(1)
+    }
+}
+func chk_false(name: string, v: bool) {
+    if !v {
+        println("PASS " + name)
+    } else {
+        println("FAIL " + name + " expected false")
+        exit(1)
+    }
+}
+func chk_str(name: string, got: string, want: string) {
+    if got == want {
+        println("PASS " + name)
+    } else {
+        println("FAIL " + name + " got=[" + got + "] want=[" + want + "]")
+        exit(1)
+    }
+}
+func chk_list(name: string, t: table<string>, n: i64) {
+    if len(t) == n {
+        println("PASS " + name)
+    } else {
+        println("FAIL " + name + " len=" + to_string(len(t)))
+        exit(1)
+    }
+}
+
+func tst_alternation() {
+    chk_true("alt_cat", regex.is_match("cat", "cat|dog"))
+    chk_true("alt_dog", regex.is_match("dog", "cat|dog"))
+    chk_false("alt_pig", regex.is_match("pig", "cat|dog"))
+    // 交替与组结合
+    chk_true("alt_group", regex.is_match("foobaz", "(foo|bar)baz"))
+    chk_true("alt_group2", regex.is_match("barbaz", "(foo|bar)baz"))
+    chk_false("alt_group3", regex.is_match("bazbaz", "(foo|bar)baz"))
+    // 三路交替
+    chk_true("alt_three", regex.is_match("banana", "apple|banana|cherry"))
+    // 顺序优先：短前者优先（"a|ab" 优先 a）
+    chk_str("alt_leftexpr", regex.find("ab", "a|ab"), "a")
+}
+
+func tst_findstr_compat() {
+    // findstr 的 /R 正则不支持 `|`（字面 '|'）；本引擎补全为交替，用于
+    // "多词之一"检索。检索日志中是否出现 error 或 warn。
+    chk_true("fst_error_or_warn", regex.is_match("error", "error|warn"))
+    chk_true("fst_warn", regex.is_match("warn", "error|warn"))
+    chk_false("fst_info", regex.is_match("info", "error|warn"))
+    // 一段日志用交替命中全部关键字
+    var all = regex.find_all("err ok warn dbg", "error|warn")
+    chk_list("fst_findall", all, 1)
+    chk_str("fst_first", all[0], "warn")
+    // IP 前缀匹配：192.|10. 之一
+    chk_true("fst_ip", regex.is_match("192.168.1.1", "192\\.|10\\."))
+}
+
+func tst_replace() {
+    // 组引用互换 $1 $2
+    chk_str("rp_swap", regex.regex_replace("first last", "(\\w+) (\\w+)", "$2 $1"), "last first")
+    // 单组包裹
+    chk_str("rp_wrap", regex.regex_replace("abc", "(b)", "<$1>"), "a<b>c")
+    // 交替匹配多个并各自替换（`a|b` 都命中的该替换）
+    chk_str("rp_alt", regex.regex_replace("ab", "a|b", "[$0]"), "[a][b]")
+    // 替换中非组引用原样
+    chk_str("rp_literal", regex.regex_replace("x=1", "=", " equals "), "x equals 1")
+    // $0 整体引用
+    chk_str("rp_zero", regex.regex_replace("abc", "b", "($0)"), "a(b)c")
+    // 复用 group() 验证捕获与替换一致
+    chk_str("rp_group", regex.group("first last", "(\\w+) (\\w+)", 1), "first")
+}
+
+func main() {
+    tst_alternation()
+    tst_findstr_compat()
+    tst_replace()
+    println("regex21 done")
+    exit(0)
+}

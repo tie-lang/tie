@@ -1,0 +1,325 @@
+type tie<class>
+// compiler/backend/irgen_stmt_p4.tie —— 分片 4（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 irgen_stmt.tie。
+namespace irgen {
+// byte_concat 形态判定：val 为 builtin 调用 `byte_concat(Var(t), 任意)` 或
+// 字节拼接包装 `concat(Var(t), 任意)`（如 zd.concat → byte_concat 转发）。
+// 内置调用节点：s_names 存名字、实参 children[slot_off(+k)]（call_arg 布局）。
+// 注：concat 需"返回值赋给首参表变量 + 引用纯净"双门（cbs_scan）兜底，
+// 语义非拼接的自定义 concat 因引用纯净不满足自然被排除。
+func cbs_is_self_concat(val: i64, nid: i64) -> bool {
+    if val < 0 {
+        return false
+    }
+    var nm = sstate.name_str(val)
+    if nm != "byte_concat" && nm != "concat" {
+        return false
+    }
+    var off = sstate.slot_off(val)
+    var a0 = sstate.child(val, off)
+    if a0 < 0 {
+        return false
+    }
+    return s_tags[a0] == 6 && s_names[a0] == nid
+}
+
+// 定位 cbs 状态索引（-1 未提升）
+func cbs_find(nid: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_cbs_keys) {
+        if g_cbs_keys[i] == nid {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 取消提升登记（循环出口写回后）
+func cbs_remove(nid: i64) {
+    var i = cbs_find(nid)
+    if i < 0 {
+        return
+    }
+    var outk = table_new_i64()
+    var outa = table_new_i64()
+    var j: i64 = 0
+    while j < len(g_cbs_keys) {
+        if j != i {
+            table_push(outk, g_cbs_keys[j])
+            table_push(outa, g_cbs_acc[j])
+        }
+        j = j + 1
+    }
+    g_cbs_keys = outk
+    g_cbs_acc = outa
+}
+
+// 私有累积表新建 + 拷贝 t 现有内容（模板：走运行时建表 + 采纳拷贝缓冲）。
+func cbs_copy(t: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var lv = s21_load(s21_gep(t, 8, true), T64)
+    var eszv = s21_load(s21_gep(t, 24, true), T64)
+    var buf = s21_raw_alloc_str(s21_bin(2, lv, eszv))
+    s21_memcpy_if(buf, t21_data(t), s21_bin(2, lv, eszv))
+    return s21_tbl_adopt(eszv, lv, lv, buf)
+}
+
+// 就地追加段 x 到累积表 acc：ensure 扩容（免费旧块）→ memcpy → set_len。
+func cbs_append(acc: i64, x: i64) {
+    var T64 = types.named(TK_I64)
+    var la = s21_load(s21_gep(acc, 8, true), T64)
+    var lx = s21_load(s21_gep(x, 8, true), T64)
+    var eszv = s21_load(s21_gep(acc, 24, true), T64)
+    var need = s21_bin(0, la, lx)
+    var data_i = tl_i64_2("tl_tbl$tbl_ensure", t21_ptri(acc), need)
+    var data_p = t21_intp(data_i)
+    var dst = s21_gep(data_p, s21_bin(2, la, eszv), false)
+    s21_memcpy_if(dst, t21_data(x), s21_bin(2, lx, eszv))
+    s21_store(s21_gep(acc, 8, true), need, T64)
+}
+
+// 递归收集循环内 `t = byte_concat(t, x)` 自加候选（合法叶 = RHS 第一实参 Var）。
+func cbs_collect(st: i64, ref legal: table<i64>, ref nids: table<i64>) {
+    if st < 0 {
+        return
+    }
+    if s_tags[st] == 144 {
+        return
+    }
+    if s_tags[st] == 103 {
+        var nm = sstate.name_str(st)
+        if str_len(nm) > 0 {
+            var nid = interner.intern(nm)
+            var val = sstate.child(st, 0)
+            if cbs_is_self_concat(val, nid) {
+                var off = sstate.slot_off(val)
+                var a0 = sstate.child(val, off)
+                if a0 >= 0 {
+                    table_push(legal, a0)
+                }
+                if !sb_contains(nids, nid) {
+                    table_push(nids, nid)
+                }
+            }
+        }
+        return
+    }
+    var n = sstate.nchild(st)
+    var i: i64 = 0
+    while i < n {
+        cbs_collect(sstate.child(st, i), legal, nids)
+        i = i + 1
+    }
+}
+
+// 扫描循环体：返回可安全提升的字节表自加变量名 id 表（空 = 不提升）。
+func cbs_scan(body: i64, cond: i64) -> table<i64> {
+    var jobs = table_new_i64()
+    var legal = table_new_i64()
+    cbs_collect(body, legal, jobs)
+    var w_nid = table_new_i64()
+    var w_has = table_new_i64()
+    collect_other_writes(body, w_nid, w_has)
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < len(jobs) {
+        var nid = jobs[i]
+        var ok: bool = true
+        if scope_get(nid) < 0 {
+            ok = false
+        }
+        if ok && g_lookup_is_global != 0 {
+            ok = false
+        }
+        if ok && g_lookup_ty != types.named(TK_STR) && !types.is_table(g_lookup_ty) {
+            ok = false
+        }
+        if ok && cbs_find(nid) >= 0 {
+            ok = false
+        }
+        if ok && scan_goto(body) {
+            ok = false
+        }
+        var wi = linear_find(w_nid, nid)
+        if ok && wi >= 0 && w_has[wi] == 1 {
+            ok = false
+        }
+        if ok {
+            var refs = find_var_refs(body, nid)
+            var rc = find_var_refs(cond, nid)
+            var rk: i64 = 0
+            while rk < len(rc) {
+                table_push(refs, rc[rk])
+                rk = rk + 1
+            }
+            var j: i64 = 0
+            while j < len(refs) {
+                if !sb_contains(legal, refs[j]) {
+                    ok = false
+                    break
+                }
+                j = j + 1
+            }
+        }
+        if ok {
+            table_push(out, nid)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 语句块遍历（StmtList children）。每个块独立作用域（push/pop）。
+// 死代码承接：前一条语句已终止块（goto/break/continue/return 等 terminator）
+// 后仍有语句时，新开承接块存放后续死代码——LLVM 不允许 terminator 后跟指令，
+// 死块由 opt DCE 清理（设计 §7.1.5：goto 后不可达代码 opt 清理，不报错）。
+func tig_block_stmts(blk: i64) -> i64 {
+    g_block_lvl = g_block_lvl + 1
+    scope_push()
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(blk, i)
+        if block_terminated() {
+            g_cur_block = ir.new_block(g_cur_func, interner.intern("blk.dead"))
+        }
+        // r.1.6.7 逃逸分析前置钩子：生成该语句前先扫描其整棵子树，命中「句柄离开
+        // 本次调用」的泄漏点即把相关候选表**立即置死**（单调）。一并覆盖：
+        //   · 顺序语句 → 流敏感（泄漏点之前的访问仍享免锁快路径）；
+        //   · 循环语句 → 子树里的泄漏点被**提前**置死（循环体只生成一次，
+        //     「本轮泄漏 / 下一轮误用」必须提前堵住）。
+        esc_stmt_pre(s)
+        var r = tig_stmt(s)
+        if r < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    // p.9.11.4 defer：命名函数体的最外层块末尾（隐式函数收尾，块未终止即流到
+    // 隐式 return）→ 运行函数级全部 defer（作用域 0 与已清标志的循环 defer 因
+    // 已执行而自动跳过）。须在 scope_pop 前发射以保证 defer body 读到作用域变量。
+    if g_in_fn_body != 0 && g_block_lvl == 1 && len(g_def_flags) > 0 && !block_terminated() {
+        var dref = tig_run_defers_all()
+        if dref < 0 {
+            g_block_lvl = g_block_lvl - 1
+            return -1
+        }
+        g_in_fn_body = 0
+    }
+    scope_pop()
+    g_block_lvl = g_block_lvl - 1
+    return 0
+}
+
+// p.9.11.3 try 错误聚合块（表达式）：线性发射块体语句（块内 `?` 经 tig_try
+// 在 Err/None 时 ret 传播到当前函数——与块外一致，try 纯语法分组）。末语句若
+// 为 N_EXPR_STMT 取其表达式值作为 try 块的值；无末值则返回哑值（仅作语句）。
+// 注意：块体语句可能被 tig_stmt 内部阻塞（如 `?` 条件切块），逐语句在同一
+// g_cur_block 流上发射即达成顺序语义。
+func tig_try_block(id: i64) -> i64 {
+    var body = sstate.child(id, 0)
+    var nb = sstate.nchild(body)
+    var val: i64 = tig_int_lit(0)
+    var i: i64 = 0
+    while i < nb {
+        var s = sstate.child(body, i)
+        var is_last: bool = i == nb - 1
+        if is_last && s_tags[s] == S_N_EXPR_STMT && sstate.nchild(s) == 1 {
+            var ev = tig_expr(sstate.child(s, 0))
+            if ev < 0 {
+                return -1
+            }
+            val = ev
+        } else {
+            if tig_stmt(s) < 0 {
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    return val
+}
+
+// 发射 defer LIFO 执行链。scopef<0 = 运行全部作用域（函数出口 return/?/尾收）；
+// scopef>=0 = 仅运行该循环体作用域（循环退出 break/自然结束，逆序）。
+// 逆序遍历（后注册先执行），每项用运行时标志守卫（true → 执行 body 后清标志，
+// false → 跳过）。执行后 g_cur_block 落在 continuation 块（调用方随后发射出口）。
+func tig_run_defers(scopef: i64) -> i64 {
+    var cnt = g_def_cnt
+    if cnt == 0 {
+        return 0
+    }
+    // 收集满足作用域条件的 defer 下标，LIFO 序 = 注册逆序
+    var list: table<i64> = table_new_i64()
+    var j: i64 = cnt - 1
+    while j >= 0 {
+        if scopef < 0 || g_def_scopes[j] == scopef {
+            table_push(list, j)
+        }
+        j = j - 1
+    }
+    var nl = len(list)
+    if nl == 0 {
+        return 0
+    }
+    var cont = ir.new_block(g_cur_func, interner.intern("dfr.cont"))
+    var guard_blocks: table<i64> = table_new_i64()
+    var body_blocks: table<i64> = table_new_i64()
+    var q: i64 = 0
+    while q < nl {
+        table_push(guard_blocks, ir.new_block(g_cur_func, interner.intern("dfr.g")))
+        table_push(body_blocks, ir.new_block(g_cur_func, interner.intern("dfr.b")))
+        q = q + 1
+    }
+    // 入口（当前块）→ 首个守卫块
+    if !block_terminated() {
+        var ebr = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(ebr, guard_blocks[0], 1)
+    } else {
+        g_cur_block = guard_blocks[0]
+    }
+    q = 0
+    while q < nl {
+        var nextblk: i64 = cont
+        if q + 1 < nl {
+            nextblk = guard_blocks[q + 1]
+        }
+        // 守卫块：load 标志 → cond_br(flag → body, else → next)
+        g_cur_block = guard_blocks[q]
+        var ldc = ir.new_inst(g_cur_block, 21, types.named(TK_BOOL))  // load i1
+        ir.add_operand(ldc, g_def_flags[list[q]], 0)
+        var flagv = ir.get_value(ldc)
+        var cbr = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+        ir.add_operand(cbr, flagv, 0)
+        ir.add_operand(cbr, body_blocks[q], 1)
+        ir.add_operand(cbr, nextblk, 1)
+        // body 块：执行 defer body 语句，清标志，汇入 next
+        g_cur_block = body_blocks[q]
+        var br2 = tig_block_stmts(g_def_bodies[list[q]])
+        if br2 < 0 {
+            return -1
+        }
+        var fc = tig_bool_lit(0)  // false：清除（防止再次执行）
+        var fcs = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(fcs, types.named(TK_BOOL), 2)
+        ir.add_operand(fcs, fc, 0)
+        ir.add_operand(fcs, g_def_flags[list[q]], 0)
+        if !block_terminated() {
+            var brc = ir.new_inst(g_cur_block, 30, -1)
+            ir.add_operand(brc, nextblk, 1)
+        }
+        q = q + 1
+    }
+    g_cur_block = cont
+    return 0
+}
+
+// 快捷：运行全部作用域的 defer（函数出口）
+func tig_run_defers_all() -> i64 {
+    return tig_run_defers(-1)
+}
+
+}

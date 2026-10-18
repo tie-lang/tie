@@ -1,0 +1,51 @@
+type tie<logic>
+// tests/_cap_probe/cap_probe.tie —— v2 值参数泛型（容量档位）语法 + 语义测试
+// ============================================================
+// 覆盖：
+//   1) `func f<CAP: i64>` 显式整型字面量实参 `f<1024>` / `f<1280>`（多档共存，
+//      值参数编码 -1-v 进入类型系统，mangled 含值去重）；
+//   2) 默认值 `func f<CAP: i64 = 1024>` 无显式实参时自动代入默认档；
+//   3) 数组长度引用值参数 `ref array<f32, CAP>`（实例化后替换为字面量）。
+// 内存安全护栏：0/负/超上限长度拒绝（上限 2^18=262144）。
+// 运行（tiec 根目录）：
+//   compiler\tiec2.exe tests\_cap_probe\cap_probe.tie
+
+func sum_arr<CAP: i64>(a: ref array<f32, CAP>, n: i64) -> f64 {
+    var s: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        s = s + to_f64(a[i])
+        i = i + 1
+    }
+    return s
+}
+
+// 默认档值参数：无显式实参时按 CAP=1024 实例化
+func def_cap<CAP: i64 = 1024>(a: ref array<f32, CAP>, n: i64) -> f64 {
+    var s: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        s = s + to_f64(a[i])
+        i = i + 1
+    }
+    return s
+}
+
+func main() {
+    // 档位 1024
+    var a: array<f32, 1024> = array_init(0.0)
+    a[10] = 1.5
+    a[11] = 2.5
+    // 档位 1280（> 1024，需显式实例化）
+    var b: array<f32, 1280> = array_init(0.0)
+    b[0] = 7.0
+    b[100] = 3.0
+    var s1 = sum_arr<1024>(a, 1024)
+    var s2 = sum_arr<1280>(b, 1280)
+    var s3 = def_cap(a, 1024)
+    println("s1=" + to_string(s1) + " s2=" + to_string(s2) + " s3=" + to_string(s3))
+    if s1 < 3.9 || s1 > 4.1001 { exit(1) }
+    if s2 < 9.9 || s2 > 10.1001 { exit(1) }
+    if s3 < 3.9 || s3 > 4.1001 { exit(1) }
+    println("CAP PROBE PASS")
+}

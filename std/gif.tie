@@ -1,0 +1,760 @@
+type tie<class>
+// ============================================================================
+// std/gif.tie —— GIF87a/89a 编解码（命名空间 gif，纯 tie）p.9.1.1.5
+// GIF LZW（码宽 2..12，随字典增长递增，clear=2^mincs / end=clear+1，字典满发 clear）。
+//
+// 数据平面：整链路 table<i64>（元素 0..255）承载原始字节，绝不转 string。
+// 多字节整数一律小端（LE，GIF 规范）；LZW 位流 LSB-first。
+//
+// 解码范围：
+//   - 头（GIF87a/89a）+ 逻辑屏幕描述符 + 全局调色板 GCT；
+//   - 图像描述符（含局部调色板 LCT）+ LZW 解压（GIF 变体）+ 交织（interlace）
+//     （前四个 pass 行序重排）；返回索引像素流 + 调色板（RGB 三元组平铺）。
+//   - 逐块遍历至 trailer；扩展块（含图形控制扩展 GCE）按规范跳过。
+//   多帧动画：完整扫描计数帧（nframes），但仅展开第一帧像素（简单动画留待调用方
+//   自行通过 decode_frames 思路扩展——本阶段提供单帧数据平面，满足最小可用）。
+//
+// 编码范围（最小可用）：索引图像 → 合法 GIF89a（GCT + 单图 + 结尾），LZW 字典编码。
+//
+// 错误约定：decode 返回 GifImage{ok=false, err=...}；encode 恒构造合法 GIF。
+// 语言约束同 ext/png：位运算只接触 ≤0xFFFFFFFF 正值；拷贝用 while + table_push。
+// ============================================================================
+
+// GIF 解码结果。
+struct GifImage {
+    var ok: bool = false
+    var err: string = ""
+    var w: i64 = 0
+    var h: i64 = 0
+    var min_code_size: i64 = 0
+    var interlace: i64 = 0     // 0/1
+    var has_gct: bool = false
+    var transparent: i64 = -1  // 透明索引（GCE 给出；无则 -1）
+    var frame_delay: i64 = 0   // GCE 帧延迟（1/100 秒）
+    var nframes: i64 = 0       // 扫描到的图像描述符数
+    var pixels: table<i64> = table_new_i64()   // 索引像素流（row-major, w*h）
+    var palette: table<i64> = table_new_i64()  // 调色板（RGB 三元组平铺，3*n）
+}
+
+namespace gif {
+
+// 小端 u16。
+func le16(b: table<i64>, off: i64) -> i64 {
+    return b[off] | (b[off + 1] << 8)
+}
+
+// 追加小端 u16。
+func push_le16(ref buf: table<i64>, v: i64) {
+    table_push(buf, v & 0xFFFF)
+    table_push(buf, (v >> 8) & 0xFFFF)
+}
+
+// ============================================================================
+// 一、GIF LZW 解码（码宽 2..12 递增，字典扩容）
+// ============================================================================
+
+// 位读取器：st=[0]bitbuf,[1]bitcnt,[2]pos。读 n 位 LSB-first；越界返回 -1。
+func read_bits(ref st: table<i64>, raw: table<i64>, n: i64) -> i64 {
+    while st[1] < n {
+        if st[2] >= len(raw) {
+            return -1
+        }
+        var b = raw[st[2]]
+        st[2] = st[2] + 1
+        st[0] = st[0] | (b << st[1])
+        st[1] = st[1] + 8
+    }
+    var mask: i64 = 1
+    var k: i64 = 0
+    while k < n {
+        mask = mask << 1
+        k = k + 1
+    }
+    mask = mask - 1
+    var res = st[0] & mask
+    st[0] = st[0] >> n
+    st[1] = st[1] - n
+    return res
+}
+
+// GIF LZW 解压：raw 为扁平 LZW 字节，min_cs 为最小码宽。
+// 返回 (ok, 索引字节表)。
+func lzw_decode(raw: table<i64>, min_cs: i64) -> (bool, table<i64>) {
+    var clear = 1 << min_cs
+    var endc = clear + 1
+    var next: i64 = endc + 1
+    var codesize = min_cs + 1
+    var out = table_new_i64()
+    if len(raw) == 0 {
+        return (false, out)
+    }
+    // 字典：prefix/suffix 各 4096（GIF 码宽上限 12）。
+    var prefix = table_new_i64()
+    var suffix = table_new_i64()
+    var z: i64 = 0
+    while z < 4096 {
+        table_push(prefix, 0)
+        table_push(suffix, 0)
+        z = z + 1
+    }
+    z = 0
+    while z < clear {
+        suffix[z] = z
+        z = z + 1
+    }
+    var st = table_new_i64()
+    table_push(st, 0)   // [0] bitbuf
+    table_push(st, 0)   // [1] bitcnt
+    table_push(st, 0)   // [2] pos
+    var prev: i64 = -1
+    var g: i64 = 0
+    while g < 40000000 {
+        g = g + 1
+        var cd = read_bits(st, raw, codesize)
+        if cd < 0 {
+            return (false, out)
+        }
+        if cd == endc {
+            break
+        }
+        if cd == clear {
+            // 复位字典与码宽
+            next = endc + 1
+            codesize = min_cs + 1
+            prev = -1
+            continue
+        }
+        // 用栈回溯 cd 的字节序列
+        var stack = table_new_i64()
+        var i = cd
+        while i >= clear {
+            table_push(stack, suffix[i])
+            i = prefix[i]
+            if i < 0 || len(stack) > 4096 {
+                return (false, out)
+            }
+        }
+        // 根字节 i（< clear）
+        var root_byte = i
+        table_push(stack, root_byte)
+        if prev == -1 {
+            // 首码后必须跟根——实际该进入上面的 while 前即 cd<clear（正常），
+            // prev==-1 时只允许根字面；这里统一按栈回放输出。
+            prev = cd
+            var q: i64 = len(stack) - 1
+            while q >= 0 {
+                table_push(out, stack[q])
+                q = q - 1
+            }
+            continue
+        }
+        // 是否是"未定义码"（cd == next，即 prev+prev首字节 的延迟情况）
+        if cd == next && cd < 4096 {
+            // 该码=prev序列+prev首字节：先复制 prev 序列到 stack（重排）
+            // 我们在上方已经按 cd(==next) 走栈——但 cd 尚未入字典，prefix/suffix
+            // 无意义。故重新用 prev 构建。
+            stack = table_new_i64()
+            var pi = prev
+            while pi >= clear {
+                table_push(stack, suffix[pi])
+                pi = prefix[pi]
+                if len(stack) > 4096 {
+                    return (false, out)
+                }
+            }
+            var proot = pi
+            table_push(stack, proot)
+            // 新条目 = prev + prev首字节
+            if next < 4096 {
+                prefix[next] = prev
+                suffix[next] = proot
+                next = next + 1
+                if next == (1 << codesize) && codesize < 12 {
+                    codesize = codesize + 1
+                }
+            }
+            // 输出：先 proot(prev首) 再 prev 序列 → 即栈自顶向下
+            var q2: i64 = len(stack) - 1
+            while q2 >= 0 {
+                table_push(out, stack[q2])
+                q2 = q2 - 1
+            }
+            prev = cd
+            continue
+        }
+        // 正常已知码：输出其序列；并新增条目 prev + entry首字节
+        var entry_first = root_byte
+        if next < 4096 {
+            prefix[next] = prev
+            suffix[next] = entry_first
+            next = next + 1
+            if next == (1 << codesize) && codesize < 12 {
+                codesize = codesize + 1
+            }
+        }
+        var q3: i64 = len(stack) - 1
+        while q3 >= 0 {
+            table_push(out, stack[q3])
+            q3 = q3 - 1
+        }
+        prev = cd
+    }
+    return (true, out)
+}
+
+// 交织重排：把压缩输出的 linear 行序按 GIF 4-pass 排列转回自然行序。
+// 输入 pixels 按 GIF 交织输出顺序（pass1 行0,8,..., pass2 行4,12,..., pass4 尾），
+// 返回自然行序（行0..h-1）。
+func deinterlace(ind: table<i64>, w: i64, h: i64) -> table<i64> {
+    var out = table_new_i64()
+    var row: i64 = 0
+    while row < h {
+        table_push(out, 0)
+        row = row + 1
+    }
+    // 记录每 pass 产生的行
+    var passes = table_new_i64()   // [pass,start,inc] 三元
+    var p: i64 = 0
+    while p < 8 {
+        table_push(passes, 0)
+        p = p + 1
+    }
+    passes[0] = 0
+    passes[1] = 0
+    passes[2] = 8
+    passes[3] = 4
+    passes[4] = 4
+    passes[5] = 2
+    passes[6] = 2
+    passes[7] = 1
+    // 期望行数
+    var want = h * w
+    if len(ind) < want {
+        return out
+    }
+    var src: i64 = 0
+    var pi: i64 = 0
+    while pi < 4 {
+        var start = passes[pi * 2]
+        var inc = passes[pi * 2 + 1]
+        var r = start
+        while r < h {
+            var col: i64 = 0
+            while col < w {
+                out[r] = ind[src + col]
+                col = col + 1
+            }
+            src = src + w
+            r = r + inc
+        }
+        pi = pi + 1
+    }
+    return out
+}
+
+// 把线性像素（索引）重交织为 GIF 交织顺序（编码用；本库编码不交织，此函数备用）。
+func interlace_pixels(ind: table<i64>, w: i64, h: i64) -> table<i64> {
+    var passes = table_new_i64()
+    table_push(passes, 0)
+    table_push(passes, 0)
+    table_push(passes, 8)
+    table_push(passes, 4)
+    table_push(passes, 4)
+    table_push(passes, 2)
+    table_push(passes, 2)
+    table_push(passes, 1)
+    var out = table_new_i64()
+    var pi: i64 = 0
+    while pi < 4 {
+        var start = passes[pi * 2]
+        var inc = passes[pi * 2 + 1]
+        var r = start
+        while r < h {
+            var col: i64 = 0
+            while col < w {
+                table_push(out, ind[r * w + col])
+                col = col + 1
+            }
+            r = r + inc
+        }
+        pi = pi + 1
+    }
+    return out
+}
+
+// ============================================================================
+// 二、GIF LZW 编码（字典线性探测哈希；码宽随字典增长）
+// ============================================================================
+
+// 位写入器：wr=[0]acc,[1]cnt；把 LSB-first 的 L 位写入 out 字节表。
+func put_bits(ref wr: table<i64>, ref out: table<i64>, c: i64, n: i64) {
+    wr[0] = wr[0] | (c << wr[1])
+    wr[1] = wr[1] + n
+    while wr[1] >= 8 {
+        table_push(out, wr[0] & 0xFF)
+        wr[0] = wr[0] >> 8
+        wr[1] = wr[1] - 8
+    }
+}
+
+// GIF LZW 压缩编码（字典 + 码宽随字典增长；阈值对齐解码端，保证互操作）。
+// 说明：编码器与解码器（lzw_decode）共享同一码宽演进规则——
+//   新增字典条目后若 nextc 达 2^codesize（且 <12）则增宽；字典满 4096 发 clear 复位。
+//   该规则与参考解码器（PIL/zlib）一致，编码输出可被任意 GIF 解码器读取。
+func lzw_encode(data: table<i64>, min_cs: i64) -> table<i64> {
+    var clear = 1 << min_cs
+    var endc = clear + 1
+    var nextc: i64 = endc + 1
+    var codesize = min_cs + 1
+    var out = table_new_i64()
+    var wr = table_new_i64()
+    table_push(wr, 0)
+    table_push(wr, 0)
+    var tblk = table_new_i64()
+    var tblv = table_new_i64()
+    var z: i64 = 0
+    while z < 8192 {
+        table_push(tblk, -1)
+        table_push(tblv, 0)
+        z = z + 1
+    }
+    var n = len(data)
+    if n == 0 {
+        return out
+    }
+    if data[0] >= clear {
+        return out   // 像素值需 < 2^mincs；不合理 min_cs 由调用方保证
+    }
+    put_bits(wr, out, clear, codesize)
+    var w: i64 = data[0]
+    var i: i64 = 1
+    while i < n {
+        var c = data[i]
+        var g = dict_find(tblk, tblv, w, c)
+        if g >= 0 {
+            w = g
+        } else {
+            put_bits(wr, out, w, codesize)
+            if nextc < 4096 {
+                dict_put(tblk, tblv, w, c, nextc)
+                nextc = nextc + 1
+                if nextc == (1 << codesize) + 1 && codesize < 12 {
+                    codesize = codesize + 1
+                }
+            } else {
+                // 字典满：发 clear 复位
+                put_bits(wr, out, clear, codesize)
+                z = 0
+                while z < 8192 {
+                    tblk[z] = -1
+                    z = z + 1
+                }
+                nextc = endc + 1
+                codesize = min_cs + 1
+            }
+            w = c
+        }
+        i = i + 1
+    }
+    put_bits(wr, out, w, codesize)
+    put_bits(wr, out, endc, codesize)
+    if wr[1] > 0 {
+        table_push(out, wr[0] & 0xFF)
+    }
+    return out
+}
+
+// 线性探测哈希：key=w*256+c → code；-1 表示不在字典。tblk 存 key、tblv 存码。
+func dict_put(ref tblk: table<i64>, ref tblv: table<i64>, w: i64, c: i64, cd: i64) {
+    var key = w * 256 + c
+    var idx = (key * 2654435761) % 16384
+    if idx < 0 {
+        idx = idx + 16384
+    }
+    var guard: i64 = 0
+    while guard < 16384 {
+        if tblk[idx] == -1 || tblk[idx] == key {
+            tblk[idx] = key
+            tblv[idx] = cd
+            return
+        }
+        idx = idx + 1
+        if idx >= 16384 {
+            idx = 0
+        }
+        guard = guard + 1
+    }
+}
+
+func dict_find(tblk: table<i64>, tblv: table<i64>, w: i64, c: i64) -> i64 {
+    var key = w * 256 + c
+    var idx = (key * 2654435761) % 16384
+    if idx < 0 {
+        idx = idx + 16384
+    }
+    var guard: i64 = 0
+    while guard < 16384 {
+        if tblk[idx] == -1 {
+            return -1
+        }
+        if tblk[idx] == key {
+            return tblv[idx]
+        }
+        idx = idx + 1
+        if idx >= 16384 {
+            idx = 0
+        }
+        guard = guard + 1
+    }
+    return -1
+}
+
+// ============================================================================
+// 三、decode：完整 GIF 字节表 → GifImage
+// ============================================================================
+
+// 读取并拼接一个数据子块序列（直到 0 终止），返回 (内容字节表, pos)。
+func read_subblocks(bytes: table<i64>, pos: i64) -> (table<i64>, i64) {
+    var data = table_new_i64()
+    var p = pos
+    var guard: i64 = 0
+    while guard < 100000 {
+        guard = guard + 1
+        if p >= len(bytes) {
+            return (data, p)
+        }
+        var blk = bytes[p]
+        if blk == 0 {
+            return (data, p + 1)
+        }
+        if p + 1 + blk > len(bytes) {
+            return (data, p + 1)
+        }
+        var k: i64 = 0
+        while k < blk {
+            table_push(data, bytes[p + 1 + k])
+            k = k + 1
+        }
+        p = p + 1 + blk
+    }
+    return (data, p)
+}
+
+// 解码图像描述符后的 LZW 数据区：读 min_cs + 子块 → 索引像素（含交织重排）。
+// 返回 (ok, pixels)。
+func decode_image_pixels(bytes: table<i64>, pos: i64, w: i64, h: i64, inter: i64,
+                         has_lct: bool, lct_field: i64) -> (bool, i64, table<i64>) {
+    // 跳过局部调色板
+    var p = pos
+    if has_lct {
+        var sz = 1 << (lct_field + 1)
+        p = p + 3 * sz
+    }
+    if p >= len(bytes) {
+        return (false, p, table_new_i64())
+    }
+    var min_cs = bytes[p]
+    p = p + 1
+    var rb = read_subblocks(bytes, p)
+    var lzw = rb.0
+    var npos = rb.1
+    var r = lzw_decode(lzw, min_cs)
+    if r.0 == false {
+        return (false, npos, table_new_i64())
+    }
+    var pix = r.1
+    if inter != 0 {
+        pix = deinterlace(pix, w, h)
+    }
+    return (true, npos, pix)
+}
+
+// 完整 GIF 解码。
+pub func decode(bytes: table<i64>) -> GifImage {
+    var img = GifImage()
+    var n = len(bytes)
+    if n < 13 {
+        img.err = "truncated: <13 header"
+        return img
+    }
+    // 魔数
+    if bytes[0] != 71 || bytes[1] != 73 || bytes[2] != 70 {   // 'G','I','F'
+        img.err = "bad GIF magic"
+        return img
+    }
+    var minor = bytes[4]          // '7'(87a) 或 '9'(89a)
+    if bytes[3] != 56 || !(minor == 55 || minor == 57) {   // '8'
+        img.err = "unsupported GIF version"
+        return img
+    }
+    var w = le16(bytes, 6)
+    var h = le16(bytes, 8)
+    if w <= 0 || h <= 0 {
+        img.err = "zero dimension"
+        return img
+    }
+    var packed = bytes[10]
+    var gct_flag = (packed & 0x80) != 0
+    var gct_field = packed & 0x07
+    var gct_size = 1 << (gct_field + 1)     // 颜色数 = 2^(field+1)，field=7 → 256
+    var pos: i64 = 13
+    var palette = table_new_i64()
+    if gct_flag {
+        if pos + 3 * gct_size > n {
+            img.err = "truncated: GCT"
+            return img
+        }
+        var k: i64 = 0
+        while k < 3 * gct_size {
+            table_push(palette, bytes[pos + k])
+            k = k + 1
+        }
+        pos = pos + 3 * gct_size
+        img.has_gct = true
+    }
+    var done = false
+    var guard: i64 = 0
+    var frames: i64 = 0
+    while done == false && guard < 100000 {
+        guard = guard + 1
+        if pos >= n {
+            img.err = "truncated: no trailer"
+            return img
+        }
+        var sep = bytes[pos]
+        if sep == 0x3B {   // trailer
+            done = true
+        } else if sep == 0x2C {   // image descriptor
+            frames = frames + 1
+            if frames == 1 {
+                if pos + 10 > n {
+                    img.err = "truncated: image descriptor"
+                    return img
+                }
+                var lw = le16(bytes, pos + 5)
+                var lh = le16(bytes, pos + 7)
+                var ip = bytes[pos + 9]
+                var lct_flag = (ip & 0x80) != 0
+                var inter: i64 = 0
+                if (ip & 0x40) != 0 {
+                    inter = 1
+                }
+                var lct_field = ip & 0x07
+                var dp = pos + 10
+                var r = decode_image_pixels(bytes, dp, lw, lh, inter, lct_flag, lct_field)
+                if r.0 == false {
+                    img.err = "LZW decode failed"
+                    return img
+                }
+                if lct_flag {
+                    // 用读取自己 palette 覆盖：局部调色板在 decode_image_pixels 里跳过，
+                    // 此处直接从 dp 读 LCT
+                    var sz = 1 << (lct_field + 1)
+                    palette = table_new_i64()
+                    var kk: i64 = 0
+                    while kk < 3 * sz && dp + kk < n {
+                        table_push(palette, bytes[dp + kk])
+                        kk = kk + 1
+                    }
+                }
+                img.ok = true
+                img.w = lw
+                img.h = lh
+                img.min_code_size = 0   // 填 min_cs 稍后由 decode_image_pixels 未回传；置 0 预览
+                img.interlace = inter
+                img.pixels = r.2
+                img.palette = palette
+                pos = r.1
+            } else {
+                // 后续帧：仅推进到其数据区末尾（跳过子块）
+                var ip2 = bytes[pos + 9]
+                var lct2 = (ip2 & 0x80) != 0
+                var f2 = ip2 & 0x07
+                var dp2 = pos + 10
+                if lct2 {
+                    var s2 = 1 << (f2 + 1)
+                    dp2 = dp2 + 3 * s2
+                }
+                if dp2 < n {
+                    var mc = bytes[dp2]
+                    pos = read_subblocks(bytes, dp2 + 1).1
+                }
+            }
+        } else if sep == 0x21 {   // extension
+            if pos + 1 >= n {
+                img.err = "truncated: extension"
+                return img
+            }
+            var lab = bytes[pos + 1]
+            // GCE（0xF9）：读帧延迟与透明索引
+            if lab == 0xF9 && pos + 8 < n {
+                var gce = read_subblocks(bytes, pos + 2)
+                var gd = gce.0
+                if len(gd) >= 4 && pos + 2 + 1 < n {
+                    img.frame_delay = le16(gd, 1)
+                    if (gd[0] & 0x01) != 0 {
+                        img.transparent = gd[3]
+                    }
+                }
+                pos = gce.1
+            } else {
+                var sb = read_subblocks(bytes, pos + 2)
+                pos = sb.1
+            }
+        } else {
+            img.err = "bad block separator"
+            return img
+        }
+    }
+    if img.ok == false {
+        img.err = "no image data"
+        return img
+    }
+    img.nframes = frames
+    return img
+}
+
+// ============================================================================
+// 四、encode：索引图像 → GIF89a（GCT + 单图 + trailer）
+// ============================================================================
+
+// 求最小码宽（1..8）以覆盖 v=max_index+1：返回最小 b 使 2^b >= v。
+func need_bytes(v: i64) -> i64 {
+    var b: i64 = 1
+    var m: i64 = 2
+    while m <= 256 {
+        if v <= m {
+            return b
+        }
+        m = m << 1
+        b = b + 1
+    }
+    return 8
+}
+
+// 求最大索引。
+func max_index(ind: table<i64>) -> i64 {
+    var mx: i64 = 0
+    var i: i64 = 0
+    while i < len(ind) {
+        if ind[i] > mx {
+            mx = ind[i]
+        }
+        i = i + 1
+    }
+    return mx
+}
+
+// 索引图像 → GIF 字节。palette 为 RGB 三元组（可为 ≤2^(min_cs) 项；不足自动
+// 以黑色补足到 2^min_cs，编码 min_cs 取覆盖最大索引所需的最低位宽）。
+pub func encode_indexed(ind: table<i64>, w: i64, h: i64, palette: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    if w <= 0 || h <= 0 || len(ind) < w * h {
+        return out
+    }
+    var mi = max_index(ind)
+    var min_cs = need_bytes(mi + 1)
+    if min_cs < 1 {
+        min_cs = 1
+    }
+    // GCT 条目数 = 2^min_cs
+    var gct_n: i64 = 1
+    var s: i64 = 0
+    while s < min_cs {
+        gct_n = gct_n * 2
+        s = s + 1
+    }
+    var field = min_cs - 1
+    if min_cs == 8 {
+        field = 7
+    }
+    // 头
+    push_str(out, "GIF89a")
+    // 逻辑屏幕描述符
+    push_le16(out, w)
+    push_le16(out, h)
+    var packed = 0x80 | (7 << 4) | (field & 0x07)
+    table_push(out, packed)
+    table_push(out, 0)   // bg color
+    table_push(out, 0)   // aspect
+    // 全局调色板（补齐到 gct_n 项；每项 3 字节）
+    var pi: i64 = 0
+    while pi < gct_n * 3 {
+        var val: i64 = 0
+        if pi < len(palette) {
+            val = palette[pi]
+        }
+        table_push(out, val)
+        pi = pi + 1
+    }
+    // 图像描述符
+    table_push(out, 0x2C)
+    push_le16(out, 0)   // left
+    push_le16(out, 0)   // top
+    push_le16(out, w)
+    push_le16(out, h)
+    table_push(out, 0)  // packed：无 LCT、无交织
+    // LZW 最小码宽
+    table_push(out, min_cs)
+    // LZW 压缩 → 子块打包
+    var lzw = lzw_encode(ind, min_cs)
+    var off: i64 = 0
+    while off < len(lzw) {
+        var blk = len(lzw) - off
+        if blk > 255 {
+            blk = 255
+        }
+        table_push(out, blk)
+        var k: i64 = 0
+        while k < blk {
+            table_push(out, lzw[off + k])
+            k = k + 1
+        }
+        off = off + blk
+    }
+    table_push(out, 0)   // 子块终止
+    table_push(out, 0x3B)   // trailer
+    return out
+}
+
+// RGB 图像（row-major RGB 三元组）+ 调色板 → 索引映射后编码。
+// palette 是命名的颜色集（RGB 三元组平铺）；每像素做最近索引匹配（等则首个）。
+pub func encode(rgb: table<i64>, w: i64, h: i64, palette: table<i64>) -> table<i64> {
+    var ind = table_new_i64()
+    var np = len(palette) / 3
+    var i: i64 = 0
+    while i < w * h {
+        var r = rgb[i * 3]
+        var g = rgb[i * 3 + 1]
+        var b = rgb[i * 3 + 2]
+        var best: i64 = 0
+        var bestd: i64 = -1
+        var k: i64 = 0
+        while k < np {
+            var pr = palette[k * 3]
+            var pg = palette[k * 3 + 1]
+            var pb = palette[k * 3 + 2]
+            var d = (r - pr) * (r - pr) + (g - pg) * (g - pg) + (b - pb) * (b - pb)
+            if bestd < 0 || d < bestd {
+                bestd = d
+                best = k
+            }
+            k = k + 1
+        }
+        table_push(ind, best)
+        i = i + 1
+    }
+    return encode_indexed(ind, w, h, palette)
+}
+
+// 追加 ASCII 字符串字节。
+func push_str(ref buf: table<i64>, s: string) {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        table_push(buf, str_byte(s, i))
+        i = i + 1
+    }
+}
+
+}   // namespace gif

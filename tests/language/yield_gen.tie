@@ -1,0 +1,30 @@
+type tie<logic>
+
+// p.9.11.15 yield 生成器：产出序列（多 yield + 循环内 yield）。
+// 生成器函数必须声明返回类型（= yield 产出元素类型）；调用返回产出表，
+// for 直接消费（本轮语言侧定稿：攒表返回，惰性协程运行期由 p.9.5.1
+// trm-lite 承载）。
+
+func gen() -> i64 {
+    yield 10
+    yield 20
+    var i: i64 = 1
+    while i <= 3 {
+        yield i * 100
+        i = i + 1
+    }
+}
+
+func main() {
+    var t = gen()
+    println(len(t))
+    var k: i64 = 0
+    while k < len(t) {
+        println(t[k])
+        k = k + 1
+    }
+    // for 直接消费生成器返回值
+    for y in gen() {
+        println(y)
+    }
+}

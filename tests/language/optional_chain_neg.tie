@@ -1,0 +1,27 @@
+type tie<logic>
+
+// ============================================================
+// p.8.1.5 可空链负例：
+//   1. `?:` 左侧非 Option → 编译错误
+//   2. `?:` 右侧类型与 Option 载荷不匹配 → 编译错误
+//   3. `a?[i]` 载荷非表 → 编译错误
+//   4. `?.` 左侧非 Option → 编译错误
+// ============================================================
+import "/std/result.tie"
+
+func main() {
+    // 负例 1：?: 左侧非 Option（i64）
+    var x: i64 = 5
+    var a = x ?: 0
+    println(a)
+    // 负例 2：?: 右侧类型不匹配（Option<i64> ?: string）
+    var o: Option<i64> = Option.Some(1)
+    var b = o ?: "def"
+    println(b)
+    // 负例 3：a?[i] 载荷非表（Option<i64>）
+    var c = o?[0]
+    println(c)
+    // 负例 4：?. 左侧非 Option
+    var d = x?.v
+    println(d)
+}

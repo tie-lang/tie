@@ -1,0 +1,225 @@
+type tie<class>
+// compiler/frontend/sinfer_q2_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sinfer_q2.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+import "./sinfer_ie_ie1.tie"
+import "./sinfer_ie_ie2.tie"
+import "./sinfer_ie_ie3.tie"
+
+namespace sinfer {
+
+// p.9.11 `is` 类型判定（规范 §3.16）：`v is T` → bool。
+// 契约：左操作数须为**动态类型 any**（静态类型的实际类型编译期已知，判定无意义）；
+// 右侧类型节点经 stype.parse_type_node 解析为类型 id，登记到 node_types[类型节点]
+//（irgen 直读免二次解析；类型 id 同时决定运行期期望 tag，单源 = stype.any_expected_tag）。
+// `v is any` 恒真（any 装箱值必为某类型的值）。
+pub func infer_expr_is(id: i64) -> i64 {
+    var lhs = sstate.child(id, 0)
+    var tnode = sstate.child(id, 1)
+    if lhs < 0 || tnode < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'is' 缺少左操作数或类型"
+        return -1
+    }
+    var lt = infer_expr(lhs)
+    if lt < 0 {
+        return -1
+    }
+    if lt != types.named(TK_ANY) {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'is' 左操作数须为动态类型 any，实际是 " + types.type_name(lt)
+        return -1
+    }
+    var rt = stype.parse_type_node(tnode)
+    if rt < 0 {
+        return -1
+    }
+    if rt != types.named(TK_ANY) && stype.any_expected_tag(rt) < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'is' 暂不支持类型 " + types.type_name(rt) + "（该类型不能进 any 装箱）"
+        return -1
+    }
+    node_types[tnode] = rt
+    node_types[id] = types.named(TK_BOOL)
+    g_typed = g_typed + 1
+    return types.named(TK_BOOL)
+}
+
+pub func infer_expr(id: i64) -> i64 {    var tag = s_tags[id]
+    // p.8.2.10 展开实参兜底：N_SPREAD_ARG 节点被当作独立表达式推断 = 其调用
+    // 语境不受支持（方法/枚举构造/闭包调用/泛型等）。支持的普通变参调用已在
+    // sinfer_ret.infer_call 显式处理（不会走到这里）。此处报诊断防崩溃。
+    if tag == N_SPREAD_ARG {
+        return infer_expr_spread_arg(id)
+    }
+    // p.8.2.5 表/数组推导式：`[expr for x in src if cond]` → table<ElemTy>。
+    // 校验源为表族、if 条件为 bool；循环变量以源表元素类型登记（解构形态在
+    // 解析期已改写为 `_cN.ItemK`，此处只需登记临时变量 `_cN` 为源元素类型）。
+    if tag == N_COMPREHENSION {
+        return infer_expr_comprehension(id)
+    }
+    // 字面量
+    if tag == 0 {
+        return infer_expr_tag0(id)
+    }
+    if tag == 1 {
+        return infer_expr_tag1(id)
+    }
+    if tag == 2 {
+        return infer_expr_tag2(id)
+    }
+    if tag == 3 {
+        return infer_expr_tag3(id)
+    }
+    if tag == 4 {
+        return infer_expr_tag4(id)
+    }
+    if tag == 5 {
+        return infer_expr_tag5(id)
+    }
+    // S3.3 准引用/插值表达式：code 类型（编译期 AST 片段值）。宏体不经过
+    // 语义检查（编译期由 interp 执行）；普通代码里 code 值被 scheck 的
+    // 变量类型检查/参数类型匹配拦截（code 只能在宏中使用）。
+    if tag == 136 {   // N_CODE_LIT（准引用字面量） {
+        return infer_expr_tag136(id)
+    }
+    if tag == 137 {   // N_CODE_INTERP（插值表达式） {
+        return infer_expr_tag137(id)
+    }
+    // Var
+    if tag == S_N_VAR {
+        return infer_expr_var(id)
+    }
+    // p.9.13.4 块管道 `x -> { v -> expr }`：内联绑定（非闭包）
+    if tag == S_N_BLOCK_PIPE {
+        return infer_expr_block_pipe(id)
+    }
+    // Range
+    if tag == S_N_RANGE {
+        return infer_expr_range(id)
+    }
+    // p.9.11 `is` 类型判定（规范 §3.16）：`v is T` → bool
+    if tag == S_N_IS {
+        return infer_expr_is(id)
+    }
+    // Unary
+    if tag == S_N_UNARY {
+        return infer_expr_unary(id)
+    }
+    // Binary
+    if tag == S_N_BINARY {
+        return infer_expr_binary(id)
+    }
+    // Ternary
+    if tag == S_N_TERNARY {
+        return infer_expr_ternary(id)
+    }
+    // p.9.10.1 match/switch 表达式：分支体为表达式，整体取值。复用语句位
+    // switch 的模式/守卫/穷尽检查（scheck.check_arm_patterns / check_enum_exhaustive），
+    // 仅分支体改走 infer_expr 收集共同类型。布局见 ast.tie N_SWITCH_EXPR。
+    if tag == S_N_SWITCH_EXPR {
+        return infer_expr_switch_expr(id)
+    }
+    // Path：命名空间常量引用（ns::NAME → 全名查全局 gb_*）或不能作值
+    if tag == S_N_PATH {
+        return infer_expr_path(id)
+    }
+    // TypeLit：仅 switch case
+    if tag == S_N_TYPE_LIT {
+        return infer_expr_type_lit(id)
+    }
+    // S1.2 I1 asm!：unsafe 上下文 + 操作数表达式推断；返回 void
+    if tag == S_N_ASM {
+        return infer_expr_asm(id)
+    }
+    // Index
+    if tag == S_N_INDEX {
+        return infer_expr_index(id)
+    }
+    // p.9.11.7 切片 `t[1..3]`：结果类型 = 表/数组 → 同元素类型的新表 table<elem>
+    //（仅起点不取元素）；字符串 → string（字节子串）。端点须为整数或缺省(-1)。
+    if tag == N_SLICE {
+        return infer_expr_slice(id)
+    }
+    // p.9.11.6 表不可变更新 `with`：类型 = 左侧表/映射类型；右侧须为记录/映射
+    // 字面量（键化表 N_TABLE_LIT）。校验后登记，irgen 据此复制+合并。
+    if tag == N_WITH {
+        return infer_expr_with(id)
+    }
+    // p.8.1.5 可空链安全访问（N_SAFE_ACCESS）：
+    //   a?[i] → Option<table<T>>?[i] → Option<T>（None/越界 → None）
+    //   opt?.field → Option<Struct>?.field → Option<字段类型>
+    //   opt?.method(args) → 第一版暂不支持（报错引导）
+    if tag == N_SAFE_ACCESS {
+        return infer_expr_safe_access(id)
+    }
+    // FieldAccess
+    if tag == S_N_FIELD_ACCESS {
+        return infer_expr_field_access(id)
+    }
+    // TableLit
+    if tag == S_N_TABLE_LIT {
+        return infer_expr_table_lit(id)
+    }
+    // TupleLit
+    if tag == S_N_TUPLE_LIT {
+        return infer_expr_tuple_lit(id)
+    }
+    // S2.2 闭包字面量（N_FN_LIT）：构造 fn 类型 + 登记延迟检查队列。
+    // 布局（parse_fn_lit）：children = [泛型槽(-1), ret_ty, params..., body]，
+    // aux = nparams。ret_ty 无 -> 时解析器已生成 void 节点（N_NAMED_TYPE）。
+    // 闭包体（语句块）检查延迟到语义主流程末尾的 scheck.check_pending_closures()
+    // （sinfer 无法调用 scheck——import 树反向）。此处只做：
+    // ① 解析返回/参数类型 → types.fn_of 登记 fn 签名（含函数值作参数/返回）；
+    // ② 保存登记时 lv 快照（捕获基准：闭包体检查重建独立作用域用）；
+    // ③ 入队 g_clo_pending（FIFO）。捕获分析在 S_N_VAR 分支完成。
+    if tag == S_N_FN_LIT {
+        return infer_expr_fn_lit(id)
+    }
+    // Call
+    if tag == S_N_CALL {
+        return infer_expr_call(id)
+    }
+    // P2a 调用表达式 `t[0](5)`：被调者为 fn 值表达式
+    if tag == S_N_CALL_EXPR {
+        return infer_expr_call_expr(id)
+    }
+    // MethodCall
+    if tag == S_N_METHOD_CALL {
+        return infer_expr_method_call(id)
+    }
+    // 一期并发：`run <Actor>(args...)` 表达式 → actor 句柄类型。
+    // children[0] = actor 类型名（N_NAMED_TYPE），实参（children[1..]）逐个推断。
+    if tag == S_N_RUN_ACTOR {
+        return infer_expr_run_actor(id)
+    }
+    // 三期 A 组 `unsafe.get(share)` 凭据获取表达式 → guard<cap> 类型。
+    // children[0] = 能力域名（N_NAMED_TYPE name=share/mem/ext），children[1] = 对象
+    // 绑定表达式或 -1。仅 unsafe 上下文语义合法（安全代码持证被拦截）。
+    if tag == S_N_GUARD_REVOKE {
+        return infer_expr_guard_revoke(id)
+    }
+    if tag == S_N_GUARD_GET {
+        return infer_expr_guard_get(id)
+    }
+    // S2.3：`expr ?` 后缀解包（Result/Option）
+    if tag == S_N_TRY {
+        return infer_expr_try(id)
+    }
+    // p.9.11.3 try 错误聚合块：表达式位。块体由 scheck.check_try 检查（含 `?`
+    // 传播校验），此处取末表达式值类型（无末值则 -1/仅作语句）。块内 `?` 传播
+    // 目标 = 当前函数（与块外一致，try 仅语法分组）。
+    if tag == S_N_TRY_BLOCK {
+        return infer_expr_try_block(id)
+    }
+    sm_err_line = s_lines[id]
+    sm_err_col = s_cols[id]
+    sm_err_msg = "无法推断表达式（节点 " + to_string(tag) + "）"
+    return -1
+}
+
+}

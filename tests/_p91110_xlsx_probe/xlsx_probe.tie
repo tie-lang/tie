@@ -1,0 +1,121 @@
+type tie<logic>
+// tests/_p91110_xlsx_probe/xlsx_probe.tie —— p.9.1.1.10 验收：std/xlsx 工作簿读取。
+// 全离线确定性探针：手工构造最小 xlsx（手写 XML + std/zip 打包）→ xlsx_read 读回：
+//   1. xlsx_sheet_names 列工作表名；
+//   2. 共享串单元格（t="s"）按索引解析；
+//   3. 数字单元格（t="n"/缺省）保留原文；
+//   4. 布尔单元格（t="b"）→ TRUE/FALSE；
+//   5. 内联串（t="inlineStr">is>t）；
+//   6. 空槽补齐（B 跳空 → ""）；
+//   7. 多字节 UTF-8 共享串往返。
+// 期望全部 PASS / exit 0。
+import "/std/xlsx.tie" as xlsx
+import "/std/zip.tie" as zip
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// ASCII 字符串 → 字节表
+func ab(s: string) -> table<i64> {
+    var t = table_new_i64()
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        table_push(t, char_code(str_char(s, i)))
+        i = i + 1
+    }
+    return t
+}
+
+// UTF-8 编码（含多字节）字符串 → 字节表
+func ub(s: string) -> table<i64> {
+    var t = table_new_i64()
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var cp = char_code(str_char(s, i))
+        if cp <= 0x7F {
+            table_push(t, cp)
+        } else if cp <= 0x7FF {
+            table_push(t, 0xC0 | (cp >> 6))
+            table_push(t, 0x80 | (cp & 0x3F))
+        } else if cp <= 0xFFFF {
+            table_push(t, 0xE0 | (cp >> 12))
+            table_push(t, 0x80 | ((cp >> 6) & 0x3F))
+            table_push(t, 0x80 | (cp & 0x3F))
+        } else {
+            table_push(t, 0xF0 | (cp >> 18))
+            table_push(t, 0x80 | ((cp >> 12) & 0x3F))
+            table_push(t, 0x80 | ((cp >> 6) & 0x3F))
+            table_push(t, 0x80 | (cp & 0x3F))
+        }
+        i = i + 1
+    }
+    return t
+}
+
+func main() {
+    var wb = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" " +
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" +
+        "<sheets><sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/>" +
+        "<sheet name=\"Data2\" sheetId=\"2\" r:id=\"rId2\"/></sheets></workbook>"
+    var sst = "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" " +
+        "count=\"3\" uniqueCount=\"3\">" +
+        "<si><t>Hello</t></si><si><t>World" + "数据" + "</t></si><si><t>Num</t></si></sst>"
+    var sheet1 = "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>" +
+        "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c><c r=\"B1\" t=\"s\"><v>1</v></c></row>" +
+        "<row r=\"2\"><c r=\"A2\" t=\"n\"><v>42</v></c><c r=\"B2\" t=\"b\"><v>1</v></c></row>" +
+        "<row r=\"3\"><c r=\"A3\"><v>3.14</v></c><c r=\"C3\" t=\"s\"><v>2</v></c></row>" +
+        "</sheetData></worksheet>"
+    var sheet2 = "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>" +
+        "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Inline</t></is></c></row>" +
+        "</sheetData></worksheet>"
+
+    var names = table_new_string()
+    var datas: table<table<i64>> = [ub(wb)]
+    table_push(names, "xl/workbook.xml")
+    table_push(names, "xl/sharedStrings.xml")
+    table_push(names, "xl/worksheets/sheet1.xml")
+    table_push(names, "xl/worksheets/sheet2.xml")
+    table_push(datas, ub(sst))
+    table_push(datas, ub(sheet1))
+    table_push(datas, ub(sheet2))
+    var xb = zip.zip_pack(names, datas, 0)
+
+    // 1) 工作表名
+    var sn = xlsx.xlsx_sheet_names(xb)
+    check(len(sn) == 2, "two sheets")
+    check(sn[0] == "Sheet1" && sn[1] == "Data2", "sheet names order")
+
+    // 2/3/4/5/6/7) 读 Sheet1
+    var (ok1, r1) = xlsx.xlsx_read(xb, "Sheet1")
+    check(ok1, "read Sheet1 ok")
+    check(len(r1) == 3, "Sheet1 3 rows")
+    check(r1[0][0] == "Hello", "shared string A1 == Hello")
+    check(r1[0][1] == "World" + "数据", "shared string B1 utf8 roundtrip")
+    check(r1[1][0] == "42", "number A2 == 42")
+    check(r1[1][1] == "TRUE", "bool B2 == TRUE")
+    check(r1[2][0] == "3.14", "num A3 == 3.14")
+    check(r1[2][1] == "", "gap B3 == empty")
+    check(r1[2][2] == "Num", "shared C3 == Num")
+
+    // 读 Data2（内联串）
+    var (ok2, r2) = xlsx.xlsx_read(xb, "Data2")
+    check(ok2, "read Data2 ok")
+    check(r2[0][0] == "Inline", "inlineStr A1 == Inline")
+
+    if fails == 0 {
+        println("PASS")
+    } else {
+        println("FAILED")
+    }
+}

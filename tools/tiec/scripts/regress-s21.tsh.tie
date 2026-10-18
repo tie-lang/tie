@@ -1,0 +1,250 @@
+type tie<tsh>
+// scripts/regress-s21.tsh.tie —— S2.1 字符串模型回归验证脚本（tsh-role 移植 regress-s21.ps1）
+// ============================================================================
+// 职责：回归跑 tiec 编译 tests 探针矩阵并汇总 P/F/S：
+//   1) s21 探针（编译+运行） 2) s22 探针 3) s23 探针（预期 panic） 4) language 正例（编译）
+//   5) language 负例（应拒绝） 6) s31 config_smoke。
+// 用法（仓库根目录）：<tsh> -f scripts/regress-s21.tsh.tie [tiec路径] ；退出码 = FAIL>0 ? 1 : 0。
+// 移植说明：exec_code 对 tiec 与本机 probe 的退出码在本环境实测可靠（compile rc=0/neg rc=1/
+//           run rc 透传），故成功/拒绝判定沿用 .ps1 的 rc 语义；运行探针用 cmd 重定向到
+//           临时文件以同时取得 rc 与输出（exec_output 仅返回文本）。exec_code_timeout 未用
+//           （探针不挂起，等价 .ps1 无超时路径）。
+
+func bstr(b: bool) -> string { if b { return "T" } return "F" }
+
+var tiec = ".\\compiler\\tiec.exe"
+if arg_count() >= 1 && !is_empty(arg_at(0)) { tiec = arg_at(0) }
+
+var root = cwd()
+var pass: i64 = 0
+var fail: i64 = 0
+var known: i64 = 0
+
+// r.1.6.6：Linux 平台差异豁免表——探针显式依赖 Windows 语义。Windows 下恒为 false。
+var isLinux = get_env("OS") != "Windows_NT"
+func linux_known(name: string) -> bool {
+    if !isLinux { return false }
+    return name == "probe4_ffi.tie" || name == "proc_createprocessw_pipe.tie" ||
+           name == "extern_s10_ptr.tie"
+}
+
+// 编译+（可选）运行。返回 "COMPILE_FAIL" / "RUN_FAIL rc=N out=..." / "OK" / "OK <out>"。
+func compile_run(src: string, runIt: bool) -> string {
+    var exe = replace_all(src, ".tie", ".exe")
+    var rc = exec_code("cmd /c " + tiec + " " + src + " -o " + exe + " >nul 2>&1")
+    if rc != 0 { return "COMPILE_FAIL" }
+    if runIt {
+        var outf = get_env("TEMP") + "\\tsh_s21_run_out.txt"
+        var rrc = exec_code("cmd /c \"" + exe + "\" > \"" + outf + "\" 2>&1")
+        var out = file_read(outf)
+        if rrc != 0 { return "RUN_FAIL rc=" + to_string(rrc) + " out=" + out }
+        return "OK " + out
+    }
+    return "OK"
+}
+
+println("=== 1. S2.1 探针（编译+运行） ===")
+var s21 = ["probe1_binary.tie", "probe2_len.tie", "probe3_chars.tie", "probe4_ffi.tie", "probe5_sb.tie"]
+var i: i64 = 0
+var fn = ""
+var r = ""
+for fn in s21 {
+    if linux_known(fn) {
+        println("SKIP(Linux差异) " + fn); known = known + 1
+    } else {
+        r = compile_run(root + "\\tests\\s21_probe\\" + fn, true)
+        if has_prefix(r, "OK") { println("PASS " + fn); pass = pass + 1 }
+        else { println("FAIL " + fn + " -> " + r); fail = fail + 1 }
+    }
+}
+
+println("=== 2. S2.2 探针（编译+运行） ===")
+var s22 = sort_strings(list_dir(root + "\\tests\\s22_probe"))
+for fn in s22 {
+    if has_suffix(fn, ".tie") {
+        r = compile_run(root + "\\tests\\s22_probe\\" + fn, true)
+        if has_prefix(r, "OK") { println("PASS " + fn); pass = pass + 1 }
+        else { println("FAIL " + fn + " -> " + r); fail = fail + 1 }
+    }
+}
+
+println("=== 3. S2.3 探针（编译+运行） ===")
+var pmsg = "致命错误：除数不能为零"
+var s23 = sort_strings(list_dir(root + "\\tests\\s23_probe"))
+for fn in s23 {
+    if !has_suffix(fn, ".tie") { continue }
+    r = compile_run(root + "\\tests\\s23_probe\\" + fn, true)
+    if has_prefix(r, "OK") {
+        println("PASS " + fn); pass = pass + 1
+    } else {
+        if fn == "try_probe.tie" && has_prefix(r, "RUN_FAIL rc=1") && contains(r, pmsg) {
+            println("PASS(panic 预期) " + fn); pass = pass + 1
+        } else {
+            println("FAIL " + fn + " -> " + r); fail = fail + 1
+        }
+    }
+}
+
+println("=== 4. tests/language 正例（编译） ===")
+var lang = sort_strings(list_dir(root + "\\tests\\language"))
+for fn in lang {
+    if !has_suffix(fn, ".tie") { continue }
+    if contains(fn, "_neg") || has_suffix(fn, ".ir.tie") { continue }
+    if fn == "extern_decl.tie" || fn == "std_fs_path.tie" {
+        println("SKIP(基线已知) " + fn); known = known + 1
+    } else {
+        if linux_known(fn) {
+            println("SKIP(Linux差异) " + fn); known = known + 1
+        } else {
+            r = compile_run(root + "\\tests\\language\\" + fn, false)
+            if r == "OK" { println("PASS " + fn); pass = pass + 1 }
+            else { println("FAIL " + fn + " -> " + r); fail = fail + 1 }
+        }
+    }
+}
+
+println("=== 5. tests/language 负例（应拒绝） ===")
+var neg_tmp = root + "\\compiler\\neg_tmp.exe"
+var rc9: i64 = 0
+for fn in lang {
+    if has_suffix(fn, ".tie") && contains(fn, "_neg") {
+        rc9 = exec_code("cmd /c " + tiec + " " + root + "\\tests\\language\\" + fn + " -o " + neg_tmp + " >nul 2>&1")
+        if rc9 != 0 { println("PASS(拒) " + fn); pass = pass + 1 }
+        else { println("FAIL(未拒) " + fn); fail = fail + 1 }
+    }
+}
+
+println("=== 6. S3.1 config_smoke（编译+运行） ===")
+r = compile_run(root + "\\tests\\s31\\config_smoke.tie", true)
+if has_prefix(r, "OK") { println("PASS config_smoke"); pass = pass + 1 }
+else { println("FAIL config_smoke -> " + r); fail = fail + 1 }
+
+// 6b. 诊断行号不变式（2026-10-07）：主文件的告警/错误行号必须与用户所写的行号一致。
+//     曾因 strip_type_header 删行 + prelude 首部注入而无行映射 ⇒ 主文件全部行号 +2，
+//     用户按报的行号改会**改错行**。两探针的第 6 行分别是语法错误与未重赋值的 var，
+//     期望诊断精确报 @6。**行号即断言**：改动探针必须同步改这里的期望值。
+println("=== 6b. 诊断行号不变式（主文件行号须与用户所写一致） ===")
+var lf_dir = root + "\\tests\\_linefix_probe\\"
+var lf_tmp = get_env("TEMP") + "\\tsh_linefix_out.txt"
+var lf_n = ["linefix_err.tie", "linefix_warn.tie"]
+var lf_want = ["[E00832] @6:21:", "@6:5: 可变绑定未修改"]
+var lf_i: i64 = 0
+for fn in lf_n {
+    var lf_exe = root + "\\compiler\\lf_tmp.exe"
+    if file_exists(lf_exe) { remove_file(lf_exe) }
+    exec_code("cmd /c " + tiec + " " + lf_dir + fn + " -o " + lf_exe + " -w --no-cache > \"" + lf_tmp + "\" 2>&1")
+    var lf_txt = file_read(lf_tmp)
+    if contains(lf_txt, lf_want[lf_i]) {
+        println("PASS linefix " + fn + "（" + lf_want[lf_i] + "）"); pass = pass + 1
+    } else {
+        println("FAIL linefix " + fn + " 期望 " + lf_want[lf_i] + " -> " + lf_txt); fail = fail + 1
+    }
+    lf_i = lf_i + 1
+}
+if file_exists(root + "\\compiler\\lf_tmp.exe") { remove_file(root + "\\compiler\\lf_tmp.exe") }
+
+// 6c. td（tie:data）合规（规范 §17.1）：**头部可选**，且非 td 语法必须被拒。
+//     我连错两次的正是这条（信了「某文件自称 td」「探针注释说会失败」而不是规范与实测），
+//     故把它变成断言：合规 5 例中 3 例应成功、2 例应拒绝。
+println("=== 6c. td 合规（规范 §17.1：头可选；非 td 语法必须拒）===")
+var td_dir = root + "\\tests\\_td_probe\\"
+var td_out = get_env("TEMP") + "\\tsh_td_out.txt"
+var td_okf = ["header.data.tie", "noheader.data.tie", "named.data.tie"]
+var td_badf = ["unclosed.data.tie", "not_td.data.tie"]
+var td_zd = get_env("TEMP") + "\\tsh_td_probe.zd"
+for fn in td_okf {
+    var rc_td = exec_code("cmd /c " + tiec + " --compress-data " + td_dir + fn + " -o " + td_zd + " > \"" + td_out + "\" 2>&1")
+    if rc_td == 0 { println("PASS td " + fn); pass = pass + 1 }
+    else { println("FAIL td " + fn + " 应成功但 rc=" + to_string(rc_td) + " -> " + file_read(td_out)); fail = fail + 1 }
+}
+for fn in td_badf {
+    var rc_td2 = exec_code("cmd /c " + tiec + " --compress-data " + td_dir + fn + " -o " + td_zd + " > \"" + td_out + "\" 2>&1")
+    if rc_td2 != 0 { println("PASS(拒) td " + fn); pass = pass + 1 }
+    else { println("FAIL(未拒) td " + fn); fail = fail + 1 }
+}
+if file_exists(td_zd) { remove_file(td_zd) }
+
+// 6d. #cfg 条件求值：**空白不得改变结果**（2026-10-07）。
+//     曾只 trim 值不 trim 键 ⇒ `#cfg(os = windows)` 静默判假、分支整段丢弃（症状是
+//     main 消失、链接报「必须定义入口点」），而规范里唯一的示例正是带空格的写法。
+//     ⚠ 断言用「紧凑写与带空格写结果一致」而非「必须判真」——后者平台相关。
+//     观测值 = 编译 rc（真⇒分支保留⇒有 main；假⇒分支丢弃⇒链接失败）。
+println("=== 6d. #cfg 空白不变式（紧凑写与带空格写必须同结果） ===")
+var cfg_dir = root + "\\tests\\_cfg_probe\\"
+var cfg_tmp = get_env("TEMP") + "\\tsh_cfg_out.txt"
+var cfg_exe = get_env("TEMP") + "\\tsh_cfg_probe.exe"
+func cfg_rc(fn: string) -> i64 {
+    return exec_code("cmd /c " + tiec + " " + cfg_dir + fn + " -o " + cfg_exe + " --no-cache > \"" + cfg_tmp + "\" 2>&1")
+}
+var rc_tight = cfg_rc("cfg_tight.tie")
+var rc_space = cfg_rc("cfg_spaced.tie")
+var rc_pad = cfg_rc("cfg_padded.tie")
+var rc_quote = cfg_rc("cfg_quoted.tie")
+if rc_tight == rc_space { println("PASS cfg 空格不改变结果（紧凑/带空格同 rc）"); pass = pass + 1 }
+else { println("FAIL cfg 空格改变了结果：紧凑 rc=" + to_string(rc_tight) + " 带空格 rc=" + to_string(rc_space)); fail = fail + 1 }
+if rc_tight == rc_pad { println("PASS cfg 首尾留空不改变结果"); pass = pass + 1 }
+else { println("FAIL cfg 首尾留空改变了结果：rc=" + to_string(rc_pad)); fail = fail + 1 }
+if rc_tight == rc_quote { println("PASS cfg 值加引号不改变结果"); pass = pass + 1 }
+else { println("FAIL cfg 值加引号改变了结果：rc=" + to_string(rc_quote)); fail = fail + 1 }
+// 未知键必须判假（分支丢弃 ⇒ 无 main ⇒ rc≠0）
+if cfg_rc("cfg_unknown.tie") != 0 { println("PASS(判假) cfg 未知键"); pass = pass + 1 }
+else { println("FAIL cfg 未知键被当成真"); fail = fail + 1 }
+if file_exists(cfg_exe) { remove_file(cfg_exe) }
+
+// 6f. 复合赋值 `%%=`（规范 §1 运算符表 / §4 示例「原地取余并写回」）。
+//     实现曾缺此 token ⇒ 直接报 E00832（规范写了、实现没有）。两条断言：
+//     ① `a %%= b` 必须等于 `a %% b`（四种符号组合）——探针内部自比较，只输出一行判定；
+//     ② `%%=` 之后的语句必须照常执行（ROAD 曾记它「吞掉紧随其后的语句」）。
+println("=== 6f. 复合赋值 %%= （与二元 %% 等价；后续语句不被吞） ===")
+var cp_dir = root + "\\tests\\_compound_probe\\"
+var cp_out = get_env("TEMP") + "\\tsh_cp_out.txt"
+var cp_exe = get_env("TEMP") + "\\tsh_cp_probe.exe"
+var rc_cp1 = exec_code("cmd /c " + tiec + " " + cp_dir + "pcteq_assign.tie -o " + cp_exe + " > \"" + cp_out + "\" 2>&1")
+if rc_cp1 == 0 {
+    var rc_run1 = exec_code("cmd /c \"" + cp_exe + "\" > \"" + cp_out + "\" 2>&1")
+    var o1 = file_read(cp_out)
+    if contains(o1, "VERDICT OK") { println("PASS %%= 与 %% 等价（四种符号组合）"); pass = pass + 1 }
+    else { println("FAIL %%= 与 %% 不等价 -> " + o1); fail = fail + 1 }
+} else {
+    println("FAIL %%= 探针编译失败（E00832 复发？）-> " + file_read(cp_out)); fail = fail + 1
+}
+var rc_cp2 = exec_code("cmd /c " + tiec + " " + cp_dir + "mod_assign.tie -o " + cp_exe + " > \"" + cp_out + "\" 2>&1")
+if rc_cp2 == 0 {
+    exec_code("cmd /c \"" + cp_exe + "\" > \"" + cp_out + "\" 2>&1")
+    var o2 = file_read(cp_out)
+    if contains(o2, "after") && contains(o2, "1") { println("PASS %%= 后续语句照常执行且结果正确"); pass = pass + 1 }
+    else { println("FAIL %%= 吞掉了后续语句或结果错 -> " + o2); fail = fail + 1 }
+} else {
+    println("FAIL %%= 语句探针编译失败 -> " + file_read(cp_out)); fail = fail + 1
+}
+if file_exists(cp_exe) { remove_file(cp_exe) }
+
+// 6g. 文件级 unsafe 上下文的作用域（规范 §11.6：「文件级授权只作用于这个文件；
+//     被引入的模块也不继承引入方的授权」）。2026-10-07 修：上下文原先是**全局**抬升，
+//     ① 会扩散给被 import 的模块（父授权不继承 —— 与 caps 那条同类越权，2026-10-01
+//     只修了 caps 那一半）② 语义检查在解析之后走，全局量已不代表函数所属模块。
+//     两条不变式：**模块能自证**（安全调用方无需任何改动）+ **父授权不继承**。
+println("=== 6g. 文件级 unsafe 上下文的作用域（自证 / 不继承） ===")
+var up_dir = root + "\\tests\\_unsafe_probe\\"
+var up_out = get_env("TEMP") + "\\tsh_up_out.txt"
+var up_exe = get_env("TEMP") + "\\tsh_up_probe.exe"
+// ① 模块自证：库自己声明 unsafe+凭据，**安全**调用方 import 它应直接可用
+var rc_u1 = exec_code("cmd /c " + tiec + " " + up_dir + "use_selfcert.tie -o " + up_exe + " > \"" + up_out + "\" 2>&1")
+if rc_u1 == 0 {
+    var rc_run = exec_code("cmd /c \"" + up_exe + "\" > \"" + up_out + "\" 2>&1")
+    var uo = file_read(up_out)
+    if contains(uo, "VERDICT OK") { println("PASS 模块自证：安全调用方无需改动即可用"); pass = pass + 1 }
+    else { println("FAIL 模块自证：运行输出异常 -> " + uo); fail = fail + 1 }
+} else {
+    println("FAIL 模块自证：安全调用方被拒绝 -> " + file_read(up_out)); fail = fail + 1
+}
+// ② 父授权不继承：主文件声明 unsafe，也不能让「只给凭据、缺上下文」的模块编过
+var rc_u2 = exec_code("cmd /c " + tiec + " " + up_dir + "use_capsonly_from_unsafe.tie -o " + up_exe + " > \"" + up_out + "\" 2>&1")
+if rc_u2 != 0 { println("PASS 父授权不继承（模块仍缺上下文，被拒）"); pass = pass + 1 }
+else { println("FAIL 父授权不继承：模块白拿了主文件的 unsafe 上下文"); fail = fail + 1 }
+if file_exists(up_exe) { remove_file(up_exe) }
+
+println("")
+println("=== 汇总: PASS=" + to_string(pass) + " FAIL=" + to_string(fail) + " SKIP(已知基线)=" + to_string(known) + " ===")
+if fail > 0 { exit(1) }
+exit(0)

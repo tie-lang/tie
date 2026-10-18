@@ -1,0 +1,121 @@
+type tie<class>
+// compiler/middle/passes.tie —— p.9.20.2/3 中端 pass 管道（t 轴）
+// ============================================================
+// 双轴优化器（docs/designs/tiec-dual-axis-optimizer.md，ROAD p.9.20）：
+// t 轴 = tie-IR pass 管道，挂 irgen 之后、llvmgen 之前（driver.kpass_irgen
+// 成功后调用 passes.run(level)）。与后端无关——trm/WASM 无 LLVM 优化器，
+// 本管道是其未来唯一优化层。
+//
+// 确定性硬门禁（design §6）：
+//   - pass 集合与顺序**版本化固定**：新增/改动 pass 必须 +1 g_pass_pipeline_ver，
+//     并同步缓存键（driver cache_key_str 的 M 段）与 tieir 单元头；
+//   - 同 (源码, l, t, target) → 输出逐字节恒等；
+//   - pass 禁止时间/地址/随机依赖；纯 tie，禁 Rust。
+//
+// 分期（ROAD p.9.20.3-5）：t1 单函数局部（常量折叠/代数化简/死值消除）→
+// t2 过程内（CSE/LICM/边界检查消除，让位 --check-bounds）→ t3 过程间
+// （小函数内联/tail call/字符串构建融合）。当前 t1 已接入；t>1 暂为 t1 超集
+// 占位（分级裁剪语义：每级 = 前级超集，t2/t3 pass 依序补）。
+//
+// t1 算法（单遍、确定性、线性）：
+//   A. 按块序/指令序扫描：const_i 登记值→常量表；整型算术/icmp 双常量
+//      折叠（rewrite_to_const 改写为 const_i，除零不折叠；tie 无移位运算符，
+//      shl/shr 不折叠）；恒等式（x+0 / x-0 / x|0 / x^0 / x<<0 / x>>0 /
+//      x*1 / x/1 → x，x*0 / x&0 → 0，0+x → x）登记值替代表；
+//   B. 替代表链压缩后全量回写操作数（值传播；dominance 安全——替代目标
+//      支配原结果值，使用范围只缩不扩）；
+//   C. DCE：无使用者的纯指令（NUM 组 + CONST 组 + ptrtoint/inttoptr/
+//      bitcast）标记后经 ir.compact_dead 物理压缩；compact 拒绝（孤儿指令）
+//      时保守放弃删除，折叠/传播效果保留。
+//
+// opcode 字面量与 irgen/llvmgen 一致（const_i=60 等；ir.tie 元数据表已于
+// 2026-09-21 按实现权威重建，edd3eca）。
+//
+// 布局约束：全局 var 必须在文件顶层（命名空间体内只允许函数/类/嵌套命名空间），
+// 函数入 namespace passes（driver 以 passes.run 跨命名空间调用）。
+
+import "./ir.tie"
+import "../lib/interner.tie"
+
+var g_pass_pipeline_ver: i64 = 4;   // pass 集合版本（新增/改动 pass 必须 +1；4 = appfuse 融合接入）
+
+// 折叠涉及 opcode（实现权威字面量）
+pub const P_ADD: i64 = 0;
+pub const P_SUB: i64 = 1;
+pub const P_MUL: i64 = 2;
+pub const P_DIV: i64 = 3;
+pub const P_MOD: i64 = 4;
+pub const P_AND: i64 = 6;
+pub const P_OR: i64 = 7;
+pub const P_XOR: i64 = 8;
+pub const P_SHL: i64 = 10;
+pub const P_SHR: i64 = 11;
+const P_ICMP: i64 = 12;
+pub const P_CONST_I: i64 = 60;
+pub const P_VAL: i64 = 0;
+pub const P_IMM: i64 = 2;
+
+namespace passes {
+
+// pass 管道版本（缓存键 / tieir 单元头 / 诊断显示用）。
+pub func pipeline_ver() -> i64 {
+    return g_pass_pipeline_ver
+}
+
+// 运行 t 轴 pass 管道：level = 生效 tiec 优化档（0-3）。返回 0 = 成功，负 = 失败。
+// t0：零 pass，直出（自举不动点不变）。
+pub func run(level: i64) -> i64 {
+    if level <= 0 {
+        return 0
+    }
+    // t1 起接入；每级 = 前级超集（分级裁剪语义）
+    var r = run_t1()
+    if r != 0 {
+        return r
+    }
+    if level >= 2 {
+        var r2 = run_t2()
+        if r2 != 0 {
+            return r2
+        }
+    }
+    // p.9.20.5 进行中（2026-09-21）：run_t3（小函数内联）已实现并通过探针级
+    // 验证，但 driver 级自举存在未收敛的跨函数值引用（XREF）边界，t3 暂映射
+    // t2 保证全档位产物自洽；内联代码保留，XREF 解开后恢复门控。
+    return 0
+}
+
+// ---------- t1：常量折叠 / 代数化简 / 死值消除 ----------
+
+
+// ---------- t2：过程内 pass（p.9.20.4）----------
+//
+// 范围（2026-09-21 实装裁定）：
+//   - 块内 CSE：同一基本块内全等纯指令（同 opcode/ty/操作数）合并为首个，
+//     走值替代 + DCE 清理。跨块 CSE 与 LICM 依赖支配分析，顺延至后续子项
+//     （ROAD 落地要点已注明）。
+//   - 边界检查消除（BCE）：按设计「让位 --check-bounds」语义实现为零操作——
+//     检查指令仅在 --check-bounds 显式开启时生成（irgen_stmt.tig_array_bounds_check
+//     的 g_check_bounds 门控），默认构建无检查可消；显式开启时用户要求检查，
+//     t2 不消除。future：若检查转为默认生成，BCE 在此接入。
+
+
+// ---------- t3：过程间 pass（p.9.20.5）----------
+//
+// 范围（2026-09-21 实装裁定，ROAD 如实标注）：
+//   - **小函数内联**（本版核心）：被调函数满足「单块 + 唯一 ret 置于块尾 +
+//     无 phi + 非递归 + 指令数 ≤ INLINE_MAX_INSTS」时，在调用点直线展开——
+//     单块被调函数是纯直线代码，无需块切分 / br 链 / phi 合并（多 ret 需
+//     phi、多块需块引用重映射与 CFG 切分，顺延后续子项）。
+//   - **tail call**：IR 层无尾调用标志位，llvmgen 侧文本级识别
+//     （call 结果仅被同块 ret 消费 → 输出 tail call）延后，与内联解耦。
+//   - **字符串构建融合**：依赖 p.9.17.1 字符串原语的 IR 形态勘察，顺延。
+
+const INLINE_MAX_INSTS: i64 = 24;   // 被调函数指令数阈值（保守起点）
+
+
+}
+
+import "./passes_p1.tie"
+import "./passes_p2.tie"
+import "./passes_p3.tie"

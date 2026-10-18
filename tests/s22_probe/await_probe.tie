@@ -1,0 +1,51 @@
+type tie<tsc>
+
+// p.9.11 `await` + async 返回值（规范 §10.6 结果的延后取得）探针：
+// async 非 void 方法调用产生 future<T> 凭据；await 取值（立即完成或等待）。
+
+actor W {
+    var base: i64
+    pub func setup(b: i64) -> i64 {
+        base = b
+        return b
+    }
+    pub async func compute(x: i64) -> i64 {
+        var i: i64 = 0
+        while i < 50000000 { i = i + 1 }   // 少量耗时：验证 await 等待语义
+        return base + x * 2
+    }
+    pub async func touch() {
+        base = base + 1
+    }
+}
+
+func main() -> i64 {
+    var ok: i64 = 0
+    var w = run W()
+    w.setup(100)
+    // 1. future 凭据产生 + await 取值
+    var f = w.compute(20)
+    var r = await f
+    if r == 140 { ok = ok + 1 } else { println("F1 r=" + to_string(r)) }
+    // 2. async void 维持 fire-and-forget（无凭据、无 await）
+    w.touch()
+    var i: i64 = 0
+    while i < 100000000 { i = i + 1 }
+    // 3. 多个 future 顺序 await（同 actor 门闩串行）
+    var f3 = w.compute(1)
+    var r3 = await f3
+    var f4 = w.compute(2)
+    var r4 = await f4
+    if r3 == 103 && r4 == 105 { ok = ok + 1 } else { println("F3 r3=" + to_string(r3) + " r4=" + to_string(r4)) }
+    // 4. await 直接作用于调用表达式
+    var r5 = await w.compute(3)
+    if r5 == 107 { ok = ok + 1 } else { println("F4 r5=" + to_string(r5)) }
+
+    if ok == 3 {
+        println("VERDICT OK")
+        return 0
+    }
+    println("VERDICT FAIL ok=" + to_string(ok) + "/3")
+    exit(1)
+    return 0
+}

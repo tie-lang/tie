@@ -1,0 +1,650 @@
+type tie<class>
+// compiler/backend/llvmgen.tie —— 自举 v2 T2.8：tie-IR → LLVM IR 文本生成
+// ============================================================
+// 里程碑：自举 v2 计划 T2.8（.omo/plans/self-hosting-v2.md）后端 LLVM IR
+// 文本生成器。本文件 = tie-IR 列式表 → .ll 文本（Rust ir.rs run() 契约）。
+// 最小可行集：模块头/declare/define/entry 块/指令映射/字符串常量。
+// **字符串自省**：遍历 tie-IR 的 const_str(62)/call_vararg(41) 指令收集
+// 字符串池 id，经 interner.lookup 还原文本生成 @.str.N（不依赖 irgen）。
+// 依赖：./../middle/ir.tie（tie-IR 表访问）。
+// types.tie 经 irgen→semantic→…→stype→data 树传递可达（K_NAMED/TK_*）；
+// str_char/char_code/str_len/to_string 为语言底座原语（全局可见，无需 import）；
+// intern 经 irgen→semantic→…→lex_tokdefs→interner 树传递可达。
+// 唯一直接 import ir.tie：避免菱形 import 导致全局变量重复定义。
+// 树式无环：irgen import 本文件（本文件不 import irgen）。
+// UTF-8 字节级能力复用 std/utf（hex_escape/utf8_bytes/byte_len），
+// 不再内联重复实现（编译器自举后亦可继续依赖 std——std 亦为 tie 自写）。
+// S3.2：import 用 "../middle/ir.tie"（无 "./" 前缀）→ 展开路径归一化为
+// "compiler/middle/ir.tie"，与 tieir_ser 树的 ir 展开路径字符串一致，
+// import 去重生效（此前 "./../middle/ir.tie" 得 "compiler/backend/../middle/
+// ir.tie"，双入口时 ir 全局常量重复定义）
+import "../middle/ir.tie"
+import "../middle/ir_blkattr.tie"
+import "/std/utf.tie"
+import "./llvmgen_str.tie"  // 字符串自省+extern 声明+类型映射 子文件（同 namespace 跨文件拆分）
+import "./llvmgen_inst.tie"  // 指令映射 子文件（同 namespace 跨文件拆分）
+
+// emit 子阶段计时（性能诊断，TIEC_TIME=1 时输出）：函数生成 vs 归并。
+// GetTickCount extern 在 semantic.tie 顶层声明（跨文件 extern 全局可调用，
+// 本文件不重复声明——编译器禁止跨文件重复定义同一 extern）。
+var e_t_funcs: i64 = 0
+var e_t_join: i64 = 0
+pub var g_t_ren: i64 = 0  // renumber_lines 累计（全部函数）
+
+// ==================== 输出缓冲 ====================
+// 行收集表：line() 只追加（O(1)），emit() 末尾分治拼接成完整文本。
+// 避免 `out_buf = out_buf + s` 的 O(N²) 全量拷贝——tie 字符串不可变，
+// str_cat 每次 malloc 新串且旧串无 GC 回收，自编译（10 万级行）会挂起
+// 并耗尽内存（曾实测 30s+ / 2.3GB）。
+pub var out_lines: table<string>;
+// 值 id → 定义指令 id 索引（value_def 缓存）：值 id 从 0 连续分配
+// （ir.new_value 单调递增），直接作表下标 → O(1) 查询，替代全指令
+// 线性扫描的 O(N²)（每条指令的每个实参引用都全扫一遍）。
+pub var vdef_cache: table<i64>;
+pub var vdef_cache_ready: i64 = 0;
+// 调试：当前生成函数 id（gen_inst 的细粒度诊断用；0 = 未生成，真实 fid 从 0 起）
+pub var g_pfid: i64 = 0;
+// 当前函数参数个数（opnd_ref 形参映射用）
+pub var g_pcnt: i64 = 0;
+// 指令 id → 块 id 映射（emit 开头构建一次；gen_func 按指令序遍历用）。
+// 块 id 创建序 ≠ 值 id 分配序（if/while 嵌套：then/else/merge 块先创建、
+// 循环头块后创建）——按块 id 遍历会值编号回退，LLVM 解析拒绝。
+pub var g_inst_blk: table<i64>;
+pub var g_inst_blk_ready: i64 = 0;
+// 字符串常量表：池 id → @.str.N 序号（自省收集）
+pub var str_pool: table<i64>;   // 字符串池 id（登记序）
+pub var str_idx: table<i64>;    // 对应 @.str.N
+pub var str_count: i64 = 0;
+// p.9.14.4 性能（O(n) 化）：字符串池查询辅助表。旧 str_slot / str_len_of_slot
+// 每次线性扫 str_pool/str_idx（driver 闭包 ~10 万条诊断串 → 每处引用 O(S)，
+// emit funcs 5.9s 主源）。stamp/slot 表按 name_id 直查（跨编译只增，随
+// collect_strings 复位）；slot_len 按 slot 直索引（登记时算一次 byte_len）。
+pub var g_ss_stamp: table<i64>;   // name_id → slot（-1 = 未登记）
+pub var g_ss_slotv: table<i64>;   // name_id → slot（与 stamp 平行）
+pub var g_slot_len: table<i64>;   // slot → 字面量字节长（@.str.N 的 N）
+// printf i32 实参 sext 的新寄存器计数（LLVM 不支持内联 sext 表达式实参，
+// 每处 i32 实参生成一个独立 %ext<N> 寄存器）
+pub var g_sext_cnt: i64 = 0;
+// T4.5：extern_call(36) 收集的符号名池 id（去重登记序；llvmgen 顶层变量，
+// 与 out_buf 等同级——命名空间体内不允许 var）
+pub var ext_syms: table<i64>;
+// 阶段 A：全局变量登记（名池 id → 表/标量 + 类型）。表全局 → ptr null 占位
+// + main 入口初始化；标量 → 零值 global。
+pub var g_global_names: table<i64>;   // 全局名池 id（登记序）
+pub var g_global_is_table: table<i64>;  // 1 = 表全局（ptr null），0 = 标量
+pub var g_global_tys: table<i64>;     // 标量类型 id（表全局 -1）
+pub var g_global_inits: table<i64>;   // 标量初始值（-1 = 无折叠值；i64 字面量/字符码点/bool 0-1）
+pub var g_global_inits_ok: table<i64>; // 标量初值是否已折叠登记（0/1；区分"折叠出 -1"与"无初值"，r.1.1.2）
+pub var g_global_fps: table<i64>;     // 浮点初始值（浮点文本池 id；-1 = 无，r.1.1.2）
+// 函数地址初始值（函数名池 id；-1 = 无）。用于 (b) 方案的**静态空闭包 env**：
+// `@clo_eenv_X = global ptr @clo_edrop_X`——它的析构入口是 no-op（且不 free，
+// 因为槽是静态的），使「无捕获闭包」也有一个有效 env，释放点因此**无需判空**。
+pub var g_global_fns: table<i64>;
+pub var g_global_strs: table<i64>;    // 顶层字符串 const 初始值（字符串池 id；-1 = 无）
+// 阶段 A：用户函数调用（call 35）的符号名池 id（去重，与 ext_syms 平行收集；
+// 命名空间函数全名经 ns_symbol 转 $，无需 declare）
+pub var call_syms: table<i64>;
+// S2.4：vtable 全局常量登记（每个 impl 一个：方法函数指针按 port 方法声明序）。
+// 符号名 = "vt.<port名>.<struct名>"；类型 = 内联聚合文本 "{ ptr, ... }"
+//（函数指针数组）；方法符号 = 实现函数全名（LLVM 符号经 ns_replace 转 $）。
+pub var g_vt_names: table<i64>;   // vtable 符号名池 id（登记序）
+pub var g_vt_tys: table<i64>;     // vtable 聚合类型文本池 id（"{ ptr, ptr }" 等）
+pub var g_vt_n: table<i64>;       // 字段数（= port 方法数）
+pub var g_vt_off: table<i64>;     // 方法符号段偏移（g_vt_syms 扁平段）
+pub var g_vt_syms: table<i64>;    // 方法函数全名池 id（扁平段）
+// SSO 短串池（dev33 批次 3）：启用标记。irgen 首次调用 s21_sso_alloc 置位，
+// emit 主流程据此刻意输出 @s21_sso_pool / @s21_sso_off / @s21_sso_malloc_cnt。
+// 仅用到短串池的程序才带 256KB .bss，纯字面量程序不引入。
+pub var g_sso_enabled: i64 = 0;
+// p.9.17.1：str_char 码点索引缓存启用标记。irgen bi_str_char 首调 sc_enable()
+// 置位；emit_sc_globals 据此输出 @tie_sc_addr/len/n/tab 四全局（双槽 .bss）+
+// @tie_sc_off / @tie_sc_inval 手写 helper。
+pub var g_sc_enabled: i64 = 0;
+// p.6.4.5 可捕获网络：Winsock2 一次性初始化标志全局（@g_wsock_init）启用标记。
+// irgen 首次内联 net_*（tig_wsa_init）置位，emit 据此输出该 i64 全局。
+pub var g_wsock_enabled: i64 = 0;
+// 可捕获 panic（dev33 批次 7）：启用标记。irgen 首次生成 catch_panic/受捕
+// panic 置位，emit 据此输出 @tie_panic_jb / @tie_panic_msg / @tie_panic_active。
+pub var g_catch_enabled: i64 = 0;
+// r.1.4.4：未支持指令硬错误（不再静默降级为占位注释继续链接）——
+// gen_inst 命中未支持 op 时登记错误文本；emit() 末尾与 driver 侧拦截报错。
+pub var g_llvmgen_err: string = "";
+// 阶段 A：str_cat 内联序列的临时寄存器计数（与 printf sext 同款独立命名空间，
+// 避免与 %N 值编号冲突）
+pub var g_str_reg_cnt: i64 = 0;
+// 临时 alloca 提升（F1 增强）+ 行级重编号（对齐 Rust renumber_ir）：
+// irgen 的 ok 槽等临时 alloca 生成在当前块（循环体内），LLVM 对循环内 alloca
+// 生成动态栈分配（sub rsp 无恢复）——百万级循环栈溢出（map-bench 150 轮 →
+// 0xC00000FD，普适 map 段错误根因之一）。修复：gen_func 把函数全部 alloca
+// 前置到 entry block 输出（收集序），再对函数体行级重编号（%N → 1..N 连续）
+// 解决编号倒挂（alloca 值 id 大于后序指令值 id，LLVM 要求块内严格递增）。
+// 函数级缓冲：gen_func 期间 line() 写入 g_fn_lines，结束重编号后追加全局。
+pub var g_fn_lines: table<string>;
+pub var g_fn_mode: i64 = 0;
+// 函数指令区间索引（性能：emit 开头构建一次，O(B)）：lo[fid]..hi[fid] =
+// 函数 fid 的指令区间。指令表按函数连续（ir.new_inst 顺序 append、块按函数
+// 创建），gen_func 遍历从全表 O(F×N) 降为区间 O(N)——不再每函数全量扫全部
+// 指令表（此前 400+ 函数 × 几十万指令 = 上亿次迭代，emit funcs 4.4s 主体）。
+pub var g_fn_inst_lo: table<i64>;
+pub var g_fn_inst_hi: table<i64>;
+pub var g_hoisted_allocas: table<i64>;
+pub var g_hoisted_cnt: i64 = 0;
+// p.9.20.5 tail call：块尾「call → ret 其结果」的尾位置 call 收集（文本级
+// `tail` 提示标记；IR 不变）。LLVM 验证器仅要求尾位置正确，普通 tail 是
+// 优化提示而非硬约束（musttail 才严格），alloca 实参等场景 LLVM 自动放弃
+// 尾优化，无正确性风险。
+pub var g_tail_ids: table<i64>;
+pub var g_tail_enable: i64 = 0;   // t>=1 启用（t0 保持基线不动点）
+// 重编号映射表（直索引）：旧值 id → 新值 id（-1 = 未设；旧值 id 稠密小整数）
+// 性能重写（p.9.14.3，O(n) 化）：值 id 全编译单调递增（ir_val_cnt 仅整次编译
+// 复位），旧方案每函数 g_ren_map = table_new 后 ren_def 首触即把表增长到该
+// 函数的全局基址（Σ base_k = O(总指令²/函数数)）——driver 闭包实测 emit
+// ren 15.8s 主体。改为「印章表」：g_ren_stamp/g_ren_val 跨函数持久、仅随
+// 全局最大 id 一次性增长；g_ren_fn 每函数 +1，stamp[old] == g_ren_fn 判定
+// 本函数内是否已映射——每函数成本降为 O(自身 id 数)，全局一次 O(总指令)。
+pub var g_ren_stamp: table<i64>;
+pub var g_ren_val: table<i64>;
+pub var g_ren_fn: i64 = 0;
+pub var g_ren_next: i64 = 1;
+// 2026-10-07：**具名族**重编号（`%smN` / `%spN`）的印章表。
+// 为何需要：这两族的后缀是**构造期 id**（指令 id / 值 id），而构造顺序取决于
+// 编译路径（缓存命中与否）⇒ 原样输出会让 .ll **不可复现**（实测同一输入
+// `--no-cache` 得 a3d7ec5e…、缓存命中得 0859932b…，952 行差在 %sm）。
+// 与 %N 同法处理：按函数分配新号（编号来自函数自身的行序 ⇒ 与路径无关）。
+// 独立一套表是为了**不把构造期 id 灌进数值 id 的空间**（两套 id 空间不同，
+// 混用会互相挤占编号）。
+pub var g_renn_stamp: table<i64>;
+pub var g_renn_val: table<i64>;
+// r.1.6.3：每函数重编号的形参占位基数（renumber_lines 的 g_ren_next 初值）。
+// 普通函数 = g_pcnt；Linux main（带 i32 %0, ptr %1 附加形参）由 gen_func 置 2，
+// 防止函数体指令重编号为 %0 与形参撞号（opt：instruction expected to be
+// numbered '%2' or greater）。
+pub var g_ren_base: i64 = 0;
+// r.1.6.3：编译目标是否 Linux（入口侧 driver/pipeline.tie 经 set_linux 注入；
+// 空/Windows 恒 0）——main 入口带 argc/argv 签名 + entry 捕获 store 的平台分支判据。
+pub var g_linux_target: i64 = 0;
+// r.1.6.3：程序是否使用 arg_* 内置（irgen 首调 linux_args_enable 置位）。置位
+// 后：Linux 目标下 main 定义带 `i32 %0, ptr %1`（argc/argv，CRT 注入），entry
+// 首条把两者 store 进 @__tig_argc/@__tig_argv 全局（arg_count/arg_string 读）；
+// Windows 目标忽略（CommandLineToArgvW 既有路径，main 保持无参、IR 逐字节不变）。
+pub var g_linux_args: i64 = 0;
+
+namespace llvmgen {
+// p.9.20.5 tail call 开关（t>=1 启用文本级 tail 提示；t0 保持不动点基线）
+pub func set_tail_enable(v: i64) {
+    g_tail_enable = v
+}
+
+
+// 全局变量登记：表全局（global ptr null + main 初始化）/ 标量（零值 global）。
+// 供 irgen.tig_global_var 调用（driver 树顶层 VarDecl 439 个）。
+pub func global_table_reg(nm: string) {
+    var nid = interner.intern(nm)
+    table_push(g_global_names, nid)
+    table_push(g_global_is_table, 1)
+    table_push(g_global_tys, -1)
+    table_push(g_global_inits, -1)
+    table_push(g_global_inits_ok, 0)
+    table_push(g_global_fps, -1)
+    table_push(g_global_strs, -1)
+    table_push(g_global_fns, -1)
+}
+
+pub func global_scalar_reg(nm: string, ty: i64) {
+    var nid = interner.intern(nm)
+    table_push(g_global_names, nid)
+    table_push(g_global_is_table, 0)
+    table_push(g_global_tys, ty)
+    table_push(g_global_inits, -1)
+    table_push(g_global_inits_ok, 0)
+    table_push(g_global_fps, -1)
+    table_push(g_global_strs, -1)
+    table_push(g_global_fns, -1)
+}
+
+// 登记一个「全局 ptr，初值 = 某函数地址」（(b) 方案：静态空闭包 env 槽）。
+// 发射形态 `@nm = global ptr @fn_nm`——函数地址作指针常量，无需运行期初始化。
+pub func global_ptr_fn_reg(nm: string, fn_nm: string) {
+    var nid = interner.intern(nm)
+    table_push(g_global_names, nid)
+    table_push(g_global_is_table, 0)
+    table_push(g_global_tys, types.named(TK_STR))
+    table_push(g_global_inits, -1)
+    table_push(g_global_inits_ok, 0)
+    table_push(g_global_fps, -1)
+    table_push(g_global_strs, -1)
+    table_push(g_global_fns, interner.intern(fn_nm))
+}
+
+// r.1.6.3：注入编译目标是否 Linux（入口侧 driver/pipeline.tie 同步调用；幂等）。
+// 驱动 main 带参签名（g_linux_target）与 entry 捕获（g_linux_args）双判定。
+// 程序入口全名（主文件 main；可能带命名空间）。emit 前由 driver 设置。
+pub var g_entry_name: string = "";
+
+pub func set_entry(n: string) {
+    g_entry_name = n
+}
+
+pub func set_linux(v: bool) {
+    if v {
+        g_linux_target = 1
+    } else {
+        g_linux_target = 0
+    }
+}
+
+// r.1.6.3：程序使用 arg_* 内置时启用 Linux 入口捕获（幂等）。首次调用登记
+// 两个运行期全局槽（emit_globals 输出零值 global）：
+//   @__tig_argc : i32  —— main 入口 store 的 argc（含程序名）
+//   @__tig_argv : ptr  —— main 入口 store 的 argv（char**，UTF-8 直通）
+// gen_func 据此把 main 定义改为 `define i32 @main(i32 %0, ptr %1)` 并在 entry
+// 首条 store 两形参入全局；arg_count/arg_string（irgen_expr.tie）读槽返回。
+// Windows 目标不置 g_linux_target，本标记不影响 main 签名（IR 逐字节不变）。
+pub func linux_args_enable() {
+    if g_linux_args == 1 {
+        return
+    }
+    g_linux_args = 1
+    global_scalar_reg("__tig_argc", types.named(TK_I32))
+    global_scalar_reg("__tig_argv", types.ptr_of(types.named(TK_I8)))
+}
+
+// 标量初始值（i64 字面量/字符码点/bool 0-1）：emit_globals 输出 @g = global T <v>
+pub func global_scalar_init(nm: string, v: i64) {
+    var nid = interner.intern(nm)
+    var i: i64 = 0
+    while i < len(g_global_names) {
+        if g_global_names[i] == nid {
+            g_global_inits[i] = v
+            g_global_inits_ok[i] = 1
+            return
+        }
+        i = i + 1
+    }
+}
+
+// 顶层浮点初始值（r.1.1.2）：折叠出的浮点字面量文本（池 id）——
+// emit_globals 输出 @g = global double/float <原文>（LLVM 接受十进制/指数语法）。
+pub func global_fp_init(nm: string, lexeme_id: i64) {
+    var nid = interner.intern(nm)
+    var i: i64 = 0
+    while i < len(g_global_names) {
+        if g_global_names[i] == nid {
+            g_global_fps[i] = lexeme_id
+            g_global_inits_ok[i] = 1
+            return
+        }
+        i = i + 1
+    }
+}
+
+// 顶层字符串 const 初始值：emit_globals 输出 @g = global ptr @.str.N（字面量）
+pub func global_str_init(nm: string, lexeme_id: i64) {
+    var nid = interner.intern(nm)
+    var i: i64 = 0
+    while i < len(g_global_names) {
+        if g_global_names[i] == nid {
+            // 去引号 lexeme → 纯文本池 id（与 tig_str_lit 同款）
+            var clean = lexeme_id
+            var txt = intern.lookup(lexeme_id)
+            var n: i64 = str_len(txt)
+            if n >= 2 && str_char(txt, 0) == "\"" && str_char(txt, n - 1) == "\"" {
+                var sub: string = ""
+                var k: i64 = 1
+                while k < n - 1 {
+                    sub = sub + str_char(txt, k)
+                    k = k + 1
+                }
+                clean = interner.intern(sub)
+            }
+            g_global_strs[i] = clean
+            g_global_inits_ok[i] = 1
+            return
+        }
+        i = i + 1
+    }
+}
+
+
+// p.9.12.1：查询已登记的**标量**全局是否已折叠及其折叠值。
+// 供 irgen.global_init_fold 解析跨全局引用（`var B = A + lit`，A 为先前折叠的
+// 标量全局）——此前不折叠导致引用全局的字符串/整型初值静默变空/零。
+// 返回 (ok, kind, val)：ok=1 才有效；kind：0=整型(intv)、1=字符串(sid)、2=浮点(原文池 id)。
+pub func global_folded_of(nid: i64) -> (i64, i64, i64) {
+    var i: i64 = 0
+    while i < len(g_global_names) {
+        if g_global_names[i] == nid {
+            if g_global_is_table[i] == 1 {
+                return (0, 0, 0)
+            }
+            if g_global_inits_ok[i] == 1 {
+                if g_global_strs[i] != -1 {
+                    return (1, 1, g_global_strs[i])
+                }
+                if g_global_fps[i] != -1 {
+                    return (1, 2, g_global_fps[i])
+                }
+                return (1, 0, g_global_inits[i])
+            }
+            return (0, 0, 0)
+        }
+        i = i + 1
+    }
+    return (0, 0, 0)
+}
+
+
+// p.9.21.9 收口：装配路径登记副作用回滚（装配恢复失败 → driver 降级全量
+// irgen 前调用；不清空则全量路径 tig_global_var 会**二次登记**同名全局 →
+// .ll 重复定义）。只复位「登记类」状态（全局段/vtable/调用符号/Linux 入口
+// 捕获标记），置位旗标（sso/wsock/catch）由全量路径自行幂等置位，不清。
+pub func reset_global_regs() {
+    g_global_names = table_new_i64()
+    g_global_is_table = table_new_i64()
+    g_global_tys = table_new_i64()
+    g_global_inits = table_new_i64()
+    g_global_inits_ok = table_new_i64()
+    g_global_fps = table_new_i64()
+    g_global_strs = table_new_i64()
+    // ★ g_global_fns 必须与上面七张平行表同批清：漏了它，后续登记的每一行都会
+    // 在「函数指针段」上整体错位一格（实测常驻复用第二单元把 @clo_eenv_* 的初值
+    // 写成上一个单元的字符串常量：`global ptr getelementptr (…, @.str.0, …)`）。
+    g_global_fns = table_new_i64()
+    g_vt_names = table_new_i64()
+    g_vt_tys = table_new_i64()
+    g_vt_n = table_new_i64()
+    g_vt_off = table_new_i64()
+    g_vt_syms = table_new_i64()
+    call_syms = table_new_i64()
+    g_linux_args = 0
+}
+
+// p.9.21.9 收口：全局名是否已登记（装配路径校验「片段引用的全局均已登记」
+// 用——未登记即装配副作用恢复不全，driver 据此诚实降级全量路径）。
+// 登记名不含 '@' 前缀（emit 时补），入参按登记名比对。
+pub func has_global(nm: string) -> bool {
+    var nid = interner.intern(nm)
+    var i: i64 = 0
+    while i < len(g_global_names) {
+        if g_global_names[i] == nid {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// SSO 短串池启用标记（irgen s21_sso_alloc 首次调用置位；幂等）。
+pub func sso_enable() {
+    g_sso_enabled = 1
+}
+
+// p.9.17.1：str_char 码点索引缓存启用（irgen bi_str_char 首调置位；幂等）。
+pub func sc_enable() {
+    g_sc_enabled = 1
+}
+
+// p.6.4.5 Winsock2 标志全局启用（irgen 内联 net_* 时置位；幂等）。
+pub func wsock_enable() {
+    g_wsock_enabled = 1
+}
+
+// 可捕获 panic 启用标记（irgen 首次生成 catch_panic / 受捕 panic 置位；幂等）。
+pub func catch_enable() {
+    g_catch_enabled = 1
+}
+
+// 常驻编译服务：**单元级**全量复位（一次性 CLI 用不到——每进程只编一个单元）。
+// reset_global_regs() 只回滚「登记类」状态（装配降级语义，见其注释），
+// **不碰置位类旗标**；常驻逐请求复用必须把旗标一并清算——否则上一单元用过的
+// SSO 短串池 / str_char 缓存 / wsock 初始化 / catch_panic 会凭空给本单元多输出
+// 对应全局段（产物与一次性 CLI 不一致，且没人报错）。
+// 字符串池与 out_lines 由 emit()/collect_strings() 自建，这里显式清是为了让
+// 「复位后立即崩溃」也不残留上一单元的串表（排障时不留假象）。
+pub func unit_reset() {
+    reset_global_regs()
+    g_entry_name = ""
+    g_sso_enabled = 0
+    g_sc_enabled = 0
+    g_wsock_enabled = 0
+    g_catch_enabled = 0
+    g_llvmgen_err = ""
+    out_lines = table_new_string()
+    str_pool = table_new_i64()
+    str_idx = table_new_i64()
+    str_count = 0
+    g_ss_stamp = table_new_i64()
+    g_ss_slotv = table_new_i64()
+    g_slot_len = table_new_i64()
+    g_fn_lines = table_new_string()
+    g_pfid = 0
+    g_pcnt = 0
+    vdef_cache = table_new_i64()
+    vdef_cache_ready = 0
+    g_inst_blk = table_new_i64()
+    g_inst_blk_ready = 0
+    ext_syms = table_new_i64()
+}
+
+
+// 用户函数调用（call 35）符号登记（去重；命名空间函数全名 → $）
+pub func call_sym_reg(sid: i64) {
+    var dup = false
+    var k: i64 = 0
+    while k < len(call_syms) {
+        if call_syms[k] == sid {
+            dup = true
+            break
+        }
+        k = k + 1
+    }
+    if !dup {
+        table_push(call_syms, sid)
+    }
+}
+
+// S2.4 vtable 登记：vt_name = "vt.<port名>.<struct名>"；mnames = 方法实现函数
+// 全名表（按 port 方法声明序，如 ["Button::draw", "Button::bounds"]）。
+// 类型文本 = 内联聚合 "{ ptr, ... }"（字段数 = 方法数）。幂等（同名跳过）。
+// irgen.tig_ast 阶段对每个 impl 记录调用一次；emit_vtables 统一输出。
+pub func vtable_reg(vt_name: string, mnames: table<string>) {
+    var i: i64 = 0
+    while i < len(g_vt_names) {
+        if interner.lookup(g_vt_names[i]) == vt_name {
+            return  // 已登记（幂等）
+        }
+        i = i + 1
+    }
+    table_push(g_vt_names, interner.intern(vt_name))
+    // 聚合类型文本：{ ptr, ptr, ... }（n 个 ptr）
+    var ty: string = "{"
+    var j: i64 = 0
+    while j < len(mnames) {
+        if j > 0 {
+            ty = ty + ", "
+        }
+        ty = ty + "ptr"
+        j = j + 1
+    }
+    ty = ty + " }"
+    table_push(g_vt_tys, interner.intern(ty))
+    table_push(g_vt_n, len(mnames))
+    table_push(g_vt_off, len(g_vt_syms))
+    var k: i64 = 0
+    while k < len(mnames) {
+        table_push(g_vt_syms, interner.intern(mnames[k]))
+        k = k + 1
+    }
+}
+
+
+// ==================== 指令映射 ====================
+// 本分区已拆分为 compiler/backend/llvmgen_inst.tie（同 llvmgen_str.tie 的
+// 「同 namespace 跨文件 + 文本内联」范式）：单指令 → LLVM 文本生成（核心
+// 调度器 gen_inst）及全部辅助函数（param_pos/param_ref/opnd_ref/global_ref/
+// build_vdef_cache/value_def/arg_ref/is_table_bridge/typed_ref/str_ptr_ref/
+// to_ptr/gen_call_i64/gen_call_ptr/reg_add/reg_gep/gen_ext_str_scan/
+// ptr_arg_ref）均保留于该子文件，经上方 import 并入本编译单元。
+
+// ==================== 模块生成 ====================
+// 生成完整 .ll 文本
+// r.1.4.4：未支持指令硬错误文本（空 = 无错误；driver 在 emit() 后检查）
+pub func err_msg() -> string {
+    return g_llvmgen_err
+}
+
+pub func emit() -> string {
+    collect_strings()
+    collect_externs()
+    out_lines = table_new_string()
+    g_sext_cnt = 0
+    g_str_reg_cnt = 0
+    // 模块头
+    line("; ModuleID = 'tie'")
+    line("source_filename = \"input.tie\"")
+    // AB 数据布局（x86_64-pc-windows-msvc）：显式声明使 opt 用目标 ABI 对齐
+    //（i64 对齐 8），否则无 datalayout 时 opt 默认把字段按 4 字节对齐装箱，
+    // 导致 repr(C) 结构体（如 WIN32 STARTUPINFOW）字段偏移与 C 不兼容
+    //（dwFlags 落 56 而非 60）。对齐 clang 对该 triple 的默认 datalayout。
+    line("target datalayout = \"e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"")
+    line("")
+    // 无条件 declare
+    line("declare i32 @printf(ptr, ...)")
+    line("")
+    line("declare i64 @strlen(ptr)")
+    line("declare i32 @strcmp(ptr, ptr)")
+    line("declare ptr @malloc(i64)")
+    line("declare void @free(ptr)")
+    line("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)")
+    line("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)")
+    // 批次 7：libc memmove（map 有序数组插入平移；重叠安全，clang 链接 CRT 提供）
+    line("declare void @memmove(ptr, ptr, i64)")
+    line("")
+    line("declare ptr @fopen(ptr, ptr)")
+    line("declare i64 @fwrite(ptr, i64, i64, ptr)")
+    line("declare i64 @fread(ptr, i64, i64, ptr)")
+    line("declare i32 @fseek(ptr, i64, i32)")
+    line("declare i64 @ftell(ptr)")
+    line("declare i32 @fclose(ptr)")
+    line("declare i32 @fflush(ptr)")
+    line("declare void @exit(i32)")
+    line("declare i32 @remove(ptr)")
+    // 批次 7：可捕获 panic（catch_panic）——对齐 clang 对 MSVC setjmp 的生成：
+    // `_setjmp(env, frameaddr)` 带 returns_twice（LLVM 据其做栈帧/寄存器保存）；
+    // `longjmp(env, val)` noreturn；frameaddr 传当前帧地址（longjmp 回跳锚点）。
+    line("declare i32 @_setjmp(ptr, ptr) returns_twice")
+    line("declare void @longjmp(ptr, i32) noreturn")
+    line("declare ptr @llvm.frameaddress.p0(i32 immarg)")
+    line("declare double @sqrt(double)")
+    line("declare double @sin(double)")
+    line("declare double @cos(double)")
+    line("declare double @tan(double)")
+    line("declare double @exp(double)")
+    line("declare double @log(double)")
+    line("declare double @pow(double, double)")
+    line("declare double @floor(double)")
+    line("declare double @ceil(double)")
+    line("declare double @round(double)")
+    line("declare double @tanh(double)")
+    line("declare double @sinh(double)")
+    line("declare double @cosh(double)")
+    line("declare double @asin(double)")
+    line("declare double @acos(double)")
+    line("declare double @atan(double)")
+    line("declare double @log2(double)")
+    line("declare double @log10(double)")
+    line("declare double @expm1(double)")
+    line("declare double @log1p(double)")
+    line("declare double @cbrt(double)")
+    line("declare double @exp2(double)")
+    line("declare double @trunc(double)")
+    line("declare double @atan2(double, double)")
+    line("declare double @copysign(double, double)")
+    line("declare double @fmod(double, double)")
+    line("declare double @remainder(double, double)")
+    line("declare double @hypot(double, double)")
+    line("")
+    // T4.5：tie 运行时桥 declare（extern_call 收集，按符号名输出）
+    emit_extern_decls()
+    // 聚合类型段（struct type 定义；元组内联）
+    emit_agg_types()
+    // 阶段 A：全局变量段（表 → ptr null；标量 → 零值）
+    emit_globals()
+    // S2.4：vtable 全局常量段（方法函数指针表，每个 impl 一个）
+    emit_vtables()
+    // 各函数
+    var nf = ir.func_count()
+    var i: i64 = 0
+    unsafe {
+        var et0 = GetTickCount()
+    }
+    while i < nf {
+        gen_func(i)
+        i = i + 1
+    }
+    unsafe {
+        var et1 = GetTickCount()
+    }
+    e_t_funcs = et1 - et0
+    // 字符串常量节
+    line("")
+    emit_strings()
+    // SSO 短串池全局段 + @tie_sso_alloc helper：**必须在函数遍历之后**输出——
+    // op56（str_cat）在 gen_func 时才调 sso_enable()，提前输出会漏 helper。
+    // p.9.17.1：str_char 缓存启用时强制 SSO 段（@tie_str_free_if_heap 的缓存
+    // 失效钩子依赖 SSO 段先发射；池 bump 也保证缓存键的地址不复用）。
+    if g_sc_enabled == 1 {
+        g_sso_enabled = 1
+    }
+    emit_sso_globals()
+    // p.9.17.1：str_char 码点索引缓存段（@tie_sc_* 全局 + @tie_sc_off/
+    // @tie_sc_inval 手写 helper；仅 g_sc_enabled 时输出）
+    emit_sc_globals()
+    // --shared 缺陷修复：库无 main，全局表初始化经 tie$rt_init 模块构造器在
+    // DLL 加载时执行（DLL CRT 的 global_ctors 装载即运行）。仅当存在 tie$rt_init
+    //（即模块有表全局）时发射，纯标量库不发射、导出面逐字不变。**必须放在所有
+    // define 之后**（opt 要求全局声明在所有函数定义之后）。
+    if g_dynlib {
+        var has_rti: i64 = 0
+        var kk: i64 = 0
+        while kk < nf {
+            if intern.lookup(ir.func_name(kk)) == "tie$rt_init" {
+                has_rti = 1
+            }
+            kk = kk + 1
+        }
+        if has_rti == 1 {
+            // 元素须带显式类型前缀：LLVM 21+ 收紧数组字面量解析，旧简写
+            // `[{ i32 65535, ... }]` 在 LLVM 22 报 expected '}' at end of struct。
+            line("@llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 65535, ptr @tie$rt_init, ptr null }]")
+        }
+    }
+    // r.1.4.4：未支持指令 = 硬错误——gen_inst 已登记 g_llvmgen_err，
+    // 提前终止生成（返回错误文本，driver 侧 err_msg() 检测并 render_error）
+    if str_len(g_llvmgen_err) > 0 {
+        return "; llvmgen error: " + g_llvmgen_err
+    }
+    unsafe {
+        var et2 = GetTickCount()
+    }
+    var joined = join_lines()
+    unsafe {
+        var et3 = GetTickCount()
+    }
+    e_t_join = et3 - et2
+    // emit 子阶段计时报告（TIEC_TIME=1）
+    var etmv = get_env("TIEC_TIME")
+    if etmv == "1" {
+        println("[emit] funcs=" + to_string(e_t_funcs) + "ms ren=" + to_string(g_t_ren) + "ms join=" + to_string(e_t_join) + "ms")
+    }
+    return joined
+}
+
+
+}
+
+
+import "./llvmgen_p1.tie"
+import "./llvmgen_sc.tie"
+import "./llvmgen_p2.tie"
+import "./llvmgen_inst_gen.tie"

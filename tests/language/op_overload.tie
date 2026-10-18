@@ -1,0 +1,109 @@
+type tie<logic>
+
+// ============================================================
+// p.8.2.4 运算符重载验收（operator overloading）
+//
+// 声明形式：struct 绑定命名空间方法（命名约定，小写前缀 op_）：
+//   - 二元：op_add/op_sub/op_mul/op_div/op_mod
+//   - 比较：op_eq/op_ne/op_lt/op_le/op_gt/op_ge
+//   - 一元：op_neg（负号）
+// 签名：隐式接收者（首参，type=struct）+ 右操作数；一元仅接收者。返回类型自由
+//（== 类应返回 bool，由用户保证）。
+//
+// 调度规则（确定性，与 sinfer.try_op_overload_binary / irgen tig_binary 一致）：
+//   A. 左操作数类型为用户 struct 且声明对应 op_ 方法 → 左优先：调 <左struct>::op_X，
+//      形参 = [左, 右]
+//   B. 否则若右操作数类型为用户 struct 且声明对应 op_ 方法 → 调 <右struct>::op_X，
+//      形参 = [右, 左]（左侧为内置类型时启用；非交换运算的实参序由此规则确定）
+//   C. 两侧都为内置类型 → 绝不重载，走原算术/比较路径（既有代码行为零变化）。
+//   D. 未声明对应 op_ 方法 → 不重载，走原语义/诊断路径。
+//
+// 期望输出（逐行）：
+//   sum=(3,7) / b=(6,14) / s=(2,4) / rev=(2,4) / iseq=1 / nv=(-1,-2) /
+//   c=(3,11) / == 布尔 1 / < 布尔 1
+// ============================================================
+
+struct Vec2 {
+    var x: i64 = 0
+    var y: i64 = 0
+}
+namespace Vec2 {
+    pub func op_add(self: Vec2, o: Vec2) -> Vec2 {
+        return Vec2(self.x + o.x, self.y + o.y)
+    }
+    pub func op_mul(self: Vec2, s: i64) -> Vec2 {
+        return Vec2(self.x * s, self.y * s)
+    }
+    pub func op_eq(self: Vec2, o: Vec2) -> bool {
+        return self.x == o.x && self.y == o.y
+    }
+    pub func op_neg(self: Vec2) -> Vec2 {
+        return Vec2(0 - self.x, 0 - self.y)
+    }
+}
+
+// 复数：验证非交换 * 与一元 neg（复数乘法自含，验证接收者/实参序由调用方 op_ 决定）
+struct Complex {
+    var re: i64 = 0
+    var im: i64 = 0
+}
+namespace Complex {
+    pub func op_mul(self: Complex, o: Complex) -> Complex {
+        var r = Complex(0, 0)
+        r.re = self.re * o.re - self.im * o.im
+        r.im = self.re * o.im + self.im * o.re
+        return r
+    }
+    pub func op_eq(self: Complex, o: Complex) -> bool {
+        return self.re == o.re && self.im == o.im
+    }
+    pub func op_lt(self: Complex, o: Complex) -> bool {
+        // 自定义：按模长比较（演示 < 由自定义方法裁决，返回 bool）
+        var sn = self.re * self.re + self.im * self.im
+        var on = o.re * o.re + o.im * o.im
+        return sn < on
+    }
+}
+
+func main() {
+    // A. 左操作数 struct：a + b → Vec2::op_add(a, b)
+    var a = Vec2(1, 2)
+    var b = Vec2(2, 5)
+    var sum = a + b
+    // 构造打印（字段读取验证返回 struct 内容正确）
+    println("sum=(" + to_string(sum.x) + "," + to_string(sum.y) + ")")
+
+    // a + a → a = (2,4) × 3 = (6,12)
+    var aa = a + a
+    var bb = aa * 3
+    println("b=(" + to_string(bb.x) + "," + to_string(bb.y) + ")")
+
+    // a * 2（左 struct）与 2 * a（右 struct，形参序=[右,左]→op_mul(a,2)）均缩放
+    var s = a * 2
+    var rev = 2 * a
+    println("s=(" + to_string(s.x) + "," + to_string(s.y) + ")")
+    println("rev=(" + to_string(rev.x) + "," + to_string(rev.y) + ")")
+
+    // 比较重载（返回 bool）：a+? == b
+    var a1 = Vec2(1, 2)
+    var iseq = 0
+    if a1 == Vec2(1, 2) {
+        iseq = 1
+    }
+    println("iseq=" + to_string(iseq))
+
+    // 一元负号：-a → Vec2::op_neg(a)
+    var nv = -a
+    // op_neg 直接包创建（unary）：-Vec2(1, 2) 也重载
+    var neg2 = -Vec2(1, 2)
+    println("nv=(" + to_string(nv.x) + "," + to_string(nv.y) + ")")
+    println("neg2=(" + to_string(neg2.x) + "," + to_string(neg2.y) + ")")
+
+    // 复数非交换 *：c1*c2 vs c2*c1 不同（验证非交换语义由用户方法掌控）
+    var c1 = Complex(1, 2)
+    var c2 = Complex(3, 4)
+    var cm = c1 * c2
+    println("c=(" + to_string(cm.re) + "," + to_string(cm.im) + ")")
+    println("c== " + to_string(c1 == Complex(1, 2)))
+    println("< 布尔 " + to_string(Complex(1, 1) < Complex(2, 2)))
+}

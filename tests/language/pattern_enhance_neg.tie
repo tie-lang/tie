@@ -1,0 +1,48 @@
+type tie<logic>
+
+// ============================================================
+// p.8.1.4 模式匹配负例：
+//   1. 无 default 且漏变体（未穷尽）→ 编译错误
+//   2. 无 default 且全部 case 带守卫（守卫可能失败）→ 编译错误
+//   3. 多字段解构绑定数与 payload 字段数不一致 → 编译错误
+// ============================================================
+
+enum Shape {
+    Circle(i64)
+    Rect(i64, i64)
+}
+
+enum Mix {
+    Both(f64, table<i64>)
+    Pair(i64, string)
+    None
+}
+
+func main() {
+    // 负例 1：漏 Rect（无 default）→ 不穷尽
+    var s = Shape.Circle(1)
+    switch s {
+        case Circle(r):
+            println(r)
+    }
+    // 负例 2：全守卫无 default → 不穷尽
+    var m = Mix.None
+    switch m {
+        case Both(x, t) when x > 0:
+            println(x)
+        case Pair(n, s) when n > 0:
+            println(n)
+        case None when true:
+            println("none")
+    }
+    // 负例 3：绑定数（1）≠ 字段数（2）
+    var b = Mix.Both(1.0, [1])
+    switch b {
+        case Both(x):
+            println(x)
+        case Pair(n, s):
+            println(n)
+        case None:
+            println("none")
+    }
+}

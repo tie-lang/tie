@@ -1,0 +1,162 @@
+type tie<tsh>
+// scripts/zero-rust-check.tsh.tie —— 自举 v2：G3 闸门（0-Rust 验证）
+// （tsh-role 移植 zero-rust-check.ps1）。验证工具链构建路径的 0-Rust 程度：
+// exec_code/get_env/time_now 已内联 libc，std/runtime.a 退役；门禁只验证
+// ① tiec 编译 hello ② 运行时内联 libc ③ 二进制 Rust-free 符号扫描。
+// 退出码：0 = G3 PASS；1 = 部分 PASS / 前置缺失。
+// tsh 无 [byte] 二进制读取：③ 的二进制符号扫描用外部 findstr /M /C:"sym"
+// 逐符号判定（findstr 对 PE 的字面 ASCII 子串检测）；findstr 返回 0=在/1=不在。
+// LLVM 工具发现顺序：TIE_LLVM_HOME → 固定安装目录 → PATH（name 名）。
+
+var root = cwd()
+var tmp = get_env("TEMP") + "\\zero_rust_check"
+var _m = mkdir_all(tmp)
+
+println("===== G3 闸门：0-Rust 验证（runtime.a 退役后）=====")
+println("工作目录: " + root)
+
+var tiec = root + "\\compiler\\tiec.exe"
+
+// 前置检查：tiec / clang / opt
+var fails = table_new_string()
+// clang 发现：TIE_LLVM_HOME → 固定目录 → PATH
+var clang = ""
+var llvmHome = get_env("TIE_LLVM_HOME")
+if !is_empty(llvmHome) {
+    var c1 = llvmHome + "\\bin\\clang.exe"
+    if file_exists(c1) { clang = c1 }
+}
+if is_empty(clang) {
+    if file_exists("D:\\LLVM\\bin\\clang.exe") { clang = "D:\\LLVM\\bin\\clang.exe" }
+}
+if is_empty(clang) {
+    if file_exists("C:\\Program Files\\LLVM\\bin\\clang.exe") { clang = "C:\\Program Files\\LLVM\\bin\\clang.exe" }
+}
+if is_empty(clang) {
+    if file_exists("C:\\LLVM\\bin\\clang.exe") { clang = "C:\\LLVM\\bin\\clang.exe" }
+}
+if is_empty(clang) { clang = "clang" }
+
+var opt = ""
+if file_exists("D:\\LLVM\\bin\\opt.exe") { opt = "D:\\LLVM\\bin\\opt.exe" }
+if is_empty(opt) { opt = "opt" }
+
+if !file_exists(tiec) { table_push(fails, "缺失: " + tiec) }
+if !file_exists(clang) { table_push(fails, "缺失: " + clang) }
+if !file_exists(opt) { table_push(fails, "缺失: " + opt) }
+
+if len(fails) > 0 {
+    var fi: i64 = 0
+    while fi < len(fails) {
+        println("[FAIL] " + fails[fi])
+        fi = fi + 1
+    }
+    println("结论: FAIL（前置缺失）")
+    exit(1)
+}
+println("[PASS] 前置就绪（tiec / clang / opt）")
+
+// ---------- 1. tiec 编译 hello ----------
+var helloExe = tmp + "\\g3_hello.exe"
+var rc1 = exec_code("cmd /c " + tiec + " " + root + "\\examples\\hello.tie -o " + helloExe + " >nul 2>&1")
+if rc1 != 0 {
+    table_push(fails, "tiec 编译 hello 失败")
+} else {
+    var helloOut = exec_output("cmd /c " + helloExe + " 2>&1")
+    var hlines = split_lines(helloOut)
+    if len(hlines) != 16 {
+        table_push(fails, "hello 输出行数异常（" + to_string(len(hlines)) + " != 16）")
+    } else {
+        println("[PASS] tiec 编译 hello → 运行输出 16 行正确")
+    }
+}
+
+// ---------- 2. tiec 编译运行时程序（exec_code/time_now/get_env → 内联 libc） ----------
+var rtSrc = tmp + "\\g3_runtime.tie"
+var rtExe = tmp + "\\g3_runtime.exe"
+// tie 字符串顶层 `+` 再赋值在 interp 有已知局限（累加失效）——逐行 file_append 建源
+var _s0 = file_write(rtSrc, "// tie:logic\n")
+var _s1 = file_append(rtSrc, "// G3 闸门运行时程序（exec_code/get_env/time_now 内联 libc，零运行时）\n")
+var _s2 = file_append(rtSrc, "func main() -> i64 {\n")
+var _s3 = file_append(rtSrc, "    var t = time_now()\n")
+var _s4 = file_append(rtSrc, "    if t > 0 {\n")
+var _s5 = file_append(rtSrc, "        println(\"time_now ok\")\n")
+var _s6 = file_append(rtSrc, "    }\n")
+var _s7 = file_append(rtSrc, "    var rc = exec_code(\"cmd /c exit 0\")\n")
+var _s8 = file_append(rtSrc, "    println(rc)\n")
+var _s9 = file_append(rtSrc, "    var p: string = get_env(\"PATH\")\n")
+var _s10 = file_append(rtSrc, "    println(p)\n")
+var _s11 = file_append(rtSrc, "    return 0\n")
+var _s12 = file_append(rtSrc, "}\n")
+var rc2 = exec_code("cmd /c " + tiec + " " + rtSrc + " -o " + rtExe + " >nul 2>&1")
+if rc2 != 0 {
+    table_push(fails, "tiec 编译运行时程序失败")
+} else {
+    var rt = exec_output("cmd /c " + rtExe + " 2>&1")
+    var okRT = contains(rt, "\n0") && contains(rt, "time_now ok") && contains(rt, "C:\\")
+    if okRT {
+        println("[PASS] tiec 编译运行时程序 → 运行（time_now/exec_code/get_env 内联）正确")
+    } else {
+        table_push(fails, "运行时程序输出异常: " + rt)
+    }
+}
+
+// ---------- 3. 运行时栈 Rust-free 符号检查（外部 findstr /M /C: 逐符号） ----------
+var forbidden = table_new_string()
+table_push(forbidden, "tie_file_read")
+table_push(forbidden, "tie_str_char")
+table_push(forbidden, "tie_str_len")
+table_push(forbidden, "tie_rand_range")
+table_push(forbidden, "tie_arg_count")
+table_push(forbidden, "tie_arg_string")
+table_push(forbidden, "tie_exec_output")
+table_push(forbidden, "tie_read_line")
+table_push(forbidden, "tie_eval_expr")
+table_push(forbidden, "tie_eval_call")
+table_push(forbidden, "tie_char_code")
+table_push(forbidden, "tie_parse_int")
+table_push(forbidden, "tie_parse_float")
+table_push(forbidden, "tie_to_string")
+table_push(forbidden, "tie_table_new")
+table_push(forbidden, "tie_map_new")
+table_push(forbidden, "tie_byte_read")
+table_push(forbidden, "tie_regex_match")
+table_push(forbidden, "tie_http_get")
+table_push(forbidden, "tie_untar_gz")
+table_push(forbidden, "tie_exec_code")
+table_push(forbidden, "tie_get_env")
+table_push(forbidden, "tie_time_now")
+if file_exists(rtExe) {
+    var rustFree = true
+    var ki: i64 = 0
+    while ki < len(forbidden) {
+        var rc = exec_code("cmd /c findstr /M /C:\"" + forbidden[ki] + "\" " + rtExe + " >nul 2>&1")
+        if rc == 0 {
+            rustFree = false
+            table_push(fails, "运行时栈检出 Rust 残留符号: " + forbidden[ki])
+        }
+        ki = ki + 1
+    }
+    if rustFree {
+        println("[PASS] 运行时程序二进制无 tie_* 运行时符号（内联 libc，Rust-free）")
+    }
+}
+
+// ---------- 4. Rust 通道引用回归（已退役，2026-09-13 删除脚本） ----------
+println("[SKIP] Rust 通道引用回归（repl-parity / interp 套件）——0-Rust 目标下已退役（2026-09-10 决定，2026-09-13 删除 repl-parity.ps1 / run-interp-tests.ps1）")
+
+println("")
+if len(fails) == 0 {
+    println("===== G3 结论: PASS =====")
+    println("tiec 编译用户程序 →（exec_code/get_env/time_now 内联 libc）→ 运行正确，运行时栈 Rust-free；Rust 通道引用回归已退役（0-Rust）。")
+    exit(0)
+} else {
+    println("===== G3 结论: 部分 PASS =====")
+    println("以下环节未闭合：")
+    var mi: i64 = 0
+    while mi < len(fails) {
+        println("  - " + fails[mi])
+        mi = mi + 1
+    }
+    exit(1)
+}

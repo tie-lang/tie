@@ -1,0 +1,62 @@
+type tie<logic>
+// tests/language/closure_nested_capture.tie —— 闭包**入口函数**的按函数状态隔离不变量
+// ============================================================================
+// 本文件是回归护栏，覆盖 r.1.6.14 值语义落地时暴露的两类**跨函数 value id 混用**：
+//   (1) 闭包入口生成未隔离 `g_ownparam_slots` / `g_aggcand_*` ⇒ 闭包体尾部
+//       `tig_tbl_exit_release` 遍历**外层函数**的槽清单，其 value id 在本函数
+//       IR 里不存在 ⇒ opt 报 `use of undefined value`（E00883）。
+//       最小复现 = 某形参表被写、且该函数体内有捕获闭包（lock_credential.tie
+//       的 no_closure_inherit 即此形态）。
+//   (2) 闭包入口生成未**恢复** `g_clov_*`（只重置）⇒ 闭包体内声明的嵌套闭包候选
+//       （槽 id 属于**闭包函数**的 IR）残留到外层登记表 ⇒ 外层出口按该 id 取槽
+//       ⇒ 同一族 undefined value。最小复现 = 嵌套捕获闭包（本文件 test_nested）。
+//
+// 两处在 TIE_TBL_VALUE=0 / 1 下**都**触发（与是否值语义无关，属闭包 A 方案的
+// 按函数隔离漏项）—— 故本用例在两种模式下都必须编译通过。
+
+// (2) 嵌套捕获闭包：外层闭包 → 内层闭包捕获内层局部表 + 外层捕获表。
+func test_nested() -> i64 {
+    var t1: table<i64> = table_new_i64()
+    table_push(t1, 5)
+    var f = func() -> i64 {
+        var t2: table<i64> = table_new_i64()
+        table_push(t2, 7)
+        var g = func() -> i64 {
+            return t2[0] + t1[0]
+        }
+        return g()
+    }
+    return f()
+}
+
+// (1) 形参表被**闭包体**写 + 体内有捕获闭包（闭包内写不使外层形参需要 ref，
+// 且 ref 形参根本不允许被闭包捕获——见 E00697 ⇒ 此处必须是值形参）。
+func write_param_with_closure(p: table<i64>) -> i64 {
+    var q = func() -> i64 {
+        table_push(p, 6)
+        return p[0]
+    }
+    return q()
+}
+
+// (2) 同层两个捕获闭包：**先前**登记的候选不得被后一个的入口生成抹掉。
+func test_siblings() -> i64 {
+    var ta: table<i64> = table_new_i64()
+    table_push(ta, 10)
+    var fa = func() -> i64 {
+        return ta[0]
+    }
+    var tb: table<i64> = table_new_i64()
+    table_push(tb, 20)
+    var fb = func() -> i64 {
+        return tb[0]
+    }
+    return fa() + fb()
+}
+
+func main() {
+    var t: table<i64> = table_new_i64()
+    table_push(t, 0)
+    var acc = test_nested() + write_param_with_closure(t) + test_siblings()
+    println(to_string(acc) + " " + to_string(len(t)))
+}

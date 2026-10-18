@@ -1,0 +1,34 @@
+type tie<class>
+// compiler/backend/llvmgen_inst.tie —— 指令映射 子模块
+// ============================================================
+// 从 llvmgen.tie 拆分而来：把"指令映射"分区（单指令 → LLVM 文本）整批
+// 独立成子文件，含核心调度器 gen_inst 及一批操作数/值引用解析辅助函数：
+//   param_pos / param_ref / opnd_ref / global_ref / build_vdef_cache /
+//   value_def / arg_ref / is_table_bridge / gen_inst / typed_ref /
+//   str_ptr_ref / to_ptr / gen_call_i64 / gen_call_ptr / reg_add /
+//   reg_gep / gen_ext_str_scan / ptr_arg_ref
+//
+// 拆分范式：【同 namespace 跨文件】（文本内联）。
+// llvmgen.tie 顶层 import 本文件后，本文件被"文本内联"进同一编译单元，
+// 其中所有代码全局可见。本文件声明与 llvmgen.tie 相同的 `namespace llvmgen`，
+// tie 允许同名 namespace 横跨多文件（进编译单元后为同一 namespace）闭合并集。
+//   - 同 namespace 的函数可互相裸名调用（llvmgen.tie 主文件仍可按原样裸名
+//     调用本文件内的 param_pos / opnd_ref / value_def / gen_inst / to_ptr
+//     等，无需改名）；
+//   - 同理可访问主文件顶层全局 var（g_pcnt / g_pfid / out_lines / line /
+//     g_hoisted_cnt / g_hoisted_allocas / g_str_reg_cnt / g_sext_cnt /
+//     vdef_cache / vdef_cache_ready 等，均为编译单元内顶层全局，命名空间体
+//     内不允许 var）；
+//   - 本文件经 import 文本内联，只含函数与注释，不含顶层全局 var 声明——
+//     全局 var 仍留在 llvmgen.tie 主文件，避免重复定义。
+// 依赖约定：ir.* / intern / interner / utf / char_code / str_char / str_len /
+// ns_replace / asm_tmpl_convert / llvm_ty / str_slot / str_data_ref /
+// sso_enable / l_slice / l_find_char / str.clone 等为编译单元内可见符号；
+// 这些辅助或来自主文件、或来自 ir.tie / llvmgen_str.tie 的 import 链，经
+// 主文件既有 import 内联可达（本文件不重复 import）。
+
+namespace llvmgen {
+
+
+}
+import "./llvmgen_inst_p1.tie"

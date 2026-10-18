@@ -1,0 +1,72 @@
+type tie<tsh>
+// tests/_p921_interp_flag_probe/flag_nested_if.tie —— interp 不终止形态复现（缺陷记录，勿纳入回归）
+// ============================================================================
+// 来源：p.9.21.1 deps-check.tsh.tie 开发期实测。
+// 现象：函数体内 while 中使用「标志位变量 + 嵌套 if/else」形态时，tsh 解释器执行
+//       该循环不终止（脚本挂死，无输出）。同文件的扁平单层 if 版本正常返回。
+// 影响：脚本角色（.tsh.tie）与 interp 求值路径下的一切循环写法；写脚本必须回避该形态。
+// 状态：根因未定位到 interp 具体子模块（本文件即最小复现场景，未逐项最小化），
+//       记录待后续单独子项排查；修好前 deps-check 等脚本一律用扁平写法。
+// EN: Reproducer for a tsh/interp non-termination bug: a while loop containing a flag
+//     variable plus nested if/else never terminates inside a function. The flat
+//     single-level if form used in scripts/ returns normally.
+//
+// 运行：<tsh> -f tests/_p921_interp_flag_probe/flag_nested_if.tie   → 预期不终止（需手动中断）
+
+var g_body = ""
+var g_log = ""
+
+func lg(t: string) {
+    var _w = file_append(g_log, t + "\n")
+}
+
+// 不终止形态：标志位 + 嵌套 if/else
+func hang_form(body: string) -> i64 {
+    var n = str_len(body)
+    var i: i64 = 0
+    var start: i64 = 0
+    var lines: i64 = 0
+    while i <= n {
+        var eol = false
+        if i == n {
+            eol = true
+        } else {
+            if str_char(body, i) == "\n" {
+                eol = true
+            }
+        }
+        if eol {
+            lines = lines + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return lines
+}
+
+// 正常形态：扁平单层 if（脚本实际采用的写法）
+func flat_form(body: string) -> i64 {
+    var n = str_len(body)
+    var i: i64 = 0
+    var lines: i64 = 1
+    while i < n {
+        if str_char(body, i) == "\n" {
+            lines = lines + 1
+        }
+        i = i + 1
+    }
+    return lines
+}
+
+func mainp() {
+    g_log = get_env("TEMP") + "\\p921_flag_probe.log"
+    var _z = file_write(g_log, "")
+    var body = "a\nb\nc\n"
+    lg("flat_form = " + to_string(flat_form(body)))
+    lg("flat ok, next: hang_form（预期不终止）")
+    var _h = hang_form(body)
+    lg("hang_form = " + to_string(_h))
+}
+
+mainp()
+exit(0)

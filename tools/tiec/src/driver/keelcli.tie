@@ -1,0 +1,123 @@
+type tie<class>
+// compiler/driver/keelcli.tie —— driver keel 子命令子模块
+// ============================================================
+// 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
+// 拆分范式：同编译单元跨文件（文本内联）——本文件只含函数与注释，
+// 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
+// 风格 ns：函数在 `namespace driver` 内，一律 pub（driver 库 API 面）；
+// 主文件顶层 main() 以 driver.<名>() 调用。
+namespace driver {
+// 首个 token 是否表示一个已登记 tie 工具链子命令（0/1）。
+// 规则：有参数、首 token 非空且不以 '-' 开头、且 keelcli.has("cli:"+token)==1。
+pub func keelcli_is_subcmd() -> i64 {
+    if arg_count() == 0 {
+        return 0
+    }
+    var tok = arg_string(0)
+    if str_len(tok) == 0 {
+        return 0
+    }
+    if str_char(tok, 0) == "-" {
+        return 0
+    }
+    if keelcli.has("cli:" + tok) == 1 {
+        return 1
+    }
+    return 0
+}
+
+// 子命令执行桩：真实工具链（pack/verify 等驻 pkg/*.tie，独立入口 pkg.exe）尚未
+// 接入 tiec —— 在此打印注册描述表示"按注册表分派已路由到 driver 侧处理骨架"。
+// 真实工具链联动留待后续 p.7.1.x 接线（分派骨架已验证可运行）。
+pub func keelcli_cmd_stub(cmd: string) -> i64 {
+    println("[keel-cli] 子命令 '" + cmd + "' 已按注册表分派（工具链未接入 tiec，边界见 p.7.1.6）: " + keelcli.desc_of("cli:" + cmd))
+    return 0
+}
+
+// 子命令分派入口（返回退出码）。C1 按名分派（switch 内联 driver 实际处理）；
+// switch default = 未登记命令 → "未知命令" 返回 1。
+pub func keelcli_handle(cmd: string) -> i64 {
+    var sel: i64 = -1
+    if cmd == "help" {
+        sel = 0
+    } else if cmd == "init" {
+        sel = 1
+    } else if cmd == "add" {
+        sel = 2
+    } else if cmd == "remove" {
+        sel = 3
+    } else if cmd == "install" {
+        sel = 4
+    } else if cmd == "update" {
+        sel = 5
+    } else if cmd == "build" {
+        sel = 6
+    } else if cmd == "run" {
+        sel = 7
+    } else if cmd == "publish" {
+        sel = 8
+    } else if cmd == "pack" {
+        sel = 9
+    } else if cmd == "verify" {
+        sel = 10
+    } else if cmd == "search" {
+        sel = 11
+    } else if cmd == "info" {
+        sel = 12
+    } else if cmd == "pkg" {
+        sel = 13
+    }
+    switch sel {
+        case 0:
+            return keelcli_cmd_stub("help")
+        case 1:
+            return keelcli_cmd_stub("init")
+        case 2:
+            return keelcli_cmd_stub("add")
+        case 3:
+            return keelcli_cmd_stub("remove")
+        case 4:
+            return keelcli_cmd_stub("install")
+        case 5:
+            return keelcli_cmd_stub("update")
+        case 6:
+            return keelcli_cmd_stub("build")
+        case 7:
+            return keelcli_cmd_stub("run")
+        case 8:
+            return keelcli_cmd_stub("publish")
+        case 9:
+            return keelcli_cmd_stub("pack")
+        case 10:
+            return keelcli_cmd_stub("verify")
+        case 11:
+            return keelcli_cmd_stub("search")
+        case 12:
+            return keelcli_cmd_stub("info")
+        case 13:
+            return keelcli_pkg_handle()
+        default:
+            println(diagcode.render_error(-1, -1, "未知命令: " + cmd))
+            return 1
+    }
+}
+
+// p.7.2.5 registry 客户端子命令路由：`tie pkg publish|info|versions`。
+// 实际三操作由 compiler/keel/keel_registry_cli.tie（namespace keelpkg，独立
+// 编译 + 探针验证）提供；本层按注册表稳定路由并给出用法（同 p.7.1.6 桩边界：
+// 真实工具链接入见 docs/release.md §4.6，服务端/协议随 p.9.2.2 正式落地）。
+pub func keelcli_pkg_handle() -> i64 {
+    var sub = arg_string(1)
+    if sub == "publish" || sub == "info" || sub == "versions" {
+        println("[keel-cli] 'pkg " + sub + "' 已按注册表分派（registry 客户端最小面，p.7.2.5）")
+        println("[keel-cli] 实际执行: keelpkg." + sub + "（keel_registry_cli.tie）——三操作探针见 tests/_p725_probe，格式见 docs/release.md §4.6")
+        return 0
+    }
+    println("[keel-cli] tie pkg 用法（registry 客户端，p.7.2.5）:")
+    println("  tie pkg publish <name> <version> <src.td> [描述]")
+    println("  tie pkg info <name>")
+    println("  tie pkg versions <name>")
+    return 0
+}
+
+}

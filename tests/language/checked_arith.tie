@@ -1,0 +1,37 @@
+type tie<logic>
+// ============================================================
+// p.9.11.9 checked 运算探针：`a +? b` / `a -? b` / `a *? b`
+// 语义：与普通 `+ - *` 相同产生正确整数结果，但**任一操作数/结果上溢或下溢时
+// 运行期报错**（走既有可捕获 panic 机制：处于 catch_panic 捕获域则 longjmp 回跳，
+// 否则 printf 消息 + exit(1)）——而不像普通算术那样静默 wrap。
+// 仅整数（i64/u64 等）；f64 溢出 = inf，checked 不适用。
+// 普通 `+ - *` 行为零变化。
+// ============================================================
+func main() {
+    // 1. 正常不溢出：结果与普通算术一致
+    var a = 10 +? 5
+    if a != 15 { panic("+? 正常结果错误"); }
+    var b = 10 -? 3
+    if b != 7 { panic("-? 正常结果错误"); }
+    var c = 10 *? 5
+    if c != 50 { panic("*? 正常结果错误"); }
+    // 混合运算 + 优先级：*? 先于 +?
+    var e = 10 +? 5 *? 2
+    if e != 20 { panic("优先级错误：10 +? 5*?2 = 20，实际 " + to_string(e)); }
+    // 2. 普通 + - * 不受影响（仍静默 wrap）
+    var wrapped: i64 = 9223372036854775807 + 1   // 普通加法静默回绕，不报错
+    println("普通加法回绕: wrapped=" + to_string(wrapped))
+    // 3. 乘法上溢 → 可捕获 panic（不 exit，宿主继续，catch_panic 返回 true）
+    var cm = catch_panic(func() -> i64 { var v = 9223372036854775807 *? 2; return v; })
+    if !cm { panic("MAX *? 2 应触发乘法溢出 panic"); }
+    println("乘法溢出已捕获 (*?)")
+    // 4. 加法上溢（MAX +? 1）
+    var ca = catch_panic(func() -> i64 { var v = 9223372036854775807 +? 1; return v; })
+    if !ca { panic("MAX +? 1 应触发加法溢出 panic"); }
+    println("加法溢出已捕获 (+?)")
+    // 5. 减法下溢（MIN-1 形态：-MAX 再 -? 2 越过 MIN）
+    var cs = catch_panic(func() -> i64 { var v = -9223372036854775807 -? 2; return v; })
+    if !cs { panic("下界 -? 应触发减法溢出 panic"); }
+    println("减法下溢已捕获 (-?)")
+    println("checked 运算探针全过")
+}

@@ -1,0 +1,672 @@
+type tie<class>
+// compiler/frontend/sbuiltin_call_gen_q2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sbuiltin_call_gen.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace sbuiltin {
+pub func builtin_call_b_file_size(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "file_size" {
+            return types.named(TK_I64)
+        }
+        return types.named(TK_BOOL)
+}
+
+pub func builtin_call_b_file_write(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_BOOL)
+}
+
+pub func builtin_call_b_time_now(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_rand_range(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "rand_range() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_arg_string(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "arg_string() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+}
+
+pub func builtin_call_b_list_dir(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        // 返回元素化表：list_dir/walk_dir 是 string 表，byte_read 是 i64 表
+        if fn_name == "byte_read" {
+            return types.table_of(types.named(TK_I64))
+        }
+        return types.table_of(types.named(TK_STR))
+}
+
+pub func builtin_call_b_stdin_read(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "stdin_read" {
+            return types.table_of(types.named(TK_I64))
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_sqrt(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_F64)
+}
+
+pub func builtin_call_b_atan2(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_F64)
+}
+
+pub func builtin_call_b_bitcast_f64_i64_f64(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        // f64↔i64 位重解释（zd v2 §4.2 原语）：同宽 64 位，位模式直读。
+        // bitcast_f64_i64(x: f64) -> i64；bitcast_i64_f64(x: i64) -> f64。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "bitcast_f64_i64" {
+            return types.named(TK_I64)
+        }
+        return types.named(TK_F64)
+}
+
+pub func builtin_call_b_pow(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "pow() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_F64)
+}
+
+pub func builtin_call_b_regex_match(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if fn_name == "regex_find_all" {
+            if nargs != 2 {
+                sm_err_line = s_lines[call_node]
+                sm_err_col = s_cols[call_node]
+                sm_err_msg = "regex_find_all() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+                return -2
+            }
+            return types.table_of(types.named(TK_STR))
+        }
+        if fn_name == "regex_replace" || fn_name == "regex_group" {
+            if nargs != 3 {
+                sm_err_line = s_lines[call_node]
+                sm_err_col = s_cols[call_node]
+                sm_err_msg = fn_name + "() 期望 3 个参数，实际 " + to_string(nargs) + " 个"
+                return -2
+            }
+            return types.named(TK_STR)
+        }
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "regex_match" {
+            return types.named(TK_BOOL)
+        }
+        return types.named(TK_STR)
+}
+
+pub func builtin_call_b_exec_code(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "exec_code() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_exec_output(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if fn_name == "cwd" {
+            if nargs != 0 {
+                sm_err_line = s_lines[call_node]
+                sm_err_col = s_cols[call_node]
+                sm_err_msg = "cwd() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+                return -2
+            }
+            return types.named(TK_STR)
+        }
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+}
+
+pub func builtin_call_b_path_basename(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+}
+
+pub func builtin_call_b_byte_write(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "byte_write() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_BOOL)
+}
+
+pub func builtin_call_b_bit_read(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 && fn_name == "bit_read" {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "bit_read() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if nargs != 3 && fn_name == "bit_write" {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "bit_write() 期望 3 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "bit_write" {
+            return types.named(TK_BOOL)
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_eval(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "eval() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+}
+
+pub func builtin_call_b_eval_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "eval_call() 期望 2 个参数（函数名, 参数），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+}
+
+pub func builtin_call_b_byte_concat(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "byte_concat() 期望 2 个参数（字节表, 字节表），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_TABLE)
+}
+
+pub func builtin_call_b_mkdir_all(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_BOOL)
+}
+
+pub func builtin_call_b_path_join(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "path_join() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+}
+
+pub func builtin_call_b_set_env(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "set_env() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
+pub func builtin_call_b_print_err(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "print_err() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
+pub func builtin_call_b_msg_set_lang(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "msg_set_lang() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
+pub func builtin_call_b_msg_get_lang(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "msg_get_lang() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+}
+
+pub func builtin_call_b_msg_register(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 3 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "msg_register() 期望 3 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
+pub func builtin_call_b_msg_t(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "msg_t() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+}
+
+pub func builtin_call_b_msg_t_lang(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "msg_t_lang() 期望 2 个参数（键, 语言），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+}
+
+pub func builtin_call_b_http_get(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "http_get() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+}
+
+pub func builtin_call_b_http_get_file(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_BOOL)
+}
+
+pub func builtin_call_b_copy_dir(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_BOOL)
+}
+
+pub func builtin_call_b_spawn(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "spawn() 期望 1 个参数（函数值），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_yield(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "yield() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
+pub func builtin_call_b_collect(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "collect() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_gosched(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "gosched() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
+pub func builtin_call_b_wg_new(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "wg_new() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_wg_add(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "wg_add() 期望 2 个参数（句柄, n），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
+pub func builtin_call_b_wg_done(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "wg_done() 期望 1 个参数（句柄），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
+pub func builtin_call_b_wg_wait(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "wg_wait() 期望 1 个参数（句柄），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
+pub func builtin_call_b_wg_count(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "wg_count() 期望 1 个参数（句柄），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_ch_open(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "ch_open() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_ch_send(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "ch_send() 期望 2 个参数（通道, 值），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_ch_send_block(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "ch_send_block() 期望 2 个参数（通道, 值），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_ch_recv(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "ch_recv() 期望 1 个参数（通道），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+pub func builtin_call_b_ch_close(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "ch_close() 期望 1 个参数（通道），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
+pub func builtin_call_b_ch_select(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+        if nargs != 3 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "ch_select() 期望 3 个参数（handles/actions/values 表），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+}
+
+}

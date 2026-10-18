@@ -1,0 +1,20 @@
+type tie<logic>
+// fastmath_probe —— M14 --ffast-math 训练性能优先数学探针
+// 用若干 sin/cos/exp/pow 计算并累加，带与不带 --ffast-math 都应能编译并正常运行。
+func main() -> i64 {
+    var x: f64 = 1.5
+    var y: f64 = sin(x) + cos(x) + exp(x) + pow(2.0, 10.0)
+    var s: f64 = 0.0
+    var i: i64 = 0
+    while i < 100000 {
+        s = s + y * 0.5 - x * 0.25 + sin(x * 0.01)
+        i = i + 1
+    }
+    if s > 0.0 {
+        println("fastmath_ok")
+    } else {
+        println("fastmath_odd")
+    }
+    println("done")
+    return 0
+}

@@ -1,0 +1,57 @@
+type tie<logic>
+
+// ============================================================
+// p.8.2.9 尾随闭包（trailing closure）验收：
+//   调用/方法/链式的最后一个实参可写成裸代码块 `{ ... }`，视为**无参 void
+//   闭包**传给末位形参。tie 闭包字面量唯一语法是 func(...) { ... }（无裸
+//   lambda 参数形式），故尾随块一律按 func() -> void { ... } 处理：
+//     - f(a) { B }        ≡ f(a, func(){ B })
+//     - recv.m(a) { B }   ≡ recv.m(a, func(){ B })   （已有实参 → 追加）
+//     - recv.m { B }      ≡ recv.m(func(){ B })      （裸 .method → 唯一实参）
+//     - f { B }           ≡ f(func(){ B })           （裸函数名 → 唯一实参）
+//   覆盖普通调用、已有实参追加、链式（命名空间 dot 调用）三种形态。
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   tick / tick / tick / once / twice / twice / r=100 / tick / tick / tick
+// ============================================================
+
+// 链式形态载体：命名空间函数（末位形参为 fn() -> void 回调）
+namespace ml {
+    pub func run_n(n: i64, cb: fn() -> void) {
+        var i: i64 = 0
+        while i < n {
+            cb()
+            i = i + 1
+        }
+    }
+    pub func once(cb: fn() -> void) {
+        cb()
+    }
+}
+
+// 普通调用 + 已有实参追加 + 返回值
+func apply_twice(x: i64, cb: fn() -> void) -> i64 {
+    cb()
+    cb()
+    return x
+}
+
+func main() {
+    // 1. 普通调用，已有一个实参，尾随块追加为末位实参：run_n(3, fn)
+    ml.run_n(3) {
+        println("tick")
+    }
+    // 2. 链式（裸 .method 无括号）：ml.once { B } ≡ ml.once(func(){ B })
+    ml.once {
+        println("once")
+    }
+    // 3. 普通调用（带参）尾随闭包且返回值：apply_twice(100, fn) → r=100
+    var r: i64 = apply_twice(100) {
+        println("twice")
+    }
+    println("r=" + to_string(r))
+    // 4. 等价性核对：显式把同一闭承包进去，输出应与 #1 一致
+    ml.run_n(3, func() {
+        println("tick")
+    })
+}

@@ -1,0 +1,101 @@
+type tie<logic>
+
+// ============================================================
+// p.8.1.4 模式匹配增强验收：enum payload 结构化解构 / 穷尽检查 / 守卫
+//
+// 覆盖场景：
+//   1. 多字段解构：`case Both(x, t)`（f64 + table<i64> 混合字段）
+//   2. 多字段解构：`case Pair(n, s)`（i64 + string）
+//   3. when 守卫：同变体多分支（`case Circle(r) when r<10` 与 `case Circle(r)`），
+//      守卫命中走第一分支、失败落入下一 case
+//   4. 穷尽检查（正例）：无 default 时覆盖全部变体 → 合法
+//   5. 穷尽检查（守卫不豁免）：全守卫 case 无 default → 非法（负例见
+//      pattern_enhance_neg.tie）
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   1.5 / 8 / 3 / ab / 5 / 40 / 6 / 0 / 2 / small / big
+// ============================================================
+
+enum Mix {
+    Both(f64, table<i64>)
+    Pair(i64, string)
+    None
+}
+
+enum Shape {
+    Circle(i64)
+    Rect(i64, i64)
+}
+
+// when 守卫：r<10 走特例，否则落入下一 case（r*2）
+func area(s: Shape) -> i64 {
+    switch s {
+        case Circle(r) when r < 10:
+            return r
+        case Circle(r):
+            return r * 2
+        case Rect(w, h):
+            return w * h
+    }
+}
+
+// 穷尽（正例）：无 default 覆盖全部变体
+func mix_kind(m: Mix) -> i64 {
+    switch m {
+        case Both(x, t):
+            return 1
+        case Pair(n, s):
+            return 2
+        case None:
+            return 0
+    }
+}
+
+// 守卫 + 穷尽：全部变体各有守卫覆盖（穷尽合法——守卫 case 覆盖全部变体名）
+func classify(n: i64) -> string {
+    switch n % 3 {
+        case 0 when n == 0:
+            return "zero"
+        case 1 when n > 0:
+            return "small"
+        case 2 when n > 0:
+            return "big"
+        default:
+            return "other"
+    }
+}
+
+func main() {
+    // 1. 多字段解构（f64 + table）
+    var a = Mix.Both(1.5, [7, 8])
+    switch a {
+        case Both(x, t):
+            println(x)   // 1.5
+            println(t[1]) // 8
+        case None:
+            println("none")
+        case Pair(n, s):
+            println("pair")
+    }
+    // 2. 多字段解构（i64 + string）
+    var b = Mix.Pair(3, "ab")
+    switch b {
+        case Pair(n, s):
+            println(n)   // 3
+            println(s)   // ab
+        case Both(x, t):
+            println("both")
+        case None:
+            println("none")
+    }
+    // 3. when 守卫
+    println(area(Shape.Circle(5)))  // 5（守卫命中）
+    println(area(Shape.Circle(20))) // 40（守卫失败 → 下一 case）
+    println(area(Shape.Rect(2, 3))) // 6？——Rect 无守卫直接匹配 → 2*3=6
+    // 4. 穷尽正例
+    println(mix_kind(Mix.None))     // 0
+    println(mix_kind(Mix.Pair(1, "x"))) // 2
+    // 5. 守卫 + 默认
+    println(classify(1))  // small
+    println(classify(2))  // big
+}

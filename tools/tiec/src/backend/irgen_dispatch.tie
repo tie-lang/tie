@@ -1,0 +1,40 @@
+type tie<class>
+// compiler/backend/irgen_dispatch.tie —— 生成器 L3：内置表达式调度器（builtin_expr，p.9.21.2 两步制①产物）
+// ============================================================
+// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+import "./builtin_expr_seg1.tie"
+import "./builtin_expr_seg2.tie"
+import "./builtin_expr_seg3.tie"
+
+namespace irgen {
+    // 内置表达式调用分派：返回 0 已处理（g_builtin_res 携带结果值 id）；-1 失败
+    // （名字已由 is_builtin_name 判定命中——本函数内 -1 一律为真失败，调用方传播）。
+    func builtin_expr(nm: string, id: i64) -> i64 {
+        var r: i64 = 0
+        r = builtin_expr_seg1(nm, id)
+        if r != -1 {
+            return r
+        }
+        r = builtin_expr_seg2(nm, id)
+        if r != -1 {
+            return r
+        }
+        r = builtin_expr_seg3(nm, id)
+        if r != -1 {
+            return r
+        }
+        return -1  // 非内置
+        // ---------- S1.3 as_* 显式数值转换族 ----------
+        // as_i8/as_i16/as_i32/as_i64/as_u8/as_u16/as_u32/as_u64/as_f32/as_f64：
+        // 任意数字 → 目标类型（数值转换：截断/饱和由 LLVM 指令映射——trunc/sext/
+        // zext/fptosi/sitofp/fpext/fptrunc）。语义层已校验参数为数字。
+        // ---------- S1.3 as_* 显式数值转换族 ----------
+        // ---------- S1.3 as_* 显式数值转换族 ----------
+        // as_i8/as_i16/as_i32/as_i64/as_u8/as_u16/as_u32/as_u64/as_f32/as_f64：
+        // 任意数字 → 目标类型（数值转换：截断/饱和由 LLVM 指令映射——trunc/sext/
+        // zext/fptosi/sitofp/fpext/fptrunc）。语义层已校验参数为数字。
+        return -1  // 非内置
+    }
+}

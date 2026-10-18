@@ -1,0 +1,277 @@
+type tie<logic>
+// tests/_p9125_enumsep_probe/enumsep_probe.tie —— p.9.12.5 验收：enum 变体分隔符放宽
+// ============================================================
+// EN: acceptance probe for relaxed enum variant separators — the variant list
+// inside `enum E { ... }` accepts three interchangeable separators with no
+// semantic difference: `;` (explicit or ASI-synthesized at line ends), `,`
+// (comma), or none at all (same-line whitespace / bare gap before the next
+// variant name or the closing `}`). Existing newline-separated enums must keep
+// compiling untouched.
+//
+// 覆盖 / Coverage：
+//   · 同行空格分隔：enum E1 { A B C }
+//   · 逗号分隔：enum E2 { A, B, C }
+//   · 混用（分号+逗号+换行）：enum E3 { A; B, C, D↵E, F; }
+//   · payload 变体同行空格：enum E4 { A(i64) B(string) }
+//   · payload + 逗号：enum E5 { A(i64), B }
+//   · 无 payload / 有 payload 混合同行：enum E6 { None Some(i64) Text(string) }
+//   · `}` 前无分隔符（同行尾直接闭合）：enum E7 { A B C }
+//   · 尾随逗号（分隔符可空语义的自然结果）：enum E9 { A(i64), B, }
+//   · 既有换行分隔写法零破坏：enum E8（每行一个变体，ASI 补分号）
+//   · 嵌套/引用：上述 enum 照常作函数参数/返回值、struct 字段、switch 匹配
+//     （payload tag 区分与无 payload tag 常量比较均照旧）
+//
+// 语义落点 / Notes：
+//   · parse_enum（pstmt_top.tie）原硬性 `expect(lex_semi)`（只认分号/换行 ASI），
+//     p.9.12.5 放宽为可选：`;` / `,` / 无（下一变体名或 `}` 前直接空位）。
+//   · payload 括号内逗号由 parse_type 循环在括号内消费，变体间逗号是括号外
+//     上下文，可安全区分（`A(i64) B(string)` 同行的两个变体亦然）。
+//   · 行尾逗号在 ASI 的 no_semi_end 集合中（不补分号），逗号分隔与换行可并存。
+//   · 非法 token 不进 eat 分支，由下一轮 expect_ident 给出「期望标识符」清晰诊断。
+
+// ---- 1) 同行空格分隔 ----
+enum E1 { A B C }
+
+// ---- 2) 逗号分隔 ----
+enum E2 { A, B, C }
+
+// ---- 3) 混用：分号 + 逗号 + 换行 ----
+enum E3 {
+    A;
+    B, C,
+    D
+    E,
+    F;
+}
+
+// ---- 4) payload 变体同行空格 ----
+enum E4 { A(i64) B(string) }
+
+// ---- 5) payload + 逗号 ----
+enum E5 { A(i64), B }
+
+// ---- 6) 无 payload / 有 payload 混合同行 ----
+enum E6 { None Some(i64) Text(string) }
+
+// ---- 7) `}` 前无分隔符（同行尾直接闭合）----
+enum E7 { A B C }
+
+// ---- 8) 既有换行分隔写法（零破坏对照）----
+enum E8 {
+    X
+    Y
+    Z
+}
+
+// ---- 9) 尾随逗号（分隔符可空语义的自然结果）----
+enum E9 { A(i64), B, }
+
+// ---- 引用这些 enum：switch 匹配照常 ----
+func e1_name(e: E1) -> string {
+    switch e {
+        case E1.A:
+            return "E1-A"
+        case E1.B:
+            return "E1-B"
+        case E1.C:
+            return "E1-C"
+        default:
+            return "E1-?"
+    }
+}
+
+func e2_name(e: E2) -> string {
+    switch e {
+        case E2.A:
+            return "E2-A"
+        case E2.B:
+            return "E2-B"
+        case E2.C:
+            return "E2-C"
+        default:
+            return "E2-?"
+    }
+}
+
+func e3_name(e: E3) -> string {
+    switch e {
+        case E3.A:
+            return "E3-A"
+        case E3.B:
+            return "E3-B"
+        case E3.C:
+            return "E3-C"
+        case E3.D:
+            return "E3-D"
+        case E3.E:
+            return "E3-E"
+        case E3.F:
+            return "E3-F"
+        default:
+            return "E3-?"
+    }
+}
+
+// payload 变体 tag 区分（构造携带 payload 成功即验证）
+func e4_desc(e: E4) -> string {
+    switch e {
+        case E4.A:
+            return "E4-A(i64)"
+        case E4.B:
+            return "E4-B(string)"
+        default:
+            return "E4-?"
+    }
+}
+
+func e5_desc(e: E5) -> string {
+    switch e {
+        case E5.A:
+            return "E5-A(i64)"
+        case E5.B:
+            return "E5-B"
+        default:
+            return "E5-?"
+    }
+}
+
+func e6_desc(e: E6) -> string {
+    switch e {
+        case E6.None:
+            return "E6-None"
+        case E6.Some:
+            return "E6-Some(i64)"
+        case E6.Text:
+            return "E6-Text(string)"
+        default:
+            return "E6-?"
+    }
+}
+
+func e7_name(e: E7) -> string {
+    switch e {
+        case E7.A:
+            return "E7-A"
+        case E7.B:
+            return "E7-B"
+        case E7.C:
+            return "E7-C"
+        default:
+            return "E7-?"
+    }
+}
+
+func e8_name(e: E8) -> string {
+    switch e {
+        case E8.X:
+            return "E8-X"
+        case E8.Y:
+            return "E8-Y"
+        case E8.Z:
+            return "E8-Z"
+        default:
+            return "E8-?"
+    }
+}
+
+func e9_desc(e: E9) -> string {
+    switch e {
+        case E9.A:
+            return "E9-A(i64)"
+        case E9.B:
+            return "E9-B"
+        default:
+            return "E9-?"
+    }
+}
+
+// ---- 引用：struct 字段 + 跨函数传递 ----
+struct Holder7 {
+    var e: E7
+}
+
+func pass_through(e: E7) -> E7 {
+    return e
+}
+
+func e7_chain(e: E7) -> string {
+    return e7_name(pass_through(e))
+}
+
+var fails: i64 = 0
+var total: i64 = 0
+
+func check(cond: bool, msg: string) {
+    total = total + 1
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func main() {
+    // 1) 同行空格分隔
+    check(e1_name(E1.A) == "E1-A", "E1 same-line space: A")
+    check(e1_name(E1.B) == "E1-B", "E1 same-line space: B")
+    check(e1_name(E1.C) == "E1-C", "E1 same-line space: C")
+
+    // 2) 逗号分隔
+    check(e2_name(E2.A) == "E2-A", "E2 comma: A")
+    check(e2_name(E2.B) == "E2-B", "E2 comma: B")
+    check(e2_name(E2.C) == "E2-C", "E2 comma: C")
+
+    // 3) 混用（分号+逗号+换行）
+    check(e3_name(E3.A) == "E3-A", "E3 mixed (semi): A")
+    check(e3_name(E3.B) == "E3-B", "E3 mixed (comma): B")
+    check(e3_name(E3.C) == "E3-C", "E3 mixed (comma+newline): C")
+    check(e3_name(E3.D) == "E3-D", "E3 mixed (newline ASI): D")
+    check(e3_name(E3.E) == "E3-E", "E3 mixed (comma line-end): E")
+    check(e3_name(E3.F) == "E3-F", "E3 mixed (semi): F")
+
+    // 4) payload 变体同行空格
+    var a4 = E4.A(10)
+    var b4 = E4.B("hello")
+    check(e4_desc(a4) == "E4-A(i64)", "E4 payload same-line space: A(i64)")
+    check(e4_desc(b4) == "E4-B(string)", "E4 payload same-line space: B(string)")
+
+    // 5) payload + 逗号
+    var a5 = E5.A(7)
+    check(e5_desc(a5) == "E5-A(i64)", "E5 payload comma: A(i64)")
+    check(e5_desc(E5.B) == "E5-B", "E5 payload comma: B (no payload)")
+
+    // 6) 无 payload / 有 payload 混合同行
+    check(e6_desc(E6.None) == "E6-None", "E6 mixed none: None")
+    check(e6_desc(E6.Some(3)) == "E6-Some(i64)", "E6 mixed payload: Some(i64)")
+    check(e6_desc(E6.Text("t")) == "E6-Text(string)", "E6 mixed payload: Text(string)")
+
+    // 7) `}` 前无分隔符（同行尾直接闭合）
+    check(e7_name(E7.A) == "E7-A", "E7 no-sep before }: A")
+    check(e7_name(E7.B) == "E7-B", "E7 no-sep before }: B")
+    check(e7_name(E7.C) == "E7-C", "E7 no-sep before }: C")
+
+    // 8) 既有换行分隔写法零破坏
+    check(e8_name(E8.X) == "E8-X", "E8 newline ASI: X")
+    check(e8_name(E8.Y) == "E8-Y", "E8 newline ASI: Y")
+    check(e8_name(E8.Z) == "E8-Z", "E8 newline ASI: Z")
+
+    // 9) 尾随逗号
+    var a9 = E9.A(1)
+    check(e9_desc(a9) == "E9-A(i64)", "E9 trailing comma: A(i64)")
+    check(e9_desc(E9.B) == "E9-B", "E9 trailing comma: B")
+
+    // 10) 嵌套/引用：struct 字段 + 跨函数传递 + switch 照常
+    var h = Holder7(E7.C)
+    check(e7_name(h.e) == "E7-C", "Holder7 struct field holds E7")
+    check(e7_chain(E7.B) == "E7-B", "E7 pass-through chain")
+
+    if fails == 0 {
+        println("PASS all " + to_string(total))
+    } else {
+        println("FAIL count=" + to_string(fails) + " / total=" + to_string(total))
+    }
+    if fails > 0 {
+        exit(1)
+    }
+}

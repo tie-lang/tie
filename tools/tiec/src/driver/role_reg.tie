@@ -1,0 +1,540 @@
+type tie<class>
+// compiler/driver/role_reg.tie —— driver 角色注册表子模块
+// ============================================================
+// 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
+// 拆分范式：同编译单元跨文件（文本内联）——本文件只含函数与注释，
+// 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
+// 风格 ns：函数在 `namespace driver` 内，一律 pub（driver 库 API 面）；
+// 主文件顶层 main() 以 driver.<名>() 调用。
+namespace driver {
+// 默认表填充：注册基础角色（params 逗号分隔 → 参数对）
+pub func reg_base(nm: string, out: string, params: string) {
+    table_push(t_cr_name, nm)
+    table_push(t_cr_kind, 1)
+    table_push(t_cr_out, out)
+    var ps = split_char(params, ",")
+    var i: i64 = 0
+    while i < len(ps) {
+        if str_len(ps[i]) > 0 {
+            table_push(t_cr_p_base, nm)
+            table_push(t_cr_p_val, ps[i])
+        }
+        i = i + 1
+    }
+}
+
+// 默认表填充：注册修饰角色
+pub func reg_mod(nm: string) {
+    table_push(t_cr_name, nm)
+    table_push(t_cr_kind, 0)
+    table_push(t_cr_out, "")
+}
+
+// 初始化内建默认角色表（编译器内建插件：语言核心 + 预留领域角色）
+pub func role_registry_init_default() {
+    t_cr_name = table_new_string()
+    t_cr_kind = table_new_i64()
+    t_cr_out = table_new_string()
+    t_cr_p_base = table_new_string()
+    t_cr_p_val = table_new_string()
+    // 基础角色：lib（静态库）/ exe（可执行）/ check（仅 LLVM IR）/ pass（提示转移）
+    reg_base("logic", "exe", "")
+    reg_base("tsc", "exe", "")
+    reg_base("class", "lib", "")
+    reg_base("type", "lib", "")
+    reg_base("ir", "check", "")
+    reg_base("test", "", "")
+    reg_base("bench", "", "")
+    reg_base("data", "pass", "config,asset")
+    reg_base("ui", "pass", "window,web,embedded")
+    reg_base("db", "pass", "schema,seed,vector")
+    reg_base("port", "pass", "")
+    reg_base("zd", "pass", "")
+    reg_base("tsh", "pass", "")
+    reg_base("tieir", "", "")
+    // 修饰角色
+    reg_mod("unsafe")
+    reg_mod("owned")
+    reg_mod("embedded")
+}
+
+// 把角色表（map：角色名 → 定义表）合并进注册表；type=6（表）的条目
+// 是角色定义；type=5（数组）的条目是"角色发现目录"（test/bench），跳过。
+pub func register_role_map(roles: i64) {
+    if roles < 0 {
+        return
+    }
+    if config.type_of(roles) != 6 {
+        return
+    }
+    var rn = config.map_len(roles)
+    var r: i64 = 0
+    while r < rn {
+        var nm = config.map_key(roles, r)
+        var def = config.map_val(roles, r)
+        if config.type_of(def) == 6 {
+            if role_registered(str.clone(nm)) {
+                if !g_no_warn {
+                    dbg_txt(warn_render(-1, -1, "角色重复注册，忽略后注册者") + "（角色 '" + nm + "'）")
+                }
+            } else {
+                // 加载器安全模块：角色定义仅接受 kind/params/output 三个字段，
+                // 其余任何字段（hook/exec/script 等）一律拦截并不生效——包可
+                // 扩展编译器角色表，但绝不能借此扩展加载器行为。
+                var defn: i64 = config.map_len(def)
+                var df: i64 = 0
+                while df < defn {
+                    var dk = config.map_key(def, df)
+                    if dk != "kind" && dk != "params" && dk != "output" {
+                        dbg_txt("[audit] 拦截角色 " + nm + " 定义中的未知字段: " + dk + "（仅接受 kind/params/output）")
+                    }
+                    df = df + 1
+                }
+                var kv = config.get_str(def, "kind")
+                var is_base: i64 = 1
+                if kv == "mod" {
+                    is_base = 0
+                }
+                table_push(t_cr_name, nm)
+                table_push(t_cr_kind, is_base)
+                if is_base == 1 {
+                    var out = config.get_str(def, "output")
+                    if str_len(out) == 0 {
+                        out = "lib"
+                    }
+                    if out != "lib" && out != "check" && out != "exe" && out != "pass" {
+                        // 回退 lib 的行为不受 --no-warn 影响，只抑制打印
+                        if !g_no_warn {
+                            dbg_txt(warn_render(-1, -1, "角色 output 非法值，回退 lib") + "（角色 '" + nm + "'，值 '" + out + "'）")
+                        }
+                        out = "lib"
+                    }
+                    table_push(t_cr_out, out)
+                    var pa = config.map_get(def, "params")
+                    if config.type_of(pa) == 5 {
+                        var pn = config.arr_len(pa)
+                        var p: i64 = 0
+                        while p < pn {
+                            var pv = config.str_val(config.arr_at(pa, p))
+                            if str_len(pv) > 0 {
+                                table_push(t_cr_p_base, nm)
+                                table_push(t_cr_p_val, pv)
+                            }
+                            p = p + 1
+                        }
+                    }
+                } else {
+                    table_push(t_cr_out, "")
+                }
+            }
+        }
+        r = r + 1
+    }
+}
+
+// tie.pkg 的 "dependencies" 数组起始 '['（-1 = 无）
+pub func pkg_deps_start(src: string) -> i64 {
+    var p = find_str(src, "\"dependencies\"")
+    if p < 0 {
+        return -1
+    }
+    var rest = slice(str.clone(src), p, str_len(src))
+    var lb = find_char(rest, "[")
+    if lb < 0 {
+        return -1
+    }
+    return p + lb
+}
+
+// tie.pkg 的 "dependencies" 数组结束 ']'（-1 = 无）
+pub func pkg_deps_end(src: string) -> i64 {
+    var ds = pkg_deps_start(src)
+    if ds < 0 {
+        return -1
+    }
+    var rest = slice(str.clone(src), ds, str_len(src))
+    var rb = find_char(rest, "]")
+    if rb < 0 {
+        return -1
+    }
+    return ds + rb
+}
+
+// 解析 tie.pkg dependencies 段为逗号分隔 "name|spec" 片段序列。
+pub func pkg_dep_pairs(src: string) -> string {
+    var out: string = ""
+    var ds = pkg_deps_start(src)
+    var de = pkg_deps_end(src)
+    if ds < 0 || de < 0 {
+        return ""
+    }
+    var pos = ds + 1
+    while pos < de {
+        var tail = slice(str.clone(src), pos, de)
+        var q1 = find_char(tail, "\"")
+        if q1 < 0 {
+            return out
+        }
+        var t2 = slice(tail, q1 + 1, str_len(tail))
+        var q2 = find_char(t2, "\"")
+        if q2 < 0 {
+            return out
+        }
+        var name = slice(t2, 0, q2)
+        var t3 = slice(t2, q2 + 1, str_len(t2))
+        var q3 = find_char(t3, "\"")
+        if q3 < 0 {
+            return out
+        }
+        var t4 = slice(t3, q3 + 1, str_len(t3))
+        var q4 = find_char(t4, "\"")
+        if q4 < 0 {
+            return out
+        }
+        var spec = slice(t4, 0, q4)
+        if name != "" {
+            if out != "" {
+                out = out + ","
+            }
+            out = out + name + "|" + spec
+        }
+        pos = pos + (q1 + 1) + (q2 + 1) + (q3 + 1) + (q4 + 1)
+    }
+    return out
+}
+
+// 依赖包 roles.data.tie 路径：path: 本地源按 spec 相对项目根；
+// 其余（registry 安装）按 .tie/deps/<name>。
+pub func dep_roles_path(src_dir: string, name: string, spec: string) -> string {
+    if has_prefix(spec, "path:") {
+        var rel = trim(slice(spec, 5, str_len(spec)))
+        return src_dir + "\\" + rel + "\\roles.data.tie"
+    }
+    return src_dir + "\\.tie\\deps\\" + name + "\\roles.data.tie"
+}
+
+// 扫描项目/依赖包角色定义（一次）：<src_dir>/roles.data.tie 与
+// <src_dir>/.tie/deps/*/roles.data.tie（安装的依赖包，插件化入口）
+pub func role_registry_scan_project(src_dir: string) {
+    var proj = src_dir + "\\roles.data.tie"
+    if file_exists(proj) {
+        var r1 = config.parse_file(proj)
+        if r1 >= 0 {
+            register_role_map(r1)
+        } else {
+            if !g_no_warn {
+                dbg_txt(warn_render(-1, -1, "roles.data.tie 解析失败，使用内置默认角色") + "（" + config.err_msg() + "）")
+            }
+        }
+    }
+    // 包级角色（插件化入口）：由 tie.pkg 依赖清单驱动（不列目录——
+    // list_dir 在编译路径不可用）。path: 本地源按 spec 定位；registry
+    // 依赖在 .tie/deps/<name>。
+    var pkg_file = src_dir + "\\tie.pkg"
+    if file_exists(pkg_file) {
+        var m = file_read(pkg_file)
+        var deps = pkg_dep_pairs(m)
+        var n = str_len(deps)
+        var start: i64 = 0
+        var p: i64 = 0
+        while p <= n {
+            var at_end: bool = (p == n)
+            var is_comma: bool = false
+            if !at_end {
+                if str_char(deps, p) == "," {
+                    is_comma = true
+                }
+            }
+            if at_end || is_comma {
+                var pair = slice(deps, start, p)
+                var bar = find_char(pair, "|")
+                if bar > 0 {
+                    var nm = slice(pair, 0, bar)
+                    var sp = slice(pair, bar + 1, str_len(pair))
+                    var dp = dep_roles_path(src_dir, nm, sp)
+                    if file_exists(dp) {
+                        var r2 = config.parse_file(dp)
+                        if r2 >= 0 {
+                            register_role_map(r2)
+                        } else {
+                            if !g_no_warn {
+                                dbg_txt(warn_render(-1, -1, "依赖包角色定义解析失败，使用内置默认角色") + "（" + config.err_msg() + "）")
+                            }
+                        }
+                    }
+                }
+                start = p + 1
+            }
+            p = p + 1
+        }
+    }
+}
+
+pub func role_registry_boot(src_dir: string) {
+    if g_roles_booted {
+        return
+    }
+    role_registry_init_default()
+    if g_cfg_root >= 0 {
+        register_role_map(config.map_get(g_cfg_root, "roles"))
+    }
+    role_registry_scan_project(src_dir)
+    g_roles_booted = true
+}
+
+// 名称是否已在注册表（内建或包注册）
+pub func role_registered(nm: string) -> bool {
+    var c: i64 = 0
+    while c < len(t_cr_name) {
+        if t_cr_name[c] == nm {
+            return true
+        }
+        c = c + 1
+    }
+    return false
+}
+
+// 修饰角色白名单：注册表 kind=mod
+pub func is_valid_mod_role(name: string) -> bool {
+    var c: i64 = 0
+    while c < len(t_cr_name) {
+        if t_cr_kind[c] == 0 && t_cr_name[c] == name {
+            return true
+        }
+        c = c + 1
+    }
+    return false
+}
+
+// 修饰角色的**域参数**校验（`type tie<logic, unsafe:mem, unsafe:ext>`）。
+// unsafe 修饰角色的参数 = 能力域，取值与 guard<cap> 的域一致，且**与能力域归类
+// 定案保持同步**（tie-main/docs/designs/domain-classification.md 的五域）：
+//   share / mem / ext / raw / lock
+//   · lock  = 去锁访问（绕过运行时表锁）—— 唯一驱动 irgen 的域；
+//   · 其余四域 = 域匹配时的「本文件隐式持证」声明。
+// `trm` 已随归类删除（无门禁承载、引擎废弃），故不再接受。
+// 其他修饰角色（owned/embedded）不接受参数。
+pub func is_valid_mod_param(mod: string, param: string) -> bool {
+    if mod == "unsafe" {
+        if param == "share" || param == "mem" || param == "ext" ||
+            param == "raw" || param == "lock" {
+            return true
+        }
+        return false
+    }
+    return false
+}
+
+// 该文件是否获得 **lock 域**授权（`type tie<logic, unsafe:lock>`）——
+// driver 据此把整文件的表访问置于去锁作用域（文件级持证形态）。
+// 2026-10-01 泛化为**域位集**：本文件的头部角色声明里出现过哪些
+// `unsafe:<域>` 修饰，就返回对应位（share=1 mem=2 ext=4 lock=8 raw=16）。
+// 位序与 `types.guard_cap_index` 一致 —— 经 types.cap_bit_of 取值，保持单一事实源。
+// 供两处消费：irgen 判「本文件是否持 lock」（去锁 codegen）、
+// 语义层判「本文件各函数隐式持哪些域」（域匹配）。
+// 保存/恢复角色修饰表。用途：import 展开时要临时把「当前文件的角色」切到被导入
+// 文件上（以取该文件自己的 `unsafe:<域>` 授权），扫完必须还原主文件的角色表。
+pub func role_mods_save() -> table<string> {
+    var out: table<string> = []
+    var i: i64 = 0
+    while i < len(g_role_mods) {
+        table_push(out, g_role_mods[i])
+        i = i + 1
+    }
+    return out
+}
+
+pub func role_mods_restore(t: table<string>) {
+    g_role_mods = []
+    var i: i64 = 0
+    while i < len(t) {
+        table_push(g_role_mods, t[i])
+        i = i + 1
+    }
+}
+
+pub func role_unsafe_caps() -> i64 {
+    var out: i64 = 0
+    var i: i64 = 0
+    while i < len(g_role_mods) {
+        var m = g_role_mods[i]
+        if has_prefix(str.clone(m), "unsafe:") && str_len(m) > 7 {
+            out = out | types.cap_bit_of(slice(str.clone(m), 7, str_len(m)))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 本文件是否声明**裸 `unsafe`**（`type tie<角色, unsafe>`）——「整个文件处于不安全
+// 上下文」（规范 §11.6）。与 `unsafe:域` 是两回事：后者给域凭据（role_unsafe_caps）。
+pub func role_has_bare_unsafe() -> i64 {
+    var i: i64 = 0
+    while i < len(g_role_mods) {
+        if g_role_mods[i] == "unsafe" {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+pub func role_has_lock() -> bool {
+    var i: i64 = 0
+    while i < len(g_role_mods) {
+        if g_role_mods[i] == "unsafe:lock" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 参数白名单：注册表参数对
+pub func is_valid_role_param(base: string, param: string) -> bool {
+    var c: i64 = 0
+    while c < len(t_cr_p_base) {
+        if t_cr_p_base[c] == base && t_cr_p_val[c] == param {
+            return true
+        }
+        c = c + 1
+    }
+    return false
+}
+
+// 基础角色白名单：注册表 kind=base
+pub func is_valid_base_role(name: string) -> bool {
+    var c: i64 = 0
+    while c < len(t_cr_name) {
+        if t_cr_kind[c] == 1 && t_cr_name[c] == name {
+            return true
+        }
+        c = c + 1
+    }
+    return false
+}
+
+// 角色输出管线（lib/check/exe/pass；未注册或修饰角色返回空串）
+pub func role_output(nm: string) -> string {
+    var c: i64 = 0
+    while c < len(t_cr_name) {
+        if t_cr_kind[c] == 1 && t_cr_name[c] == nm {
+            return t_cr_out[c]
+        }
+        c = c + 1
+    }
+    return ""
+}
+
+// tsh 角色：推荐由 tie 自己的 tshell 执行 .tsh.tie 脚本。解析 tshell 可执行
+// 路径（解析顺序）：环境变量 TSHELL（显式全路径/命令名，最高优先）→ PATH 中
+// 的默认命令名 `tshell`。找到则 `tshell -f "<path>"` 执行；exec_code 经 libc
+// system() 返回子进程退出码（Windows 未找到可执行典型 9009）。找不到/执行
+// 失败时打印手工运行提示；可找到但脚本自身非零退出时透传其退出码。
+pub func tsh_dispatch(path: string) -> i64 {
+    var shell = get_env("TSHELL")
+    var via = "环境变量 TSHELL"
+    if str_len(shell) == 0 {
+        shell = "tshell"
+        via = "PATH（默认命令名 tshell）"
+    }
+    var cmd = shell + " -f \"" + path + "\""
+    dbg_txt("[tsh] 由 tshell 运行: " + cmd + "  （tshell 解析优先级: 环境变量 TSHELL → PATH）")
+    var rc = exec_code(cmd)
+    if rc == 0 {
+        return 0
+    }
+    if rc == 9009 {
+        dbg_txt("[tsh] 未在 " + via + " 中找到 tshell（请设置 TSHELL 或将 tshell 加入 PATH）")
+        dbg_txt("[tsh] 可手动运行: " + cmd)
+        return 1
+    }
+    dbg_txt("[tsh] tshell 运行结束 exit=" + to_string(rc) + "（脚本主动退出码，透传）")
+    return rc
+}
+
+// 按逗号/冒号拆分角色声明 `db:vector, unsafe` → 全局槽。返回 0 成功。
+pub func parse_role_decl(sub: string) -> i64 {
+    g_role_base = ""
+    g_role_param = ""
+    g_role_mods = table_new_string()
+    g_role_err = ""
+    var parts = split_char(sub, ",")
+    var k: i64 = 0
+    var base_set = false
+    while k < len(parts) {
+        var item = trim(parts[k])
+        if str_len(item) == 0 {
+            k = k + 1
+            continue
+        }
+        var colon = find_char(str.clone(item), ":")
+        if colon >= 0 {
+            var base = trim(slice(str.clone(item), 0, colon))
+            var param = trim(slice(str.clone(item), colon + 1, str_len(item)))
+            // r.1.6.7：**修饰角色带域参数**（`unsafe:lock`）——必须在基础角色分支之前
+            // 判定，否则 `unsafe` 会被当基础角色而报「未知基础角色」。
+            if is_valid_mod_role(str.clone(base)) {
+                if !is_valid_mod_param(str.clone(base), str.clone(param)) {
+                    g_role_err = "修饰角色 '" + base + "' 不支持参数 '" + param +
+                        "（unsafe 支持 share/mem/ext/raw/lock）"
+                    return -1
+                }
+                var full = base + ":" + param
+                var m: i64 = 0
+                while m < len(g_role_mods) {
+                    if g_role_mods[m] == full {
+                        g_role_err = "修饰角色重复: '" + item + "'"
+                        return -1
+                    }
+                    m = m + 1
+                }
+                table_push(g_role_mods, full)
+                k = k + 1
+                continue
+            }
+            if base_set {
+                g_role_err = "基础角色重复: '" + item + "'"
+                return -1
+            }
+            if !is_valid_base_role(str.clone(base)) {
+                g_role_err = "未知基础角色 '" + base + "'"
+                return -1
+            }
+            if !is_valid_role_param(str.clone(base), str.clone(param)) {
+                g_role_err = "角色 '" + base + "' 不支持参数 '" + param + "'"
+                return -1
+            }
+            g_role_base = base
+            g_role_param = param
+            base_set = true
+        } else if is_valid_mod_role(str.clone(item)) {
+            var j: i64 = 0
+            while j < len(g_role_mods) {
+                if g_role_mods[j] == item {
+                    g_role_err = "修饰角色重复: '" + item + "'"
+                    return -1
+                }
+                j = j + 1
+            }
+            table_push(g_role_mods, item)
+        } else if is_valid_base_role(str.clone(item)) {
+            if base_set {
+                g_role_err = "基础角色重复: '" + item + "'"
+                return -1
+            }
+            g_role_base = item
+            base_set = true
+        } else {
+            g_role_err = "未知角色 '" + item + "'（基础: tsc/data/ui/class/logic/port/db/ir/zd/tieir/test/bench；修饰: unsafe/owned/embedded）"
+            return -1
+        }
+        k = k + 1
+    }
+    if !base_set {
+        g_role_base = "logic"
+    }
+    return 0
+}
+
+}

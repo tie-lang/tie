@@ -1,0 +1,282 @@
+type tie<class>
+// compiler/backend/irgen_agg_p4.tie —— irgen_agg 分片 4（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 irgen_agg.tie。
+namespace irgen {
+// p.8.2.5 表/数组推导式 `[expr for x in src if cond]` → 新表。
+// 发射：新建结果表 → for 源表逐元素循环（cond 块/body 块/step 块/exit 块，
+// 模型自 tig_for_table，无 loop_push——本循环非用户循环）。
+// body 里：可选 if 条件为假 → 跳过；否则求值元素表达式 → push 进结果表。
+// 循环变量以源表元素类型绑定（scope_put/scope_pop），元素表达式经 tig_expr 求值。
+// 返回结果表句柄（容器所有权转移给推导式值）。
+func tig_comprehension(id: i64) -> i64 {
+    var src_n = sstate.child(id, 0)
+    var elem_n = sstate.child(id, 1)
+    var cond_n = sstate.child(id, 2)
+    // p.9.11.16 迭代器协议源：`[e for x in it]`（it 为 struct 实现 has_next/next）
+    // → 循环形态 = 方法调用循环（接收者求值一次落槽），其余（筛选/push）复用
+    // 表模式逻辑。协议未命中 → 表/范围源（既有路径）。
+    var src_ty = node_types[src_n]
+    var is_iter: i64 = 0
+    var it_ptr: i64 = -1
+    if src_ty >= 0 && sinfer.iter_proto_elem(src_ty) >= 0 {
+        is_iter = 1
+        var ia = ir.new_inst(g_cur_block, 20, src_ty)  // alloca struct 接收者
+        ir.add_operand(ia, src_ty, 2)
+        it_ptr = ir.get_value(ia)
+        var iv0 = tig_expr(src_n)
+        if iv0 < 0 {
+            return -1
+        }
+        var st0r = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(st0r, src_ty, 2)
+        ir.add_operand(st0r, iv0, 0)
+        ir.add_operand(st0r, it_ptr, 0)
+    }
+    // ---- 源表迭代：建循环并确定循环变量元素类型（对齐 tig_for_table）----
+    var t: i64 = -1
+    if is_iter == 0 {
+        t = tig_expr(src_n)
+        if t < 0 {
+            return -1
+        }
+    }
+    var elem: i64 = types.named(TK_I64)
+    var matched: bool = false
+    if is_iter == 1 {
+        var ie = sinfer.iter_proto_elem(src_ty)
+        if ie >= 0 {
+            elem = ie
+            matched = true
+        }
+    }
+    var bt2 = node_types[src_n]
+    if !matched && types.is_table(bt2) {
+        var le2 = types.table_elem(bt2)
+        if le2 > 0 {
+            elem = le2
+            matched = true
+        }
+    }
+    if !matched {
+        if s_tags[src_n] == 6 {
+            var bname = interner.intern(sstate.name_str(src_n))
+            var te = sinfer.var_table_elem(bname)
+            if te >= 0 {
+                elem = te
+            }
+        }
+    }
+    // 循环变量 LLVM 槽类型（源元素）
+    var suffix = bridge_suffix(elem)
+    var elem_llvm_ty = types.named(TK_I64)
+    var fk2 = types.kind(elem)
+    if fk2 == K_STRUCT || fk2 == K_ENUM || fk2 == K_FN || fk2 == K_TUPLE || elem == types.named(TK_ANY) {
+        elem_llvm_ty = elem
+    } else if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
+        suffix = "string"
+        elem_llvm_ty = elem
+    } else if suffix == "string" {
+        elem_llvm_ty = types.named(TK_STR)
+    } else if suffix == "bool" {
+        elem_llvm_ty = types.named(TK_BOOL)
+    } else if suffix == "f64" {
+        elem_llvm_ty = types.named(TK_F64)
+    }
+    // ---- 结果表元素类型（推导式结果的权威来源）----
+    var res_elem: i64 = types.named(TK_I64)
+    var lit_ty2 = node_types[id]
+    if types.is_table(lit_ty2) {
+        var re = types.table_elem(lit_ty2)
+        if re > 0 {
+            res_elem = re
+        }
+    }
+    if res_elem == types.named(TK_I64) {
+        var vt0 = node_types[elem_n]
+        if vt0 >= 0 {
+            res_elem = vt0
+        }
+    }
+    var rsize = elem_size(res_elem)
+    var rsize_v = tig_int_lit_ty(rsize, types.named(TK_I64))
+    var rt = s21_table_new_ty(res_elem, rsize_v)
+    // 结果 push 槽类型（对齐 tig_table_lit 的 pty 选择）
+    var rsuffix = bridge_suffix(res_elem)
+    var pty = types.named(TK_I64)
+    var rk = types.kind(res_elem)
+    if rk == K_STRUCT || rk == K_ENUM || rk == K_FN || rk == K_TUPLE || res_elem == types.named(TK_ANY) {
+        pty = res_elem
+    } else if types.is_table(res_elem) || types.is_map(res_elem) || types.kind(res_elem) == K_PORT {
+        rsuffix = "string"
+        pty = types.named(TK_STR)
+    } else if rsuffix == "string" {
+        pty = types.named(TK_STR)
+    } else if rsuffix == "bool" {
+        pty = types.named(TK_BOOL)
+    } else if rsuffix == "f64" {
+        pty = types.named(TK_F64)
+    }
+    // ---- 循环四块结构 ----
+    var idx_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))  // alloca i64
+    ir.add_operand(idx_a, types.named(TK_I64), 2)
+    var idx_ptr = ir.get_value(idx_a)
+    var i0 = tig_int_lit_ty(0, types.named(TK_I64))
+    var st0 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st0, types.named(TK_I64), 2)
+    ir.add_operand(st0, i0, 0)
+    ir.add_operand(st0, idx_ptr, 0)
+    var item_a = ir.new_inst(g_cur_block, 20, elem_llvm_ty)
+    ir.add_operand(item_a, elem_llvm_ty, 2)
+    var item_ptr = ir.get_value(item_a)
+    var cond_blk = ir.new_block(g_cur_func, interner.intern("cpr.cond"))
+    var body_blk = ir.new_block(g_cur_func, interner.intern("cpr.body"))
+    var step_blk = ir.new_block(g_cur_func, interner.intern("cpr.step"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("cpr.exit"))
+    var b0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b0, cond_blk, 1)
+    // cond: 表模式 cur >= len(t) → exit；迭代器模式 !has_next() → exit
+    g_cur_block = cond_blk
+    var done_v: i64 = -1
+    var cur_v: i64 = -1
+    if is_iter == 1 {
+        var si_it = types.low(src_ty)
+        var sname_it = sstate.struct_name_of(si_it)
+        var hnv = tig_iter_call(sname_it + "::has_next", it_ptr, src_ty)
+        if hnv < 0 {
+            return -1
+        }
+        done_v = hnv
+    } else {
+        var cur = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(cur, idx_ptr, 0)
+        cur_v = ir.get_value(cur)
+        var tlen = s21_table_len(t)
+        if tlen < 0 {
+            return -1
+        }
+        var done = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+        ir.add_operand(done, cur_v, 0)
+        ir.add_operand(done, tlen, 0)
+        ir.add_operand(done, 5, 2)  // sge
+        done_v = ir.get_value(done)
+    }
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    if is_iter == 1 {
+        // 迭代器模式：has_next()=true（还有元素）→ body；false → exit
+        ir.add_operand(cb, done_v, 0)
+        ir.add_operand(cb, body_blk, 1)
+        ir.add_operand(cb, exit_blk, 1)
+    } else {
+        // 表模式：cur >= len(t)=true（完成）→ exit；否则 body
+        ir.add_operand(cb, done_v, 0)
+        ir.add_operand(cb, exit_blk, 1)
+        ir.add_operand(cb, body_blk, 1)
+    }
+    // body: 绑定循环变量 → 可选 if 筛选 → 求值元素 → push
+    g_cur_block = body_blk
+    var iv: i64 = -1
+    if is_iter == 1 {
+        var si_it2 = types.low(src_ty)
+        var sname_it2 = sstate.struct_name_of(si_it2)
+        iv = tig_iter_call(sname_it2 + "::next", it_ptr, src_ty)
+        if iv < 0 {
+            return -1
+        }
+    } else {
+        var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))
+        ir.add_operand(ok_slot, types.named(TK_I8), 2)
+        iv = s21_table_at(t, cur_v, ir.get_value(ok_slot), elem_llvm_ty)
+        if iv < 0 {
+            return -1
+        }
+    }
+    var ist = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(ist, elem_llvm_ty, 2)
+    ir.add_operand(ist, iv, 0)
+    ir.add_operand(ist, item_ptr, 0)
+    scope_put(s_names[id], item_ptr, elem_llvm_ty)
+    // 有筛选：cond 为假 → 跳过 push（推 push_blk / skip_blk，最后汇入 step）
+    var have_cond = cond_n >= 0
+    var push_blk: i64 = -1
+    var skip_blk: i64 = -1
+    var body_terminated: bool = false
+    if have_cond {
+        var cv = tig_expr(cond_n)
+        if cv < 0 {
+            return -1
+        }
+        push_blk = ir.new_block(g_cur_func, interner.intern("cpr.push"))
+        skip_blk = ir.new_block(g_cur_func, interner.intern("cpr.skip"))
+        var cbr = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cbr, cv, 0)
+        ir.add_operand(cbr, push_blk, 1)
+        ir.add_operand(cbr, skip_blk, 1)
+        // push 块：求值元素 → push → br step
+        g_cur_block = push_blk
+        var ev = tig_expr(elem_n)
+        if ev < 0 {
+            return -1
+        }
+        var pv = ev
+        if pty == types.named(TK_ANY) {
+            var vt2 = node_types[elem_n]
+            if vt2 >= 0 && vt2 != types.named(TK_ANY) {
+                var bx = tig_box_any(ev, vt2)
+                if bx < 0 {
+                    return -1
+                }
+                pv = bx
+            }
+        }
+        s21_table_push(rt, pty, pv)
+        var pb2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(pb2, step_blk, 1)
+        // skip 块：直接 br step
+        g_cur_block = skip_blk
+        var sb2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(sb2, step_blk, 1)
+        body_terminated = true
+    } else {
+        // 无筛选：当前块求值元素 → push → br step
+        var ev2 = tig_expr(elem_n)
+        if ev2 < 0 {
+            return -1
+        }
+        var pv2 = ev2
+        if pty == types.named(TK_ANY) {
+            var vt3 = node_types[elem_n]
+            if vt3 >= 0 && vt3 != types.named(TK_ANY) {
+                var bx2 = tig_box_any(ev2, vt3)
+                if bx2 < 0 {
+                    return -1
+                }
+                pv2 = bx2
+            }
+        }
+        s21_table_push(rt, pty, pv2)
+        var nb = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(nb, step_blk, 1)
+        body_terminated = true
+    }
+    scope_pop()
+    // step: 表模式 cur + 1 → store → br cond；迭代器模式 next 自推进 → 直接 br cond
+    g_cur_block = step_blk
+    if is_iter == 0 {
+        var add1 = ir.new_inst(g_cur_block, 0, types.named(TK_I64))
+        ir.add_operand(add1, cur_v, 0)
+        ir.add_operand(add1, 1, 2)
+        var add_v = ir.get_value(add1)
+        var st2 = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(st2, types.named(TK_I64), 2)
+        ir.add_operand(st2, add_v, 0)
+        ir.add_operand(st2, idx_ptr, 0)
+    }
+    var sb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(sb, cond_blk, 1)
+    g_cur_block = exit_blk
+    return rt
+}
+
+}

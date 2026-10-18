@@ -1,0 +1,632 @@
+type tie<class>
+// compiler/frontend/diagcode.tie —— 诊断标号中央（p.6.9.15）
+// ============================================================
+// 职责：给 tiec 全部错误/警告挂 C# 式标号（error[E#####] / warning[W#####]）。
+//   - 错误标号：消息归一化折叠（ASCII 运行 → '%'）后查生成目录
+//     （diagcode_cat.gen.tie，scripts/gen-diagcodes.ps1 生成），exact 优先、
+//     前缀规则兜底（插值消息动态尾不参与精确匹配）；
+//   - 警告标号：核心消息（编译器发射点逐字一致）查表，与错误侧同为两级
+//     （逐字精确 → 归一化），未命中 W00000 并登记「未登记警告」供审计；
+//     目录用 warn_reg(核心消息, 标号, 短名, 建议) 单行注册，顺序无关
+//     （构建期自动按核心消息字节升序排序），加一条警告 = 加一行；
+//   - 输出格式（用户定稿）：error[E#####] @行:列: 消息名；期望 x；实际 y；提示。
+//     warning[W#####] @行:列: 消息名；潜在影响与处理建议。
+//
+// 归一化定义（与 scripts/gen-diagcodes.ps1 Fold-Ascii 完全一致）：
+//   按码点遍历，码点在 0x21..0x7E 的连续运行折叠为单个 '%'；其余码点原样保留。
+//   tie 侧按 UTF-8 字节遍历等价（ASCII 字节 == 码点；非 ASCII 字节原样拷贝）。
+//   注意：str_len() 是码点数，字节数用 len()（内置）。
+//
+// 依赖：仅 diagcode_cat.gen.tie（leaf，无 import）。调用方：driver/error_driver。
+
+import "./diagcode_cat.gen.tie"
+
+// # pub 方法全集（组件契约，p.9.21 G7 库资格①；增删须同步此处与 ROAD）
+//   归一化与查表：normalize code_of（exact → prefix → E00000 兜底）
+//   消息拆解：name_of（首个「期望 」/全角冒号/ASCII ": " 前）tail_of
+//   渲染：render_error（error[E#####] @行:列: 名；尾段）render_err_proto
+//     render_warning（warning[W#####] @行:列: 名；建议）
+//   警告目录：warn_reg warn_count warn_code_of warn_name_of warn_tip_of
+//     warn_unreg_count warn_unreg_list warn_note_unreg warn_unreg_reset
+//   自检：frontend/diagcode_test.tie（无 driver 可跑；含 E00332 私有拦截
+//     查表实证与 E00000 兜底验证）。
+
+// ---------- 警告目录全局状态（懒构建；核心消息按字节升序） ----------
+var diag_w_keys: table<string>;   // 核心消息（发射点逐字一致，升序）
+var diag_w_codes: table<string>;
+var diag_w_names: table<string>;
+var diag_w_tips: table<string>;
+var diag_w_norms: table<string>;  // 核心消息归一化键（与 keys 平行，二级匹配用）
+var diag_w_unreg: table<string>;  // 未登记警告（发射了但目录里没有，审计用）
+
+namespace diagcode {
+
+// ---------- 字节级工具（自包含；避免与调用方同名冲突） ----------
+// 取子串 [a, b)（字节级）。
+func dg_slice(s: string, a: i64, b: i64) -> string {
+    var sb = string_builder()
+    var i: i64 = a
+    while i < b {
+        sb_append_byte(sb, str_byte(s, i))
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// sub 在 s 中首次出现的字节偏移；未找到 -1。
+func dg_find(s: string, sub: string) -> i64 {
+    var n: i64 = len(s)
+    var m: i64 = len(sub)
+    if m == 0 {
+        return 0
+    }
+    if m > n {
+        return -1
+    }
+    var i: i64 = 0
+    while i <= n - m {
+        var j: i64 = 0
+        var matched: bool = true
+        while j < m && matched {
+            if str_byte(s, i + j) != str_byte(sub, j) {
+                matched = false
+            }
+            j = j + 1
+        }
+        if matched {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// s 是否以 prefix 开头（字节级）。
+func dg_starts(s: string, prefix: string) -> bool {
+    var n: i64 = len(s)
+    var m: i64 = len(prefix)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_byte(s, i) != str_byte(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 去掉尾部全角 '：'（EF BC 9A）/ 半角 ':' / 空白。
+func dg_trim_tail_colon(s: string) -> string {
+    var n: i64 = len(s)
+    var end: i64 = n
+    while end > 0 {
+        if end >= 3 {
+            var b0 = str_byte(s, end - 3)
+            var b1 = str_byte(s, end - 2)
+            var b2 = str_byte(s, end - 1)
+            if b0 == 0xEF && b1 == 0xBC && b2 == 0x9A {
+                end = end - 3
+                continue
+            }
+        }
+        var b = str_byte(s, end - 1)
+        if b == 58 || b == 32 || b == 9 {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return dg_slice(s, 0, end)
+}
+
+// ---------- 归一化与标号查询 ----------
+
+// 归一化折叠（定义见头注释）：ASCII(0x20..0x7E，含空格) 运行 → '%'。
+pub func normalize(msg: string) -> string {
+    var sb = string_builder()
+    var n: i64 = len(msg)
+    var i: i64 = 0
+    var folded: bool = false
+    while i < n {
+        var b = str_byte(msg, i)
+        if b >= 32 && b <= 126 {
+            if !folded {
+                sb_append(sb, "%")
+                folded = true
+            }
+        } else {
+            folded = false
+            sb_append_byte(sb, b)
+        }
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// 精确查表（二分）；未命中 ""。
+func exact_of(norm: string) -> string {
+    return diagcat.lookup(norm)
+}
+
+// 前缀规则：最长命中（归一化消息以某前缀开头）。
+func prefix_of(norm: string) -> string {
+    var best: string = ""
+    var i: i64 = 0
+    while i < diagcat.pfx_count() {
+        var p = diagcat.pfx_key(i)
+        if dg_starts(norm, p) {
+            if len(p) > len(best) {
+                best = diagcat.pfx_code(i)
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// 错误标号：exact → prefix → E00000（未分类兜底；五位纯序号规范）。
+pub func code_of(msg: string) -> string {
+    var norm = normalize(msg)
+    var c = diagcat.lookup(norm)
+    if len(c) > 0 {
+        return c
+    }
+    var pc = prefix_of(norm)
+    if len(pc) > 0 {
+        return pc
+    }
+    return "E00000"
+}
+
+// ---------- 消息名与尾段（用户格式：名字；期望 x；实际 y；提示。） ----------
+
+// 短消息名：首个「期望 」前（含尾部冒号清理）→ 全角「：」前 → ASCII ": "
+//（前字节非 ASCII）前 → 整条。
+pub func name_of(msg: string) -> string {
+    var p = dg_find(msg, "期望 ")
+    if p > 0 {
+        return dg_trim_tail_colon(dg_slice(msg, 0, p))
+    }
+    p = dg_find(msg, "：")
+    if p > 0 {
+        return dg_slice(msg, 0, p)
+    }
+    p = dg_find(msg, ": ")
+    if p > 1 {
+        var prev = str_byte(msg, p - 1)
+        if prev >= 128 {
+            return dg_slice(msg, 0, p)
+        }
+    }
+    return msg
+}
+
+// 尾段：名字之后的部分（去前导冒号；「，实际 」→「；实际 」）。
+pub func tail_of(msg: string) -> string {
+    var p = dg_find(msg, "期望 ")
+    if p > 0 {
+        return tail_fix(dg_slice(msg, p, len(msg)))
+    }
+    p = dg_find(msg, "：")
+    if p > 0 {
+        // ★ 全角冒号是 **3 字节**（EF BC 9A），必须整体跳过。
+        // 曾误写 `p + 1`：切片落在字符中间，丢掉首字节 EF、留下 BC 9A 非法
+        // 残片——渲染出的错误消息后半段**乱码**（实测 2026-10-01）。
+        // 半角 ": "（下方）是 2 字节故用 p+2，那条是对的。
+        return tail_fix(dg_slice(msg, p + 3, len(msg)))
+    }
+    p = dg_find(msg, ": ")
+    if p > 1 {
+        var prev = str_byte(msg, p - 1)
+        if prev >= 128 {
+            return tail_fix(dg_slice(msg, p + 2, len(msg)))
+        }
+    }
+    return ""
+}
+
+// 「，实际 」→「；实际 」；去首尾空白。
+func tail_fix(t: string) -> string {
+    var sb = string_builder()
+    var n: i64 = len(t)
+    var i: i64 = 0
+    while i < n {
+        var b = str_byte(t, i)
+        if b == 0xEF && i + 2 < n {
+            // 全角逗号 '，'（EF BC 8C）
+            if str_byte(t, i + 1) == 0xBC && str_byte(t, i + 2) == 0x8C {
+                sb_append(sb, "；")
+                i = i + 3
+                continue
+            }
+        }
+        sb_append_byte(sb, b)
+        i = i + 1
+    }
+    var out = sb_build(sb)
+    // 去首尾空白
+    var k: i64 = 0
+    var m: i64 = len(out)
+    while k < m {
+        var cb = str_byte(out, k)
+        if cb == 32 || cb == 9 || cb == 10 || cb == 13 {
+            k = k + 1
+        } else {
+            break
+        }
+    }
+    if k > 0 {
+        out = dg_slice(out, k, m)
+    }
+    var e: i64 = len(out)
+    while e > 0 {
+        var eb = str_byte(out, e - 1)
+        if eb == 32 || eb == 9 || eb == 10 || eb == 13 {
+            e = e - 1
+        } else {
+            break
+        }
+    }
+    if e < len(out) {
+        out = dg_slice(out, 0, e)
+    }
+    return out
+}
+
+// ---------- 输出渲染 ----------
+
+// error[E#####] @行:列: 消息名；期望 x；实际 y。 （line < 0 时省略位置段）
+pub func render_error(line: i64, col: i64, msg: string) -> string {
+    var cc = code_of(msg)
+    var out = "error[" + cc + "]"
+    if line >= 0 {
+        out = out + " @" + to_string(line) + ":" + to_string(col)
+    }
+    out = out + ": " + name_of(msg)
+    var tl = tail_of(msg)
+    if len(tl) > 0 {
+        out = out + "；" + tl
+    }
+    return out + "。"
+}
+
+// 从 ERR 协议文本 "ERR:<line> <col> <msg>" 渲染错误行。
+pub func render_err_proto(proto: string) -> string {
+    if !dg_starts(proto, "ERR:") {
+        return proto
+    }
+    var rest = dg_slice(proto, 4, len(proto))
+    var sp1 = dg_find(rest, " ")
+    if sp1 < 0 {
+        return proto
+    }
+    var sp2: i64 = -1
+    var i: i64 = sp1 + 1
+    var rn: i64 = len(rest)
+    while i < rn {
+        if str_byte(rest, i) == 32 {
+            sp2 = i
+            break
+        }
+        i = i + 1
+    }
+    if sp2 < 0 {
+        return proto
+    }
+    var lv: i64 = 0
+    var j: i64 = 0
+    while j < sp1 {
+        lv = lv * 10 + (str_byte(rest, j) - 48)
+        j = j + 1
+    }
+    var cv: i64 = 0
+    j = sp1 + 1
+    while j < sp2 {
+        cv = cv * 10 + (str_byte(rest, j) - 48)
+        j = j + 1
+    }
+    var msg = dg_slice(rest, sp2 + 1, rn)
+    return render_error(lv, cv, msg)
+}
+
+// ---------- 警告目录（核心消息 → 码/名/建议；核心按字节升序） ----------
+
+// 注册一条警告。**加一条警告只需加一行 warn_reg**：
+//   warn_reg(核心消息, 标号, 短名, 建议)
+//   - 核心消息：发射点 sm_warn_add 的第三个参数，逐字一致；
+//   - 标号：五位纯序号（规划见 tdiag/docs/warnings.md）；
+//   - 短名：渲染在 warning[W#####] @行:列: 之后；
+//   - 建议：潜在影响与处理方向（渲染在「；」之后）。
+// 顺序无关——注册结束由 warn_sort() 统一按核心消息字节升序排序（二分查找前提）。
+pub func warn_reg(core: string, wcode: string, wnm: string, tip: string) {
+    table_push(diag_w_keys, core)
+    table_push(diag_w_codes, wcode)
+    table_push(diag_w_names, wnm)
+    table_push(diag_w_tips, tip)
+    table_push(diag_w_norms, normalize(core))
+}
+
+// 构建期排序：核心消息按字节升序（插入排序；五张平行表同步交换）。
+func warn_sort() {
+    var n: i64 = len(diag_w_keys)
+    var i: i64 = 1
+    while i < n {
+        var j: i64 = i
+        var go: bool = true
+        while j > 0 && go {
+            if diag_w_keys[j - 1] > diag_w_keys[j] {
+                var tk = diag_w_keys[j - 1]
+                diag_w_keys[j - 1] = diag_w_keys[j]
+                diag_w_keys[j] = tk
+                var tc = diag_w_codes[j - 1]
+                diag_w_codes[j - 1] = diag_w_codes[j]
+                diag_w_codes[j] = tc
+                var tn = diag_w_names[j - 1]
+                diag_w_names[j - 1] = diag_w_names[j]
+                diag_w_names[j] = tn
+                var tt = diag_w_tips[j - 1]
+                diag_w_tips[j - 1] = diag_w_tips[j]
+                diag_w_tips[j] = tt
+                var tm = diag_w_norms[j - 1]
+                diag_w_norms[j - 1] = diag_w_norms[j]
+                diag_w_norms[j] = tm
+                j = j - 1
+            } else {
+                go = false
+            }
+        }
+        i = i + 1
+    }
+}
+
+func ensure_warns() {
+    if len(diag_w_keys) > 0 {
+        return
+    }
+    diag_w_keys = table_new_string()
+    diag_w_codes = table_new_string()
+    diag_w_names = table_new_string()
+    diag_w_tips = table_new_string()
+    diag_w_norms = table_new_string()
+    diag_w_unreg = table_new_string()
+
+    // —— 核心警告（W00001..）——
+    warn_reg("浮点相等比较（==/!= 对 f64/f32 结果不可靠）", "W00001", "浮点相等比较",
+        "浮点二进制表示有误差，== 几乎总是不成立；改用 |a-b| <= eps 的误差范围比较")
+    warn_reg("整数除法结果截断（如 7/2 == 3）", "W00002", "整数除法截断",
+        "整数除法结果向下取整会丢小数；需保留精度请把操作数转为 f64")
+    warn_reg("循环内字符串拼接累积（x = x + y 逐次整体复制，O(n²)）", "W00003", "字符串拼接累积",
+        "tie 字符串不可变，每次拼接生成新串并复制全部旧内容，循环 N 次总成本 O(N²)，长文本可致内存/时间爆炸；用 string_builder + sb_append + sb_build")
+    warn_reg("表变量拷贝共享底层数组（var b = a 后 b 的修改会反映到 a）", "W00004", "表变量拷贝共享",
+        "表赋值是引用共享而非深拷贝；需要独立副本请用 clone")
+
+    // —— 规划经验型警告（W00005..W00019；语义与编号以 tdiag/docs/warnings.md 为准）——
+    warn_reg("未使用变量（声明后从未被读取）", "W00005", "未使用变量",
+        "该变量声明后从未被读取；删除声明，或以 _ 前缀表明有意不使用")
+    warn_reg("未使用函数/方法（声明后从未被调用）", "W00006", "未使用函数",
+        "死代码扩充 API 面并产生误导；删除")
+    warn_reg("未使用 import（导入后从未引用）", "W00007", "未使用 import",
+        "依赖面冗余，重命名时易误伤；删除未使用 import")
+    warn_reg("变量遮蔽（内层同名变量遮蔽外层）", "W00008", "变量遮蔽",
+        "内层同名变量遮蔽外层，阅读与引用时易误用；重命名内层变量")
+    warn_reg("return 后不可达语句（语句恒不执行）", "W00009", "不可达语句",
+        "语句恒不执行，多为分支错误；删除或移入正确分支")
+    warn_reg("空语句块（无内容且无注释占位）", "W00010", "空语句块",
+        "占位且无注释，意图不明；补充注释或删除")
+    warn_reg("函数参数未使用（参数从未被读取）", "W00011", "参数未使用",
+        "参数表与实际行为不符；删除，或以 _ 前缀声明")
+    warn_reg("魔法数字（非 0/1 的字面量直接参与运算）", "W00012", "魔法数字",
+        "字面量含义不明，局部修改易遗漏；使用命名常量 const")
+    warn_reg("for 遍历表时修改表（循环体内追加/删除元素）", "W00013", "遍历时改表",
+        "追加/删除元素使遍历结果不可预期；遍历副本，或按索引倒序删除")
+    warn_reg("布尔参数调用（实参为 bool 字面量，语义不明）", "W00014", "布尔参数调用",
+        "foo(true) 无法表达参数语义；使用命名常量或枚举参数")
+    warn_reg("可变绑定未修改（var 声明后从未赋值）", "W00015", "可变绑定未修改",
+        "声明 var 却从未赋值，应使用 const；改为 const")
+    warn_reg("可变全局表共享状态（被多处修改）", "W00016", "全局表共享状态",
+        "全局可变表被多处修改，状态难以追踪；收敛至模块内或改参数传递")
+    warn_reg("嵌套过深（控制流嵌套超过 5 层）", "W00017", "嵌套过深",
+        "可读性显著下降，重构成本高；提取函数或提前返回")
+    warn_reg("大整数字面量溢出风险（超出目标窄类型范围）", "W00018", "整数字面量溢出",
+        "超出目标窄类型范围时静默回绕；使用显式后缀（i32/u8）或转换前检查")
+    warn_reg("表元素越界写静默失败（t[i] = v 且 i >= len 时丢弃）", "W00019", "表越界写",
+        "t[i] = v 在 i ≥ len 时静默丢弃；使用 table_push 追加")
+
+    // —— 新拍警告（W00024..W00029；编号避开 W00005..W00019 规划段）——
+    warn_reg("变量重复声明（同名变量再次声明，后者覆盖前者）", "W00024", "变量重复声明",
+        "tie 局部变量作用域为覆盖语义（scope.insert），同名再次声明后前者在后续代码中不可再访问；请确认是否为遮蔽本意，否则改用新名")
+    warn_reg("条件恒假（if/while 条件为常量 0/false）", "W00025", "条件恒假",
+        "条件恒为假，if 分支 / while 循环体永远不会执行，可能是逻辑错误或遗留代码")
+    warn_reg("条件恒真（if/while 条件为常量 true/非零值）", "W00026", "条件恒真",
+        "条件恒为真，if 分支恒执行 / while 循环恒不退出（死循环）；检查是否为常量误用")
+    warn_reg("整数除零（字面量 0 作除数，运行期崩溃）", "W00027", "整数除零",
+        "整数除以字面量 0 会在运行期触发崩溃（除零）；请检查除数来源并加非零判断")
+    warn_reg("switch 缺少 default（未匹配值时静默无操作）", "W00028", "switch 缺少 default",
+        "未匹配的值会静默跳过；若其余值确实无需处理，建议补 default 分支明确意图，避免新增值后静默漏处理")
+    warn_reg("内存上限限制下优化档 O3 受限，已自动降为 O2", "W00029", "优化档自动降级",
+        "内存上限配置下优化档 O3 需要更大内存，已自动降为 O2；如需 O3 请调大 tiec.mem_limit")
+    // 凭据挂空（unsafe-credential-lock.md §3）：域名由发射点拼入，归一化后
+    // ASCII 段折成 '%'，故这一条 core（含 "mem"）即可覆盖 mem/ext/raw/lock 全部域名。
+    warn_reg("持有的 mem 域凭据在本作用域内未使用（凭据挂空）", "W00030", "凭据挂空",
+        "该作用域申请了此域凭据，却没有任何本域操作；多持的凭据会使审计清单失真，请改用需要的域或不申请")
+    // 同 W00030 的**文件粒度**措辞（作用域是整个文件）：核心消息不同，须单独登记
+    // —— 查表是「核心消息归一化后精确匹配」，措辞不同就查不到，会静默降级成
+    // W00000 兜底（本轮踩过：文件级告警发出了却渲染不出来，正是漏了这条）。
+    warn_reg("文件级授权持有的 mem 域凭据在全文件内未使用（凭据挂空）", "W00030", "凭据挂空",
+        "该文件级授权声明了此域，却整个文件都没有本域操作；空授权会让审计清单失真，请移除该域或不申请")
+    // r.1.6.10 按值形参的表字段重绑定（W00031）：struct 按值传参，但其中的表字段
+    // 指向同一张堆表——经句柄改内容调用方可见（惯用法），**重新赋值字段本身调用方
+    // 看不见**（只改本地副本）。后者无声失效，最该出声音。两条措辞（自赋值 / 一般
+    // 重绑定）**核心消息不同，必须分别登记**：查表是归一化后精确匹配，措辞不同就
+    // 查不到，会静默降级成 W00000（与 W00030 的文件粒度措辞同一坑）。
+    warn_reg("对按值形参 'x' 的表字段 'y' 的赋值是自赋值：右值本就是该字段本身，此行无任何效果（且按值形参的字段也改不到调用方）", "W00031", "按值形参表字段重绑定",
+        "`var h = p.f` 取出的 h 就是 p.f 本身（同一句柄），再写回 p.f 是空操作；若想追加内容，直接对 h 操作即可")
+    warn_reg("对按值形参 'x' 的表字段 'y' 重新赋值，调用方看不到（按值传参只拷贝句柄；经句柄改内容才可见，如需换表请返回新 struct）", "W00031", "按值形参表字段重绑定",
+        "struct 按值传参时会拷贝，对副本的字段赋值不会影响调用方；经句柄修改表内容才会被看到，换表请改为返回新 struct")
+    // r.1.6.10 W00031 第二形态（2026-10-07）：**局部副本写入后再未被读取**。
+    // 与上面同源（写的是副本 ⇒ 无声失效），但受害面更大：`var t = xget(s)` 取到的
+    // 是全局表的副本，`t[g] = 1` 之后再没人读 t ⇒ 写入静默丢失。实测两处真实缺陷
+    // （tofflib 的字形标记表与 cmap 缓存）都栽在这里：编译通过、六层自检全绿，
+    // 只有产物的文本层错位才暴露。
+    // 归一化警告：核心消息的 ASCII 段（`'x'` 那一段）折成 `%`，故登记与发射只要
+    // 骨架一致即可精确命中；措辞改了必须重跑 gen-diagcodes。
+    warn_reg("变量 'x' 被写入后再未被读取：这次写入不会生效", "W00031", "写入副本后未使用",
+        "赋值与取用访问器都产生副本，写入落在副本上；此后不再读取它，等于没写。若本意是修改共享的表（全局表 / 访问器返回的表 / 按值形参的表），需把结果写回（g = t）或改用 ref 出参")
+
+    // —— 角色类（W00020..）——
+    warn_reg("roles.data.tie 解析失败，使用内置默认角色", "W00020", "角色配置解析失败",
+        "自定义角色配置语法错误，本次按内置默认角色编译；请检查 roles 段格式")
+    warn_reg("依赖包角色定义解析失败，使用内置默认角色", "W00021", "角色定义解析失败",
+        "依赖包角色定义解析失败，已忽略；请检查包内 roles.data.tie 格式")
+    warn_reg("角色重复注册，忽略后注册者", "W00022", "角色重复注册",
+        "同名角色先注册者生效，后注册者被忽略；请保持角色名全局唯一")
+    warn_reg("角色 output 非法值，回退 lib", "W00023", "角色 output 非法",
+        "角色输出类型仅支持 lib/check/exe；非法值按 lib 处理，请检查 roles 段 output 字段")
+
+    warn_sort()
+}
+
+// 按核心消息查（原始字节二分；表升序）；未命中 ""。
+func warn_at(core: string) -> i64 {
+    ensure_warns()
+    var lo: i64 = 0
+    var hi: i64 = len(diag_w_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if diag_w_keys[mid] == core {
+            return mid
+        }
+        if diag_w_keys[mid] < core {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// 归一化键查（二级匹配）：与错误侧 code_of 的 exact→prefix 两级对齐，
+// 发射点消息与目录消息仅在 ASCII 段有出入（空格、插值）时仍可命中。
+func warn_at_norm(norm: string) -> i64 {
+    ensure_warns()
+    var lo: i64 = 0
+    var hi: i64 = len(diag_w_norms) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if diag_w_norms[mid] == norm {
+            return mid
+        }
+        if diag_w_norms[mid] < norm {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// 统一查找：逐字精确 → 归一化 → 未命中（顺带登记为「未登记警告」）。
+func warn_idx(core: string) -> i64 {
+    var idx = warn_at(core)
+    if idx >= 0 {
+        return idx
+    }
+    idx = warn_at_norm(normalize(core))
+    if idx >= 0 {
+        return idx
+    }
+    warn_note_unreg(core)
+    return -1
+}
+
+// 登记一条「未登记警告」：发射点有、目录里没有（加新警告忘了 warn_reg 时触发）。
+pub func warn_note_unreg(core: string) {
+    ensure_warns()
+    var i: i64 = 0
+    while i < len(diag_w_unreg) {
+        if diag_w_unreg[i] == core {
+            return
+        }
+        i = i + 1
+    }
+    table_push(diag_w_unreg, core)
+}
+
+// 未登记警告条数（0 = 目录与发射点一致）。
+pub func warn_unreg_count() -> i64 {
+    ensure_warns()
+    return len(diag_w_unreg)
+}
+
+// 未登记警告清单（'|' 分隔；供 TIEC_WARN_AUDIT 与测试断言）。
+pub func warn_unreg_list() -> string {
+    var out = ""
+    var i: i64 = 0
+    while i < len(diag_w_unreg) {
+        if i > 0 {
+            out = out + "|"
+        }
+        out = out + diag_w_unreg[i]
+        i = i + 1
+    }
+    return out
+}
+
+// 清空未登记清单（每次编译入口调用，避免跨文件累积）。
+pub func warn_unreg_reset() {
+    ensure_warns()
+    diag_w_unreg = table_new_string()
+}
+
+// 目录中已注册的警告条数。
+pub func warn_count() -> i64 {
+    ensure_warns()
+    return len(diag_w_keys)
+}
+
+// 警告标号：未命中 W00000（并登记未登记，供审计）。
+pub func warn_code_of(core: string) -> string {
+    var idx = warn_idx(core)
+    if idx < 0 {
+        return "W00000"
+    }
+    return diag_w_codes[idx]
+}
+
+// 警告消息名。
+pub func warn_name_of(core: string) -> string {
+    var idx = warn_idx(core)
+    if idx < 0 {
+        return core
+    }
+    return diag_w_names[idx]
+}
+
+// 警告建议（潜在影响 / 处理方向）。
+pub func warn_tip_of(core: string) -> string {
+    var idx = warn_idx(core)
+    if idx < 0 {
+        return ""
+    }
+    return diag_w_tips[idx]
+}
+
+// warning[W#####] @行:列: 消息名；潜在影响与处理建议。 （line < 0 省略位置段）
+pub func render_warning(line: i64, col: i64, core: string) -> string {
+    var cc = warn_code_of(core)
+    var out = "warning[" + cc + "]"
+    if line >= 0 {
+        out = out + " @" + to_string(line) + ":" + to_string(col)
+    }
+    out = out + ": " + warn_name_of(core)
+    var tp = warn_tip_of(core)
+    if len(tp) > 0 {
+        out = out + "；" + tp
+    }
+    return out + "。"
+}
+
+}   // namespace diagcode

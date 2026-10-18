@@ -1,0 +1,150 @@
+type tie<class>
+// compiler/frontend/lex_symtab.tie —— T2.4 关键字/符号表（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）完整词法器
+// lexer.tie 拆分为 5 模块之一（本文件 = 关键字/符号表，零依赖叶节点）。
+// 表全局变量（kw_keys/kw_vals/sym_keys/sym_vals）按 tie 约束放文件顶层，
+// 本 namespace 内函数裸名访问；由 lex_scan.tie import（传递可达 lexer）。
+// 依赖：无。
+// 表全局变量（kw_keys/kw_vals/sym_keys/sym_vals）按 tie 约束放本文件顶层，
+// namespace 内函数裸名访问（同文件顶层全局，已验证可行）。
+
+// ---------- 关键字/符号排序表（懒构建；键升序 + 二分）----------
+// S3.3 宏/元编程：新增 macro 关键字（in 与 map 之间——'i'<'m' 且 'c'<'p'）。
+// 注意：S2.4 并行分支可能同时改本表（port/impl），合并冲突时保留两份新增。
+var kw_keys: table<string>;
+var kw_vals: table<i64>;
+var sym_keys: table<string>;
+var sym_vals: table<i64>;
+
+namespace lexsym {
+
+// ---------- 关键字表构建与二分 ----------
+// 51+6 项 ASCII/strcmp 升序（TypeKw 值=32，具体类型由 lexeme 区分——同 Rust
+// 单变体）。S1.2 新增：asm（as 后 bool 前）、repr（ref 后 return 前）、
+// unsafe（u8 后 using 前）。S2.3/S2.4 新增：impl（if 后 import 前——'l'<'o'）、
+// panic/port（num 后 pub 前——'a'<'o'<'u'）。S3.3 新增：macro（in 后 map 前）。
+// 批次 2（i128/u128）：i128 在 i16 前（'2'<'6'）、u128 在 u16 前——严格升序。
+// 三期 goto（2026-08-23）：goto 在 func 后 i128 前（'g'<'i'）——严格升序。
+// p.9.11.10/11 two more keyword（严格升序）：
+//   immut（i m m u t）在 impl（i m p）前——第三字节 'm'(109)<'p'(112)；
+//   inline（i n l）在 in（i n）后（"in" 为 "inline" 前缀）、macro 前——'i'<'m'。
+// p.9.11.21 interface 关键字（tag 106，严格升序）：
+//   interface（i n t）在 inline（i n l）后——第三字节 't'(116)>'l'(108)；
+//   interface 在 macro（m）前——'i'<'m'。结构性接口（鸭子多态静态检查）。
+// p.9.11 `is` 关键字（tag 119，规范 §3.16 类型判定）：严格升序——
+//   is 在 interface（i n < i s，第三字节 'n'<'s'）后、macro（m）前。
+// p.9.11 `reentrant` 关键字（tag 120，规范 §10.7）：严格升序——
+//   reentrant 在 pub（p）后、ref（r e f）前（第三字节 'e'<'f'）。
+// p.9.11 `await` 关键字（tag 121，规范 §10.6）：严格升序——
+//   await 在 async（a s）后（第四字节 'y'<'w'？否：async=a s y n c，await=a w——
+//   第二字节 's'(115)<'w'(119) ⇒ async < await）、bool（b）前。
+func build_kw() {
+    var k: table<string> = ["actor", "alias", "any", "as", "asm", "async", "await", "bool", "break",
+        "case", "char", "code", "const", "continue", "deep", "default", "else", "enum",
+        "extends", "extern", "f32", "f64", "false", "for", "func", "goto", "i128", "i16",
+        "i32", "i64", "i8", "if", "immut", "impl", "import", "in", "inline", "interface", "is", "macro", "map", "misc",
+        "move", "namespace", "num", "panic", "port", "pub", "reentrant", "ref", "repr", "return", "shared",
+        "string", "struct", "switch", "table", "text", "trit", "true", "u128",
+        "u16", "u32", "u64", "u8", "unsafe", "using", "var", "void", "when",
+        "while", "with", "yield", "zero"]
+        var v: table<i64> = [92, 107, 32, 21, 84, 93, 121, 32, 14, 17, 32, 32, 7, 15, 116, 18, 9, 81,
+        23, 27, 32, 32, 29, 11, 5, 94, 32, 32, 32, 32, 32, 8, 103, 87,
+        20, 12, 102, 106, 119, 88, 32, 32, 113, 24, 32, 85, 86, 25, 120, 31, 83, 13, 117,
+        32, 22, 16, 32, 32, 32, 28, 32, 32, 32, 32, 32, 82, 26, 6, 32,
+        19, 10, 98, 105, 30]
+    kw_keys = table_new_string()
+    kw_vals = table_new_i64()
+    var i: i64 = 0
+    while i < len(k) {
+        table_push(kw_keys, k[i])
+        table_push(kw_vals, v[i])
+        i = i + 1
+    }
+}
+
+// 懒构建保证：首次调用前表为空，构建后复用
+pub func ensure_kw() {
+    if len(kw_keys) == 0 {
+        build_kw()
+    }
+}
+
+// 二分查找关键字 s 的 tag；未命中返回 -1（键表升序，比较走 strcmp）
+pub func kw_lookup(s: string) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(kw_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if kw_keys[mid] == s {
+            return kw_vals[mid]
+        }
+        if kw_keys[mid] < s {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// ---------- 符号表构建与二分 ----------
+// 49 项 strcmp 升序（'<'=60 < '='=61 < '>'=62，故 '<'组："<"<"<<"<"<<="<"<="，
+// '>'组：">"<">="<">>"<">>="——必须严格升序否则二分错乱，2026-08-11 实测踩坑；
+// `...`（0x2E2E2E）介于 `..`（0x2E2E）与 `/`（0x2F）之间：第三字节 46 > 0 故靠后）
+// S3.3 新增两个符号（严格升序校验）：
+//   "$"（0x24）：介于 "!="（0x21 0x3D）与 "%"（0x25）之间——0x21<0x24<0x25；
+//   "`"（0x60）：介于 "^="（0x5E 0x3D）与 "{"（0x7B）之间——0x5E<0x60<0x7B。
+// M4（dev33 批次9）新增 "#"（0x23）：介于 "!="（0x21 0x3D）与 "$"（0x24）之间
+//   ——0x21<0x23<0x24。tag 91（lex_hash），属性语法 `#[macro]` 起始符。
+// p.9.11.9 checked 运算符号 `*?`/`+?`/`-?`（严格升序插入，二分不破坏）：
+//   "*?"（0x2A 0x3F）：介于 "*="（0x2A 0x3D）与 "+"（0x2B）之间——0x3D<0x3F；
+//   "+?"（0x2B 0x3F）：介于 "+="（0x2B 0x3D）与 ","（0x2C）之间——0x3D<0x3F<0x2C 末字节仍 0x2B<0x2C；
+//   "-?"（0x2D 0x3F）：介于 "->"（0x2D 0x3E）与 "."（0x2E）之间——0x3E<0x3F。
+// 三者第二字符均为 '?'，与 `?` 解包/`?.`/`a?[i]` 前缀因首字符不同不冲突。
+// p.9.11.12 @注解符（0x40）：介于 "?"（0x3F）与 "["（0x5B）之间——0x3F<0x40<0x5B。
+func build_sym() {
+    var k: table<string> = ["!", "!=", "#", "$", "%", "%%", "%%=", "%=", "&", "&&", "&=", "(",
+        ")", "*", "**", "**?", "*=", "*?", "+", "++", "+=", "+?", ",", "-", "--", "-=", "->", "-?", ".",
+        "..", "...", "..=", "/", "/=", ":", "::", ";", "<", "<-", "<<", "<<=", "<=", "=", "==",
+        ">", ">=", ">>", ">>=", "?", "@", "[", "\\", "\\=", "]", "^", "^=", "`", "{", "|", "|=",
+        "||", "}", "~"]
+    var v: table<i64> = [60, 53, 91, 90, 50, 111, 118, 65, 71, 58, 66, 33, 34, 48, 110, 112, 63, 101, 46, 76,
+        61, 99, 39, 47, 77, 62, 45, 100, 43, 44, 80, 115, 49, 64, 40, 41, 42, 54, 95, 74, 69, 56,
+        51, 52, 55, 57, 75, 70, 78, 104, 37, 108, 109, 38, 73, 68, 89, 35, 72, 67, 59, 36, 114]
+    sym_keys = table_new_string()
+    sym_vals = table_new_i64()
+    var i: i64 = 0
+    while i < len(k) {
+        table_push(sym_keys, k[i])
+        table_push(sym_vals, v[i])
+        i = i + 1
+    }
+}
+
+// 懒构建保证：首次调用前表为空，构建后复用
+pub func ensure_sym() {
+    if len(sym_keys) == 0 {
+        build_sym()
+    }
+}
+
+// 二分查找符号文本 s 的 tag；未命中返回 -1
+pub func sym_lookup(s: string) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(sym_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if sym_keys[mid] == s {
+            return sym_vals[mid]
+        }
+        if sym_keys[mid] < s {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+}

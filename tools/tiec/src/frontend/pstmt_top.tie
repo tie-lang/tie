@@ -1,0 +1,477 @@
+type tie<class>
+// compiler/frontend/pstmt_top.tie — T2.5 parser 顶层声明（再拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
+// 原 pstmt.tie（1091 行）拆为 pstmt_top（本文件：程序入口 + 顶层声明
+// import/using/namespace/extern/fn/struct）+ pstmt_flow（语句分派+控制流）
+// + pstmt（var 声明/表达式赋值）。
+// 依赖：./pstmt_flow.tie（语句分派/控制流，经其传递可达 pstmt/pexpr/putil/ast）。
+// 树式无环：由 parser.tie import。
+import "./pstmt_flow.tie"
+
+// 三期通用 `#[]` 属性通道（§7.1）：解析 `#[unsafe.share]` 等声明属性后暂存
+// 在此，附着到下一 actor/func 声明节点（N_ACTOR / N_FN_DEF 的 val bit3）。
+// 0 = 无 pending；>0 = 属性全名池 id。解析完声明即清零。
+pub var g_pending_attr: i64 = 0;
+
+// p.9.11 `reentrant`（规范 §10.7）：parse_actor 解析方法期间置 1，供 parse_fn_def
+// 判「reentrant 仅可用于 actor 消息方法」（顶层/普通函数标注解析期即拒绝）。
+pub var g_in_actor_body: i64 = 0;
+
+// p.9.11.12 @注解/属性：声明前置注解 `@name` / `@name(args)`（元数据，无运行期
+// 行为）。注册表按「声明节点 id → 注解条目」平行存放（每个注解一条记录）：
+//   g_ann_nodes[序] = 声明节点 id（解析完声明回填；-1 = 尚未附着）
+//   g_ann_names[序] = 注解名（字符串池 id）
+//   g_ann_arg_off/cnt = 参数 AST 节点 id 在 g_ann_arg_ids 扁平段中的 [off, off+cnt)
+//   g_ann_lines/cols = 注解起始位置（诊断/工具链展示）
+// 每次 parse_program（含 import 展开的每份文件）独立重置；查询接口见
+// pstmt_top 命名空间 pann_*（工具链消费（Keel 注册表/tieapi/tdiag）在组件层做）。
+pub var g_ann_nodes: table<i64>;
+pub var g_ann_names: table<i64>;
+pub var g_ann_arg_off: table<i64>;
+pub var g_ann_arg_cnt: table<i64>;
+pub var g_ann_arg_ids: table<i64>;
+pub var g_ann_lines: table<i64>;
+pub var g_ann_cols: table<i64>;
+
+// p.9.11.29 doc 注释 `///`：声明前连续 ///（或 /** */）行经词法 collect_doc/
+// flush_doc 落表后，此处按「doc 声明起始行 == ast.line(声明节点)」完成归属
+// 登记（@注解同路：解析期注册表，零运行时；tsp/工具链消费经 pdoc_* 接口，
+// Keel/tdiag 落盘在组件层做）。每份文件 parse_program 独立重置（同 pann）。
+// 附着面：函数/import/using/namespace/struct/enum/extern/宏/port/interface/
+// actor/字段与全局变量（N_VAR）；walk 不进函数/宏体——体内局部 var 不附着。
+pub var g_doc_nodes: table<i64>;     // 声明节点 id
+pub var g_doc_texts: table<i64>;    // 文本池 id（与 lextok.doc_entry_text_id 同源）
+pub var g_doc_dlines: table<i64>;   // 声明起始行（1 起，报告用）
+pub var doc_claimed: table<i64>;    // doc 已消费标记（0/1，一条 doc 至多附着一个声明）
+
+namespace pstmt_top {
+
+pub func parse_program() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    // p.9.11.12：注解注册表重置（每份文件解析独立；import 展开的文件各自重置）
+    g_ann_nodes = table_new_i64()
+    g_ann_names = table_new_i64()
+    g_ann_arg_off = table_new_i64()
+    g_ann_arg_cnt = table_new_i64()
+    g_ann_arg_ids = table_new_i64()
+    g_ann_lines = table_new_i64()
+    g_ann_cols = table_new_i64()
+    // p.9.11.29：doc 注册表重置（同 pann——每份文件解析独立）
+    g_doc_nodes = table_new_i64()
+    g_doc_texts = table_new_i64()
+    g_doc_dlines = table_new_i64()
+    doc_claimed = table_new_i64()
+    var stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_eof {
+            done = true
+        } else if tag == lex_func {
+            var s = parse_fn_def()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_inline {
+            // p.9.11.10 inline fn：`inline func ...`（inline 可跟 pub/const）
+            var s = parse_fn_def()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_pub {
+            // pub 后：pub func / pub macro / pub #[macro]（dev33 批次10 任务29
+            // 跨文件宏：pub macro 导出跨文件可见，非 pub 宏同文件私有）。
+            var nxt = putil.peek_n(1)
+            if nxt == lex_macro {
+                putil.advance()   // pub
+                var s = parse_macro_def()
+                if s < 0 {
+                    return -1
+                }
+                ast.set_val(s, ast.val(s) + 2)   // val bit1 = ispub
+                ast.collect_stmt(stmts, s)
+            } else if nxt == lex_hash {
+                putil.advance()   // pub
+                var s = parse_proc_macro_attr()
+                if s < 0 {
+                    return -1
+                }
+                ast.set_val(s, ast.val(s) + 2)   // val bit1 = ispub
+                ast.collect_stmt(stmts, s)
+            } else if nxt == lex_const {
+                // p.9.21.5 II2：`pub const` —— 常量纳入 pub API 面（A2b：
+                // 常量可见性跟随 L1 梯度）。val bit0 = is_const（parse_var_decl
+                // 置位），bit1 = ispub（此处置位，与 macro 同款）。
+                putil.advance()   // pub
+                var s = pstmt.parse_var_decl(1)
+                if s < 0 {
+                    return -1
+                }
+                ast.set_val(s, ast.val(s) + 2)   // val bit1 = ispub
+                ast.collect_stmt(stmts, s)
+            } else if nxt == lex_var {
+                // 2026-10-13：`pub var` —— 可变全局纳入 pub API 面（跨文件
+                // 引用须 pub；bit1 = ispub 与 const 同款）。
+                putil.advance()   // pub
+                var sv = pstmt.parse_var_decl(0)
+                if sv < 0 {
+                    return -1
+                }
+                ast.set_val(sv, ast.val(sv) + 2)   // val bit1 = ispub
+                ast.collect_stmt(stmts, sv)
+            } else if nxt == lex_import {
+                // p.9.11.14 重导出：`pub import "path" [as 别名]`（内联模型
+                // 零成本；parse_import 内部消化 pub 前缀）
+                var s = parse_import()
+                if s < 0 {
+                    return -1
+                }
+                ast.collect_stmt(stmts, s)
+            } else {
+                var s = parse_fn_def()
+                if s < 0 {
+                    return -1
+                }
+                ast.collect_stmt(stmts, s)
+            }
+        } else if tag == lex_unsafe {
+            // S1.2：`unsafe fn ...`（unsafe 函数）或 `unsafe extern fn ...`
+            // （E3 强制 unsafe 标注的 extern 声明）。按下一 token 分派。
+            var nxt = putil.peek_n(1)
+            if nxt == lex_extern {
+                var s = parse_extern()
+                if s < 0 {
+                    return -1
+                }
+                ast.collect_stmt(stmts, s)
+            } else {
+                var s = parse_fn_def()
+                if s < 0 {
+                    return -1
+                }
+                ast.collect_stmt(stmts, s)
+            }
+        } else if tag == lex_repr {
+            // S1.2：`repr(C) struct ...`（C 内存布局结构体）
+            var s = parse_struct()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_import {
+            var s = parse_import()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_using {
+            var s = parse_using()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_struct {
+            var s = parse_struct()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_enum {
+            var s = parse_enum()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_port {
+            // S2.4：port 接口声明
+            var s = parse_port()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_alias {
+            // p.9.11.32：类型别名声明（真保留字；既有 alias 标识符已由
+            // prep/alias_kw_clean.tie 一键改名为 alias_id）
+            var s = parse_alias()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_interface {
+            // p.9.11.21：interface 结构性接口声明
+            var s = parse_interface()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_impl {
+            // S2.4：impl 实现块（impl Drawable for Button { ... }）
+            var s = parse_impl()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_namespace {
+            var s = parse_namespace()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_actor {
+            // 一期并发：actor 原生语法（`actor Name { ... }`）
+            var s = parse_actor()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_extern {
+            var s = parse_extern()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_var {
+            var s = pstmt.parse_var_decl(0)
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_const {
+            // p.8.1.1：`const fn` / `const func` → const fn 定义；否则 const 全局变量
+            if putil.peek_lexeme_n(1) == "fn" || putil.peek_lexeme_n(1) == "func" {
+                var s = parse_fn_def()
+                if s < 0 {
+                    return -1
+                }
+                ast.collect_stmt(stmts, s)
+            } else {
+                var s = pstmt.parse_var_decl(1)
+                if s < 0 {
+                    return -1
+                }
+                ast.collect_stmt(stmts, s)
+            }
+        } else if tag == lex_macro {
+            // S3.3：宏定义 `macro name(...) -> code { ... }`（编译期函数）
+            var s = parse_macro_def()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_hash {
+            // M4（dev33 批次9）过程宏属性 `#[macro]` + 三期通用 `#[]` 属性通道
+            // （§7.1，A/B/C 组声明属性 `#[unsafe.share]` 等）。按属性名分派：
+            //   #[macro] → 过程宏定义（保留兼容）
+            //   其他（#[unsafe.x]）→ 通用属性，附着到下一 actor/func 声明
+            var an2 = putil.peek_lexeme_n(2)
+            if an2 == "macro" {
+                var ps = parse_proc_macro_attr()
+                if ps < 0 {
+                    return -1
+                }
+                ast.collect_stmt(stmts, ps)
+            } else {
+                var attr = parse_generic_attr()
+                if attr < 0 {
+                    return -1
+                }
+                g_pending_attr = attr   // 附着到下一声明（actor/func）
+            }
+        } else if tag == lex_at {
+            // p.9.11.12 @注解/属性：`@name` / `@name(args)`（可堆叠）后跟声明
+            var s2 = parse_annotated_decl()
+            if s2 < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s2)
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、enum、命名空间声明、extern 声明、全局变量或宏定义，实际是 " + putil.describe(tag))
+            return -1
+        }
+    }
+    // S2.2：回填延迟闭包函数体。parse_primary 解析闭包字面量时只解析头部
+    // （pexpr 在 import 树底层无法调用 pstmt_flow 的语句解析——成环），
+    // 函数体 token 流被配平跳过并登记快照；这里在整份文件解析完后统一
+    // 恢复快照、parse_block 解析函数体、回填到 N_FN_LIT（见
+    // pstmt_flow.parse_deferred_closures）。
+    // S3.3：准引用块 `` `{ stmts } `` 同款延迟——parse_deferred_all 交替
+    // 处理闭包表与准引用块表直到两者都稳定（嵌套/交错均可）。
+    if parse_deferred_all() < 0 {
+        return -1
+    }
+    // p.9.11.29：doc 注释归属回填（声明起始行匹配，详见 doc_attach_all）
+    doc_attach_all(stmts)
+    var root = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    ast.set_children(root, stmts)
+    return root
+}
+
+
+// ---------- p.9.11.12 @注解/属性（声明前置元数据） ----------
+
+
+// ---------- p.9.11.12 注解查询接口（编译期元数据） ----------
+// 工具链消费（Keel 注册表 / tieapi / tdiag）在组件层做；本批提供可查询入口：
+//   pann_count(decl) / pann_name(decl,i) / pann_argc(decl,i) /
+//   pann_arg_node(decl,i,k) / pann_line(decl,i) / pann_col(decl,i)
+// 注意：注册表按「最近一次 parse_program」的生命周期（import 展开会重置），
+// 跨文件/import 的注解查询需组件层按文件基址偏移处理（后续批次）。
+
+// 声明节点上的注解条数（无注解返回 0）。
+pub func pann_count(decl: i64) -> i64 {
+    var c: i64 = 0
+    var i: i64 = 0
+    while i < len(g_ann_nodes) {
+        if g_ann_nodes[i] == decl {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+
+// 第 i 条注解名（字符串池 id；-1 = 越界）。
+pub func pann_name(decl: i64, i: i64) -> i64 {
+    var idx = pann_idx(decl, i)
+    if idx < 0 {
+        return -1
+    }
+    return g_ann_names[idx]
+}
+
+// 第 i 条注解参数个数。
+pub func pann_argc(decl: i64, i: i64) -> i64 {
+    var idx = pann_idx(decl, i)
+    if idx < 0 {
+        return -1
+    }
+    return g_ann_arg_cnt[idx]
+}
+
+// 第 i 条注解第 k 个参数的 AST 节点 id（-1 = 越界）。
+pub func pann_arg_node(decl: i64, i: i64, k: i64) -> i64 {
+    var idx = pann_idx(decl, i)
+    if idx < 0 {
+        return -1
+    }
+    if k < 0 || k >= g_ann_arg_cnt[idx] {
+        return -1
+    }
+    return g_ann_arg_ids[g_ann_arg_off[idx] + k]
+}
+
+// 第 i 条注解起始行（1 起）。
+pub func pann_line(decl: i64, i: i64) -> i64 {
+    var idx = pann_idx(decl, i)
+    if idx < 0 {
+        return -1
+    }
+    return g_ann_lines[idx]
+}
+
+// 第 i 条注解起始列（1 起）。
+pub func pann_col(decl: i64, i: i64) -> i64 {
+    var idx = pann_idx(decl, i)
+    if idx < 0 {
+        return -1
+    }
+    return g_ann_cols[idx]
+}
+
+// ---------- p.9.11.29 doc 注释注册表（解析收尾回填，查询接口） ----------
+// 归属回填：整份文件解析完后对顶层声明做一次 walk，凡声明节点起始行与某条
+// doc 的声明起始行相等且双方均未被消费即登记（容器声明递归进成员：struct
+// 字段/方法、actor 字段/方法、port/interface 方法、impl 方法、namespace 内
+// 声明、enum 变体层不再下钻——变体无可附着的声明起始 token）。
+
+
+// 已登记 doc 条数。
+pub func pdoc_count() -> i64 {
+    return len(g_doc_nodes)
+}
+
+// 第 i 条 doc 的声明节点 id。
+pub func pdoc_node(i: i64) -> i64 {
+    return g_doc_nodes[i]
+}
+
+// 第 i 条 doc 的文本池 id。
+pub func pdoc_text_id(i: i64) -> i64 {
+    return g_doc_texts[i]
+}
+
+// 第 i 条 doc 文本（声明起始行前连续 /// 内容，\n 拼接）。
+pub func pdoc_text(i: i64) -> string {
+    return interner.name_str(g_doc_texts[i])
+}
+
+// 第 i 条 doc 的声明起始行（1 起）。
+pub func pdoc_line(i: i64) -> i64 {
+    return g_doc_dlines[i]
+}
+
+// 声明节点 doc 文本（未登记返回空串）。
+pub func pdoc_of(decl: i64) -> string {
+    var i: i64 = 0
+    while i < len(g_doc_nodes) {
+        if g_doc_nodes[i] == decl {
+            return interner.name_str(g_doc_texts[i])
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 注册表可读摘要（--dump-docs 调试输出；tsp hover/补全经 pdoc_* 消费）。
+// 性能：用 StringBuilder 累积（旧实现 out = out + ... 循环拼接，每轮复制全串，
+// 文档条数 k 时为 O(k²) 字节复制；本仓无 GC，峰值内存随之增长）。范式同
+// driver/util.tie strip_type_header 的性能重写。
+pub func pdoc_dump() -> string {
+    var sb = string_builder()
+    sb_append(sb, "共 " + to_string(len(g_doc_nodes)) + " 条声明 doc:\n")
+    var i: i64 = 0
+    while i < len(g_doc_nodes) {
+        var node = g_doc_nodes[i]
+        var nm: string = "<匿名>"
+        var nid = ast.name(node)
+        if nid >= 0 {
+            nm = interner.name_str(nid)
+        }
+        sb_append(sb, "  [" + to_string(g_doc_dlines[i]) + "] " + nm + ": " +
+            interner.name_str(g_doc_texts[i]) + "\n")
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// ---------- 语句分派 ----------
+
+
+// ---------- 函数 / struct 定义 ----------
+
+
+// `[pub] [unsafe] func name [<T1, T2>] (params) -> Ty { stmts }`
+// 泛型（2026-08-14）：名字后紧跟类型参数列表 `<T1, T2>`；产出 N_FN_DEF
+// children = [泛型槽(-1或N_TYPE_PARAMS), 返回类型, 参数..., 函数体]。
+// S1.2：val 复用为标志位（bit0=is_pub, bit1=is_unsafe）。
+// 一期并发：val bit2 = is_async（`pub async func` = actor 异步投递方法；仅 actor
+// 体内语义合法，解析层统一接受、语义层拦截非 actor 用法）。
+// S2.4：port 方法签名（无体）由 parse_port_method 单独解析（见下）。
+// ---------- p.9.11.28 return 可省：判定辅助 ----------
+
+
+// ---------- 块 / 控制流语句 ----------
+
+// `{ stmts }` 代码块：返回 StmtList 节点
+
+}
+
+import "./pstmt_top_p1.tie"
+import "./pstmt_top_p2.tie"
+import "./pstmt_top_p3.tie"
+import "./pstmt_top_p4.tie"

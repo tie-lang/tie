@@ -1,0 +1,308 @@
+type tie<class>
+// ============================================================================
+// std/xlsx.tie —— XLSX 工作簿读取库（命名空间 xlsx，纯 tie）p.9.1.1.10
+// 读取 .xlsx（OOXML）工作簿：它是 zip 容器（std/zip 解包）+ 若干 XML
+// （ext/xml 解析）。只读、简化：
+//   - xl/workbook.xml           → 工作表名（顺序）
+//   - xl/sharedStrings.xml      → 共享字符串池（可选，无则视为空）
+//   - xl/worksheets/sheetN.xml  → 行/单元格（N = 按 workbook 中顺序 +1）
+//
+// API（简化裁决）：
+//   tie std 表无法表达 task 原设计的「sheet_name/rows/cells」三元深嵌套
+//   （元组表/深嵌套不可用），故扁平为两步：
+//     xlsx_sheet_names(xb) -> table<string>             （工作表名，顺序）
+//     xlsx_read(xb, sheet_name) -> (bool, rows)
+//        rows: table<table<string>>  —— 每行一组单元格**字符串值**（栅格对齐：
+//        按列字母定位并补 "" 空槽，尾随空去掉），行/列索引即数组下标。
+//   单元格"值"简化统一成 string：数字=原始 <v> 文本、共享串=t 文本、布尔=
+//   "TRUE"/"FALSE"、公式结果/内联串=文本。类型信息不再保留（简化）。
+//
+// 局限（注明）：不解析公式（只读 <v> 结果）；不处理合并单元格样式/日期格式；
+// 工作表文件按"sheetN.xml 依 workbook 顺序"约定定位（不读 rels 映射 r:id）；
+// 只读不写；Zip64 依赖 std/zip（其亦不支超大）。
+// ============================================================================
+
+import "./zip.tie" as zip
+import "../ext/xml/xml.tie" as xm
+
+namespace xlsx {
+
+// ============================================================================
+// 一、基础工具：字节表 ↔ UTF-8 字符串（自包含解码）
+// ============================================================================
+
+// 取 XML 字节并转为字符串（zip 条目）；缺失返回 ""。
+func entry_text(xb: table<i64>, name: string) -> string {
+    var b = zip.zip_get(xb, name)
+    if len(b) == 0 {
+        return ""
+    }
+    return dec(b)
+}
+
+// UTF-8 字节序列 → 字符串（逐序列解码；畸形字节按码值直落）。
+func dec(b: table<i64>) -> string {
+    var out: string = ""
+    var n = len(b)
+    var i: i64 = 0
+    while i < n {
+        var c0 = b[i] & 0xFF
+        var cp: i64 = c0
+        var adv: i64 = 1
+        if (c0 & 0xE0) == 0xC0 && i + 1 < n {
+            cp = ((c0 & 0x1F) << 6) | (b[i + 1] & 0x3F)
+            adv = 2
+        } else if (c0 & 0xF0) == 0xE0 && i + 2 < n {
+            cp = ((c0 & 0x0F) << 12) | ((b[i + 1] & 0x3F) << 6) | (b[i + 2] & 0x3F)
+            adv = 3
+        } else if (c0 & 0xF8) == 0xF0 && i + 3 < n {
+            cp = ((c0 & 0x07) << 18) | ((b[i + 1] & 0x3F) << 12) |
+                ((b[i + 2] & 0x3F) << 6) | (b[i + 3] & 0x3F)
+            adv = 4
+        }
+        out = out + str_from_code(cp)
+        i = i + adv
+    }
+    return out
+}
+
+// ============================================================================
+// 二、XML 树辅助（基于 ext/xml 节点句柄）
+// ============================================================================
+
+// 取元素 nid 的直接文本孩子内容之和（<t>你好</t> → "你好"）。
+func elem_text(d: XmlDoc, nid: i64) -> string {
+    var sb = string_builder()
+    var kids = xm.children(d, nid)
+    var n = len(kids)
+    var i: i64 = 0
+    while i < n {
+        if xm.kind(d, kids[i]) == 1 {        // 文本节点
+            sb_append(sb, xm.content(d, kids[i]))
+        }
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// 取 nid 子树下全部 <t> 元素文本之和（共享串 / 内联串富文本合并）。
+func subtree_text(d: XmlDoc, nid: i64) -> string {
+    var sb = string_builder()
+    collect_t(d, nid, sb)
+    return sb_build(sb)
+}
+
+func collect_t(d: XmlDoc, nid: i64, sb: i64) {
+    var kids = xm.children(d, nid)
+    var n = len(kids)
+    var i: i64 = 0
+    while i < n {
+        var k = kids[i]
+        if xm.kind(d, k) == 0 {              // 元素
+            if xm.tag(d, k) == "t" {
+                sb_append(sb, elem_text(d, k))
+            } else {
+                collect_t(d, k, sb)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// 单元格值文本：直接 <v> 文本；内联串取 <is>/<t>；兜底子文本。
+func cell_value(d: XmlDoc, cid: i64) -> string {
+    var sb = string_builder()
+    var kids = xm.children(d, cid)
+    var n = len(kids)
+    var i: i64 = 0
+    while i < n {
+        var k = kids[i]
+        if xm.kind(d, k) == 0 {
+            var tg = xm.tag(d, k)
+            if tg == "v" {
+                sb_append(sb, elem_text(d, k))
+            } else if tg == "is" {
+                sb_append(sb, subtree_text(d, k))
+            }
+        } else if xm.kind(d, k) == 1 {
+            sb_append(sb, xm.content(d, k))
+        }
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// 单元格引用 "A1"/"B12" → (列索引 0 基, 行索引 0 基)。
+func cell_ref(r: string) -> (i64, i64) {
+    var col: i64 = 0
+    var rowab: string = ""
+    var n = str_len(r)
+    var i: i64 = 0
+    while i < n {
+        var cp = char_code(str_char(r, i))
+        if cp >= 65 && cp <= 90 {            // A..Z
+            col = col * 26 + (cp - 64)
+        } else {
+            rowab = rowab + str_char(r, i)
+        }
+        i = i + 1
+    }
+    var row = parse_int(rowab) - 1
+    if row < 0 {
+        row = 0
+    }
+    return (col - 1, row)
+}
+
+// ============================================================================
+// 三、工作簿表层：xlsx_sheet_names
+// ============================================================================
+
+// 列出工作簿的全部工作表名（按 workbook.xml 顺序）。
+pub func xlsx_sheet_names(xb: table<i64>) -> table<string> {
+    var wtxt = entry_text(xb, "xl/workbook.xml")
+    var out = table_new_string()
+    if str_len(wtxt) == 0 {
+        return out
+    }
+    var d = xm.parse(wtxt)
+    if !xm.is_ok(d) {
+        return out
+    }
+    var sh = xm.query(d, "sheet")
+    var n = len(sh)
+    var i: i64 = 0
+    while i < n {
+        table_push(out, xm.attr(d, sh[i], "name"))
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================================
+// 四、整表读取：xlsx_read
+// ============================================================================
+
+// 读取指定工作表为行栅格。返回 (ok, rows)；rows[i][j] = 第 i 行第 j 列串值。
+pub func xlsx_read(xb: table<i64>, sheet_name: string) -> (bool, table<table<string>>) {
+    var names = xlsx_sheet_names(xb)
+    var n = len(names)
+    var idx: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        if names[i] == sheet_name {
+            idx = i
+        }
+        i = i + 1
+    }
+    var empty: table<table<string>> = []
+    if idx < 0 {
+        return (false, empty)
+    }
+    // XL sheet 文件名约定：按 workbook 顺序 → sheet1.xml / sheet2.xml ...
+    var sheettxt = entry_text(xb, "xl/worksheets/sheet" + to_string(idx + 1) + ".xml")
+    if str_len(sheettxt) == 0 {
+        return (false, empty)
+    }
+    // 共享字符串池（可选）
+    var sst = shared_strings(xb)
+    var d = xm.parse(sheettxt)
+    if !xm.is_ok(d) {
+        return (false, empty)
+    }
+    var rows = rows_from_sheet(d, sst)
+    return (true, rows)
+}
+
+// 解析共享字符串池（xl/sharedStrings.xml）→ 表；无该文件返回空表。
+func shared_strings(xb: table<i64>) -> table<string> {
+    var out = table_new_string()
+    var sxt = entry_text(xb, "xl/sharedStrings.xml")
+    if str_len(sxt) == 0 {
+        return out
+    }
+    var d = xm.parse(sxt)
+    if !xm.is_ok(d) {
+        return out
+    }
+    var sis = xm.query(d, "si")
+    var n = len(sis)
+    var i: i64 = 0
+    while i < n {
+        table_push(out, subtree_text(d, sis[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// 从解析好的 sheet 文档构建行栅格（行=数组，单元格按列定位补 "" 空槽）。
+func rows_from_sheet(d: XmlDoc, sst: table<string>) -> table<table<string>> {
+    var rows_el = xm.query(d, "row")
+    var n = len(rows_el)
+    var empty: table<table<string>> = []
+    if n == 0 {
+        return empty
+    }
+    var r0 = build_row(d, rows_el[0], sst)
+    var rows: table<table<string>> = [r0]
+    var i: i64 = 1
+    while i < n {
+        table_push(rows, build_row(d, rows_el[i], sst))
+        i = i + 1
+    }
+    return rows
+}
+
+// 建一行：cells 按 <c r="A1"> 的列字母放置到数组，空槽补 ""，尾随空删除。
+func build_row(d: XmlDoc, rowel: i64, sst: table<string>) -> table<string> {
+    var cells = table_new_string()
+    var kids = xm.children(d, rowel)
+    var kn = len(kids)
+    var k: i64 = 0
+    var maxc: i64 = -1
+    while k < kn {
+        var c = kids[k]
+        if xm.kind(d, c) == 0 && xm.tag(d, c) == "c" {
+            var cref = xm.attr(d, c, "r")
+            var (col, _) = cell_ref(cref)
+            var typ = xm.attr(d, c, "t")
+            var val = cell_value(d, c)
+            if typ == "s" {
+                var sindex = parse_int(val)
+                if sindex >= 0 && sindex < len(sst) {
+                    val = sst[sindex]
+                } else {
+                    val = ""
+                }
+            } else if typ == "b" {
+                if val == "1" {
+                    val = "TRUE"
+                } else {
+                    val = "FALSE"
+                }
+            } else if typ == "inlineStr" {
+                // cell_value 已取 <is><t> 文本
+            }
+            while len(cells) <= col {
+                table_push(cells, "")
+            }
+            cells[col] = val
+            if col > maxc {
+                maxc = col
+            }
+        }
+        k = k + 1
+    }
+    if maxc < 0 {
+        return [""]          // 空行：返回一个空占位元素（避免空行歧义）
+    }
+    var res = table_new_string()
+    var j: i64 = 0
+    while j <= maxc {
+        table_push(res, cells[j])
+        j = j + 1
+    }
+    return res
+}
+
+}   // namespace xlsx

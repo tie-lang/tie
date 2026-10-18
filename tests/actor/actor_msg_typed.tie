@@ -1,0 +1,52 @@
+type tie<logic>
+// actor_msg_typed.tie —— actor 消息参数**类型化**回归（2026-03-03 架构增强）
+// ============================================================================
+// 消息参数区原是「固定 8 字节 i64 槽」⇒ 只能传 i64；传 fn（16 字节 `{ptr,ptr}`）
+// 会同时触发类型不匹配与越界，后端 opt 崩溃：
+//   '%fn.0' defined with type '{ ptr, ptr }' but expected 'i64'
+// 增强后：参数区是每槽 64 字节**字节缓冲**，参数按自身类型打包、8 字节对齐
+// （后端 `actor_arg_byte_off`，发送侧与 dispatch 侧共用），唯一约束是总字节 ≤ 64。
+//
+// 本探针：① i64 参数（基线，必须仍正确）② fn 参数（16 字节聚合，以前崩溃）
+// 运行需要 TIE_TRM_LITE_LIB 指向 trm_lite.a。
+// 依赖：编译期需重建库（trm-lite 的 tl_runtime.tie 已补 tl_sync import）。
+
+actor Worker {
+    var base: i64 = 0
+
+    // ① 基线：i64 参数
+    pub func setup(b: i64) -> i64 {
+        base = b
+        return b
+    }
+
+    // ② 增强目标：fn 参数（16 字节聚合）+ 另一个 i64，验证类型化打包的偏移
+    pub func apply(f: fn(i64) -> i64, x: i64) -> i64 {
+        return f(x) + base
+    }
+}
+
+func main() {
+    var w = run Worker()
+    var s = w.setup(100)
+    var k: i64 = 5
+    var r = w.apply(func(y: i64) -> i64 { return y * k }, 3)
+    // 期望：setup=100，apply = 3*5 + 100 = 115
+    if s == 100 {
+        println("PASS actor-msg-typed setup=" + to_string(s))
+    } else {
+        println("FAIL actor-msg-typed setup=" + to_string(s) + " 期望 100")
+    }
+    if r == 115 {
+        println("PASS actor-msg-typed apply=" + to_string(r))
+    } else {
+        // 历史缺陷（2026-10-03 修复）：曾返回 0（编译期 IR 正确、运行期错）。
+        // 根因 = 消息参数区「未用尾字填零」的偏移写成 `k*8`（槽内第 k 个字），
+        // 与已用参数区**重叠**：fn 参数占 16 字节（offset 0..15），第 1 个未用尾字
+        // 写到 offset 8 ⇒ 覆盖闭包聚合的后半段（env 指针）⇒ env 变 null。
+        // 修复：尾字起点改为「已用区末尾（8 对齐）」，并加 64 字节槽边界守卫
+        // （backend/irgen_rt_p2.tie `tig_mq_publish`）。
+        println("FAIL actor-msg-typed apply=" + to_string(r) + " 期望 115"
+            + "（消息参数区尾字覆盖了 fn 聚合的 env 指针；不应再出现）")
+    }
+}

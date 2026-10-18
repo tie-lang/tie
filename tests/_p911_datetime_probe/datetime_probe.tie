@@ -1,0 +1,146 @@
+type tie<logic>
+// tests/_p911_datetime_probe/datetime_probe.tie —— p.9.1.1.4 验收：std/datetime。
+// 全离线确定性探针：
+//   1. 固定日期格式化（epoch → 字段 + %Y-%m-%d %H:%M:%S + 星期 + 闰日）；
+//   2. 解析回环（ISO 子集：date / date time / dateT / 带时区偏移 → to_epoch 对拍）；
+//   3. 跨月/闰年/跨年算术（add_seconds 回绕）与闰年判定；
+//   4. 时区偏移换算（同一 epoch，不同 offset 墙钟一致、UTC 反解正确）。
+// 期望全部 PASS / exit 0。
+import "/std/datetime.tie" as datetime
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func section_integers() {
+    // 破晓：1949-10-01（log2 经典）、2024-02-29 闰日、2000 世纪闰年、1900/2100 非闰
+    check(datetime.is_leap(2024), "2024 leap")
+    check(datetime.is_leap(2000), "2000 leap (400)")
+    check(datetime.is_leap(1900) == false, "1900 not leap (100)")
+    check(datetime.is_leap(2100) == false, "2100 not leap (100)")
+    check(datetime.is_leap(2023) == false, "2023 not leap")
+    check(datetime.days_in_month(2024, 2) == 29, "Feb 2024 = 29")
+    check(datetime.days_in_month(2023, 2) == 28, "Feb 2023 = 28")
+    check(datetime.days_in_month(2024, 4) == 30, "Apr = 30")
+    // 已知 epoch_days：1970-01-01 = 0；2000-01-01 与 JDN 对拍
+    check(datetime.epoch_days(1970, 1, 1) == 0, "epoch_days 1970-01-01 == 0")
+    check(datetime.epoch_days(2000, 1, 1) == 10957, "epoch_days 2000-01-01 == 10957")
+    check(datetime.epoch_days(2024, 2, 29) > 0, "2024 leap day positive ed")
+}
+
+func section_format_fixed() {
+    // 2000-01-03 12:34:56 UTC（2000-01-01=946684800 + 2*86400 + 45296）
+    var dt = datetime.from_epoch(946902896)
+    check(dt.ok, "from_epoch ok")
+    check(dt.y == 2000 && dt.mo == 1 && dt.d == 3, "from_epoch 2000-01-03")
+    // 2000-01-03 是星期日? 用 wday 判定：2000-01-01=Saturday(6), 01-03=Monday(1)
+    check(datetime.format_date(dt) == "2000-01-03", "format_date")
+    check(datetime.format_time(dt) == "12:34:56", "format_time")
+    // 选一个 h/mi/s 明确的 epoch：2000-01-01 00:00:00 = 946684800
+    var d0 = datetime.from_epoch(946684800)
+    check(datetime.format_iso(d0) == "2000-01-01 00:00:00", "format_iso epoch 00:00:00")
+    // 2000-01-01 是周六(6)
+    check(d0.wday == 6, "2000-01-01 wday=Saturday(6)")
+    // 1970-01-01 周四(4)
+    var d1 = datetime.from_epoch(0)
+    check(d1.wday == 4, "1970-01-01 wday=Thursday(4)")
+    // 2000-01-01 是 20 世纪 2000 年第 1 天 %j=001
+    check(datetime.format(d0, "%Y-%m-%d %H:%M:%S %j %u") == "2000-01-01 00:00:00 001 6",
+          "format %j/%u")
+}
+
+func section_parse() {
+    // 纯日期
+    var d = datetime.parse("1999-12-31")
+    check(d.ok, "parse date ok")
+    check(d.y == 1999 && d.mo == 12 && d.d == 31, "parse date fields")
+    check(datetime.format_date(d) == "1999-12-31", "parse date -> format roundtrip")
+    // 日期时间（空格分隔 / T 分隔）
+    var dt1 = datetime.parse("2024-02-29 23:59:58")
+    check(dt1.ok && dt1.h == 23 && dt1.mi == 59 && dt1.s == 58, "parse datetime space")
+    check(datetime.format_iso(dt1) == "2024-02-29 23:59:58", "parse dt -> format")
+    var dt2 = datetime.parse("2024-02-29T23:59:58")
+    check(dt2.ok && datetime.format_iso(dt2) == "2024-02-29 23:59:58", "parse T-separator")
+    // 时区偏移：+08:00
+    var dt3 = datetime.parse("2024-03-01 08:00:00+08:00")
+    check(dt3.ok && dt3.offset == 480, "parse offset +08:00 = 480")
+    // 同一时刻 UTC vs +08:00 墙钟差 8 小时 → to_epoch 相同
+    var a = datetime.parse("2024-03-01 08:00:00+08:00")
+    var b = datetime.parse("2024-03-01 00:00:00")   // UTC
+    check(datetime.to_epoch(a) == datetime.to_epoch(b), "offset to_epoch equal")
+    // 负偏移 -05:00
+    var c = datetime.parse("2024-03-01 00:00:00-05:00")
+    check(c.offset == -300, "parse offset -05:00 = -300")
+    // 年不足4位 / 非法月 → ok=false
+    var bad1 = datetime.parse("123")
+    check(bad1.ok == false, "parse short year -> false")
+    var bad2 = datetime.parse("2024-13-01")
+    check(bad2.ok == false, "parse month 13 -> false")
+    var bad3 = datetime.parse("2024-02-30")
+    check(bad3.ok == false, "parse Feb 30 -> false")
+}
+
+func section_roundtrip_epoch() {
+    // 任意时刻 to_epoch - from_epoch - to_epoch 不动点
+    var sec = 1735689600   // 2025-01-01 00:00:00 UTC
+    var dt = datetime.from_epoch(sec)
+    check(datetime.to_epoch(dt) == sec, "epoch roundtrip identity")
+    // add_seconds 跨年/跨闰年回绕
+    var d = datetime.from_epoch(0)   // 1970-01-01
+    var dnext = datetime.add_seconds(d, 366 * 86400)   // 1970 平年 → 366 天 = 1971-01-02
+    check(dnext.y == 1971 && dnext.mo == 1 && dnext.d == 2, "add_seconds across year")
+    // 2024-02-28 +2 天 = 2024-03-01（跨闰日）
+    var leap = datetime.parse("2024-02-28")
+    var lafter = datetime.add_seconds(leap, 2 * 86400)
+    check(lafter.y == 2024 && lafter.mo == 3 && lafter.d == 1, "add across leap day")
+    // UTC 减一秒跨日
+    var d0 = datetime.parse("2024-03-01 00:00:00")
+    var dminus = datetime.add_seconds(d0, -1)
+    check(dminus.mo == 2 && dminus.d == 29 && dminus.h == 23 && dminus.mi == 59 && dminus.s == 59,
+          "add -1s across midnight leap year")
+    // parse_utc：+08:00 → UTC 字段回退 8 小时
+    var pu = datetime.parse_utc("2024-03-01 08:00:00+08:00")
+    check(pu.ok && pu.offset == 0 && pu.h == 0, "parse_utc converts offset to UTC")
+}
+
+func section_timezone() {
+    // 同一 epoch，+08:00 与 +09:00 墙钟相差 1 小时
+    var sec = 1704067200   // 2024-01-01 00:00:00 UTC
+    var tz8 = datetime.from_epoch_offset(sec, 480)
+    var tz9 = datetime.from_epoch_offset(sec, 540)
+    check(tz8.offset == 480 && tz9.offset == 540, "from_epoch_offset offsets")
+    check(tz8.h == 8 && tz9.h == 9, "offset wall-clock +8/+9 hours")
+    // 反解：墙钟 to_epoch 一致
+    check(datetime.to_epoch(tz8) == sec && datetime.to_epoch(tz9) == sec, "to_epoch recovers UTC")
+    // 跨时区同墙钟：不同 epoch
+    var utc8 = datetime.parse("2024-01-01 08:00:00")
+    var loc8 = datetime.parse("2024-01-01 08:00:00+08:00")
+    check(datetime.to_epoch(loc8) - datetime.to_epoch(utc8) == -480 * 60, "offset hour conversion")
+    // 时区偏移字符串 %z
+    check(datetime.format(tz8, "%Y-%m-%d %H:%M:%S %z") == "2024-01-01 08:00:00 +0800",
+          "format %z +0800")
+    var neg = datetime.parse("2024-03-01 00:00:00-05:00")
+    check(datetime.format(neg, "%z") == "-0500", "format %z -0500")
+}
+
+func main() {
+    println("start")
+    section_integers()
+    section_format_fixed()
+    section_parse()
+    section_roundtrip_epoch()
+    section_timezone()
+    if fails == 0 {
+        println("PASS")
+    } else {
+        println("FAIL count=" + to_string(fails))
+    }
+    println("done")
+}

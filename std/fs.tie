@@ -1,0 +1,397 @@
+type tie<class>
+// fs.tie：标准库——完整文件系统模块（命名空间 fs）。
+// ============================================================
+// 对齐 Rust std::fs 的常用 API 形态；全部文件操作底层为 **UTF-8
+// 安全桥**（crates/tie-interp 的 Rust std::fs 实现，Windows 走宽字符
+// API）——中文/Unicode 路径天然支持（曾用 libc fopen/remove，按 ANSI
+// 代码页误读 UTF-8 字节，中文路径必失败）。
+//
+// 底座原语返回约定：
+//   - file_read(path) -> string：失败返回空串（无法区分"空文件"与"失败"，
+//     故读取类接口统一返回 Result，用 file_exists 前置校验区分）；
+//   - file_write / file_append / file_delete / file_copy / file_move /
+//     mkdir_all / remove_dir_all / copy_dir / untar_gz / unzip -> bool；
+//   - file_exists(path) -> bool；file_size(path) -> i64（失败 -1）；
+//   - file_is_dir / file_is_file(path) -> bool；
+//   - list_dir / walk_dir(path) -> table<string>：失败返回空表。
+// Windows 注意：路径反斜杠在 tie 源码字符串中须写成 \\（如 "F:\\tmp\\a.txt"）。
+//
+// 调用：import 后 fs.read_text(...) / fs.exists(...) / fs.write_text(...)；
+// 命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 fs_ 前缀（统一 func 写法，Harbor M2.1.6）。
+// library-v2：读取类返回 Result<string, string>（失败 Err 带错误消息），
+// 写/删类保持 bool；别名去重（read_to_string→read_text、write→write_text、
+// append→append_text、remove_file/delete→remove、remove_dir_all→remove_all、
+// mkdir_all→create_dir_all、move→rename、list→read_dir）。
+
+import "./result.tie"
+
+namespace fs {
+// ---------- 读取 ----------
+
+// 读取文本文件全部内容（Rust std::fs::read_to_string 风格）。
+// 成功 Ok(全文)；文件不存在/读取失败 Err(错误消息)。
+pub func read_text(path: string) -> Result<string, string> {
+    if !file_exists(path) {
+        return Result.Err("read_text: 文件不存在: " + path)
+    }
+    return Result.Ok(file_read(path))
+}
+
+// 读取文件原始字节（byte_read 底座），返回字节表（元素 i64，值域 0..255，
+// D7 编解码器约定）；失败返回空表。
+// 注：本应返回 Result<table<i64>, string>，但编译器 enum payload 白名单
+// 仅支持标量（i8..u64/bool/char/trit/string），table 作 payload 编译不过，
+// 故保持原始空表哨兵；需精确判断时先用 exists() 前置检查。
+pub func read_bytes(path: string) -> table<i64> {
+    return byte_read(path)
+}
+
+// 按行读取文本文件（\n 拆分，去掉 Windows 行尾 \r）；空文件返回空表。
+// 注：同理（payload 白名单已放开，见 read_bytes 注）保持空表哨兵签名。
+pub func read_lines(path: string) -> table<string> {
+    var rows = table_new_string()
+    var content = file_read(path)
+    var n: i64 = str_len(content)
+    var line: string = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(content, i)
+        if c == "\n" {
+            // 行结束：去掉行尾 \r 后入表
+            var m: i64 = str_len(line)
+            if m > 0 && str_char(line, m - 1) == "\r" {
+                line = str_char_slice(line, 0, m - 1)
+            }
+            table_push(rows, line)
+            line = ""
+        } else {
+            line = line + c
+        }
+        i = i + 1
+    }
+    // 末尾无换行时补最后一行（非空）
+    if str_len(line) > 0 {
+        table_push(rows, line)
+    }
+    return rows
+}
+
+// ---------- 写入 ----------
+
+// 覆盖写入文本文件（Rust std::fs::write 风格）；成功返回 true。
+pub func write_text(path: string, content: string) -> bool {
+    return file_write(path, content)
+}
+
+// 追加文本到文件末尾（不存在则创建）；成功返回 true。
+pub func append_text(path: string, content: string) -> bool {
+    return file_append(path, content)
+}
+
+// 多行写入：lines 逐行以 \n 连接后覆盖写入（末行不带换行符）。
+pub func write_lines(path: string, lines: table<string>) -> bool {
+    var content: string = ""
+    var n: i64 = len(lines)
+    var i: i64 = 0
+    while i < n {
+        content = content + lines[i]
+        if i + 1 < n {
+            content = content + "\n"
+        }
+        i = i + 1
+    }
+    return file_write(path, content)
+}
+
+// ---------- 元数据 ----------
+
+// 文件（或目录）是否存在。
+pub func exists(path: string) -> bool {
+    return file_exists(path)
+}
+
+// 路径是否为普通文件。
+pub func is_file(path: string) -> bool {
+    return file_is_file(path)
+}
+
+// 路径是否为目录。
+pub func is_dir(path: string) -> bool {
+    return file_is_dir(path)
+}
+
+// 文件字节大小；失败（不存在/目录）返回 -1。
+pub func size(path: string) -> i64 {
+    return file_size(path)
+}
+
+// ---------- 删除 ----------
+
+// 删除文件；成功返回 true（文件不存在返回 false，与 libc remove 语义一致）。
+pub func remove(path: string) -> bool {
+    return file_delete(path)
+}
+
+// 递归删除目录及其全部内容；成功返回 true。
+pub func remove_all(path: string) -> bool {
+    return remove_dir_all(path)
+}
+
+// ---------- 目录 ----------
+
+// 递归创建目录（含中间层级）；成功返回 true（已存在亦成功）。
+pub func create_dir_all(path: string) -> bool {
+    return mkdir_all(path)
+}
+
+// 列出目录下的直接条目（文件名，不含路径前缀）；失败返回空表。
+pub func read_dir(path: string) -> table<string> {
+    return list_dir(path)
+}
+
+// 递归遍历目录，返回全部文件/目录路径；失败返回空表。
+pub func walk(path: string) -> table<string> {
+    return walk_dir(path)
+}
+
+// 递归复制目录 src → dst；成功返回 true。
+pub func copy_dir(src: string, dst: string) -> bool {
+    return copy_dir(src, dst)
+}
+
+// ---------- 复制 / 移动 ----------
+
+// 复制文件 src → dst（Rust std::fs::copy 风格）；成功返回 true。
+pub func copy(src: string, dst: string) -> bool {
+    return file_copy(src, dst)
+}
+
+// 移动/重命名文件 src → dst（Rust std::fs::rename 风格）；成功返回 true。
+pub func rename(src: string, dst: string) -> bool {
+    return file_move(src, dst)
+}
+
+// ---------- 归档 ----------
+
+// 解压 .tar.gz 归档到 dest 目录；成功返回 true。
+pub func untar_gz(file: string, dest: string) -> bool {
+    return untar_gz(file, dest)
+}
+
+// 解压 .zip 归档到 dest 目录；成功返回 true。
+pub func unzip(file: string, dest: string) -> bool {
+    return unzip(file, dest)
+}
+
+// ---------- 内部辅助 ----------
+
+// 取字符串 [start, end) 子串（码点级）。read_lines 的内部辅助——不用
+// std/string.tie 的 str.slice（保持 fs 模块最小依赖），str_char 逐码点拼接。
+func str_char_slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================================
+// 增强（p.9.1.1.18）：file_size 别名 / 递归目录复制（含 exclude 前缀过滤）/
+// 目录递归大小聚合。全部在现有底座原语（walk_dir / file_is_file / file_size /
+// file_copy / mkdir_all）之上组合，纯 tie，向后兼容。
+// ============================================================================
+
+// 取首个子串位置（码点级）；未找到返回 -1。walk_dir 结果的相对路径切分用。
+func str_find_i(s: string, sub: string) -> i64 {
+    var n = str_len(s)
+    var m = str_len(sub)
+    if m == 0 {
+        return 0
+    }
+    if m > n {
+        return -1
+    }
+    var i: i64 = 0
+    while i <= n - m {
+        var j: i64 = 0
+        var ok = true
+        while j < m {
+            if str_char(s, i + j) != str_char(sub, j) {
+                ok = false
+            }
+            j = j + 1
+        }
+        if ok {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 字符串 s 是否以 p 为前缀（码点级）。
+func str_has_prefix(s: string, p: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(p)
+    if m > n {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(p, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 把反斜杠统一为 "/"，供路径前缀比较（Windows 原生为 "\\"，二者等价比较）。
+func fwd(p: string) -> string {
+    var out: string = ""
+    var n = str_len(p)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(p, i)
+        if c == "\\" {
+            out = out + "/"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 相对路径 rel 是否命中任一 exclude 前缀（"目录/子树" 或 "文件" 整体跳过）。
+// 匹配规则：rel == ex 或 rel 以 "ex/" 开头（边界感知，避免 "abc" 误匹配 "abcx"）。
+func is_excluded(rel: string, exclude: table<string>) -> bool {
+    var f = fwd(rel)
+    var n = len(exclude)
+    var i: i64 = 0
+    while i < n {
+        var ex = fwd(exclude[i])
+        if f == ex {
+            return true
+        }
+        if str_has_prefix(ex, "..") == false && str_has_prefix(f, ex + "/") {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 对象大小别名：fs.file_size(path) （与 size 等价，Rust std::fs::metadata().len
+// 形态；失败/目录返回 -1）。
+pub func file_size(path: string) -> i64 {
+    return file_size(path)
+}
+
+// 目录递归总大小（字节）：累加 walk 结果中所有普通文件 size；目录/不存在返回 0。
+pub func dir_size(path: string) -> i64 {
+    var entries = walk_dir(path)
+    var n = len(entries)
+    var total: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var p = entries[i]
+        if p != path && file_is_file(p) {
+            var s = file_size(p)
+            if s >= 0 {
+                total = total + s
+            }
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// 递归复制目录 src → dst（保留相对目录结构），exclude 内为相对路径前缀，
+// 命中即整体跳过（子树/文件）。exclude 为空表则全量复制。成功返回 true；
+// 任一子项失败置 false 并继续尝试其余（尽力而为）。
+pub func copy_tree(src: string, dst: string, exclude: table<string>) -> bool {
+    var all = walk_dir(src)
+    var n = len(all)
+    var ok: bool = true
+    var i: i64 = 0
+    while i < n {
+        var p = all[i]
+        var rel = rel_under(p, src)
+        if rel == "" {
+            // src 自身：确保 dst 目录存在
+            if !mkdir_all(dst) {
+                ok = false
+            }
+        } else if !is_excluded(rel, exclude) {
+            var dp = join_sep(dst, rel)
+            if file_is_dir(p) {
+                if !mkdir_all(dp) {
+                    ok = false
+                }
+            } else {
+                // 先确保目标文件父目录存在（walk 已含各目录，这里再兜底一次）
+                if !mkdir_all(parent_of(dp)) {
+                    ok = false
+                }
+                if !file_copy(p, dp) {
+                    ok = false
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+// 判断绝对路径 p 是否在 src 之下：p==src 返回 ""，pc==src+"\\"+rel 时返回 rel，
+// 否则（恰好前缀重合但非子孙，如 src="a" p="ab"）返回空串并按"不复制该条目"处理。
+func rel_under(p: string, src: string) -> string {
+    if p == src {
+        return ""
+    }
+    var sep = norm_sep_char(p)
+    var pre = src + sep
+    if str_has_prefix(p, pre) {
+        return str_char_slice(p, str_len(pre), str_len(p))
+    }
+    return ""
+}
+
+// p 的实际路径分隔符（"\\" 或 "/" 均接受；用于拼接 dst 子路径）。
+func norm_sep_char(p: string) -> string {
+    if str_find_i(p, "\\") >= 0 {
+        return "\\"
+    }
+    return "/"
+}
+
+// 拼接 dst 与 rel（复用 dst 自身分隔符 repr 的目录分隔符；Windows 直反斜杠）。
+func join_sep(dst: string, rel: string) -> string {
+    if str_find_i(dst, "\\") >= 0 {
+        return dst + "\\" + rel
+    }
+    return dst + "/" + rel
+}
+
+// 取路径的父目录（最后一个分隔符之前；无分隔符返回空串）。
+func parent_of(p: string) -> string {
+    var n = str_len(p)
+    var idx: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(p, i)
+        if c == "\\" || c == "/" {
+            idx = i
+        }
+        i = i + 1
+    }
+    if idx < 0 {
+        return ""
+    }
+    return str_char_slice(p, 0, idx)
+}
+}

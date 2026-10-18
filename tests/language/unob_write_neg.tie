@@ -1,0 +1,35 @@
+type tie<logic>
+// ============================================================
+// 规范 §13.1「不可观测写入」负例：按值表形参的直接写入 = 编译错误。
+//   1. 下标写 `t[0] = value`
+//   2. 反向箭头下标写 `t[0] <- value`
+//   3. 变更内建追加 `table_push(t, value)`
+//   4. 变更内建弹出 `table_pop(t)`
+//   5. 元素追加 `t <- value`（3.11 形态，改写为 table_push）
+//   6. 箭头追加 `1 -> table_push(t)`（数据作末参 = table_push(t, 1)）
+// 按值表形参只改本函数副本，调用方永不观察——任一命中即编译失败
+// （回归把 *_neg*.tie 应拒编译视为 PASS）。
+// 对照正例：unob_write_pos.tie（ref / move / 局部合并 / 全局表）。
+// ============================================================
+func bad_index(t: table<i64>) -> i64 {
+    t[0] = 7         // 1. 不可观测写入
+    return t[0]
+}
+func bad_arrow_index(t: table<i64>) {
+    t[0] <- 1        // 2. 不可观测写入（反向箭头下标形态）
+}
+func bad_push(t: table<i64>) {
+    table_push(t, 7) // 3. 不可观测写入（变更内建·追加）
+}
+func bad_pop(t: table<i64>) -> i64 {
+    return table_pop(t)   // 4. 不可观测写入（变更内建·弹出）
+}
+func bad_append(t: table<i64>) {
+    t <- 1           // 5. 不可观测写入（3.11 追加形态）
+}
+func bad_arrow_push(t: table<i64>) {
+    1 -> table_push(t)   // 6. 不可观测写入（箭头形态）
+}
+func main() {
+    println("unreachable")
+}

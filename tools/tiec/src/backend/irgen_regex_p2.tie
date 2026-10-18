@@ -1,0 +1,349 @@
+type tie<class>
+// compiler/backend/irgen_regex_p2.tie —— irgen_regex 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 irgen_regex.tie。
+namespace irgen {
+func rex_bridge_find_all(id: i64) -> i64 {
+    g_used_interp = true
+    var s = tig_expr(call_arg(id, 0))
+    if s < 0 {
+        return -1
+    }
+    var p = tig_expr(call_arg(id, 1))
+    if p < 0 {
+        return -1
+    }
+    g_builtin_res = tig_ext_call2("tie_regex_find_all", s, types.named(TK_STR), p, types.named(TK_STR), types.named(TK_STR))
+    return 0
+}
+
+func rex_bridge_group(id: i64) -> i64 {
+    g_used_interp = true
+    var g1 = tig_expr(call_arg(id, 0))
+    if g1 < 0 {
+        return -1
+    }
+    var g2 = tig_expr(call_arg(id, 1))
+    if g2 < 0 {
+        return -1
+    }
+    var g3 = tig_expr(call_arg(id, 2))
+    if g3 < 0 {
+        return -1
+    }
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, g1)
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, g2)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, g3)
+    g_builtin_res = tig_ext_call_typed("tie_regex_group", ats, avs, types.named(TK_STR))
+    return 0
+}
+
+func rex_bridge_replace(id: i64) -> i64 {
+    g_used_interp = true
+    var r1 = tig_expr(call_arg(id, 0))
+    if r1 < 0 {
+        return -1
+    }
+    var r2 = tig_expr(call_arg(id, 1))
+    if r2 < 0 {
+        return -1
+    }
+    var r3 = tig_expr(call_arg(id, 2))
+    if r3 < 0 {
+        return -1
+    }
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, r1)
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, r2)
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, r3)
+    g_builtin_res = tig_ext_call_typed("tie_regex_replace", ats, avs, types.named(TK_STR))
+    return 0
+}
+
+func tig_regex_match(id: i64) -> i64 {
+    if !rex_lit_pat(id) {
+        return rex_bridge_match(id)
+    }
+    var T64 = types.named(TK_I64)
+    var TB = types.named(TK_BOOL)
+    if !rex_prelude(id) {
+        g_builtin_res = tig_bool_lit(0)
+        return 0
+    }
+    var cont = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.cont")))
+    var succ = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.suc")))
+    var fail = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.fai")))
+    var done = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.don")))
+    var resb = rx_alloca(TB)
+    var pre = rex_emit_attempt(succ, fail)
+    g_cur_block = succ
+    s21_store(resb, tig_bool_lit(1), TB)
+    rx_jmp(cont)
+    g_cur_block = fail
+    var nsp = s21_bin(0, s21_load(g_rx_spa, T64), tig_int_lit(1))
+    s21_store(g_rx_spa, nsp, T64)
+    rx_cbr(tig_icmp_c(nsp, g_rx_slen, 4), pre, done)
+    g_cur_block = done
+    s21_store(resb, tig_bool_lit(0), TB)
+    rx_jmp(cont)
+    g_cur_block = cont
+    g_builtin_res = s21_load(resb, TB)
+    return 0
+}
+
+func tig_regex_find(id: i64) -> i64 {
+    if !rex_lit_pat(id) {
+        return rex_bridge_find(id)
+    }
+    var T64 = types.named(TK_I64)
+    var TS = types.named(TK_STR)
+    if !rex_prelude(id) {
+        g_builtin_res = rx_empty_str()
+        return 0
+    }
+    var cont = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.cont")))
+    var succ = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.suc")))
+    var fail = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.fai")))
+    var done = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.don")))
+    var resa = rx_alloca(TS)
+    var pre = rex_emit_attempt(succ, fail)
+    g_cur_block = succ
+    s21_store(resa, s21_str_sub_bytes(g_rx_s, s21_load(g_rx_spa, T64), s21_load(g_rx_enda, T64)), TS)
+    rx_jmp(cont)
+    g_cur_block = fail
+    var nsp = s21_bin(0, s21_load(g_rx_spa, T64), tig_int_lit(1))
+    s21_store(g_rx_spa, nsp, T64)
+    rx_cbr(tig_icmp_c(nsp, g_rx_slen, 4), pre, done)
+    g_cur_block = done
+    s21_store(resa, rx_empty_str(), TS)
+    rx_jmp(cont)
+    g_cur_block = cont
+    g_builtin_res = s21_load(resa, TS)
+    return 0
+}
+
+func tig_regex_group(id: i64) -> i64 {
+    if !rex_lit_pat(id) {
+        return rex_bridge_group(id)
+    }
+    var T64 = types.named(TK_I64)
+    var TS = types.named(TK_STR)
+    var gi = tig_expr(call_arg(id, 2))
+    if gi < 0 {
+        return -1
+    }
+    if !rex_prelude(id) {
+        g_builtin_res = rx_empty_str()
+        return 0
+    }
+    var cont = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.cont")))
+    var succ = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.suc")))
+    var fail = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.fai")))
+    var done = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.don")))
+    var resa = rx_alloca(TS)
+    var pre = rex_emit_attempt(succ, fail)
+    g_cur_block = succ
+    s21_store(resa, rex_group_res(gi, s21_load(g_rx_spa, T64), s21_load(g_rx_enda, T64)), TS)
+    rx_jmp(cont)
+    g_cur_block = fail
+    var nsp = s21_bin(0, s21_load(g_rx_spa, T64), tig_int_lit(1))
+    s21_store(g_rx_spa, nsp, T64)
+    rx_cbr(tig_icmp_c(nsp, g_rx_slen, 4), pre, done)
+    g_cur_block = done
+    s21_store(resa, rx_empty_str(), TS)
+    rx_jmp(cont)
+    g_cur_block = cont
+    g_builtin_res = s21_load(resa, TS)
+    return 0
+}
+
+// 提取第 i 组子串（i==0 整体；否则 slots）；phi 汇合
+func rex_group_res(gi: i64, spv: i64, env: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var whole_blk = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.gw")))
+    var gblk = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.gg")))
+    var contb = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.gm")))
+    var gres = rx_alloca(T64)
+    rx_cbr(tig_icmp_c(gi, tig_int_lit(0), 0), whole_blk, gblk)
+    g_cur_block = whole_blk
+    s21_store(gres, spv, T64)
+    var b1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b1, contb, 1)
+    g_cur_block = gblk
+    var g2 = s21_bin(2, gi, tig_int_lit(2))
+    var slots = g_rx_slotsv
+    var gs0 = s21_table_at(slots, g2, g_rx_okptr, T64)
+    var gs1 = s21_table_at(slots, s21_bin(0, g2, tig_int_lit(1)), g_rx_okptr, T64)
+    s21_store(gres, gs0, T64)
+    var b2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b2, contb, 1)
+    // gres 需同时带终点——用第二个槽存 end（gru）. 简化为栈：whole→spv/env；group→[gs0,gs1]
+    // 重新以 phi 获得 p0=start, p1=end
+    g_cur_block = contb
+    var p0 = ir.new_inst(g_cur_block, 33, T64)
+    ir.add_operand(p0, spv, 0)
+    ir.add_operand(p0, whole_blk, 1)
+    ir.add_operand(p0, gs0, 0)
+    ir.add_operand(p0, gblk, 1)
+    var p1 = ir.new_inst(g_cur_block, 33, T64)
+    ir.add_operand(p1, env, 0)
+    ir.add_operand(p1, whole_blk, 1)
+    ir.add_operand(p1, gs1, 0)
+    ir.add_operand(p1, gblk, 1)
+    return s21_str_sub_bytes(g_rx_s, ir.get_value(p0), ir.get_value(p1))
+}
+
+func tig_regex_find_all(id: i64) -> i64 {
+    if !rex_lit_pat(id) {
+        return rex_bridge_find_all(id)
+    }
+    var T64 = types.named(TK_I64)
+    var TS = types.named(TK_STR)
+    if !rex_prelude(id) {
+        g_builtin_res = s21_table_new(tig_int_lit_ty(8, T64))
+        return 0
+    }
+    var rtab = s21_table_new(tig_int_lit_ty(8, T64))
+    var cont = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.cont")))
+    var succ = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.suc")))
+    var fail = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.fai")))
+    var finalb = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.fin")))
+    var pre = rex_emit_attempt(succ, fail)
+    g_cur_block = succ
+    var csp = s21_load(g_rx_spa, T64)
+    var cend = s21_load(g_rx_enda, T64)
+    s21_table_push(rtab, TS, s21_str_sub_bytes(g_rx_s, csp, cend))
+    var gt = tig_icmp_c(cend, csp, 3)
+    var nsp2 = tig_select_i(gt, cend, s21_bin(0, cend, tig_int_lit(1)), T64)
+    s21_store(g_rx_spa, nsp2, T64)
+    rx_cbr(tig_icmp_c(nsp2, g_rx_slen, 4), pre, finalb)
+    g_cur_block = fail
+    var nsp3 = s21_bin(0, s21_load(g_rx_spa, T64), tig_int_lit(1))
+    s21_store(g_rx_spa, nsp3, T64)
+    rx_cbr(tig_icmp_c(nsp3, g_rx_slen, 4), pre, finalb)
+    g_cur_block = finalb
+    rx_jmp(cont)
+    g_cur_block = cont
+    g_builtin_res = rtab
+    return 0
+}
+
+func tig_regex_replace(id: i64) -> i64 {
+    if !rex_lit_pat(id) {
+        return rex_bridge_replace(id)
+    }
+    var T64 = types.named(TK_I64)
+    var TS = types.named(TK_STR)
+    var repl = tig_expr(call_arg(id, 2))
+    if repl < 0 {
+        return -1
+    }
+    if !rex_prelude(id) {
+        g_builtin_res = rx_empty_str()
+        return 0
+    }
+    var sb = s21_sb_new()
+    var lasta = rx_alloca(T64)
+    s21_store(lasta, tig_int_lit(0), T64)
+    var resa = rx_alloca(TS)
+    var cont = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.cont")))
+    var succ = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.suc")))
+    var fail = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.fai")))
+    var finalb = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.fin")))
+    var pre = rex_emit_attempt(succ, fail)
+    g_cur_block = succ
+    var csp = s21_load(g_rx_spa, T64)
+    var cend = s21_load(g_rx_enda, T64)
+    s21_sb_append(sb, s21_str_sub_bytes(g_rx_s, s21_load(lasta, T64), csp))
+    rex_emit_repl(sb, repl, csp, cend)
+    s21_store(lasta, cend, T64)
+    var gt = tig_icmp_c(cend, csp, 3)
+    var nsp2 = tig_select_i(gt, cend, s21_bin(0, cend, tig_int_lit(1)), T64)
+    s21_store(g_rx_spa, nsp2, T64)
+    rx_cbr(tig_icmp_c(nsp2, g_rx_slen, 4), pre, finalb)
+    g_cur_block = fail
+    var nsp3 = s21_bin(0, s21_load(g_rx_spa, T64), tig_int_lit(1))
+    s21_store(g_rx_spa, nsp3, T64)
+    rx_cbr(tig_icmp_c(nsp3, g_rx_slen, 4), pre, finalb)
+    g_cur_block = finalb
+    s21_sb_append(sb, s21_str_sub_bytes(g_rx_s, s21_load(lasta, T64), g_rx_slen))
+    s21_store(resa, s21_sb_build(sb), TS)
+    rx_jmp(cont)
+    g_cur_block = cont
+    g_builtin_res = s21_load(resa, TS)
+    return 0
+}
+
+// 生成替换引用扫描：扫 repl 字节，$N/$0 → 捕获组，其余字面。结束后当前块=exit。
+func rex_emit_repl(sb: i64, repl: i64, csp: i64, cend: i64) {
+    var T64 = types.named(TK_I64)
+    var ii = rx_alloca(T64)
+    var rlen = s21_str_head_len(repl)
+    s21_store(ii, tig_int_lit(0), T64)
+    var head = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.rhead")))
+    var body = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.rbody")))
+    var exit = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.rexit")))
+    rx_jmp(head)
+    g_cur_block = head
+    var ci = s21_load(ii, T64)
+    rx_cbr(tig_icmp_c(ci, rlen, 2), body, exit)
+    g_cur_block = body
+    var rb = s21_str_byte(repl, ci)
+    var dblk = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.rdll")))
+    var litblk = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.rlit")))
+    rx_cbr(tig_icmp_c(rb, tig_int_lit(36), 0), dblk, litblk)
+    g_cur_block = dblk
+    var cip1 = s21_bin(0, ci, tig_int_lit(1))
+    var digchk = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.rdig")))
+    var litd = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.rdol")))
+    rx_cbr(tig_icmp_c(cip1, rlen, 2), digchk, litd)
+    g_cur_block = digchk
+    var d = s21_str_byte(repl, cip1)
+    var digblk = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.rdok")))
+    rx_cbr(tig_and_i1(tig_icmp_c(d, tig_int_lit(48), 5), tig_icmp_c(d, tig_int_lit(57), 4)), digblk, litd)
+    g_cur_block = digblk
+    var gi = s21_bin(1, d, tig_int_lit(48))
+    var gw = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.replw")))
+    var gg = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.replg")))
+    var gmerge = ir.new_block(g_cur_func, interner.intern(rx_bnm("rx.replm")))
+    rx_cbr(tig_icmp_c(gi, tig_int_lit(0), 0), gw, gg)
+    g_cur_block = gw
+    s21_sb_append(sb, s21_str_sub_bytes(g_rx_s, csp, cend))
+    var b2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b2, gmerge, 1)
+    g_cur_block = gg
+    var g2i = s21_bin(2, gi, tig_int_lit(2))
+    var sl = g_rx_slotsv
+    var gs0 = s21_table_at(sl, g2i, g_rx_okptr, T64)
+    var gs1 = s21_table_at(sl, s21_bin(0, g2i, tig_int_lit(1)), g_rx_okptr, T64)
+    s21_sb_append(sb, s21_str_sub_bytes(g_rx_s, gs0, gs1))
+    var b3 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b3, gmerge, 1)
+    g_cur_block = gmerge
+    s21_store(ii, s21_bin(0, ci, tig_int_lit(2)), T64)
+    var bh = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bh, head, 1)
+    g_cur_block = litd
+    s21_sb_append_byte(sb, tig_int_lit(36))
+    s21_store(ii, s21_bin(0, ci, tig_int_lit(1)), T64)
+    var bl = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bl, head, 1)
+    g_cur_block = litblk
+    s21_sb_append_byte(sb, rb)
+    s21_store(ii, s21_bin(0, ci, tig_int_lit(1)), T64)
+    var br = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br, head, 1)
+    g_cur_block = exit
+}
+
+}

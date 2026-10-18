@@ -1,0 +1,614 @@
+type tie<class>
+// compiler/frontend/scollect_port_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 scollect_port.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace scollect {
+// impl 块统一处理（collect_top 之后、expand_generics 之前调用）：
+// 此时全部 struct/port 已登记。对每个暂存 N_IMPL：
+//   1. 校验 port/struct 存在
+//   2. 方法 self 参数类型节点改写为 struct 类型（触发 M2.1.8 自动 ref）
+//   3. 方法改名 <struct 名>::<方法名> → g_extra_tops → collect_fn 登记签名
+//   4. 完整性检查（port 方法全部实现 + 签名匹配）+ reg_impl 登记
+pub func collect_impl_fns() -> i64 {
+    var n = len(g_impl_pending)
+    var i: i64 = 0
+    while i < n {
+        var r = collect_impl_one(g_impl_pending[i])
+        if r < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 查找顶层 enum 定义节点（按名字；g_extra_tops 顶层 + 命名空间递归）。
+// import 展开后 enum 可能在 g_extra_tops（全部文件顶层）；命名空间体内的
+// enum 节点在 namespace 的 body StmtList 中，须递归查找（对齐 find_fn_node）。
+pub func find_enum_node(name: string) -> i64 {
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        var tag = s_tags[s]
+        if tag == S_N_ENUM {
+            if sstate.name_str(s) == name {
+                return s
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var k: i64 = 0
+            while k < nsegs {
+                sstate.ns_push(s_names[sstate.child(s, k)])
+                k = k + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var found = find_enum_in_ns(body, name)
+            k = 0
+            while k < nsegs {
+                sstate.ns_pop()
+                k = k + 1
+            }
+            if found >= 0 {
+                return found
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 查找顶层 actor 定义节点（按名字；g_extra_tops 顶层 + 命名空间递归）。
+// 镜像 find_enum_node——Step4b-2 生成方法 handler 时需要 actor 的 AST 节点
+//（其 FnDef body 在此节点 children[字段..., 方法...] 中）。
+pub func find_actor_node(name: string) -> i64 {
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        var tag = s_tags[s]
+        if tag == N_ACTOR {
+            if sstate.name_str(s) == name {
+                return s
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 泛型类型引用预实例化（2026-08-14 泛型字段类型修复）。
+// 遍历已登记 struct（st_keys，动态增长）的字段类型节点，用泛型感知解析触发
+// 模板 struct 引用（如 `A<i64>`）的 instantiate_struct。必须发生在
+// collect_all_struct_fields 之前——否则字段类型解析的实例化副作用会把
+// cls_fldoff 顶偏（详见 collect_struct_fields 注释）。此时实例化已幂等，
+// 正式字段拍平不再产生新副作用，off 稳定。
+pub func pre_instantiate_field_types() -> i64 {
+    var i: i64 = 0
+    while i < len(st_keys) {
+        var nm = intern.lookup(st_keys[i])
+        var snode = find_struct_node(nm)
+        if snode >= 0 {
+            var soff = sstate.slot_off(snode)
+            var nf = sstate.nchild(snode) - soff
+            var k: i64 = 0
+            while k < nf {
+                var f = sstate.child(snode, soff + k)
+                var fty = sgen.parse_generic_type_node(sstate.child(f, 0))
+                if fty < 0 {
+                    sm_err_line = s_lines[f]
+                    sm_err_col = s_cols[f]
+                    return -1
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1  // len(st_keys) 每次重求——实例化增长自动覆盖
+    }
+    return 0
+}
+
+// 收集单个 struct 的拍平字段（含继承）
+pub func collect_struct_fields(si: i64) -> i64 {
+    if cls_done[si] == 1 {
+        return 0
+    }
+    // 继承环检测（对齐 Rust check_inheritance_cycle）：沿 cls_parent 链走，
+    // 若回到自身（si）则成环。A extends B、B extends A → A→B→A。
+    var start_si = si
+    var cur: i64 = si
+    var guard: i64 = 0
+    var has_cycle: bool = false
+    while guard < 1000 {
+        var pp = cls_parent[cur]
+        if pp < 0 {
+            break
+        }
+        var pidx = sstate.bs_find(st_keys, pp)
+        if pidx < 0 {
+            break
+        }
+        var psi = st_vals[pidx]
+        if psi == start_si {
+            has_cycle = true
+            break
+        }
+        cur = psi
+        guard = guard + 1
+    }
+    if has_cycle {
+        var nm = sstate.struct_name_of(si)
+        sm_err_line = s_lines[find_struct_node(nm)]
+        sm_err_col = s_cols[find_struct_node(nm)]
+        sm_err_msg = "struct 继承形成环（含 '" + nm + "'）"
+        return -1
+    }
+    cls_done[si] = 1
+    var p = cls_parent[si]
+    if p >= 0 {
+        var pidx = sstate.bs_find(st_keys, p)
+        var psi = st_vals[pidx]
+        var r = collect_struct_fields(psi)
+        if r < 0 {
+            return -1
+        }
+        // 字段段起点对齐父字段段
+        cls_fldoff[si] = cls_fldoff[psi]
+        cls_nfld[si] = cls_nfld[psi]
+    } else {
+        // 无父：字段段起点 = 当前 fld_names 末尾
+        cls_fldoff[si] = len(fld_names)
+        cls_nfld[si] = 0
+    }
+    // struct 名按索引反查（st_keys 按名排序，不能直接用 si 下标取——排序序
+    // 与登记序不一致时（如 import 文件 struct 名先被主文件 intern）会取到
+    // 别的 struct 名，导致字段收集错位/继承环误报）
+    var nm = sstate.struct_name_of(si)
+    var snode = find_struct_node(nm)
+    if snode < 0 {
+        sm_err_line = 1
+        sm_err_col = 1
+        sm_err_msg = "内部错误：struct '" + nm + "' 定义节点未找到"
+        return -1
+    }
+    // p.6.8.2：传播 repr(C) 显式 C ABI 布局标记（N_STRUCT.val = reprc；1=repr(C)）。
+    // 默认 struct 亦为 C 自然对齐（LLVM datalayout），此处仅登记显式声明；供
+    // irgen 布局表与后续 extern/dynlib 互操作判定使用（本批零行为改变）。
+    st_reprc[si] = 0
+    if s_vals[snode] == 1 {
+        st_reprc[si] = 1
+    }
+    // 自身字段：Struct children = [泛型槽, ClassField...]，字段从 children[1] 起
+    var soff = sstate.slot_off(snode)  // struct 泛型槽偏移（恒 1；防御读取）
+    var nf = sstate.nchild(snode) - soff
+    // 2026-08-14 泛型修复：先预解析全部字段类型到临时表，再设 cls_fldoff，最后统一
+    // push。原因：字段类型中的模板 struct 引用（如 `A<i64>`）经 sgen.parse_generic_type_node
+    // 会触发 instantiate_struct → 立即把实例化 struct 的字段 push 进 fld_*。若 cls_fldoff
+    // 在解析前设置，这些副作用字段会把 off 顶偏（构造时读到别的 struct 的字段段，
+    // 报"字段 'v' 期望 i64，实际 A$i64"这类错位）。先解析 → off 取解析后的长度 →
+    // 自身字段 push 在副作用字段之后，off 恒正确。
+    var f_ids: table<i64> = table_new_i64()
+    var f_tys: table<i64> = table_new_i64()
+    var f_defs: table<i64> = table_new_i64()
+    var k: i64 = 0
+    while k < nf {
+        var f = sstate.child(snode, soff + k)
+        var fty = sgen.parse_generic_type_node(sstate.child(f, 0))
+        if fty < 0 {
+            sm_err_line = s_lines[f]
+            sm_err_col = s_cols[f]
+            return -1
+        }
+        table_push(f_ids, intern.intern(sstate.name_str(f)))
+        table_push(f_tys, fty)
+        // 字段默认值（`var y: i64 = 10` → child(f, 1)；无默认值 -1）
+        var fdef: i64 = -1
+        if sstate.nchild(f) > 1 {
+            fdef = sstate.child(f, 1)
+        }
+        table_push(f_defs, fdef)
+        k = k + 1
+    }
+    // 字段段起点：无父 = 类型解析完成后 fld_* 的当前长度（副作用字段已在其内，
+    // off 恒正确）；有父 = 继承父字段段（前面 294-310 已设 off/nfld，不覆盖）
+    if cls_parent[si] < 0 {
+        cls_fldoff[si] = len(fld_names)
+        cls_nfld[si] = 0
+    }
+    // 统一 push 自身字段（重名检查覆盖继承字段 + 已 push 的自身字段）
+    var kk: i64 = 0
+    while kk < nf {
+        var fnid = f_ids[kk]
+        var d: i64 = 0
+        var dup: bool = false
+        while d < cls_nfld[si] {
+            if fld_names[cls_fldoff[si] + d] == fnid {
+                dup = true
+                break
+            }
+            d = d + 1
+        }
+        if dup {
+            var f2 = sstate.child(snode, soff + kk)
+            sm_err_line = s_lines[f2]
+            sm_err_col = s_cols[f2]
+            sm_err_msg = "字段 '" + nm + "." + sstate.name_str(f2) + "' 与继承链中的字段重名（字段名必须跨继承链唯一）"
+            return -1
+        }
+        table_push(fld_names, fnid)
+        table_push(fld_tys, f_tys[kk])
+        table_push(fld_defs, f_defs[kk])
+        cls_nfld[si] = cls_nfld[si] + 1
+        kk = kk + 1
+    }
+    return 0
+}
+
+// 全部 struct 字段收集（check 前调用）
+pub func collect_all_struct_fields() -> i64 {
+    var n = len(st_keys)
+    var i: i64 = 0
+    while i < n {
+        var si = st_vals[i]
+        var r = collect_struct_fields(si)
+        if r < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 收集单个 enum 的变体信息（payload 类型拍平 + 白名单校验 + 槽数 K）。
+// 布局：Enum children = [泛型槽(-1或N_TYPE_PARAMS), EnumVariant...]，
+// 变体从 children[slot_off] 起；EnumVariant children = [payload 类型...]。
+// 白名单（p.8.1.7 放开）：整数族（i8..u64）/ bool / char / trit / string /
+// f64 / table<T> / map<V>；struct / 嵌套 enum → "变体 'X' 的 payload 暂不支持类型 'Y'"。
+// 槽数 K = 所有变体 payload 字段数的最大值（后端聚合布局：{i64 tag, i64×K}）。
+pub func collect_enum_variants(ei: i64) -> i64 {
+    if en_done[ei] == 1 {
+        return 0
+    }
+    en_done[ei] = 1
+    var nm = sstate.enum_name_of(ei)
+    var enode = find_enum_node(nm)
+    if enode < 0 {
+        sm_err_line = 1
+        sm_err_col = 1
+        sm_err_msg = "内部错误：枚举 '" + nm + "' 定义节点未找到"
+        return -1
+    }
+    var soff = sstate.slot_off(enode)  // enum 泛型槽偏移（恒 1；防御读取）
+    var nv = sstate.nchild(enode) - soff
+    // 先解析全部变体到临时表（payload 类型中的模板 struct 引用如 `Box<i64>`
+    // 经 parse_generic_type_node 会触发实例化副作用——复用 struct 字段收集的
+    // 先解析后落盘策略，避免副作用把变体段偏移顶偏）
+    var v_names: table<i64> = table_new_i64()
+    var v_nfld: table<i64> = table_new_i64()
+    var v_fldoff: table<i64> = table_new_i64()
+    var v_ftys: table<i64> = table_new_i64()
+    var max_slot: i64 = 0
+    var k: i64 = 0
+    while k < nv {
+        var v = sstate.child(enode, soff + k)
+        var vname = sstate.name_str(v)
+        var vnid = intern.intern(vname)
+        // 变体重名检查（本 enum 内）
+        var d: i64 = 0
+        var dup: bool = false
+        while d < len(v_names) {
+            if v_names[d] == vnid {
+                dup = true
+                break
+            }
+            d = d + 1
+        }
+        if dup {
+            sm_err_line = s_lines[v]
+            sm_err_col = s_cols[v]
+            sm_err_msg = "变体 '" + vname + "' 重复定义"
+            return -1
+        }
+        // payload 类型解析 + 白名单校验
+        var np = sstate.nchild(v)
+        var foff = len(v_ftys)
+        var j: i64 = 0
+        while j < np {
+            var fty = sgen.parse_generic_type_node(sstate.child(v, j))
+            if fty < 0 {
+                return -1
+            }
+            // 白名单：整数族 / bool / char / trit / string / f64 / table<T> / map<V>
+            //（f64 槽 i64 与 double 同宽，type-punned 直存；table/map 值是 ptr →
+            // 槽存 ptrtoint，读侧 inttoptr 还原——与 string 桥同构；struct/嵌套
+            // enum 需堆拷贝/多槽布局，仍拒绝）
+            var ok: bool = false
+            if types.is_int(fty) || fty == TK_BOOL || fty == TK_CHAR || fty == TK_TRIT || fty == TK_STR || fty == TK_F64 || types.is_table(fty) || types.is_map(fty) {
+                ok = true
+            }
+            if !ok {
+                sm_err_line = s_lines[v]
+                sm_err_col = s_cols[v]
+                sm_err_msg = "变体 '" + vname + "' 的 payload 暂不支持类型 '" + types.type_name(fty) + "'"
+                return -1
+            }
+            table_push(v_ftys, fty)
+            j = j + 1
+        }
+        if np > max_slot {
+            max_slot = np
+        }
+        table_push(v_names, vnid)
+        table_push(v_nfld, np)
+        table_push(v_fldoff, foff)
+        k = k + 1
+    }
+    // 落盘：变体段起点 = 当前 en_vnames 末尾（无继承，直接追加）
+    var vbase = len(en_vnames)
+    // payload 类型绝对段起点（en_ftys 全局拍平；en_vfldoff 必须存**绝对**偏移——
+    // 消费方按 en_ftys[foff + jj] 全局索引。单枚举时相对==绝对==0，掩盖了此问题；
+    // 出现第二个枚举时，其相对偏移 0 会读到首个枚举的 payload 字段）
+    var fbase = len(en_ftys)
+    en_varoff[ei] = vbase
+    en_nvar[ei] = len(v_names)
+    en_nslot[ei] = max_slot
+    var kk: i64 = 0
+    while kk < len(v_names) {
+        table_push(en_vnames, v_names[kk])
+        table_push(en_vtags, kk)
+        table_push(en_vfldoff, v_fldoff[kk] + fbase)
+        table_push(en_vnfld, v_nfld[kk])
+        kk = kk + 1
+    }
+    // payload 类型拍平追加（与 v_fldoff 段对齐）
+    var z: i64 = 0
+    while z < len(v_ftys) {
+        table_push(en_ftys, v_ftys[z])
+        z = z + 1
+    }
+    return 0
+}
+
+// 全部 enum 变体收集（check 前调用；须在 collect_all_struct_fields 之后——
+// 变体 payload 类型可能引用 struct，其字段须已拍平）
+pub func collect_all_enums() -> i64 {
+    var n = len(en_keys)
+    var i: i64 = 0
+    while i < n {
+        var ei = en_vals[i]
+        var r = collect_enum_variants(ei)
+        if r < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 返回表达式元素类型（表字面量/构造调用/变量）
+pub func scan_return_elem(e: i64) -> i64 {
+    var tag = s_tags[e]
+    if tag == S_N_CALL {
+        var nm = sstate.name_str(e)
+        if nm == "table_new_i64" {
+            return types.named(TK_I64)
+        }
+        if nm == "table_new_f64" {
+            return types.named(TK_F64)
+        }
+        if nm == "table_new_string" {
+            return types.named(TK_STR)
+        }
+        if nm == "table_new_bool" {
+            return types.named(TK_BOOL)
+        }
+        // 已登记返回表的函数调用（裸名经 resolve_call_name 补全 using/命名空间前缀）
+        var fnm = sinfer.resolve_call_name(nm)
+        return sinfer.table_ret_elem(fnm)
+    }
+    if tag == S_N_TABLE_LIT {
+        var nc = sstate.nchild(e)
+        if nc == 0 {
+            return types.named(TK_I64)
+        }
+        // 表字面量：取首元素值推断
+        return scan_return_elem(sstate.child(sstate.child(e, 0), 1))
+    }
+    if tag == S_N_VAR {
+        var nm = sstate.name_str(e)
+        // 查本函数体内同名 var 声明的初始化
+        var nparams = s_aux[g_cur_scan_fn]
+        // 函数体：children[slot_off + 1 + nparams]
+        return scan_blk(sstate.child(g_cur_scan_fn, sstate.slot_off(g_cur_scan_fn) + 1 + nparams), nm)
+    }
+    return -1
+}
+
+// 遍历语句块：want 为空 → 找 return 表达式推断元素类型；否则找同名 var 声明
+pub func scan_blk(blk: i64, want: string) -> i64 {
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(blk, i)
+        var tag = s_tags[s]
+        if want == "" {
+            if tag == S_N_RETURN {
+                var v = sstate.child(s, 0)
+                if v >= 0 {
+                    var e = scan_return_elem(v)
+                    if e >= 0 {
+                        return e
+                    }
+                }
+            }
+        } else {
+            if tag == S_N_VAR_DECL {
+                if sstate.name_str(s) == want {
+                    var init = sstate.child(s, 1)
+                    if init >= 0 {
+                        var e = scan_return_elem(init)
+                        if e >= 0 {
+                            return e
+                        }
+                    }
+                }
+            }
+        }
+        // 递归子块：if/while/for/switch
+        var r: i64 = -1
+        if tag == S_N_IF {
+            r = scan_blk(sstate.child(s, 1), want)
+            if r >= 0 {
+                return r
+            }
+            var el = sstate.child(s, 2)
+            if el >= 0 {
+                r = scan_blk(el, want)
+                if r >= 0 {
+                    return r
+                }
+            }
+        } else if tag == S_N_WHILE {
+            r = scan_blk(sstate.child(s, 1), want)
+            if r >= 0 {
+                return r
+            }
+        } else if tag == S_N_FOR {
+            r = scan_blk(sstate.child(s, 1), want)
+            if r >= 0 {
+                return r
+            }
+        } else if tag == S_N_SWITCH {
+            var ncases = s_aux[s]
+            var k: i64 = 0
+            while k < ncases {
+                var c = sstate.child(s, 1 + k)
+                r = scan_blk(sstate.child(c, 2), want)
+                if r >= 0 {
+                    return r
+                }
+                k = k + 1
+            }
+            var dflt = sstate.child(s, 1 + ncases)
+            if dflt >= 0 {
+                r = scan_blk(dflt, want)
+                if r >= 0 {
+                    return r
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 全部返回表函数预扫描（check 前调用）
+pub func collect_all_return_tables() -> i64 {
+    var n = len(fn_keys)
+    var i: i64 = 0
+    while i < n {
+        var fname = intern.lookup(fn_keys[i])
+        var sig = sstate.fn_sig(fname)
+        if sig >= 0 {
+            if sg_ret[sig] == TK_TABLE {
+                var fn_node = find_fn_node(fname)
+                if fn_node >= 0 {
+                    g_cur_scan_fn = fn_node
+                    var nparams = s_aux[fn_node]
+                    // 函数体：children[slot_off + 1 + nparams]
+                    var e = scan_blk(sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams), "")
+                    if e >= 0 {
+                        if sstate.bs_find(tre_keys, fn_keys[i]) < 0 {
+                            sstate.sorted_insert(tre_keys, tre_vals, fn_keys[i], e)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 命名空间递归收集（全名路径段压栈 + 递归）
+pub func collect_ns(ns_node: i64) -> i64 {
+    var nsegs = s_aux[ns_node]
+    var body: i64 = -1
+    var i: i64 = 0
+    while i < nsegs {
+        var seg = sstate.child(ns_node, i)
+        sstate.ns_push(s_names[seg])
+        i = i + 1
+    }
+    body = sstate.child(ns_node, nsegs)
+    // 命名空间内：函数/嵌套命名空间/struct
+    var nb = sstate.nchild(body)
+    var j: i64 = 0
+    while j < nb {
+        var s = sstate.child(body, j)
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            var full = sstate.ns_full_name(sstate.name_str(s))
+            var r = collect_fn(s, full)
+            if r < 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                return -1
+            }
+        } else if tag == S_N_NAMESPACE {
+            var r = collect_ns(s)
+            if r < 0 {
+                return -1
+            }
+        } else if tag == S_N_STRUCT {
+            // 泛型 struct 模板 / 普通 struct 统一分派登记
+            var rd = collect_struct_decl(s)
+            if rd < 0 {
+                return -1
+            }
+        } else if tag == S_N_ENUM {
+            // 泛型 enum 模板 / 普通 enum 统一分派登记
+            var re = collect_enum_decl(s)
+            if re < 0 {
+                return -1
+            }
+        } else if tag == S_N_PORT {
+            // S2.4：port 声明收集（方法签名登记）
+            var rp = collect_port(s)
+            if rp < 0 {
+                return -1
+            }
+        } else if tag == S_N_IMPL {
+            // S2.4：impl 块暂存（struct 可能声明在后，统一处理在
+            // collect_top 之后由 semantic 主流程调 collect_impl_fns）
+            table_push(g_impl_pending, s)
+        } else if tag == S_N_ACTOR {
+            // 一期并发：actor 声明（语义注册/句柄/消息分派在 A2/A3 落地；
+            // A1 语法层仅解析，此处显式接受节点以防被误当顶层孤儿忽略。
+            // 其内部方法 FnDef 不注册为独立函数——actor 方法专属通道后续接续。）
+            var ra = collect_actor_decl(s)
+            if ra < 0 {
+                return -1
+            }
+        } else if tag == S_N_VAR_DECL {
+            // p.9.12.4：命名空间内 const 常量 → 以命名空间全名登记全局
+            //（ns::NAME，gb_* 表，与命名空间函数同前缀规则）
+            var vfull = sstate.ns_full_name(sstate.name_str(s))
+            var rv = collect_global_var(s, vfull)
+            if rv < 0 {
+                return -1
+            }
+        }
+        j = j + 1
+    }
+    // 弹栈
+    i = 0
+    while i < nsegs {
+        sstate.ns_pop()
+        i = i + 1
+    }
+    return 0
+}
+
+}

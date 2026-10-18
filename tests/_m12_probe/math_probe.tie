@@ -1,0 +1,70 @@
+type tie<logic>
+// math_probe: M12 新增数学内建探针（tanh/sinh/cosh/asin/acos/atan/log2/log10/
+// expm1/log1p/cbrt/exp2/trunc/atan2/copysign/fmod/remainder/hypot）基础数值正确性
+var fails: i64 = 0
+var eps: f64 = 0.000000000001
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// 误差范围比较（浮点）
+func near(a: f64, b: f64, eps: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d <= eps
+}
+
+func main() {
+    println("start")
+    // 1 参族基础值（整数字面量提升 f64 一并验证）
+    check(tanh(0.0) == 0.0, "tanh(0)==0")
+    check(sinh(0.0) == 0.0, "sinh(0)==0")
+    check(cosh(0.0) == 1.0, "cosh(0)==1")
+    check(tanh(0) == 0.0, "tanh(0:int)==0")
+    check(near(asin(0.0), 0.0, eps), "asin(0)==0")
+    check(near(asin(1.0), 3.141592653589793 / 2.0, eps), "asin(1)==pi/2")
+    check(near(acos(1.0), 0.0, eps), "acos(1)==0")
+    check(near(acos(0.0), 3.141592653589793 / 2.0, eps), "acos(0)==pi/2")
+    check(near(atan(0.0), 0.0, eps), "atan(0)==0")
+    check(near(atan(1.0), 3.141592653589793 / 4.0, eps), "atan(1)==pi/4")
+    check(log2(8.0) == 3.0, "log2(8)==3")
+    check(log2(8) == 3.0, "log2(8:int)==3")
+    check(log10(100.0) == 2.0, "log10(100)==2")
+    check(log10(100) == 2.0, "log10(100:int)==2")
+    check(expm1(0.0) == 0.0, "expm1(0)==0")
+    check(log1p(0.0) == 0.0, "log1p(0)==0")
+    check(cbrt(27.0) == 3.0, "cbrt(27)==3")
+    check(cbrt(27) == 3.0, "cbrt(27:int)==3")
+    check(exp2(3.0) == 8.0, "exp2(3)==8")
+    check(exp2(3) == 8.0, "exp2(3:int)==8")
+    check(trunc(-1.7) == -1.0, "trunc(-1.7)==-1")
+    check(trunc(1.7) == 1.0, "trunc(1.7)==1")
+    check(trunc(2.0) == 2.0, "trunc(2.0)==2")
+    // 2 参族基础值
+    check(near(atan2(1.0, 1.0), 0.7853981633974483, eps), "atan2(1,1)~0.785398")
+    check(near(atan2(0.0, 1.0), 0.0, eps), "atan2(0,1)==0")
+    check(copysign(3.0, -1.0) == -3.0, "copysign(3,-1)==-3")
+    check(copysign(-3.0, 1.0) == 3.0, "copysign(-3,1)==3")
+    check(fmod(7.0, 3.0) == 1.0, "fmod(7,3)==1")
+    check(fmod(-7.0, 3.0) == -1.0, "fmod(-7,3)==-1")
+    check(fmod(7, 3) == 1.0, "fmod(7:int,3:int)==1")
+    check(remainder(7.0, 3.0) == 1.0, "remainder(7,3)==1")
+    check(remainder(5.0, 2.0) == 1.0, "remainder(5,2)==1")
+    check(hypot(3.0, 4.0) == 5.0, "hypot(3,4)==5")
+    check(near(hypot(1.0, 1.0), 1.4142135623730951, eps), "hypot(1,1)~sqrt2")
+
+    if fails == 0 {
+        println("PASS all")
+    } else {
+        println("FAIL total=" + to_string(fails))
+    }
+    println("done")
+}

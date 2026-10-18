@@ -1,0 +1,84 @@
+type tie<tsh>
+// scripts/m6_actor_regress.tsh.tie —— M6 actor 并发回归（tsh-role 移植 m6_actor_regress.ps1）
+// ============================================================================
+// 职责：编译+运行 tests/m6_actor/*.tie 探针矩阵：负例（含 _neg_）应编译拒绝；
+//   actor_a4_panic_raise 应非零退出且输出含 raise 消息；其余应清零退出且输出无「失败」。
+// 用法（仓库根目录）：<tsh> -f scripts/m6_actor_regress.tsh.tie [tiec路径]
+// 移植说明：与 regress-s21 一致——exec_code 得 rc，运行探针 stdout 重定向到 log 文件再
+//   file_read 取输出（消息体仅用于 FAIL 详情，判定以 rc 为准）。编译输出捕获同法。
+
+var tiec = cwd() + "\\compiler\\tiec_new.exe"
+if arg_count() >= 1 && !is_empty(arg_at(0)) { tiec = arg_at(0) }
+
+var root = cwd()
+// M6 actor 依赖 trm-lite provider 静态库，编译期经 TIE_TRM_LITE_LIB 传给 tiec。
+set_env("TIE_TRM_LITE_LIB", root + "\\..\\trm-lite\\trm_lite.a")
+
+var outdir = root + "\\_m6_out"
+var _mk = mkdir_all(outdir)
+var _rd = exec_code("cmd /c rd /s /q \"" + outdir + "\" >nul 2>&1")
+var _mk2 = mkdir_all(outdir)
+
+var files = sort_strings(list_dir(root + "\\tests\\m6_actor"))
+var pass: i64 = 0
+var fail: i64 = 0
+var crc: i64 = 0
+var rrc: i64 = 0
+var out = ""
+var base = ""
+var fn = ""
+
+for fn in files {
+    if !has_suffix(fn, ".tie") { continue }
+    base = replace_all(fn, ".tie", "")
+    var isNeg = contains(fn, "_neg_")
+    var exe = outdir + "\\" + base + ".exe"
+    var logf = outdir + "\\" + base + ".log"
+
+    // 编译（输出落 log 文件，rc 取退出码）
+    crc = exec_code("cmd /c " + tiec + " \"" + root + "\\tests\\m6_actor\\" + fn + "\" -o \"" + exe + "\" --no-cache > \"" + logf + "\" 2>&1")
+    if isNeg {
+        if crc != 0 {
+            println("PASS(neg-compile-reject) " + base)
+            pass = pass + 1
+        } else {
+            println("FAIL(neg-compiled-ok) " + base)
+            fail = fail + 1
+        }
+        continue
+    }
+    if crc != 0 {
+        out = file_read(logf)
+        println("FAIL(compile) " + base + " : " + out)
+        fail = fail + 1
+        continue
+    }
+
+    // 运行（stdout/stderr 落 log 文件）
+    rrc = exec_code("cmd /c \"" + exe + "\" > \"" + logf + "\" 2>&1")
+    sleep_ms(100)
+    out = file_read(logf)
+
+    if base == "actor_a4_panic_raise" {
+        if rrc != 0 && (contains(out, "actor 方法 panic") || contains(out, "bomb!")) {
+            println("PASS(run-raise) " + base)
+            pass = pass + 1
+        } else {
+            println("FAIL(run-raise) " + base + " rc=" + to_string(rrc) + " out=" + out)
+            fail = fail + 1
+        }
+        continue
+    }
+
+    if rrc == 0 && !contains(out, "失败") && !is_empty(out) {
+        println("PASS(run) " + base)
+        pass = pass + 1
+    } else {
+        println("FAIL(run) " + base + " rc=" + to_string(rrc) + " out=" + out)
+        fail = fail + 1
+    }
+}
+
+println("===== m6_actor: PASS=" + to_string(pass) + " FAIL=" + to_string(fail) + " =====")
+if fail > 0 { exit(1) }
+exit(0)

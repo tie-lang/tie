@@ -1,0 +1,114 @@
+type tie<logic>
+// compiler/middle/passes_test.tie —— passes 库独立自检（p.9.21 G7 库资格② / p.921-prompt §3）
+// ============================================================
+// 无 driver 可跑：本文件即入口（tie<logic>），只 import 被测库链。
+// 覆盖（对照 p921-prompt §3 passes 项）：
+//   - 用 ir.new_* 构造「两常量相加」模块，passes.run(1) 后断言折叠生效
+//     （add 指令被 rewrite_to_const 改写为 const_i，值 = 5）；
+//   - pipeline_ver 稳定（两次读取一致）；
+//   - run 前后 content_hash 记录（折叠前 ≠ 折叠后；折叠后再 run 幂等，哈希不变）；
+//   - t0 零 pass：run(0) 不改动模块（哈希不变）。
+//
+// 运行（repo 根）：
+//   compiler\tiec.exe compiler\middle\passes_test.tie -o <tmp>\passestest.exe
+//   <tmp>\passestest.exe    # -> 「passes 自检通过」exit 0
+
+import "./passes.tie"
+import "./tieir_ser.tie"
+
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+func main() {
+    var ok: bool = true
+    // ---------- 构造：fn @f(i64,i64) { %2 = const_i 2; %3 = const_i 3; %4 = add %2,%3; ret } ----------
+    ir.new_module()
+    var nm_f = interner.intern("f")
+    var ptys: table<i64> = table_new_i64()
+    table_push(ptys, 3)   // 3 = TK_I64
+    table_push(ptys, 3)
+    var f = ir.new_func(nm_f, 3, ptys)
+    var entry = ir.new_block(f, interner.intern("entry"))
+    // 常量 2（const_i=60，操作数①= 立即数 kind 2）
+    var c2 = ir.new_inst(entry, 60, 3)
+    ir.add_operand(c2, 2, 2)
+    // 常量 3
+    var c3 = ir.new_inst(entry, 60, 3)
+    ir.add_operand(c3, 3, 2)
+    // 相加：操作数 = 两个常量指令的结果值（kind 0）
+    var add = ir.new_inst(entry, 0, 3)   // 0 = add
+    ir.add_operand(add, ir.get_value(c2), 0)
+    ir.add_operand(add, ir.get_value(c3), 0)
+    // 返回
+    var ret = ir.new_inst(entry, 32, -1) // 32 = ret
+    ir.add_operand(ret, ir.get_value(add), 0)
+    if !check(ir.func_count() == 1 && ir.inst_count() == 4, "构造完成（1 函数 4 指令）") {
+        ok = false
+    }
+    var ver1 = passes.pipeline_ver()
+    if !check(ver1 >= 1, "pipeline_ver 登记") {
+        ok = false
+    }
+    // ---------- t0：零 pass 不改动 ----------
+    var h_before = tieir.content_hash()
+    var r0 = passes.run(0)
+    if !check(r0 == 0, "run(0) 成功") {
+        ok = false
+    }
+    if !check(tieir.content_hash() == h_before, "t0 零改动（哈希不变）") {
+        ok = false
+    }
+    // ---------- t1：两常量相加折叠 ----------
+    var r1 = passes.run(1)
+    if !check(r1 == 0, "run(1) 成功") {
+        ok = false
+    }
+    // 折叠 + DCE 生效：c2/c3（被折叠吞噬）被死值消除，模块只剩 const_i 5 + ret；
+    // 扫描断言（DCE 压缩指令表，原 add id 不再可靠）
+    var saw_const5: bool = false
+    var saw_ret: bool = false
+    var total2 = ir.inst_count()
+    var ii: i64 = 0
+    while ii < total2 {
+        if ir.ins_op(ii) == 60 && ir.ins_ops_cnt(ii) >= 1 && ir.ins_opnd_kind(ii, 0) == 2 {
+            if ir.ins_opnd(ii, 0) == 5 {
+                saw_const5 = true
+            }
+        }
+        if ir.ins_op(ii) == 32 {
+            saw_ret = true
+        }
+        ii = ii + 1
+    }
+    if !check(saw_const5, "折叠生效：const_i 5 存在") {
+        ok = false
+    }
+    if !check(saw_ret, "ret 保留") {
+        ok = false
+    }
+    if !check(total2 == 2, "DCE 收缩：4 → 2 指令（实际 " + to_string(total2) + "）") {
+        ok = false
+    }
+    var h_after = tieir.content_hash()
+    if !check(h_after != h_before, "折叠前后哈希不同（改写生效）") {
+        ok = false
+    }
+    // ---------- 幂等：再跑一次 t1，哈希不变 ----------
+    var r1b = passes.run(1)
+    if !check(r1b == 0 && tieir.content_hash() == h_after, "t1 幂等（二次 run 哈希不变）") {
+        ok = false
+    }
+    // ---------- pipeline_ver 稳定 ----------
+    if !check(passes.pipeline_ver() == ver1, "pipeline_ver 稳定") {
+        ok = false
+    }
+    // ---------- 汇总 ----------
+    if !ok {
+        exit(1)
+    }
+    println("passes 自检通过")
+}

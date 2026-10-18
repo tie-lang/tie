@@ -1,0 +1,38 @@
+type tie<logic>
+// p.9.5.x T4 探针：async 真非阻塞——连续多消息纯入队不等待，最终 FIFO 精确。
+// 主线程连续 40 条 async push（无任何同步屏障/等待，fire-and-forget），consumer
+// 单飞串行处理；handler 校验每条值 == 上一条+1（严格 FIFO 处理序）；同步
+// get_last()/get_bad() 作最终屏障。per-message 槽独立承载——旧单共享槽设计
+// async 被迫等 pending 腾槽（非 fire-and-forget），本探针断言扩展版行为。
+actor Seq {
+    var last: i64 = 0
+    var order_bad: i64 = 0
+    pub async func push(v: i64) {
+        if v != last + 1 {
+            order_bad = 1
+        }
+        last = v
+    }
+    pub func get_last() -> i64 {
+        return last
+    }
+    pub func get_bad() -> i64 {
+        return order_bad
+    }
+}
+func main() {
+    var s = run Seq()
+    var i: i64 = 0
+    while i < 40 {
+        s.push(i + 1)
+        i = i + 1
+    }
+    var v = s.get_last()
+    var b = s.get_bad()
+    println("last=" + to_string(v) + " bad=" + to_string(b))
+    if v == 40 && b == 0 {
+        println("T4 async 纯入队 FIFO 精确通过")
+    } else {
+        println("T4 失败 last=" + to_string(v) + " bad=" + to_string(b))
+    }
+}

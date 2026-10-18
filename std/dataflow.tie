@@ -1,0 +1,355 @@
+type tie<class, unsafe, unsafe:share>
+// ↑ 头部必须在文件最前（§2.1），故声明在前、说明在后。
+// 2026-10-07：本库的 spawn 需要【上下文】+【share 凭据】两把锁（规范 §11.6）。
+// `unsafe` 开「整个文件的不安全上下文」，`unsafe:share` 授 share 域凭据 ——
+// 二者缺一不可（只给凭据报 E00903，只开上下文报 E00904）。
+// 文件级声明只作用于本文件：调用方**无需**任何改动，`run_par` 的签名保持安全。
+// std/dataflow.tie —— 并行数据流图（p.9.13.5 最小内核）
+// EN: parallel dataflow graph (p.9.13.5 minimal kernel).
+// ============================================================
+// 依据 docs/designs/tie-primitive-op-design.md §5。命名空间取 `dataflow` 而非
+// `graph`——后者已被 std/graph.tie（图论算法：最短路/最小生成树/最大流/匹配）
+// 占用，二者是**不同之物**：graph 在静态图上做算法，本模块承载**可运行的数据流图**。
+//
+// ---- 图即表（设计裁决）----
+// graph **无独立存储**：本模块用两张扁平表承载一张图——
+//   * 节点表 = `fn(i64) -> i64` 函数值表（下标即节点 id）
+//   * 边表   = 起点 / 终点 / 回边标记 三张并行表
+// 与设计「节点 = 模块（普通 tie 函数，或匿名单参块）」一致：tie 的函数值
+// **可入表且可按索引调用**（实测 `table<fn(i64)->i64>` 的 push 与 `t[i](v)` 均可用），
+// 故本模块**无需任何语言改动**即可承载图；运算符形态（`{ A } - { B -> ~ A }`）
+// 留作后续语言档——届时本模块即为它的语义后端。
+//
+// ---- 算子对应（设计 §5 的库级实现）----
+//   `-`  并行分叉  → `fork(a, b)`：a 加一条**前向边**到 b（多后继即分叉）
+//   `->` 串联      → `link(a, b)`：同上（`fork` 为其别名，语义无差别）
+//   `~`  汇合/回边 → `back(a, b)`：把 a 的结果作为 b 的**下一波输入**
+//   节点           → `node(f)`：登记 `fn(i64) -> i64`
+//   入口           → `entry(n)`：执行时输入值送入该节点
+//   出口           → 末端节点（无后继亦无回边）的结果，按末波顺序组成结果表
+//
+// ---- 执行 = 波次 SDF ----
+// 入口收到输入即启动一波；一波内各节点求值，结果沿前向边送后继、沿回边
+// **进入下一波**（回边使节点可自反馈，即设计所述「响应式循环」）；末端节点结果
+// 累积为出口值表；当某波不再投递任何后继/回边时收敛。
+// `run` 串行、`run_par` 并行（trm-lite 的 spawn + wg 提供任务隔离与 join 屏障）；
+// 两者语义一致，但**并行版出口顺序不保证**（并发完成顺序）。
+//
+// ---- 安全默认 / 不可变 ----
+// 图只能**整体替换或组合**（构造 API 追加即视为新状态）；执行不在图上写状态
+// （结果只进出口表）。unsafe 原地变异（设计的分期后段）不在本内核范围。
+//
+// ---- 已知边界（如实登记，勿当缺陷）----
+// 1. **单图模型**：模块级状态承载一张图（`new_g()` 重置）。设计的多图共存/图值
+//    传参需「句柄承载两张表」，留待后续（当前足以验证执行语义）。
+// 2. **join 语义**：多入边节点按「每条入边的值各自触发一次节点」处理（流处理
+//    语义，每份数据独立流过）。设计 §5 的「所有入边到齐才放行（join 屏障）」是
+//    另一种语义，需先裁决「多值如何合并为单参」——待设计定。
+// 3. 无图论算法套件与 trit 穿透（设计的分期后段）。
+
+// ---------- 模块级图状态（tie：命名空间体内不允许 var）----------
+var df_fns: table<fn(i64) -> i64>;   // 节点表：下标 = 节点 id
+var df_from: table<i64>;             // 边表：起点
+var df_to: table<i64>;               // 边表：终点
+var df_loop: table<i64>;             // 边表：1 = 回边，0 = 前向边
+var df_entry: i64 = -1;              // 入口节点 id
+var df_ready: i64 = 0;               // 懒初始化标记
+
+// ---------- 模块级执行状态（并行用；避免闭包捕获大表产生整表拷贝）----------
+var df_w_node: table<i64>;           // 本波：节点 id（并行数组）
+var df_w_val: table<i64>;            // 本波：输入值
+var df_slots: table<i64>;            // 本波结果槽（下标对齐 df_w_node）
+var df_out: table<i64>;              // 出口值表
+var df_ex_ready: i64 = 0;
+var df_limit: i64 = 100000;          // 波次上限（可配；有界守护）
+var df_last_waves: i64 = 0;          // 上次执行实际经过的波数
+
+// 波次上限（有界守护）：回边不收敛时终止，避免死循环。
+const DF_WAVE_LIMIT: i64 = 100000;
+
+namespace dataflow {
+
+// ---- 懒初始化 ----
+func ensure() {
+    if df_ready == 0 {
+        var f: table<fn(i64) -> i64> = []
+        df_fns = f
+        df_from = table_new_i64()
+        df_to = table_new_i64()
+        df_loop = table_new_i64()
+        df_entry = -1
+        df_ready = 1
+    }
+}
+
+func ex_ensure() {
+    if df_ex_ready == 0 {
+        df_w_node = table_new_i64()
+        df_w_val = table_new_i64()
+        df_slots = table_new_i64()
+        df_out = table_new_i64()
+        df_ex_ready = 1
+    }
+}
+
+// ---- 构造（安全默认：追加即新状态；不做原地变异）----
+
+// 新建空图（重置；单图模型，见文件头边界 1）。
+pub func new_g() -> i64 {
+    df_ready = 0
+    ensure()
+    ex_ensure()
+    df_w_node = table_new_i64()
+    df_w_val = table_new_i64()
+    df_slots = table_new_i64()
+    df_out = table_new_i64()
+    return 0
+}
+
+// 登记节点（f = `fn(i64) -> i64`），返回节点 id。
+pub func node(f: fn(i64) -> i64) -> i64 {
+    ensure()
+    table_push(df_fns, f)
+    return len(df_fns) - 1
+}
+
+// 加**前向边** a → b（`->` 串联；多后继即 `-` 并行分叉）。
+pub func link(a: i64, b: i64) -> i64 {
+    ensure()
+    table_push(df_from, a)
+    table_push(df_to, b)
+    table_push(df_loop, 0)
+    return 0
+}
+
+// 并行分叉（`-`）：语义与 link 相同，保留独立名字以对齐设计算子。
+pub func fork(a: i64, b: i64) -> i64 {
+    return link(a, b)
+}
+
+// 加**回边** a ~> b（`~` 汇合/回边）：a 的结果作为 b 的**下一波输入**。
+pub func back(a: i64, b: i64) -> i64 {
+    ensure()
+    table_push(df_from, a)
+    table_push(df_to, b)
+    table_push(df_loop, 1)
+    return 0
+}
+
+// 设入口节点。
+pub func entry(n: i64) -> i64 {
+    ensure()
+    df_entry = n
+    return 0
+}
+
+// ---- 结构查询（表化视图的基础）----
+
+pub func node_count() -> i64 {
+    ensure()
+    return len(df_fns)
+}
+
+pub func edge_count() -> i64 {
+    ensure()
+    return len(df_from)
+}
+
+// 节点 n 的后继（前向边终点）表。
+pub func succs(n: i64) -> table<i64> {
+    ensure()
+    var out: table<i64> = table_new_i64()
+    var i: i64 = 0
+    var e: i64 = len(df_from)
+    while i < e {
+        if df_from[i] == n && df_loop[i] == 0 {
+            table_push(out, df_to[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 节点 n 的回边终点表。
+pub func backs(n: i64) -> table<i64> {
+    ensure()
+    var out: table<i64> = table_new_i64()
+    var i: i64 = 0
+    var e: i64 = len(df_from)
+    while i < e {
+        if df_from[i] == n && df_loop[i] == 1 {
+            table_push(out, df_to[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 节点 n 的入边数（前向 + 回边）。
+pub func in_degree(n: i64) -> i64 {
+    ensure()
+    var c: i64 = 0
+    var i: i64 = 0
+    var e: i64 = len(df_to)
+    while i < e {
+        if df_to[i] == n {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ---- 执行 ----
+
+// 设波次上限（有界守护；用于回边类图——无终止条件的回边会产生无限波）。
+pub func set_limit(n: i64) -> i64 {
+    if n > 0 {
+        df_limit = n
+    }
+    return df_limit
+}
+
+// 上次执行实际经过的波数（用于观察回边产生的多波反馈）。
+pub func last_waves() -> i64 {
+    return df_last_waves
+}
+
+// 串行波次 SDF：输入送入入口，返回出口值表（末端节点结果，按末波顺序）。
+pub func run(input: i64) -> table<i64> {
+    ensure()
+    var outs: table<i64> = table_new_i64()
+    if df_entry < 0 {
+        df_last_waves = 0
+        return outs
+    }
+    var w_node: table<i64> = table_new_i64()
+    var w_val: table<i64> = table_new_i64()
+    table_push(w_node, df_entry)
+    table_push(w_val, input)
+    var waves: i64 = 0
+    while len(w_node) > 0 && waves < df_limit {
+        var n_node: table<i64> = table_new_i64()
+        var n_val: table<i64> = table_new_i64()
+        var m: i64 = len(w_node)
+        var i: i64 = 0
+        while i < m {
+            var nd = w_node[i]
+            var fv = df_fns[nd]
+            var rv = fv(w_val[i])
+            var sc = succs(nd)
+            var bk = backs(nd)
+            if len(sc) == 0 && len(bk) == 0 {
+                table_push(outs, rv)
+            }
+            var j: i64 = 0
+            while j < len(sc) {
+                table_push(n_node, sc[j])
+                table_push(n_val, rv)
+                j = j + 1
+            }
+            var k: i64 = 0
+            while k < len(bk) {
+                table_push(n_node, bk[k])
+                table_push(n_val, rv)
+                k = k + 1
+            }
+            i = i + 1
+        }
+        w_node = n_node
+        w_val = n_val
+        waves = waves + 1
+    }
+    df_last_waves = waves
+    return outs
+}
+
+// 单任务体（供 spawn）：求值 + 写自己的槽 + 屏障计数。
+// 只捕获 idx（实测闭包对循环变量的捕获是**每迭代独立**的：循环里 spawn 3 个
+// 闭包分别捕获到 0/1/2），数据从**模块级**波表读，避免捕获大表引发整表拷贝。
+// 注：必须定义在 `run_par` **之前**——tie 不解析闭包体内的前向引用（实测
+// `E00489 未定义的函数`，把本函数置于 run_par 之后即编译失败）。
+func one_task(idx: i64, wg: i64) {
+    var nd = df_w_node[idx]
+    var fv = df_fns[nd]
+    var rv = fv(df_w_val[idx])
+    df_slots[idx] = rv
+    wg_done(wg)
+}
+
+// 并行波次 SDF：一波内全部节点用 trm-lite 的 spawn 并行、wg 汇合（任务隔离 +
+// join 屏障由运行时提供），再串行投递并发结果到下一波。
+// 语义与 run 一致；**出口顺序不保证**（并发完成顺序）。
+pub func run_par(input: i64) -> table<i64> {
+    ensure()
+    ex_ensure()
+    df_out = table_new_i64()
+    if df_entry < 0 {
+        return df_out
+    }
+    df_w_node = table_new_i64()
+    df_w_val = table_new_i64()
+    table_push(df_w_node, df_entry)
+    table_push(df_w_val, input)
+    var waves: i64 = 0
+    while len(df_w_node) > 0 && waves < df_limit {
+        var m: i64 = len(df_w_node)
+        // 预分配结果槽：每个任务只写自己的下标（不同下标写不同位置，无 push 竞态）
+        df_slots = table_new_i64()
+        var z: i64 = 0
+        while z < m {
+            table_push(df_slots, 0)
+            z = z + 1
+        }
+        var wg = wg_new()
+        wg_add(wg, m)
+        var t: i64 = 0
+        while t < m {
+            // 任务体**内联**在闭包里：实测闭包体内调用同命名空间的非 pub 函数会报
+            // `E00489 未定义的函数`（即便该函数定义在闭包之前）——闭包体的名字解析
+            // 不覆盖外层命名空间。内联后只用模块级表与捕获的 t/wg，无解析问题。
+            spawn(func() -> i64 {
+                var nd = df_w_node[t]
+                var fv = df_fns[nd]
+                df_slots[t] = fv(df_w_val[t])
+                wg_done(wg)
+                return 0
+            })
+            t = t + 1
+        }
+        wg_wait(wg)
+        // 汇合后串行投递（读槽 → 展开为下一波）
+        var n_node: table<i64> = table_new_i64()
+        var n_val: table<i64> = table_new_i64()
+        var i: i64 = 0
+        while i < m {
+            var nd = df_w_node[i]
+            var rv = df_slots[i]
+            var sc = succs(nd)
+            var bk = backs(nd)
+            if len(sc) == 0 && len(bk) == 0 {
+                table_push(df_out, rv)
+            }
+            var j: i64 = 0
+            while j < len(sc) {
+                table_push(n_node, sc[j])
+                table_push(n_val, rv)
+                j = j + 1
+            }
+            var k: i64 = 0
+            while k < len(bk) {
+                table_push(n_node, bk[k])
+                table_push(n_val, rv)
+                k = k + 1
+            }
+            i = i + 1
+        }
+        df_w_node = n_node
+        df_w_val = n_val
+        waves = waves + 1
+    }
+    df_last_waves = waves
+    return df_out
+}
+
+}

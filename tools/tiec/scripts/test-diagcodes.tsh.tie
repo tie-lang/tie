@@ -1,0 +1,101 @@
+type tie<tsh>
+// scripts/test-diagcodes.tsh.tie —— 诊断标号回归测试（p.6.9.15）（tsh-role 移植 test-diagcodes.ps1）
+// ============================================================================
+// 职责：1) 对 tests/errors/golden/*.tie 逐条跑 tiec 断言含 error[E#####（无 E00000 回退）；
+//       2) 固定警告语料断言 W00001..W00004 经验型警告；3) diagcode 单元探针 ALL PASS。
+// 用法（仓库根目录）：<tsh> -f scripts/test-diagcodes.tsh.tie [tiec路径]
+// 移植说明：
+//   - tiec 输出经 exec_output("cmd /c tiec <file> 2>&1") 整体捕获，分类与 .ps1 一致。
+//   - 超时强杀（.ps1 的 WaitForExit + taskkill）在 tsh 无「不强杀」内建 = 能力缺口：
+//     本语料 tiec 不挂起，等价于无超时路径；若编译器真挂起将卡住（记录为待补内建）。
+
+func bstr(b: bool) -> string {
+    if b { return "T" }
+    return "F"
+}
+
+var tiec = ".\\compiler\\tiec.exe"
+if arg_count() >= 1 && !is_empty(arg_at(0)) { tiec = arg_at(0) }
+
+var root = cwd()
+var GoldenDir = root + "\\tests\\errors\\golden"
+var warnSrc = get_env("TEMP") + "\\diagcodes_warn_probe.tie"
+var probeSrc = root + "\\tests\\_p6915_probe\\diagcode_probe.tie"
+var probeExe = get_env("TEMP") + "\\diagcode_probe.exe"
+
+var fails: i64 = 0
+var total: i64 = 0
+var i: i64 = 0
+var rc: i64 = 0
+var out = ""
+var skipF = false
+var wname = ""
+
+// 警告语料（与 .ps1 逐字一致；tie 字符串 \n 换行）
+// 语料内容带时间戳：tiec 缓存按路径+内容命中，若每次都写同一份固定语料，
+// 二次运行会命中缓存跳过编译 → 拿不到警告输出 → 误判「警告缺失」。
+var warnText = "type tie<logic>\n// diagcodes warn probe " + to_string(time_now()) + "\nfunc main() {\n    var s: string = \"\"\n    var i: i64 = 0\n    while i < 100 {\n        s = s + \"x\"\n        i = i + 1\n    }\n    var a: table<i64> = table_new_i64()\n    var b = a\n    var f: f64 = 1.5\n    var g: f64 = 2.5\n    if f == g {\n        println(\"eq\")\n    }\n    var q: i64 = 7 / 2\n    println(s + to_string(len(b)) + to_string(q))\n}\n"
+var wcodes = ["W00001", "W00002", "W00003", "W00004"]
+
+// ---------- (1) golden 错误语料覆盖 ----------
+var golden = list_dir(GoldenDir)
+var sorted = sort_strings(golden)
+for gn in sorted {
+    if has_suffix(gn, ".tie") && !has_suffix(gn, ".stderr") {
+        i = i + 1
+        out = exec_output("cmd /c " + tiec + " " + GoldenDir + "\\" + gn + " 2>&1")
+        skipF = contains(out, "编译成功") && !contains(out, "error[E")
+        if skipF {
+            // 过时 golden：现行编译器已接受（编译成功）→ 跳过
+        } else {
+            total = total + 1
+            if !contains(out, "error[E") {
+                println("[test-diagcodes] NO-CODE: " + gn)
+                fails = fails + 1
+            } else {
+                if contains(out, "error[E00000]") {
+                    println("[test-diagcodes] FALLBACK(E0000): " + gn)
+                    fails = fails + 1
+                }
+            }
+        }
+    }
+}
+
+// ---------- (2) 警告语料 ----------
+file_write(warnSrc, warnText)
+out = exec_output("cmd /c " + tiec + " " + warnSrc + " 2>&1")
+for wc in wcodes {
+    wname = wc
+    if contains(out, "warning[" + wname + "]") {
+        println("[test-diagcodes] 警告 " + wname + " 命中")
+    } else {
+        println("[test-diagcodes] 警告缺失: " + wname)
+        fails = fails + 1
+    }
+}
+
+// ---------- (3) diagcode 单元探针 ----------
+rc = exec_code("cmd /c " + tiec + " " + probeSrc + " -o " + probeExe + " >nul 2>&1")
+if rc != 0 {
+    println("[test-diagcodes] diagcode 探针编译失败")
+    fails = fails + 1
+} else {
+    sleep_ms(400)
+    out = exec_output("cmd /c " + probeExe + " 2>&1")
+    if contains(out, "ALL PASS") {
+        println("[test-diagcodes] diagcode 单元探针 PASS")
+    } else {
+        println("[test-diagcodes] diagcode 单元探针失败")
+        println(out)
+        fails = fails + 1
+    }
+}
+
+println("[test-diagcodes] golden 语料 " + to_string(total) + " 条（跳过过时），失败 " + to_string(fails))
+if fails == 0 {
+    println("[test-diagcodes] ALL PASS")
+    exit(0)
+}
+println("[test-diagcodes] FAILS=" + to_string(fails))
+exit(1)

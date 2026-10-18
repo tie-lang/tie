@@ -1,0 +1,31 @@
+type tie<logic>
+// closure_share_gate_neg.tie —— share 域门禁负例（B 方案，2026-10-03）
+// ============================================================================
+// 引用**全局可变容器**的闭包交给 spawn ⇒ 需 share 域凭据（双锁）。本文件**故意编译失败**，
+// 由回归以「应失败」检查。覆盖三段：缺 unsafe 上下文 / 缺 share 凭据 / 块级持证通过。
+// 诊断码 E00899（unsafe 上下文）、E00898（share 凭据）。
+
+var g_tbl: table<i64> = [1, 2, 3]
+
+// 段一：既无 unsafe 上下文也无凭据 ⇒ E00899
+func bad1() {
+    spawn(func() -> i64 { return len(g_tbl) })
+}
+
+// 段二：在 unsafe 上下文但无 share 凭据 ⇒ E00898
+unsafe func bad2() {
+    spawn(func() -> i64 { return len(g_tbl) })
+}
+
+// 段三：块级持证 ⇒ 放行（放在最后，前两段已中止编译）
+func ok3() {
+    unsafe with(share) {
+        spawn(func() -> i64 { return len(g_tbl) })
+    }
+}
+
+func main() {
+    bad1()
+    bad2()
+    ok3()
+}

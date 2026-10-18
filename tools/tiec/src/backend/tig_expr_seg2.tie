@@ -1,0 +1,261 @@
+type tie<class>
+// compiler/backend/tig_expr_seg2.tie —— tig_expr 分派链分段 2（p.9.21 G2 单函数 ≤300 行）
+// ============================================================
+// 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
+// 与原函数同 namespace，跨文件裸名互调；段尾 return <sentinel> = 本段未命中。
+namespace irgen {
+// asm 内存约束操作数的**地址**（S1.2 I1，2026-10-02 补 (mem) 约束）。
+// 变量（局部/全局）→ 该变量**真实的槽地址**：asm 直接读/写槽本身，故
+// out(mem)/inout(mem) 天然写回变量，无需额外 load/store 回写。
+// 其它表达式 → 求值后落临时 alloca，返回该 alloca 地址（只读用途；写回无意义）。
+// 与 bi_addr_of 的差别正在此处：addr_of 连局部变量也只给临时副本地址，
+// 而 asm 的 out(mem) 必须落到真槽上才有意义。
+// 返回 (槽引用, ir 操作数种类)：局部槽 kind=0（值 id）、全局槽 kind=3
+// （符号引用）—— 种类由 llvmgen 的 opnd_ref 渲染成 `%N` / `@name`，
+// 与 irgen_arith_p2 的 load/store 处同约定。
+func asm_mem_addr(e: i64) -> (a: i64, k: i64) {
+    var et = node_types[e]
+    if et < 0 {
+        et = types.named(TK_I64)
+    }
+    if s_tags[e] == 6 {   // Var
+        var nid = interner.intern(sstate.name_str(e))
+        if scope_get_global(nid) >= 0 {
+            if g_lookup_is_global > 0 {
+                return (g_lookup_alloca, 3)
+            }
+            return (g_lookup_alloca, 0)
+        }
+    }
+    var v = tig_expr(e)
+    if v < 0 {
+        return (-1, 0)
+    }
+    var alloca = ir.new_inst(g_cur_block, 20, et)
+    ir.add_operand(alloca, et, 2)
+    var ap = ir.get_value(alloca)
+    var st = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st, et, 2)
+    ir.add_operand(st, v, 0)
+    ir.add_operand(st, ap, 0)
+    return (ap, 0)
+}
+
+func tig_expr_seg2(id: i64) -> i64 {
+    var tag = s_tags[id]
+    if tag == 131 {
+        // S1.2 I1 asm!：生成 inline_asm 指令（模板池 id + 操作数方向/值对）。
+        // 第一个 out 操作数 → 结果类型（call 返回值）；其余 out 第一版忽略。
+        // 任务17：平台条件编译——target("arch") 标注按当前编译目标分支：
+        //   无 target 标注 → 始终发射（向后兼容）；
+        //   有 target 标注 → 当前目标匹配任一 → 发射；全不匹配 → 明确报错。
+        var nc = sstate.nchild(id)
+        // ---------- 平台条件编译判定（任务17）----------
+        var has_target: bool = false
+        var matched: bool = false
+        var listed = ""
+        var kt: i64 = 0
+        while kt < nc {
+            var opx = sstate.child(id, kt)
+            if s_vals[opx] == 3 {
+                has_target = true
+                // 平台名（带引号 lexeme 池 id）→ 去引号纯文本
+                var arch = interner.lookup(str_unescape_quoted(s_names[opx]))
+                if str_len(listed) > 0 {
+                    listed = listed + "/"
+                }
+                listed = listed + arch
+                if asm_target_matches(arch) {
+                    matched = true
+                }
+            }
+            kt = kt + 1
+        }
+        if has_target && !matched {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            var cur_t = g_asm_target
+            if str_len(cur_t) == 0 {
+                cur_t = "（未设置）"
+            }
+            sm_err_msg = "asm! 平台 target(" + listed + ") 与当前编译目标 " + cur_t + " 不匹配（无目标平台分支可编译）"
+            return -1
+        }
+        var tmpl = s_names[id]
+        var out_slot: i64 = -1
+        var out_ty: i64 = -1
+        var k: i64 = 0
+        while k < nc {
+            var op0 = sstate.child(id, k)
+            // 有**输出**的操作数：out(1) 与 inout(2) 都要承载 call 返回值 ——
+            // 缺陷修复 2026-09-30：原判据只认 out，导致纯 inout 的 asm 生成
+            // `call void asm ..., "+r"(...)`（约束声明有输出却用 void 接收），
+            // LLVM 端类型不匹配 ⇒ 生成坏代码 ⇒ 运行时段错误（实测退出码 139）。
+            // 只有 **reg** 约束的 out/inout 由 call 返回值承载；mem 约束的
+            // out/inout 直接写内存（指针经参数传入），不占返回值。
+            if s_vals[op0] < 4 && (s_vals[op0] == 1 || s_vals[op0] == 2) {
+                var e0 = sstate.child(op0, 0)
+                if s_tags[e0] == 6 {  // Var
+                    var nid0 = interner.intern(sstate.name_str(e0))
+                    if scope_get_global(nid0) >= 0 {
+                        out_slot = g_lookup_alloca
+                        out_ty = g_lookup_ty
+                    }
+                }
+                break
+            }
+            k = k + 1
+        }
+        // ---------------------------------------------------------------------
+        // 两遍法（缺陷修复 2026-09-30）—— **先求值全部入参，再统一 add_operand**。
+        //
+        // 缺陷：只要 asm! 含 in/inout 操作数就报「编译器内部错误: ir.add_operand
+        // 操作数段交错」。根因 = 入参求值 tig_expr(e) 会发射新指令（load/const…），
+        // 而这些新指令的操作数被 push 进**全局操作数段**，恰好插在 inline_asm
+        // 已经 push 的操作数**中间**。add_operand 的契约明确禁止这种交错（错误
+        // 消息自带指引：「常量生成请先存变量」）。
+        //
+        // 与操作数**个数**无关：纯 out 的 `asm!("mov $0, %rax", out(reg) rax)`
+        // 一直正常，只因 out 分支不调用 tig_expr；反例 `asm!("nop", in(reg) n)`
+        // 单个 in 操作数即崩（实测）。
+        // ---------------------------------------------------------------------
+        var op_dirs = table_new_i64()
+        var op_tys = table_new_i64()
+        var op_vals = table_new_i64()
+        var op_kinds = table_new_i64()   // ir 操作数种类（mem 槽：0=局部值 / 3=全局符号）
+        k = 0
+        while k < nc {
+            var opv = sstate.child(id, k)
+            var dirv = s_vals[opv]
+            if dirv == 3 {
+                // target("arch") 平台标注（任务17）：不占 asm 操作数，跳过
+                k = k + 1
+                continue
+            }
+            // val 低 2 位 = 方向，bit2 = mem 约束（+4）。见 pexpr_p3 的编码说明。
+            var dir_b = dirv % 4
+            var is_mem: bool = false
+            if dirv >= 4 {
+                is_mem = true
+            }
+            table_push(op_dirs, dirv)
+            // ★ is_mem 必须先于方向判据：out(mem) 的 dir_b 也是 1，若先判
+            // dir_b==1 会把它当成 out(reg)（不占参数）⇒ 约束串出现 `=*m` 却
+            // 没有对应参数，生成 `... "=*m"(ptr elementtype(i64) 0)` 这种坏码。
+            if is_mem {
+                // in/out/inout + mem：**在发射 inline_asm 之前**取地址（同两遍法
+                // 约束：其间可能发射 alloca/store 指令，不能与 add_operand 交错）。
+                var em = sstate.child(opv, 0)
+                var (am, ak) = asm_mem_addr(em)
+                if am < 0 {
+                    return -1
+                }
+                var etm = node_types[em]
+                if etm < 0 {
+                    etm = types.named(TK_I64)
+                }
+                table_push(op_tys, types.ptr_of(etm))   // mem 操作数的参数是指针
+                table_push(op_vals, am)
+                table_push(op_kinds, ak)
+            } else if dir_b == 1 {
+                // out(reg)：不占参数（call 返回值承载）；第一版只支持第一个 out
+                table_push(op_tys, types.named(TK_I64))
+                table_push(op_vals, 0)
+                table_push(op_kinds, 2)
+            } else {
+                // in/inout + reg：**在发射 inline_asm 之前**求值入参
+                var ein = sstate.child(opv, 0)
+                var ev0 = tig_expr(ein)
+                if ev0 < 0 {
+                    return -1
+                }
+                var et0 = node_types[ein]
+                if et0 < 0 {
+                    et0 = types.named(TK_I64)
+                }
+                table_push(op_tys, et0)
+                table_push(op_vals, ev0)
+                table_push(op_kinds, 0)
+            }
+            k = k + 1
+        }
+        // 第二遍：纯 add_operand 序列，其间不再触发任何指令生成
+        var inst = ir.new_inst(g_cur_block, 65, out_ty)  // void（-1）或 out 类型
+        ir.add_operand(inst, tmpl, 0)
+        k = 0
+        while k < len(op_dirs) {
+            ir.add_operand(inst, op_dirs[k], 2)
+            ir.add_operand(inst, op_tys[k], 2)
+            if op_dirs[k] % 4 == 1 && op_dirs[k] < 4 {
+                // out(reg)：值由 call 返回值承载，不占参数
+                ir.add_operand(inst, 0, 2)
+            } else {
+                // in/inout(reg)：值；out/inout(mem)：指针（mem 的 indirect
+                // 操作数必须各占一个参数，见 llvmgen 侧 asm_mem_arg_ty 说明）
+                ir.add_operand(inst, op_vals[k], op_kinds[k])
+            }
+            k = k + 1
+        }
+        if out_slot >= 0 {
+            // 结果写回 out 变量槽
+            var st = ir.new_inst(g_cur_block, 22, -1)
+            ir.add_operand(st, out_ty, 2)
+            ir.add_operand(st, ir.get_value(inst), 0)
+            ir.add_operand(st, out_slot, 0)
+        }
+        return tig_int_lit(0)  // 哑值（asm 表达式无值）
+    }
+    if tag == 132 {
+        // S2.2 闭包字面量（N_FN_LIT）：生成入口函数 + 构造闭包值 {env, entry}
+        return tig_closure_lit(id)
+    }
+    if tag == 133 {
+        // S2.3：`expr ?` 解包（N_TRY）：Result/Option 枚举——Err/None 提前
+        // return，Ok/Some 解包 payload。语义由 sinfer.infer_try_unwrap 校验。
+        return tig_try(id)
+    }
+    if tag == S_N_RUN_ACTOR {
+        // 一期并发 A4（Step3）：`run <Actor>(...)` 分配 per-actor state（含初始化
+        // OS 锁/条件变量）并返回真实句柄（record 指针 i64）。Step4 起在 record 上
+        // 接线程消息循环（mailbox + dispatch + 同步 RPC）。
+        return tig_actor_run(id)
+    }
+    if tag == S_N_GUARD_GET {
+        // 三期 A 组 `unsafe.get(share)` 凭据获取（§7.1.1 + unsafe-model §13.4）：
+        // guard<cap> 凭据运行期无操作（门禁在编译期语义层强制），LLVM 表示 = i64
+        // 占位值 0。对象绑定表达式（children[1]）若存在先求值（取其地址语义由
+        // 语义层定义，此处仅保证对象表达式编译通过）。
+        var bind = sstate.child(id, 1)
+        if bind >= 0 {
+            var bv = tig_expr(bind)
+            if bv < 0 {
+                return -1
+            }
+        }
+        return tig_int_lit(0)
+    }
+    if tag == S_N_GUARD_REVOKE {
+        // r.1.6.7 `unsafe.revoke(g)` 凭据撤销（§11.6）：与 unsafe.get 同族，
+        // 凭据无运行时表示 ⇒ 撤销**运行期无操作**（失效跟踪与诊断都在编译期
+        // 语义层完成）。实参仍求值一次，保持"实参表达式都会被生成"的一致语义。
+        var ra = sstate.child(id, 0)
+        if ra >= 0 {
+            var rv = tig_expr(ra)
+            if rv < 0 {
+                return -1
+            }
+        }
+        return tig_int_lit(0)
+    }
+    // p.9.10.1 match/switch 表达式：按模式链短路求值各分支表达式 → phi 汇合。
+    if tag == N_SWITCH_EXPR {
+        return tig_switch_expr(id)
+    }
+    // p.9.11.3 try 错误聚合块（N_TRY_BLOCK=157）：线性发射块体语句（块内 `?`
+    // 传播到当前函数），末表达式值为 try 块值。
+    if tag == 157 {
+        return tig_try_block(id)
+    }
+    return -1  // 本段未命中
+}
+}

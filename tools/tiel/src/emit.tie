@@ -1,0 +1,634 @@
+type tie<class, unsafe:lock, unsafe:mem>
+// emit.tie —— tiel 前端的节点表示层（裸内存 arena 直写 + 自检）
+// 文件级授权：unsafe:lock（会话单线程，表访问免锁）+ unsafe:mem（槽池/偏移池
+// 为裸内存 i64 缓冲，原语见下）。
+// ============================================================
+// 设计（v2：槽池/偏移池换裸内存 arena；完整短稿在仓库工作区）：
+//   * 槽池/偏移池 = 裸内存 i64 缓冲（ar_* 原语；容量翻倍，会话内只增不减，
+//     em_reset 仅回退游标）——热路径每次字段访问 = 2 次裸 load/store，无表调用。
+//   * 槽池平坦存放全部节点；每节点槽数按 tag 档位（4 / 6 / 8）。
+//     槽 0 = tag，字段自槽 1 起；节点 id 自 1 起（0 保留无效）。
+//   * id → 槽偏移经偏移池（[0] 占位 -1）。
+//   * 子列表/名表保持表容器（冷路径：每轮子项/名数十，实测非热点，8B 裸化
+//     收益不抵复杂度）；区段 = (start, len) 两个字段槽。
+//   * 名表：名池 em_names + 开放寻址哈希桶 em_bk（FNV-1a 32 位，
+//     负载 > 3/4 时双倍重建）；桶内值 = 名 id + 1（0 表示空桶）。
+//   * 字面量不复制文本：节点存源区段（em_src 偏移 + 长度），消费方按需解析。
+//   * 错误面：单错误槽（首错即停），line / col / msg / code 访问器；
+//     code 在置错时经 emcodes 的表查询填入（E 码）。
+// 口径：内存第一（零中间物、紧凑定长、名字共用一份）；安全（非法 id 访问
+// 一律安全返回；内部槽下标越界 → panic 响亮失败，与旧表 OOB 语义对齐）。
+// 符号前缀 em_（多文件合并防撞）。
+
+import "./emcodes.tie"
+namespace tiel;
+
+// ---------- tag 常量：表达式 ----------
+pub const T_E_INT: i64 = 1;        // 源区段(2) + 进制标记
+pub const T_E_FLOAT: i64 = 2;      // 源区段(2)
+pub const T_E_STR: i64 = 3;        // 源区段(2) + 形态标记
+pub const T_E_INTERP: i64 = 4;     // 段区段(2)
+pub const T_E_CHAR: i64 = 5;       // 源区段(2)
+pub const T_E_BOOL: i64 = 6;       // 值(0/1)
+pub const T_E_TRIT: i64 = 7;       // 值(1/0/-1)
+pub const T_E_IDENT: i64 = 8;      // 名 id
+
+pub const T_E_BIN: i64 = 10;       // op + l + r
+pub const T_E_UN: i64 = 11;        // op + e
+pub const T_E_CALL: i64 = 12;      // callee + 实参区段(2)
+pub const T_E_INDEX: i64 = 13;     // obj + idx
+pub const T_E_FIELD: i64 = 14;     // obj + 名 id
+pub const T_E_TABLE: i64 = 15;     // 元素区段(2)
+pub const T_E_MAP: i64 = 16;       // 条目区段(2)（键值交替）
+pub const T_E_TUPLE: i64 = 17;     // 元素区段(2)
+pub const T_E_RANGE: i64 = 18;     // lo + hi + incl
+pub const T_E_SLICE: i64 = 19;     // obj + lo + hi
+pub const T_E_CLOSURE: i64 = 20;   // 签名区段(2)（首元素=ret） + body
+pub const T_E_IFEXPR: i64 = 21;    // cond + then + else
+pub const T_E_SWITCHEXPR: i64 = 22;// obj + 分支区段(2)
+pub const T_E_PIPE: i64 = 23;      // l + r
+pub const T_E_IS: i64 = 24;        // e + 类型
+pub const T_E_COMP: i64 = 25;      // name + src + cond + body（综合；多层 for 用嵌套）
+pub const T_E_TRYPOP: i64 = 26;    // e
+pub const T_E_DEFVAL: i64 = 27;    // e + d
+pub const T_E_OPTCHAIN: i64 = 28;  // e + 名/下标
+pub const T_E_APPEND: i64 = 29;    // target + value
+pub const T_E_ASSIGN: i64 = 30;    // op + target + value
+pub const T_E_DECON: i64 = 31;     // 目标区段(2) + src
+pub const T_E_UNWRAP: i64 = 32;    // e（xs... 展开）
+pub const T_E_TERNARY: i64 = 33;   // cond + then + else（条件取值 cond ? then : else）
+
+// ---------- tag 常量：语句 ----------
+pub const T_S_BLOCK: i64 = 40;     // 语句区段(2)
+pub const T_S_EXPR: i64 = 41;      // e
+pub const T_S_IF: i64 = 42;        // cond + then + else
+pub const T_S_WHILE: i64 = 43;     // cond + body
+pub const T_S_FORRANGE: i64 = 44;  // var + lo + hi + incl + body + lbl
+pub const T_S_FORIN: i64 = 45;     // var + src + body + lbl
+pub const T_S_SWITCH: i64 = 46;    // obj + 分支区段(2) + lbl
+pub const T_S_RETURN: i64 = 47;    // e
+pub const T_S_BREAK: i64 = 48;     // lbl
+pub const T_S_CONTINUE: i64 = 49;  // lbl
+pub const T_S_PANIC: i64 = 50;     // e
+pub const T_S_IFLET: i64 = 51;     // 变体名 + 绑定名 + e + then + else
+
+// ---------- tag 常量：声明 ----------
+pub const T_D_FUNC: i64 = 60;      // name + 签名区段(2) + body + flags
+pub const T_D_ENUM: i64 = 61;      // name + 变体区段(2)
+pub const T_D_NAMESPACE: i64 = 62; // name + body
+pub const T_D_ALIAS: i64 = 63;     // name + 类型
+pub const T_D_IMPORT: i64 = 64;    // 路径区段(2) + 别名名
+pub const T_D_VAR: i64 = 65;       // bind 区段(2) + 类型 + init + flags（var/const/全局/局部/pub）
+pub const T_D_USING: i64 = 67;     // 名字链区段(2)（using 引入）
+
+// ---------- tag 常量：类型与辅助 ----------
+pub const T_T_NAME: i64 = 80;      // 名 id
+pub const T_T_APPLY: i64 = 81;     // base + 参数区段(2)
+pub const T_T_TUPLE: i64 = 82;     // 元素区段(2)
+pub const T_T_FN: i64 = 83;        // 参数区段(2) + ret
+
+pub const T_A_PARAM: i64 = 90;     // name + 类型 + 约定标记 + default
+pub const T_A_VARIANT: i64 = 91;   // name + 载荷区段(2)
+pub const T_A_PATTERN: i64 = 92;   // 变体名 + 绑定区段(2)
+pub const T_A_CASE: i64 = 93;      // 模式区段(2) + body
+pub const T_A_BIND: i64 = 94;      // name + flags（绑定；rest 位）
+pub const T_A_STRSEG: i64 = 95;    // kind + 内容（区段或表达式）
+pub const T_A_NARG: i64 = 96;      // name + value（命名实参）
+
+// 合成运算符（表示层 op 编号；与词法 kind 不冲突）
+pub const OP_NOT_IN: i64 = 210;    // "not in" 组合
+
+// ---------- 会话状态 ----------
+// 槽池 / 偏移池：裸内存 i64 缓冲（基址 + 容量 + 游标分列；缓冲不释放、reset 复用）
+var em_pool_p: i64 = 0;                 // 节点槽池基址
+var em_pool_cap: i64 = 0;               // 槽池容量（槽数）
+var em_pool_len: i64 = 0;               // 槽池已用槽数
+var em_off_p: i64 = 0;                  // 偏移池基址（[0] 占位）
+var em_off_cap: i64 = 0;
+var em_off_len: i64 = 0;
+pub var em_cnt: i64 = 0;                // 节点数（id 自 1 至 em_cnt）
+pub var em_ch: table<i64> = [];         // 子池（子节点 id 序列；冷路径保持表）
+pub var em_names: table<string> = [];   // 名池（名 id 自 0 起）
+pub var em_bk: table<i64> = [];         // 名哈希桶（开放寻址）
+pub var em_src: string = "";            // 源文本（当前会话保留一份）
+
+// ---------- 裸内存原语（仅本文件内部；i64 元素、8B 步长） ----------
+// 口径：会话单线程 ⇒ 免锁；缓冲会话生命周期内只增不减（reset 复用、不 free）。
+const AR_SZ: i64 = 8;          // i64 元素宽度（字节）
+const AR_MIN_CAP: i64 = 16;    // 首个容量
+
+unsafe func ar_alloc(n: i64) -> i64 {
+    return ptr_to_int(alloc(n * AR_SZ))
+}
+
+// 元素读（常量尺寸 memcpy ⇒ LLVM 降为 load）
+unsafe func ar_get(base: i64, i: i64) -> i64 {
+    var v: i64 = 0
+    memcpy(int_to_ptr(ptr_to_int(addr_of(v))), int_to_ptr(base + i * AR_SZ), AR_SZ)
+    return v
+}
+
+// 元素写（常量尺寸 memcpy ⇒ LLVM 降为 store）
+unsafe func ar_set(base: i64, i: i64, v: i64) {
+    var s: i64 = v
+    memcpy(int_to_ptr(base + i * AR_SZ), int_to_ptr(ptr_to_int(addr_of(s))), AR_SZ)
+}
+
+// 下一容量：翻倍；下限 AR_MIN_CAP；不足 need 继续翻倍
+unsafe func ar_next_cap(cap: i64, need: i64) -> i64 {
+    var nc = cap * 2
+    if nc < AR_MIN_CAP {
+        nc = AR_MIN_CAP
+    }
+    while nc < need {
+        nc = nc * 2
+    }
+    return nc
+}
+
+// 新缓冲 + 拷贝旧内容（旧缓冲不回收）；返回新基址
+unsafe func ar_move(base: i64, used: i64, nc: i64) -> i64 {
+    var nb = ar_alloc(nc)
+    if base != 0 && used > 0 {
+        memcpy(int_to_ptr(nb), int_to_ptr(base), used * AR_SZ)
+    }
+    return nb
+}
+
+// ---------- 槽池访问器（下标越界 = 内部不变式破坏 → panic） ----------
+unsafe func pool_get(i: i64) -> i64 {
+    if i < 0 || i >= em_pool_len {
+        panic("em: 槽池下标越界")
+    }
+    return ar_get(em_pool_p, i)
+}
+
+unsafe func pool_set(i: i64, v: i64) {
+    if i < 0 || i >= em_pool_len {
+        panic("em: 槽池下标越界")
+    }
+    ar_set(em_pool_p, i, v)
+}
+
+// 槽池预留 add 个槽（容量不足翻倍）；调用方推进 em_pool_len
+unsafe func pool_reserve(add: i64) {
+    var need = em_pool_len + add
+    if need > em_pool_cap {
+        var nc = ar_next_cap(em_pool_cap, need)
+        em_pool_p = ar_move(em_pool_p, em_pool_len, nc)
+        em_pool_cap = nc
+    }
+}
+
+// 偏移池推入（容量不足翻倍）
+unsafe func off_push(v: i64) {
+    if em_off_len >= em_off_cap {
+        var nc = ar_next_cap(em_off_cap, em_off_len + 1)
+        em_off_p = ar_move(em_off_p, em_off_len, nc)
+        em_off_cap = nc
+    }
+    ar_set(em_off_p, em_off_len, v)
+    em_off_len = em_off_len + 1
+}
+
+unsafe func off_get(i: i64) -> i64 {
+    if i < 0 || i >= em_off_len {
+        panic("em: 偏移池下标越界")
+    }
+    return ar_get(em_off_p, i)
+}
+
+var em_err_l: i64 = 0;
+var em_err_c: i64 = 0;
+var em_err_m: string = "";
+var em_err_x: string = "";  // 错误码（E 码；置错时经 ec_lookup 填入）
+var em_err_k: i64 = 0;      // 错误类别：0 无 / 1 词法 / 2 语法
+var em_has_err: bool = false;
+var em_es: table<i64> = [];       // 错误槽快照栈（探测回退；每层 he/l/c/k）
+var em_ess: table<string> = [];   // 错误槽快照栈（每层 msg/code）
+
+// ---------- 每 tag 槽数（4 / 6 / 8 档；默认 4） ----------
+pub func em_tsz(tag: i64) -> i64 {
+    if tag == T_S_FORRANGE {
+        return 8
+    }
+    if tag == T_D_FUNC {
+        return 6
+    }
+    if tag == T_D_ENUM {
+        return 6
+    }
+    if tag == T_D_VAR {
+        return 6
+    }
+    if tag == T_S_IFLET {
+        return 6
+    }
+    if tag == T_S_FORIN {
+        return 6
+    }
+    if tag == T_S_SWITCH {
+        return 6
+    }
+    if tag == T_E_COMP {
+        return 6
+    }
+    if tag == T_A_PARAM {
+        return 6
+    }
+    return 4
+}
+
+// ---------- 会话生命周期 ----------
+pub func em_reset() {
+    // 裸内存池：只回退游标（容量保留、缓冲复用，同旧表 trunc 的复用口径）。
+    // 表容器清空仍走 table_trunc（一次缩表，不逐元素 pop）。
+    em_pool_len = 0
+    em_off_len = 0
+    unsafe {
+        off_push(-1)     // id 0 占位
+    }
+    table_trunc(em_ch, 0)
+    table_trunc(em_names, 0)
+    table_trunc(em_bk, 0)
+    em_cnt = 0
+    em_src = ""
+    em_clear_err()
+}
+
+pub func em_set_src(s: string) {
+    em_src = s
+}
+
+pub func em_source() -> string {
+    return em_src
+}
+
+// ---------- 节点分配与字段访问 ----------
+pub func em_new(tag: i64) -> i64 {
+    var sz = em_tsz(tag)
+    unsafe {
+        if em_off_len == 0 {
+            off_push(-1)
+        }
+        pool_reserve(sz)
+        var off = em_pool_len
+        em_pool_len = em_pool_len + sz
+        // 槽清零（含 tag 槽）+ 写 tag：一次 memset 取代逐槽 push
+        memset(int_to_ptr(em_pool_p + off * AR_SZ), 0, sz * AR_SZ)
+        ar_set(em_pool_p, off, tag)
+        off_push(off)
+    }
+    em_cnt = em_cnt + 1
+    return em_cnt
+}
+
+// id → 槽偏移；非法 id 返回 -1。
+pub func em_at(id: i64) -> i64 {
+    if id < 1 || id > em_cnt {
+        return -1
+    }
+    var off: i64 = -1
+    unsafe {
+        off = off_get(id)
+    }
+    return off
+}
+
+pub func em_tag(id: i64) -> i64 {
+    var off = em_at(id)
+    if off < 0 {
+        return -1
+    }
+    var tg: i64 = 0
+    unsafe {
+        tg = pool_get(off)
+    }
+    return tg
+}
+
+// 读字段（slot 自 1 起）；非法 id 返回 0。
+pub func em_get(id: i64, slot: i64) -> i64 {
+    var off = em_at(id)
+    if off < 0 {
+        return 0
+    }
+    var v: i64 = 0
+    unsafe {
+        v = pool_get(off + slot)
+    }
+    return v
+}
+
+// 写字段（slot 自 1 起）；非法 id 忽略。
+pub func em_put(id: i64, slot: i64, v: i64) {
+    var off = em_at(id)
+    if off < 0 {
+        return
+    }
+    unsafe {
+        pool_set(off + slot, v)
+    }
+}
+
+// ---------- 子池区段 ----------
+pub func em_seg_begin() -> i64 {
+    return len(em_ch)
+}
+
+pub func em_seg_push(child: i64) {
+    table_push(em_ch, child)
+}
+
+pub func em_seg_len(st: i64) -> i64 {
+    return len(em_ch) - st
+}
+
+// ---------- 名表（intern） ----------
+func em_hash(s: string) -> i64 {
+    var h: i64 = 2166136261
+    var n = len(s)
+    var i: i64 = 0
+    while i < n {
+        h = h ^ str_byte(s, i)
+        h = (h * 16777619) & 4294967295
+        i = i + 1
+    }
+    return h
+}
+
+// 无检查插入（用于重哈希重插；桶内须有空位）。
+func em_bk_ins(nid: i64) {
+    var b = em_hash(em_names[nid]) % len(em_bk)
+    while em_bk[b] != 0 {
+        b = b + 1
+        if b >= len(em_bk) {
+            b = 0
+        }
+    }
+    em_bk[b] = nid + 1
+}
+
+// 桶容量双倍并重插全部名。
+// 注：table_pop 不触发 COW（实测穿透别名）——取证必须先逐元素显式复制，
+// 不能靠 `var old = em_bk` 后直接清空。
+func em_bk_rehash() {
+    var old: table<i64> = []
+    var i: i64 = 0
+    while i < len(em_bk) {
+        table_push(old, em_bk[i])
+        i = i + 1
+    }
+    table_trunc(em_bk, 0)
+    var cap = len(old) * 2
+    i = 0
+    while i < cap {
+        table_push(em_bk, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < len(old) {
+        var v = old[i]
+        if v > 0 {
+            em_bk_ins(v - 1)
+        }
+        i = i + 1
+    }
+}
+
+// 名字 → 名 id（去重；命中复用，未命中登记）。
+pub func em_nameid(s: string) -> i64 {
+    if len(em_bk) == 0 {
+        var k: i64 = 0
+        while k < 16 {
+            table_push(em_bk, 0)
+            k = k + 1
+        }
+    }
+    var b = em_hash(s) % len(em_bk)
+    while true {
+        var v = em_bk[b]
+        if v == 0 {
+            table_push(em_names, s)
+            var nid = len(em_names) - 1
+            em_bk[b] = nid + 1
+            var nn = len(em_names)
+            if nn * 4 > len(em_bk) * 3 {
+                em_bk_rehash()
+            }
+            return nid
+        }
+        if em_names[v - 1] == s {
+            return v - 1
+        }
+        b = b + 1
+        if b >= len(em_bk) {
+            b = 0
+        }
+    }
+    return -1
+}
+
+pub func em_namestr(nid: i64) -> string {
+    if nid < 0 || nid >= len(em_names) {
+        return ""
+    }
+    return em_names[nid]
+}
+
+// ---------- 错误槽（首错即停） ----------
+pub func em_clear_err() {
+    em_err_l = 0
+    em_err_c = 0
+    em_err_m = ""
+    em_err_x = ""
+    em_err_k = 0
+    em_has_err = false
+    table_trunc(em_es, 0)
+    table_trunc(em_ess, 0)
+}
+
+pub func em_fail_k(k: i64, line: i64, col: i64, msg: string) {
+    if em_has_err {
+        return
+    }
+    em_err_k = k
+    em_err_l = line
+    em_err_c = col
+    em_err_m = msg
+    em_err_x = ec_lookup(msg)
+    em_has_err = true
+}
+
+// 语法类错误（缺省类别）
+pub func em_fail(line: i64, col: i64, msg: string) {
+    em_fail_k(2, line, col, msg)
+}
+
+// 词法类错误
+pub func em_fail_lex(line: i64, col: i64, msg: string) {
+    em_fail_k(1, line, col, msg)
+}
+
+pub func em_err_kind() -> i64 {
+    return em_err_k
+}
+
+pub func em_ok() -> bool {
+    return !em_has_err
+}
+
+pub func em_err_line() -> i64 {
+    return em_err_l
+}
+
+pub func em_err_col() -> i64 {
+    return em_err_c
+}
+
+pub func em_err_msg() -> string {
+    return em_err_m
+}
+
+pub func em_err_code() -> string {
+    return em_err_x
+}
+
+// ---------- 错误槽快照（供解析层探测回退；栈式、save/restore 配对、可嵌套） ----------
+pub func em_err_save() {
+    var he: i64 = 0
+    if em_has_err {
+        he = 1
+    }
+    table_push(em_es, he)
+    table_push(em_es, em_err_l)
+    table_push(em_es, em_err_c)
+    table_push(em_es, em_err_k)
+    table_push(em_ess, em_err_m)
+    table_push(em_ess, em_err_x)
+}
+
+pub func em_err_restore() {
+    var n = len(em_es)
+    if n < 4 {
+        return
+    }
+    var ek = em_es[n - 1]
+    var ec = em_es[n - 2]
+    var el = em_es[n - 3]
+    var he = em_es[n - 4]
+    var i: i64 = 0
+    while i < 4 {
+        table_pop(em_es)
+        i = i + 1
+    }
+    var x: string = ""
+    var m: string = ""
+    if len(em_ess) >= 2 {
+        x = em_ess[len(em_ess) - 1]
+        table_pop(em_ess)
+        m = em_ess[len(em_ess) - 1]
+        table_pop(em_ess)
+    }
+    if he == 1 {
+        em_has_err = true
+    } else {
+        em_has_err = false
+    }
+    em_err_l = el
+    em_err_c = ec
+    em_err_k = ek
+    em_err_m = m
+    em_err_x = x
+}
+
+// ---------- 自检与统计 ----------
+func em_tag_ok(tg: i64) -> bool {
+    if tg >= 1 && tg <= 8 {
+        return true
+    }
+    if tg >= 10 && tg <= 33 {
+        return true
+    }
+    if tg >= 40 && tg <= 51 {
+        return true
+    }
+    if tg >= 60 && tg <= 67 {
+        return true
+    }
+    if tg >= 80 && tg <= 83 {
+        return true
+    }
+    if tg >= 90 && tg <= 96 {
+        return true
+    }
+    return false
+}
+
+// 自检：0 = 通过；非 0 为首个失败的检查编号。
+//   1 索引规模   2 偏移不单调   3 池总量不符   4 非法 tag
+//   5 子池 id 越界  6 名桶名 id 越界
+pub func em_verify() -> i64 {
+    if em_cnt == 0 {
+        if em_off_len == 0 {
+            // 未初始化（空会话）：池也必须为空
+            if em_pool_len != 0 {
+                return 1
+            }
+            return 0
+        }
+    }
+    if em_off_len != em_cnt + 1 {
+        return 1
+    }
+    var i: i64 = 1
+    var expect: i64 = 0
+    while i <= em_cnt {
+        if em_at(i) != expect {
+            return 2
+        }
+        if expect < 0 || expect >= em_pool_len {
+            return 3
+        }
+        var tg: i64 = 0
+        unsafe {
+            tg = ar_get(em_pool_p, expect)
+        }
+        expect = expect + em_tsz(tg)
+        i = i + 1
+    }
+    if expect != em_pool_len {
+        return 3
+    }
+    i = 1
+    while i <= em_cnt {
+        if !em_tag_ok(em_tag(i)) {
+            return 4
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < len(em_ch) {
+        var c = em_ch[i]
+        if c < 1 || c > em_cnt {
+            return 5
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < len(em_bk) {
+        var v = em_bk[i]
+        if v > 0 {
+            if v - 1 >= len(em_names) {
+                return 6
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+pub func em_stats() -> string {
+    return "nodes=" + to_string(em_cnt) + " child=" + to_string(len(em_ch)) +
+        " names=" + to_string(len(em_names)) + " pool=" + to_string(em_pool_len)
+}

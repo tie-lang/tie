@@ -1,0 +1,35 @@
+type tie<class>
+// compiler/backend/rt_abi.tie —— trm-lite 表句柄 ABI（**编译器侧唯一副本**）
+// ============================================================
+// 权威定义：`trm-lite/core/tbl/tl_tbl.tie` 的 48B 句柄布局（cap/len/data/esz/
+// lock/rc 六字段；esz 低 62 位为元素宽度，bit62 = 深表标记）。
+//
+// 用途：codegen 的**免锁快路径内联**（r.1.7）直接按本文件的偏移发射 gep + load/
+// store——`len(t)` 自更早版本起就已如此（见 irgen_str_p2.s21_table_len）。本文件
+// 把散落的字面量收敛成单点：**改运行时布局必须同时改这里**。
+//
+// 一致性核对：`tests/language/rt_abi_probe.tie` 在运行期经 trm-lite 入口建表，
+// 按本文件偏移读句柄字段断言（cap/len/esz/rc/data），对不上即 FAIL——把"布局
+// 知识进编译器"这件事从口头约定变成机器校验。
+//
+// 内联快路径的静态前提（irgen 侧判据，见 rt_elem_inline_ok）：
+//   * 元素是标量/字符串/布尔（LLVM 一等值；聚合与 any 一律回退调用路径）；
+//   * 元素宽度与运行期 esz 同源（同一 `elem_size` 决定建表实参）。
+pub const RT_TBL_OFF_CAP: i64 = 0;    // 容量（元素数）
+pub const RT_TBL_OFF_LEN: i64 = 8;    // 长度（元素数）
+pub const RT_TBL_OFF_DATA: i64 = 16;  // 数据缓冲区地址
+pub const RT_TBL_OFF_ESZ: i64 = 24;   // 元素宽度（低 62 位；bit62 = 深表）
+pub const RT_TBL_OFF_RC: i64 = 40;    // 引用计数（越界写分流用）
+
+// 内联快路径元素宽度：标量/字符串 8，布尔 1；其余 -1（回退调用路径）。
+// 与 `elem_size`（建表实参同源）保持一致：i64/f64/string/ptr 族 → 8，bool → 1。
+pub func rt_elem_inline_bytes(ty: i64) -> i64 {
+    var T = types.named(TK_I64)
+    if ty == T || ty == types.named(TK_F64) || ty == types.named(TK_STR) {
+        return 8
+    }
+    if ty == types.named(TK_BOOL) {
+        return 1
+    }
+    return 0 - 1
+}

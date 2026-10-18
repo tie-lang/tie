@@ -1,0 +1,363 @@
+type tie<class>
+// compiler/frontend/xref.tie —— 结构化输出·全量符号表交叉引用侧表（p.9.22.6）
+// ============================================================
+// 零 import 叶模块（namespace xref）：自持三组 append-only 侧表，为 dbgem
+// symtab dump / 产物 .sym.zd / tieir 段 8 提供「作用域 + 声明 + 引用」全量
+// 交叉引用数据。设计稿：docs/superpowers/specs/2026-09-25-structured-output-
+// tinker-design.md §4（字段号 188-198）。
+//
+// # 表（列号 = 设计稿字段号）
+//   scope：188 parent（-1=根）· 189 owner（owner 节点 id，根 = -1）
+//   decl ：190 name · 191 kind · 192 type · 193 scope · 194 node · 195 line · 196 col
+//   use  ：197 node · 198 decl
+//
+// # kind 码
+//   0=fn 1=struct 2=enum 3=alias 4=global 5=local 6=param
+//
+// # 登记纪律（登记调用点一律无条件——无「忘了开」的坑；开关在叶子内）
+//   - reg_decl ：声明登记（fn/struct/enum/alias/global/local/param）
+//   - reg_use  ：sinfer 标识符解析成功处一行（use→decl 经 bind_find 或直取）
+//   - push_scope / pop_scope：函数体 / 闭包体作用域
+//   - snapshot_bind / load_bind：闭包登记时快照 + 闭包体检查时装载——捕获
+//     变量的 use→decl 解析与语义层 cl_o* 快照同语义（登记时刻 = 解析基准）
+//
+// # 采集门（性能/内存纪律）
+//   默认**关闭**：全部登记函数首行短路返回（一次全局 bool 判定），除 reset
+//   的少量空表外零分配、零追加。需要结构化符号表的路径由 driver 单点开启
+//  （set_enabled(1)，在语义检查之前）：--emit symtab* / library|class 伴生
+//   .sym.zd / --tieir-out（段 8）/ trm 目标。dump/序列化侧以 enabled() 断言
+//   （未开启 = 显式失败，不静默产出空符号表）。
+//   ——设计稿「常开无开关」的语义边界：调用点形态不变（无条件登记行），
+//   仅把成本门放在叶子内部；消费方开启与否由 driver 单一出处决定。
+//
+// # 查找结构（纯物理段模型；开启时 O(短段扫描) + O(log n) 全局二分）
+//   - 绑定段：物理追加、只增不减（tie 表不可截断）。每个 scope 记录**压入
+//     时的物理长度** xg_sc_bstart；当前 scope 的可见绑定 = 物理段
+//     [bstart[cur], len)。pop 只回退游标（上层段起点即天然边界，旧数据天然
+//     不可见）——不依赖逻辑计数，避免「逻辑索引 / 物理索引」错位。
+//   - 局部/形参/捕获就近后进先查（遮蔽语义与 lv_insert「覆盖」一致）；
+//     段长 = 本函数/闭包绑定数（短）。
+//   - 全局（kind 4）：独立排序表（名 id 升序）二分——全局集合跨函数复用，
+//     不进段扫描路径。
+//
+// # 行号读取
+//   声明登记时即从 s_lines/s_cols 快照 line/col（登记点保证节点 id 在
+//   语义池内有效）；越界/无节点写 -1。use 行号不冗余存——由消费方经
+//   ast 节点表 107/108 取（设计稿 §4）。
+
+// ---------- 全局状态 ----------
+var xg_enabled: bool = false;   // 采集门（默认关；driver 单点开启）
+
+// scope 表（每 scope 一行）。
+var xg_sc_parent: table<i64>;
+var xg_sc_owner: table<i64>;
+var xg_sc_bstart: table<i64>;   // scope 的绑定段物理起点
+var xg_cur: i64 = -1;           // 当前 scope id（reset 后 = 0 根）
+
+// 声明表（7 列并行）。
+var xg_d_names: table<i64>;
+var xg_d_kinds: table<i64>;
+var xg_d_tys: table<i64>;
+var xg_d_scopes: table<i64>;
+var xg_d_nodes: table<i64>;
+var xg_d_lines: table<i64>;
+var xg_d_cols: table<i64>;
+
+// 引用表（2 列并行）。
+var xg_u_nodes: table<i64>;
+var xg_u_decls: table<i64>;
+
+// 绑定段（局部/形参/捕获；name id → decl node）。
+var xg_b_keys: table<i64>;
+var xg_b_vals: table<i64>;
+
+// 全局绑定排序表（kind 4；名 id 升序）。
+var xg_g_keys: table<i64>;
+var xg_g_vals: table<i64>;
+
+// 闭包绑定快照（登记时拷贝当前段；按闭包索引寻址）。
+var xg_sav_keys: table<i64>;
+var xg_sav_vals: table<i64>;
+var xg_sav_off: table<i64>;
+var xg_sav_n: table<i64>;
+var xg_sav_scope: table<i64>;   // 快照时所在 scope（闭包 scope 的父修正）
+
+namespace xref {
+
+// 采集门：1 = 开启（driver 单点调用，先于语义检查；可重复调用）。
+pub func set_enabled(v: i64) {
+    if v != 0 {
+        xg_enabled = true
+    } else {
+        xg_enabled = false
+    }
+}
+
+pub func enabled() -> i64 {
+    if xg_enabled {
+        return 1
+    }
+    return 0
+}
+
+// 全量复位（编译单元级；由 semantic.reset_sem_state 单一出处调用）。
+// 建根 scope（id 0，parent/owner = -1，绑定段起点 0）。门关时仅建空表。
+pub func reset() {
+    xg_sc_parent = table_new_i64()
+    xg_sc_owner = table_new_i64()
+    xg_sc_bstart = table_new_i64()
+    table_push(xg_sc_parent, -1)
+    table_push(xg_sc_owner, -1)
+    table_push(xg_sc_bstart, 0)
+    xg_cur = 0
+    xg_d_names = table_new_i64()
+    xg_d_kinds = table_new_i64()
+    xg_d_tys = table_new_i64()
+    xg_d_scopes = table_new_i64()
+    xg_d_nodes = table_new_i64()
+    xg_d_lines = table_new_i64()
+    xg_d_cols = table_new_i64()
+    xg_u_nodes = table_new_i64()
+    xg_u_decls = table_new_i64()
+    xg_b_keys = table_new_i64()
+    xg_b_vals = table_new_i64()
+    xg_g_keys = table_new_i64()
+    xg_g_vals = table_new_i64()
+    xg_sav_keys = table_new_i64()
+    xg_sav_vals = table_new_i64()
+    xg_sav_off = table_new_i64()
+    xg_sav_n = table_new_i64()
+    xg_sav_scope = table_new_i64()
+}
+
+// 当前 scope id（未 reset 时 -1）。
+pub func cur_scope() -> i64 {
+    return xg_cur
+}
+
+// 压入新 scope（owner = 拥有者节点 id，如函数/闭包字面量节点；-1 = 无）。
+// 返回新 scope id。段起点 = 压入时的绑定物理长度。
+pub func push_scope(owner: i64) -> i64 {
+    var id = len(xg_sc_parent)
+    table_push(xg_sc_parent, xg_cur)
+    table_push(xg_sc_owner, owner)
+    table_push(xg_sc_bstart, len(xg_b_keys))
+    xg_cur = id
+    return id
+}
+
+// 弹出当前 scope（回到父）。纯游标回退——物理段不动（上层段起点即天然
+// 边界；旧数据在本层不可见，下一层起点也从当前物理长度续接）。
+pub func pop_scope() {
+    if xg_cur <= 0 {
+        return
+    }
+    xg_cur = xg_sc_parent[xg_cur]
+}
+
+// 全局绑定登记（名 id 升序二分，命中改值——重复声明 = 覆盖语义）。
+func gbind_add(nid: i64, node: i64) {
+    var n = len(xg_g_keys)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if xg_g_keys[mid] < nid {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    if pos < n && xg_g_keys[pos] == nid {
+        xg_g_vals[pos] = node
+        return
+    }
+    table_push(xg_g_keys, 0)
+    table_push(xg_g_vals, 0)
+    var i = n
+    while i > pos {
+        xg_g_keys[i] = xg_g_keys[i - 1]
+        xg_g_vals[i] = xg_g_vals[i - 1]
+        i = i - 1
+    }
+    xg_g_keys[pos] = nid
+    xg_g_vals[pos] = node
+}
+
+// 声明登记。kind：0=fn 1=struct 2=enum 3=alias 4=global 5=local 6=param。
+// node = 声明节点 id（-1 = 无源节点，如泛型实例化产物）；line/col 从
+// s_lines/s_cols 即时快照（越界写 -1）。返回声明行号（门关时返回 -1）。
+// 绑定登记：global → 排序表；local/param → 当前 scope 段物理尾。
+pub func reg_decl(nid: i64, kind: i64, ty: i64, node: i64) -> i64 {
+    if !xg_enabled {
+        return -1
+    }
+    var ln: i64 = -1
+    var cl: i64 = -1
+    if node >= 0 && node < len(s_lines) {
+        ln = s_lines[node]
+        cl = s_cols[node]
+    }
+    var row = len(xg_d_names)
+    table_push(xg_d_names, nid)
+    table_push(xg_d_kinds, kind)
+    table_push(xg_d_tys, ty)
+    table_push(xg_d_scopes, xg_cur)
+    table_push(xg_d_nodes, node)
+    table_push(xg_d_lines, ln)
+    table_push(xg_d_cols, cl)
+    if kind == 4 {
+        gbind_add(nid, node)
+    } else if kind == 5 || kind == 6 {
+        table_push(xg_b_keys, nid)
+        table_push(xg_b_vals, node)
+    }
+    return row
+}
+
+// 引用登记：node = 使用处表达式节点 id；decl = 解析到的声明节点 id
+//（-1 = 未解析，如无源节点声明/闭包捕获登记前的引用）。
+pub func reg_use(node: i64, decl: i64) {
+    if !xg_enabled {
+        return
+    }
+    table_push(xg_u_nodes, node)
+    table_push(xg_u_decls, decl)
+}
+
+// 绑定查找：name id → decl node（当前段后进先查 + 全局排序表二分；
+// -1 = 未命中）。段扫描范围 = [bstart[cur], 物理长度)（闭包段已含捕获快照）。
+pub func bind_find(nid: i64) -> i64 {
+    if !xg_enabled || xg_cur < 0 {
+        return -1
+    }
+    var s = xg_sc_bstart[xg_cur]
+    var i = len(xg_b_keys) - 1
+    while i >= s {
+        if xg_b_keys[i] == nid {
+            return xg_b_vals[i]
+        }
+        i = i - 1
+    }
+    var n = len(xg_g_keys)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if xg_g_keys[mid] == nid {
+            return xg_g_vals[mid]
+        }
+        if xg_g_keys[mid] < nid {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// 闭包绑定快照（闭包登记时调用；ci = 闭包索引）。拷贝当前 scope 段
+// [bstart, 物理长度)（局部/形参；全局由排序表覆盖，不进快照）；
+// 每闭包只快照一次（以 sav_scope 哨兵判重）。
+pub func snapshot_bind(ci: i64) {
+    if !xg_enabled {
+        return
+    }
+    while len(xg_sav_off) <= ci {
+        table_push(xg_sav_off, 0)
+        table_push(xg_sav_n, 0)
+        table_push(xg_sav_scope, -1)
+    }
+    if xg_sav_scope[ci] >= 0 {
+        return
+    }
+    var off = len(xg_sav_keys)
+    var s = xg_sc_bstart[xg_cur]
+    var e = len(xg_b_keys)
+    var i = s
+    while i < e {
+        table_push(xg_sav_keys, xg_b_keys[i])
+        table_push(xg_sav_vals, xg_b_vals[i])
+        i = i + 1
+    }
+    xg_sav_off[ci] = off
+    xg_sav_n[ci] = e - s
+    xg_sav_scope[ci] = xg_cur
+}
+
+// 闭包绑定装载（闭包体检查时调用，在 push_scope 之后）：把快照追加进当前
+// scope 段（捕获变量的 use→decl 解析基础），并把 scope 父修正为其登记时
+// 所在 scope（闭包嵌套时 scope 树的父子关系真实化）。
+pub func load_bind(ci: i64) {
+    if !xg_enabled {
+        return
+    }
+    if ci < 0 || ci >= len(xg_sav_off) {
+        return
+    }
+    var off = xg_sav_off[ci]
+    var n = xg_sav_n[ci]
+    var i: i64 = 0
+    while i < n {
+        table_push(xg_b_keys, xg_sav_keys[off + i])
+        table_push(xg_b_vals, xg_sav_vals[off + i])
+        i = i + 1
+    }
+    if xg_cur > 0 && ci < len(xg_sav_scope) {
+        var ps = xg_sav_scope[ci]
+        if ps >= 0 {
+            xg_sc_parent[xg_cur] = ps
+        }
+    }
+}
+
+// ==================== 访问器（dump / 序列化消费）====================
+
+pub func scope_count() -> i64 {
+    return len(xg_sc_parent)
+}
+pub func scope_parent_at(i: i64) -> i64 {
+    return xg_sc_parent[i]
+}
+pub func scope_owner_at(i: i64) -> i64 {
+    return xg_sc_owner[i]
+}
+
+pub func decl_count() -> i64 {
+    return len(xg_d_names)
+}
+pub func decl_name_at(i: i64) -> i64 {
+    return xg_d_names[i]
+}
+pub func decl_kind_at(i: i64) -> i64 {
+    return xg_d_kinds[i]
+}
+pub func decl_type_at(i: i64) -> i64 {
+    return xg_d_tys[i]
+}
+pub func decl_scope_at(i: i64) -> i64 {
+    return xg_d_scopes[i]
+}
+pub func decl_node_at(i: i64) -> i64 {
+    return xg_d_nodes[i]
+}
+pub func decl_line_at(i: i64) -> i64 {
+    return xg_d_lines[i]
+}
+pub func decl_col_at(i: i64) -> i64 {
+    return xg_d_cols[i]
+}
+
+pub func use_count() -> i64 {
+    return len(xg_u_nodes)
+}
+pub func use_node_at(i: i64) -> i64 {
+    return xg_u_nodes[i]
+}
+pub func use_decl_at(i: i64) -> i64 {
+    return xg_u_decls[i]
+}
+
+}   // namespace xref

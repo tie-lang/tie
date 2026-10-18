@@ -1,0 +1,349 @@
+type tie<class>
+// std/tmath.tie —— L2 数学壳库 tmath（命名空间 tmath；纯 tie，std 层）
+// ============================================================
+// 设计定位：面向"微型扩散模型训练"提供神经网络常用**标量激活**、**组合**
+// (softmax) 与**轻量统计**（定长数组窗口归约）。通用张量/批量归约不是本库
+// 职责（那是后续 tensor 库的事），此处留白。
+//
+// 【为什么只做"组合/激活/辅助"，不封装单个内建】
+//   tie 的数学内建（exp/log/sqrt/tanh/ceil/floor 等）以裸名在全局可见，调用方
+//   可直接裸调。若在命名空间内声明同名函数（如 `pub func tanh(x) { return
+//   tanh(x) }`），函数体里的 `tanh(x)` 会解析为**自己**而非内建，形成无限递归；
+//   且 tie 无函数重载可借签名区分。故本库对单内建一律不封装，只提供由
+//   若干内建/算术**组合而成**的新函数（激活/距离/插值/softmax/统计）。
+//
+// 【统计为何用"定长数组窗口 + 固定档位（64/512）"】
+//   tie 中数组长度是数组**类型的一部分**：array<f64,64> 与 array<f64,512>
+//   是两种不同类型，无法用泛型统一传参；`ref` 形参又仅限 table 与 array<T,N>
+//   （自定义 struct 不可作 ref）。这意味着无法写一个"任意长度"的单函数。折衷：
+//   用户按需构造定长数组并只填充有效 `n` 个元素，库函数取前 n 个归约。为控制
+//   API 规模，仅提供 64 与 512 两档固定窗口（覆盖微型扩散模型常见批量粒度），
+//   其他窗口由调用方自建同构循环，或交给后续 tensor 库统一处理。
+//
+// 内置数学均裸名调用（exp/log/sqrt/tanh/asin/acos/floor/ceil/expm1/log1p 等）。
+// EN: L2 math shell. Scalar activations + combos (softmax) + fixed-window stats.
+// Single builtins are NOT wrapped (a same-named `pub func tanh` would self-recurse
+// and tie has no overloading); callers use builtins bare. Stats use fixed windows
+// (64/512) because array length is part of the type and `ref` only accepts
+// table/array<T,N>, so a length-agnostic function is impossible.
+
+namespace tmath {
+
+// ---- 标量激活族（f64）Scalar activations ----
+
+// 线性整流：x<0 置 0，否则原样返回。
+// EN: ReLU: 0 for x<0, else x.
+pub func relu(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0
+    }
+    return x
+}
+
+// 带泄漏 ReLU：x<0 输出 slope*x，否则原样返回。
+// EN: leaky ReLU: slope*x for x<0, else x.
+pub func leaky_relu(x: f64, slope: f64) -> f64 {
+    if x < 0.0 {
+        return slope * x
+    }
+    return x
+}
+
+// Logistic sigmoid：1/(1+e^-x)，值域 (0,1)。
+// EN: logistic sigmoid: 1/(1+e^-x), range (0,1).
+pub func sigmoid(x: f64) -> f64 {
+    return 1.0 / (1.0 + exp(0.0 - x))
+}
+
+// GELU 的 tanh 近似：0.5x(1+tanh(√(2/π)(x+0.044715x³)))，π≈3.141592653589793。
+// EN: GELU tanh-approx: 0.5x(1+tanh(√(2/π)(x+0.044715x³))); π≈3.141592653589793.
+pub func gelu(x: f64) -> f64 {
+    var x3: f64 = x * x * x
+    return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x3)))
+}
+
+// Softplus：log(1+e^x)，数值稳定式 max(x,0)+log1p(e^-|x|)。
+// EN: softplus: log(1+e^x); stable max(x,0)+log1p(e^-|x|).
+pub func softplus(x: f64) -> f64 {
+    var ax: f64 = x
+    if ax < 0.0 {
+        ax = 0.0 - ax
+    }
+    var m: f64 = x
+    if m < 0.0 {
+        m = 0.0
+    }
+    return m + log1p(exp(0.0 - ax))
+}
+
+// SiLU（swish）：x·sigmoid(x)=x/(1+e^-x)，x<0 时略负。
+// EN: SiLU / swish: x·sigmoid(x)=x/(1+e^-x), slightly negative for x<0.
+pub func silu(x: f64) -> f64 {
+    return x / (1.0 + exp(0.0 - x))
+}
+
+// 限幅 x 到 [lo,hi]（要求 lo<=hi）。
+// EN: clamp x into [lo,hi] (requires lo<=hi).
+pub func clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+// 线性插值：a+(b-a)t。
+// EN: linear interpolation: a+(b-a)t.
+pub func lerp(a: f64, b: f64, t: f64) -> f64 {
+    return a + (b - a) * t
+}
+
+// Hermite 平滑阶跃：区间 [e0,e1] 上 3t²-2t³ 平滑（t 已夹到 0..1）。
+// EN: Hermite smoothstep over [e0,e1] via 3t²-2t³ (t clamped to 0..1).
+pub func smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
+    var t: f64 = (x - e0) / (e1 - e0)
+    if t < 0.0 {
+        t = 0.0
+    }
+    if t > 1.0 {
+        t = 1.0
+    }
+    return t * t * (3.0 - 2.0 * t)
+}
+
+// 单位阶跃：x>=0 输出 1.0，否则 0.0。
+// EN: unit step: 1.0 for x>=0, else 0.0.
+pub func step(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0
+    }
+    return 1.0
+}
+
+// ---- softmax 组合（数值稳定性：exp(x-max)，防溢出）Softmax (exp(x-max), overflow-safe) ----
+// 任意长度输入留给调用方循环或 tensor 库；本库提供 2/3/4/6 元固定档。
+// 归一化输出和恰为 1（忽略浮点舍入）。
+
+// 2 元 softmax。(two-element softmax.)
+pub func softmax_2(a: f64, b: f64) -> (s1: f64, s2: f64) {
+    var mx = a
+    if b > mx {
+        mx = b
+    }
+    var ea = exp(a - mx)
+    var eb = exp(b - mx)
+    var s = ea + eb
+    return (ea / s, eb / s)
+}
+
+// 3 元 softmax。(three-element softmax.)
+pub func softmax_3(a: f64, b: f64, c: f64) -> (s1: f64, s2: f64, s3: f64) {
+    var mx = a
+    if b > mx {
+        mx = b
+    }
+    if c > mx {
+        mx = c
+    }
+    var ea = exp(a - mx)
+    var eb = exp(b - mx)
+    var ec = exp(c - mx)
+    var s = ea + eb + ec
+    return (ea / s, eb / s, ec / s)
+}
+
+// 4 元 softmax。(four-element softmax.)
+pub func softmax_4(a: f64, b: f64, c: f64, d: f64) -> (s1: f64, s2: f64, s3: f64, s4: f64) {
+    var mx = a
+    if b > mx {
+        mx = b
+    }
+    if c > mx {
+        mx = c
+    }
+    if d > mx {
+        mx = d
+    }
+    var ea = exp(a - mx)
+    var eb = exp(b - mx)
+    var ec = exp(c - mx)
+    var ed = exp(d - mx)
+    var s = ea + eb + ec + ed
+    return (ea / s, eb / s, ec / s, ed / s)
+}
+
+// 6 元 softmax。(six-element softmax.)
+pub func softmax_6(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) -> (s1: f64, s2: f64, s3: f64, s4: f64, s5: f64, s6: f64) {
+    var mx = a
+    if b > mx {
+        mx = b
+    }
+    if c > mx {
+        mx = c
+    }
+    if d > mx {
+        mx = d
+    }
+    if e > mx {
+        mx = e
+    }
+    if f > mx {
+        mx = f
+    }
+    var ea = exp(a - mx)
+    var eb = exp(b - mx)
+    var ec = exp(c - mx)
+    var ed = exp(d - mx)
+    var ee = exp(e - mx)
+    var ef = exp(f - mx)
+    var s = ea + eb + ec + ed + ee + ef
+    return (ea / s, eb / s, ec / s, ed / s, ee / s, ef / s)
+}
+
+// ---- 定长数组窗口统计（64 / 512 两档，只取前 n 个元素）Stats on fixed windows (64/512), first n elements ----
+
+// 窗口 64 均值：前 n 个元素的算术平均；n<=0 返回 0。
+// EN: mean of first n over array<f64,64>; returns 0 when n<=0.
+pub func mean64(xs: ref array<f64, 64>, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0
+    }
+    var s: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        s = s + xs[i]
+        i = i + 1
+    }
+    return s / to_f64(n)
+}
+
+// 窗口 64 总体方差：1/n·Σ(x-mean)²；n<=0 返回 0。
+// EN: population variance over first n; returns 0 when n<=0.
+pub func var64(xs: ref array<f64, 64>, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0
+    }
+    var m = mean64(xs, n)
+    var acc: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        var d = xs[i] - m
+        acc = acc + d * d
+        i = i + 1
+    }
+    return acc / to_f64(n)
+}
+
+// 窗口 64 总体标准差：sqrt(var64)。(population std = sqrt(var64).)
+pub func std64(xs: ref array<f64, 64>, n: i64) -> f64 {
+    return sqrt(var64(xs, n))
+}
+
+// 窗口 64 最大值；n<=0 返回 0。
+// EN: max over first n; returns 0 when n<=0.
+pub func max64(xs: ref array<f64, 64>, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0
+    }
+    var m = xs[0]
+    var i: i64 = 1
+    while i < n {
+        if xs[i] > m {
+            m = xs[i]
+        }
+        i = i + 1
+    }
+    return m
+}
+
+// 窗口 64 最小值；n<=0 返回 0。
+// EN: min over first n; returns 0 when n<=0.
+pub func min64(xs: ref array<f64, 64>, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0
+    }
+    var m = xs[0]
+    var i: i64 = 1
+    while i < n {
+        if xs[i] < m {
+            m = xs[i]
+        }
+        i = i + 1
+    }
+    return m
+}
+
+// 窗口 512 均值：前 n 个元素的算术平均；n<=0 返回 0。
+// EN: mean of first n over array<f64,512>; returns 0 when n<=0.
+pub func mean512(xs: ref array<f64, 512>, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0
+    }
+    var s: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        s = s + xs[i]
+        i = i + 1
+    }
+    return s / to_f64(n)
+}
+
+// 窗口 512 总体方差：1/n·Σ(x-mean)²；n<=0 返回 0。
+// EN: population variance over first n; returns 0 when n<=0.
+pub func var512(xs: ref array<f64, 512>, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0
+    }
+    var m = mean512(xs, n)
+    var acc: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        var d = xs[i] - m
+        acc = acc + d * d
+        i = i + 1
+    }
+    return acc / to_f64(n)
+}
+
+// 窗口 512 总体标准差：sqrt(var512)。(population std = sqrt(var512).)
+pub func std512(xs: ref array<f64, 512>, n: i64) -> f64 {
+    return sqrt(var512(xs, n))
+}
+
+// 窗口 512 最大值；n<=0 返回 0。
+// EN: max over first n; returns 0 when n<=0.
+pub func max512(xs: ref array<f64, 512>, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0
+    }
+    var m = xs[0]
+    var i: i64 = 1
+    while i < n {
+        if xs[i] > m {
+            m = xs[i]
+        }
+        i = i + 1
+    }
+    return m
+}
+
+// 窗口 512 最小值；n<=0 返回 0。
+// EN: min over first n; returns 0 when n<=0.
+pub func min512(xs: ref array<f64, 512>, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0
+    }
+    var m = xs[0]
+    var i: i64 = 1
+    while i < n {
+        if xs[i] < m {
+            m = xs[i]
+        }
+        i = i + 1
+    }
+    return m
+}
+
+}   // namespace tmath

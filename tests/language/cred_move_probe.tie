@@ -1,0 +1,57 @@
+type tie<logic>
+// cred_move_probe.tie —— 凭据 move-only 正例（规范 §11.6「可以转移，但不能复制」）
+// ============================================================================
+// 凭据是一类特殊的值：它可以转移，但不能复制——因此同一时刻只有一处持有它。
+// 本文件覆盖三条**合法**转移路径，确认约束只拦复制、不误伤转移：
+//   ① 局部转移      var g2 = g（源失效、目标可用）
+//   ② 跨函数转移    return guard（move out）
+//   ③ 转移后消费    目标进入 unsafe use 块执行 mem 域操作
+// 负例见 cred_dup_move_neg.tie（凭据重复转移）/ heap_dup_move_neg.tie（堆类型同理）。
+
+// ① 局部转移：g → g2，随后只用 g2
+unsafe func transfer_ok() -> i64 {
+    var g: guard<mem> = unsafe.get(mem)
+    var g2 = g
+    var r: i64 = 0
+    unsafe use g2 {
+        var p = alloc(16)
+        free(p)
+        r = 7
+    }
+    return r
+}
+
+// ② 跨函数转移：返回即 move out
+// 注：`unsafe.get` 本身是**取得**凭据的操作，只需锁一（unsafe 上下文），
+// 不需要锁二——否则「取 mem 凭据」自身要求先有 mem 凭据，形成循环依赖。
+// 而 `#[unsafe.mem]` 只给锁二不给锁一，故此处用 `unsafe func`。
+unsafe func make_cred() -> guard<mem> {
+    var g: guard<mem> = unsafe.get(mem)
+    return g
+}
+
+// ③ 接收方消费转移过来的凭据
+unsafe func chain() -> i64 {
+    var g = make_cred()
+    var r: i64 = 0
+    unsafe use g {
+        var p = alloc(8)
+        free(p)
+        r = 9
+    }
+    return r
+}
+
+func main() {
+    var a: i64 = 0
+    var b: i64 = 0
+    unsafe {
+        a = transfer_ok()
+        b = chain()
+    }
+    if a == 7 && b == 9 {
+        println("cred-move PASS (transfer 7 chain 9)")
+    } else {
+        println("cred-move FAIL (" + to_string(a) + " " + to_string(b) + ")")
+    }
+}

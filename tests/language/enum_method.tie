@@ -1,0 +1,41 @@
+type tie<logic>
+
+// p.9.11.20 enum 关联方法：enum 类型可定义方法——namespace <enum 名> 内
+// pub func，首参 = enum 类型自动 ref（与 p.8.2.4/p.8.2.7 struct 方法约定
+// 一致）；调用 obj.method() 分派 <enum>::method(obj)。方法内可 switch self
+// 解构 payload（p.8.1.4 CaseBind 机制复用）。
+
+enum Shape {
+    Circle(i64)
+    Rect(i64, i64)
+}
+
+namespace Shape {
+    // 方法：面积（match self 解构 payload）
+    pub func area(self: Shape) -> i64 {
+        switch self {
+            case Circle(r):
+                return 3 * r * r
+            case Rect(w, h):
+                return w * h
+        }
+    }
+    // 方法：形状种类描述
+    pub func kind(self: Shape) -> string {
+        switch self {
+            case Circle(r):
+                return "circle"
+            case Rect(w, h):
+                return "rect"
+        }
+    }
+}
+
+func main() {
+    var c = Shape.Circle(10)
+    println(c.area())
+    println(c.kind())
+    var r = Shape.Rect(3, 4)
+    println(r.area())
+    println(r.kind())
+}

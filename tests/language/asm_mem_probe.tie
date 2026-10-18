@@ -1,0 +1,57 @@
+type tie<logic>
+// asm_mem_probe.tie —— asm! 的 (mem) 约束回归探针（S1.2 I1，2026-10-02）
+// ============================================================================
+// 规范 §11.7：操作数声明「方向 + 约束位置」——方向为输出/输入/既读又写，
+// 约束位置为**寄存器 / 内存**。本探针覆盖 (mem) 的全部三种方向，
+// 与只覆盖 (reg) 的 atomic_asm.tie / asm_multi_probe.tie 互补。
+//
+// (mem) 的语义：操作数是**内存**而非寄存器——编译器传变量地址，内联汇编
+// 直接读写该内存槽。故 out(mem) 天然写回变量，无需额外回写指令。
+//
+// 期望输出：41 77 7 12345
+
+// ---- ① in(mem)：读内存到寄存器 ----
+func m_in() -> i64 {
+    var x: i64 = 41
+    var r: i64 = 0
+    unsafe {
+        asm!("movq $1, $0", out(reg) r, in(mem) x)
+    }
+    return r
+}
+
+// ---- ② out(mem)：寄存器写内存（直接落到变量槽）----
+func m_out() -> i64 {
+    var y: i64 = 0
+    unsafe {
+        asm!("movq $$77, $0", out(mem) y)
+    }
+    return y
+}
+
+// ---- ③ inout(mem)：既读又写（读旧值 + 加 2 写回）----
+func m_inout() -> i64 {
+    var z: i64 = 5
+    unsafe {
+        asm!("addq $$2, $0", inout(mem) z)
+    }
+    return z
+}
+
+// ---- ④ (mem) 与 (reg) 混用：reg 输入 + mem 输出 ----
+func m_mixed() -> i64 {
+    var src: i64 = 12345
+    var dst: i64 = 0
+    unsafe {
+        asm!("movq $1, $0", out(mem) dst, in(reg) src)
+    }
+    return dst
+}
+
+func main() {
+    var a = m_in()
+    var b = m_out()
+    var c = m_inout()
+    var d = m_mixed()
+    println(to_string(a) + " " + to_string(b) + " " + to_string(c) + " " + to_string(d))
+}

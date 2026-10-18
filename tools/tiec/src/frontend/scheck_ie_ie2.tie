@@ -1,0 +1,403 @@
+type tie<class>
+// compiler/frontend/scheck_ie_ie2.tie —— check_stmt 分支提子函数分片 2（p.9.21 G2 单函数 ≤300 行）
+// ============================================================
+// 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
+// 分片内函数与原调度器同 namespace，跨文件裸名互调。
+namespace scheck {
+pub func check_stmt_for(s: i64) -> i64 {
+    var tag = s_tags[s]
+        var vname = sstate.name_str(s)
+        var vnid = intern.intern(vname)
+        var iter = sstate.child(s, 0)
+        var it = sinfer.infer_expr(iter)
+        if it < 0 {
+            return -1
+        }
+        var elem_ty: i64 = types.named(TK_I64)
+        // 字符串码点迭代器：`for c in s.chars()`（dev33 批次4 语法糖）。
+        // 循环变量元素类型 = 单字符 string；须先于 is_table 分支（iter 的
+        // 推断类型也是 string，但 is_table(string)=false 不影响）。
+        if it == types.named(TK_STR) && is_chars_iter(iter) {
+            elem_ty = types.named(TK_STR)
+        } else if types.is_table(it) {
+            var te = types.table_elem(it)
+            if te >= 0 {
+                elem_ty = te
+            } else {
+                if s_tags[iter] == S_N_VAR {
+                    var itname = sstate.name_str(iter)
+                    var itnid = intern.intern(itname)
+                    var vte = sinfer.var_table_elem(itnid)
+                    if vte >= 0 {
+                        elem_ty = vte
+                    }
+                }
+            }
+        } else if types.is_int(it) {
+            elem_ty = types.named(TK_I64)
+        } else {
+            // 拉取协议（2026-10-13 惰性流）：`fn() -> Option<T>`，元素类型 = T。
+            var fo_e = sinfer.fn_opt_elem(it)
+            if fo_e >= 0 {
+                elem_ty = fo_e
+            } else {
+            // p.9.11.16 迭代器协议对象（struct 实现 has_next/next）：循环变量
+            // 元素类型 = next 返回类型。协议探测失败 → 报错（消息含协议提示）。
+            var ip_e = sinfer.iter_proto_elem(it)
+            if ip_e >= 0 {
+                elem_ty = ip_e
+            } else {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "for 迭代对象仅支持范围（0..10）、表变量、迭代器协议对象（struct 实现 has_next/next）或流（fn() -> Option<T>），实际是 " + types.type_name(it)
+                return -1
+            }
+            }
+        }
+        // W00008 / W00005：for 迭代变量重名判定（覆盖语义）
+        decl_warn(vnid, s_lines[s], s_cols[s])
+        // for 迭代变量：lv_insert 已实现覆盖
+        sinfer.lv_insert(vnid, elem_ty, 0, -1, 0)
+        // p.9.22.6 全量符号表：for 迭代变量声明登记（kind 5；节点取 for 语句）。
+        xref.reg_decl(vnid, 5, elem_ty, s)
+        var lbl = s_aux[s]
+        // 逻辑压栈：复用槽位
+        if lp_top < len(lp_stack) {
+            lp_stack[lp_top] = lbl
+        } else {
+            table_push(lp_stack, lbl)
+        }
+        lp_top = lp_top + 1
+        var fbody = sstate.child(s, 1)
+        // W00013：for 遍历表时修改表（循环体内对该表追加/删除元素，
+        // 使遍历结果不可预期）。迭代对象名为空（如范围 0..10）则跳过。
+        // p.9.14.2：mod_walk 是每个 for 的一次全子树递归（嵌套 for 下退化），
+        // 仅当警告 pass 启用才执行。
+        if semantic.sm_warn_enabled() {
+            var w13_nm = sstate.name_str(sstate.child(s, 0))
+            if len(w13_nm) > 0 {
+                if mod_walk(fbody, w13_nm) == 1 {
+                    sm_warn_add(s_lines[s], s_cols[s], "for 遍历表时修改表（循环体内追加/删除元素）")
+                }
+            }
+        }
+        warn_empty_block(fbody, s)
+        var r = check_cf_block(fbody, s)
+        lp_top = lp_top - 1
+        if r < 0 {
+            return -1
+        }
+        return 0
+}
+
+pub func check_stmt_break(s: i64) -> i64 {
+    var tag = s_tags[s]
+        if lp_top == 0 {
+            var kw = "break"
+            if tag == S_N_CONTINUE {
+                kw = "continue"
+            }
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = kw + " 只能出现在循环体内"
+            return -1
+        }
+        var lbl = s_names[s]
+        if lbl >= 0 {
+            var found: bool = false
+            var i: i64 = lp_top - 1
+            while i >= 0 {
+                if lp_stack[i] == lbl {
+                    found = true
+                    break
+                }
+                i = i - 1
+            }
+            if !found {
+                var kw = "break"
+                if tag == S_N_CONTINUE {
+                    kw = "continue"
+                }
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = kw + " 的标签 '" + intern.lookup(lbl) + "' 未匹配任何外层循环"
+                return -1
+            }
+        }
+        return 0
+}
+
+pub func check_stmt_goto_label(s: i64) -> i64 {
+    var tag = s_tags[s]
+        // 三期 goto 标签（§7.1.5）：`#[tag.x]` 语句位置登记。
+        // 登记标签名 → 当前块链/块内序号/全局序号（R2/R3 校验用）。
+        var lnm = s_names[s]
+        var dup = gt_find(lnm)
+        if dup >= 0 {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "goto 标签 '#" + intern.lookup(lnm) + "' 重复定义（同函数内标签名必须唯一）"
+            return -1
+        }
+        table_push(g_gt_keys, lnm)
+        table_push(g_gt_chain, g_cur_chain)
+        table_push(g_gt_blkidx, g_cur_blkidx)
+        table_push(g_gt_seq, g_gt_seq_cnt)
+        table_push(g_gt_depths, g_cur_depth)
+        table_push(g_gt_blknode, g_cur_blknode)
+        return 0
+}
+
+pub func check_stmt_goto(s: i64) -> i64 {
+    var tag = s_tags[s]
+        // 三期 goto 语句（§7.1.5）：`unsafe goto #x`。goto 仅在 unsafe 上下文合法。
+        // 校验延迟到函数体检查完（标签可能在前向/后向任意位置，须全表收集后统一
+        // 判定 R1/R2/R3）；此处仅做 unsafe 上下文检查 + 登记 goto 请求。
+        if g_unsafe_depth == 0 {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "goto 只能在 unsafe 上下文使用（unsafe 块或 unsafe 函数内）"
+            return -1
+        }
+        table_push(g_gtg_keys, s_names[s])
+        table_push(g_gtg_chain, g_cur_chain)
+        table_push(g_gtg_blkidx, g_cur_blkidx)
+        table_push(g_gtg_seq, g_gt_seq_cnt)
+        table_push(g_gtg_line, s_lines[s])
+        table_push(g_gtg_col, s_cols[s])
+        return 0
+}
+
+pub func check_stmt_switch(s: i64) -> i64 {
+    var tag = s_tags[s]
+        var subj = sinfer.infer_expr(sstate.child(s, 0))
+        if subj < 0 {
+            return -1
+        }
+        // P2b：switch 对象新增 any 动态类型（case 类型匹配，见 check_switch_case）
+        if !types.is_number(subj) && !types.is_bool_like(subj) && subj != TK_STR && subj != TK_CHAR && types.kind(subj) != K_ENUM && subj != types.named(TK_ANY) {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "switch 对象仅支持数字、布尔、字符、字符串、枚举或 any 类型，实际是 " + types.type_name(subj)
+            return -1
+        }
+        var ncases = s_aux[s]
+        var i: i64 = 0
+        // 重置 case 去重表（每个 switch 独立）
+        g_case_seen = table_new_string()
+        while i < ncases {
+            var c = sstate.child(s, 1 + i)
+            var r = check_switch_case(c, subj)
+            if r < 0 {
+                return -1
+            }
+            i = i + 1
+        }
+        var dflt = sstate.child(s, 1 + ncases)
+        // 无 default：parser 对缺省 default 生成**空 StmtList** 节点（nchild==0）
+        var has_default: bool = dflt >= 0 && sstate.nchild(dflt) > 0
+        if has_default {
+            var r = check_cf_block(dflt, s)
+            if r < 0 {
+                return -1
+            }
+        } else if types.kind(subj) == K_ENUM {
+            // p.8.1.4 穷尽检查：无 default 的 enum switch 必须覆盖全部变体
+            //（带 when 守卫的 case 不视为穷尽——守卫可能失败，对齐 Rust 语义）
+            var r = check_enum_exhaustive(subj, s)
+            if r < 0 {
+                return -1
+            }
+        } else {
+            // W00028：switch 无 default 且非 enum（enum 已有穷尽检查兜底，不重复报）。
+            // 未匹配任何 case 时静默无操作，通常是漏写 default。
+            sm_warn_add(s_lines[s], s_cols[s], "switch 缺少 default（未匹配值时静默无操作）")
+        }
+        return 0
+}
+
+pub func check_stmt_field_assign(s: i64) -> i64 {
+    var tag = s_tags[s]
+        var base = sinfer.infer_expr(sstate.child(s, 0))
+        if base < 0 {
+            return -1
+        }
+        // p.9.11.11 immut 只读形参：字段写（t.k = v）目标根变量为 immut 形参 → 拒绝
+        //（覆盖 struct/tuple 接收者；计算属性 setter 亦属内容写，一并拒绝）。
+        var froot = sstate.im_root(sstate.child(s, 0))
+        if froot >= 0 && sstate.im_is(froot) {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "不能修改 immut 形参 '" + sstate.im_name(froot) + "' 的字段；immut 形参只读"
+            return -1
+        }
+        var fnm = sstate.name_str(s)
+        var bk = types.kind(base)
+        if bk != K_STRUCT && bk != K_TUPLE {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "字段赋值的对象必须是 struct 实例，实际是 " + types.type_name(base)
+            return -1
+        }
+        if bk == K_STRUCT {
+            var si = types.low(base)
+            var off = cls_fldoff[si]
+            var cnt = cls_nfld[si]
+            var found: bool = false
+            var ft: i64 = -1
+            var i: i64 = 0
+            while i < cnt {
+                if intern.lookup(fld_names[off + i]) == fnm {
+                    found = true
+                    ft = fld_tys[off + i]
+                    break
+                }
+                i = i + 1
+            }
+            if !found {
+                // p.8.2.7 计算属性写：命中 setter（<Struct>::<name>_set，接收者+新值）
+                // → 校验 setter 参数并登记 g_cmp_setter，供 irgen 发射 setter 调用。
+                var sname = sstate.struct_name_of(si)
+                var setfull = sname + "::" + fnm + "_set"
+                var ssig = sstate.fn_sig(setfull)
+                if ssig >= 0 {
+                    var srec = sp_tys[sg_off[ssig]]
+                    if !stype.types_compatible(srec, base) {
+                        sm_err_line = s_lines[s]
+                        sm_err_col = s_cols[s]
+                        sm_err_msg = "计算属性 setter '" + setfull + "' 接收者类型不匹配：期望 " + types.type_name(srec) + "，实际 " + types.type_name(base)
+                        return -1
+                    }
+                    if sg_nparams[ssig] != 2 {
+                        sm_err_line = s_lines[s]
+                        sm_err_col = s_cols[s]
+                        sm_err_msg = "计算属性 setter '" + setfull + "' 必须恰好 2 个参数（接收者 + 新值），实际 " + to_string(sg_nparams[ssig]) + " 个"
+                        return -1
+                    }
+                    var want_v = sp_tys[sg_off[ssig] + 1]
+                    var vt = sinfer.infer_expr(sstate.child(s, 1))
+                    if vt < 0 {
+                        return -1
+                    }
+                    if !stype.types_compatible(want_v, vt) && !stype.types_match(want_v, vt, sstate.child(s, 1)) {
+                        sm_err_line = s_lines[s]
+                        sm_err_col = s_cols[s]
+                        sm_err_msg = "计算属性 setter '" + setfull + "' 参数类型不匹配：期望 " + types.type_name(want_v) + "，实际 " + types.type_name(vt)
+                        return -1
+                    }
+                    g_cmp_setter[s] = interner.intern(setfull)
+                    return 0
+                }
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "类 '" + sname + "' 没有字段 '" + fnm + "'"
+                return -1
+            }
+            var vt = sinfer.infer_expr(sstate.child(s, 1))
+            if vt < 0 {
+                return -1
+            }
+            if !stype.types_compatible(ft, vt) && !stype.types_match(ft, vt, sstate.child(s, 1)) {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "字段赋值类型不匹配：期望 " + types.type_name(ft) + "，实际 " + types.type_name(vt)
+                return -1
+            }
+        }
+        return 0
+}
+
+pub func check_stmt_index_assign(s: i64) -> i64 {
+    var tag = s_tags[s]
+        // 目标必须是下标表达式 t[i]（Index 节点）
+        var target = sstate.child(s, 0)
+        if s_tags[target] != S_N_INDEX {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "下标赋值的目标必须是表元素访问（t[i]）"
+            return -1
+        }
+        var base_node = sstate.child(target, 0)
+        var idx_node = sstate.child(target, 1)
+        // p.9.11.11 immut 只读形参：下标写（t[i] = v）目标根变量为 immut 形参 → 拒绝
+        //（覆盖表元素写与字符串下标写；immut 限定「容器内容写」一并拒绝）。
+        var iroot = sstate.im_root(base_node)
+        if iroot >= 0 && sstate.im_is(iroot) {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "不能修改 immut 形参 '" + sstate.im_name(iroot) + "' 的下标元素；immut 形参只读"
+            return -1
+        }
+        // W00016：全局可变表的下标写点（根变量非局部 → 按全局键解析后登记）
+        if iroot >= 0 && sinfer.lv_find(iroot) < 0 {
+            var gk16 = sinfer.gb_find_ns_key(iroot)
+            if gk16 >= 0 {
+                w16_record(gk16, s_lines[s], s_cols[s])
+            }
+        }
+        var base = sinfer.infer_expr(base_node)
+        if base < 0 {
+            return -1
+        }
+        var idx = sinfer.infer_expr(idx_node)
+        if idx < 0 {
+            return -1
+        }
+        var vt = sinfer.infer_expr(sstate.child(s, 1))
+        if vt < 0 {
+            return -1
+        }
+        if !types.is_table(base) && base != TK_STR && !types.is_array(base) {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "下标赋值的对象必须是表，实际是 " + types.type_name(base)
+            return -1
+        }
+        // 下标类型：map 键值表允许字符串键（E3：m["key"] = v → tie_map_set_string）
+        // 与整数键；普通表下标必须是整数
+        if !types.is_map(base) {
+            if !types.is_int(idx) {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "下标必须是整数，实际是 " + types.type_name(idx)
+                return -1
+            }
+        }
+        // L1 定长数组写：编译期常量越界检查 + 值类型须与元素类型匹配
+        //（LLVM store 是类型化 store，类型不符会在 llvmgen/opt 报错前崩溃）。
+        if types.is_array(base) {
+            var elem_a = types.array_elem(base)
+            if !stype.types_match(elem_a, vt, sstate.child(s, 1)) && !stype.types_compatible(elem_a, vt) {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "数组元素赋值类型不匹配：期望 " + types.type_name(elem_a) + "，实际 " + types.type_name(vt)
+                return -1
+            }
+            var (ciw, cvw) = stype.arr_const_index(idx_node)
+            if ciw {
+                if cvw < 0 {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "数组下标越界：索引为负数"
+                    return -1
+                }
+                if cvw >= types.array_len(base) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "数组下标越界：索引 " + to_string(cvw) + " ≥ 长度 " + to_string(types.array_len(base))
+                    return -1
+                }
+            }
+        }
+        return 0
+}
+
+pub func check_stmt_import(s: i64) -> i64 {
+    var tag = s_tags[s]
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "语句只能出现在文件顶层"
+        return -1
+}
+
+}

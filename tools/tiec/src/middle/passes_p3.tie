@@ -1,0 +1,1213 @@
+type tie<class>
+// compiler/middle/passes_p3.tie —— appfuse：循环→批量原语融合（t2 族 pass）
+// ============================================================================
+// 目标：把 irgen 为「逐元素表操作」生成的循环惯用法改写为一次批量调用
+// （tl_tbl$tbl_append_tbl_nl / tl_tbl$tbl_append_zeros_nl）——N 次（加锁/字段
+// 重读/调用）粗化为 1 次 + 一段 memcpy。语义与逐元素循环逐项等价（同扩容规则、
+// 同 len 提交、同 in-place 写；_nl 前提 = 原循环两条访问本就选了 _nl）。
+//
+// 两个形状（严格匹配，任一条件不满足即放弃，宁可少融合）：
+//   P1 拷贝段：while i < len(src) { table_push(dst, src[i]); i = i + 1 }
+//       守卫 icmp(load i_slot, len值)；体：at_nl(src,load i,out) → 越界检查 →
+//       push_nl(dst,读 out)；回边块含步进 +1。
+//       → tbl_append_tbl_nl(ptri(dst), ptri(src), len值)
+//   P2 零填充：while i < n { table_push(dst, 0); i = i + 1 }
+//       体：push_nl(dst, const0)；回边即体。
+//       → tbl_append_zeros_nl(ptri(dst), n)
+//
+// 匹配前提（全部结构性；"检查恒不触发"的证明见下）：
+//   * 守卫块 G：cond_br(icmp cc=2(load i_slot, n), B, E)；
+//   * i_slot 全模块恰两处 store：初值 const 0（在 G 的前驱 P）+ 步进
+//     （load i +1）；G 的前驱 ⊆ {P, 回边块}；
+//   * B 的前驱恰为 {G}（防外部直入体）；
+//   * P1：体终结 = cond_br(检查, R, J)；J 含 push 且终 br G；R 区（R 可达块集 S）
+//     仅经 B(true) 进入、内部自洽（指向 S 的分支源 ∈ S∪{B}；指向 J 的源 ⊆
+//     {B}∪S）——改写把检查常量压断后 S 不可达；
+//   * at/push 均 _nl 入口且各恰一处；push 槽/out 槽各恰一处写（store ←读 out）/
+//     at 直写；dst/src 句柄槽在体区无 store（无 COW 回存 ⇒ in-place 等价）；
+//   * 检查形状：or(icmp eq(load ok8, 0), icmp slt(load i_slot, 0))，ok8 ←
+//     trunc(at 结果)。守卫保证 i ∈ [0, len) 且检查前无表操作 ⇒ 检查恒不触发
+//     （i0=0、步进 +1、len 未变）——压断为常量与逐元素行为一致；
+//   * 元素类型门（types.kind）：拒深表（表/映射）/结构/枚举/函数/元组/any。
+//
+// 改写手法（零新增指令，全部就地手术）：
+//   * P1 复用 at 调用槽位：符号改 append；实参换 (ptri(dst), ptri(src), n值)
+//     （全 i64 ⇒ 类型操作数不动）；
+//   * P1 复用检查的 or 指令 → rewrite_to_const(0)：cond_br 恒走 J（"检查通过"）；
+//   * P2 复用 push 调用槽位：符号改 append_zeros；第 2 实参 = n（类型操作数
+//     一并改为 i64——push 槽类型可能非 i64）；
+//   * 回边块/体的步进 store：值换成 n（循环变量收敛值）；终结 br 改指 E。
+//   * 删集合先"试探"，经全模块 use 校验（存活指令不得引用待删值）后才提交标记。
+//
+// 形状模式（r.1.7）：同一惯用法两套入口——`_nl`（unsafe:lock 已证，免锁）与
+// 带锁变体（安全代码，运行时一次加锁）。模式由体块内出现的 push 符号判定。
+// 未做（明确的 IR 约束，非遗漏）：
+//   * 常量填充（push 常量 K≠0 → repeat），需 3 参改写；pass 只能就地改操作数，
+//     3 参调用在既有 IR 上不可表达（add_operand 仅尾插）。
+//   * 区间复制 dst[a..a+n]=src[0..n]，需 (dst, off, src, n) 4 参 + 空隙零填充语义
+//     （含共享表扩容拒绝的诊断路径），同样越出"就地改操作数"的表达力。
+//   * reserve 协同：融合调用本身一次分配，前置 reserve 冗余但无害，未做剪枝。
+// 两者需要 IR 层的"插指令/扩操作数"能力（跨 pass 基础设施改动）再议。
+//
+// 审计：TIEC_APFUSE_AUDIT=1 打印每处融合（形状/函数/元素数）。
+
+import "./ir.tie"
+import "./types.tie"
+
+// 融合计数（env 审计与回归探针读）
+pub var g_af_hits: i64 = 0;
+
+// opcode 字面量（与 irgen 一致）
+const AF_OP_ADD: i64 = 0;
+const AF_OP_OR: i64 = 7;
+const AF_OP_ICMP: i64 = 12;
+const AF_OP_ALLOCA: i64 = 20;
+const AF_OP_LOAD: i64 = 21;
+const AF_OP_STORE: i64 = 22;
+const AF_OP_GEP: i64 = 23;
+const AF_OP_PTRTOINT: i64 = 24;
+const AF_OP_BR: i64 = 30;
+const AF_OP_COND_BR: i64 = 31;
+const AF_OP_TRMCALL: i64 = 36;
+const AF_OP_TRUNC: i64 = 37;
+const AF_OP_CONST_I: i64 = 60;
+const AF_K_VALUE: i64 = 0;
+const AF_K_BLOCK: i64 = 1;
+const AF_K_IMM: i64 = 2;
+const AF_CC_EQ: i64 = 0;
+const AF_CC_LT: i64 = 2;
+
+// ---------- 模块级映射（每次 appfuse 重建） ----------
+var af_def_inst: table<i64> = [];   // 值 id -> 定义指令 id（-1 = 无）
+var af_inst_blk: table<i64> = [];   // 指令 id -> 块 id
+var af_audit: bool = false;
+
+namespace passes {
+
+func af_build_maps() {
+    var nvals = ir.value_count()
+    af_def_inst = table_new_i64()
+    var i: i64 = 0
+    while i < nvals {
+        table_push(af_def_inst, 0 - 1)
+        i = i + 1
+    }
+    var total = ir.inst_count()
+    af_inst_blk = table_new_i64()
+    i = 0
+    while i < total {
+        table_push(af_inst_blk, 0 - 1)
+        i = i + 1
+    }
+    var nb = ir.block_count()
+    var b: i64 = 0
+    while b < nb {
+        var s0 = ir.block_start(b)
+        var e0 = ir.block_end(b)
+        var ii = s0
+        while ii < e0 {
+            af_inst_blk[ii] = b
+            var v = ir.ins_val(ii)
+            if v >= 0 {
+                af_def_inst[v] = ii
+            }
+            ii = ii + 1
+        }
+        b = b + 1
+    }
+}
+
+func af_def_of(v: i64) -> i64 {
+    if v < 0 || v >= len(af_def_inst) {
+        return 0 - 1
+    }
+    return af_def_inst[v]
+}
+
+// 指令是否 op 36 且符号名 == name。
+func af_call_is(inst: i64, name: string) -> bool {
+    if inst < 0 {
+        return false
+    }
+    if ir.ins_op(inst) != AF_OP_TRMCALL {
+        return false
+    }
+    if ir.ins_ops_cnt(inst) < 1 {
+        return false
+    }
+    return interner.lookup(ir.ins_opnd(inst, 0)) == name
+}
+
+// 块内恰一处 name 调用 → 指令 id；0 处或多处 → -1。
+func af_find_call(b: i64, name: string) -> i64 {
+    var s0 = ir.block_start(b)
+    var e0 = ir.block_end(b)
+    var cnt: i64 = 0
+    var hit: i64 = 0 - 1
+    var ii = s0
+    while ii < e0 {
+        if af_call_is(ii, name) {
+            cnt = cnt + 1
+            hit = ii
+        }
+        ii = ii + 1
+    }
+    if cnt != 1 {
+        return 0 - 1
+    }
+    return hit
+}
+
+// 值是否 const_i(imm)。
+func af_is_const(v: i64, imm: i64) -> bool {
+    var d = af_def_of(v)
+    if d < 0 {
+        return false
+    }
+    if ir.ins_op(d) != AF_OP_CONST_I {
+        return false
+    }
+    if ir.ins_ops_cnt(d) < 1 {
+        return false
+    }
+    return ir.ins_opnd(d, 0) == imm
+}
+
+// ptri（op24）的操作数；非 ptri → -1。
+func af_ptri_operand(v: i64) -> i64 {
+    var d = af_def_of(v)
+    if d < 0 {
+        return 0 - 1
+    }
+    if ir.ins_op(d) != AF_OP_PTRTOINT {
+        return 0 - 1
+    }
+    if ir.ins_ops_cnt(d) < 1 {
+        return 0 - 1
+    }
+    return ir.ins_opnd(d, 0)
+}
+
+// v 是否某槽的 load；是则返回槽值，否则 -1。
+func af_load_slot(v: i64) -> i64 {
+    var d = af_def_of(v)
+    if d < 0 {
+        return 0 - 1
+    }
+    if ir.ins_op(d) != AF_OP_LOAD {
+        return 0 - 1
+    }
+    if ir.ins_ops_cnt(d) < 1 {
+        return 0 - 1
+    }
+    return ir.ins_opnd(d, 0)
+}
+
+// v 是否 alloca；是返回 1。
+func af_is_alloca(v: i64) -> i64 {
+    var d = af_def_of(v)
+    if d < 0 {
+        return 0
+    }
+    if ir.ins_op(d) != AF_OP_ALLOCA {
+        return 0
+    }
+    return 1
+}
+
+// 全模块指向块 t 的分支（br/cond_br 的块操作数）计数。
+func af_count_targets(t: i64) -> i64 {
+    var total = ir.inst_count()
+    var c: i64 = 0
+    var i: i64 = 0
+    while i < total {
+        var op = ir.ins_op(i)
+        if op == AF_OP_BR || op == AF_OP_COND_BR {
+            var k: i64 = 0
+            var cnt = ir.ins_ops_cnt(i)
+            while k < cnt {
+                if ir.ins_opnd_kind(i, k) == AF_K_BLOCK {
+                    if ir.ins_opnd(i, k) == t {
+                        c = c + 1
+                    }
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// 指向块 t 的分支源块列表（去重不要求；调试/校验用）。
+func af_target_sources(t: i64) -> table<i64> {
+    var out = table_new_i64()
+    var total = ir.inst_count()
+    var i: i64 = 0
+    while i < total {
+        var op = ir.ins_op(i)
+        if op == AF_OP_BR || op == AF_OP_COND_BR {
+            var k: i64 = 0
+            var cnt = ir.ins_ops_cnt(i)
+            while k < cnt {
+                if ir.ins_opnd_kind(i, k) == AF_K_BLOCK {
+                    if ir.ins_opnd(i, k) == t {
+                        if af_inst_blk[i] >= 0 {
+                            table_push(out, af_inst_blk[i])
+                        }
+                    }
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 从块 s 出发可达块集（分支目标闭包；vis 按块 id 置位）。
+func af_reach_from(s: i64, ref vis: table<bool>) {
+    if s < 0 || s >= len(vis) {
+        return
+    }
+    if vis[s] {
+        return
+    }
+    vis[s] = true
+    var s0 = ir.block_start(s)
+    var e0 = ir.block_end(s)
+    var ii = s0
+    while ii < e0 {
+        var op = ir.ins_op(ii)
+        if op == AF_OP_BR || op == AF_OP_COND_BR {
+            var k: i64 = 0
+            var cnt = ir.ins_ops_cnt(ii)
+            while k < cnt {
+                if ir.ins_opnd_kind(ii, k) == AF_K_BLOCK {
+                    af_reach_from(ir.ins_opnd(ii, k), vis)
+                }
+                k = k + 1
+            }
+        }
+        ii = ii + 1
+    }
+}
+
+// 槽值 v 的 store 计数与唯一 store 指令（count != 1 → sti = -1）。
+func af_store_count(slot: i64) -> i64 {
+    var total = ir.inst_count()
+    var c: i64 = 0
+    var i: i64 = 0
+    while i < total {
+        if ir.ins_op(i) == AF_OP_STORE {
+            if ir.ins_ops_cnt(i) >= 3 {
+                if ir.ins_opnd(i, 2) == slot {
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+func af_find_store(slot: i64) -> i64 {
+    var total = ir.inst_count()
+    var c: i64 = 0
+    var hit: i64 = 0 - 1
+    var i: i64 = 0
+    while i < total {
+        if ir.ins_op(i) == AF_OP_STORE {
+            if ir.ins_ops_cnt(i) >= 3 {
+                if ir.ins_opnd(i, 2) == slot {
+                    c = c + 1
+                    hit = i
+                }
+            }
+        }
+        i = i + 1
+    }
+    if c != 1 {
+        return 0 - 1
+    }
+    return hit
+}
+
+// 元素类型门（对齐 table_append 内置 v1 口径）。
+func af_elem_forbidden(elem: i64) -> bool {
+    if elem < 0 {
+        return true
+    }
+    if types.is_table(elem) || types.is_map(elem) || elem == types.named(TK_ANY) {
+        return true
+    }
+    var k = types.kind(elem)
+    if k == K_STRUCT || k == K_ENUM || k == K_FN || k == K_TUPLE {
+        return true
+    }
+    return false
+}
+
+// 待删集合 use 校验（**变更前**；返回 1 = 可删）：对 cand（指令 id 列表）中每条
+// 带结果值的指令，若其值被任一"非 cand 且非 skip"指令引用 → 返回 0（放弃）。
+// skip = 本处将被改写的指令（其操作数由改写方保证指向保留值）。
+func af_verify_dead(cand: table<i64>, skip: table<i64>) -> i64 {
+    var total = ir.inst_count()
+    var i: i64 = 0
+    var incand = table_new_bool()
+    while i < total {
+        table_push(incand, false)
+        i = i + 1
+    }
+    i = 0
+    while i < len(cand) {
+        var ci = cand[i]
+        if ci >= 0 && ci < total {
+            incand[ci] = true
+        }
+        i = i + 1
+    }
+    var inskip = table_new_bool()
+    i = 0
+    while i < total {
+        table_push(inskip, false)
+        i = i + 1
+    }
+    i = 0
+    while i < len(skip) {
+        var si = skip[i]
+        if si >= 0 && si < total {
+            inskip[si] = true
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < total {
+        if !incand[i] && !inskip[i] {
+            var k: i64 = 0
+            var cnt = ir.ins_ops_cnt(i)
+            var opv = ir.ins_op(i)
+            while k < cnt {
+                // call 族 k=0 是**符号名槽**（名池 id，非值 id）——不得当值解析
+                var symk = false
+                if k == 0 {
+                    if opv == 35 || opv == AF_OP_TRMCALL || opv == 41 || opv == 51 || opv == 62 || opv == 63 || opv == 65 {
+                        symk = true
+                    }
+                }
+                if !symk && ir.ins_opnd_kind(i, k) == AF_K_VALUE {
+                    var d = af_def_of(ir.ins_opnd(i, k))
+                    if d >= 0 && d < total {
+                        if incand[d] {
+                            return 0
+                        }
+                    }
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// 提交删除标记（校验通过后调用）。
+func af_mark_dead(cand: table<i64>, ref dead: table<bool>) {
+    var total = ir.inst_count()
+    var i: i64 = 0
+    while i < len(cand) {
+        var ci = cand[i]
+        if ci >= 0 && ci < total {
+            dead[ci] = true
+        }
+        i = i + 1
+    }
+}
+
+// 块 b（单块）内是否存在对槽 slot 的 store。
+func af_store_in_block(b: i64, slot: i64) -> i64 {
+    var s0 = ir.block_start(b)
+    var e0 = ir.block_end(b)
+    var ii = s0
+    while ii < e0 {
+        if ir.ins_op(ii) == AF_OP_STORE {
+            if ir.ins_ops_cnt(ii) >= 3 {
+                if ir.ins_opnd(ii, 2) == slot {
+                    return 1
+                }
+            }
+        }
+        ii = ii + 1
+    }
+    return 0
+}
+
+// ---------- 形状模式：_nl（免锁；unsafe:lock 已证）与 locked（安全代码形状） ----------
+// 同一惯用法的两套入口：_nl 免锁；带锁变体把一次加锁留在运行时（融合后仍只锁一次）。
+func af_push_sym(locked: bool) -> string {
+    if locked {
+        return "tl_tbl$tbl_push"
+    }
+    return "tl_tbl$tbl_push_nl"
+}
+
+func af_at_sym(locked: bool) -> string {
+    if locked {
+        return "tl_tbl$tbl_at"
+    }
+    return "tl_tbl$tbl_at_nl"
+}
+
+func af_zeros_sym(locked: bool) -> string {
+    if locked {
+        return "tl_tbl$tbl_append_zeros"
+    }
+    return "tl_tbl$tbl_append_zeros_nl"
+}
+
+func af_repeat_v_sym(locked: bool) -> string {
+    if locked {
+        return "tl_tbl$tbl_append_repeat_v"
+    }
+    return "tl_tbl$tbl_append_repeat_v_nl"
+}
+
+func af_copy_sym(locked: bool) -> string {
+    if locked {
+        return "tl_tbl$tbl_append_tbl"
+    }
+    return "tl_tbl$tbl_append_tbl_nl"
+}
+
+// 体块里出现哪套 push（0=_nl，1=带锁，-1=无）。
+func af_body_push_mode(B: i64) -> i64 {
+    if af_find_call(B, "tl_tbl$tbl_push_nl") >= 0 {
+        return 0
+    }
+    if af_find_call(B, "tl_tbl$tbl_push") >= 0 {
+        return 1
+    }
+    return 0 - 1
+}
+
+// ---------- P2：零填充 / 常量填充 ----------
+func af_try_p2(G: i64, E: i64, B: i64, iv_slot: i64, nv: i64, ref dead: table<bool>, locked: bool) -> i64 {
+    var bt = ir.block_end(B) - 1
+    if bt < ir.block_start(B) {
+        return 0
+    }
+    if ir.ins_op(bt) != AF_OP_BR {
+        return 0
+    }
+    if ir.ins_opnd(bt, 0) != G {
+        return 0
+    }
+    // B 前驱唯一 = G
+    if af_count_targets(B) != 1 {
+        return 0
+    }
+    // push_nl 恰一处
+    var pc = af_find_call(B, af_push_sym(locked))
+    if pc < 0 {
+        return 0
+    }
+    var pu_dst_v = af_ptri_operand(ir.ins_opnd(pc, 3))
+    var pu_slot_v = af_ptri_operand(ir.ins_opnd(pc, 5))
+    if pu_dst_v < 0 || pu_slot_v < 0 {
+        return 0
+    }
+    // 推入值 = const 0；push 槽恰一处 store 且其 val 即该 const
+    if af_store_count(pu_slot_v) != 1 {
+        return 0
+    }
+    var sti = af_find_store(pu_slot_v)
+    if sti < 0 {
+        return 0
+    }
+    var sv = ir.ins_opnd(sti, 1)
+    var svd = af_def_of(sv)
+    if svd < 0 {
+        return 0
+    }
+    // 仅零填充（K=0 → zeros 入口，单次 memset）。
+    // 注：常量填充（K≠0）需 3 参改写（dst, K, n），而本 pass 运行在**操作数段连续
+    // 存储**的 IR 上——`ir.add_operand` 只允许紧随指令创建时追加，既有无从扩参
+    // （实测触发交错断言 panic）。故 K≠0 一律放弃（见文件头"未做"节）。
+    if !af_is_const(sv, 0) {
+        return 0
+    }
+    // 元素类型门（const 的 ty 即元素类型）
+    if af_elem_forbidden(ir.ins_ty(svd)) {
+        return 0
+    }
+    // dst 加载 + dst 槽在 B 内无 store
+    var dl = af_def_of(pu_dst_v)
+    if dl < 0 {
+        return 0
+    }
+    if ir.ins_op(dl) != AF_OP_LOAD {
+        return 0
+    }
+    var dst_slot = ir.ins_opnd(dl, 0)
+    if af_store_in_block(B, dst_slot) != 0 {
+        return 0
+    }
+    // 步进：iv_slot 全模块恰 2 处 store：初值 const0（P）+ 步进（B 内）
+    if af_store_count(iv_slot) != 2 {
+        return 0
+    }
+    var step_st = 0 - 1
+    var init_st = 0 - 1
+    var total = ir.inst_count()
+    var i: i64 = 0
+    while i < total {
+        if ir.ins_op(i) == AF_OP_STORE {
+            if ir.ins_ops_cnt(i) >= 3 {
+                if ir.ins_opnd(i, 2) == iv_slot {
+                    if af_is_const(ir.ins_opnd(i, 1), 0) {
+                        init_st = i
+                    } else {
+                        step_st = i
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if init_st < 0 || step_st < 0 {
+        return 0
+    }
+    if af_inst_blk[step_st] != B {
+        return 0
+    }
+    // 步进形状：val = add(load(iv_slot), const1)
+    var svi = af_def_of(ir.ins_opnd(step_st, 1))
+    if svi < 0 {
+        return 0
+    }
+    if ir.ins_op(svi) != AF_OP_ADD {
+        return 0
+    }
+    if ir.ins_ops_cnt(svi) < 2 {
+        return 0
+    }
+    var a0 = ir.ins_opnd(svi, 0)
+    var a1 = ir.ins_opnd(svi, 1)
+    var ok_iv = false
+    if af_load_slot(a0) == iv_slot {
+        if af_is_const(a1, 1) {
+            ok_iv = true
+        }
+    }
+    if !ok_iv {
+        return 0
+    }
+    // 初值 store 所在块 = P；G 的前驱 ⊆ {P, B}
+    var P = af_inst_blk[init_st]
+    var gs = af_target_sources(G)
+    var gi: i64 = 0
+    while gi < len(gs) {
+        if gs[gi] != P && gs[gi] != B {
+            return 0
+        }
+        gi = gi + 1
+    }
+    // 删集合（旧状态构建 + 校验；改写与标记在其后）
+    var pdd = af_def_of(ir.ins_opnd(pc, 3))   // ptri(dst)：改写后仍被 append 调用引用，必须保留
+    var cand = table_new_i64()
+    var skip = table_new_i64()
+    table_push(skip, pc)
+    table_push(skip, step_st)
+    table_push(skip, bt)
+    var s0 = ir.block_start(B)
+    var e0 = ir.block_end(B)
+    var ii = s0
+    while ii < e0 {
+        var keep = false
+        if ii == dl || ii == bt || ii == pc || ii == step_st {
+            keep = true
+        }
+        if ii == pdd {
+            keep = true
+        }
+        if !keep {
+            table_push(cand, ii)
+        }
+        ii = ii + 1
+    }
+    if af_verify_dead(cand, skip) == 0 {
+        return 0
+    }
+    // ---------- 改写 ----------
+    // 1) push 调用改写 → append_zeros[_nl](dst, n)：第 2 实参（值 + 类型）换成 n/i64
+    ir.set_opnd(pc, 0, interner.intern(af_zeros_sym(locked)), AF_K_VALUE)
+    ir.set_opnd(pc, 4, types.named(TK_I64), AF_K_IMM)
+    ir.set_opnd(pc, 5, nv, AF_K_VALUE)
+    // 2) 步进 store 值换 n（循环变量收敛值）
+    ir.set_opnd(step_st, 1, nv, AF_K_VALUE)
+    // 3) 去回边：B 终结改指 E
+    ir.set_opnd(bt, 0, E, AF_K_BLOCK)
+    af_mark_dead(cand, dead)
+    if af_audit {
+        var lk = ""
+        if locked {
+            lk = " locked"
+        }
+        println("apfuse: P2 zeros" + lk + " fn=" + interner.lookup(ir.func_name(ir.block_func(B))) +
+            " nval=" + to_string(nv))
+    }
+    g_af_hits = g_af_hits + 1
+    return 1
+}
+
+// ---------- P1：拷贝段 ----------
+func af_try_p1(G: i64, E: i64, B: i64, iv_slot: i64, nv: i64, ref dead: table<bool>, locked: bool) -> i64 {
+    var bt = ir.block_end(B) - 1
+    if bt < ir.block_start(B) {
+        return 0
+    }
+    if ir.ins_op(bt) != AF_OP_COND_BR {
+        return 0
+    }
+    var condv = ir.ins_opnd(bt, 0)
+    var R = ir.ins_opnd(bt, 1)
+    var J = ir.ins_opnd(bt, 2)
+    if R == J || J == E || R == E || R == G || J == G {
+        return 0
+    }
+    if ir.block_func(R) != ir.block_func(B) || ir.block_func(J) != ir.block_func(B) {
+        return 0
+    }
+    // J 终结 = br G
+    var jt = ir.block_end(J) - 1
+    if jt < ir.block_start(J) {
+        return 0
+    }
+    if ir.ins_op(jt) != AF_OP_BR {
+        return 0
+    }
+    if ir.ins_opnd(jt, 0) != G {
+        return 0
+    }
+    // B 前驱唯一 = G
+    var ctnb = af_count_targets(B)
+    var atc = af_find_call(B, af_at_sym(locked))
+    var pc = af_find_call(J, af_push_sym(locked))
+    if ctnb != 1 {
+        return 0
+    }
+    // at / push 各恰一处
+    if atc < 0 {
+        return 0
+    }
+    if pc < 0 {
+        return 0
+    }
+    // at 实参：src 句柄 ptri、i 装载、out 槽 ptri
+    var at_src_p = ir.ins_opnd(atc, 3)
+    var at_iv = ir.ins_opnd(atc, 5)
+    var at_out_p = ir.ins_opnd(atc, 7)
+    var pu_dst_p = ir.ins_opnd(pc, 3)
+    var pu_slot_p = ir.ins_opnd(pc, 5)
+    var src_ld = af_ptri_operand(at_src_p)
+    var out_slot = af_ptri_operand(at_out_p)
+    var dst_ld = af_ptri_operand(pu_dst_p)
+    var push_slot = af_ptri_operand(pu_slot_p)
+    if src_ld < 0 || out_slot < 0 || dst_ld < 0 || push_slot < 0 {
+        return 0
+    }
+    var src_def = af_def_of(src_ld)
+    var dst_def = af_def_of(dst_ld)
+    if src_def < 0 || dst_def < 0 {
+        return 0
+    }
+    if ir.ins_op(src_def) != AF_OP_LOAD || ir.ins_op(dst_def) != AF_OP_LOAD {
+        return 0
+    }
+    var src_slot = ir.ins_opnd(src_def, 0)
+    var dst_slot = ir.ins_opnd(dst_def, 0)
+    if af_is_alloca(out_slot) == 0 || af_is_alloca(push_slot) == 0 {
+        return 0
+    }
+    // i 装载来自 iv_slot
+    if af_load_slot(at_iv) != iv_slot {
+        return 0
+    }
+    // 守卫的界值 = len(src)：nv ← load(gep(src 装载, 8))，且该装载与 at 的 src 同槽
+    var nvd = af_def_of(nv)
+    if nvd < 0 {
+        return 0
+    }
+    if ir.ins_op(nvd) != AF_OP_LOAD {
+        return 0
+    }
+    var gp = af_def_of(ir.ins_opnd(nvd, 0))
+    if gp < 0 {
+        return 0
+    }
+    if ir.ins_op(gp) != AF_OP_GEP {
+        return 0
+    }
+    var gbase = ir.ins_opnd(gp, 0)
+    if af_load_slot(gbase) != src_slot {
+        return 0
+    }
+    // push 槽恰一处 store；其 val ← load(out_slot)；out 槽无 store（at 直写）
+    if af_store_count(push_slot) != 1 {
+        return 0
+    }
+    var pst = af_find_store(push_slot)
+    if pst < 0 {
+        return 0
+    }
+    var psv = ir.ins_opnd(pst, 1)
+    if af_load_slot(psv) != out_slot {
+        return 0
+    }
+    if af_store_count(out_slot) != 0 {
+        return 0
+    }
+    // dst/src 句柄槽在体区（B ∪ J）无 store（无 COW 回存）
+    var region = table_new_bool()
+    var nbk = ir.block_count()
+    var z: i64 = 0
+    while z < nbk {
+        table_push(region, false)
+        z = z + 1
+    }
+    if B >= 0 && B < nbk {
+        region[B] = true
+    }
+    if J >= 0 && J < nbk {
+        region[J] = true
+    }
+    var total = ir.inst_count()
+    var i: i64 = 0
+    while i < total {
+        if ir.ins_op(i) == AF_OP_STORE {
+            if ir.ins_ops_cnt(i) >= 3 {
+                var ad = ir.ins_opnd(i, 2)
+                if ad == dst_slot || ad == src_slot {
+                    var bb = af_inst_blk[i]
+                    if bb >= 0 {
+                        if region[bb] {
+                            return 0
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    // 检查形状：condv ← or(eq(load(ok8), 0), slt(load(iv_slot), 0))，ok8 ← trunc(at 值)
+    var ori = af_def_of(condv)
+    if ori < 0 {
+        return 0
+    }
+    if ir.ins_op(ori) != AF_OP_OR {
+        return 0
+    }
+    if ir.ins_ops_cnt(ori) < 2 {
+        return 0
+    }
+    var u = ir.ins_opnd(ori, 0)
+    var v = ir.ins_opnd(ori, 1)
+    var ui = af_def_of(u)
+    var vi = af_def_of(v)
+    if ui < 0 || vi < 0 {
+        return 0
+    }
+    if ir.ins_op(ui) != AF_OP_ICMP || ir.ins_op(vi) != AF_OP_ICMP {
+        return 0
+    }
+    // ok 侧：eq(load(ok8), 0)；ok8 唯一 store 的 val = trunc(at 值)
+    var atv = ir.ins_val(atc)
+    if atv < 0 {
+        return 0
+    }
+    var oku = 0 - 1
+    var c0u = 0 - 1
+    if ir.ins_ops_cnt(ui) >= 3 {
+        var ua = ir.ins_opnd(ui, 0)
+        var ub = ir.ins_opnd(ui, 1)
+        var ucc = ir.ins_opnd(ui, 2)
+        if ucc == AF_CC_EQ {
+            if af_is_const(ua, 0) {
+                oku = ub
+            } else {
+                oku = ua
+            }
+            c0u = 0
+        }
+    }
+    if oku < 0 || c0u < 0 {
+        return 0
+    }
+    var ok_slot = af_load_slot(oku)
+    if ok_slot < 0 {
+        return 0
+    }
+    if af_store_count(ok_slot) != 1 {
+        return 0
+    }
+    var ost = af_find_store(ok_slot)
+    if ost < 0 {
+        return 0
+    }
+    var osv = ir.ins_opnd(ost, 1)
+    var osd = af_def_of(osv)
+    if osd < 0 {
+        return 0
+    }
+    if ir.ins_op(osd) != AF_OP_TRUNC {
+        return 0
+    }
+    if ir.ins_ops_cnt(osd) < 2 {
+        return 0
+    }
+    // s21_trunc_i8 布局：[类型(2), 值(0)] —— 值在 index 1
+    if ir.ins_opnd(osd, 1) != atv {
+        return 0
+    }
+    // i 侧：slt(load(iv_slot), 0)
+    var okv = false
+    if ir.ins_ops_cnt(vi) >= 3 {
+        var va = ir.ins_opnd(vi, 0)
+        var vb = ir.ins_opnd(vi, 1)
+        var vcc = ir.ins_opnd(vi, 2)
+        if vcc == AF_CC_LT {
+            if af_load_slot(va) == iv_slot {
+                if af_is_const(vb, 0) {
+                    okv = true
+                }
+            }
+        }
+    }
+    if !okv {
+        return 0
+    }
+    // 元素类型门：out 槽的 ty（= 元素类型）
+    var outd = af_def_of(out_slot)
+    if outd < 0 {
+        return 0
+    }
+    if af_elem_forbidden(ir.ins_ty(outd)) {
+        return 0
+    }
+    // R 区检查：S = reach(R)；指向 S 的分支源 ⊆ S∪{B}；指向 J 的源 ⊆ {B}∪S
+    var vis = table_new_bool()
+    var nb2 = ir.block_count()
+    var z2: i64 = 0
+    while z2 < nb2 {
+        table_push(vis, false)
+        z2 = z2 + 1
+    }
+    af_reach_from(R, vis)
+    // 指向 J 的源 ⊆ {B} ∪ S
+    var js = af_target_sources(J)
+    var ji: i64 = 0
+    while ji < len(js) {
+        var s2 = js[ji]
+        if s2 != B {
+            if s2 < 0 || s2 >= nb2 {
+                return 0
+            }
+            if !vis[s2] {
+                return 0
+            }
+        }
+        ji = ji + 1
+    }
+    // 指向 S 的分支源 ⊆ S ∪ {B}（G/E/B/J 除外——它们的入口本就来自环外）
+    z2 = 0
+    while z2 < nb2 {
+        if vis[z2] && z2 != G && z2 != E && z2 != B && z2 != J {
+            var ss = af_target_sources(z2)
+            var si: i64 = 0
+            while si < len(ss) {
+                var s3 = ss[si]
+                if s3 != B {
+                    if s3 < 0 || s3 >= nb2 {
+                        return 0
+                    }
+                    if !vis[s3] {
+                        return 0
+                    }
+                }
+                si = si + 1
+            }
+        }
+        z2 = z2 + 1
+    }
+    // 步进：iv_slot 恰 2 处 store（初值 const0 在 P + 步进在 J）
+    if af_store_count(iv_slot) != 2 {
+        return 0
+    }
+    var init_st = 0 - 1
+    var step_st = 0 - 1
+    i = 0
+    while i < total {
+        if ir.ins_op(i) == AF_OP_STORE {
+            if ir.ins_ops_cnt(i) >= 3 {
+                if ir.ins_opnd(i, 2) == iv_slot {
+                    if af_is_const(ir.ins_opnd(i, 1), 0) {
+                        init_st = i
+                    } else {
+                        step_st = i
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if init_st < 0 || step_st < 0 {
+        return 0
+    }
+    if af_inst_blk[step_st] != J {
+        return 0
+    }
+    var svi = af_def_of(ir.ins_opnd(step_st, 1))
+    if svi < 0 {
+        return 0
+    }
+    if ir.ins_op(svi) != AF_OP_ADD {
+        return 0
+    }
+    if ir.ins_ops_cnt(svi) < 2 {
+        return 0
+    }
+    var ok_iv = false
+    if af_load_slot(ir.ins_opnd(svi, 0)) == iv_slot {
+        if af_is_const(ir.ins_opnd(svi, 1), 1) {
+            ok_iv = true
+        }
+    }
+    if !ok_iv {
+        return 0
+    }
+    var P = af_inst_blk[init_st]
+    var gs = af_target_sources(G)
+    var gi: i64 = 0
+    while gi < len(gs) {
+        if gs[gi] != P && gs[gi] != J {
+            return 0
+        }
+        gi = gi + 1
+    }
+    // 删集合（旧状态构建 + 校验；改写与标记在其后）
+    // 复用 at 的输出槽 ptri 指令 → ptri(dst)（B 块内定义，保证支配；J 块 ptri 不用）
+    var dst_p_b_inst = af_def_of(at_out_p)
+    if dst_p_b_inst < 0 {
+        return 0
+    }
+    var gp_def = af_def_of(ir.ins_opnd(nvd, 0))
+    var cand = table_new_i64()
+    var skip = table_new_i64()
+    table_push(skip, atc)
+    table_push(skip, ori)
+    table_push(skip, step_st)
+    table_push(skip, bt)
+    table_push(skip, jt)
+    table_push(skip, dst_p_b_inst)
+    var s0 = ir.block_start(B)
+    var e0 = ir.block_end(B)
+    var ii = s0
+    while ii < e0 {
+        var keep = false
+        if ii == src_def || ii == dst_def || ii == bt {
+            keep = true
+        }
+        if ii == af_def_of(at_src_p) || ii == dst_p_b_inst || ii == atc {
+            keep = true
+        }
+        if ii == gp_def || ii == nvd || ii == ori {
+            keep = true
+        }
+        if !keep {
+            table_push(cand, ii)
+        }
+        ii = ii + 1
+    }
+    var j0 = ir.block_start(J)
+    var j1 = ir.block_end(J)
+    ii = j0
+    while ii < j1 {
+        var keep2 = false
+        if ii == step_st || ii == jt {
+            keep2 = true
+        }
+        if !keep2 {
+            table_push(cand, ii)
+        }
+        ii = ii + 1
+    }
+    // S 区（R 可达块，J/B/G/E 除外）改为不可达：终结子 + 终结子操作数定义者保留，
+    // 其余（panic/exit 机构与其取值链）一并删——悬垂引用就地处决，LLVM 随后清空块。
+    var feed = table_new_bool()
+    var zi: i64 = 0
+    while zi < total {
+        table_push(feed, false)
+        zi = zi + 1
+    }
+    var z2b: i64 = 0
+    while z2b < nb2 {
+        if vis[z2b] && z2b != J && z2b != B && z2b != G && z2b != E {
+            var so = ir.block_start(z2b)
+            var eo = ir.block_end(z2b)
+            var kk = so
+            while kk < eo {
+                var opk = ir.ins_op(kk)
+                if opk == AF_OP_BR || opk == AF_OP_COND_BR {
+                    var k2: i64 = 0
+                    var c2 = ir.ins_ops_cnt(kk)
+                    while k2 < c2 {
+                        if ir.ins_opnd_kind(kk, k2) == AF_K_VALUE {
+                            var df = af_def_of(ir.ins_opnd(kk, k2))
+                            if df >= 0 && df < total {
+                                feed[df] = true
+                            }
+                        }
+                        k2 = k2 + 1
+                    }
+                }
+                kk = kk + 1
+            }
+        }
+        z2b = z2b + 1
+    }
+    z2b = 0
+    while z2b < nb2 {
+        if vis[z2b] && z2b != J && z2b != B && z2b != G && z2b != E {
+            var so2 = ir.block_start(z2b)
+            var eo2 = ir.block_end(z2b)
+            var kk2 = so2
+            while kk2 < eo2 {
+                var opk2 = ir.ins_op(kk2)
+                var isterm = false
+                if opk2 == AF_OP_BR || opk2 == AF_OP_COND_BR {
+                    isterm = true
+                }
+                if !isterm && !feed[kk2] {
+                    table_push(cand, kk2)
+                }
+                kk2 = kk2 + 1
+            }
+        }
+        z2b = z2b + 1
+    }
+    if af_verify_dead(cand, skip) == 0 {
+        return 0
+    }
+    // ---------- 改写 ----------
+    // 1) at 调用 → append_tbl_nl：符号名 + 三个实参（全 i64，类型操作数不动）
+    //    arg0 = 复用后的 B 块 ptri(dst)（先改该 ptri 的操作数为 dst 装载值）
+    ir.set_opnd(dst_p_b_inst, 0, dst_ld, AF_K_VALUE)
+    ir.set_opnd(atc, 0, interner.intern(af_copy_sym(locked)), AF_K_VALUE)
+    ir.set_opnd(atc, 3, at_out_p, AF_K_VALUE)
+    ir.set_opnd(atc, 5, at_src_p, AF_K_VALUE)
+    ir.set_opnd(atc, 7, nv, AF_K_VALUE)
+    // 2) 检查的 or 常量压断（false → cond_br 恒走 J）
+    ir.rewrite_to_const(ori, AF_OP_CONST_I, 0)
+    // 3) 步进 store 值换 n
+    ir.set_opnd(step_st, 1, nv, AF_K_VALUE)
+    // 4) 去回边：J 终结改指 E
+    ir.set_opnd(jt, 0, E, AF_K_BLOCK)
+    af_mark_dead(cand, dead)
+    if af_audit {
+        var lk1 = ""
+        if locked {
+            lk1 = " locked"
+        }
+        println("apfuse: P1 copy" + lk1 + " fn=" + interner.lookup(ir.func_name(ir.block_func(B))) +
+            " nval=" + to_string(nv))
+    }
+    g_af_hits = g_af_hits + 1
+    return 1
+}
+
+// 守卫候选：G 以 cond_br(icmp cc=2(load i_slot, n), B, E) 收尾。
+func af_try_guard(G: i64, ref dead: table<bool>) -> i64 {
+    var s0 = ir.block_start(G)
+    var gt = ir.block_end(G) - 1
+    if gt < s0 {
+        return 0
+    }
+    if ir.ins_op(gt) != AF_OP_COND_BR {
+        return 0
+    }
+    if ir.ins_ops_cnt(gt) < 3 {
+        return 0
+    }
+    var condv = ir.ins_opnd(gt, 0)
+    var B = ir.ins_opnd(gt, 1)
+    var E = ir.ins_opnd(gt, 2)
+    if B == E || B == G || E == G {
+        return 0
+    }
+    var nb = ir.block_count()
+    if B < 0 || B >= nb || E < 0 || E >= nb {
+        return 0
+    }
+    var fg = ir.block_func(G)
+    if ir.block_func(B) != fg || ir.block_func(E) != fg {
+        return 0
+    }
+    var ci = af_def_of(condv)
+    if ci < 0 {
+        return 0
+    }
+    if ir.ins_op(ci) != AF_OP_ICMP {
+        return 0
+    }
+    if ir.ins_ops_cnt(ci) < 3 {
+        return 0
+    }
+    var cc = ir.ins_opnd(ci, 2)
+    if cc != AF_CC_LT {
+        return 0
+    }
+    var gA = ir.ins_opnd(ci, 0)
+    var gB = ir.ins_opnd(ci, 1)
+    // gA = load(i_slot)
+    var iv_slot = af_load_slot(gA)
+    if iv_slot < 0 {
+        return 0
+    }
+    var lm = af_body_push_mode(B)
+    if lm < 0 {
+        return 0
+    }
+    var locked = lm == 1
+    var r = af_try_p2(G, E, B, iv_slot, gB, dead, locked)
+    if r != 0 {
+        return r
+    }
+    var r2 = af_try_p1(G, E, B, iv_slot, gB, dead, locked)
+    return r2
+}
+
+// 入口（run_t2 在 apply_repl 之后、dce 之前调用）。
+pub func appfuse() -> i64 {
+    af_audit = get_env("TIEC_APFUSE_AUDIT") == "1"
+    af_build_maps()
+    var total = ir.inst_count()
+    var dead = table_new_bool()
+    var i: i64 = 0
+    while i < total {
+        table_push(dead, false)
+        i = i + 1
+    }
+    var nb = ir.block_count()
+    var g: i64 = 0
+    while g < nb {
+        af_try_guard(g, dead)
+        g = g + 1
+    }
+    var rm = ir.compact_dead(dead)
+    if af_audit {
+        println("apfuse: hits=" + to_string(g_af_hits) + " removed=" + to_string(rm))
+    }
+    return 0
+}
+
+}

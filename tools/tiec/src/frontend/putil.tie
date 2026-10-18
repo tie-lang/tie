@@ -1,0 +1,58 @@
+type tie<class>
+// compiler/frontend/putil.tie —— T2.5 parser 工具层（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5（.omo/plans/self-hosting-v2.md）完整 parser
+// 拆分为 5 模块之一（本文件 = 错误/token 流/字面量/判定工具；调试名表
+// 拆出到 ./pnames.tie）。对应 proto/parser.tie 345-752 行逻辑搬移
+// + fill_pending 新增。
+// 依赖：./pst.tie（状态）+ ./ast.tie（N_* 常量 + 节点池，T2.1 复用）
+// + ./lexer.tie（T2.4 词法器，经其 import 树传递可达 errors/interner/string）
+// + ./pnames.tie（调试名表）。
+// 树式无环：本文件是 import 树深层节点，由 pexpr_chain.tie import（传递可达上层）。
+import "./pst.tie"
+import "./ast.tie"
+import "./lexer.tie"
+import "./pnames.tie"
+
+namespace putil {
+
+
+// ---------- 词法游标（含 >> 分裂 pending 队列）----------
+
+
+// ---------- >> 闭括号分裂（A1/E1 类型参数）----------
+
+
+// ---------- 延迟闭包函数体快照（S2.2）----------
+// 闭包字面量 `func(x: i64) -> i64 { ... }` 由 pexpr.parse_primary 解析头部，
+// 但函数体是语句块，需要 pstmt_flow 的语句解析——pexpr 在 import 树底层
+// 无法调用 pstmt_flow（成环：pstmt_flow → pstmt → pexpr）。方案：parse_primary
+// 遇 func 时登记「函数体起始处完整 token 流快照」（多槽，闭包可嵌套/多个），
+// 配平跳过函数体 token；整份文件解析完后由 pstmt_flow.parse_deferred_closures
+// 逐闭包恢复快照、parse_block 解析函数体、回填到 N_FN_LIT 的 children。
+// 与 save_pos/restore_pos 不同：那对是单槽、探测用、立即成对；这里是多槽表。
+
+
+// ---------- S3.3 延迟准引用块快照（`` `{ stmts } `` 的块体）----------
+// 与 defer_closure_* 同构：parse_primary 解析准引用块字面量时只登记
+// N_CODE_LIT 节点 + 块体起始 token 流快照，配平跳过块体；整份文件解析完后
+// 由 pstmt_flow.parse_deferred_code_blocks 恢复快照、parse_block 解析块体、
+// 回填到 N_CODE_LIT 的 children[0]（块形式子 AST = StmtList）。
+
+
+// ---------- 泛型调用点 '<' 歧义探测（token 层，无副作用，2026-08-14）----------
+// 调用点 `ident<...>(...)` 与比较 `a < b` / 链式 `f < g > h` 共用 '<' token。
+// 判据：'<' 后是「完整类型实参列表 + '>' + 紧接着 '('」才按泛型调用处理，
+// 否则回退为比较。本函数只做 token 结构扫描（不建 AST 节点、不消费 token，
+// 内部 save/restore 还原），命中后由调用方以 parse_type_args 正式解析。
+
+
+// ---------- 类型关键字与整数字面量 ----------
+
+
+}
+
+import "./putil_p1.tie"
+
+import "./putil_q1.tie"
+import "./putil_q2.tie"

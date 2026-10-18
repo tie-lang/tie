@@ -1,0 +1,374 @@
+type tie<class>
+// tlib/std/zd_builder.tie —— zd 字节构建器 + 批量编解码 + 预分配（自 tiedb 提炼）
+// ============================================================================
+// 目标（specs/2026-08-31-zd-v2-design.md §4，namespace zdb）：
+//   - 字节构建器（append-only buffer）：一次线性填充，消除逐元素 concat 的
+//     O(n²) 重复分配（concat 每次拷贝已累积主体，N 元素 O(N²) 字节拷贝）；
+//   - 批量字符串/数值数组：构建器一次性写入数组头 + 各元素；decode 先取 n、
+//     预建输出表后逐元素解码（不逐元素重建表）；
+//   - decode_string_fast：StringBuilder 一次构建字符串，消除逐码点
+//     out = out + str_from_code(cp) 的 O(n²) 拼接。
+// 字节一律 table<i64>；复用 zd 的 slice/u8_at/write_*_be/read_*_be/encode_*/decode_*。
+
+import "./zd.tie"
+
+namespace zdb {
+
+// ---------- 字节构建器（append-only buffer） ----------
+
+// new_builder：空字节缓冲。
+pub func new_builder() -> table<i64> {
+    return table_new_i64()
+}
+
+// b_append：追加 1 字节（取低 8 位）。
+pub func b_append(buf: ref table<i64>, b: i64) {
+    table_push(buf, b & 0xFF)
+}
+
+// b_append_bytes：整段追加字节表。
+pub func b_append_bytes(buf: ref table<i64>, bytes: table<i64>) {
+    var n: i64 = len(bytes)
+    var i: i64 = 0
+    while i < n {
+        table_push(buf, bytes[i])
+        i = i + 1
+    }
+}
+
+// b_append_be16：追加 2 字节大端（内部辅助，等价 zd.write_u16_be 直写）。
+func b_append_be16(buf: ref table<i64>, v: i64) {
+    table_push(buf, (v >> 8) & 0xFF)
+    table_push(buf, v & 0xFF)
+}
+
+// b_append_be32：追加 4 字节大端（等价 zd.write_u32_be 直写）。
+pub func b_append_be32(buf: ref table<i64>, v: i64) {
+    table_push(buf, (v >> 24) & 0xFF)
+    table_push(buf, (v >> 16) & 0xFF)
+    table_push(buf, (v >> 8) & 0xFF)
+    table_push(buf, v & 0xFF)
+}
+
+// b_append_be64：追加 8 字节大端（等价 zd.write_u64_be 直写）。
+pub func b_append_be64(buf: ref table<i64>, v: i64) {
+    var i: i64 = 7
+    while i >= 0 {
+        table_push(buf, (v >> (i * 8)) & 0xFF)
+        i = i - 1
+    }
+}
+
+// b_append_varint：追加 Protobuf varint（等价 zd.write_varint 直写）。
+pub func b_append_varint(buf: ref table<i64>, n: i64) {
+    if n < 0 {
+        return
+    }
+    var v: i64 = n
+    while v >= 0x80 {
+        table_push(buf, (v & 0x7F) | 0x80)
+        v = v >> 7
+    }
+    table_push(buf, v)
+}
+
+// b_len：当前已写入字节数。
+pub func b_len(buf: table<i64>) -> i64 {
+    return len(buf)
+}
+
+// b_build：取走结果——拷贝当前内容为新表，并清空构建器（ref 重绑定写回调用方）。
+pub func b_build(buf: ref table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var n: i64 = len(buf)
+    var i: i64 = 0
+    while i < n {
+        table_push(out, buf[i])
+        i = i + 1
+    }
+    buf = table_new_i64()
+    return out
+}
+
+// ---------- 直写辅助（避免每元素中间表分配） ----------
+
+// b_append_i64：紧凑 i64 直写构建器（等价 zd.encode_i64 语义，免中间表）。
+func b_append_i64(buf: ref table<i64>, n: i64) {
+    if n >= 0 && n <= 127 {
+        table_push(buf, n)
+        return
+    }
+    if n >= -32 && n < 0 {
+        table_push(buf, n & 0xFF)
+        return
+    }
+    if n >= -128 && n < -32 {
+        table_push(buf, 0xD0)
+        table_push(buf, n & 0xFF)
+        return
+    }
+    if n >= 128 && n <= 255 {
+        table_push(buf, 0xCC)
+        table_push(buf, n)
+        return
+    }
+    if n >= -32768 && n < -128 {
+        table_push(buf, 0xD1)
+        b_append_be16(buf, n & 0xFFFF)
+        return
+    }
+    if n >= 256 && n <= 65535 {
+        table_push(buf, 0xCD)
+        b_append_be16(buf, n)
+        return
+    }
+    if n >= -2147483648 && n < -32768 {
+        table_push(buf, 0xD2)
+        b_append_be32(buf, n & 0xFFFFFFFF)
+        return
+    }
+    if n >= 65536 && n <= 4294967295 {
+        table_push(buf, 0xCE)
+        b_append_be32(buf, n)
+        return
+    }
+    if n >= 0 {
+        table_push(buf, 0xCF)
+        b_append_be64(buf, n)
+        return
+    }
+    table_push(buf, 0xD3)
+    b_append_be64(buf, n)
+}
+
+// b_append_string：字符串长度头 + UTF-8 字节直写构建器（等价 zd.encode_string 语义）。
+func b_append_string(buf: ref table<i64>, s: string) {
+    var body = zd.utf8_encode(s)
+    var n: i64 = len(body)
+    if n <= 31 {
+        table_push(buf, 0xA0 | n)
+    } else if n <= 255 {
+        table_push(buf, 0xD9)
+        table_push(buf, n)
+    } else if n <= 65535 {
+        table_push(buf, 0xDA)
+        b_append_be16(buf, n)
+    } else {
+        table_push(buf, 0xDB)
+        b_append_be32(buf, n)
+    }
+    b_append_bytes(buf, body)
+}
+
+// b_append_array_head：fixarray/16/32 头直写构建器（等价 zd.array_head 语义）。
+func b_append_array_head(buf: ref table<i64>, n: i64) {
+    if n <= 15 {
+        table_push(buf, 0x90 | n)
+        return
+    }
+    if n <= 65535 {
+        table_push(buf, 0xDC)
+        b_append_be16(buf, n)
+        return
+    }
+    table_push(buf, 0xDD)
+    b_append_be32(buf, n)
+}
+
+// b_append_f64：0xCB + 8 字节位模式直写构建器（M1 bitcast 原语接入，
+// 取代 zd.write_f64_be 的数学分解快路径；同宽 64 位直读）。
+pub func b_append_f64(buf: ref table<i64>, x: f64) {
+    table_push(buf, 0xCB)
+    var bits = bitcast_f64_i64(x)
+    var i: i64 = 7
+    while i >= 0 {
+        table_push(buf, (bits >> (i * 8)) & 0xFF)
+        i = i - 1
+    }
+}
+
+// decode_f64_fast：0xCB + 8 字节位模式 → f64（M1 bitcast 原语接入，
+// 取代 zd.read_f64_be 的数学分解快路径）。失败 (0.0, -1)。
+pub func decode_f64_fast(t: table<i64>, pos: i64) -> (f64, i64) {
+    if zd.u8_at(t, pos) != 0xCB {
+        return (0.0, -1)
+    }
+    var bits: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        var b = zd.u8_at(t, pos + 1 + i)
+        if b < 0 {
+            return (0.0, -1)
+        }
+        bits = (bits << 8) | b
+        i = i + 1
+    }
+    return (bitcast_i64_f64(bits), pos + 9)
+}
+
+// ---------- 批量编解码 ----------
+
+// encode_string_array_batch：构建器一次性写入 fixarray 头 + 各字符串。
+pub func encode_string_array_batch(vals: table<string>) -> table<i64> {
+    var buf = new_builder()
+    b_append_array_head(buf, len(vals))
+    var n: i64 = len(vals)
+    var i: i64 = 0
+    while i < n {
+        b_append_string(buf, vals[i])
+        i = i + 1
+    }
+    return b_build(buf)
+}
+
+// encode_i64_array_batch：构建器一次性写入 fixarray 头 + 各紧凑 i64。
+pub func encode_i64_array_batch(vals: table<i64>) -> table<i64> {
+    var buf = new_builder()
+    b_append_array_head(buf, len(vals))
+    var n: i64 = len(vals)
+    var i: i64 = 0
+    while i < n {
+        b_append_i64(buf, vals[i])
+        i = i + 1
+    }
+    return b_build(buf)
+}
+
+// encode_f64_array_batch：构建器一次性写入 fixarray 头 + 各 f64（0xCB + 8 字节位模式，
+// bitcast 直写）。
+pub func encode_f64_array_batch(vals: table<f64>) -> table<i64> {
+    var buf = new_builder()
+    b_append_array_head(buf, len(vals))
+    var n: i64 = len(vals)
+    var i: i64 = 0
+    while i < n {
+        b_append_f64(buf, vals[i])
+        i = i + 1
+    }
+    return b_build(buf)
+}
+
+// decode_i64_array_batch：读数组标签 n，预建输出表后逐元素 decode_i64。
+pub func decode_i64_array_batch(bytes: table<i64>, pos: i64) -> (table<i64>, i64) {
+    var (n, dp) = zd.array_tag(bytes, pos)
+    if n < 0 {
+        return (table_new_i64(), -1)
+    }
+    var out = table_new_i64()
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (v, np) = zd.decode_i64(bytes, p)
+        if np < 0 {
+            return (out, -1)
+        }
+        table_push(out, v)
+        p = np
+        i = i + 1
+    }
+    return (out, p)
+}
+
+// decode_f64_array_batch：读数组标签 n，预建输出表后逐元素 decode_f64。
+pub func decode_f64_array_batch(bytes: table<i64>, pos: i64) -> (table<f64>, i64) {
+    var (n, dp) = zd.array_tag(bytes, pos)
+    if n < 0 {
+        return (table_new_f64(), -1)
+    }
+    var out = table_new_f64()
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (v, np) = zd.decode_f64(bytes, p)
+        if np < 0 {
+            return (out, -1)
+        }
+        table_push(out, v)
+        p = np
+        i = i + 1
+    }
+    return (out, p)
+}
+
+// decode_string_array_batch：读数组标签 n，预建输出表后逐元素快速解码。
+pub func decode_string_array_batch(bytes: table<i64>, pos: i64) -> (table<string>, i64) {
+    var (n, dp) = zd.array_tag(bytes, pos)
+    if n < 0 {
+        return (table_new_string(), -1)
+    }
+    return decode_string_bulk(bytes, dp, n)
+}
+
+// decode_string_bulk：连续 n 个字符串（各带长度前缀）一次解码进预建表。
+pub func decode_string_bulk(bytes: table<i64>, pos: i64, n: i64) -> (table<string>, i64) {
+    var out = table_new_string()
+    var p: i64 = pos
+    var i: i64 = 0
+    while i < n {
+        var (v, np) = decode_string_fast(bytes, p)
+        if np < 0 {
+            return (out, -1)
+        }
+        table_push(out, v)
+        p = np
+        i = i + 1
+    }
+    return (out, p)
+}
+
+// ---------- 快速字符串解码（StringBuilder 一次构建，O(n)） ----------
+
+// str_head：读字符串头 → (UTF-8 字节数, 数据起点)。失败 (-1, -1)。
+func str_head(t: table<i64>, pos: i64) -> (i64, i64) {
+    var tag = zd.u8_at(t, pos)
+    if tag < 0 {
+        return (-1, -1)
+    }
+    if tag >= 0xA0 && tag <= 0xBF {
+        return (tag & 0x1F, pos + 1)
+    }
+    if tag == 0xD9 {
+        var v = zd.u8_at(t, pos + 1)
+        if v < 0 {
+            return (-1, -1)
+        }
+        return (v, pos + 2)
+    }
+    if tag == 0xDA {
+        var (v, p2) = zd.read_u16_be(t, pos + 1)
+        if p2 < 0 {
+            return (-1, -1)
+        }
+        return (v, p2)
+    }
+    if tag == 0xDB {
+        var (v, p2) = zd.read_u32_be(t, pos + 1)
+        if p2 < 0 {
+            return (-1, -1)
+        }
+        return (v, p2)
+    }
+    return (-1, -1)
+}
+
+// decode_string_fast：读长度头 + 原样拷贝 UTF-8 字节到 StringBuilder 一次构建，
+// 消除逐码点 out = out + str_from_code(cp) 的 O(n²) 拼接。语义对齐 zd.decode_string
+// （自身编码数据往返无损；不做码点级 UTF-8 校验，非法输入按字节原样保留）。
+func decode_string_fast(t: table<i64>, pos: i64) -> (string, i64) {
+    var (n, dp) = str_head(t, pos)
+    if n < 0 {
+        return ("", -1)
+    }
+    var end: i64 = dp + n
+    if end > len(t) {
+        return ("", -1)
+    }
+    var sb = string_builder()
+    var p: i64 = dp
+    while p < end {
+        sb_append_byte(sb, t[p])
+        p = p + 1
+    }
+    return (sb_build(sb), end)
+}
+}

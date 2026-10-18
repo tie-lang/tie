@@ -1,0 +1,148 @@
+type tie<logic>
+// compiler/middle/types_test.tie —— tie.types 库独立自检（p.9.21 G7 库资格②）
+// ============================================================
+// 无 driver 可跑：本文件即入口（tie<logic>），只 import 被测库，
+// 覆盖类型 id 编码的核心契约（构造 -> 判别 -> 负载 往返一致）：
+//   - named：TK_* 关键字 id 即类型 id（< 100），kind = K_NAMED；
+//   - 构造器确定性：同一输入两次构造得到同一 id（幂等）；
+//   - kind 判别：table/map/ptr/slice/atomic/fn/array 各归各类；
+//   - low 负载：容器类型解出元素类型 id；
+//   - fn：fn_of 登记返回类型 + 参数表，fn_ret_ty / fn_param_of 读回；
+//   - 判据族：is_int / is_float / is_number / is_bool_like / is_wide；
+//   - type_name：可读名（不含 "unknown"）。
+// 全部通过输出「types 自检通过」exit 0；任一失败打印明细 exit 1。
+//
+// # 语言边界应用（同 ir_test.tie）
+//   - import 文本内联后与本库顶层常量同作用域：**不定义本地常量**，
+//     TK_* / K_* / 断言期望值全部直接用库内常量或字面量；
+//   - 前缀调用（types.xxx）；断言失败累积用嵌套 if。
+//
+// 运行（repo 根）：
+//   compiler\tiec.exe compiler\middle\types_test.tie -o <tmp>\typestest.exe
+//   <tmp>\typestest.exe      # -> 「types 自检通过」exit 0
+
+import "./types.tie"
+
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+func main() {
+    var ok: bool = true
+
+    // ---------- named：TK_* 即类型 id ----------
+    var i64t = types.named(TK_I64)
+    if !check(i64t == TK_I64, "named(TK_I64) 恒等返回关键字 id") {
+        ok = false
+    }
+    if !check(types.kind(i64t) == K_NAMED, "named 类别 = K_NAMED") {
+        ok = false
+    }
+    if !check(types.named(TK_F64) == TK_F64, "named(TK_F64) 恒等") {
+        ok = false
+    }
+
+    // ---------- 判据族 ----------
+    if !check(types.is_int(TK_I64) && types.is_int(TK_U8) && types.is_int(TK_I128),
+              "is_int 覆盖有符号/无符号/宽整数") {
+        ok = false
+    }
+    if !check(!types.is_int(TK_F64) && !types.is_int(TK_BOOL), "is_int 排除浮点与布尔") {
+        ok = false
+    }
+    if !check(types.is_float(TK_F32) && types.is_float(TK_F64), "is_float 覆盖 f32/f64") {
+        ok = false
+    }
+    if !check(types.is_number(TK_I64) && types.is_number(TK_F32), "is_number = 整数或浮点") {
+        ok = false
+    }
+    if !check(types.is_bool_like(TK_BOOL) && types.is_bool_like(TK_TRIT), "is_bool_like = bool/trit") {
+        ok = false
+    }
+    if !check(types.is_wide(TK_NUM) && types.is_wide(TK_TEXT) && types.is_wide(TK_MISC),
+              "is_wide = num/text/misc") {
+        ok = false
+    }
+
+    // ---------- 容器构造：确定性 + 类别 + 负载 ----------
+    var t1 = types.table_of(i64t)
+    var t1b = types.table_of(i64t)
+    if !check(t1 == t1b, "table_of 同输入幂等") {
+        ok = false
+    }
+    if !check(types.kind(t1) == K_TABLE, "table_of 类别 = K_TABLE") {
+        ok = false
+    }
+    if !check(types.low(t1) == i64t, "table 负载解出元素类型") {
+        ok = false
+    }
+    if !check(types.is_table(t1), "is_table 命中") {
+        ok = false
+    }
+
+    var m1 = types.map_of(i64t)
+    if !check(types.kind(m1) == K_MAP && types.low(m1) == i64t, "map 类别与负载") {
+        ok = false
+    }
+    if !check(types.is_map(m1), "is_map 命中") {
+        ok = false
+    }
+
+    var p1 = types.ptr_of(i64t)
+    var s1 = types.slice_of(i64t)
+    if !check(types.kind(p1) == K_PTR && types.low(p1) == i64t, "ptr 类别与负载") {
+        ok = false
+    }
+    if !check(types.kind(s1) == K_SLICE && types.low(s1) == i64t, "slice 类别与负载") {
+        ok = false
+    }
+    if !check(p1 != s1, "ptr 与 slice 编码不同") {
+        ok = false
+    }
+
+    var a1 = types.array_of(i64t, 4)
+    if !check(types.kind(a1) == K_ARRAY, "array 类别 = K_ARRAY") {
+        ok = false
+    }
+    if !check(types.is_array(a1) && types.array_elem(a1) == i64t && types.array_len(a1) == 4,
+              "array 元素与定长读回") {
+        ok = false
+    }
+
+    // ---------- 函数类型 ----------
+    var ps: table<i64> = table_new_i64()
+    table_push(ps, i64t)
+    table_push(ps, types.named(TK_STR))
+    var f1 = types.fn_of(i64t, ps)
+    if !check(types.kind(f1) == K_FN, "fn 类别 = K_FN") {
+        ok = false
+    }
+    if !check(types.fn_ret_ty(f1) == i64t, "fn 返回类型读回") {
+        ok = false
+    }
+    if !check(types.fn_nparams_of(f1) == 2, "fn 参数个数读回") {
+        ok = false
+    }
+    if !check(types.fn_param_of(f1, 0) == i64t && types.fn_param_of(f1, 1) == TK_STR,
+              "fn 参数类型读回") {
+        ok = false
+    }
+    if !check(types.fn_of(i64t, ps) == f1, "fn_of 同签名幂等") {
+        ok = false
+    }
+
+    // ---------- type_name ----------
+    var nm = types.type_name(i64t)
+    if !check(str_len(nm) > 0, "type_name 产生可读名") {
+        ok = false
+    }
+
+    // ---------- 汇总 ----------
+    if !ok {
+        exit(1)
+    }
+    println("types 自检通过")
+}

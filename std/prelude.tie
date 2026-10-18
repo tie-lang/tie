@@ -1,0 +1,649 @@
+type tie<class>
+// tlib/std/prelude.tie —— 语言前置基元（p.9.13.2）
+// EN: language prelude primitives (p.9.13.2).
+// ============================================================
+// 编译器级**隐式前置**：本模块由编译器自动 import（免用户 import、免前缀），其
+// `lang` 命名空间的 pub 函数经 `using` 暴露为全局裸名。同名用户定义优先遮蔽。
+//
+// 设计依据 docs/designs/tie-primitive-op-design.md §2：精选**平台无关**函数；
+// 平台相关（文件/进程/网络/时钟）不进前置。
+//
+// ============================================================
+// 关键设计：**本模块自包含 —— 不 import 任何 std 模块**（实测教训）
+// ============================================================
+// 初版用 `import "/std/string.tie" as ...` + using 复用既有实现，触发三处真实回归：
+//   1) **命名空间别名覆盖**：同一文件被两个不同别名 import（prelude 的 prelude_str
+//      与用户的 str）时，tie 的别名注册互相覆盖 —— 用户侧 `str.slice(...)` 报「未定义」。
+//   2) **改用与库一致的别名（str）仍失败**：与调用方已有的 `str` 别名重复 import
+//      同一文件时，命名空间函数注册丢失，同样报「未定义」。
+//   3) **整表 using 抢占同名不同签名**：整表引入的 str.find(s, sub) 与用户自定义
+//      的 find(a: i64) 同名不同签名，裸调用被解析到前者 → 参数个数不匹配。
+// 结论：**前置模块必须自包含**——只用语言原语（str_len / str_char / char_code /
+// str_from_code / 字符串拼接）实现，不 import 任何模块、不注册任何别名，从而对
+// 调用方的 import 图零干扰；并且**逐个包装只暴露精选名单**，绝不整表 using。
+//
+// ---- 名单纪律（放宽新名字前必读）----
+// 入选条件：签名**独特**（用户极少自定义同名同形函数）。已实测排除的高风险名：
+//   find / contains / slice / clone / replace / split / join / repeat（用户常自定义
+//   且签名各异）· abs / max / min（用户几乎必然自定义）。这些保持显式限定名
+//   （str.split / math.max）可用，只是不进前置裸名。
+//
+// ---- 性能说明 ----
+// 本模块函数用**逐字符拼接**实现（O(n²)）。前置定位是「免 import 的便利入口」，
+// 输入通常是短串（配置键、标签、命令名）；处理长串或热点路径请显式用
+// `str.trim` / `str.to_upper`（O(n) 版本，std/string.tie）。
+// 大小写转换只覆盖 ASCII a-z / A-Z（保守：不做 Unicode 大小写折叠）。
+
+namespace lang {
+
+// 单字符是否空白（空格 / 制表 / 换行 / 回车）。
+func is_ws(c: string) -> bool {
+    if c == " " {
+        return true
+    }
+    if c == "\t" {
+        return true
+    }
+    if c == "\n" {
+        return true
+    }
+    if c == "\r" {
+        return true
+    }
+    return false
+}
+
+// 从 from 起把剩余字符拼成新串（内部用；O(n²) 见文件头性能说明）。
+func tail_from(s: string, from: i64) -> string {
+    var n = str_len(s)
+    var out = ""
+    var i = from
+    while i < n {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+// 把 [start, end) 区间字符拼成新串（内部用）。
+func range_str(s: string, start: i64, end: i64) -> string {
+    var out = ""
+    var i = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- 字符串：空白裁剪 ----
+
+pub func trim_start(s: string) -> string {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n && is_ws(str_char(s, i)) {
+        i = i + 1
+    }
+    if i == 0 {
+        return s
+    }
+    return tail_from(s, i)
+}
+
+pub func trim_end(s: string) -> string {
+    var n = str_len(s)
+    while n > 0 && is_ws(str_char(s, n - 1)) {
+        n = n - 1
+    }
+    if n == str_len(s) {
+        return s
+    }
+    return range_str(s, 0, n)
+}
+
+pub func trim(s: string) -> string {
+    return trim_end(trim_start(s))
+}
+
+// ---- 字符串：大小写（ASCII）----
+
+pub func to_upper(s: string) -> string {
+    var n = str_len(s)
+    var out = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        var cp = char_code(c)
+        if cp >= 97 && cp <= 122 {
+            out = out + str_from_code(cp - 32)
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+pub func to_lower(s: string) -> string {
+    var n = str_len(s)
+    var out = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        var cp = char_code(c)
+        if cp >= 65 && cp <= 90 {
+            out = out + str_from_code(cp + 32)
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- 字符串：前缀 / 后缀判定 ----
+
+pub func starts_with(s: string, prefix: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(prefix)
+    if m > n {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+pub func ends_with(s: string, suffix: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(suffix)
+    if m > n {
+        return false
+    }
+    var off = n - m
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, off + i) != str_char(suffix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ---- 数学：区间钳制 / 整数幂 ----
+
+pub func clamp_i(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+// 整数快速幂（平方求幂，O(log n)）；n 为负返回 0（i64 无分数结果）。
+pub func pow_i(x: i64, n: i64) -> i64 {
+    if n < 0 {
+        return 0
+    }
+    var base = x
+    var e = n
+    var acc: i64 = 1
+    while e > 0 {
+        if e % 2 == 1 {
+            acc = acc * base
+        }
+        base = base * base
+        e = e / 2
+    }
+    return acc
+}
+
+// checked 幂（供 `**?` 运算符）：任一步乘法溢出即运行期报错（对齐 p.9.11.9 的
+// `+?`/`-?`/`*?` 族）。用 `*?` 逐步检查，故**中间结果**溢出也能捕获
+//（先算幂再验结果的做法无法捕获中间溢出）。
+// 注：`base = base *? base` 在最后一步（e 已耗尽的循环末轮）仍可能溢出——那是
+// 真实溢出，报错正确；但为减少无谓检查，e==0 时提前返回。
+pub func pow_i_checked(x: i64, n: i64) -> i64 {
+    if n < 0 {
+        return 0
+    }
+    if n == 0 {
+        return 1
+    }
+    var base = x
+    var e = n
+    var acc: i64 = 1
+    while e > 0 {
+        if e % 2 == 1 {
+            acc = acc *? base
+        }
+        e = e / 2
+        if e > 0 {
+            base = base *? base
+        }
+    }
+    return acc
+}
+
+// ---- 容器包含（供 `in` 中缀脱糖；p.9.13.3）----
+// `elem in container` 由**语义层**按容器类型分派到下列三者之一
+// （见 sinfer.infer_in_op——容器类型解析期不可知、语义期可知）：
+//   string → `str_has`（子串）· table → `seq_has`（元素）· map → `map_has`（键）
+// 三者签名统一为「**容器在前**、键/元素在后」，故 irgen 可直接把节点 children
+// 当实参（无需换序）。
+
+// 子串包含（朴素匹配 O(n·m)）。空 needle 返回 true（空串是任何串的子串）。
+pub func str_has(hay: string, needle: string) -> bool {
+    var n = str_len(hay)
+    var m = str_len(needle)
+    if m == 0 {
+        return true
+    }
+    if m > n {
+        return false
+    }
+    var i: i64 = 0
+    while i + m <= n {
+        var j: i64 = 0
+        var ok: bool = true
+        while j < m {
+            if str_char(hay, i + j) != str_char(needle, j) {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 表元素包含（泛型单态化覆盖任意元素类型）。
+// 复杂度：顺序扫描 O(n)；热点路径的大表查找请改用 map（键查找 O(1)）。
+pub func seq_has<T>(t: table<T>, v: T) -> bool {
+    var n = len(t)
+    var i: i64 = 0
+    while i < n {
+        if t[i] == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 下标查找（返回首达下标，未命中 -1）；供需要位置的调用方使用。
+pub func seq_index<T>(t: table<T>, v: T) -> i64 {
+    var n = len(t)
+    var i: i64 = 0
+    while i < n {
+        if t[i] == v {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 键包含（map；O(1)，底层走编译器内置 `map_contains`）。
+// 泛型化是为了让 `map<V>` 的任意值类型都能过类型检查——值类型对本操作无关。
+pub func map_has<V>(m: map<V>, k: string) -> bool {
+    return map_contains(m, k)
+}
+
+// 映射合并（供 `+` 扩展；p.9.13.3）：返回**新映射**（值语义），不改动入参。
+// 键冲突以 **b 的值覆盖 a**（右覆盖左，对齐「后者优先」的合并直觉）。
+// 实现要点：从**空 map 字面量**起逐键写入——`m[k] = v` 的映射下标赋值可用，
+// 且**不能**写 `var out = a`（实测 tie 的表/映射赋值是**别名**，会改到入参）。
+// 复杂度 O(|a|+|b|)。
+pub func map_cat<V>(a: map<V>, b: map<V>) -> map<V> {
+    var out: map<V> = {}
+    var ka = map_keys(a)
+    var i: i64 = 0
+    while i < len(ka) {
+        out[ka[i]] = a[ka[i]]
+        i = i + 1
+    }
+    var kb = map_keys(b)
+    var j: i64 = 0
+    while j < len(kb) {
+        out[kb[j]] = b[kb[j]]
+        j = j + 1
+    }
+    return out
+}
+// 实现：从**空表**起逐元素搬入 a、再搬 b——不能写 `var out = a`，实测 tie 的
+// 表赋值是**别名**（对 out 的 push 会改到 a），故必须从空表开始重建。
+// 复杂度 O(n+m)；大表慎用（设计与 p.9.11.6 `with` 同款性能裁决）。
+pub func tbl_cat<T>(a: table<T>, b: table<T>) -> table<T> {
+    var out: table<T> = []
+    var i: i64 = 0
+    while i < len(a) {
+        table_push(out, a[i])
+        i = i + 1
+    }
+    var j: i64 = 0
+    while j < len(b) {
+        table_push(out, b[j])
+        j = j + 1
+    }
+    return out
+}
+
+// ---- 2.20 集合批（2026-10-13）：原地操作返回自身（可接管道），产新值不动入参。----
+// 全部泛型实现；元素需支持 `<` / `==`（i64 / f64 / string 等标量族）。
+
+// 逆置（原地生效并返回自身）。
+pub func seq_reverse<T>(ref t: table<T>) -> table<T> {
+    var n = len(t)
+    var i: i64 = 0
+    while i < n / 2 {
+        var j = n - 1 - i
+        var tmp = t[i]
+        t[i] = t[j]
+        t[j] = tmp
+        i = i + 1
+    }
+    return t
+}
+
+// 升序排序（**稳定**，自底向上归并，原地生效并返回自身）。
+// 复杂度 O(n log n)（比较与写入同阶）；迭代式不递归；辅助表一轮内复用。
+pub func seq_sort<T>(ref t: table<T>) -> table<T> {
+    var n = len(t)
+    if n < 2 {
+        return t
+    }
+    var aux: table<T> = []
+    var j: i64 = 0
+    while j < n {
+        table_push(aux, t[j])
+        j = j + 1
+    }
+    var width: i64 = 1
+    while width < n {
+        var lo: i64 = 0
+        while lo < n {
+            var mid = lo + width
+            if mid > n {
+                mid = n
+            }
+            var hi = lo + 2 * width
+            if hi > n {
+                hi = n
+            }
+            var a = lo
+            var b = mid
+            var k: i64 = lo
+            while k < hi {
+                // 稳定性：`<=` 时取左run
+                if a < mid && (b >= hi || !(t[b] < t[a])) {
+                    aux[k] = t[a]
+                    a = a + 1
+                } else {
+                    aux[k] = t[b]
+                    b = b + 1
+                }
+                k = k + 1
+            }
+            lo = lo + 2 * width
+        }
+        var m: i64 = 0
+        while m < n {
+            t[m] = aux[m]
+            m = m + 1
+        }
+        width = width * 2
+    }
+    return t
+}
+
+// 以比较函数排序（cmp(a, b) = 「a 应排在 b 前」；**稳定**，同归并实现）。
+// 数据作末参：`xs -> seq_sort_by(cmp)`。
+pub func seq_sort_by<T>(cmp: fn(T, T) -> bool, ref t: table<T>) -> table<T> {
+    var n = len(t)
+    if n < 2 {
+        return t
+    }
+    var aux: table<T> = []
+    var j: i64 = 0
+    while j < n {
+        table_push(aux, t[j])
+        j = j + 1
+    }
+    var width: i64 = 1
+    while width < n {
+        var lo: i64 = 0
+        while lo < n {
+            var mid = lo + width
+            if mid > n {
+                mid = n
+            }
+            var hi = lo + 2 * width
+            if hi > n {
+                hi = n
+            }
+            var a = lo
+            var b = mid
+            var k: i64 = lo
+            while k < hi {
+                // 稳定性：右侧不先于左侧时取左run
+                if a < mid && (b >= hi || !cmp(t[b], t[a])) {
+                    aux[k] = t[a]
+                    a = a + 1
+                } else {
+                    aux[k] = t[b]
+                    b = b + 1
+                }
+                k = k + 1
+            }
+            lo = lo + 2 * width
+        }
+        var m: i64 = 0
+        while m < n {
+            t[m] = aux[m]
+            m = m + 1
+        }
+        width = width * 2
+    }
+    return t
+}
+
+// 保序去重（返回新表，不改入参）。O(n²) 相等扫描。
+pub func seq_distinct<T>(t: table<T>) -> table<T> {
+    var out: table<T> = []
+    var n = len(t)
+    var i: i64 = 0
+    while i < n {
+        if !seq_has(out, t[i]) {
+            table_push(out, t[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- 6.11 惰性流（拉取协议 `fn() -> Option<T>`，2026-10-13）----
+// 流 = 每次调用返回下一个元素的函数：Some(元素)，取尽后恒 None。for 语句直接
+// 消费（拉取循环：Some 绑定元素执行循环体、None 退出）；适配器逐元素传递，
+// take 短路后不再向上游拉取（实测：10 元素源 take(3) 只映射 3 次）。
+pub func stream_from<T>(xs: table<T>) -> fn() -> Option<T> {
+    var i: i64 = 0
+    return func() -> Option<T> {
+        if i < len(xs) {
+            var v = xs[i]
+            i = i + 1
+            return Option.Some(v)
+        }
+        return Option.None
+    }
+}
+
+// 逐元素变换：`xs -> stream_from() -> stream_map(f)`。
+pub func stream_map<T, U>(f: fn(T) -> U, it: fn() -> Option<T>) -> fn() -> Option<U> {
+    return func() -> Option<U> {
+        var m = it()?
+        return Option.Some(f(m))
+    }
+}
+
+// 保留判定为真的元素（内部循环跳过不合格项）。
+pub func stream_filter<T>(p: fn(T) -> bool, it: fn() -> Option<T>) -> fn() -> Option<T> {
+    return func() -> Option<T> {
+        var m = it()?
+        while !p(m) {
+            m = it()?
+        }
+        return Option.Some(m)
+    }
+}
+
+// 取前 n 个元素（到量即 None，且不再向上游拉取）。
+pub func stream_take<T>(n: i64, it: fn() -> Option<T>) -> fn() -> Option<T> {
+    var cnt: i64 = 0
+    return func() -> Option<T> {
+        if cnt >= n {
+            return Option.None
+        }
+        var m = it()?
+        cnt = cnt + 1
+        return Option.Some(m)
+    }
+}
+
+// 注：stream_zip（产出 (a_i, b_i) 元组流）待泛型系统开放 tuple 实参后补
+//（现行 E00566：泛型实参不能是 tuple 类型）——表域已有 iter_zip。
+
+// 注：stream_chain（先后串接两路）待缺陷修复后补——泛型返回闭包内的
+// switch-case 绑定当前不过（最小复：泛型 fn 返回的闭包体内 `case Option.Some(v)`
+// 报「变量 'v' 未入作用域」）；表域可用 tbl_cat 或两段 collect 拼接。
+
+// 消费：拉空成表。
+pub func stream_collect<T>(it: fn() -> Option<T>) -> table<T> {
+    var out: table<T> = []
+    var go: bool = true
+    while go {
+        var m = it()
+        switch m {
+            case Option.None:
+                go = false
+            case Option.Some(v):
+                table_push(out, v)
+        }
+    }
+    return out
+}
+
+// 消费：逐元素应用（数据作末参：`it -> stream_each(f)`）。
+pub func stream_each<T>(f: fn(T), it: fn() -> Option<T>) {
+    var go: bool = true
+    while go {
+        var m = it()
+        switch m {
+            case Option.None:
+                go = false
+            case Option.Some(v):
+                f(v)
+        }
+    }
+}
+
+// ---- 6.11 迭代器适配（2026-10-13 落地，急求值版）----
+// 语义：逐元素变换/过滤/截取，返回新表；可直接接箭头链。惰性流式留待迭代器
+// 句柄引入后演进（接口不变）。
+
+// 逐元素变换，产出 f(元素)。数据作末参：`xs -> iter_map(f)`。
+pub func iter_map<T, U>(f: fn(T) -> U, xs: table<T>) -> table<U> {
+    var out: table<U> = []
+    var i: i64 = 0
+    while i < len(xs) {
+        table_push(out, f(xs[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// 保留判定为真的元素。数据作末参：`xs -> iter_filter(p)`。
+pub func iter_filter<T>(p: fn(T) -> bool, xs: table<T>) -> table<T> {
+    var out: table<T> = []
+    var i: i64 = 0
+    while i < len(xs) {
+        if p(xs[i]) {
+            table_push(out, xs[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 取前 n 个元素（不足则全取）。数据作末参：`xs -> iter_take(n)`。
+pub func iter_take<T>(n: i64, xs: table<T>) -> table<T> {
+    var out: table<T> = []
+    var i: i64 = 0
+    while i < len(xs) && i < n {
+        table_push(out, xs[i])
+        i = i + 1
+    }
+    return out
+}
+
+// 两路并读，产出 (a_i, b_i) 元组，短者取尽即止。
+pub func iter_zip<A, B>(a: table<A>, b: table<B>) -> table<(A, B)> {
+    var out: table<(A, B)> = []
+    var n = len(a)
+    if len(b) < n {
+        n = len(b)
+    }
+    var i: i64 = 0
+    while i < n {
+        table_push(out, (a[i], b[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// 先后串接两路元素（同 tbl_cat 语义；管道读出更顺）。
+pub func iter_chain<T>(a: table<T>, b: table<T>) -> table<T> {
+    return tbl_cat(a, b)
+}
+
+// 按键分组（key 返回字符串键；返回 map<table<T>>，键序按 map_keys 升序）。
+// 数据作末参：`xs -> seq_group_by(k -> k.city)`。
+pub func seq_group_by<T>(key: fn(T) -> string, t: table<T>) -> map<table<T>> {
+    var out: map<table<T>> = {}
+    var n = len(t)
+    var i: i64 = 0
+    while i < n {
+        var k = key(t[i])
+        if map_contains(out, k) {
+            // COW 惯用法：读出的值表可能因共享被复制，push 后必须**回写**，
+            // 否则复制体丢弃、分组表只留最后一笔（COW 陷阱实测）。
+            var cur = out[k]
+            table_push(cur, t[i])
+            out[k] = cur
+        } else {
+            var nt: table<T> = []
+            table_push(nt, t[i])
+            out[k] = nt
+        }
+        i = i + 1
+    }
+    return out
+}
+
+}
+
+
+
+

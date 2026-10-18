@@ -1,0 +1,647 @@
+type tie<class>
+// compiler/interp/interp_p3.tie —— 分片 3（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 interp.tie。
+// table_push 特判用的惰性 nid（p.9.17.3 后半；namespace 外——tie 全局必须顶层）。
+var tp_nid: i64 = -1;
+var tp_nid_ready: bool = false;
+
+namespace tiep {
+// 函数调用（Call 节点）：name=函数名，children=实参...
+func gen_call(id: i64) -> Value {
+    // p.9.17.3 后半：热入口直传 interned id（免 nname_str 构造；名字只在
+    // ns 前缀补全 / 错误文本等冷分支经 interner.lookup 还原）。
+    var nid = isess.nname(id)
+    // table_push 需要**原地修改**表变量（值按值传参无法写回），
+    // 故特判：直接对变量做 push 并写回（对齐 Rust eval_table_push）。
+    // nid 比较惰性初始化一次（同 is_builtin_nid 手法；tie 全局在 namespace 外）。
+    if tp_nid_ready == false {
+        tp_nid = interner.intern("table_push")
+        tp_nid_ready = true
+    }
+    if nid == tp_nid {
+        return eval_table_push(id)
+    }
+    var arg_nodes: table<i64> = table_new_i64()
+    var args: table<Value> = {}
+    // 泛型槽偏移：Call children[0] = 类型实参槽（-1 哨兵或 N_TYPE_ARGS），
+    // 实参从 children[slot_off] 起（对齐 sstate.slot_off——曾把 -1 槽当实参
+    // 求值，导致 len(x)/println 多收一个哑参：`len 需要一个参数`、`0hi`）。
+    var soff: i64 = 0
+    if isess.nchild(id) > 0 {
+        var c0 = isess.nchild_at(id, 0)
+        if c0 < 0 {
+            soff = 1  // -1 哨兵：泛型槽存在但为空
+        } else if isess.ntag(c0) == N_TYPE_ARGS || isess.ntag(c0) == N_TYPE_PARAMS {
+            soff = 1
+        }
+    }
+    var i: i64 = soff
+    while i < isess.nchild(id) {
+        var a = isess.nchild_at(id, i)
+        table_push(arg_nodes, a)
+        var v = gen_expr(a)
+        if w_err != "" {
+            return Value.Nil
+        }
+        table_push(args, v)
+        i = i + 1
+    }
+    // 裸调用名解析：先查裸名（顶层/内置函数），查不到则按当前命名空间
+    // 前缀补全（命名空间内函数互调，如 tcmsg::error 内 helper()）。
+    // nid 版：f/e/m 三表整数键查询，ns 补全的拼接全名 intern 一次。
+    var resolved_nid = nid
+    if !isess.f_has_nid(nid) {
+        var cn = len(env_ns)
+        if cn > 0 {
+            var full = ns_join(env_ns, interner.lookup(nid))
+            var fnid = interner.intern(full)
+            if isess.f_has_nid(fnid) {
+                resolved_nid = fnid
+            }
+        }
+    }
+    // T0.7 extern 调用检查：extern 是链接期符号，解释器无实现体
+    if isess.e_has_nid(resolved_nid) {
+        w_err = "REPL 不支持调用 extern 函数 '" + interner.lookup(resolved_nid) +
+            "'（仅编译路径可用，请用 tie-llvm 编译运行）"
+        return Value.Nil
+    }
+    // S3.3 宏调用（宏体内调用宏 / 展开调用）：实参必须已是 code 值——
+    // 实参表达式先求值（`$x` 插值 = 读取 x 的 code 值；准引用 = code 值；
+    // 其他表达式 → 报错），再执行宏函数，结果 code 文本还原为值。
+    if isess.m_has_nid(resolved_nid) {
+        var resolved = interner.lookup(resolved_nid)
+        var macro_args: table<string> = table_new_string()
+        var ai: i64 = 0
+        while ai < len(args) {
+            if vval.type_of(args[ai]) != W_CODE {
+                w_err = "宏 '" + resolved + "' 的实参必须是 code 值（准引用或插值），实际是 " +
+                    vval.type_name(args[ai])
+                return Value.Nil
+            }
+            table_push(macro_args, vval.code_str(args[ai]))
+            ai = ai + 1
+        }
+        var r = eval_macro(resolved, macro_args)
+        if w_err != "" {
+            return Value.Nil
+        }
+        return vval.new_code(r)
+    }
+    return call_fn_nid(resolved_nid, args, arg_nodes)
+}
+
+// 动态表追加：`table_push(t, x)`——对表变量 t 原地 push 元素 x 并写回。
+func eval_table_push(id: i64) -> Value {
+    // 泛型槽偏移（Call children[0] = 类型实参槽 -1 哨兵；实参从 soff 起）
+    var soff: i64 = 0
+    if isess.nchild(id) > 0 {
+        if isess.nchild_at(id, 0) < 0 {
+            soff = 1
+        }
+    }
+    if isess.nchild(id) != soff + 2 {
+        w_err = "table_push 需要表与元素参数"
+        return Value.Nil
+    }
+    var tname_node = isess.nchild_at(id, soff)
+    if isess.ntag(tname_node) != N_VAR {
+        w_err = "table_push 的第 1 个参数必须是表变量"
+        return Value.Nil
+    }
+    var nm = isess.nname_str(tname_node)
+    var val = gen_expr(isess.nchild_at(id, soff + 1))
+    if w_err != "" {
+        return Value.Nil
+    }
+    var cur = isess.lookup(nm)
+    if w_err != "" {
+        // lookup miss 已置同文本错误（变量未声明）
+        return Value.Nil
+    }
+    if vval.type_of(cur) != W_TABLE {
+        w_err = "table_push 的第 1 个参数必须是表"
+        return Value.Nil
+    }
+    var nt = vval.table_push_val(cur, val)
+    if isess.assign(nm, nt) < 0 {
+        return Value.Nil
+    }
+    return vval.new_void()
+}
+
+// 命名空间函数调用（MethodCall）：receiver 是路径/未绑定 Var/FieldAccess 链。
+// 泛型槽（2026-08-14）：children = [类型实参槽, 接收者, 实参...]，须先偏移。
+func gen_method_call(id: i64) -> Value {
+    var soff: i64 = 0
+    if isess.nchild(id) > 0 {
+        var c0 = isess.nchild_at(id, 0)
+        if c0 < 0 {
+            soff = 1
+        } else if isess.ntag(c0) == N_TYPE_ARGS || isess.ntag(c0) == N_TYPE_PARAMS {
+            soff = 1
+        }
+    }
+    var receiver = isess.nchild_at(id, soff)
+    var method = isess.nname_str(id)
+    // 字符串码点迭代器 `s.chars()`（dev33 批次4）：REPL 求值为接收者字符串
+    // 自身（for-in 场景由 exec_stmt_for 的 W_STR 分支按码点遍历；非 for 场景
+    // 表达式求值为原串亦可）。无实参校验。
+    if method == "chars" {
+        var rv = gen_expr(receiver)
+        if w_err != "" {
+            return Value.Nil
+        }
+        if vval.type_of(rv) != W_STR {
+            w_err = ".chars() 只能作用于字符串（实际是 " + vval.type_name(rv) + "）"
+            return Value.Nil
+        }
+        if isess.nchild(id) != soff + 1 {
+            w_err = "字符串迭代器 s.chars() 不接受实参"
+            return Value.Nil
+        }
+        return rv
+    }
+    // S3.3 C2 thunk：code 值 `.call()` —— 编译期执行该代码块（惰性 thunk，
+    // 宏体内用；运行期无 code 值）。接收者先求值，code 值 → exec_code_proto。
+    if method == "call" {
+        var rv = gen_expr(receiver)
+        if w_err != "" {
+            return Value.Nil
+        }
+        if vval.type_of(rv) == W_CODE {
+            // 实参必须为空（call() 无参；第一版）
+            var ai: i64 = soff + 1
+            while ai < isess.nchild(id) {
+                ai = ai + 1
+            }
+            if isess.nchild(id) != soff + 1 {
+                w_err = "code 值 .call() 不接受参数（第一版）"
+                return Value.Nil
+            }
+            var r = exec_code_proto(vval.code_str(rv))
+            if w_err != "" {
+                return Value.Nil
+            }
+            return r
+        }
+        w_err = ".call() 只能作用于 code 值（实际是 " + vval.type_name(rv) + "）"
+        return Value.Nil
+    }
+    var prefix = ns_prefix_of_receiver(receiver)
+    if prefix == "" {
+        w_err = "REPL v1 暂不支持 struct 方法调用"
+        return Value.Nil
+    }
+    var full = prefix + "::" + method
+    var arg_nodes: table<i64> = table_new_i64()
+    var args: table<Value> = {}
+    var i: i64 = soff + 1
+    while i < isess.nchild(id) {
+        var a = isess.nchild_at(id, i)
+        table_push(arg_nodes, a)
+        var v = gen_expr(a)
+        if w_err != "" {
+            return Value.Nil
+        }
+        table_push(args, v)
+        i = i + 1
+    }
+    return call_fn_nid(interner.intern(full), args, arg_nodes)
+}
+
+// receiver 命名空间前缀判定：Path / 未绑定 Var / FieldAccess 链 → 前缀段。
+// 未命中返回 ""（走 struct 方法调用错误路径）。
+func ns_prefix_of_receiver(receiver: i64) -> string {
+    var rt = isess.ntag(receiver)
+    if rt == N_PATH {
+        // 路径节点：children 全是 Segment
+        var segs = path_segs(receiver)
+        if has_ns_prefix(segs) {
+            return seg_join(segs)
+        }
+        return ""
+    }
+    // FieldAccess 链 / 未绑定 Var：递归拍平，存在该前缀的命名空间函数
+    // 即视为命名空间调用（对齐 Rust ns_segments + has_ns_prefix）
+    if ns_segments(receiver) {
+        if has_ns_prefix(g_ns_segs) {
+            return seg_join(g_ns_segs)
+        }
+    }
+    return ""
+}
+
+// 递归拍平命名空间链（FieldAccess/Var）为段表；条件：每个标识符都未声明。
+// 结果写入全局 g_ns_segs；成功返回 true。
+func ns_segments(id: i64) -> bool {
+    var t = isess.ntag(id)
+    if t == N_VAR {
+        var nm = isess.nname_str(id)
+        if !isess.var_declared(nm) {
+            g_ns_segs = table_new_string()
+            table_push(g_ns_segs, nm)
+            return true
+        }
+        return false
+    }
+    if t == N_FIELD_ACCESS {
+        // 基址 + 字段名（children=[基址]）
+        var base = isess.nchild_at(id, 0)
+        if ns_segments(base) {
+            table_push(g_ns_segs, isess.nname_str(id))
+            return true
+        }
+        return false
+    }
+    return false
+}
+
+// 命名空间前缀存在判定：funcs 中是否存在以 `路径段::` 开头的函数键。
+func has_ns_prefix(segs: table<string>) -> bool {
+    var pre = seg_join(segs) + "::"
+    var i: i64 = 0
+    while i < len(f_keys) {
+        if has_str_prefix(f_keys[i], pre) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Path 节点 → 段表（children 全为 Segment，name=段名池 id）。
+func path_segs(id: i64) -> table<string> {
+    var out: table<string> = table_new_string()
+    var i: i64 = 0
+    while i < isess.nchild(id) {
+        table_push(out, isess.nname_str(isess.nchild_at(id, i)))
+        i = i + 1
+    }
+    return out
+}
+
+// Path 节点 → "a::b" 文本（错误提示用）。
+func path_text(id: i64) -> string {
+    return seg_join(path_segs(id))
+}
+
+// 段表 → "a::b"（空表 → ""）。
+func seg_join(segs: table<string>) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < len(segs) {
+        out = out + segs[i]
+        if i + 1 < len(segs) {
+            out = out + "::"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 前缀段 + 名字 → 全名（"a","b" + "f" → "a::b::f"）。
+func ns_join(segs: table<string>, name: string) -> string {
+    var pre = seg_join(segs)
+    if pre == "" {
+        return name
+    }
+    return pre + "::" + name
+}
+
+// 两段表拼接（外层前缀 + 内层命名空间段）。
+func ns_merge(outer: table<string>, inner: table<string>) -> table<string> {
+    var out: table<string> = table_new_string()
+    var i: i64 = 0
+    while i < len(outer) {
+        table_push(out, outer[i])
+        i = i + 1
+    }
+    var j: i64 = 0
+    while j < len(inner) {
+        table_push(out, inner[j])
+        j = j + 1
+    }
+    return out
+}
+
+// 表字面量：纯位置表（无字符串键）→ Value::Table；带字符串键 → 键值表。
+func gen_table_lit(id: i64) -> Value {
+    var nc = isess.nchild(id)
+    // 是否存在字符串键（TableCell 的 TableId 名字字段 >= 0）。
+    // 注意：tie 的 && 不短路，必须嵌套 if 防 ntag(-1) 越界
+    var has_str: bool = false
+    var i: i64 = 0
+    while i < nc {
+        var cell = isess.nchild_at(id, i)
+        var tid = isess.nchild_at(cell, 0)
+        if tid >= 0 {
+            if isess.ntag(tid) == N_TABLE_ID {
+                if isess.nname(tid) >= 0 {
+                    has_str = true
+                }
+            }
+        }
+        i = i + 1
+    }
+    if has_str {
+        // 键值表：全部元素必须带字符串键（对齐 Rust 错误文本）
+        var m = vval.new_map()
+        var j: i64 = 0
+        while j < nc {
+            var cell = isess.nchild_at(id, j)
+            var tid = isess.nchild_at(cell, 0)
+            if tid < 0 {
+                w_err = "键值表元素必须全部带字符串键"
+                return Value.Nil
+            }
+            if isess.ntag(tid) != N_TABLE_ID {
+                w_err = "键值表元素必须全部带字符串键"
+                return Value.Nil
+            }
+            if isess.nname(tid) < 0 {
+                w_err = "键值表元素必须全部带字符串键"
+                return Value.Nil
+            }
+            var key_id = interner.intern(vval.unescape_str(interner.lookup(isess.nname(tid))))
+            var v = gen_expr(isess.nchild_at(cell, 1))
+            if w_err != "" {
+                return Value.Nil
+            }
+            // map_set：新节点调用方建 + 键走全局槽 + 值走参数（缓冲 bug 规避）
+            w_ms_key = key_id
+            var nm = vval.new_map()
+            m = vval.map_set(nm, m, v)
+            j = j + 1
+        }
+        return m
+    }
+    // 纯位置表：逐元素求值（对齐 Rust TableLit 路径）
+    var t = vval.new_table()
+    var k: i64 = 0
+    while k < nc {
+        var cell = isess.nchild_at(id, k)
+        var v = gen_expr(isess.nchild_at(cell, 1))
+        if w_err != "" {
+            return Value.Nil
+        }
+        t = vval.table_push_val(t, v)
+        k = k + 1
+    }
+    return t
+}
+
+// 下标读取：表 t[i] / 键值表 m["k"]（对齐 Rust eval_expr Index 分支）。
+func eval_index(b: Value, i: Value) -> Value {
+    var bt = vval.type_of(b)
+    var it = vval.type_of(i)
+    if bt == W_MAP {
+        if it == W_STR {
+            return vval.map_get(b, interner.intern(vval.str_val(i)))
+        }
+        w_err = "键值表下标必须是字符串键"
+        return Value.Nil
+    }
+    if it == W_INT {
+        if bt == W_TABLE {
+            var idx = vval.int_val(i)
+            var cnt = vval.elem_count(b)
+            if idx < 0 || idx >= cnt {
+                w_err = "运行时错误: 下标越界：索引 " + to_string(idx) + " 超出长度 " +
+                    to_string(cnt)
+                return Value.Nil
+            }
+            return vval.elem_at(b, idx)
+        }
+        w_err = "下标访问仅支持表"
+        return Value.Nil
+    }
+    w_err = "下标访问仅支持表或键值表"
+    return Value.Nil
+}
+
+// 字符串字节数（len(字符串) 语义；对齐 Rust s.len()）。
+func byte_len(s: string) -> i64 {
+    var n: i64 = 0
+    var i: i64 = 0
+    var m = str_len(s)
+    while i < m {
+        var c = str_char(s, i)
+        var cp = char_code(c)
+        if cp < 128 {
+            n = n + 1
+        } else if cp < 2048 {
+            n = n + 2
+        } else if cp < 65536 {
+            n = n + 3
+        } else {
+            n = n + 4
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// 字符串前缀判定。
+func has_str_prefix(s: string, pre: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(pre)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 查找最后一个 "::" 的位置（命名空间分隔；返回 ':' 下标，-1 = 无）。
+func rfind_ns_str(s: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    var last: i64 = -1
+    while i + 1 < n {
+        if str_char(s, i) == ":" {
+            if str_char(s, i + 1) == ":" {
+                last = i
+            }
+        }
+        i = i + 1
+    }
+    return last
+}
+
+// 全名 → 命名空间前缀段（"a::b::f" → ["a","b"]）。
+func ns_prefix_of_name(name: string) -> table<string> {
+    var out: table<string> = table_new_string()
+    var n = str_len(name)
+    var seg_start: i64 = 0
+    var i: i64 = 0
+    while i + 1 < n {
+        if str_char(name, i) == ":" {
+            if str_char(name, i + 1) == ":" {
+                table_push(out, slice_str(name, seg_start, i))
+                seg_start = i + 2
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// 子串 s[start, end)。
+func slice_str(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+// break/continue 标签文本（对齐 Rust `l.map(|x| format!(" {x} "))`）：
+// 无标签 → " "；有标签 L → " L "。
+func label_space(label: string) -> string {
+    if label == "" {
+        return " "
+    }
+    return " " + label + " "
+}
+
+// "ERR:<line> <col> <msg>" → "<cat> @<line>:<col>: <msg>"（对齐 Rust Display）。
+func fmt_err(e: string, cat: string) -> string {
+    var body = slice_str(e, 4, str_len(e))  // 去 "ERR:" 前缀
+    var sp1 = find_char(body, " ")
+    var line: string = ""
+    var rest: string = ""
+    if sp1 >= 0 {
+        line = slice_str(body, 0, sp1)
+        rest = slice_str(body, sp1 + 1, str_len(body))
+    } else {
+        line = body
+    }
+    var sp2 = find_char(rest, " ")
+    var col: string = ""
+    var msg: string = ""
+    if sp2 >= 0 {
+        col = slice_str(rest, 0, sp2)
+        msg = slice_str(rest, sp2 + 1, str_len(rest))
+    } else {
+        col = rest
+    }
+    return cat + " @" + line + ":" + col + ": " + msg
+}
+
+// 找第一个指定字符下标（-1 = 无）。
+func find_char(s: string, c: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 找包装程序里的 main 函数节点（根 StmtList 的 FnDef 子节点）。
+func find_main() -> i64 {
+    var i: i64 = 0
+    while i < isess.nchild(a_root) {
+        var s = isess.nchild_at(a_root, i)
+        if isess.ntag(s) == N_FN_DEF && isess.nname_str(s) == "main" {
+            return s
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 整数文本自检（对齐 Rust str::parse::<i64>：可选符号 + 纯数字）。
+func is_int_text(s: string) -> bool {
+    var n = str_len(s)
+    if n == 0 {
+        return false
+    }
+    var i: i64 = 0
+    var c0 = str_char(s, 0)
+    if c0 == "-" || c0 == "+" {
+        i = 1
+        if n == 1 {
+            return false
+        }
+    }
+    while i < n {
+        var cc = char_code(str_char(s, i))
+        if cc < 48 || cc > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 浮点文本自检（十进制/科学计数法子集；覆盖验收用例，含 inf/nan 之外的
+// 常规形式。对齐 Rust str::parse::<f64> 的常见文法）。
+func is_float_text(s: string) -> bool {
+    var n = str_len(s)
+    if n == 0 {
+        return false
+    }
+    var i: i64 = 0
+    var c0 = str_char(s, 0)
+    if c0 == "-" || c0 == "+" {
+        i = 1
+    }
+    if i >= n {
+        return false
+    }
+    var seen_digit: bool = false
+    var seen_dot: bool = false
+    var seen_exp: bool = false
+    while i < n {
+        var c = str_char(s, i)
+        var cc = char_code(c)
+        if cc >= 48 && cc <= 57 {
+            seen_digit = true
+            i = i + 1
+        } else if c == "." && !seen_dot && !seen_exp {
+            seen_dot = true
+            i = i + 1
+        } else if (c == "e" || c == "E") && !seen_exp && seen_digit {
+            seen_exp = true
+            i = i + 1
+            // 指数符号可选；指数必须至少一位数字
+            if i < n {
+                var ec = str_char(s, i)
+                if ec == "-" || ec == "+" {
+                    i = i + 1
+                }
+            }
+            if i >= n {
+                return false
+            }
+            var cc2 = char_code(str_char(s, i))
+            if cc2 < 48 || cc2 > 57 {
+                return false
+            }
+        } else {
+            return false
+        }
+    }
+    return seen_digit
+}
+
+}

@@ -1,0 +1,759 @@
+type tie<class>
+// compiler/backend/irgen.tie —— 自举 v2 T2.8：AST → tie-IR 生成器
+// ============================================================
+// 里程碑：自举 v2 计划 T2.8（.omo/plans/self-hosting-v2.md）后端 LLVM IR
+// 文本生成器。本文件 = AST 协议文本 → tie-IR 列式表（ir.tie 消费）。
+// 最小可行集：函数定义/参数/局部变量/算术/比较/if/for 范围/println/print/
+// return。未支持语句返回 -1（后续迭代扩展）。
+// 依赖：./../frontend/semantic.tie（check_src 填 AST + 类型表；sstate/types/
+// interner 经其 import 树传递可达）。llvmgen 不再由本文件引入——p.9.21 G3
+// 收口 irgen→llvmgen 反向依赖：改由 driver 侧显式 import 并在注入编译目标时
+// 同步调用 llvmgen.set_linux，irgen 不再持有后端引用。
+import "./../frontend/semantic.tie"
+import "./../frontend/consteval.tie"
+import "./rt_abi.tie"
+import "./irgen_str.tie"
+import "./irgen_vtable.tie"
+import "./irgen_closure.tie"
+import "./irgen_lit.tie"
+import "./irgen_builder.tie"
+
+import "./irgen_arith.tie"
+import "./irgen_expr.tie"
+import "./irgen_stmt.tie"
+import "./irgen_agg.tie"
+import "./irgen_call.tie"
+import "./irgen_rt.tie"
+import "./irgen_regex.tie"
+import "./irgen_path.tie"
+import "./irgen_bi_dyn.tie"
+import "./irgen_bi_mem.tie"
+import "./irgen_bi_msg.tie"
+import "./irgen_bi_num.tie"
+import "./irgen_bi_str.tie"
+import "./irgen_bi_sys.tie"
+import "./irgen_bi_trm.tie"
+import "./irgen_archive.tie"
+import "./irgen_esc.tie"
+import "./irgen_bits.tie"
+import "./irgen_conv.tie"
+import "./irgen_dir.tie"
+import "./irgen_dispatch.tie"
+import "./irgen_fs.tie"
+import "./irgen_http.tie"
+import "./irgen_huff.tie"
+import "./irgen_inflate.tie"
+import "./irgen_msgrt.tie"
+import "./irgen_net.tie"
+import "./irgen_netudp.tie"
+import "./irgen_console.tie"
+import "./irgen_proc.tie"
+import "./irgen_stdio.tie"
+import "./irgen_strutil.tie"
+import "./irgen_switch.tie"
+// ==================== 生成器状态 ====================
+// 变量作用域：变量名池 id → (alloca 值 id, 类型 id)（线性表，作用域小）。
+// **作用域栈**：g_sc_top 为逻辑栈顶游标（tie 表无法截断，用游标模拟 pop，
+// 与 sstate 的 lp_top/ns_top 同款）。函数/块（if/while/for/switch 体）进入
+// 时 push（记录当前长度），退出时 pop（游标回退）——同名变量遮蔽 + 跨块
+// 不串用。scope_put/scope_get 只查 [0, g_sc_top) 区间。
+pub var g_sc_keys: table<i64>;
+pub var g_sc_allocas: table<i64>;
+pub var g_sc_tys: table<i64>;
+pub var g_sc_top: i64 = 0;
+// 循环上下文栈（break → exit 块、continue → 条件/步进块）：最近循环在栈顶。
+// 并行表：标签池 id（-1 = 无标签）、break 块、continue 块、栈顶游标。
+pub var g_lp_labels: table<i64>;
+pub var g_lp_breaks: table<i64>;
+pub var g_lp_cont: table<i64>;
+pub var g_lp_top: i64 = 0;
+// 三期 goto 标签表（§7.1.5，函数级）：标签名池 id → 目标基本块 id。
+// 语义层已做 R1/R2/R3 校验；irgen 按标签表生成 br 目标块。
+pub var g_gt_names: table<i64>;
+pub var g_gt_blks: table<i64>;
+// p.9.11.4 defer 资源释放（编译期注册表 + 出口 LIFO 发射）：
+//   g_def_bodies/g_def_flags/g_def_scopes —— defer 体节点 id / 运行时标志 alloca
+//   / 注册作用域（0 函数体，>0 循环嵌套层，对齐 g_lp_top）；
+//   g_def_cnt —— 已注册计数；g_def_sc_cnt —— （保留）作用域计数；
+//   g_block_lvl —— tig_block_stmts 嵌套深度；g_in_fn_body —— 命名函数体标记。
+pub var g_def_bodies: table<i64>;
+pub var g_def_flags: table<i64>;
+pub var g_def_scopes: table<i64>;
+pub var g_def_cnt: i64 = 0;
+var g_def_sc_cnt: i64 = 0;
+pub var g_block_lvl: i64 = 0;
+pub var g_in_fn_body: i64 = 0;
+// 字符串常量收集（池 id → 全局序号）；llvmgen 生成 @.str.N
+pub var g_str_keys: table<i64>;
+pub var g_str_count: i64 = 0;
+// 当前函数/块（生成中）
+pub var g_cur_func: i64 = 0;
+pub var g_cur_block: i64 = 0;
+// 参数区是否已输出（entry 顶部）
+var g_params_done: bool = false;
+// 阶段 A：程序是否使用了 tie-interp 库桥（file_*/regex_*/exec_output 等 Rust 桥）。
+// 置位后 driver 链接 tie_interp.lib（Rust 桥）。exec_code/get_env/time_now 已
+// 内联到 libc（runtime.a 退役），不再置位本标志。
+pub var g_used_interp: bool = false;
+// trm-lite 阶段1块2：程序是否使用了轻量执行体内置（spawn/yield/collect）。
+// 置位后 driver 链接 trm_lite.a（Go 式静态内置运行时；TIE_TRM_LITE_LIB 定位）。
+pub var g_used_trmlite: bool = false;
+// 并发缺席（driver 注入，见 pipeline.no_concurrency / set_noconc）：可执行产物 +
+// 非动态库 + 单元内无 spawn（三条件全满足）⇒ 无第二个执行流可达任何表 ⇒ 表读写
+// 免锁（与 esc 逐变量独占证明互补，二者任一即够）。
+// ★ 误置会把数据竞争带回来：driver 侧按「存疑即关」注入，且缓存键须织入本标志。
+pub var g_noconc: bool = false;
+// r.1.1.3：全局表字面量初值记录（表全局 + 非空表字面量）——
+// 并行表：全局名池 id ↔ 初始化 AST 节点 id（main 入口创建后 tig_table_lit
+// 整体构造，含逐元素 push）。空表/无初值不入表（main 建空表既有路径）。
+pub var g_ginit_names: table<i64>;
+pub var g_ginit_nodes: table<i64>;
+// 2026-10-13 聚合全局（struct/enum）初值物化：无法静态折叠（构造器/调用形态）的
+// 初值节点在 main 入口（--shared 走 tie$rt_init）逐条求值存回 @g。槽已由
+// llvmgen 以 `@g = global %agg zeroinitializer` 就位，本段只补运行期赋值。
+pub var g_agginit_names: table<i64>;
+pub var g_agginit_nodes: table<i64>;
+pub var g_agginit_tys: table<i64>;
+// p.6.4.5：程序是否使用了网络原语（net_* 内联 Winsock2 直调）。置位后
+// driver 链接 ws2_32（-lws2_32）；脱离 tie_interp 后独立链，净程序无需桥。
+pub var g_used_wsock: bool = false;
+// p.6.4.7 消息系统（msg_* 纯 tie 内联）：模块级惰性登记标记——运行期程序全局槽
+// （@__msg_lang / @__msg_keys / @__msg_langs / @__msg_texts）首次 msg_* 调用时登记
+// 一次（tig_ast/tig_src 每模块重置；实现见 irgen_expr.tie tig_msg_* 系列）。
+pub var g_msg_reg_done: i64 = 0;
+// p.6.4.10 rand_range 64 位 LCG：模块级惰性登记标记——运行期程序全局槽 @__rng_state
+//（i64，存 LCG 状态，首次 rand_range 调用时登记一次；tig_ast/tig_src 每模块重置；
+// 实现见 irgen_expr.tie tig_rng_reg）。状态存运行期全局，兼容「编译器给用户程序建
+// 全局变量」约定，脱离 tie_interp 桥（g_used_interp 不置位）。
+pub var g_rng_reg_done: i64 = 0;
+// M5 动态库模式（dev33 批次 12）：driver 在 tig_ast 前经 set_dynlib 注入。
+// 置位后 irgen 登记导出面（ir.func_exported）供 llvmgen 输出 dllexport，
+// 并对导出函数做边界检查（表/struct 不跨动态库边界）。
+pub var g_dynlib: bool = false;
+// --dll-export 导出白名单（driver 经 set_dll_export 注入；空 = 不过滤）。
+pub var g_dll_export: string = "";
+// S1.4 --check-bounds：数组越界检查（默认关；driver 经 set_check_bounds 注入）。
+pub var g_check_bounds: bool = false;
+// 当前编译目标三元组（driver 在 tig_ast 前经 set_target 注入；空 = 未设置）。
+// 任务17 asm! 平台条件编译：target("arch") 按此目标匹配。
+pub var g_asm_target: string = "";
+// 当前函数的**全名**（命名空间函数含 "::"，如 sstate::child）——调用名解析
+// 需要当前命名空间前缀补全（对齐 sinfer.resolve_call_name 的候选 2）。
+pub var g_cur_fn_name: string = "";
+// 当前函数返回类型 id（Return 的 BoolLit 适配 trit 用：`return false` 在返回
+// trit 的函数里生成 i8 而非 i1）
+pub var g_cur_ret_ty: i64 = 0;
+// p.9.11.15 生成器（yield）IR 上下文：当前函数为生成器时 g_gen_tbl = 产出表
+// 句柄的 alloca 槽（ptr 值），g_gen_elem = 产出元素 LLVM 类型 id（表 push 槽
+// 类型）。非生成器函数 g_gen_tbl = -1。tig_fn_def 按 sstate.is_gen 设置/复位。
+pub var g_gen_tbl: i64 = -1;
+pub var g_gen_elem: i64 = -1;
+// p.6.4.8 正则引擎（irgen_regex.tie）：编译期解析状态 + 生成期上下文。
+// 解析状态（rx_compile 期间）：
+pub var g_rx_u: i64 = 0;             // 模块唯一块名后缀
+pub var g_rx_pstr: string = "";      // 当前 pattern
+pub var g_rx_plen: i64 = 0;          // pattern 字节长
+pub var g_rx_ppos: i64 = 0;          // 解析游标
+pub var g_rx_prog: table<i64>;       // 编译产物：指令程序
+pub var g_rx_cls: table<i64>;        // 编译产物：字符类位集（每类 4×i64）
+pub var g_rx_ngroups: i64 = 0;       // 捕获组数
+pub var g_rx_ingrp: i64 = 0;         // 分组深度（0=顶层；>0 时 ')' 终止 seq）
+pub var g_rx_ok: bool = true;        // 解析成功标志
+// 生成期上下文（tig_regex_* 生成 IR 期间）：
+pub var g_rx_s: i64 = 0;             // 输入串 IR 值
+pub var g_rx_slen: i64 = 0;          // 输入串长度 IR 值
+pub var g_rx_nsl: i64 = 0;           // 捕获槽数 = 2*(ngroups+1)
+pub var g_rx_rprog: i64 = 0;         // 运行时 prog 表句柄 IR 值
+pub var g_rx_rcls: i64 = 0;          // 运行时 clsbits 表句柄 IR 值
+pub var g_rx_okptr: i64 = 0;         // table_at 出参 alloca i8
+pub var g_rx_posa: i64 = 0;          // 匹配位置 alloca
+pub var g_rx_pcsa: i64 = 0;          // 程序计数器 alloca
+pub var g_rx_spa: i64 = 0;           // 搜索起点 alloca
+pub var g_rx_enda: i64 = 0;          // 匹配终点 alloca
+pub var g_rx_slotsv: i64 = 0;        // 本次匹配尝试的捕获槽表句柄（SSA 值）
+// 表变量元素类型表（函数级）：变量名池 id → 元素类型 id。语义层 lv_telem
+// 是 per-function 且在 irgen 阶段已过期（只可靠查到最后一个函数），跨函数
+// 场景（exmath::parse_series 里 table_push(result, parse_float(...))）必须由
+// irgen 自己登记 table_new_f64()/table<T> 变量的元素类型。
+pub var g_tv_keys: table<i64>;
+pub var g_tv_elems: table<i64>;
+// r.1.6.7 编译期「独占局部表」逃逸分析：候选表变量（名池 id）与并行存活位。
+// 详见 irgen_esc.tie 头注释（判据 / 泄漏点 / 控制流处理 / 为何必须编译期）。
+pub var g_esc_names: table<i64>;
+pub var g_esc_live: table<i64>;
+pub var g_esc_audit: bool = false;
+pub var g_esc_hits: i64 = 0;
+// esc_scan 递归深度计数（2026-10-03）：逃逸扫描无 visited 集，畸形 AST 会无限
+// 递归爆栈。上限兜底用，正常 AST 深度远小于 4000。
+pub var g_esc_depth: i64 = 0;
+// r.1.6.7 显式 lock 凭据（语法层去锁）：持 `guard<lock>` 凭据的作用域深度。
+// >0 ⇒ 该作用域内所有表访问走免锁入口（开发者显式声明无并发访问，责任归开发者）。
+pub var g_lock_depth: i64 = 0;
+// 凭据路径的去锁命中计数（审计/探针断言用）。
+pub var g_lock_hits: i64 = 0;
+// 文件级授权（`type tie<logic, unsafe:lock>`）：整文件所有函数的 lock 作用域初值。
+pub var g_file_lock: bool = false;
+// p.6.10.3：函数参数表名集合（intern id → 1）——出口析构跳过参数（借用语义，
+// 所有权在调用方）；参数槽被赋值覆盖也不 release（避免收回调用方所有权）。
+pub var g_param_nids: table<i64>;
+// r.1.6.14 值语义过渡开关（TIE_TBL_VALUE=1 开启；默认关＝当前共享语义不变）。
+// 关闭时全部 COW 接线为 no-op ⇒ 逐指令等价，回归可用来证明「没接线坏」。
+pub var g_tbl_value: bool = false;
+pub var g_tbl_value_init: bool = false;
+// `shared` 形参名 id（bit5）——写路径遇到它们**不做 COW**（显式共享＝就地改）。
+// 与 g_param_nids 同生命周期（每编译重置 + 闭包体生成时保存/恢复）。
+pub var g_shared_param_nids: table<i64>;
+// 值语义形参的出口释放候选（r.1.6.14）：入口 retain 过的表形参槽地址。
+// **每函数重置**（否则 B 函数出口会释放 A 函数的形参 ⇒ 双释放）。
+pub var g_ownparam_slots: table<i64>;
+// p.6.10.3：entry 级（函数顶层块创建的）局部表变量 alloca 清单——供函数出口
+// 析构（entry alloca 被任意出口块 load 均满足支配关系；循环/分支内 var 的 alloca
+// 在非 entry 块，排除以避免 LLVM「instruction does not dominate」）。
+pub var g_entry_block: i64 = 0;
+pub var g_tblcand_allocas: table<i64>;
+// r.1.6.13：**聚合（struct）**析构候选——与 g_tblcand_allocas 分离，避免动到表路径
+// （闭包那份会交换 g_tblcand_allocas，混入聚合会牵连）。两表平行：槽地址 + 类型。
+// 出口按类型递归 release 各表字段，与绑定处的 tig_agg_retain_bound 成对。
+pub var g_aggcand_allocas: table<i64>;
+pub var g_aggcand_tys: table<i64>;
+// 闭包 env 释放候选（A 方案，2026-10-02）：初值为**闭包字面量**、且该闭包确有捕获的
+// 局部变量。三张平行表：变量名 id（查 esc 不逃逸）/ fn 值槽地址 / fn 类型 id。
+// 出口按 esc_is_live 判定——未逃逸才发 drop（保守：逃逸者不释放，残余泄漏但安全）。
+pub var g_clov_nids: table<i64>;
+pub var g_clov_slots: table<i64>;
+pub var g_clov_cids: table<i64>;   // 闭包字面量节点 id ⇒ drop 名("drop_"+id) 与 fn 类型(node_types)
+// (b) 静态空闭包 env（2026-10-02）：每函数一份，**单元级缓存**（按函数名），
+// 故不参与按函数的重置——重置会导致同一函数重复生成符号 ⇒ 链接冲突。
+pub var g_eenv_fns: table<i64>;
+pub var g_eenv_refs: table<i64>;
+pub var g_eenv_ready: i64 = 0;
+// p.9.12.6 行池（table<R>，R 为 struct）登记表：name 池 id → 结构化行池。
+// 行池变量降为 R 各字段的平行列（每字段一根 table<fld>）+ 共享行数（各列恒齐平，
+// len 取第 0 列句柄长度）。rp_keys/rp_si/rp_ncol 并行；rp_allocas[r] = 该行池各
+// 字段列 alloca（TK_STR ptr 槽，存列表句柄）。scope 槽存第 0 列 alloca（len 直用）。
+pub var rp_keys: table<i64>;
+pub var rp_si: table<i64>;
+pub var rp_ncol: table<i64>;
+pub var rp_allocas: table<table<i64>>;
+// p.6.1.7-RCA-2【2026-09-06】：tuple **返回**路径需要对表元素 retain 的标记（见
+// irgen_stmt Return / irgen_agg tig_tuple_lit_typed）——返回的元组表元素 retain 后
+// 交给调用方，出口析构减回；普通 tuple 构造不置位。
+pub var g_ret_tup_tbl: i64 = 0;
+// p.6.10.4：非 entry 块（循环/分支）表变量声明的「首次进入」哨兵计数——每个此类
+// 声明唯一分配一个零值全局标志，用于区分首次写槽（槽未初始化，禁止负载）与
+// 回边重写（槽持上一轮表，store 前须 release）。零值全局天然首版为 0，无需入口
+// 初始化（循环内栈槽无法安全置空：alloca 在非 entry 块）。
+pub var g_tf_ctr: i64 = 0;
+// r.1.1.4：loopf 哨兵名按「所在函数名 + 计数」命名（tig_loopvar_release）——
+// 独立编译再静态链接的单元（用户程序 vs trm_lite.a）函数名天然不同，哨兵
+// 名 tl_loopf_<fn>_<n> 互不冲突（LNK2005 多重定义根治），且命名逻辑随源码
+// 确定——种子编译器与自举产物同源同逻辑 → 两轮 --emit-ir 逐字节一致。
+// 顶层全局变量登记：name 池 id → 类型 id / 表元素类型 id（对齐 sstate gb_*，
+// 直接查 gb_keys/gb_vals/gb_telem；此处仅缓存 llvm 初始化需要的标记）。
+// （llvmgen 侧维护 g_global_* 登记表，irgen 仅转发登记。）
+
+// 变量查作用域：命中返回 1 并置 out 参数（tie 无引用返回，用全局槽）
+pub var g_lookup_found: bool = false;
+pub var g_lookup_alloca: i64 = 0;
+pub var g_lookup_ty: i64 = 0;
+// 一期并发 A4：actor 工作循环 thunk（@actor_loop）惰性生成标记（每模块仅一次）
+pub var g_actor_task_gen: i64 = 0;
+// 一期并发 A4：actor dispatch/handler 函数急切生成标记（每模块仅一次）
+pub var g_actor_disp_gen: i64 = 0;
+// p.9.11 `reentrant`：actor 单步处理/嵌套排空函数急切生成标记（与 step+nested
+// 一起每模块仅一次；随 gen_actor_task_eager 末尾一并生成）
+pub var g_actor_step_gen: i64 = 0;
+// p.9.11 `reentrant`（规范 §10.7）：actor 方法 handler 生成期上下文——
+// g_cur_actor_recval = 本方法的 record 指针**值 id**（-1 = 非 actor 方法体）；
+// g_cur_method_reent = 本方法是否标注 reentrant。gen_actor_sync_call 据此在
+// 同步 RPC 等待点生成「嵌套排空」分支（仅本 actor 队列中的异步消息）。
+// ★ per-function 状态：闭包入口生成（tig_closure_entry_fn）须保存/清零/恢复
+//（闭包是独立函数，recp 值 id 跨函数引用会产生 undefined value）。
+pub var g_cur_actor_recval: i64 = -1;
+pub var g_cur_method_reent: bool = false;
+// p.6.7.6：S-pool 常驻 worker（@tie_s_pool_worker）急切生成标记（每模块仅一次）
+pub var g_s_pool_worker_gen: i64 = 0;
+// 阶段 A：变量命中形态（0=本地/1=全局标量/2=全局表，scope_get_global 置位）
+pub var g_lookup_is_global: i64 = 0;
+// 内置调用结果全局槽（builtin_expr 置位；tie 无引用返回）
+pub var g_builtin_res: i64 = 0;
+// 批次5 任务13：用户 extern 名集（顶层 S_N_EXTERN=117，仅声明无函数体）。
+// 稀疏收集（用户程序通常 0~若干；编译器自身 0）→ tig_user_call 判定 extern → 路由
+// op36（llvmgen 推导 declare + 字符串返回自动扫描 char* → {ptr,len}）。
+pub var g_extern_ids: table<i64>;
+pub var g_extern_ready: i64 = 0;
+// p.6.8.2：repr(C) struct 显式 C ABI 布局表（编译期计算，C 自然对齐——每字段按
+// 自身对齐放置、struct 对齐 = 最大成员对齐、总大小向上取整到对齐）。
+//   g_stl_fbase[si] -> g_stl_offs 段起点；g_stl_offs[..] -> 拍平字段绝对字节偏移
+//   g_stl_size[si]  -> struct 总大小；g_stl_align[si] -> struct 对齐；g_stl_done 幂等。
+// 由 irgen_str.agg_ensure_layout 惰性构建（幂等），struct_field_off / struct_align_of 读取。
+pub var g_stl_fbase: table<i64>;
+pub var g_stl_offs: table<i64>;
+pub var g_stl_size: table<i64>;
+pub var g_stl_align: table<i64>;
+pub var g_stl_done: i64 = 0;
+// 循环内字符串自加提升（p.6.1.4 增强）：捕捉 `out = out + x`（循环体内 string
+// 变量自加拼接）→ 自动 StringBuilder 提升（s21_sb_*），根治 O(n²) 无名分配
+// 引起的内存无界增长（str_cat 每次新分配、旧中间串从不释放，tie 无 GC）。
+// 提升期间 out 存储槽不更新（循环内保证无其它引用），循环结束 sb_build 回写。
+// per-函数状态：变量名池 id → sb 句柄值。
+pub var g_sb_keys: table<i64>;
+pub var g_sb_hv: table<i64>;
+// 字节表自加提升（p.6.1.4 增强）：`t = byte_concat(t, seg)` 循环累积 = 每迭代
+// 新建整表 + 旧表永不释放（tie 无 GC）→ O(n²) 无名分配（dpcodec/jcc-pack 内存
+// 无界增长根因，与字符串 str_cat 同族）。提升：循环前拷贝 t 到私有累积表 acc
+// （唯一引用），循环内 byte_concat 自加 → acc 就地追加（ensure+memcpy+set_len，
+// tbl_ensure 内部 free 旧块 → 摊销 O(1)），循环出口把 acc 写回 t 槽。
+// 与原语义（t 最终=全部段顺序拼接）完全等价；旧 t 表只读不写 → 无别名污染。
+pub var g_cbs_keys: table<i64>;   // 提升中变量名池 id（字节表变量）
+pub var g_cbs_acc: table<i64>;    // 平行：私有累积表句柄
+
+namespace irgen {
+
+
+// ==================== 元组 / struct 聚合（M4/P7 扩展）====================
+// 聚合值表示：LLVM 结构体 {T0, T1, ...}——寄存器中是聚合值，变量/参数在
+// alloca 聚合槽。字段读写统一走"取地址 → agg_gep → load/store"。
+// 对齐 Rust ir.rs：元组构造 insertvalue、字段访问 extractvalue/GEP+load 语义
+// 完全一致；tie-IR 用 alloca+store+load 构造聚合值、agg_gep 取字段地址。
+
+
+// ==================== 顶层入口 ====================
+// 生成 tie-IR（AST 已就绪版，driver.tie 主路径专用）：**前置条件**——调用方
+// 必须先执行过 semantic.check_impl（含 parse 的 check_src 等价物），使以下
+// 全局状态完整可用：sstate 全局表（s_tags/s_children/s_lines/...）、
+// g_extra_tops（顶层声明序列，import 已递归展开填充）、node_types/fn_keys
+// （类型/函数签名登记）。driver.frontend() 即满足该条件（parser.parse_src +
+// semantic.check_impl，与 semantic.check_src 内部流程完全等价，AST 与类型表
+// 状态一致）。
+// 本函数**不含**语法/语义检查——只做 生成器状态重置 → 全局变量登记 →
+// 顶层函数/命名空间遍历 生成 tie-IR，省去第二次完整前端执行
+// （parse + import 展开 + 符号表重建）的性能浪费。调用方在 frontend 失败时
+// 已提前返回，故本函数无需再判语义错误。
+// 返回 0 成功 / -1 错误（sm_err_* 已置）。
+// ==================== 批次5 任务13：用户 extern 判定（稀疏 extern 名集） ====================
+// extern 函数仅声明无函数体（顶层 S_N_EXTERN=117，名集 g_extern_ids 见模块头）。
+// tig_user_call 判定 full 是 extern → 路由 op36（llvmgen 推导 declare + 字符串返回
+// 自动扫描 char* → {ptr,len}）。
+
+
+// 注入编译目标（driver 调用：normalize_target(g_target)，空则本机默认）。
+// r.1.6.3 起 Linux main 入口 argc/argv 签名判据由 driver 侧同步注入 llvmgen
+// （见 driver/pipeline.tie kpass_irgen），本模块不再反向调用 llvmgen。
+pub func set_target(t: string) {
+    g_asm_target = t
+}
+
+// 注入动态库模式（driver 在 detect_shared_mode 后调用，M5 dev33 批次 12）。
+// 置位后本模块对每个函数登记导出面（ir.func_export_set）+ 导出边界检查。
+pub func set_dynlib(v: bool) {
+    g_dynlib = v
+}
+
+// 注入动态库导出白名单（逗号分隔的导出名，如 "tiel$check"；空 = 不过滤）。
+pub func set_dll_export(s: string) {
+    g_dll_export = s
+}
+
+// 注入数组越界检查（driver 在 --check-bounds 时调用；默认关）。
+pub func set_check_bounds(v: bool) {
+    g_check_bounds = v
+}
+
+// 注入「并发缺席」判据（driver 在前端完成后注入，判据见 pipeline.no_concurrency：
+// 可执行产物 + 非动态库 + 单元无 spawn）：此时不存在第二个执行流可达**任何**表
+// ⇒ 表读写与「可证独占」同价（免锁）。与 irgen_esc 的逐变量独占分析相互独立：
+// 两者都足以证明无边并发，任一成立即走免锁路径。
+pub func set_noconc(v: bool) {
+    g_noconc = v
+}
+
+// 常驻编译服务：**单元级**复位（一次性 CLI 用不到——每进程只编一个单元）。
+// tig_ast() 开头已复位 sc/lp/str 三族与 ir.new_module()，但**不含**下列跨单元
+// 累加器：不清则第二个单元带着上一个单元的全局初值登记 → 重复 @g 初始化 /
+// 重复定义（与 reset_global_regs 注释里记的「二次登记」同一类故障）。
+pub func unit_reset() {
+    g_ginit_names = table_new_i64()
+    g_ginit_nodes = table_new_i64()
+    g_agginit_names = table_new_i64()
+    g_agginit_nodes = table_new_i64()
+    g_agginit_tys = table_new_i64()
+    // 「惰性一次」的单元级缓存：不清则第二单元直接命中第一单元的形状
+    //（实测 g_stl_done 残留 ⇒ struct_field_off 越界，index 1 / len 1）。
+    g_stl_fbase = table_new_i64()
+    g_stl_offs = table_new_i64()
+    g_stl_size = table_new_i64()
+    g_stl_align = table_new_i64()
+    g_stl_done = 0
+    g_eenv_fns = table_new_i64()
+    g_eenv_refs = table_new_i64()
+    g_eenv_ready = 0
+    g_extern_ids = table_new_i64()
+    g_extern_ready = 0
+    rp_keys = table_new_i64()
+    rp_si = table_new_i64()
+    rp_ncol = table_new_i64()
+    rp_allocas = []
+    // 命名计数器（参与符号名后缀）：不归零则本单元哨兵从上一单元的计数接着编
+    //（实测 comprehension.tie 的 @tl_loopf_main_274… 而非 _1…，产物逐字节不等）。
+    g_tf_ctr = 0
+    g_rx_u = 0
+    g_used_trmlite = false
+    g_used_interp = false
+    g_used_wsock = false
+    g_dynlib = false
+    g_dll_export = ""
+    g_msg_reg_done = 0
+    g_rng_reg_done = 0
+    g_cur_fn_name = ""
+    g_cur_func = 0
+    g_cur_block = 0
+    g_asm_target = ""
+}
+
+
+pub func tig_ast() -> i64 {
+    // 重置生成器状态
+    g_sc_keys = table_new_i64()
+    g_sc_allocas = table_new_i64()
+    g_sc_tys = table_new_i64()
+    g_sc_top = 0
+    esc_reset()
+    g_lp_labels = table_new_i64()
+    g_lp_breaks = table_new_i64()
+    g_lp_cont = table_new_i64()
+    g_lp_top = 0
+    g_str_keys = table_new_i64()
+    g_str_count = 0
+    g_used_interp = false
+    g_used_wsock = false
+    g_msg_reg_done = 0
+    g_rng_reg_done = 0
+    ir.new_module()
+    // 一期并发 A4：actor 工作循环 thunk 急切生成（任何用户函数之前，避免指令
+    // 编号交错——llvmgen 逐函数重编号要求函数指令连续）
+    gen_actor_task_eager()
+    // 一期并发 A4：actor 方法 handler + dispatch 函数急切生成
+    gen_actor_dispatch_eager()
+    // S2.4 vtable 全局常量登记（每个 impl 一个：方法函数指针按 port 方法
+    // 声明序；llvmgen 在 emit_globals 后输出 @vt.<port>.<struct> 常量）
+    reg_all_vtables()
+    // 全局变量登记（表全局 → llvmgen 输出 @g = global ptr null，main 入口初始化）
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        if s_tags[s] == 100 {
+            tig_global_var(s, sstate.name_str(s))
+        }
+        i = i + 1
+    }
+    // 顶层遍历：FnDef（顶层函数）/ Namespace（递归函数体）/ 全局 VarDecl 已登记
+    i = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        if s_tags[s] == 101 {
+            // 顶层函数：全名 = 裸名
+            var r = tig_fn_def(s, "")
+            if r < 0 {
+                if str_len(sm_err_msg) == 0 {
+                    sm_err_msg = "顶层函数 " + sstate.name_str(s) + " 生成失败"
+                }
+                return -1
+            }
+        } else if s_tags[s] == 112 {
+            // 命名空间：递归生成体内函数（全名 = ns 段::函数名）
+            var nr = tig_ns(s, "")
+            if nr < 0 {
+                if str_len(sm_err_msg) == 0 {
+                    sm_err_msg = "顶层命名空间生成失败"
+                }
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    // --shared：全部函数生成后，若需全局表初始化则生成 tie$rt_init +
+    // 模块构造器（DLL 加载时建表全局；FFM 宿主也可显式调用）。
+    var rti = tig_shared_rt_init()
+    if rti < 0 {
+        return -1
+    }
+    return 0
+}
+
+// p.9.21.9 收口：装配路径（driver 全命中跳过 irgen+passes）的**登记副作用
+// 重放**入口——只登记、不生成 IR。
+// 背景：llvmgen 的全局段（g_global_*）与 vtable 段（g_vt_*）此前只在 tig_ast
+// 内由 irgen 登记；装配路径不走 irgen → 含顶层 VarDecl / impl 的单元会缺全局
+// 定义（llvmgen 报未定义符号）。AST（g_extra_tops）与语义层状态在装配路径
+// 同样可用（driver 已跑前端），故按 tig_ast 的同序遍历重放登记：
+//   ① reg_all_vtables（impl 记录）→ ② 顶层 VarDecl（tag 100）→
+//   ③ 命名空间 const（tag 112 内 tag 100，全名 prefix::NAME）。
+// 返回 0 / -1（sm_err_msg 已置；行池 table<R> 全局等边界由 tig_global_var 报出）。
+pub func asm_reg_globals() -> i64 {
+    reg_all_vtables()
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        if s_tags[s] == 100 {
+            if tig_global_var(s, sstate.name_str(s)) < 0 {
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        if s_tags[s] == 112 {
+            if asm_reg_ns_globals(s, "") < 0 {
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 命名空间内 const（tag 100）登记（与 tig_ns 同款前缀拼接：段以 :: 连接）。
+func asm_reg_ns_globals(ns_node: i64, prefix: string) -> i64 {
+    var nseg = s_aux[ns_node]
+    var full_pre: string = prefix
+    var k: i64 = 0
+    while k < nseg {
+        var seg = sstate.child(ns_node, k)
+        if full_pre != "" {
+            full_pre = full_pre + "::"
+        }
+        full_pre = full_pre + sstate.name_str(seg)
+        k = k + 1
+    }
+    var body = sstate.child(ns_node, nseg)
+    var nb = sstate.nchild(body)
+    var i: i64 = 0
+    while i < nb {
+        var st = sstate.child(body, i)
+        var tag = s_tags[st]
+        if tag == 100 {
+            if tig_global_var(st, full_pre + "::" + sstate.name_str(st)) < 0 {
+                return -1
+            }
+        } else if tag == 112 {
+            if asm_reg_ns_globals(st, full_pre) < 0 {
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 装配路径的惰性登记族（msg_* 全局槽 / rand_range 状态槽）：irgen 在生成
+// 函数体时惰性登记，装配路径按「片段是否引用对应全局」由 driver 调此入口恢复。
+pub func asm_reg_msg() {
+    tig_msg_reg_globals()
+}
+pub func asm_reg_rng() {
+    tig_rng_reg()
+}
+
+// 装配路径的链接判据恢复助手：extern 符号是否 libc（非 libc 的 tie_* 桥符号
+// 才需要链 tie_interp.lib；trm-lite tl_* 走 trm_lite.a）。
+pub func asm_is_libc(sym: string) -> bool {
+    return is_libc_sym(sym)
+}
+
+// 生成 tie-IR（完整版）：内部调 semantic.check_src（parse + 语义 + import）
+// 填充 AST + 类型表，然后遍历顶层 FnDef。driver-lite.tie 与 backend/
+// _driver_test.tie 仍在使用；driver.tie 主路径改用 tig_ast() 避免重复前端。
+// 返回 0 成功 / -1 错误（sm_err_* 已置）
+pub func tig_src(src: string, base_dir: string) -> i64 {
+    var sem = semantic.check_src(src, base_dir)
+    if str_len(sem) < 3 {
+        return -1
+    }
+    if str_char(sem, 0) != "O" {
+        // 语义错误
+        sm_err_msg = sem
+        return -1
+    }
+    // 重置生成器状态
+    g_sc_keys = table_new_i64()
+    g_sc_allocas = table_new_i64()
+    g_sc_tys = table_new_i64()
+    g_sc_top = 0
+    g_lp_labels = table_new_i64()
+    g_lp_breaks = table_new_i64()
+    g_lp_cont = table_new_i64()
+    g_lp_top = 0
+    g_str_keys = table_new_i64()
+    g_str_count = 0
+    g_used_interp = false
+    g_used_wsock = false
+    g_msg_reg_done = 0
+    g_rng_reg_done = 0
+    ir.new_module()
+    // 一期并发 A4：actor 工作循环 thunk 急切生成（任何用户函数之前，避免指令
+    // 编号交错——llvmgen 逐函数重编号要求函数指令连续）
+    gen_actor_task_eager()
+    // 一期并发 A4：actor 方法 handler + dispatch 函数急切生成
+    gen_actor_dispatch_eager()
+    // S2.4 vtable 全局常量登记（每个 impl 一个：方法函数指针按 port 方法
+    // 声明序；llvmgen 在 emit_globals 后输出 @vt.<port>.<struct> 常量）
+    reg_all_vtables()
+    // 全局变量登记（表全局 → llvmgen 输出 @g = global ptr null，main 入口初始化）
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        if s_tags[s] == 100 {
+            tig_global_var(s, sstate.name_str(s))
+        }
+        i = i + 1
+    }
+    // 顶层遍历：FnDef（顶层函数）/ Namespace（递归函数体）/ 全局 VarDecl 已登记
+    i = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        if s_tags[s] == 101 {
+            // 顶层函数：全名 = 裸名
+            var r = tig_fn_def(s, "")
+            if r < 0 {
+                if str_len(sm_err_msg) == 0 {
+                    sm_err_msg = "顶层函数 " + sstate.name_str(s) + " 生成失败"
+                }
+                return -1
+            }
+        } else if s_tags[s] == 112 {
+            // 命名空间：递归生成体内函数（全名 = ns 段::函数名）
+            var nr = tig_ns(s, "")
+            if nr < 0 {
+                if str_len(sm_err_msg) == 0 {
+                    sm_err_msg = "顶层命名空间生成失败"
+                }
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ==================== S2.4 vtable / port 对象后端 ====================
+// reg_all_vtables / tig_ptr_tuple_ty / tig_port_coerce / tig_port_method_call 仍在
+// 子文件 compiler/backend/irgen_vtable.tie（同 namespace 文本内联）。以下返回
+// tig_global_var / tig_ns / tig_fn_def 三个顶层入口 / 函数生成主逻辑。
+// 归属纠偏：这三个函数原被误移入子文件，现迁回主文件顶层入口分区。
+
+
+// ---------- 全局表初始化（--shared 缺陷修复）----------
+// 普通 exe 在 main 入口对所有模块表全局预建表句柄（@g = global ptr null → store
+// 新表句柄；缺此则 len(g) 对 null 崩溃 0xC0000005）。--shared 库无 main → 该初始化
+// 整块跳过 → 模块表全局保持 null → 惰性 ensure 首读 len(global) 在 [0+8] 崩溃。
+// 本函数把该初始化抽取为可复用发射器：exe 由 main 调用（行为不变）；共享模式经
+// tie$rt_init 模块构造器在 DLL 加载时执行（见 tig_shared_rt_init）。
+// 发射到当前 g_cur_block。返回 0 / -1（错误已置 sm_err_msg）。
+pub func gen_global_tbl_init() -> i64 {
+    var saved_fn = g_cur_fn_name
+    var gi: i64 = 0
+    while gi < len(gb_keys) {
+        var gte = gb_telem[gi]
+        if gte >= 0 {
+            // p.9.12.6 边界：全局行池 table<R> v1 不支持（列式行池需每字段列 @g 全局）
+            if types.kind(gte) == K_STRUCT {
+                sm_err_msg = "行池 table<R> 全局变量 v1 暂不支持（p.9.12.6 边界；仅局部行池可用）"
+                return -1
+            }
+            var gv: i64 = -1
+            var ginit_node = g_ginit_node_of(gb_keys[gi])
+            if ginit_node >= 0 {
+                // 初始化表达式在**声明所在命名空间**里求值：全局键可能是
+                // "tiel::names"，裸名常量 KW_ALIAS 须按 tiel 前缀补全。
+                var gkey = intern.lookup(gb_keys[gi])
+                var gcut = sstate.rfind_ns(gkey)
+                if gcut >= 0 {
+                    g_cur_fn_name = ig_slice(gkey, 0, gcut)
+                } else {
+                    g_cur_fn_name = ""
+                }
+                gv = tig_table_lit(ginit_node)
+                if gv < 0 {
+                    return -1
+                }
+            } else {
+                var gsz = elem_size(gte)
+                var gsz_v = tig_int_lit_ty(gsz, types.named(TK_I64))
+                gv = s21_table_new_ty(gte, gsz_v)  // r.1.1.4：元素为表 → 深表
+                if gv < 0 {
+                    return -1
+                }
+            }
+            var gst = ir.new_inst(g_cur_block, 22, -1)  // store
+            ir.add_operand(gst, types.named(TK_STR), 2)
+            ir.add_operand(gst, gv, 0)
+            ir.add_operand(gst, interner.intern("@" + intern.lookup(gb_keys[gi])), 3)  // 全局槽
+        }
+        gi = gi + 1
+    }
+    // 2026-10-13 聚合全局初值物化：main 入口逐条求值存回（对齐表全局初始化）。
+    // 缺此段则 @g 恒为 zeroinitializer——struct 读出全 0、fn（已门禁）读野指针。
+    var ai: i64 = 0
+    while ai < len(g_agginit_names) {
+        var akey = intern.lookup(g_agginit_names[ai])
+        var acut = sstate.rfind_ns(akey)
+        if acut >= 0 {
+            g_cur_fn_name = ig_slice(akey, 0, acut)
+        } else {
+            g_cur_fn_name = ""
+        }
+        var av = tig_expr(g_agginit_nodes[ai])
+        if av < 0 {
+            return -1
+        }
+        var aty = g_agginit_tys[ai]
+        var ast = ir.new_inst(g_cur_block, 22, -1)  // store agg → @g
+        ir.add_operand(ast, aty, 2)
+        ir.add_operand(ast, av, 0)
+        ir.add_operand(ast, interner.intern("@" + intern.lookup(g_agginit_names[ai])), 3)
+        ai = ai + 1
+    }
+    g_cur_fn_name = saved_fn
+    return 0
+}
+
+// --shared 模块构造器初始化（a+b 双轨）：
+// 共享库无 main → 生成 dllexport 的 tie$rt_init（内含全局表初始化），并注册为模块
+// 构造器（llvmgen 据此输出 @llvm.global_ctors），DLL 加载时自动执行（a）；宿主也可
+// 用 FFM 显式调用 tie$rt_init（b，符号缺失时向后兼容跳过）。仅当存在表全局时生成
+// （纯标量库无表全局 → 不生成，导出面与既有 m5 行为逐字不变）。返回 0 / -1。
+pub func tig_shared_rt_init() -> i64 {
+    if !g_dynlib {
+        return 0
+    }
+    if len(gb_keys) == 0 {
+        return 0
+    }
+    var params: table<i64> = table_new_i64()
+    var fid = ir.new_func(interner.intern("tie$rt_init"), types.named(TK_VOID), params)
+    ir.func_export_set(fid, 1)  // dllexport → FFM 宿主可显式调用（b 轨）
+    ir.func_inline_set(fid, 0)
+    g_cur_func = fid
+    var entry = ir.new_block(fid, interner.intern("entry"))
+    g_entry_block = entry
+    g_cur_block = entry
+    var r = gen_global_tbl_init()
+    if r < 0 {
+        return -1
+    }
+    var retv = ir.new_inst(g_cur_block, 32, -1)  // ret void
+    return 0
+}
+
+
+}
+
+import "./irgen_p1.tie"
+import "./irgen_p2.tie"
+import "./irgen_stmt_gen.tie"

@@ -1,0 +1,118 @@
+type tie<logic>
+// tests/_buf_probe/buf_probe.tie —— 动态字节缓冲 buffer<u8> 验收探针
+// 覆盖：push 各类数值（u8/u16/u32/i64/f32/f64）→ 读回比对（小端）、
+//   push_cstr 长度与字节（含多字节 UTF-8）、文件 round-trip、越界读三件套、concat。
+// 输出：每项 PASS/FAIL 明细 + 汇总 PASS/FAIL。
+import "/ext/buffer.tie"
+
+var g_fail: i64 = 0
+
+// 断言：条件真则打印 PASS，否则打印 FAIL 并置失败标记。
+func chk(name: string, cond: bool) {
+    if cond {
+        println("PASS " + name)
+    } else {
+        g_fail = 1
+        println("FAIL " + name)
+    }
+}
+
+func main() {
+    // 1. 各数值类型独立缓冲：push → i64_at/u8_at 读回比对（小端）
+    var w1: Buf = buf.new()
+    w1 = buf.push_u8(w1, 0xAB)
+    chk("u8 值", buf.u8_at(w1, 0) == 0xAB)
+
+    var w2: Buf = buf.new()
+    w2 = buf.push_u16(w2, 0x1234)
+    chk("u16 长度", buf.length(w2) == 2)
+    chk("u16 读回", buf.i64_at(w2, 0) == 0x1234)
+    chk("u16 小端 b0", buf.u8_at(w2, 0) == 0x34)
+    chk("u16 小端 b1", buf.u8_at(w2, 1) == 0x12)
+
+    var w3: Buf = buf.new()
+    w3 = buf.push_u32(w3, 0x89ABCDEF)
+    chk("u32 长度", buf.length(w3) == 4)
+    chk("u32 小端 b0", buf.u8_at(w3, 0) == 0xEF)
+    chk("u32 小端 b3", buf.u8_at(w3, 3) == 0x89)
+
+    var w4: Buf = buf.new()
+    w4 = buf.push_i64(w4, 0x1234567890ABCDEF)
+    chk("i64 长度", buf.length(w4) == 8)
+    chk("i64 小端 b0", buf.u8_at(w4, 0) == 0xEF)
+    chk("i64 小端 b7", buf.u8_at(w4, 7) == 0x12)
+    chk("i64 读回", buf.i64_at(w4, 0) == 0x1234567890ABCDEF)
+
+    // 2. 连续 push 到同一缓冲：偏移递增（1+2+4+8 = 15 字节）
+    var b: Buf = buf.new()
+    b = buf.push_u8(b, 0xAB)
+    b = buf.push_u16(b, 0x1234)
+    b = buf.push_u32(b, 0x89ABCDEF)
+    b = buf.push_i64(b, 0x1234567890ABCDEF)
+    chk("连续 push 总长", buf.length(b) == 15)
+    chk("连续 u8", buf.u8_at(b, 0) == 0xAB)
+    chk("连续 u16 低", buf.u8_at(b, 1) == 0x34)
+    chk("连续 u32 首", buf.u8_at(b, 3) == 0xEF)
+    chk("连续 i64 头", buf.u8_at(b, 7) == 0xEF)
+    chk("连续 i64 尾", buf.u8_at(b, 14) == 0x12)
+
+    // 3. f64 / f32 bitcast 往返
+    var bb: Buf = buf.new()
+    bb = buf.push_f64(bb, 3.141592653589793)
+    bb = buf.push_f32(bb, 2.5)
+    chk("f64 往返", buf.f64_at(bb, 0) == 3.141592653589793)
+    chk("f32 往返", buf.f32_at(bb, 8) == 2.5)
+    chk("f64+f32 长", buf.length(bb) == 12)
+
+    // 4. push_cstr：UTF-8 字节 + NUL
+    var cs: Buf = buf.new()
+    cs = buf.push_cstr(cs, "Hi")
+    chk("cstr ASCII 长", buf.length(cs) == 3)      // 2 + NUL
+    chk("cstr ASCII b0", buf.u8_at(cs, 0) == 72)   // 'H'
+    chk("cstr ASCII NUL", buf.u8_at(cs, 2) == 0)
+    var u: Buf = buf.new()
+    u = buf.push_cstr(u, "你好")                    // 2×3=6 字节 + NUL
+    chk("cstr UTF8 长", buf.length(u) == 7)
+    chk("cstr UTF8 b0", buf.u8_at(u, 0) == 228)    // 0xE4 '你' 首字节
+    chk("cstr UTF8 NUL", buf.u8_at(u, 6) == 0)
+
+    // 5. 文件 round-trip：write → load → 读回比对
+    var rt: Buf = buf.new()
+    rt = buf.push_u16(rt, 0xCAFE)
+    rt = buf.push_i64(rt, 0x1122334455667788)
+    rt = buf.push_f64(rt, 6.25)
+    chk("写文件返回", buf.write_bytes(rt, "tests/_buf_probe/_w.bin"))
+    var rt2: Buf = buf.load("tests/_buf_probe/_w.bin")
+    chk("load 长度一致", buf.length(rt2) == buf.length(rt))
+    chk("roundtrip u16", ((buf.u8_at(rt2, 0) & 0xFF) | ((buf.u8_at(rt2, 1) & 0xFF) << 8)) == 0xCAFE)
+    chk("roundtrip i64", buf.i64_at(rt2, 2) == 0x1122334455667788)
+    chk("roundtrip f64", buf.f64_at(rt2, 10) == 6.25)
+
+    // 6. concat（a += b）
+    var a: Buf = buf.new()
+    a = buf.push_u8(a, 1)
+    a = buf.push_u8(a, 2)
+    var bb2: Buf = buf.new()
+    bb2 = buf.push_u8(bb2, 3)
+    bb2 = buf.push_u8(bb2, 4)
+    bb2 = buf.push_u8(bb2, 5)
+    var c: Buf = buf.concat(a, bb2)
+    chk("concat 长", buf.length(c) == 5)
+    chk("concat 序列", buf.u8_at(c, 0) == 1 && buf.u8_at(c, 1) == 2 && buf.u8_at(c, 2) == 3 && buf.u8_at(c, 3) == 4 && buf.u8_at(c, 4) == 5)
+
+    // 7. 越界读三件套（返回 0 / 0.0）+ clear
+    var ob: Buf = buf.new()
+    ob = buf.push_u8(ob, 7)                        // 仅 1 字节
+    chk("oob u8 负", buf.u8_at(ob, -1) == 0)
+    chk("oob u8 超", buf.u8_at(ob, 99) == 0)
+    chk("oob i64 超", buf.i64_at(ob, 100) == 0)
+    chk("oob f64 超", buf.f64_at(ob, 100) == 0.0)
+    chk("oob f32 超", buf.f32_at(ob, 100) == 0.0)
+    chk("clear 后长", buf.length(buf.clear(c)) == 0)
+
+    if g_fail == 0 {
+        println("=== 汇总 PASS ===")
+    } else {
+        println("=== 汇总 FAIL ===")
+    }
+}

@@ -1,0 +1,237 @@
+type tie<class, unsafe:ext, unsafe:mem>
+// ============================================================================
+// std/rng_adv.tie —— 统一随机/密码学封装（命名空间 rng）p.9.1.1.12
+// Unified RNG wrapper. 把 std/random（rnd，底座 rand_range）与 std/csprng
+// （csrnd，BCryptGenRandom）聚合为一致的「显式状态」接口：
+//   显式状态（可复现，测试友好）：rng.new / new_str / new_entropy 建 state，
+//   显式状态表持有内部 PRNG，调用方逐次推进（rng 为 ref 表形参，原地推进）。
+//   加密安全：rng.crypto_bytes(n) → csrnd.strong_bytes（非密钥级/不建议用于
+//   比特级安全边界请直接走 csrnd），作为统一入口提供。
+//
+// 设计裁决（Design decisions）：
+//   - PRNG：xorshift64（13/7/17），同种子同序列，确定性可复现（对齐 rdu_rnd 的
+//     反 splitmix 裁决——splitmix 偏移常量 0x9E3779B97F4A7C15 > i64::MAX，
+//     tie 字面量表达不确定，故弃用，改 xorshift64）。
+//   - 状态：table<i64>，[0]=xorshift 状态；显式 ref 推进，替代 std/random 的
+//     隐式底座（rand_range）→ 调用方可持有多路独立流（stream）。
+//   - 范围映射：整数用 modulo 映射 normalize 到 [0,span)；浮点用 53-bit
+//     均匀分数 / 2^53 → IEEE-754 double 可精确保留 0..1。
+//   - 向后兼容：不修改 std/random/csprng 任何签名；本文为新增暴露层。
+//   - 密码学安全版本：走 csprng（Windows BCryptGenRandom）；失败返回空表。
+//
+// 接口（namespace rng）：
+//   new(seed) -> table<i64>            显式状态（xorshift64 初始化，非零种子更佳）
+//   new_str(s) -> table<i64>           从字符串派生种子（FNV-1a64 + 混合）
+//   new_entropy() -> table<i64>        从系统熵派生种子（csrnd.strong_bytes(8)）
+//   next(r: ref) -> i64                推进并返回 64-bit
+//   uint(r: ref) -> i64                推进返回低 63 位（非负，uniform 采样）
+//   range(r: ref, a, b) -> i64         半开区间 [a, b) 均匀整数
+//   irange(r: ref, a, b) -> i64        闭区间 [a, b] 均匀整数
+//   float(r: ref) -> f64               [0,1) 均匀浮点（53-bit 精度）
+//   frange(r: ref, a, b) -> f64        [a,b) 均匀浮点
+//   bytes(r: ref, n) -> table<i64>     n 个确定性伪随机字节（0..255）
+//   crypto_bytes(n) -> table<i64>      n 个加密安全字节（系统 CSPRNG），失败空表
+//   pick(r: ref, t) -> i64            均匀取表 t 一个元素（空表返回 0）
+//   seed_str(s) -> i64                字符串 → i64 种子（供手动 new 复用）
+// ============================================================================
+
+// === 设计裁决（Design decisions） ===
+//   - PRNG：xorshift64（13/7/17），同种子同序列，确定性可复现（对齐 rdu_rnd 的
+//     反 splitmix 裁决——splitmix 偏移常量 0x9E3779B97F4A7C15 > i64::MAX，
+//     tie 字面量表达不确定，故弃用，改 xorshift64）。
+//   - 状态：table<i64>，[0]=xorshift 状态；显式 ref 推进，替代 std/random 的
+//     隐式底座（rand_range）→ 调用方可持有多路独立流（stream）。
+//   - 范围映射：整数用 modulo 映射 normalize 到 [0,span)；浮点用 53-bit
+//     均匀分数 / 2^53 → IEEE-754 double 可精确保留 0..1。
+//   - 向后兼容：不修改 std/random/csprng 任何签名；本文为新增暴露层。
+//   - 加密安全版本（crypto）：本应静态 import csprng（csrnd.strong_bytes →
+//     BCryptGenRandom）。但 csprng 的 BCryptGenRandom 是静态 unsafe extern，
+//     Windows 目标会让编译器置 tie-interp 桥链接位（缺 tie_interp.lib 即失败；
+//     本检出 0-Rust 已移除该 Rust 静态库，且无刷内 crate 源可重建）→ 对「仅用
+//     PRNG 的调用方」也强行引入不可链接依赖。故改裁决：crypto_bytes 用语言内建
+//     动态加载原语（load_library/get_proc/dyn_call，全为内建、非 extern、不置
+//     interp 位）在运行期解析 bcrypt.dll::BCryptGenRandom——与 csprng 同一系统
+//     CSPRNG 原语、同一调用契约（hAlgorithm=NULL + BCRYPT_USE_SYSTEM_PREFERRED_RNG
+//     =0x2），仅链接时机从「编译期静态」改为「运行期动态」。既满足「密码学安全
+//     版本走系统 CSPRNG」，又在无 tie_interp.lib 的环境可编译可测可复现。
+//     行为契约与 csprng 一致：失败（bcrypt.dll 不可用 / 调用返回非 0）返回空表。
+// ============================================================================
+
+// ---- 模块级全局：bcrypt 动态句柄 + 函数地址（命名空间外） ----
+var g_bcrypt_handle: i64 = 0;   // LoadLibraryW("bcrypt.dll") 模块句柄（0=未加载）
+var g_bcrypt_gen: i64 = 0;      // BCryptGenRandom 函数地址（0=未解析）
+
+namespace rng {
+
+// ---- 统一接口 ----
+
+// 建显式状态：以 seed 初始化 xorshift64。seed==0 时归零会产生全 0 序列，
+// 内部自动用固定非零常量补救。
+// 注：tie 整数字面量须在 i64::MAX 内（十六进制同样检查），> i64::MAX 的
+// 64 位黄金比例常量（0x9E3779B97F4A7C15）无法直接书写，故用其 32 位低段
+// 0x9E3779B9 作为可行的非零回退种子（对齐 rdu_rnd 的反 splitmix 裁决）。
+pub func new(seed: i64) -> table<i64> {
+    var st = table_new_i64()
+    var s: i64 = seed
+    if s == 0 {
+        s = 0x9E3779B9   // 32 位黄金比例低段，fits i64
+    }
+    table_push(st, s)
+    return st
+}
+
+// 字符串 → i64 种子（确定性哈希）：fnv-ish 逐字节累加 + 终值混合。
+// 常量全取 ≤ i64::MAX 者：prime 1099511628211（0x100000001B3）32 位混合常量
+// 0xFF51AFD7。乘法/移位回绕即位型运算，保持确定性。
+pub func seed_str(s: string) -> i64 {
+    var h: i64 = 0x811C9DC5   // fmv offset-basis 低段
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var b = str_byte(s, i)
+        h = h ^ b
+        h = h * 1099511628211
+        i = i + 1
+    }
+    h = h ^ (h >> 33)
+    h = h * 0xFF51AFD7
+    return h ^ (h >> 31)
+}
+
+// 从字符串派生显式状态（哈希后经 new 初始化）。
+pub func new_str(s: string) -> table<i64> {
+    return new(seed_str(s))
+}
+
+// 从系统熵派生显式状态。crypto_bytes(8) 失败（空表）→ 回退到以当前时间派生
+// 的非加密种子（仅 bcrypt.dll 在熵源不可用时）。
+pub func new_entropy() -> table<i64> {
+    var b = crypto_bytes(8)
+    if len(b) != 8 {
+        return new(time_now())
+    }
+    var h: i64 = b[0]
+    var i: i64 = 1
+    while i < 8 {
+        h = (h * 0x100B5) ^ b[i]   // 0x100B5=65717 素数步进（fits）
+        h = h ^ (h >> 31)
+        i = i + 1
+    }
+    h = h ^ (h >> 33)
+    h = h * 0xFF51AFD7
+    return new(h ^ (h >> 31))
+}
+
+// 推进一步：xorshift64（13/7/17）。返回当前状态值（i64 位型）。
+pub func next(r: ref table<i64>) -> i64 {
+    var x: i64 = r[0]
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    r[0] = x
+    return x
+}
+
+// 返回低 63 位（恒非负），uniform 采样（用于整数映射，避免符号位干扰）。
+pub func uint(r: ref table<i64>) -> i64 {
+    return next(r) & 0x7FFFFFFFFFFFFFFF
+}
+
+// 半开区间 [a, b) 均匀整数（b > a）。spanpossible overflow 时退化为 b==a 返回 a。
+pub func range(r: ref table<i64>, a: i64, b: i64) -> i64 {
+    var span = b - a
+    if span <= 0 {
+        return a
+    }
+    var u = uint(r)
+    return a + (u % span)
+}
+
+// 闭区间 [a, b] 均匀整数（b >= a）。等价 range(a, b+1)；注意 b==i64::MAX 溢出。
+pub func irange(r: ref table<i64>, a: i64, b: i64) -> i64 {
+    if b == 9223372036854775807 {
+        return range(r, a, b + 1)
+    }
+    return range(r, a, b + 1)
+}
+
+// [0,1) 均匀浮点：53 位均匀分数 / 2^53。
+pub func float(r: ref table<i64>) -> f64 {
+    var val = next(r)
+    var frac = val & 9007199254740991        // (1<<53)-1
+    var f: f64 = to_f64(frac)
+    return f / 9007199254740992.0            // 2^53
+}
+
+// [a, b) 均匀浮点。
+pub func frange(r: ref table<i64>, a: f64, b: f64) -> f64 {
+    var t = float(r)
+    return a + t * (b - a)
+}
+
+// n 个确定性伪随机字节（0..255）。n<=0 → 空表。
+pub func bytes(r: ref table<i64>, n: i64) -> table<i64> {
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        var v = next(r)
+        table_push(out, v & 0xFF)
+        i = i + 1
+    }
+    return out
+}
+
+// 惰性解析 bcrypt.dll::BCryptGenRandom。返回 1=可用，0=不可用。
+func bcrypt_ensure() -> i64 {
+    if g_bcrypt_gen != 0 {
+        return 1
+    }
+    if g_bcrypt_handle == 0 {
+        g_bcrypt_handle = load_library("bcrypt.dll")
+        if g_bcrypt_handle == 0 {
+            return 0
+        }
+    }
+    g_bcrypt_gen = get_proc(g_bcrypt_handle, "BCryptGenRandom")
+    if g_bcrypt_gen == 0 {
+        return 0
+    }
+    return 1
+}
+
+// n 个加密安全字节（系统 CSPRNG：bcrypt.dll::BCryptGenRandom，与 csprng 同源
+// 同契约）。n<=0 或不可用/失败 → 空表（哨兵拒绝，不降级伪随机）。
+pub func crypto_bytes(n: i64) -> table<i64> {
+    var out = table_new_i64()
+    if n <= 0 {
+        return out
+    }
+    if bcrypt_ensure() == 0 {
+        return out
+    }
+    unsafe {
+        var p: ptr<u8> = alloc(n)
+        // BCryptGenRandom(NULL, buf, cb, BCRYPT_USE_SYSTEM_PREFERRED_RNG=0x2) -> NTSTATUS
+        var rc = dyn_call(g_bcrypt_gen, 0, ptr_to_int(p), n, 2, 0)
+        if rc != 0 {
+            return table_new_i64()
+        }
+        var i: i64 = 0
+        while i < n {
+            table_push(out, to_i64(deref(ptr_add(p, i))))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// 均匀取表 t 一个元素；空表返回 0（约定，与 std/random 一致）。
+pub func pick(r: ref table<i64>, t: table<i64>) -> i64 {
+    var n = len(t)
+    if n == 0 {
+        return 0
+    }
+    return t[range(r, 0, n)]
+}
+
+}   // namespace rng

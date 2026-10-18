@@ -1,0 +1,77 @@
+type tie<logic>
+// tests/_p9123_fdflt_probe/fdflt_probe.tie —— p.9.12.3 回归探针
+// ============================================================
+// struct 字段默认值为**整数字面量**而字段类型是浮点/窄整型时，无参/缺省构造
+// （R() / R(2) 缺省后槽）irgen 崩溃：tig_expr 对 IntLit 恒定发射 i64（字段 f64
+// 时 node_types 收窄为 f64 非 int），store 到 double 槽 → opt 类型错
+//（'%2' defined with type 'i64' but expected 'double'）。
+// 修复：字段默认值按「tig_expr 实际发射类型」记 vt（IntLit → i64/窄型，
+// FloatLit → f64），走 S1.3 tig_coerce 按字段目标类型转换（sitofp/trunc）。
+//
+// 覆盖：
+//   · f64 = 5（整数字面量默认 → sitofp）
+//   · f32 = 3（整数字面量默认 → sitofp 到 f32）
+//   · u16 = 7（窄整型默认 → 收窄）
+//   · i64 = 8（同宽直传）
+//   · bool 默认（语义侧，非数字族直传）
+//   · 有参构造 R(2)（int 实参 → 字段目标类型转换）与 R(3.0)（浮点实参）
+//   · 字段默认值表构造
+//   · R() 全缺省
+func check(cond: bool, msg: string) {
+    if !cond {
+        println("FAIL: " + msg)
+        exit(1)
+    }
+}
+
+struct R {
+    var w: f64 = 5
+}
+struct S {
+    var a: f32 = 3
+    var b: u16 = 7
+    var c: i64 = 8
+    var d: bool = true
+}
+struct T {
+    var x: f64 = 1
+    var y: f64 = 2
+}
+struct U {
+    var m: u32 = 11
+    var n: u8 = 4
+}
+
+func main() {
+    // R() 全缺省：w 用默认值 5（整数字面量 → sitofp 到 f64）
+    var r0 = R()
+    check(r0.w == 5.0, "R() default int lit -> f64")
+
+    // 有参构造：int 实参 → 字段目标类型转换
+    var r1 = R(2)
+    check(r1.w == 2.0, "R(2) int arg -> f64")
+    // 浮点实参：同型直传
+    var r2 = R(3.0)
+    check(r2.w == 3.0, "R(3.0) float arg -> f64")
+
+    // 多字段默认值表构造：整数字面量 → f32；窄整型 u16；i64 同宽；bool
+    var s = S()
+    // f32 断言经 as_f64 拓宽（fpext）再比——避免混合宽 fcmp（f32 字面量
+    // 发射恒 f64，属既有独立缺口，非本探针范围）
+    check(to_f64(s.a) == 3.0, "S() f32 default int lit")
+    check(s.b == 7, "S() u16 default")
+    check(s.c == 8, "S() i64 default")
+    check(s.d == true, "S() bool default")
+
+    // 字段默认值表构造（缺省后槽，前槽显式实参）
+    var t = T(9.5)
+    check(t.x == 9.5, "T(9.5) explicit arg")
+    check(t.y == 2.0, "T() default y int lit -> f64")
+
+    // 窄整型字段默认值：u32 / u8
+    var u = U()
+    check(u.m == 11, "U() u32 default")
+    check(u.n == 4, "U() u8 default")
+
+    println("PASS: p.9.12.3 fdflt probe")
+}

@@ -1,0 +1,275 @@
+type tie<class>
+// compiler/backend/irgen_arith_p3.tie —— irgen_arith 分片 3（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 irgen_arith.tie。
+namespace irgen {
+// 复合赋值运算（Assign op ≥ 0）：在 load 出的旧值与右值上执行二元运算。
+// 类型分派：字符串 += → str_cat；浮点 → fadd 族；整数/位运算 → 常规 opcode。
+func tig_compound_assign(op: i64, lv: i64, rv: i64, ty: i64) -> i64 {
+    // 字符串拼接（+=）：str_cat 指令
+    if ty == types.named(TK_STR) && op == 0 {
+        var sc = ir.new_inst(g_cur_block, 56, types.named(TK_STR))  // str_cat
+        ir.add_operand(sc, lv, 0)
+        ir.add_operand(sc, rv, 0)
+        return ir.get_value(sc)
+    }
+    var is_f = types.is_float(ty)
+    // p.9.11 `%%=`（浮点）：与二元 `%%` 同构 —— a - floor(a/b)*b（余数符号跟随除数）。
+    // 必须提前返回：frem 的语义与 floor 取余不同（-7.0 frem 3.0 == -1.0，
+    // 而 -7.0 %% 3.0 == 2.0），故不能像 `%=` 那样靠一个 opcode 表达。
+    if op == 26 && is_f {
+        var q2 = ir.new_inst(g_cur_block, 16, ty)  // fdiv a/b
+        ir.add_operand(q2, lv, 0)
+        ir.add_operand(q2, rv, 0)
+        var fl2 = tig_ext_call1("floor", ir.get_value(q2), ty, ty)
+        if fl2 < 0 {
+            return -1
+        }
+        var pr2 = ir.new_inst(g_cur_block, 15, ty)  // fmul floor(a/b)*b
+        ir.add_operand(pr2, fl2, 0)
+        ir.add_operand(pr2, rv, 0)
+        var sb2 = ir.new_inst(g_cur_block, 14, ty)  // fsub a - q*b
+        ir.add_operand(sb2, lv, 0)
+        ir.add_operand(sb2, ir.get_value(pr2), 0)
+        return ir.get_value(sb2)
+    }
+    var iop: i64 = -1
+    if op == 0 {
+        iop = 0  // +=
+    } else if op == 1 {
+        iop = 1  // -=
+    } else if op == 2 {
+        iop = 2  // *=
+    } else if op == 3 {
+        iop = 3  // /=
+    } else if op == 24 {
+        iop = 3  // \=：先取截断商；有符号整数随后套 floor 调整（见函数尾）
+    } else if op == 4 {
+        iop = 4  // %=
+    } else if op == 26 {
+        iop = 4  // %%=：先取截断余数；有符号整数随后套 floor 调整（见函数尾）
+    } else if op == 13 {
+        iop = 6  // &=
+    } else if op == 14 {
+        iop = 7  // |=
+    } else if op == 15 {
+        iop = 8  // ^=
+    } else if op == 16 {
+        iop = 10  // <<=
+    } else if op == 17 {
+        iop = 11  // >>=
+    }
+    if is_f {
+        if op == 0 {
+            iop = 13  // fadd
+        } else if op == 1 {
+            iop = 14  // fsub
+        } else if op == 2 {
+            iop = 15  // fmul
+        } else if op == 3 {
+            iop = 16  // fdiv
+        } else if op == 4 {
+            iop = 17  // fmod
+        } else if op == 24 {
+            iop = 16  // \= 浮点：先 fdiv，随后套 floor（见下）
+        }
+    }
+    if iop < 0 {
+        return -1
+    }
+    var inst = ir.new_inst(g_cur_block, iop, ty)
+    ir.add_operand(inst, lv, 0)
+    ir.add_operand(inst, rv, 0)
+    var res = ir.get_value(inst)
+    // p.9.13.3 `\=`（浮点）：fdiv 结果再取 floor，保持与二元 `\` 的 floor-div 语义一致。
+    if op == 24 && is_f {
+        return tig_ext_call1("floor", res, ty, ty)
+    }
+    // p.9.0-S.7 `\=`（有符号整数）：截断商 → floor 商，与二元 `\` 同语义（规范 §3.3）。
+    // 无符号/char/trit 在 tig_floor_fix_div 内直接返回截断值（无负值，两者等价）。
+    if op == 24 {
+        return tig_floor_fix_div(lv, res, rv, ty)
+    }
+    // p.9.11 `%%=`（有符号整数）：截断余数 → floor 余数，与二元 `%%` 同语义。
+    // 无符号/char/trit 在 tig_floor_fix_mod 内直接返回截断值（无负值，两者等价）。
+    if op == 26 {
+        return tig_floor_fix_mod(res, rv, ty)
+    }
+    return res
+}
+
+// p.9.13.3 `+` 扩展的辅助：把标量值转成字符串（供 string+标量 拼接）。
+// 复用语料库里的**值级**转换 helper（它们直接吃 SSA 值，不需要调用节点）：
+//   * 整数（含窄整数/无符号）→ 先拓宽到 i64 再 tig_i64_to_str
+//   * f64/f32 → tig_f64_to_str
+//   * bool → cond_br + phi 在 "true"/"false" 两常量间选（与内置 to_string 同语义）
+// 其它类型（表/聚合/指针等）返回 -1——本扩展只面向标量。
+func tig_scalar_to_str(v: i64, t: i64) -> i64 {
+    if types.is_int(t) {
+        var w = stype.int_width(t)
+        var iv = v
+        if w > 0 && w < 64 {
+            iv = tig_widen(v, t, types.named(TK_I64))
+            if iv < 0 {
+                return -1
+            }
+        }
+        return tig_i64_to_str(iv, stype.is_signed(t))
+    }
+    if types.is_float(t) {
+        return tig_f64_to_str(v)
+    }
+    if types.is_bool_like(t) {
+        var t_str = tig_str_lit(interner.intern("\"true\""))
+        var f_str = tig_str_lit(interner.intern("\"false\""))
+        var bcond = tig_cond_to_bool(v, t)
+        var t_blk = ir.new_block(g_cur_func, interner.intern("cat.t"))
+        var f_blk = ir.new_block(g_cur_func, interner.intern("cat.f"))
+        var m_blk = ir.new_block(g_cur_func, interner.intern("cat.m"))
+        var cbr = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+        ir.add_operand(cbr, bcond, 0)
+        ir.add_operand(cbr, t_blk, 1)
+        ir.add_operand(cbr, f_blk, 1)
+        g_cur_block = t_blk
+        var br1 = ir.new_inst(g_cur_block, 30, -1)  // br merge
+        ir.add_operand(br1, m_blk, 1)
+        g_cur_block = f_blk
+        var br2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br2, m_blk, 1)
+        g_cur_block = m_blk
+        // φ 汇合：opcode **33** 是 phi（32 不是——用错会生成 label 类型导致
+        // LLVM 校验报「defined with type 'label' but expected 'ptr'」，实测）。
+        var ph = ir.new_inst(g_cur_block, 33, types.named(TK_STR))  // phi
+        ir.add_operand(ph, t_str, 0)
+        ir.add_operand(ph, t_blk, 1)
+        ir.add_operand(ph, f_str, 0)
+        ir.add_operand(ph, f_blk, 1)
+        return ir.get_value(ph)
+    }
+    sm_err_msg = "'+' 的字符串拼接只支持标量（整数/浮点/bool），不支持 " + types.type_name(t)
+    return -1
+}
+
+// 字符串二元运算：拼接（+）→ tie 运行时 str_cat 桥（tie_str_cat 无——用
+// llvmgen 的 str_cat(56) 指令，llvmgen 内联 malloc+memcpy）；比较 → strcmp。
+// 复用 ir opcode：str_cat(56) 拼接；比较走 icmp(12) + 桥 strcmp。
+func tig_binary_str(op: i64, lv: i64, rv: i64) -> i64 {
+    if op == 0 {
+        // 拼接：str_cat(56) 指令 [lhs, rhs]
+        var inst = ir.new_inst(g_cur_block, 56, types.named(TK_STR))
+        ir.add_operand(inst, lv, 0)
+        ir.add_operand(inst, rv, 0)
+        return ir.get_value(inst)
+    }
+    // 比较：strcmp(lv, rv) → i32；再与 0 比较。
+    // strcmp 是 libc 函数（llvmgen 无条件 declare），走 extern_call(36)。
+    var cmp = tig_ext_call2("strcmp", lv, types.named(TK_STR), rv, types.named(TK_STR), types.named(TK_I32))
+    if cmp < 0 {
+        return -1
+    }
+    var c: i64 = -1
+    if op == 5 {
+        c = 0  // ==
+    } else if op == 6 {
+        c = 1  // !=
+    } else if op == 7 {
+        c = 2  // <
+    } else if op == 8 {
+        c = 3  // >
+    } else if op == 9 {
+        c = 4  // <=
+    } else if op == 10 {
+        c = 5  // >=
+    } else {
+        return -1
+    }
+    var inst = ir.new_inst(g_cur_block, 12, types.named(10))  // icmp i1
+    ir.add_operand(inst, cmp, 0)
+    ir.add_operand(inst, 0, 2)
+    ir.add_operand(inst, c, 2)
+    return ir.get_value(inst)
+}
+
+// 逻辑短路 && / ||：cond_br + phi 汇合（对齐 Rust ir.rs）。
+//   a && b：br a → then(求 b) / else(false)；then 后 phi [b, then], [false, else]
+//   a || b：br a → then(true) / else(求 b)；else 后 phi [true, then], [b, else]
+func tig_logic_short(op: i64, lhs: i64, rhs: i64) -> i64 {
+    var lv = tig_expr(lhs)
+    if lv < 0 {
+        return -1
+    }
+    var then_blk = ir.new_block(g_cur_func, interner.intern("sc.then"))
+    var else_blk = ir.new_block(g_cur_func, interner.intern("sc.else"))
+    var merge_blk = ir.new_block(g_cur_func, interner.intern("sc.merge"))
+    var cbr = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbr, lv, 0)
+    if op == 11 {
+        // &&：lv 真 → 求 b；假 → false
+        ir.add_operand(cbr, then_blk, 1)
+        ir.add_operand(cbr, else_blk, 1)
+    } else {
+        // ||：lv 真 → true；假 → 求 b
+        ir.add_operand(cbr, then_blk, 1)
+        ir.add_operand(cbr, else_blk, 1)
+    }
+    // then 分支
+    g_cur_block = then_blk
+    var tv: i64 = 0
+    if op == 11 {
+        var bv = tig_expr(rhs)
+        if bv < 0 {
+            return -1
+        }
+        tv = bv
+    } else {
+        // || 短路 true：i1 字面量 true
+        tv = tig_bool_lit(1)
+    }
+    // 值实际产生块：rhs 若为嵌套短路，g_cur_block 已是其内部 merge 块
+    // （phi 的 incoming 前驱必须用该块，否则违反 LLVM 支配规则）
+    var tv_blk = g_cur_block
+    if !block_terminated() {
+        var br1 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br1, merge_blk, 1)
+    }
+    // else 分支
+    g_cur_block = else_blk
+    var ev: i64 = 0
+    if op == 11 {
+        ev = tig_bool_lit(0)
+    } else {
+        var bv2 = tig_expr(rhs)
+        if bv2 < 0 {
+            return -1
+        }
+        ev = bv2
+    }
+    var ev_blk = g_cur_block
+    if !block_terminated() {
+        var br2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br2, merge_blk, 1)
+    }
+    // merge：phi 合流（incoming 前驱块 = 值实际产生块，非写死的 then/else 块）
+    g_cur_block = merge_blk
+    var phi = ir.new_inst(g_cur_block, 33, types.named(TK_BOOL))  // phi i1
+    ir.add_operand(phi, tv, 0)
+    ir.add_operand(phi, tv_blk, 1)
+    ir.add_operand(phi, ev, 0)
+    ir.add_operand(phi, ev_blk, 1)
+    return ir.get_value(phi)
+}
+
+// 当前块是否已 terminated（ret/br/cond_br）——块尾汇合 br 生成前检查，
+// 避免 ret 后追加死代码 br（LLVM 解析 terminator 后的指令会编号错乱：
+// "instruction expected to be numbered" 报错）
+func block_terminated() -> bool {
+    var en = ir.block_end(g_cur_block)
+    if en <= ir.block_start(g_cur_block) {
+        return false
+    }
+    var lop = ir.ins_op(en - 1)
+    return lop == 30 || lop == 31 || lop == 32
+}
+
+}

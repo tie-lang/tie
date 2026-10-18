@@ -1,0 +1,291 @@
+type tie<class>
+// compiler/interp/call_builtin_seg1.tie —— call_builtin 分派链分段 1（p.9.21 G2 单函数 ≤300 行）
+// ============================================================
+// 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
+// 与原函数同 namespace，跨文件裸名互调；p.9.17.2 Value 化后未命中改由
+// 前置名单（interp_call_p2 的 cb_is_seg1）判定，错误统一经 w_err 传播。
+namespace tiep {
+func call_builtin_seg1(name: string, args: table<Value>) -> Value {
+    if name == "gensym" {
+        // S3.3 H3 显式卫生：gensym("前缀") → 唯一标识符（intern 池 + 计数器）。
+        // 宏体内生成导出/共享名，经插值（$name / $nm 名字位置）使用。
+        if len(args) != 1 {
+            w_err = "gensym 需要一个字符串前缀参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_STR {
+            w_err = "gensym 需要一个字符串前缀参数"
+            return Value.Nil
+        }
+        g_gensym_n = g_gensym_n + 1
+        return vval.new_str("__tie_gensym" + to_string(g_gensym_n) + "_" +
+            vval.str_val(args[0]))
+    }
+    if name == "eval_code" {
+        // S3.3 C3 编译期 eval：eval_code("源码") → code 值（AST 协议文本）。
+        // 编译期代码生成（宏体内用）；源码必须语法合法（解析即校验）。
+        if len(args) != 1 {
+            w_err = "eval_code 需要一个字符串源码参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_STR {
+            w_err = "eval_code 需要一个字符串源码参数"
+            return Value.Nil
+        }
+        var src = vval.str_val(args[0])
+        var proto = parser.parse_src(src)
+        if has_str_prefix(proto, "ERR:") {
+            w_err = "eval_code 源码语法错误: " + proto
+            return Value.Nil
+        }
+        return vval.new_code(proto)
+    }
+    if name == "eval_expr" {
+        // M4（dev33 批次9）：eval_expr("表达式源码") → code 值（根 = 表达式
+        // 子树）。eval_code 只能解析完整程序，表达式需独立入口——包装成
+        // `func __tie_wrap__() -> i64 { return ( <expr> ) }` 解析后抽取
+        // return 表达式子树序列化。编译期常量计算宏（任务25）用它注入
+        // 计算结果字面量。
+        if len(args) != 1 {
+            w_err = "eval_expr 需要一个字符串参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_STR {
+            w_err = "eval_expr 需要一个字符串参数"
+            return Value.Nil
+        }
+        var src = vval.str_val(args[0])
+        // 单行包装无换行 → ASI 不补分号，return 语句须显式分号
+        var proto = parser.parse_src("func __tie_wrap__() -> i64 { return ( " + src + " ) ; }")
+        if has_str_prefix(proto, "ERR:") {
+            w_err = "eval_expr 源码语法错误: " + proto
+            return Value.Nil
+        }
+        if sstate.load_ast(proto) < 0 {
+            w_err = "内部错误: eval_expr 协议加载失败"
+            return Value.Nil
+        }
+        var p = expr_from_wrap()
+        if w_err != "" {
+            return Value.Nil
+        }
+        return vval.new_code(p)
+    }
+    if name == "println" {
+        var line = join_print(args)
+        println(line)
+        return vval.new_void()
+    }
+    if name == "print" {
+        var line = join_print(args)
+        print(line)
+        return vval.new_void()
+    }
+    if name == "len" {
+        if len(args) != 1 {
+            w_err = "len 需要一个参数"
+            return Value.Nil
+        }
+        var v = args[0]
+        var t = vval.type_of(v)
+        if t == W_STR {
+            // 字节数（与 Rust s.len() 一致；编译路径 len 同语义）
+            return vval.new_int(byte_len(vval.str_val(v)))
+        }
+        if t == W_TABLE || t == W_MAP {
+            return vval.new_int(vval.elem_count(v))
+        }
+        w_err = "len 只支持字符串、表或键值表"
+        return Value.Nil
+    }
+    if name == "str_len" {
+        if len(args) != 1 {
+            w_err = "str_len 需要一个参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_STR {
+            w_err = "str_len 只支持字符串"
+            return Value.Nil
+        }
+        return vval.new_int(str_len(vval.str_val(args[0])))
+    }
+    if name == "str_char" {
+        if len(args) != 2 {
+            w_err = "str_char 需要字符串与整数参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_STR || vval.type_of(args[1]) != W_INT {
+            w_err = "str_char 需要字符串与整数参数"
+            return Value.Nil
+        }
+        return vval.new_str(str_char(vval.str_val(args[0]), vval.int_val(args[1])))
+    }
+    if name == "char_code" {
+        if len(args) != 1 {
+            w_err = "char_code 需要一个字符串参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_STR {
+            w_err = "char_code 需要一个字符串参数"
+            return Value.Nil
+        }
+        return vval.new_int(char_code(vval.str_val(args[0])))
+    }
+    if name == "to_string" {
+        if len(args) != 1 {
+            w_err = "to_string 需要一个数字参数"
+            return Value.Nil
+        }
+        var v = args[0]
+        var t = vval.type_of(v)
+        if t == W_INT {
+            return vval.new_str(to_string(vval.int_val(v)))
+        }
+        if t == W_FLOAT {
+            return vval.new_str(to_string(vval.float_val(v)))
+        }
+        if t == W_TRIT {
+            return vval.new_str(to_string(vval.int_val(v)))
+        }
+        w_err = "to_string 需要一个数字参数"
+        return Value.Nil
+    }
+    if name == "to_trit" {
+        // i64 → 饱和钳制 trit（>0→+1，<0→-1，0→0，对齐 interp_bin clamp_trit）
+        if len(args) != 1 {
+            w_err = "to_trit 需要一个整数参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_INT {
+            if vval.type_of(args[0]) != W_TRIT {
+                w_err = "to_trit 需要一个整数参数"
+                return Value.Nil
+            }
+        }
+        return vval.new_trit(clamp_trit(vval.int_val(args[0])))
+    }
+    if name == "trit_val" {
+        // trit → i64（-1/0/1 直接返回）；trit 盒即 i64，直取 int_val
+        if len(args) != 1 {
+            w_err = "trit_val 需要一个 trit 参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_TRIT {
+            w_err = "trit_val 需要一个 trit 参数"
+            return Value.Nil
+        }
+        return vval.new_int(vval.int_val(args[0]))
+    }
+    if name == "parse_int" {
+        if len(args) != 1 {
+            w_err = "parse_int 需要一个字符串参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_STR {
+            w_err = "parse_int 需要一个字符串参数"
+            return Value.Nil
+        }
+        var s = vval.str_val(args[0])
+        // 非法输入先自检（对齐 Rust str::parse::<i64> 严格文法；语言底座
+        // parse_int 非法时直接退出进程，解释路径必须改为返回错误）
+        if !is_int_text(s) {
+            w_err = "运行时错误: parse_int 参数 '" + s + "' 不是合法的整数"
+            return Value.Nil
+        }
+        return vval.new_int(parse_int(s))
+    }
+    if name == "parse_float" {
+        if len(args) != 1 {
+            w_err = "parse_float 需要一个字符串参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_STR {
+            w_err = "parse_float 需要一个字符串参数"
+            return Value.Nil
+        }
+        var s = vval.str_val(args[0])
+        if !is_float_text(s) {
+            w_err = "运行时错误: parse_float 参数 '" + s + "' 不是合法的浮点数"
+            return Value.Nil
+        }
+        return vval.new_float(parse_float(s))
+    }
+    // 动态表构造：全部返回空表值（与编译路径 table_new_* 语义一致）
+    if name == "table_new_i64" || name == "table_new_f64" ||
+        name == "table_new_string" || name == "table_new_bool" {
+        if len(args) != 0 {
+            w_err = name + " 不需要参数"
+            return Value.Nil
+        }
+        return vval.new_table()
+    }
+    if name == "table_at" {
+        if len(args) != 2 {
+            w_err = "table_at 需要表与整数下标参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_TABLE || vval.type_of(args[1]) != W_INT {
+            w_err = "table_at 需要表与整数下标参数"
+            return Value.Nil
+        }
+        var t = args[0]
+        var idx = vval.int_val(args[1])
+        if idx < 0 || idx >= vval.elem_count(t) {
+            w_err = "运行时错误: table_at 下标越界：索引 " + to_string(idx) +
+                " 超出长度 " + to_string(vval.elem_count(t))
+            return Value.Nil
+        }
+        return vval.elem_at(t, idx)
+    }
+    if name == "eval" {
+        if len(args) != 1 {
+            w_err = "eval 需要一个字符串参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_STR {
+            w_err = "eval 需要一个字符串参数"
+            return Value.Nil
+        }
+        // 递归 eval（同一会话；对齐 Rust session.eval）
+        var r = eval(vval.str_val(args[0]))
+        if w_err != "" {
+            return Value.Nil
+        }
+        return vval.new_str(r)
+    }
+    if name == "eval_call" {
+        if len(args) != 2 {
+            w_err = "eval_call 需要两个字符串参数（函数名, 参数）"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_STR || vval.type_of(args[1]) != W_STR {
+            w_err = "eval_call 需要两个字符串参数（函数名, 参数）"
+            return Value.Nil
+        }
+        var r = eval_call(vval.str_val(args[0]), vval.str_val(args[1]))
+        if w_err != "" {
+            return Value.Nil
+        }
+        return vval.new_str(r)
+    }
+    // ==================== M4 token 流 API（宏环境，dev33 批次9） ====================
+    // tokenize：源码字符串 → token 流文本（首行 <N>:，随后每行 <tag> <lexeme>，
+    // 排除末尾 Eof；lexeme 反斜杠/换行转义——保证每 token 单行且往返一致）。
+    if name == "compile_error" {
+        // M4（dev33 批次9 任务27）：宏内主动报编译错误。置 w_err 上抛，
+        // eval_macro/exec 链传播，mexpand 以**调用点**行列号报「宏展开失败:
+        // 编译错误: <消息>」——编译错误定位到宏调用点（任务27 验收）。
+        if len(args) != 1 {
+            w_err = "compile_error 需要一个字符串参数"
+            return Value.Nil
+        }
+        if vval.type_of(args[0]) != W_STR {
+            w_err = "compile_error 需要一个字符串参数"
+            return Value.Nil
+        }
+        w_err = "编译错误: " + vval.str_val(args[0])
+        return Value.Nil
+    }
+    return Value.Nil  // 防御出口：名单前置分派（cb_is_seg1）保证不达
+}
+}

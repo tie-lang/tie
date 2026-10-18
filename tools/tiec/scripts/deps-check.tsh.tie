@@ -1,0 +1,892 @@
+type tie<tsh>
+// scripts/deps-check.tsh.tie —— p.9.21.1 库依赖矩阵门禁（方法分类 16 库 + 公共基建）
+// ============================================================================
+// 依据：tie-main/docs/designs/tiec-modularization-design.md §I1 / §4
+//  * 库按方法域分类（不设 frontend/backend 阶段桶），库间为「使用」关系；
+//  * 每库只允许依赖 ALLOW 段白名单内的库（见 init_matrix）；
+//  * 违规（跨库越界引用）、跨库环、悬空 import、未纳入矩阵的文件 = FAIL（退出码 1）；
+//  * 附带输出各库规模（文件数 / 行数 / 超 800 行文件数）供 p.9.21.3 跟踪。
+//
+// 用法：<tsh> -f scripts/deps-check.tsh.tie [-v]
+//   [-v] 打印违规边样例文件对（默认只打印计数）
+// 环境（可选）：
+//   TIE_DEPS_ROOT    只扫指定子树（相对仓库根，如 compiler/middle），便于分片调试
+//   TIE_DEPS_NO_SIZE 置 1 跳过行数统计（统计需逐文件调用 find，约 200 次进程启动）
+//   TIE_DEPS_FINDSTR / TIE_DEPS_FIND  外部工具路径覆盖（默认 C:\Windows\System32\*.exe）
+//
+// 性能与实现约束（实测，务必遵守，否则脚本会慢到不可用）：
+//  * tsh 解释器执行 tie 代码约 5 万语句/秒量级——禁止在解释器里逐字符扫全仓源码
+//    （全仓 300 万字符 = 数分钟以上）；重活交给 findstr/find，解释器只处理小输出；
+//  * split_lines 实测 O(n) 且很快（130KB/31ms），可放心用于工具输出；
+//  * 表作形参是值拷贝（函数内改表无效）→ 共享状态一律用全局表直接写；
+//  * 顶层 `var x = f()` 的初始化会被提升到最前执行 → 顺序敏感逻辑收进单一入口函数；
+//  * 函数内 while 中出现「标志位 + 嵌套 if/else」形态会不终止（interp 缺陷）→ 只用扁平单层 if。
+// EN: dependency-direction gate for the tiec method libraries — forbidden cross-library
+//     imports, cycles, dangling imports and unclassified files fail the gate. Native
+//     tools do the bulk text work; the interpreter only handles small outputs.
+
+// ---------------------------------------------------------------------------
+// 0. 基础工具（仅用于短字符串：路径与 import 目标）
+// ---------------------------------------------------------------------------
+
+func bstr(b: bool) -> string {
+    if b {
+        return "T"
+    }
+    return "F"
+}
+
+func has_pre(s: string, p: string) -> bool {
+    if str_len(s) < str_len(p) {
+        return false
+    }
+    return substr(s, 0, str_len(p)) == p
+}
+
+func has_suf(s: string, p: string) -> bool {
+    if str_len(s) < str_len(p) {
+        return false
+    }
+    return substr(s, str_len(s) - str_len(p), str_len(s)) == p
+}
+
+func sfind(s: string, sub: string) -> i64 {
+    return sfind_from(s, sub, 0)
+}
+
+// 首个匹配子串起点；无匹配返回 -1
+func sfind_from(s: string, sub: string, from: i64) -> i64 {
+    var n = str_len(s)
+    var m = str_len(sub)
+    if m == 0 {
+        return -1
+    }
+    var i = from
+    while i + m <= n {
+        if substr(s, i, i + m) == sub {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 末尾匹配子串起点；无匹配返回 -1
+func sfind_last(s: string, sub: string) -> i64 {
+    var n = str_len(s)
+    var m = str_len(sub)
+    if m == 0 {
+        return -1
+    }
+    var i = n - m
+    while i >= 0 {
+        if substr(s, i, i + m) == sub {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+func last_sep(s: string) -> i64 {
+    return sfind_last(s, "\\")
+}
+
+func dir_of(s: string) -> string {
+    var k = last_sep(s)
+    if k < 0 {
+        return ""
+    }
+    return substr(s, 0, k)
+}
+
+func base_of(s: string) -> string {
+    var k = last_sep(s)
+    if k < 0 {
+        return s
+    }
+    return substr(s, k + 1, str_len(s))
+}
+
+func is_ws(ch: string) -> bool {
+    if ch == " " {
+        return true
+    }
+    if ch == "\t" {
+        return true
+    }
+    if ch == "\r" {
+        return true
+    }
+    if ch == "\n" {
+        return true
+    }
+    return false
+}
+
+// 去首尾空白（仅用于工具输出的小字符串）
+func trim_ws(s: string) -> string {
+    var a: i64 = 0
+    var n = str_len(s)
+    while a < n && is_ws(str_char(s, a)) {
+        a = a + 1
+    }
+    var b = n
+    while b > a && is_ws(str_char(s, b - 1)) {
+        b = b - 1
+    }
+    return substr(s, a, b)
+}
+
+// 路径归一（"\\" 分隔）：消解 "." 与 ".."；栈 = 表 + 逻辑长度
+func norm_path(p: string) -> string {
+    var segs = table_new_string()
+    var top: i64 = 0
+    var cur = ""
+    var i: i64 = 0
+    var n = str_len(p)
+    while i <= n {
+        var ch = "\\"
+        if i < n {
+            ch = str_char(p, i)
+        }
+        if ch == "\\" {
+            if !is_empty(cur) && cur != "." {
+                if cur == ".." {
+                    if top > 0 {
+                        top = top - 1
+                    }
+                } else {
+                    if top < len(segs) {
+                        segs[top] = cur
+                    } else {
+                        table_push(segs, cur)
+                    }
+                    top = top + 1
+                }
+            }
+            cur = ""
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    var out = ""
+    var j: i64 = 0
+    while j < top {
+        if j > 0 {
+            out = out + "\\"
+        }
+        out = out + segs[j]
+        j = j + 1
+    }
+    return out
+}
+
+// import 目标（"/" 分隔）→ 原生路径（"\\" 分隔）
+func to_back(s: string) -> string {
+    var out = ""
+    var i: i64 = 0
+    var n = str_len(s)
+    while i < n {
+        var ch = str_char(s, i)
+        if ch == "/" {
+            ch = "\\"
+        }
+        out = out + ch
+        i = i + 1
+    }
+    return out
+}
+
+func pad_right(s: string, w: i64) -> string {
+    var out = s
+    while str_len(out) < w {
+        out = out + " "
+    }
+    return out
+}
+
+func pad_left(s: string, w: i64) -> string {
+    var out = s
+    while str_len(out) < w {
+        out = " " + out
+    }
+    return out
+}
+
+// ---------------------------------------------------------------------------
+// 1. 库编号与共享状态
+// ---------------------------------------------------------------------------
+// 16 个方法库 + core（lib/dispatch.tie 等公共基建，全库可依赖）+ trm / legacy / external 登记位。
+
+var L_INTERNER: i64 = 0
+var L_BYTES: i64 = 1
+var L_COLUMNAR: i64 = 2
+var L_DIAG: i64 = 3
+var L_TYPES: i64 = 4
+var L_IR: i64 = 5
+var L_LEX: i64 = 6
+var L_AST: i64 = 7
+var L_PARSE: i64 = 8
+var L_SEMA: i64 = 9
+var L_IRGEN: i64 = 10
+var L_LLVMGEN: i64 = 11
+var L_TIEP: i64 = 12
+var L_PASSES: i64 = 13
+var L_TIEIR: i64 = 14
+var L_CONFIG: i64 = 15
+var L_DRIVER: i64 = 16
+var L_CORE: i64 = 17
+var L_TRM: i64 = 18
+var L_LEGACY: i64 = 19
+var L_EXTERNAL: i64 = 20
+
+var LIB_N: i64 = 21
+var GATED_N: i64 = 20
+
+var g_name = table_new_string()
+var g_allow = table_new_i64()
+var g_cnt = table_new_i64()
+var g_ex_src = table_new_string()
+var g_ex_dst = table_new_string()
+var g_ex_n = table_new_i64()
+var g_files = table_new_i64()
+var g_lines = table_new_i64()
+var g_over = table_new_i64()
+var g_maxln = table_new_i64()
+var g_maxfile = table_new_string()
+var g_rule_kind = table_new_i64()
+var g_rule_pat = table_new_string()
+var g_rule_lib = table_new_i64()
+var g_ext_name = table_new_string()
+var g_ext_cnt = table_new_i64()
+var g_unres = table_new_string()
+var g_skip = table_new_i64()
+var g_verbose: i64 = 0
+var g_no_size: i64 = 0
+var g_scan_n: i64 = 0
+var g_root = ""
+var g_findstr = ""
+var g_find = ""
+
+func slot(a: i64, b: i64) -> i64 {
+    return a * LIB_N + b
+}
+
+// 样例槽：每边 4 个
+func xslot(e: i64, k: i64) -> i64 {
+    return e * 4 + k
+}
+
+func push_name(nm: string) {
+    table_push(g_name, nm)
+}
+
+func allow(a: i64, b: i64) {
+    g_allow[slot(a, b)] = 1
+}
+
+func rule(kind: i64, pat: string, lib: i64) {
+    table_push(g_rule_kind, kind)
+    table_push(g_rule_pat, pat)
+    table_push(g_rule_lib, lib)
+}
+
+// 边登记 + 样例（每边最多 3 例）
+func note_edge(src: i64, dst: i64, sfile: string, dfile: string) {
+    var e = slot(src, dst)
+    g_cnt[e] = g_cnt[e] + 1
+    var k = g_ex_n[e]
+    if k < 3 {
+        g_ex_src[xslot(e, k)] = sfile
+        g_ex_dst[xslot(e, k)] = dfile
+        g_ex_n[e] = k + 1
+    }
+}
+
+func note_ext(name: string) {
+    var i: i64 = 0
+    while i < len(g_ext_name) {
+        if g_ext_name[i] == name {
+            g_ext_cnt[i] = g_ext_cnt[i] + 1
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_ext_name, name)
+    table_push(g_ext_cnt, 1)
+}
+
+func note_unres(rec: string) {
+    if len(g_unres) < 40 {
+        table_push(g_unres, rec)
+    }
+}
+
+func bump_skip(k: i64) {
+    g_skip[k] = g_skip[k] + 1
+}
+
+func note_size(lib: i64, rel: string, nl: i64) {
+    g_files[lib] = g_files[lib] + 1
+    g_lines[lib] = g_lines[lib] + nl
+    if nl > 800 {
+        g_over[lib] = g_over[lib] + 1
+    }
+    if nl > g_maxln[lib] {
+        g_maxln[lib] = nl
+        g_maxfile[lib] = rel
+    }
+}
+
+// 相对路径 → 库编号；未纳入矩阵返回 -1
+func lib_of(rel: string) -> i64 {
+    var i: i64 = 0
+    while i < len(g_rule_kind) {
+        var kind = g_rule_kind[i]
+        var pat = g_rule_pat[i]
+        var hit = false
+        if kind == 0 {
+            hit = rel == pat
+        } else {
+            if kind == 1 {
+                hit = has_pre(rel, pat)
+            } else {
+                hit = has_suf(rel, pat)
+            }
+        }
+        if hit {
+            return g_rule_lib[i]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ---------------------------------------------------------------------------
+// 2. 初始化
+// ---------------------------------------------------------------------------
+
+func zero_globals() {
+    var i: i64 = 0
+    while i < LIB_N * LIB_N {
+        table_push(g_allow, 0)
+        table_push(g_cnt, 0)
+        table_push(g_ex_n, 0)
+        i = i + 1
+    }
+    var e: i64 = 0
+    while e < LIB_N * LIB_N * 4 {
+        table_push(g_ex_src, "")
+        table_push(g_ex_dst, "")
+        e = e + 1
+    }
+    var j: i64 = 0
+    while j < 8 {
+        table_push(g_skip, 0)
+        j = j + 1
+    }
+    var k: i64 = 0
+    while k < LIB_N {
+        table_push(g_files, 0)
+        table_push(g_lines, 0)
+        table_push(g_over, 0)
+        table_push(g_maxln, 0)
+        table_push(g_maxfile, "")
+        k = k + 1
+    }
+}
+
+func init_libs() {
+    push_name("interner")
+    push_name("bytes")
+    push_name("columnar")
+    push_name("diag")
+    push_name("types")
+    push_name("ir")
+    push_name("lex")
+    push_name("ast")
+    push_name("parse")
+    push_name("sema")
+    push_name("irgen")
+    push_name("llvmgen")
+    push_name("tiep")
+    push_name("passes")
+    push_name("tieir")
+    push_name("config")
+    push_name("driver")
+    push_name("core")
+    push_name("trm")
+    push_name("legacy")
+    push_name("external")
+}
+
+func init_matrix() {
+    zero_globals()
+
+    // 设计 §I1 依赖方向（直接依赖白名单）
+    allow(L_TYPES, L_INTERNER)
+    allow(L_IR, L_INTERNER)
+    allow(L_IR, L_COLUMNAR)
+    allow(L_IR, L_TYPES)
+    allow(L_LEX, L_INTERNER)
+    allow(L_LEX, L_DIAG)
+    allow(L_AST, L_INTERNER)
+    allow(L_PARSE, L_LEX)
+    allow(L_PARSE, L_AST)
+    allow(L_PARSE, L_INTERNER)
+    allow(L_PARSE, L_DIAG)
+    allow(L_SEMA, L_AST)
+    allow(L_SEMA, L_TYPES)
+    allow(L_SEMA, L_DIAG)
+    allow(L_SEMA, L_INTERNER)
+    allow(L_IRGEN, L_AST)
+    allow(L_IRGEN, L_IR)
+    allow(L_IRGEN, L_SEMA)
+    allow(L_LLVMGEN, L_IR)
+    allow(L_TIEP, L_IR)
+    allow(L_PASSES, L_IR)
+    allow(L_TIEIR, L_IR)
+    allow(L_TRM, L_IR)
+    allow(L_TRM, L_INTERNER)
+    allow(L_TRM, L_COLUMNAR)
+    // p.9.21 G3：trm 加载 .tieir 分发单元是该后端自身的输入契约（正向后端依赖，
+    // 非越界）——加载器读模块 ABI 恒合法，故不把 tieir 并入 ir 库。
+    allow(L_TRM, L_TIEIR)
+
+    // 基础方法库（interner/bytes/core）对所有库开放 + driver 持编排权
+    var i: i64 = 0
+    while i <= L_DRIVER {
+        allow(L_DRIVER, i)
+        allow(i, L_CORE)
+        allow(i, L_INTERNER)
+        allow(i, L_BYTES)
+        i = i + 1
+    }
+    allow(L_TRM, L_CORE)
+    allow(L_LEGACY, L_CORE)
+}
+
+func init_rules() {
+    // 精确规则（先匹配）
+    rule(0, "compiler\\lib\\interner.tie", L_INTERNER)
+    rule(0, "compiler\\lib\\interner_test.tie", L_INTERNER)
+    rule(0, "compiler\\lib\\bytes.tie", L_BYTES)
+    rule(0, "compiler\\lib\\columnar.tie", L_COLUMNAR)
+    rule(0, "compiler\\lib\\columnar_test.tie", L_COLUMNAR)
+    rule(0, "compiler\\lib\\dispatch.tie", L_CORE)
+    rule(0, "compiler\\lib\\dispatch_test.tie", L_CORE)
+    rule(0, "compiler\\frontend\\ast.tie", L_AST)
+    rule(0, "compiler\\frontend\\ast_test.tie", L_AST)
+    // 注意：frontend/stype.tie 不是 tie.types 库——它是**语义层**的 AST→类型 id
+    // 映射器（s* 家族成员），归 sema；tie.types = middle/types.tie 的类型 id 编码。
+    rule(0, "compiler\\frontend\\stype.tie", L_SEMA)
+    // error_driver.tie 是错误 golden 语料的**编排入口**（自带 main，驱动 sema），
+    // 不是 diag 库的成员——归 driver，否则 diag 会被算成反向依赖 sema。
+    rule(0, "compiler\\frontend\\error_driver.tie", L_DRIVER)
+    rule(0, "compiler\\middle\\data.tie", L_IR)
+    rule(0, "compiler\\middle\\ir.tie", L_IR)
+    rule(0, "compiler\\middle\\ir_meta.tie", L_IR)
+    rule(0, "compiler\\middle\\ir_test.tie", L_IR)
+    rule(0, "compiler\\middle\\types.tie", L_TYPES)
+    rule(0, "compiler\\middle\\types_test.tie", L_TYPES)
+    rule(0, "compiler\\middle\\passes.tie", L_PASSES)
+    rule(0, "compiler\\middle\\tieir_ser.tie", L_TIEIR)
+    rule(0, "compiler\\middle\\tieir_test.tie", L_TIEIR)
+    rule(0, "compiler\\config.tie", L_CONFIG)
+    rule(0, "compiler\\driver.tie", L_DRIVER)
+    rule(0, "compiler\\driver-lite.tie", L_DRIVER)
+    rule(0, "compiler\\mode.tie", L_DRIVER)
+    rule(0, "compiler\\pipeline.tie", L_DRIVER)
+    rule(0, "compiler\\repl.tie", L_DRIVER)
+    rule(0, "compiler\\tdzd.tie", L_DRIVER)
+    rule(0, "compiler\\zdpub.tie", L_DRIVER)
+    rule(0, "compiler\\zdwrite.tie", L_DRIVER)
+    // 前缀规则（由具体到泛化）
+    // 注：`_pN`/`_qN` 分片文件必须跟随其主文件的库归属，否则会落到目录级泛化规则上
+    //     （例如 middle\types_q1.tie 落到 middle\ → ir，被误判成 types → ir 越界）。
+    rule(1, "compiler\\config", L_CONFIG)
+    rule(1, "compiler\\driver\\", L_DRIVER)
+    rule(1, "compiler\\frontend\\stype", L_SEMA)
+    rule(1, "compiler\\frontend\\lex", L_LEX)
+    rule(1, "compiler\\frontend\\diagcode", L_DIAG)
+    rule(1, "compiler\\frontend\\error", L_DIAG)
+    rule(1, "compiler\\frontend\\consteval", L_SEMA)
+    rule(1, "compiler\\frontend\\mexpand", L_PARSE)
+    rule(1, "compiler\\frontend\\cfg_preproc", L_PARSE)
+    rule(1, "compiler\\frontend\\p", L_PARSE)
+    rule(1, "compiler\\frontend\\s", L_SEMA)
+    rule(1, "compiler\\backend\\irgen", L_IRGEN)
+    rule(1, "compiler\\backend\\builtin_expr_seg", L_IRGEN)
+    rule(1, "compiler\\backend\\tig_expr_seg", L_IRGEN)
+    rule(1, "compiler\\backend\\llvmgen", L_LLVMGEN)
+    rule(1, "compiler\\backend\\toolchain", L_LLVMGEN)
+    rule(1, "compiler\\tiep\\", L_TIEP)
+    rule(1, "compiler\\middle\\pass\\", L_PASSES)
+    rule(1, "compiler\\middle\\passes", L_PASSES)
+    rule(1, "compiler\\middle\\types", L_TYPES)
+    rule(1, "compiler\\middle\\", L_IR)
+    rule(1, "compiler\\keel\\", L_DRIVER)
+    rule(1, "compiler\\dbug\\", L_DRIVER)
+    rule(1, "compiler\\trm\\", L_TRM)
+    rule(1, "compiler\\proto\\", L_LEGACY)
+}
+
+// ---------------------------------------------------------------------------
+// 3. 扫描（原生工具取重活，解释器只做小数据处理）
+// ---------------------------------------------------------------------------
+
+// 跳过判定：返回 ≥0 表示跳过原因编号，-1 表示参与门禁
+func skipped(rel: string, base: string) -> i64 {
+    if has_suf(rel, ".tsh.tie") {
+        return 0
+    }
+    if !has_suf(rel, ".tie") {
+        return 1
+    }
+    if has_pre(base, "_") {
+        return 2
+    }
+    if has_pre(base, "README") {
+        return 3
+    }
+    if sfind(rel, "\\backuptmp\\") >= 0 {
+        return 4
+    }
+    if sfind(rel, "\\_bak") >= 0 {
+        return 5
+    }
+    return -1
+}
+
+// 外部库前缀归一："/std/string.tie" → "std"
+func ext_of(tgt: string) -> string {
+    var t = substr(tgt, 1, str_len(tgt))
+    var k = sfind(t, "/")
+    if k < 0 {
+        return t
+    }
+    return substr(t, 0, k)
+}
+
+// 行数统计：type <file> | find /c /v ""（实测 find 直接带文件参数经 exec_output 调用恒为空，
+// 走 stdin 管道形态可用）；失败返回 0
+func count_lines(full: string) -> i64 {
+    var out = exec_output("cmd /c type \"" + full + "\" | " + g_find + " /c /v \"\" 2>nul")
+    var tail = out
+    var k = sfind_last(out, ":")
+    if k >= 0 {
+        tail = substr(out, k + 1, str_len(out))
+    }
+    var nstr = trim_ws(tail)
+    if is_empty(nstr) {
+        return 0
+    }
+    return parse_int(nstr)
+}
+
+// 单条 import 记录处理：rest 形如 `import "./x.tie"`（已剥去 findstr 的文件前缀）
+func handle_import(rel: string, src_lib: i64, rest: string) {
+    if src_lib < 0 || src_lib == L_LEGACY {
+        return
+    }
+    var q1 = sfind(rest, "\"")
+    if q1 < 0 {
+        return
+    }
+    var q2 = sfind_from(rest, "\"", q1 + 1)
+    if q2 <= q1 {
+        return
+    }
+    var tgt = substr(rest, q1 + 1, q2)
+    if is_empty(tgt) {
+        return
+    }
+    if has_pre(tgt, "/") {
+        note_ext(ext_of(tgt))
+        note_edge(src_lib, L_EXTERNAL, rel, tgt)
+        return
+    }
+    var comb = norm_path(dir_of(rel) + "\\" + to_back(tgt))
+    var dst_lib = lib_of(comb)
+    if dst_lib < 0 {
+        note_unres("未纳入矩阵的引用: " + rel + " -> " + comb)
+        return
+    }
+    note_edge(src_lib, dst_lib, rel, comb)
+    if !file_exists(g_root + "\\" + comb) {
+        note_unres("悬空 import: " + rel + " -> " + comb)
+    }
+}
+
+// 扫描根（受 TIE_DEPS_ROOT 控制；分隔符统一为反斜杠，"/" 输入亦接受）
+func scan_dir() -> string {
+    var sub = get_env("TIE_DEPS_ROOT")
+    if is_empty(sub) {
+        return g_root + "\\compiler"
+    }
+    var norm = to_back(sub)
+    while has_suf(norm, "\\") {
+        norm = substr(norm, 0, str_len(norm) - 1)
+    }
+    while has_pre(norm, "\\") {
+        norm = substr(norm, 1, str_len(norm))
+    }
+    return g_root + "\\" + norm
+}
+
+// 文件清单：规模统计 + 跳过项统计（无逐字符扫描）
+func walk_tree() {
+    var files = walk_dir(scan_dir())
+    var i: i64 = 0
+    while i < len(files) {
+        var full = files[i]
+        var rel = full
+        if has_pre(full, g_root + "\\") {
+            rel = substr(full, str_len(g_root) + 1, str_len(full))
+        }
+        var base = base_of(rel)
+        var sk = skipped(rel, base)
+        if sk >= 0 {
+            bump_skip(sk)
+        } else {
+            var lib = lib_of(rel)
+            if lib < 0 {
+                bump_skip(6)
+                note_unres("未纳入矩阵: " + rel)
+            } else {
+                if lib == L_LEGACY {
+                    bump_skip(7)
+                }
+                if g_no_size == 0 {
+                    note_size(lib, rel, count_lines(full))
+                } else {
+                    note_size(lib, rel, 0)
+                }
+            }
+        }
+        g_scan_n = g_scan_n + 1
+        i = i + 1
+    }
+}
+
+// import 边：一次 findstr /S 取全树 import 行 → 逐行解析（行数小，解释器可承受）
+func scan_imports() {
+    var pat = scan_dir() + "\\*.tie"
+    var out = exec_output("cmd /c " + g_findstr + " /S /R /C:\"^import \" \"" + pat + "\" 2>nul")
+    if is_empty(out) {
+        return
+    }
+    var ls = split_lines(out)
+    var i: i64 = 0
+    while i < len(ls) {
+        var ln = ls[i]
+        var c = sfind(ln, ":import ")
+        if c > 0 {
+            var rel = substr(ln, 0, c)
+            if has_pre(rel, g_root + "\\") {
+                rel = substr(rel, str_len(g_root) + 1, str_len(rel))
+            }
+            var base = base_of(rel)
+            if skipped(rel, base) < 0 {
+                handle_import(rel, lib_of(rel), substr(ln, c + 1, str_len(ln)))
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. 输出
+// ---------------------------------------------------------------------------
+
+func show_sizes() {
+    println("库规模（文件 / 行数 / 超 800 行 / 最大文件）:")
+    var i: i64 = 0
+    while i < GATED_N {
+        if i != L_LEGACY && g_files[i] > 0 {
+            println("  " + pad_right(g_name[i], 10) + pad_left(to_string(g_files[i]), 4) + " /" + pad_left(to_string(g_lines[i]), 7) + " /" + pad_left(to_string(g_over[i]), 4) + " / " + g_maxfile[i])
+        }
+        i = i + 1
+    }
+    println("  " + pad_right("legacy", 10) + pad_left(to_string(g_files[L_LEGACY]), 4) + "（proto 原型，豁免门禁与行数上限）")
+}
+
+func show_violations() -> i64 {
+    println("")
+    println("跨库违规边（矩阵外依赖）:")
+    var bad: i64 = 0
+    var a: i64 = 0
+    while a < GATED_N {
+        var b: i64 = 0
+        while b < GATED_N {
+            if a != b && g_cnt[slot(a, b)] > 0 && g_allow[slot(a, b)] == 0 {
+                bad = bad + 1
+                println("  [FAIL] " + g_name[a] + " -> " + g_name[b] + "  (" + to_string(g_cnt[slot(a, b)]) + " 处)")
+                if g_verbose == 1 {
+                    var k: i64 = 0
+                    var m = g_ex_n[slot(a, b)]
+                    while k < m {
+                        println("          " + g_ex_src[xslot(slot(a, b), k)] + " -> " + g_ex_dst[xslot(slot(a, b), k)])
+                        k = k + 1
+                    }
+                }
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    if bad == 0 {
+        println("  无")
+    }
+    return bad
+}
+
+func show_cycles() -> i64 {
+    println("")
+    println("跨库环:")
+    var adj = table_new_i64()
+    var z: i64 = 0
+    while z < LIB_N * LIB_N {
+        table_push(adj, 0)
+        z = z + 1
+    }
+    var a: i64 = 0
+    while a < GATED_N {
+        var b: i64 = 0
+        while b < GATED_N {
+            if a != b && g_cnt[slot(a, b)] > 0 {
+                adj[slot(a, b)] = 1
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    var k: i64 = 0
+    while k < GATED_N {
+        var i: i64 = 0
+        while i < GATED_N {
+            if adj[slot(i, k)] == 1 {
+                var j: i64 = 0
+                while j < GATED_N {
+                    if adj[slot(k, j)] == 1 {
+                        adj[slot(i, j)] = 1
+                    }
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    var cyc: i64 = 0
+    var m: i64 = 0
+    while m < GATED_N {
+        if adj[slot(m, m)] == 1 {
+            cyc = cyc + 1
+            println("  [FAIL] " + g_name[m] + " 处于跨库环中")
+        }
+        m = m + 1
+    }
+    if cyc == 0 {
+        println("  无")
+    }
+    return cyc
+}
+
+func show_ext() {
+    println("")
+    println("外部依赖（tlib 前缀 import，统计用，不参与门禁）:")
+    if len(g_ext_name) == 0 {
+        println("  无")
+        return
+    }
+    var i: i64 = 0
+    while i < len(g_ext_name) {
+        println("  " + pad_right(g_ext_name[i], 10) + to_string(g_ext_cnt[i]) + " 处")
+        i = i + 1
+    }
+}
+
+func show_unres() -> i64 {
+    println("")
+    println("未纳入矩阵 / 悬空 import:")
+    var i: i64 = 0
+    while i < len(g_unres) {
+        println("  " + g_unres[i])
+        i = i + 1
+    }
+    if len(g_unres) == 0 {
+        println("  无")
+    }
+    return len(g_unres)
+}
+
+// ---------------------------------------------------------------------------
+// 5. 入口
+// ---------------------------------------------------------------------------
+
+func entry() -> i64 {
+    g_root = cwd()
+    if has_suf(g_root, "\\") {
+        g_root = substr(g_root, 0, str_len(g_root) - 1)
+    }
+    g_findstr = "C:\\Windows\\System32\\findstr.exe"
+    g_find = "C:\\Windows\\System32\\find.exe"
+    var e1 = get_env("TIE_DEPS_FINDSTR")
+    if !is_empty(e1) {
+        g_findstr = e1
+    }
+    var e2 = get_env("TIE_DEPS_FIND")
+    if !is_empty(e2) {
+        g_find = e2
+    }
+    if get_env("TIE_DEPS_NO_SIZE") == "1" {
+        g_no_size = 1
+    }
+    if arg_count() >= 1 && arg_at(0) == "-v" {
+        g_verbose = 1
+    }
+
+    println("===== tiec deps-check（p.9.21.1 库依赖矩阵门禁）=====")
+    println("仓库根: " + g_root)
+    init_libs()
+    init_matrix()
+    init_rules()
+
+    walk_tree()
+    scan_imports()
+
+    var sub = get_env("TIE_DEPS_ROOT")
+    if !is_empty(sub) {
+        println("扫描范围: " + sub + "（子树模式）")
+    }
+    println("扫描条目: " + to_string(g_scan_n) + "（跳过: 非 .tie " + to_string(g_skip[1]) + " / _ 探针 " + to_string(g_skip[2]) + " / 文档 " + to_string(g_skip[3]) + " / 备份 " + to_string(g_skip[4] + g_skip[5]) + " / legacy " + to_string(g_skip[7]) + "）")
+    println("")
+    show_sizes()
+    var v = show_violations()
+    var c = show_cycles()
+    show_ext()
+    var u = show_unres()
+
+    println("")
+    println("===== 结论 =====")
+    var bad: i64 = v + c + u
+    if bad == 0 {
+        println("PASS：依赖矩阵全绿（无越界引用、无跨库环、无悬空 import）")
+    } else {
+        println("FAIL：越界边 " + to_string(v) + " 条 / 环节点 " + to_string(c) + " 个 / 待修记录 " + to_string(u) + " 条")
+    }
+    return bad
+}
+
+var g_rc: i64 = 0
+func main_() {
+    g_rc = entry()
+}
+main_()
+if g_rc > 0 {
+    exit(1)
+}
+exit(0)

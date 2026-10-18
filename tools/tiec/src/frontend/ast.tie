@@ -1,0 +1,544 @@
+type tie<class>
+// compiler/frontend/ast.tie —— 自举 v2 T2.1：AST 节点 tag 常量表 + 节点池
+// ============================================================
+// 里程碑：自举 v2 计划 T2.1 模块化地基。从阶段 1 原型
+// compiler/proto/parser.tie 提炼：文件头注释的 B1 tag 编号表
+// （权威定义）+ 节点字段布局规范 + 节点池操作（reset_nodes /
+// new_node / set_children / child_at / collect_stmt）。
+//
+// # 职责
+//   1. AST 节点 tag 常量（N_*，与 parser.tie 完全一致，对齐 Rust
+//      ast.rs Stmt/Expr 变体顺序，便于 --ast 对比）；
+//   2. 全局列式节点池（9 张并行表，下标对齐 = 节点 id）；
+//   3. 节点池访问辅助（创建/链接/读取，parser 同款语义）。
+//
+// # 列式节点池布局（B1 arena，下标对齐 = 节点 id）
+//   node_tags       : 节点 tag（判别键，switch node_tags[id] 分派）
+//   node_names      : 字符串池 id（-1 = 无名字；interner 统一接口）
+//   node_vals       : 主整数值（字面量值/运算符编号/标志）
+//   node_aux        : 次整数值（nparams/nsegs/ncases/别名/父名等）
+//   node_child_off  : 子节点段起点（node_children 中的偏移）
+//   node_nchild     : 子节点个数
+//   node_children   : **扁平化**子节点 id 拼接区（段偏移方案）
+//   node_lines      : 起始行（1 起，旁路 span 表）
+//   node_cols       : 起始列（1 起）
+//   节点 i 的子节点 = node_children[node_child_off[i] .. +node_nchild[i])
+//
+// # pub 方法全集（组件契约，p.9.21 G7 库资格①；增删须同步此处与 ROAD）
+//   池生命周期：reset count
+//   字段访问器：tag name val aux line col set_val
+//   构造与链接：new_node set_children
+//   子节点遍历：child_count child_at is_stmt_list collect_stmt
+//   自检：frontend/ast_test.tie（无 driver 可跑）。
+//   说明：N_* tag 常量是**数据契约**的一部分（与 parser.tie 权威表一致），
+//   不在「方法」之列但同样受契约保护——增删 tag 须同步 parser 与本文档。
+//
+// # 节点字段布局规范（children 列表按序，-1 = 无；权威见 parser.tie 头）
+//   表达式：IntLit[val=值] / FloatLit[name=lexeme] / StrLit[name=lexeme]
+//     CharLit[name=lexeme] / BoolLit[val=0/1] / TritLit[val=-1/0/1]
+//     Var[name] / Call[name=函数名, children=[类型实参槽, 实参...]]
+//     Unary[val=一元 op 码, children=[操作数]]
+//     Binary[val=二元 op 码, children=[左, 右]]
+//     Ternary[children=[条件, 真支, 假支]] / Range[val=1=闭区间, 0=半开区间,
+//       children=[起点, 终点]]
+//     TableLit[children=TableCell...] / Index[children=[基址, 下标]]
+//     TupleLit[children=TupleField...]
+//     FieldAccess[name=字段名, children=[基址]] / Path[children=Segment...]
+//     TypeLit[children=[类型节点]] / MethodCall[name=方法名, children=[类型实参槽, 接收者, 实参...]]
+//     TableCell[val=行号, children=[TableId 或 -1, 值]]
+//     TableId[name=字符串键池 id(-1=数字键), val=数字键值]
+//     TupleField[name=字段名(-1=匿名), children=[值]] / Segment[name=段名池 id]
+//   语句：VarDecl[name, val=is_const, children=[类型或 -1, 初值]]
+//     FnDef[name=函数名, val=is_pub, aux=nparams, children=[泛型槽, 返回类型]+参数...+[函数体]]
+//     ExprStmt[children=[表达式]] / Assign[name=目标名, val=op 码(-1=普通), children=[值]]
+//     Return[children=[表达式或 -1]] / If[children=[条件, then, else]]
+//     While[name=循环标签(-1=无), children=[条件, 体]]
+//     For[name=迭代变量, aux=循环标签, children=[迭代对象, 体]]
+//     Break/Continue[name=标签(-1=无)]
+//     Switch[aux=ncases, children=[主体]+cases...+[default]]
+//     Import[name=路径池 id, aux=别名(-1=无)] / Using[aux=nsegs, children=Segment...]
+//     Namespace[aux=nsegs, children=Segment...+[体]]
+//     Struct[name, aux=父名(-1=无), children=[泛型槽, ClassField...]]
+//     Enum[name, children=[泛型槽(-1或N_TYPE_PARAMS), EnumVariant...]]
+//     EnumVariant[name=变体名, children=[payload 类型...]]
+//     FieldAssign[name=字段名, val=op 码, children=[基址, 值]]
+//     IndexAssign[val=op 码, children=[目标, 值]]
+//     Extern[name, aux=nparams, children=[返回类型]+参数...]
+//     Param[name=参数名, val=by_ref(0/1), children=[类型, 默认值或 -1]]
+//     SwitchCase[children=[PatternList, when 或 -1, 体]]
+//     PatternList[children=模式...] / StmtList[children=语句...]
+//     ClassField[name, children=[类型或 -1, 默认值或 -1]]
+//     TupleTypeField[name=字段名(-1=匿名), children=[类型]]
+//
+// # 泛型槽布局约定（2026-08-14，泛型语法 parser 层）
+//   泛型语法（`func max<T>(...)` / `struct Box<T>` / `max<i64>(...)` / `Box<i64>`）
+//   在以下节点 children 头部插入「泛型槽」/「类型实参槽」，**-1 哨兵 = 非泛型**
+//   （硬性约定：所有下游——语义/irgen——按 children[0] 判断 tag 是否
+//   N_TYPE_PARAMS/N_TYPE_ARGS 来偏移，见各消费方适配任务）：
+//     FnDef    : children = [type_params(-1或N_TYPE_PARAMS), 返回类型, 参数..., 函数体]
+//     Struct   : children = [type_params(-1或N_TYPE_PARAMS), ClassField...]
+//     Call     : children = [type_args(-1或N_TYPE_ARGS), 实参...]
+//     MethodCall: children = [type_args(-1或N_TYPE_ARGS), 接收者, 实参...]
+//     StructType: children = [type_args(-1或N_TYPE_ARGS)]  —— `Box<i64>` 类型引用
+//   N_TYPE_PARAMS（声明处类型参数列表）children = N_TYPE_PARAM 节点序列，
+//   N_TYPE_PARAM 的 name 字段 = 类型参数名（如 "T"，存 interner 池 id）。
+//   N_TYPE_ARGS（使用处类型实参列表）children = 现有 parse_type 产出的类型节点
+//   序列（N_NAMED_TYPE / N_TABLE_TYPE / N_MAP_TYPE / N_STRUCT_TYPE / N_TUPLE_TYPE）。
+//   注意：内建泛型 table<T> / map<T> 的 N_TABLE_TYPE/N_MAP_TYPE 布局不变，
+//   它们不占泛型槽（children 直接是元素/值类型节点）。
+//
+// # 设计修订（实测语言边界，2026-08-10，parser 同款）
+//   子节点不用嵌套表，改用**全局扁平表 + 段偏移**：节点创建即确定
+//   tag 与标量字段；子节点先收集进局部表，再经 set_children 一次性
+//   连续批量追加（段偏移 O(1) 读取，无 O(n²) 拼接）。
+//
+// 调用：import 后 ast.new_node(...) / ast.child_at(...)
+// 命名规范：命名空间内函数不加 ast_ 前缀；内部工具私有（非 pub）。
+// 注意：本模块**不 import 任何库**（import 树式展开，同文件被 import
+// 两次会重复定义——DAG 共享在 tie 的 import 机制下不可用）。字符串池
+// id → 文本由消费方经 interner.name_str 完成（见 driver 自检用法）。
+
+// ---------- AST 节点 tag 常量（对齐 Rust ast.rs 变体顺序，权威）----------
+pub const N_INT_LIT: i64 = 0;
+pub const N_FLOAT_LIT: i64 = 1;
+pub const N_STR_LIT: i64 = 2;
+pub const N_CHAR_LIT: i64 = 3;
+pub const N_BOOL_LIT: i64 = 4;
+pub const N_TRIT_LIT: i64 = 5;
+pub const N_VAR: i64 = 6;
+pub const N_CALL: i64 = 7;
+pub const N_UNARY: i64 = 8;
+pub const N_BINARY: i64 = 9;
+pub const N_TERNARY: i64 = 10;
+pub const N_RANGE: i64 = 11;
+pub const N_TABLE_LIT: i64 = 12;
+pub const N_INDEX: i64 = 13;
+pub const N_TUPLE_LIT: i64 = 14;
+pub const N_FIELD_ACCESS: i64 = 15;
+pub const N_PATH: i64 = 16;
+pub const N_TYPE_LIT: i64 = 17;
+pub const N_METHOD_CALL: i64 = 18;
+pub const N_TABLE_CELL: i64 = 19;
+pub const N_TABLE_ID: i64 = 20;
+pub const N_TUPLE_FIELD: i64 = 21;
+pub const N_SEGMENT: i64 = 22;
+// 语句段（Rust Stmt 顺序）
+pub const N_VAR_DECL: i64 = 100;
+pub const N_FN_DEF: i64 = 101;
+pub const N_EXPR_STMT: i64 = 102;
+pub const N_ASSIGN: i64 = 103;
+pub const N_RETURN: i64 = 104;
+pub const N_IF: i64 = 105;
+pub const N_WHILE: i64 = 106;
+pub const N_FOR: i64 = 107;
+pub const N_BREAK: i64 = 108;
+pub const N_CONTINUE: i64 = 109;
+pub const N_SWITCH: i64 = 110;
+pub const N_IMPORT: i64 = 111;
+pub const N_NAMESPACE: i64 = 112;
+pub const N_USING: i64 = 113;
+pub const N_STRUCT: i64 = 114;
+pub const N_FIELD_ASSIGN: i64 = 115;
+pub const N_INDEX_ASSIGN: i64 = 116;
+pub const N_EXTERN: i64 = 117;
+pub const N_PARAM: i64 = 118;
+// 语句辅助段（120-124；125-127 泛型语法节点，2026-08-14 占用原 Label 预留）
+pub const N_SWITCH_CASE: i64 = 120;
+pub const N_PATTERN_LIST: i64 = 121;
+pub const N_STMTLIST: i64 = 122;
+pub const N_CLASS_FIELD: i64 = 123;
+pub const N_TUPLE_TYPE_FIELD: i64 = 124;
+pub const N_TYPE_PARAMS: i64 = 125;  // 泛型声明类型参数列表（children = N_TYPE_PARAM 序列）
+pub const N_TYPE_PARAM: i64 = 126;   // 单个类型参数（name 字段 = 类型参数名，如 "T"）
+pub const N_TYPE_ARGS: i64 = 127;    // 类型实参列表（children = parse_type 产出的类型节点序列）
+pub const N_ENUM: i64 = 128;         // 枚举声明：Enum[name, children=[泛型槽(-1或N_TYPE_PARAMS), EnumVariant...]]
+pub const N_ENUM_VARIANT: i64 = 129; // 枚举变体：EnumVariant[name=变体名, children=[payload 类型...]]
+pub const N_UNSAFE_BLOCK: i64 = 130; // unsafe 块（S1.2 U3）：UnsafeBlock[children=[StmtList]]
+pub const N_ASM: i64 = 131;          // asm! 内联汇编（S1.2 I1）：Asm[name=模板串池 id,
+                                 //   children=[操作数...]；操作数 Param 复用：val=0=in
+                                 //   1=out 2=inout，children=[表达式]]
+pub const N_FN_LIT: i64 = 132;       // func 字面量（S2.2 闭包）：FnLit[name=-1, aux=nparams,
+                                 //   children=[泛型槽(-1), 返回类型或 -1, 参数..., 函数体]]
+                                 //   布局与 N_FN_DEF 一致（解析复用 parse_fn_def 主体），
+                                 //   仅无函数名（name=-1）。
+pub const N_TRY: i64 = 133;          // ? 后缀解包（S2.3）：Try[children=[操作数表达式]]
+                                 //   expr ? —— expr 为 Result/Option：Ok 解包 / Err 提前返回
+pub const N_PANIC: i64 = 134;        // panic 语句（S2.3）：Panic[children=[消息表达式]]
+                                 //   panic("消息") 不可恢复错误（可配置目标行为）
+// S2.4 port 接口模型（docs/plans/port-model.md）：
+//   Port[name=port 名, children=[泛型槽(-1), 方法 FnDef...]]——port 声明 =
+//   方法签名集合（方法无函数体 = 签名声明；体 = -1 占位。默认实现暂不支持，
+//   有体报错，见 S2.4 语义层）。泛型槽恒 -1（第一版 port 不支持泛型）。
+//   编号 138/139：与 S3.3 宏节点（135-137）错开（整合时统一，见下）。
+pub const N_PORT: i64 = 138;
+//   Impl[children=[port 类型节点(N_STRUCT_TYPE), struct 类型节点, 方法 FnDef...]]
+//   ——impl 块 = 把命名空间函数注册为 port 方法（`impl Drawable for Button`）。
+//   方法必须有函数体；语义层以 <struct 名>::<方法名> 全名登记（复用现有
+//   namespace 方法机制与 M2.1.8 自动 ref），vtable 隐式生成（I1）。
+pub const N_IMPL: i64 = 139;
+// 批次 7（dev33 错误处理 C2）：switch case 枚举变体 payload 解构
+//   CaseBind[children=[变体引用（N_VAR 或 N_FIELD_ACCESS）, 绑定变量名池 id]]
+//     —— `case Ok(v):` / `case Result.Ok(v):` —— 命中变体后把 payload 绑定到 v。
+//     仅出现在 SwitchCase 的 PatternList 内。
+pub const N_CASE_BIND: i64 = 140;
+// 一期并发：actor 原生语法
+//   ActorDecl[name=actor 名, aux=字段+方法总数, children=[字段 N_CLASS_FIELD...,
+//   方法 N_FN_DEF...]]。字段与方法混合收集：字段先、方法后，均裸节点序列
+//   （children[0] 起即内容，无泛型槽——一期 actor 不支持泛型）。async 方法
+//   用 N_FN_DEF 的 val bit2（ax%）标记，见 parser。
+pub const N_ACTOR: i64 = 141;
+// 一期并发：run 表达式（`run Counter()` 上下文识别——run 非保留字）
+//   RunActor[name=-1, children=[actor 类型名节点(N_NAMED_TYPE), 实参...]]
+//   —— 表达式位 `run Counter()`：run 后跟 actor 类型名 + 调用实参，产出句柄。
+//   语句位 `run Logger().log("x")`（fire-and-forget）：本节点作方法调用的
+//   接收者，由 MethodCall 后缀链继续处理。
+pub const N_RUN_ACTOR: i64 = 142;
+// 三期 goto/标签（2026-08-23，§7.1.5）：
+//   GotoLabel[name=标签名池 id]——`#[tag.x]` 语句位置标签：标定一条语句前为
+//   跳转点（LLVM 目标基本块起点）。仅 unsafe 函数/块内合法。
+//   Goto[name=目标标签名池 id]——`unsafe goto #x` 无条件跳转（仅 unsafe 上下文）。
+//   与循环标签（E5 `标识符:`）命名空间分离：goto 用 `#[tag.x]` + `#x`。
+pub const N_GOTO_LABEL: i64 = 143;
+pub const N_GOTO: i64 = 144;
+// 三期 A 组 guard<cap> 凭据（§7.1.1 + unsafe-model §13.4）：
+//   GuardGet[children=[能力域名节点(N_NAMED_TYPE 或 -1), 对象绑定表达式或 -1]]
+//     —— `unsafe.get(share)` / `unsafe.get(share -> obj)` 取得凭据（表达式）。
+//   GuardUse[name=凭据变量名池 id, children=[块 StmtList]]——`unsafe use g { ... }`
+//     持证越界块（仅 unsafe 上下文合法；块内以凭据身份开启对应能力域）。
+//   GuardWith[children=[能力域名节点, 块 StmtList]]——`unsafe with(share) { ... }`
+//     作用域临时凭据（退块自动回收）。
+pub const N_GUARD_GET: i64 = 145;
+pub const N_GUARD_USE: i64 = 146;
+pub const N_GUARD_WITH: i64 = 147;
+// P2a（2026-08-30）fn 元素表：调用表达式 `expr(args)`（fn 值表达式作被调者）
+//   CallExpr[children=[被调者表达式, 实参...]]——`t[0](5)` / `get_fn()(x)`。
+//   语义层要求被调者为 fn 类型；间接调用 entry(env, args...)。
+pub const N_CALL_EXPR: i64 = 148;
+// r.1.6.7 `unsafe.revoke(g)` 凭据撤销（§11.6）：GuardRevoke[children=[凭据表达式]]。
+// 撤销该凭据后，由它（传递）派生出的凭据一并失效；仅 unsafe 上下文合法。
+// 与 guard<cap> 同族：纯编译期语义（凭据无运行时表示），故只在语义层登记与诊断。
+pub const N_GUARD_REVOKE: i64 = 149;
+// p.8.1.5 可空链安全访问：name = 字段/方法名池 id（-1 = 索引形态）；
+// 索引形态 children=[base, index]；字段形态 children=[base]；方法形态
+// children=[base, 实参...]（无泛型槽，第一版）
+pub const N_SAFE_ACCESS: i64 = 150;
+// p.8.2.2 命名实参：`f(x: 1, y: 2)`——NamedArg[name=形参名池 id, children=[值]]。
+// 语义层调用检查时按形参名重排为位置实参（改写调用节点 children）。
+pub const N_NAMED_ARG: i64 = 151;
+// p.8.2.10 展开/解包实参：`f(a, xs..., b)`——SpreadArg[children=[expr]]。调用实参
+// 中的 `expr...`：expr 为表/数组时按元素序展开为该位置之后的多个实参（与
+// p.8.1.3 变长泛型形参衔接），展开数量由运行期表长度决定。
+pub const N_SPREAD_ARG: i64 = 152;
+// p.8.2.11 guard else 早退：`guard <cond> else { <stmts> }`——前置条件检查，
+// 条件为假则执行 else 块（该块必须以 return/break/continue 等跳转语句收尾，
+// scheck 约束），随后不再继续；为真则继续向下。children=[cond, else_list]。
+// 语义等价 `if not(cond) { else_list }`（irgen 按 if-not 发射，复用 if AST/IR）。
+pub const N_GUARD_STMT: i64 = 153;
+// p.8.2.5 表/数组推导式（comprehension）：`[expr for 迭代变量 in 源表 if 条件]`
+//   —— 展开构建新表。name=循环变量名池 id（解构形态 `for (a,b) in` 为临时变量
+//   名 `_cN`，element/cond 内对解构名 `a`/`b` 的引用已在解析期改写为
+//   `_cN.Item1`/`_cN.Item2` 字段访问），aux 未用(= -1)，
+//   children=[源表达式, 元素表达式, 筛选条件或 -1]。语义等价：
+//     out = table_new(); for x in src { if !cond 跳过; out.push(expr) }
+pub const N_COMPREHENSION: i64 = 154;
+// S3.3 宏/元编程（三节点，布局约定见 mexpand.tie 头注释）：
+//   MacroDef[name=宏名, val=0, aux=nparams, children=[返回类型, 参数..., 函数体]]
+//     —— 布局与 FnDef 一致但**无泛型槽**（children[0] 即返回类型；形参从 1 起，
+//     函数体在末尾）。宏 = 编译期函数：参数/返回类型必须 code（解析层校验）。
+//   CodeLit[name=-1, val=0=表达式准引用 1=块准引用, children=[子 AST]]
+//     —— `` `(expr) `` 子 AST = 单个表达式节点；`` `{ stmts } `` 子 AST =
+//     StmtList。准引用 = code 字面量（编译期 AST 片段值，C1）。
+//   CodeInterp[name=变量名池 id（`$x` 简单形式）或 -1, children=[表达式或 -1]]
+//     —— `$x` / `$(expr)` 插值：仅准引用内合法；求值时把变量（code/字符串）
+//     的值嵌入准引用 AST（宏参数嵌入 / gensym 标识符插值）。
+pub const N_MACRO_DEF: i64 = 135;
+pub const N_CODE_LIT: i64 = 136;
+pub const N_CODE_INTERP: i64 = 137;
+// p.8.2.12 声明式宏（declarative macro，模板式，区别于既有 N_MACRO_DEF
+// 编译期函数宏）：`macro swap(a, b) { var __t = a; a = b; b = __t }`。
+// name=宏名, aux=nparams, children=[函数体 StmtList, 形参 N_PARAM...]（形参
+// N_PARAM children=[-1]，name=形参名）。展开（mexpand 声明式路径）：
+//   体内与形参同名的裸标识符 = 代换槽（替换为调用实参的**克隆**）；体内由
+//   宏作者引入、`__` 前缀的标识符 = 卫生临时名，每次展开唯一化（加序号后缀），
+//   与调用处同名隔离/不泄漏到调用处。不编译期执行（区别于既有宏），纯模板
+//   代换 + 卫生唯一化（p.8.2.12）。
+pub const N_DECL_MACRO_DEF: i64 = 155;
+// p.9.13.1 单箭头统一：match/switch **表达式**：`let v = switch x { pat -> expr, _ -> expr }`。
+//   复用语句位 switch 的同款模式语法（parse_case_pattern）+ 穷尽检查/守卫/解构
+//  （p.8.1.4），仅分支体为**表达式**且用 `->` 分隔、`_` 作通配缺省臂。
+//   布局（对齐语句位 N_SWITCH）：N_SWITCH_EXPR[aux=ncases, val=1=有 `_` 通配臂,
+//   children=[subject, caseExpr1..caseExprN, defaultExpr 或 -1]]——
+//   caseExpr = N_SWITCH_CASE[children=[N_PATTERN_LIST, when 或 -1, bodyExpr]]；
+//   defaultExpr = `_ -> expr` 的 body 表达式（无 `_` 时该槽为 -1）。
+pub const N_SWITCH_EXPR: i64 = 156;
+// p.9.11.3 try 错误聚合块：`try { stmts }`——块内多个 `?` 传播点聚合（纯语法
+//   分组，块内 `?` 语义与块外一致→传播到当前函数）；块末表达式为 try 块的值
+//   （无末值则 try 作语句，取值规则=末 N_EXPR_STMT 的值）。布局：
+//   N_TRY_BLOCK[children=[块 StmtList]]。表达式节点（parse_primary 识别
+//   `try {`；语句位经 N_EXPR_STMT 包裹）。node_types = 末表达式类型或 -1。
+pub const N_TRY_BLOCK: i64 = 157;
+// p.9.11.4 defer 资源释放：`defer { stmts }`——注册者所在作用域（函数/块）退出
+//   时**逆序**（后注册先执行）执行。块内禁止 return/break/continue/yield/goto/
+//   panic/嵌套 defer（scheck 诊断），允许表达式/赋值/读作用域变量。布局：
+//   N_DEFER[children=[块 StmtList]]。语句节点（parse_stmt 识别 `defer {`）。
+pub const N_DEFER: i64 = 158;
+// p.9.11.6 表不可变更新 `t with {k: v}`：基于左表/记录产出**新表**（值语义纯糖，
+// 等价拷贝+赋值；左表不被修改），右操作数 `with` 后的更新 map 字面量（键:值 对）。
+// 布局：N_WITH[children=[base 表/映射表达式, 更新 map 字面量(N_TABLE_LIT)]]。
+// 未提及键值从 base 拷贝（map 值语义：整表/整映射副本），无法零拷贝共享（容器
+// 扁平数组无结构化共享），裁决=全复制。链式 `t with {a:1} with {b:2}` 左结合。
+pub const N_WITH: i64 = 159;
+// p.9.11.32 类型别名：`alias Name<T...> = TypeNode;`——纯透明别名（语义层
+// 展开替换，无新类型无标称区分）。布局：
+//   TypeAlias[name=别名, children=[类型参数(-1 或 N_TYPE_PARAMS), 目标类型节点]]
+pub const N_TYPE_ALIAS: i64 = 160;
+// p.9.11.15 yield 产出语句：`yield expr;`——生成器函数内产出单个值（本轮
+// 语言侧定稿：生成器 = 声明返回类型的函数，yield 攒入产出表，调用返回表；
+// 惰性协程运行期由 p.9.5.1 trm-lite 承载）。布局：N_YIELD[children=[expr]]。
+// 语句节点（parse_stmt 识别 lex_yield）。scheck 约束：仅具名函数体内合法、
+// 生成器函数须声明返回类型、禁止带值 return；IR = 表 push。
+pub const N_YIELD: i64 = 161;
+// p.9.11.7 切片/区间 `t[1..3]`：下标访问的区间形态——`t[1..3]`（含 1 不含 3）、
+// `t[..n]`（0..n）、`t[n..]`（n..len）、`t[..]`（全拷贝）。布局：
+// N_SLICE[children=[base, start 或 -1(=0), end 或 -1(=len)]]（start/end 为整数
+// 表达式或 -1 表示缺省端）。适用于表/数组（元素类型子表）与 string（字节子串）。
+// 端点闭开：**左闭右开**[start,end)；越界语义：**clamp** 到 [0,len]（与既有一维
+// 下标"越界报错"不同，切片默认收敛/钳制，字符串借 str_sub_bytes 内建 clamp）——
+// 见 sinfer/irgen 注释裁决。负端 → clamp 至 0/len。
+pub const N_SLICE: i64 = 160;
+// p.9.13.4 块管道 `x -> { v -> expr }`（161）：把管道数据绑定到局部名后求值体，
+// 整体是**表达式**（结果 = 体的值）。name = 绑定名池 id；children=[数据表达式, 体]。
+// 语义：绑定 v 的类型 = 数据的推断类型（内联绑定，非闭包——因 tie 闭包形参与返回
+// 类型均不可省略，E00484/E00204，故无法脱糖为闭包）。它是 p.9.13.5 图「节点 =
+// 匿名单参块」形态的前置。
+pub const N_BLOCK_PIPE: i64 = 162;
+// p.9.11.34 语义期**类型引用**节点（163）：`val` = 语义类型 id。
+// 为何需要：语义期消糖造节点时（如赋值位 `f = t -> expr` 展开为闭包），新节点的
+// 类型位（N_PARAM/N_FN_LIT 的 children[0]）本该放**类型 AST 节点**，但语义期手上的
+// 是**类型 id**——而复杂类型（fn/表/聚合）无法逆向构造出等价 AST 节点。
+// 故新增本"引用节点"：只存类型 id，由 sgen.parse_generic_type_node 直接返回该 id
+//（见其 N_SEM_TYPE 分支），任何类型都能表达，无需递归构造。
+const N_SEM_TYPE: i64 = 163;
+// 类型段（val=TyKw 索引，name=类型关键字文本池 id）
+//   StructType[name=结构名, children=[类型实参槽]]——`Box<i64>` 引用含 N_TYPE_ARGS
+//   子节点；`Box` 裸引用 children[0] = -1（兼容现有）。
+pub const N_NAMED_TYPE: i64 = 200;
+pub const N_TUPLE_TYPE: i64 = 201;
+pub const N_STRUCT_TYPE: i64 = 202;
+pub const N_TABLE_TYPE: i64 = 203;
+pub const N_MAP_TYPE: i64 = 204;
+pub const N_FN_TYPE: i64 = 205;      // 函数值类型（S2.2）：FnType[children=[返回类型]+参数类型...]
+                                 //   `fn(A, B) -> R` 类型节点，children[0]=返回类型，
+                                 //   children[1..]=参数类型。与 N_FN_DEF 的返回类型+
+                                 //   参数布局呼应，语义解析按 children 顺序读取。
+pub const N_ARRAY_TYPE: i64 = 206;   // L1 定长数组类型：ArrayType[children=[元素类型, N_INT_LIT]]
+// p.9.11 `is` 类型判定（规范 §3.16）：Is[children=[左操作数表达式, 类型节点]]。
+// 左操作数须为动态类型 any（语义层校验）；右侧由 pexpr_type.parse_type 解析成
+// 类型节点（N_NAMED_TYPE/N_STRUCT_TYPE/N_TABLE_TYPE/N_MAP_TYPE…），语义层把
+// 解析出的类型 id 登记到 node_types[类型节点]（irgen 直读，免二次解析）。
+pub const N_IS: i64 = 207;
+
+// ---------- 二元/一元 op 码（对齐 Rust BinaryOp/UnaryOp 顺序，T2.5 补）----------
+// 二元：0=Add 1=Sub 2=Mul 3=Div 4=Mod 5=Eq 6=NotEq 7=Lt 8=Gt 9=Le 10=Ge
+//   11=And 12=Or 13=BitAnd 14=BitOr 15=BitXor 16=Shl 17=Shr
+pub const B_ADD: i64 = 0;
+pub const B_SUB: i64 = 1;
+pub const B_MUL: i64 = 2;
+pub const B_DIV: i64 = 3;
+pub const B_MOD: i64 = 4;
+pub const B_EQ: i64 = 5;
+pub const B_NOTEQ: i64 = 6;
+pub const B_LT: i64 = 7;
+pub const B_GT: i64 = 8;
+pub const B_LE: i64 = 9;
+pub const B_GE: i64 = 10;
+pub const B_AND: i64 = 11;
+pub const B_OR: i64 = 12;
+pub const B_BITAND: i64 = 13;
+pub const B_BITOR: i64 = 14;
+pub const B_BITXOR: i64 = 15;
+pub const B_SHL: i64 = 16;
+pub const B_SHR: i64 = 17;
+// P1 数据流箭头：18=Fwd(->) 19=Rev(<-)。Fwd：数据在 LHS、目标在 RHS；
+// Rev：数据在 RHS、目标在 LHS（镜像；目标 = 函数/调用 → 传参（数据作末参）；
+// 目标 = 可赋值 lvalue → 赋值）
+pub const B_ARROW_FWD: i64 = 18;
+pub const B_ARROW_REV: i64 = 19;
+// p.8.1.5：20=Elvis（`?:` 安全默认值）——Option<T> ?: T → T（Some 解包 / None 用默认值）
+pub const B_ELVIS: i64 = 20;
+// p.9.11.9 checked 运算：21=+? 22=-? 23=*?（整数溢出即运行期报错）。
+pub const B_CHECK_ADD: i64 = 21;
+pub const B_CHECK_SUB: i64 = 22;
+pub const B_CHECK_MUL: i64 = 23;
+// p.9.13.3 整除运算符 `\`：24=整数截断除（int 走 sdiv；f64 走 floor-div）。
+// 符号改用 `\` 而非设计稿的 `//`——`//` 在 tie 中**已是行注释**（§16.3 符号表），
+// 改注释规则属破坏性改动；`\` 在符号表中完全空闲（0x5C），且有 VB 系先例。
+pub const B_IDIV: i64 = 24;
+// p.9.13.3 幂 `**`（25）与 floor 取余 `%%`（26）。
+// `**`：右结合、优先级高于 `*`（见 pexpr.parse_power）；int 走前置快速幂
+//（`lang::pow_i`），f64 走 libm `pow`——由 irgen 按操作数类型分派。
+// `%%`：与 `\` 成对的 floor 取余——f64 为 `a - floor(a/b)*b`（向 -inf 取整，
+// 与 `/` 的 frem 不同）；int 与 `%` 同（因 int 的 `\` 本身即截断除）。
+pub const B_POW: i64 = 25;
+pub const B_FLOORMOD: i64 = 26;
+// p.9.13.3 checked 幂 `**?`（27）：与 `**` 同级；int 族任一步乘法溢出即运行期
+// 报错（对齐 p.9.11.9 的 `+?`/`-?`/`*?`）。f64 无 checked 语义（溢出即 inf）。
+pub const B_CHECK_POW: i64 = 27;
+// p.9.13.3 `in` 中缀（28）：**语义期中间形态**——解析器只记 `elem in cont`，
+// 由语义层按右操作数类型分派并**重写**为目标库调用（string→str_has 子串 /
+// table→seq_has 元素 / map→map_has 键）。理由：容器类型在解析期不可知，
+// 而在语义期已知（node_types）。重写后本码不再出现于 irgen。
+pub const B_IN: i64 = 28;
+
+// 一元：0=Neg 1=Not 2=PreInc 3=PreDec 4=PostInc 5=PostDec 6=BitNot
+pub const U_NEG: i64 = 0;
+pub const U_NOT: i64 = 1;
+pub const U_PRE_INC: i64 = 2;
+pub const U_PRE_DEC: i64 = 3;
+pub const U_POST_INC: i64 = 4;
+pub const U_POST_DEC: i64 = 5;
+pub const U_BIT_NOT: i64 = 6;
+// p.9.11 `await`（规范 §10.6）：future<T> 凭据取值前缀（unary op，operand =
+// future 表达式；结果类型 = T，由 sinfer 从 future 负载解出并登记 node_types）
+pub const U_AWAIT: i64 = 7;
+
+// ---------- 全局列式节点池（T0.4 全局表：下标对齐 = 节点 id）----------
+var node_tags: table<i64>;       // 第 0 列：节点 tag
+var node_names: table<i64>;      // 第 1 列：字符串池 id（-1 = 无名字）
+var node_vals: table<i64>;       // 第 2 列：主整数值（字面量/运算符/标志）
+var node_aux: table<i64>;        // 第 3 列：次整数值（nparams/nsegs/ncases 等）
+var node_child_off: table<i64>;  // 第 4 列：子节点段起点（node_children 偏移）
+var node_nchild: table<i64>;     // 第 5 列：子节点个数
+var node_children: table<i64>;   // 第 6 列：**扁平化**子节点 id 拼接区
+var node_lines: table<i64>;      // 第 7 列：起始行（1 起）
+var node_cols: table<i64>;       // 第 8 列：起始列（1 起）
+
+namespace ast {
+
+// 重置节点池：清空全部 9 列（每次编译一个源文件前调用）。
+// 与 parser.reset_nodes 同款（节点池部分）。
+pub func reset() {
+    node_tags = table_new_i64()
+    node_names = table_new_i64()
+    node_vals = table_new_i64()
+    node_aux = table_new_i64()
+    node_child_off = table_new_i64()
+    node_nchild = table_new_i64()
+    node_children = table_new_i64()
+    node_lines = table_new_i64()
+    node_cols = table_new_i64()
+}
+
+// 当前节点总数（节点 id 上界，新节点 id = 当前总数）。
+pub func count() -> i64 {
+    return len(node_tags)
+}
+
+// 第 id 个节点的 tag（判别键，switch 分派用）。
+pub func tag(id: i64) -> i64 {
+    return node_tags[id]
+}
+
+// 第 id 个节点的名字字段（字符串池 id，-1 = 无名字；
+// 文本取 interner.name_str(node_names[id])）。
+pub func name(id: i64) -> i64 {
+    return node_names[id]
+}
+
+// 第 id 个节点的主整数值（字面量值/运算符编号/标志）。
+pub func val(id: i64) -> i64 {
+    return node_vals[id]
+}
+
+// 第 id 个节点的次整数值（nparams/nsegs/ncases/别名等）。
+pub func aux(id: i64) -> i64 {
+    return node_aux[id]
+}
+
+// 第 id 个节点的起始行（1 起；旁路 span 表）。
+pub func line(id: i64) -> i64 {
+    return node_lines[id]
+}
+
+// 第 id 个节点的起始列（1 起）。
+pub func col(id: i64) -> i64 {
+    return node_cols[id]
+}
+
+// 创建节点：tag/name/val/aux + span 一次性确定；
+// 子节点稍后经 set_children 批量设置。返回新节点 id。
+pub func new_node(tag: i64, name: i64, val: i64, aux: i64, line: i64, col: i64) -> i64 {
+    table_push(node_tags, tag)
+    table_push(node_names, name)
+    table_push(node_vals, val)
+    table_push(node_aux, aux)
+    table_push(node_child_off, 0)
+    table_push(node_nchild, 0)
+    table_push(node_lines, line)
+    table_push(node_cols, col)
+    return len(node_tags) - 1
+}
+
+// 一次性批量设置子节点：children 已收集完毕，连续 push 进
+// node_children 段，记录段起点与个数。允许含 -1 哨兵槽位。
+// 保证每节点子节点段连续（段偏移 O(1) 读取）。
+pub func set_children(node: i64, children: table<i64>) {
+    node_child_off[node] = len(node_children)
+    var k: i64 = 0
+    while k < len(children) {
+        table_push(node_children, children[k])
+        k = k + 1
+    }
+    node_nchild[node] = len(children)
+}
+
+// 覆盖节点 val 字段（M4：`#[macro]` 属性把 N_MACRO_DEF 的 val 置 1 标记过程宏）。
+pub func set_val(node: i64, v: i64) {
+    node_vals[node] = v
+}
+
+// 子节点个数（无子节点返回 0）。
+pub func child_count(id: i64) -> i64 {
+    return node_nchild[id]
+}
+
+// 第 i 个子节点 id（段偏移读取；越界返回 -1 哨兵）。
+pub func child_at(id: i64, i: i64) -> i64 {
+    var off = node_child_off[id]
+    var n = node_nchild[id]
+    if i < 0 {
+        return -1
+    }
+    if i >= n {
+        return -1
+    }
+    return node_children[off + i]
+}
+
+// 是否 StmtList 节点（解构语句时的多语句包装判别）。
+pub func is_stmt_list(id: i64) -> bool {
+    if id < 0 {
+        return false
+    }
+    return node_tags[id] == N_STMTLIST
+}
+
+// 收集语句到列表：解构 StmtList 时展开其子语句，否则直接收集。
+// list 用 ref 表参数（写回调用方，T0.3 by_ref）。
+pub func collect_stmt(list: ref table<i64>, s: i64) {
+    if is_stmt_list(s) {
+        var k: i64 = 0
+        while k < child_count(s) {
+            table_push(list, child_at(s, k))
+            k = k + 1
+        }
+    } else {
+        table_push(list, s)
+    }
+}
+
+// 节点名字字段 -> 文本：由消费方完成（本模块不依赖字符串池）：
+//   interner.name_str(ast.name(id))——见 lib/interner.tie 的 name_str。
+// 此处仅提供池 id 读取（name(id)），文本转换统一走 interner。
+
+}   // namespace ast

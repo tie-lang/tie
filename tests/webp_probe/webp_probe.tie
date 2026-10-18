@@ -1,0 +1,130 @@
+type tie<logic>
+// tests/webp_probe/webp_probe.tie —— p.9.1.1.2 验收：ext/webp（纯 tie VP8L 无损子集）。
+// 全离线确定性探针；因本机无 libwebp，以 encode→decode 纯 tie 回环为验收依据。
+// 期望全部 PASS / exit 0。
+import "/ext/webp/webp.tie" as webp
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func byte_eq(a: table<i64>, b: table<i64>) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// RGBA 图（w*h）构造：fill 函数给每像素 r,g,b,a。
+func solid(r: i64, g: i64, b: i64, a: i64, w: i64, h: i64) -> table<i64> {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < w * h {
+        table_push(t, r)
+        table_push(t, g)
+        table_push(t, b)
+        table_push(t, a)
+        i = i + 1
+    }
+    return t
+}
+
+// ==================== 1) 16x16 纯色 回环 ====================
+func section_solid() {
+    var img = solid(0x33, 0x88, 0xCC, 0xFF, 16, 16)
+    var enc = webp.encode(img, 16, 16)
+    check(len(enc) > 40, "encode 16x16 non-empty (RIFF+VP8L)")
+    var dec = webp.decode(enc)
+    check(dec.ok, "decode 16x16 solid ok")
+    check(dec.w == 16 && dec.h == 16, "decode 16x16 dims")
+    check(dec.w * dec.h * 4 == len(dec.rgba), "pixel bytes count")
+    check(byte_eq(dec.rgba, img), "16x16 solid roundtrip identical")
+}
+
+// ==================== 2) 多符号图 回环（覆盖 5 树多取值） ====================
+func section_gradient() {
+    var src = table_new_i64()
+    var i: i64 = 0
+    while i < 6 {          // 2x3
+        table_push(src, (i * 40 + 7) & 0xFF)    // R
+        table_push(src, (i * 63 + 11) & 0xFF)   // G
+        table_push(src, (i * 91 + 19) & 0xFF)   // B
+        table_push(src, (i * 3 + 40) & 0xFF)    // A（含半透明）
+        i = i + 1
+    }
+    var enc = webp.encode(src, 2, 3)
+    check(len(enc) > 40, "encode 2x3 non-empty")
+    var dec = webp.decode(enc)
+    check(dec.ok, "decode 2x3 ok")
+    check(dec.w == 2 && dec.h == 3, "2x3 dims")
+    check(byte_eq(dec.rgba, src), "2x3 multi-symbol roundtrip identical")
+}
+
+// ==================== 3) get_info 头解析 ====================
+func section_info() {
+    var img = solid(1, 2, 3, 255, 4, 6)
+    var enc = webp.encode(img, 4, 6)
+    var inf = webp.get_info(enc)
+    check(inf.ok, "get_info ok")
+    check(inf.w == 4 && inf.h == 6, "get_info dims 4x6")
+    check(inf.alpha_used == 0, "get_info opaque alpha_used=0")
+
+    var img2 = solid(1, 2, 3, 128, 2, 2)
+    var enc2 = webp.encode(img2, 2, 2)
+    var inf2 = webp.get_info(enc2)
+    check(inf2.alpha_used == 1, "get_info translucent alpha_used=1")
+}
+
+// ==================== 4) 非法 / 截断输入 ====================
+func section_invalid() {
+    var e1 = webp.decode(table_new_i64())
+    check(e1.ok == false && str_len(e1.err) > 0, "decode empty -> ok=false")
+    // 8 字节非 RIFF 魔数
+    var sig = table_new_i64()
+    var c: i64 = 0
+    while c < 20 {
+        table_push(sig, 0x00)
+        c = c + 1
+    }
+    sig[0] = 0x52; sig[1] = 0x49; sig[2] = 0x46; sig[3] = 0x46
+    sig[8] = 0x00; sig[9] = 0x00; sig[10] = 0x00; sig[11] = 0x00   // 非 WEBP
+    var e2 = webp.decode(sig)
+    check(e2.ok == false, "decode bad WEBP magic -> ok=false")
+    // 全 0 垃圾
+    var junk = table_new_i64()
+    var j: i64 = 0
+    while j < 40 {
+        table_push(junk, 0x2F)
+        j = j + 1
+    }
+    var e3 = webp.decode(junk)
+    check(e3.ok == false, "decode junk -> ok=false")
+}
+
+func main() {
+    println("start")
+    section_solid()
+    section_gradient()
+    section_info()
+    section_invalid()
+    if fails == 0 {
+        println("PASS")
+    } else {
+        println("FAIL count=" + to_string(fails))
+    }
+    println("done")
+}

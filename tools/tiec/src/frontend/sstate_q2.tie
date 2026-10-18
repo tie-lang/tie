@@ -1,0 +1,800 @@
+type tie<class>
+// compiler/frontend/sstate_q2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sstate.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace sstate {
+// 全局变量四列有序插入（返回插入位置）：keys/vals/cons/telems 并行同步移位。
+// 全局变量收集顺序与 intern id 顺序不一致（import 文件全局先收集、主文件
+// 全局后收集但 nid 更小），故 sorted_insert 可能中间插入——若 const/telem
+// 仅 table_push 末尾追加会与 keys/vals 错位（读错行的 const/元素类型）。
+// 参照 sinfer.lv_add 的五列同步移位模式，四列同位置插入。
+pub func sorted_insert_gb(ref keys: table<i64>, ref vals: table<i64>, ref cons: table<i64>, ref telems: table<i64>, ref mods: table<i64>, k: i64, v: i64, c: i64, e: i64, m: i64) -> i64 {
+    var n = len(keys)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if keys[mid] < k {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    table_push(keys, 0)
+    table_push(vals, 0)
+    table_push(cons, 0)
+    table_push(telems, 0)
+    table_push(mods, 0)
+    var i: i64 = n
+    while i > pos {
+        keys[i] = keys[i - 1]
+        vals[i] = vals[i - 1]
+        cons[i] = cons[i - 1]
+        telems[i] = telems[i - 1]
+        mods[i] = mods[i - 1]
+        i = i - 1
+    }
+    keys[pos] = k
+    vals[pos] = v
+    cons[pos] = c
+    telems[pos] = e
+    mods[pos] = m
+    return pos
+}
+
+// 函数签名登记（重复定义检查，返回签名 id 或 -1）。
+// def_node：函数定义 AST 节点 id（fn_def_nodes 平行登记，check_fn_walk 查表用）。
+//
+// ★ E00340 触发域（2026-10-12 实证明文化）：
+//   唯一性键 = **限定全名**（`ns::name` / 顶层裸名），登记表 fn_keys 为**编译
+//   单元级全局**——与导入拓扑无关：
+//     · 两个**顶层**同名函数，无论直接双导入、传递导入还是直接+传递混合，
+//       第二个登记一律 E00340；无「不同导入链豁免」。
+//     · **命名空间成员**按限定名分列（`a::d` 与 `b::d` 各安其位），跨命名
+//       空间同名不冲突——命名空间是顶层裸名的唯一解毒剂。
+//     · 推论：库作者要么给顶层函数取单元级唯一名，要么装进命名空间。
+//   实测依据：v1 直接双导入 / v2 传递式 / v3 混合，三者均 E00340；
+//   `namespace interp` 内的 find_char 与顶层工具函数跨文件共存无碍。
+pub func reg_fn(full_name: string, is_pub: i64, nparams: i64, required: i64, ret_ty: i64, p_tys: table<i64>, p_refs: table<i64>, p_defs: table<i64>, p_vars: table<i64>, def_node: i64) -> i64 {
+    var nid = intern.intern(full_name)
+    if bs_find(fn_keys, nid) >= 0 {
+        sm_err_line = 1
+        sm_err_col = 1
+        // 命名空间函数 vs 顶层函数措辞（对齐 Rust）：A::f → 函数 'f' 在命名空间 'A' 内重复定义
+        var last = rfind_ns(full_name)
+        if last >= 0 {
+            var bare = str.slice(full_name, last + 2, str_len(full_name))
+            var prefix = str.slice(full_name, 0, last)
+            sm_err_msg = "函数 '" + bare + "' 在命名空间 '" + prefix + "' 中重复定义"
+        } else {
+            sm_err_msg = "函数 '" + full_name + "' 重复定义"
+        }
+        return -1
+    }
+    // 程序入口：主文件（file id 0）里最后一段为 main 的函数。命名空间内的
+    // main 记全名（如 "app::main"），由 llvmgen 以 C 入口符号 @main 发射。
+    if file_id_of_node(def_node) == 0 {
+        var lastm = rfind_ns(full_name)
+        var tail = full_name
+        if lastm >= 0 {
+            tail = str.slice(full_name, lastm + 2, str_len(full_name))
+        }
+        if tail == "main" {
+            g_entry_name = full_name
+        }
+    }
+    var sig = len(sg_nparams)
+    var off = len(sp_tys)
+    table_push(sg_nparams, nparams)
+    table_push(sg_required, required)
+    table_push(sg_ret, ret_ty)
+    table_push(sg_pub, is_pub)
+    table_push(sg_off, off)
+    table_push(sg_defnode, def_node)   // p.9.11.22：签名 → 声明节点
+    // p.9.11.15：生成器标记列（与 sg_* 下标对齐；0=普通函数 1=生成器）。
+    // scollect.collect_fn 检测函数体含 N_YIELD 后置 1；scheck/irgen 据此
+    // 校验与生成（签名返回类型已登记为 table<elem>）。
+    table_push(gen_marks, 0)
+    // p.9.21.6-1 模块边界显式化：签名来源模块列（def_node 反查所属文件 id；
+    // 实例化等无源场景 def_node 越界时 file_id_of_node 兜底 0 = 主文件）。
+    table_push(sg_mod, file_id_of_node(def_node))
+    var i: i64 = 0
+    while i < nparams {
+        table_push(sp_tys, p_tys[i])
+        table_push(sp_refs, p_refs[i])
+        table_push(sp_defs, p_defs[i])
+        table_push(sp_vars, p_vars[i])
+        i = i + 1
+    }
+    sorted_insert_fn(fn_keys, fn_vals, fn_def_nodes, nid, sig, def_node)
+    // p.9.22.6 全量符号表：函数声明登记（kind 0；type = 签名 id）。
+    if def_node >= 0 {
+        xref.reg_decl(nid, 0, sig, def_node)
+    }
+    return sig
+}
+
+// 查函数定义 AST 节点 id（未定义 -1）。check_fn_walk 的 O(log n) 快路径。
+pub func fn_def_node(full_name: string) -> i64 {
+    var nid = intern.intern(full_name)
+    var idx = bs_find(fn_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return fn_def_nodes[idx]
+}
+
+// 查函数签名 id（未定义返回 -1）
+pub func fn_sig(full_name: string) -> i64 {
+    var nid = intern.intern(full_name)
+    var idx = bs_find(fn_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return fn_vals[idx]
+}
+
+// p.9.11.15：标记 sig 为生成器函数（函数体含 yield；签名返回类型 = table<elem>）
+pub func mark_gen(sig: i64) {
+    if sig >= 0 && sig < len(gen_marks) {
+        gen_marks[sig] = 1
+    }
+}
+
+// 是否生成器函数（1=是；0/越界=否）
+pub func is_gen(sig: i64) -> i64 {
+    if sig < 0 || sig >= len(gen_marks) {
+        return 0
+    }
+    return gen_marks[sig]
+}
+
+// 函数是否含变参（最后一个形参 sp_vars == 1）；nparams=0 或非变参 → 0
+pub func fn_has_variadic(sig: i64) -> i64 {
+    var n = sg_nparams[sig]
+    if n <= 0 {
+        return 0
+    }
+    return sp_vars[sg_off[sig] + n - 1]
+}
+
+// S1.2：函数是否 unsafe（签名标志位 bit1）。1 = unsafe fn（调用必须在
+// unsafe 上下文，安全代码调用 = 编译错误）
+pub func sig_unsafe(sig: i64) -> i64 {
+    if sig < 0 {
+        return 0
+    }
+    return (sg_pub[sig] >> 1) & 1
+}
+
+// struct 登记（重复/冲突检查，返回 struct 索引或 -1）
+pub func reg_struct(name: string, parent: string) -> i64 {
+    var nid = intern.intern(name)
+    if bs_find(st_keys, nid) >= 0 {
+        sm_err_msg = "struct '" + name + "' 重复定义"
+        return -1
+    }
+    var idx = len(cls_parent)
+    var p_nid: i64 = -1
+    if parent != "" {
+        p_nid = intern.intern(parent)
+    }
+    table_push(cls_parent, p_nid)
+    table_push(cls_fldoff, len(fld_names))
+    table_push(cls_nfld, 0)
+    table_push(cls_done, 0)
+    table_push(st_reprc, 0)
+    // p.9.21.6-1 模块边界显式化：struct 行来源模块列（默认 0 = 主文件；
+    // 调用点持定义节点处回填真实文件 id——collect_struct_decl / sgen_inst）。
+    table_push(st_mod, 0)
+    sorted_insert(st_keys, st_vals, nid, idx)
+    // struct 名登记由上层（stype）经 types.set_struct_name 完成
+    return idx
+}
+
+// enum 登记（重名检查，返回 enum 索引或 -1）。
+// 入参为枚举名的 interner 池 id（升序二分键）。登记时只 push 变体信息
+// 表的占位行（en_nvar/en_varoff/en_nslot/en_done），变体内容由
+// scollect.collect_enum_variants 在 check 前统一填充（对齐 struct 两遍收集）。
+pub func reg_enum(name_id: i64) -> i64 {
+    if bs_find(en_keys, name_id) >= 0 {
+        sm_err_msg = "枚举 '" + intern.lookup(name_id) + "' 重复定义"
+        return -1
+    }
+    var idx = len(en_nvar)
+    table_push(en_nvar, 0)
+    table_push(en_varoff, len(en_vnames))
+    table_push(en_nslot, 0)
+    table_push(en_done, 0)
+    sorted_insert(en_keys, en_vals, name_id, idx)
+    // enum 名登记由上层（scollect）经 types.set_enum_name 完成
+    return idx
+}
+
+// enum 索引 -> 名字（en_keys 按名字排序，须经 en_vals 反查索引位置）
+pub func enum_name_of(idx: i64) -> string {
+    var n = len(en_keys)
+    var i: i64 = 0
+    while i < n {
+        if en_vals[i] == idx {
+            return intern.lookup(en_keys[i])
+        }
+        i = i + 1
+    }
+    return "?"
+}
+
+// 泛型模板索引查询（全名 -> 模板索引；-1 = 未登记）。
+// 模板名与普通函数/struct 名分表存储：同一全名只可能在 gty_keys 或
+// fn_keys/st_keys 之一（collect 阶段分派，重复定义在各自登记处报错）。
+pub func gt_find(full_name: string) -> i64 {
+    var nid = intern.intern(full_name)
+    var idx = bs_find(gty_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return gty_vals[idx]
+}
+
+// 泛型模板登记：node 的 children[0] 必为 N_TYPE_PARAMS（调用方已判定）。
+// 提取类型参数名段（N_TYPE_PARAM 序列的 name 字段，扁平存入 gtyp_names）+
+// 登记定义节点 id / 类别。重复定义返回 -1（sm_err_* 已置）；成功返回模板
+// 索引。登记本身不检查模板体内 TypeVar 引用（T3b 单态化展开时处理）。
+pub func reg_generic(full_name: string, node: i64, is_struct: i64) -> i64 {
+    if gt_find(full_name) >= 0 {
+        sm_err_line = s_lines[node]
+        sm_err_col = s_cols[node]
+        sm_err_msg = "泛型模板 '" + full_name + "' 重复定义"
+        return -1
+    }
+    var tp = child(node, 0)  // N_TYPE_PARAMS 节点
+    var npar = s_nchild[tp]
+    var idx = len(gtyp_nparams)
+    var off = len(gtyp_names)
+    // S2.4 泛型约束：每个类型参数 1 槽（约束 port 名 id，-1 = 无约束）。
+    // 约束来源：N_TYPE_PARAM.children[0]（parse_type_params 产出：约束类型
+    // 节点 N_STRUCT_TYPE 的 name 字段，或 -1 哨兵）。合法性（必须是已登记
+    // port）由 sgen.check_generic_constraints 在实例化时校验。
+    var con_off = len(gtyp_cons)
+    var def_off = len(gtyp_defs)
+    var kind_off = len(gtyp_kinds)
+    var i: i64 = 0
+    while i < npar {
+        var p = child(tp, i)  // N_TYPE_PARAM 节点（name = 类型参数名 id）
+        table_push(gtyp_names, s_names[p])
+        // v2 值参数：N_TYPE_PARAM.val = 1（整型容量参数）；0 = 类型参数
+        table_push(gtyp_kinds, s_vals[p])
+        var cons: i64 = -1
+        if s_nchild[p] > 0 {
+            var cnode = child(p, 0)
+            if cnode >= 0 {
+                // 约束节点必须是标识符类型引用（N_STRUCT_TYPE，name = port 名）；
+                // 其余类型（table<T> 等）不是合法 port 约束
+                if s_tags[cnode] != S_N_STRUCT_TYPE {
+                    sm_err_line = s_lines[p]
+                    sm_err_col = s_cols[p]
+                    sm_err_msg = "泛型约束必须是 port 类型（如 <T: Drawable>），实际是其他类型表达式"
+                    return -1
+                }
+                cons = s_names[cnode]
+            }
+        }
+        table_push(gtyp_cons, cons)
+        // p.8.2.6 默认类型参数：children[1]（若存在）存默认类型节点 id（-1=无）
+        var dnode: i64 = -1
+        if s_nchild[p] > 1 {
+            dnode = child(p, 1)
+        }
+        table_push(gtyp_defs, dnode)
+        i = i + 1
+    }
+    table_push(gtyp_nparams, npar)
+    table_push(gtyp_off, off)
+    table_push(gtyp_conoff, con_off)
+    table_push(gtyp_defoff, def_off)
+    table_push(gtyp_kindoff, kind_off)
+    table_push(gty_node, node)
+    table_push(gty_is_struct, is_struct)
+    table_push(gty_full, intern.intern(full_name))
+    sorted_insert(gty_keys, gty_vals, intern.intern(full_name), idx)
+    return idx
+}
+
+// port 索引查询（port 名 -> 索引；-1 = 未登记）。
+pub func port_find(name: string) -> i64 {
+    var nid = intern.intern(name)
+    var idx = bs_find(pt_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return pt_vals[idx]
+}
+
+// port 登记（重名检查，返回 port 索引或 -1）。
+// 同时登记 types 侧 port 名表（type_name 还原用；追加式与索引顺序一致）。
+pub func reg_port(name: string) -> i64 {
+    if port_find(name) >= 0 {
+        sm_err_msg = "port '" + name + "' 重复定义"
+        return -1
+    }
+    var idx = len(pm_off)
+    table_push(pm_off, len(pm_names))
+    table_push(pm_n, 0)
+    table_push(pm_npar, len(pm_npars))
+    table_push(pm_paroff, len(pm_ptys))
+    table_push(pm_ret, len(pm_rets))
+    table_push(pm_iface, 0)   // p.9.11.21：默认 port（名义）；interface 由 collect 置 1
+    sorted_insert(pt_keys, pt_vals, intern.intern(name), idx)
+    types.set_port_name(idx, name)
+    return idx
+}
+
+// p.9.11.21：port 索引是否 interface（结构性接口；0=port 名义接口）
+pub func port_is_iface(pi: i64) -> bool {
+    if pi < 0 || pi >= len(pm_iface) {
+        return false
+    }
+    return pm_iface[pi] == 1
+}
+
+// actor 索引查询（actor 名 -> 索引；-1 = 未登记）。
+pub func actor_find(name: string) -> i64 {
+    var nid = intern.intern(name)
+    var idx = bs_find(ac_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return ac_vals[idx]
+}
+
+// actor 登记（重名检查，返回 actor 索引或 -1）。
+// 同时登记 types 侧 actor 名表（type_name 还原用；追加式与索引顺序一致）。
+pub func reg_actor(name: string) -> i64 {
+    if actor_find(name) >= 0 {
+        sm_err_msg = "actor '" + name + "' 重复定义"
+        return -1
+    }
+    var idx = len(ac_vals)
+    sorted_insert(ac_keys, ac_vals, intern.intern(name), idx)
+    types.set_actor_name(idx, name)
+    // 初始化 actor 方法签名表行（仿 port：空行）
+    table_push(ac_moff, len(ac_mnames))
+    table_push(ac_mn, 0)
+    table_push(ac_mpar, len(ac_mnpars))
+    table_push(ac_paroff, len(ac_mptys))
+    table_push(ac_mret, len(ac_mrets))
+    // 初始化字段布局行（仿方法签名：空行）
+    table_push(ac_fnoff, len(ac_fnames))
+    table_push(ac_fncnt, 0)
+    table_push(ac_ftyoff, len(ac_ftys))
+    table_push(ac_fvoff, len(ac_foffs))
+    return idx
+}
+
+// actor 私有状态字段登记（collect_actor_decl 用）：字段名 + 类型 + 记录内字节偏移
+//（含固定头；8 字节对齐，由收集方计算）。追加式排平段，与 ac_fnoff/fncnt 行对齐。
+// 返回字段下标；-1 错误（重名）。
+pub func reg_actor_field(ai: i64, fname: string, fty: i64, fdef: i64, foff: i64) -> i64 {
+    var nid = intern.intern(fname)
+    var off = ac_fnoff[ai]
+    var n = ac_fncnt[ai]
+    var k: i64 = 0
+    while k < n {
+        if ac_fnames[off + k] == nid {
+            sm_err_msg = "actor '" + intern.lookup(ac_keys[ai]) + "' 的字段 '" + fname + "' 重复定义"
+            return -1
+        }
+        k = k + 1
+    }
+    var fi = n
+    table_push(ac_fnames, nid)
+    table_push(ac_ftys, fty)
+    table_push(ac_fdefs, fdef)
+    table_push(ac_foffs, foff)
+    ac_fncnt[ai] = n + 1
+    return fi
+}
+
+// actor 字段区长度（字节，含固定头；run 据此分配 record）。字段区起始偏移 +
+// 各字段 8 对齐大小。返回总字节数。
+pub func actor_field_bytes(ai: i64) -> i64 {
+    var off = ac_fvoff[ai]
+    var n = ac_fncnt[ai]
+    var total: i64 = 0
+    var k: i64 = 0
+    while k < n {
+        var fty = ac_ftys[off + k]
+        var sz: i64 = 8
+        if fty == types.named(TK_F64) {
+            sz = 8
+        } else if types.is_int(fty) {
+            sz = 8  // 标量态一律 8 字节槽（i64/u64/窄整/lifter）
+        }
+        total = total + sz
+        k = k + 1
+    }
+    return total
+}
+
+// actor 消息方法登记（collect_actor_decl 用）：方法名 + 参数类型表 + 返回类型。
+// 返回方法索引（声明顺序）；-1 错误（sm_err_* 已置）。
+pub func reg_actor_method(ai: i64, mname: string, ptys: table<i64>, ret: i64) -> i64 {
+    var nid = intern.intern(mname)
+    // 重名检查（actor 内方法名唯一）
+    var off = ac_moff[ai]
+    var n = ac_mn[ai]
+    var k: i64 = 0
+    while k < n {
+        if ac_mnames[off + k] == nid {
+            sm_err_msg = "actor '" + intern.lookup(ac_keys[ai]) + "' 的方法 '" + mname + "' 重复定义"
+            return -1
+        }
+        k = k + 1
+    }
+    var mi = n
+    table_push(ac_mnames, nid)
+    table_push(ac_mnpars, len(ptys))
+    var j: i64 = 0
+    while j < len(ptys) {
+        table_push(ac_mptys, ptys[j])
+        j = j + 1
+    }
+    table_push(ac_mrets, ret)
+    ac_mn[ai] = n + 1
+    return mi
+}
+
+// actor 方法索引查询（方法名 -> 声明序号；-1 = 无）
+pub func actor_method_idx(ai: i64, mname: string) -> i64 {
+    var nid = intern.intern(mname)
+    var off = ac_moff[ai]
+    var n = ac_mn[ai]
+    var k: i64 = 0
+    while k < n {
+        if ac_mnames[off + k] == nid {
+            return k
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// actor 方法参数个数查询（-1 = 非该 actor 方法）
+pub func actor_method_npar(ai: i64, mname: string) -> i64 {
+    var mi = actor_method_idx(ai, mname)
+    if mi < 0 {
+        return -1
+    }
+    return ac_mnpars[ac_mpar[ai] + mi]
+}
+
+// actor 方法第 k 个参数类型（-1 = 越界）
+pub func actor_method_param(ai: i64, mname: string, k: i64) -> i64 {
+    var mi = actor_method_idx(ai, mname)
+    if mi < 0 {
+        return -1
+    }
+    var np = ac_mnpars[ac_mpar[ai] + mi]
+    if k < 0 || k >= np {
+        return -1
+    }
+    // ★ 段偏移必须**累积前序方法的参数个数**（ac_mptys 是所有方法参数类型的扁平段）：
+    //   方法 mi 的第 k 个参数 = ac_mptys[ac_paroff[ai] + Σ_{p<mi} npars(p) + k]。
+    // 曾经误写成 `ac_paroff[ai] + mi + k`（把**方法序号**当成**参数偏移**）⇒ 只有
+    // 「每个方法都恰好 1 个参数」时才偶然正确。actor 内方法参数个数不等时
+    // （如 `a(f,x)` 后跟 `b(f)`）会取到**别的方法**的参数类型，报假
+    // E00469「参数类型不匹配」。后端 irgen_rt_p3.tie 的 pstart 累积是正确写法。
+    var pstart = ac_paroff[ai]
+    var pk: i64 = 0
+    while pk < mi {
+        pstart = pstart + ac_mnpars[ac_mpar[ai] + pk]
+        pk = pk + 1
+    }
+    return ac_mptys[pstart + k]
+}
+
+// actor 方法返回类型（-1 = 非该 actor 方法；void → TK_VOID）
+pub func actor_method_ret(ai: i64, mname: string) -> i64 {
+    var mi = actor_method_idx(ai, mname)
+    if mi < 0 {
+        return -1
+    }
+    return ac_mrets[ac_mret[ai] + mi]
+}
+
+// port 方法登记（collect_port 用）：方法名 + 参数类型表（含 self 槽）+ 返回类型。
+// 返回方法索引（声明顺序，vtable 字段序）；-1 错误（sm_err_* 已置）。
+pub func reg_port_method(pi: i64, mname: string, ptys: table<i64>, ret: i64) -> i64 {
+    var nid = intern.intern(mname)
+    // 重名检查（port 内方法名唯一）
+    var off = pm_off[pi]
+    var n = pm_n[pi]
+    var k: i64 = 0
+    while k < n {
+        if pm_names[off + k] == nid {
+            sm_err_msg = "port '" + intern.lookup(pt_keys[pi]) + "' 的方法 '" + mname + "' 重复定义"
+            return -1
+        }
+        k = k + 1
+    }
+    var mi = n
+    table_push(pm_names, nid)
+    table_push(pm_npars, len(ptys))
+    var j: i64 = 0
+    while j < len(ptys) {
+        table_push(pm_ptys, ptys[j])
+        j = j + 1
+    }
+    table_push(pm_rets, ret)
+    pm_n[pi] = n + 1
+    return mi
+}
+
+// port 方法索引查询（方法名 -> 声明序号；-1 = 无）
+pub func port_method_idx(pi: i64, mname: string) -> i64 {
+    var nid = intern.intern(mname)
+    var off = pm_off[pi]
+    var n = pm_n[pi]
+    var k: i64 = 0
+    while k < n {
+        if pm_names[off + k] == nid {
+            return k
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// port 方法名（第 mi 个；-1 越界兜底）
+pub func port_method_name(pi: i64, mi: i64) -> string {
+    if mi < 0 || mi >= pm_n[pi] {
+        return ""
+    }
+    return intern.lookup(pm_names[pm_off[pi] + mi])
+}
+
+// port 方法参数个数（含 self）
+pub func port_method_nparams(pi: i64, mi: i64) -> i64 {
+    if mi < 0 || mi >= pm_n[pi] {
+        return -1
+    }
+    return pm_npars[pm_npar[pi] + mi]
+}
+
+// port 方法第 k 个参数类型（k 从 0 = self；越界返回 -1）
+pub func port_method_param(pi: i64, mi: i64, k: i64) -> i64 {
+    var np = port_method_nparams(pi, mi)
+    if k < 0 || k >= np {
+        return -1
+    }
+    return pm_ptys[pm_paroff[pi] + mi * np + k]
+}
+
+// port 方法返回类型
+pub func port_method_ret(pi: i64, mi: i64) -> i64 {
+    if mi < 0 || mi >= pm_n[pi] {
+        return -1
+    }
+    return pm_rets[pm_ret[pi] + mi]
+}
+
+// impl 键（port 名 + struct 名 -> 升序键）
+pub func impl_key(port_name: string, struct_name: string) -> string {
+    return port_name + "::" + struct_name
+}
+
+// impl 记录查询（port 索引 + struct 索引 -> impl 索引；-1 = 未实现）
+pub func impl_find(pi: i64, si: i64) -> i64 {
+    var pname = intern.lookup(pt_keys[pi])
+    var sname = sstate.struct_name_of(si)
+    var nid = intern.intern(impl_key(pname, sname))
+    var idx = bs_find(im_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return im_vals[idx]
+}
+
+// impl 登记（collect_impl 用）：port 索引 + struct 索引 + 方法实现全名表
+// （按 port 方法声明顺序）。返回 impl 索引；-1 错误（sm_err_* 已置）。
+pub func reg_impl(pi: i64, si: i64, mnames: table<i64>) -> i64 {
+    var pname = intern.lookup(pt_keys[pi])
+    var sname = sstate.struct_name_of(si)
+    var key = intern.intern(impl_key(pname, sname))
+    if bs_find(im_keys, key) >= 0 {
+        sm_err_msg = "port '" + pname + "' 对 struct '" + sname + "' 的 impl 重复定义"
+        return -1
+    }
+    var idx = len(im_port)
+    table_push(im_port, pi)
+    table_push(im_struct, si)
+    table_push(im_poff, len(im_mnames))
+    table_push(im_n, len(mnames))
+    var k: i64 = 0
+    while k < len(mnames) {
+        table_push(im_mnames, mnames[k])
+        k = k + 1
+    }
+    sorted_insert(im_keys, im_vals, key, idx)
+    return idx
+}
+
+// 实例化记录查询（mangled 名 -> 记录索引；-1 = 未实例化）。
+// 去重键 = mangled 名（含类型实参片段），同名即同组合。
+pub func gin_find(mangled: string) -> i64 {
+    var nid = intern.intern(mangled)
+    var idx = bs_find(gin_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return gin_vals[idx]
+}
+
+// 实例化记录登记：mangled 名 + 模板索引 + 类型实参表（按模板类型参数顺序）
+// + 类别。返回记录索引。调用方保证未重复（gin_find 已判定）。
+pub func gin_reg(mangled: string, gti: i64, args: table<i64>, is_struct: i64) -> i64 {
+    var rec = len(gin_tmpl)
+    var off = len(garg_vals)
+    var k: i64 = 0
+    while k < len(args) {
+        table_push(garg_vals, args[k])
+        k = k + 1
+    }
+    table_push(gin_tmpl, gti)
+    table_push(gin_off, off)
+    table_push(gin_nargs, len(args))
+    table_push(gin_is_struct, is_struct)
+    sorted_insert(gin_keys, gin_vals, intern.intern(mangled), rec)
+    return rec
+}
+
+// 第 rec 条记录的第 k 个类型实参 id（越界返回 -1）
+pub func gin_arg_at(rec: i64, k: i64) -> i64 {
+    if rec < 0 || rec >= len(gin_tmpl) {
+        return -1
+    }
+    var n = gin_nargs[rec]
+    if k < 0 || k >= n {
+        return -1
+    }
+    return garg_vals[gin_off[rec] + k]
+}
+
+// 第 rec 条记录的类型实参表副本（推断/匹配用）
+pub func gin_args(rec: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    if rec < 0 || rec >= len(gin_tmpl) {
+        return out
+    }
+    var n = gin_nargs[rec]
+    var k: i64 = 0
+    while k < n {
+        table_push(out, garg_vals[gin_off[rec] + k])
+        k = k + 1
+    }
+    return out
+}
+
+// 模板类型参数名 id 表（按声明顺序；返回新表）
+pub func gt_param_names(gti: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    if gti < 0 || gti >= len(gtyp_nparams) {
+        return out
+    }
+    var n = gtyp_nparams[gti]
+    var off = gtyp_off[gti]
+    var k: i64 = 0
+    while k < n {
+        table_push(out, gtyp_names[off + k])
+        k = k + 1
+    }
+    return out
+}
+
+// v2 模板参数 kind 表（按声明顺序；0=类型参数 1=值参数；返回新表）
+pub func gt_param_kinds(gti: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    if gti < 0 || gti >= len(gtyp_nparams) {
+        return out
+    }
+    var n = gtyp_nparams[gti]
+    var off = gtyp_kindoff[gti]
+    var k: i64 = 0
+    while k < n {
+        table_push(out, gtyp_kinds[off + k])
+        k = k + 1
+    }
+    return out
+}
+
+// ==================== v2 整型常量表（数组长度/值参数求值）====================
+// 编译期整型常量名 → 整值。登记与查询均按 intern 名 id；值 ≤ 0 视为无效
+//（数组长度/容量参数语义只允许正整数；-1 返回 = 未登记）。表声明见文件头。
+pub func gval_lookup(nid: i64) -> i64 {
+    var idx = bs_find(gval_kkeys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return gval_kvals[idx]
+}
+
+pub func gval_register(nid: i64, v: i64) {
+    var idx = bs_find(gval_kkeys, nid)
+    if idx >= 0 {
+        gval_kvals[idx] = v
+        return
+    }
+    sorted_insert(gval_kkeys, gval_kvals, nid, v)
+}
+
+// v2：整型常量节点 → 编译期整值。N_INT_LIT 取字面量；N_VAR 查整型常量表
+//（gval，const 名在数组长度/值参数默认值处引用时登记与查询）；其余 -1。
+pub func resolve_int_len_node(id: i64) -> i64 {
+    if id < 0 {
+        return -1
+    }
+    if s_tags[id] == S_N_INT_LIT {
+        return s_vals[id]
+    }
+    if s_tags[id] == S_N_VAR {
+        return gval_lookup(s_names[id])
+    }
+    return -1
+}
+
+// p.8.2.6 默认类型参数节点 id 表（按声明顺序；-1 = 无默认；返回新表）。
+// 槽值 = 类型 AST 节点 id，调用处用 sgen.parse_generic_type_node 解析为类型 id。
+pub func gt_defaults(gti: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    if gti < 0 || gti >= len(gtyp_nparams) {
+        return out
+    }
+    var n = gtyp_nparams[gti]
+    var off = gtyp_defoff[gti]
+    var k: i64 = 0
+    while k < n {
+        table_push(out, gtyp_defs[off + k])
+        k = k + 1
+    }
+    return out
+}
+
+// ==================== 命名空间栈 ====================
+// 命名空间段压栈（游标写：复用已分配槽位，避免旧值残留误读）
+pub func ns_push(seg_id: i64) {
+    if ns_top < len(ns_stack) {
+        ns_stack[ns_top] = seg_id
+    } else {
+        table_push(ns_stack, seg_id)
+    }
+    ns_top = ns_top + 1
+}
+
+// 命名空间段弹栈（游标递减）
+pub func ns_pop() {
+    if ns_top > 0 {
+        ns_top = ns_top - 1
+    }
+}
+
+// 命名空间全名拼接（ns_stack 段 + 名字）
+pub func ns_full_name(name: string) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < ns_top {
+        if i > 0 {
+            out = out + "::"
+        }
+        out = out + intern.lookup(ns_stack[i])
+        i = i + 1
+    }
+    if out != "" {
+        out = out + "::"
+    }
+    return out + name
+}
+
+}

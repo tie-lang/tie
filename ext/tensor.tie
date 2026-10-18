@@ -1,0 +1,605 @@
+type tie<class>
+// std/tensor.tie —— L2 张量库 tensor（命名空间 tensor；纯 tie，std 层）
+// ============================================================
+// 用途：nn/diffusion 与世界生成（3D 密度列/体素网格）的基础张量层，性能优先。
+//
+// 【固定容量池 ABI（设计说明）】
+//   Tensor 是 struct，data 字段为 array<f32,TMAX>（TMAX=262144 ≈1MB）。struct 是
+//   值类型，按值传 Tensor 会整体 COPY ~1MB。故**重操作一律不把大 data 按值传递**：
+//     - 元素级/变换类函数第一参数为 `me: ref array<f32,TMAX>`（零拷贝指针通道），
+//       配合 `t: Tensor`（仅取形状/长度元数据，按值传入即拷贝 ~64B 元数据，可接受）；
+//     - 逐元素二元运算 extra 采用 `ma/mb/out` 三条 ref 数组通道 + w 元数据；
+//     - 改"形状"类的函数（reshape/slice/block_slice/transpose/density_sub）按 ABI
+//       返回**新的 Tensor 值**（其结果 data 为重组后的数组拷贝，调用方再以 ref 通道使用）。
+//   调用方手持有 data 数组（如 `var data: array<f32,TMAX>`）作为存储池，
+//   `new(...)` 返回的 Tensor 经 `t.data` 抽取数组即得存储；后续全走 ref 通道。
+//
+// 【线性序约定（3D 密度列）】
+//   3D 张量 shape=(X,Y,Z)，线性序 X 最快 → Y → Z：
+//   idx = x + X*y + X*Y*z ,  x∈[0,X), y∈[0,Y), z∈[0,Z)。
+//   依此，stride1=X、stride2=X*Y；4D (X,Y,Z,W) 时 stride3=X*Y*Z。
+//
+// 【y 轴分块语义（新规格）】
+//   YMAX=1024：密度列 y 上限（可配置；世界生成按此列高）。
+//   TMAX=262144 = YMAX*16*16：容量池（= 整列在全 16×16 水平面上的全覆盖）。
+//   YBLOCK=256：y 轴分区块粒度，每块 y 层数（可配置，推荐 64~512，低配取更小）。
+//   block_count() = YMAX/YBLOCK（=4）。3D 体素网格按 y 块物化避免整列常驻内存。
+//   块 b 覆盖 y∈[b*YBLOCK, min((b+1)*YBLOCK, YMAX))（并再对实际 shape1 钳制）。
+//   block_slice(me,t,b) 抽出第 b 个 y 块为连续 (X, blkY, Z) 新 Tensor（data 段拷贝）；
+//   block_write(me,t,b,src) 把某 y 块的更新写回 me（分离块处理→合并）。本库只提供
+//   块容器与 density_sub 降采样辅助，LOD 分级调度属应用侧，不在库内实现。
+// EN: fixed-capacity-pool ABI (ref-array channel). Heavy ops take `ref array<f32,TMAX>`
+// as zero-copy channel + Tensor as shape metadata. Linear order x-fastest: idx=x+X*y+X*Y*z.
+// y-axis chunked (YBLOCK) containers: block_count/slice/write + density_sub helper.
+
+// 密度列 y 上限（可配置；世界生成按此列高）。
+// EN: max y along density column (configurable; world-gen uses this height).
+const YMAX: i64 = 1024
+// 容量池元素数（f32）。注：规格预设 TMAX=262144=YMAX*16*16，但本机 tiec 的
+// array<f32,N> 在 N≥65536 时后端 clang 崩溃，且 N 越大整库/probe 经 opt 的
+// struct-SROA 耗时越难承受（16384 时单个 probe 编译 >20 分钟）。为可编译/可迭代，
+// 收敛为 TMAX=1024（覆盖一块 y（YBLOCK=256）× 4 水平槽：X=Z=2，块长 2*256*2=1024）。
+// YMAX/YBLOCK 语义不变，block_count=YMAX/YBLOCK=4。
+// EN: pool capacity (f32 els). 262144 unbuildable (clang crashes >=65536); clamped to
+// 1024 for feasible opt compile time. Covers one YBLOCK of 2x2x256. YMAX/YBLOCK unchanged.
+const TMAX: i64 = 1024
+// y 轴分区块粒度：每块 y 层数（可配置，建议 64~512，低配更小）。
+// EN: y-axis chunk granularity: y-layers per block.
+const YBLOCK: i64 = 256
+
+// Tensor：张量元数据 + 固定容量池 data（值语义；ABI 见上）。
+// EN: Tensor metadata + fixed-capacity pool.
+struct Tensor {
+    var data: array<f32, 1024>;
+    var shape0: i64 = 1;
+    var shape1: i64 = 1;
+    var shape2: i64 = 1;
+    var shape3: i64 = 1;
+    var dims: i64 = 0;   // 有效维数 1..4
+    var len: i64 = 0;    // 实际元素数
+}
+
+namespace tensor {
+    // 新建张量：shape 前 n 维有效。len=前 n 维乘积；超 TMAX 或 y(shape[1])>YMAX 时
+    // 校验失败返回 len=0。data 前 len 个元素填充为 fill（f32 存储）。
+    // EN: new tensor; validates n dims product <= TMAX and y<=YMAX, else len=0.
+    pub func new(shape: array<i64, 4>, n: i64, fill: f64) -> Tensor {
+        var s0: i64 = 1
+        var s1: i64 = 1
+        var s2: i64 = 1
+        var s3: i64 = 1
+        if n >= 1 {
+            s0 = shape[0]
+        }
+        if n >= 2 {
+            s1 = shape[1]
+        }
+        if n >= 3 {
+            s2 = shape[2]
+        }
+        if n >= 4 {
+            s3 = shape[3]
+        }
+        var nel: i64 = 1
+        var ok: bool = true
+        var k: i64 = 0
+        while k < n {
+            var sz: i64 = 0
+            if k == 0 {
+                sz = s0
+            } else if k == 1 {
+                sz = s1
+            } else if k == 2 {
+                sz = s2
+            } else {
+                sz = s3
+            }
+            if sz < 1 {
+                ok = false
+            }
+            nel = nel * sz
+            if nel > TMAX {
+                ok = false
+            }
+            k = k + 1
+        }
+        if n >= 2 {
+            if s1 > YMAX {
+                ok = false
+            }
+        }
+        if !ok {
+            return Tensor(array_init(0.0), s0, s1, s2, s3, n, 0)
+        }
+        var d: array<f32, 1024> = array_init(0.0)
+        var i: i64 = 0
+        while i < nel {
+            d[i] = to_f32(fill)
+            i = i + 1
+        }
+        return Tensor(d, s0, s1, s2, s3, n, nel)
+    }
+
+    // 线性下标读（i∈[0,t.len)）。
+    // EN: read at linear index i.
+    pub func at(me: ref array<f32, 1024>, t: Tensor, i: i64) -> f32 {
+        return me[i]
+    }
+
+    // 3D 定位读：idx = x + X*y + X*Y*z。
+    // EN: read at (x,y,z) for 3D tensor.
+    pub func at3(me: ref array<f32, 1024>, t: Tensor, x: i64, y: i64, z: i64) -> f32 {
+        var X = t.shape0
+        var Y = t.shape1
+        return me[x + X * y + X * Y * z]
+    }
+
+    // 2D 定位读：idx = x + X*y。
+    // EN: read at (x,y) for 2D tensor.
+    pub func at2(me: ref array<f32, 1024>, t: Tensor, x: i64, y: i64) -> f32 {
+        var X = t.shape0
+        return me[x + X * y]
+    }
+
+    // 4D 定位读：idx = x + X*y + X*Y*z + X*Y*Z*w。
+    // EN: read at (x,y,z,w) for 4D tensor.
+    pub func at4(me: ref array<f32, 1024>, t: Tensor, x: i64, y: i64, z: i64, w: i64) -> f32 {
+        var X = t.shape0
+        var Y = t.shape1
+        var Z = t.shape2
+        return me[x + X * y + X * Y * z + X * Y * Z * w]
+    }
+
+    // 线性下标写（窄化为 f32）。
+    // EN: write value at linear index i.
+    pub func set(me: ref array<f32, 1024>, t: Tensor, i: i64, v: f64) {
+        me[i] = to_f32(v)
+    }
+
+    // 3D 定位写：idx = x + X*y + X*Y*z。
+    // EN: write at (x,y,z).
+    pub func set3(me: ref array<f32, 1024>, t: Tensor, x: i64, y: i64, z: i64, v: f64) {
+        var X = t.shape0
+        var Y = t.shape1
+        me[x + X * y + X * Y * z] = to_f32(v)
+    }
+
+    // reshape：校验新 len==t.len 且 <=TMAX（y 维度 ≤YMAX）。不改数据，返回新元数据。
+    // EN: reshape; validate unchanged len, return new Tensor metadata.
+    pub func reshape(me: ref array<f32, 1024>, t: Tensor, shape: array<i64, 4>, n: i64) -> Tensor {
+        var s0: i64 = 1
+        var s1: i64 = 1
+        var s2: i64 = 1
+        var s3: i64 = 1
+        if n >= 1 {
+            s0 = shape[0]
+        }
+        if n >= 2 {
+            s1 = shape[1]
+        }
+        if n >= 3 {
+            s2 = shape[2]
+        }
+        if n >= 4 {
+            s3 = shape[3]
+        }
+        var nel: i64 = 1
+        var ok: bool = true
+        var k: i64 = 0
+        while k < n {
+            var sz: i64 = 0
+            if k == 0 {
+                sz = s0
+            } else if k == 1 {
+                sz = s1
+            } else if k == 2 {
+                sz = s2
+            } else {
+                sz = s3
+            }
+            nel = nel * sz
+            k = k + 1
+        }
+        if n >= 2 && s1 > YMAX {
+            ok = false
+        }
+        if nel != t.len || nel > TMAX {
+            ok = false
+        }
+        if !ok {
+            return Tensor(array_init(0.0), s0, s1, s2, s3, n, 0)
+        }
+        return Tensor(t.data, s0, s1, s2, s3, n, nel)
+    }
+
+    // slice：沿 axis 取 [start,end) 的拷贝视图，返回新 Tensor（值语义，不改原张量）。
+    // EN: copy view along axis; returns new Tensor, original untouched.
+    pub func slice(me: ref array<f32, 1024>, t: Tensor, axis: i64, start: i64, end: i64) -> Tensor {
+        var dims = t.dims
+        var s0 = t.shape0
+        var s1 = t.shape1
+        var s2 = t.shape2
+        var s3 = t.shape3
+        var a0: i64 = 0
+        if axis == 0 {
+            a0 = s0
+        } else if axis == 1 {
+            a0 = s1
+        } else if axis == 2 {
+            a0 = s2
+        } else {
+            a0 = s3
+        }
+        var st: i64 = start
+        if st < 0 {
+            st = 0
+        }
+        var en: i64 = end
+        if en > a0 {
+            en = a0
+        }
+        if axis < 0 || axis >= dims || en <= st {
+            return Tensor(array_init(0.0), s0, s1, s2, s3, dims, 0)
+        }
+        var bl = en - st
+        var r0 = s0
+        var r1 = s1
+        var r2 = s2
+        var r3 = s3
+        if axis == 0 {
+            r0 = bl
+        } else if axis == 1 {
+            r1 = bl
+        } else if axis == 2 {
+            r2 = bl
+        } else {
+            r3 = bl
+        }
+        var nel: i64 = 1
+        var k: i64 = 0
+        while k < dims {
+            var sz: i64 = 0
+            if k == 0 {
+                sz = r0
+            } else if k == 1 {
+                sz = r1
+            } else if k == 2 {
+                sz = r2
+            } else {
+                sz = r3
+            }
+            nel = nel * sz
+            k = k + 1
+        }
+        if nel > TMAX {
+            return Tensor(array_init(0.0), r0, r1, r2, r3, dims, 0)
+        }
+        var d: array<f32, 1024> = array_init(0.0)
+        var rs1 = r0
+        var rs2 = r0 * r1
+        var rs3 = r0 * r1 * r2
+        var ss1 = s0
+        var ss2 = s0 * s1
+        var ss3 = s0 * s1 * s2
+        var io: i64 = 0
+        while io < nel {
+            var rem = io
+            var c0: i64 = 0
+            var c1: i64 = 0
+            var c2: i64 = 0
+            var c3: i64 = 0
+            if dims >= 4 {
+                c3 = rem / rs3
+                rem = rem % rs3
+            }
+            if dims >= 3 {
+                c2 = rem / rs2
+                rem = rem % rs2
+            }
+            if dims >= 2 {
+                c1 = rem / rs1
+                rem = rem % rs1
+            }
+            c0 = rem
+            var q0 = c0
+            var q1 = c1
+            var q2 = c2
+            var q3 = c3
+            if axis == 0 {
+                q0 = st + c0
+            } else if axis == 1 {
+                q1 = st + c1
+            } else if axis == 2 {
+                q2 = st + c2
+            } else {
+                q3 = st + c3
+            }
+            var si = q0 + ss1 * q1 + ss2 * q2 + ss3 * q3
+            d[io] = me[si]
+            io = io + 1
+        }
+        return Tensor(d, r0, r1, r2, r3, dims, nel)
+    }
+
+    // copy：把 me 金额 t.len 元素拷到 dst 数组。
+    // EN: copy me to dst buffer.
+    pub func copy(me: ref array<f32, 1024>, t: Tensor, dst: ref array<f32, 1024>) {
+        var i: i64 = 0
+        while i < t.len {
+            dst[i] = me[i]
+            i = i + 1
+        }
+    }
+
+    // fill：把前 n 个元素设为 v。
+    // EN: set all elements to v.
+    pub func fill(me: ref array<f32, 1024>, t: Tensor, v: f64) {
+        var i: i64 = 0
+        while i < t.len {
+            me[i] = to_f32(v)
+            i = i + 1
+        }
+    }
+
+    // scale：逐元素乘 s。
+    // EN: element-wise multiply by s.
+    pub func scale(me: ref array<f32, 1024>, t: Tensor, s: f64) {
+        var i: i64 = 0
+        while i < t.len {
+            me[i] = to_f32(to_f64(me[i]) * s)
+            i = i + 1
+        }
+    }
+
+    // clip：逐元素钳制到 [lo, hi]。
+    // EN: element-wise clamp into [lo, hi].
+    pub func clip(me: ref array<f32, 1024>, t: Tensor, lo: f64, hi: f64) {
+        var i: i64 = 0
+        while i < t.len {
+            var v: f64 = to_f64(me[i])
+            if v < lo {
+                v = lo
+            }
+            if v > hi {
+                v = hi
+            }
+            me[i] = to_f32(v)
+            i = i + 1
+        }
+    }
+
+    // sum：前 n 个元素 f64 累加和。
+    // EN: f64 sum of elements.
+    pub func sum(me: ref array<f32, 1024>, t: Tensor) -> f64 {
+        var s: f64 = 0.0
+        var i: i64 = 0
+        while i < t.len {
+            s = s + to_f64(me[i])
+            i = i + 1
+        }
+        return s
+    }
+
+    // mean：算术平均；len==0 返回 0。
+    // EN: arithmetic mean.
+    pub func mean(me: ref array<f32, 1024>, t: Tensor) -> f64 {
+        if t.len <= 0 {
+            return 0.0
+        }
+        return sum(me, t) / to_f64(t.len)
+    }
+
+    // max：最大值（f32）；len==0 返回 0。
+    // EN: maximum value.
+    pub func max(me: ref array<f32, 1024>, t: Tensor) -> f32 {
+        if t.len <= 0 {
+            return 0.0
+        }
+        var m: f32 = me[0]
+        var i: i64 = 1
+        while i < t.len {
+            if me[i] > m {
+                m = me[i]
+            }
+            i = i + 1
+        }
+        return m
+    }
+
+    // min：最小值（f32）；len==0 返回 0。
+    // EN: minimum value.
+    pub func min(me: ref array<f32, 1024>, t: Tensor) -> f32 {
+        if t.len <= 0 {
+            return 0.0
+        }
+        var m: f32 = me[0]
+        var i: i64 = 1
+        while i < t.len {
+            if me[i] < m {
+                m = me[i]
+            }
+            i = i + 1
+        }
+        return m
+    }
+
+    // 私有：二元运算核心（op=0 add,1 sub,2 mul,3 div）。支持同形或标量广播
+    // （dims==1 && len==1）。out 为结果数组，w 为其形状元数据。
+    // 注：返回 void——避免 `return w` 把入参 1MB Tensor 再拷进返回槽触发编译器
+    // 在巨型 struct 值传递上的 opt 缺陷（见文件头 ABI 说明）。
+    // EN: elementwise binary core with scalar broadcast (writes `out` in place).
+    func bin(ma: ref array<f32, 1024>, ta: Tensor, mb: ref array<f32, 1024>, tb: Tensor, out: ref array<f32, 1024>, w: Tensor, op: i64) {
+        var n = w.len
+        var ba: bool = (ta.dims == 1 && ta.len == 1)
+        var bb: bool = (tb.dims == 1 && tb.len == 1)
+        var i: i64 = 0
+        while i < n {
+            var av: f32 = ma[i]
+            if ba {
+                av = ma[0]
+            }
+            var bv: f32 = mb[i]
+            if bb {
+                bv = mb[0]
+            }
+            // f32 逐元素算术在本版 tiec 会误生成 fadd/fmul double 触发 opt 崩溃，
+            // 故一律升 f64 计算再窄化回 f32（见文件头 ABI 说明）。
+            if op == 0 {
+                out[i] = to_f32(to_f64(av) + to_f64(bv))
+            } else if op == 1 {
+                out[i] = to_f32(to_f64(av) - to_f64(bv))
+            } else if op == 2 {
+                out[i] = to_f32(to_f64(av) * to_f64(bv))
+            } else {
+                out[i] = to_f32(to_f64(av) / to_f64(bv))
+            }
+            i = i + 1
+        }
+    }
+
+    // 逐元素相加（同形或标量广播）；结果写入 out，元数据用 w。
+    // EN: elementwise add.
+    pub func add(ma: ref array<f32, 1024>, ta: Tensor, mb: ref array<f32, 1024>, tb: Tensor, out: ref array<f32, 1024>, w: Tensor) {
+        bin(ma, ta, mb, tb, out, w, 0)
+    }
+    // 逐元素相减。
+    // EN: elementwise subtract.
+    pub func sub(ma: ref array<f32, 1024>, ta: Tensor, mb: ref array<f32, 1024>, tb: Tensor, out: ref array<f32, 1024>, w: Tensor) {
+        bin(ma, ta, mb, tb, out, w, 1)
+    }
+    // 逐元素相乘。
+    // EN: elementwise multiply.
+    pub func mul(ma: ref array<f32, 1024>, ta: Tensor, mb: ref array<f32, 1024>, tb: Tensor, out: ref array<f32, 1024>, w: Tensor) {
+        bin(ma, ta, mb, tb, out, w, 2)
+    }
+    // 逐元素相除。
+    // EN: elementwise divide.
+    pub func div(ma: ref array<f32, 1024>, ta: Tensor, mb: ref array<f32, 1024>, tb: Tensor, out: ref array<f32, 1024>, w: Tensor) {
+        bin(ma, ta, mb, tb, out, w, 3)
+    }
+
+    // 标量加：me[i] += v（升 f64 计算后窄化回 f32，规避 f32 算术 opt 崩溃）。
+    // EN: scalar add in place.
+    pub func add_scalar(me: ref array<f32, 1024>, t: Tensor, v: f32) {
+        var i: i64 = 0
+        while i < t.len {
+            me[i] = to_f32(to_f64(me[i]) + to_f64(v))
+            i = i + 1
+        }
+    }
+
+    // y 分块总数 = YMAX/YBLOCK。
+    // EN: total number of y blocks.
+    pub func block_count() -> i64 {
+        return YMAX / YBLOCK
+    }
+
+    // block_slice：抽出第 b 个 y 块的拷贝视图，返回连续 (X, blkY, Z) 新 Tensor。
+    // 块 b 覆盖 y∈[b*YBLOCK, min((b+1)*YBLOCK, YMAX, shape1))；blkY 为实际层数。
+    // EN: extract y block b as a contiguous (X, blkY, Z) Tensor (copy view).
+    pub func block_slice(me: ref array<f32, 1024>, t: Tensor, b: i64) -> Tensor {
+        var X = t.shape0
+        var Y = t.shape1
+        var Z = t.shape2
+        var ylo = b * YBLOCK
+        var yhi = ylo + YBLOCK
+        if yhi > YMAX {
+            yhi = YMAX
+        }
+        if yhi > Y {
+            yhi = Y
+        }
+        var bl = yhi - ylo
+        if bl <= 0 || t.dims < 3 {
+            return Tensor(array_init(0.0), X, bl, Z, 1, t.dims, 0)
+        }
+        var nel = X * bl * Z
+        if nel > TMAX {
+            return Tensor(array_init(0.0), X, bl, Z, 1, t.dims, 0)
+        }
+        var d: array<f32, 1024> = array_init(0.0)
+        var sx = X * bl
+        var i: i64 = 0
+        while i < nel {
+            var x2 = i % X
+            var yb = (i / X) % bl
+            var z2 = i / sx
+            var si = x2 + X * (ylo + yb) + X * Y * z2
+            d[i] = me[si]
+            i = i + 1
+        }
+        return Tensor(d, X, bl, Z, 1, 3, nel)
+    }
+
+    // block_write：把某 y 块的更新（src，连续 (X, blkY, Z)）写回 me 对应位置。
+    // 返回 void（分离块处理→合并；避免返回入参巨型 Tensor 触发 opt 缺陷）。
+    // EN: write block b back into me (consumer merges chunks).
+    pub func block_write(me: ref array<f32, 1024>, t: Tensor, b: i64, src: ref array<f32, 1024>) {
+        var X = t.shape0
+        var Y = t.shape1
+        var Z = t.shape2
+        var ylo = b * YBLOCK
+        var yhi = ylo + YBLOCK
+        if yhi > YMAX {
+            yhi = YMAX
+        }
+        if yhi > Y {
+            yhi = Y
+        }
+        var bl = yhi - ylo
+        if bl <= 0 || t.dims < 3 {
+            return
+        }
+        var nel = X * bl * Z
+        if nel > TMAX {
+            return
+        }
+        var sx = X * bl
+        var i: i64 = 0
+        while i < nel {
+            var x2 = i % X
+            var yb = (i / X) % bl
+            var z2 = i / sx
+            var si = x2 + X * (ylo + yb) + X * Y * z2
+            me[si] = src[i]
+            i = i + 1
+        }
+    }
+
+    // density_sub：远景降采样辅助——x/z 每隔 fx/fz 抽一，y 全保留。
+    // 输入 (X,Y,Z) → 输出 (X/fx, Y, Z/fz)。fx,fz≥1。
+    // EN: downsampling helper: keep every fx-th x / fz-th z, all y retained.
+    pub func density_sub(me: ref array<f32, 1024>, t: Tensor, fx: i64, fz: i64) -> Tensor {
+        var X = t.shape0
+        var Y = t.shape1
+        var Z = t.shape2
+        if fx < 1 {
+            fx = 1
+        }
+        if fz < 1 {
+            fz = 1
+        }
+        var RX = X / fx
+        var RZ = Z / fz
+        if RX < 1 || RZ < 1 || t.dims < 3 {
+            return Tensor(array_init(0.0), X, Y, Z, 1, 3, 0)
+        }
+        var nel = RX * Y * RZ
+        if nel > TMAX {
+            return Tensor(array_init(0.0), RX, Y, RZ, 1, 3, 0)
+        }
+        var d: array<f32, 1024> = array_init(0.0)
+        var drx = RX
+        var dr2 = RX * Y
+        var i: i64 = 0
+        while i < nel {
+            var x2 = i % RX
+            var y = (i / RX) % Y
+            var z2 = i / dr2
+            var si = x2 * fx + X * y + X * Y * (z2 * fz)
+            d[i] = me[si]
+            i = i + 1
+        }
+        return Tensor(d, RX, Y, RZ, 1, 3, nel)
+    }
+}

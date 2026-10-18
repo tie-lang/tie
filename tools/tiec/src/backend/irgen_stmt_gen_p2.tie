@@ -1,0 +1,446 @@
+type tie<class>
+// compiler/backend/irgen_stmt_gen_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 irgen_stmt_gen.tie。
+namespace irgen {
+pub func tig_stmt_b_106_While(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // While：children=[cond, body]。cond_br 回边 + 循环上下文
+        var cond = sstate.child(id, 0)
+        var body = sstate.child(id, 1)
+        var label = s_names[id]
+        // p.6.1.4：预扫循环体找可提升的字符串自加变量（静态核对后挂 sb）。
+        // sb 以「out 循环前值」为起始段——提升从空 sb 开始，若循环前 out
+        // 已有值（前一循环结果/初始精），必须保留（否则多循环链丢结果）。
+        var cands = sb_scan(body, cond)
+        var cix: i64 = 0
+        while cix < len(cands) {
+            table_push(g_sb_keys, cands[cix])
+            var h_sb2 = s21_sb_new()
+            if scope_get(cands[cix]) >= 0 {
+                var pre_ld = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load 旧值
+                ir.add_operand(pre_ld, g_lookup_alloca, 0)
+                s21_sb_append(h_sb2, ir.get_value(pre_ld))
+            }
+            table_push(g_sb_hv, h_sb2)
+            cix = cix + 1
+        }
+        // p.6.1.4：字节表自加提升——循环前拷贝 t → 私有累积表 acc（唯一引用）
+        var cbs_cands = cbs_scan(body, cond)
+        var ccix: i64 = 0
+        while ccix < len(cbs_cands) {
+            table_push(g_cbs_keys, cbs_cands[ccix])
+            if scope_get(cbs_cands[ccix]) >= 0 {
+                var t_ld = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load 表句柄值
+                ir.add_operand(t_ld, g_lookup_alloca, 0)
+                var acc_t = cbs_copy(ir.get_value(t_ld))
+                table_push(g_cbs_acc, acc_t)
+            } else {
+                table_push(g_cbs_acc, 0)
+            }
+            ccix = ccix + 1
+        }
+        var cond_blk = ir.new_block(g_cur_func, interner.intern("while.cond"))
+        var body_blk = ir.new_block(g_cur_func, interner.intern("while.body"))
+        var exit_blk = ir.new_block(g_cur_func, interner.intern("while.exit"))
+        loop_push(label, exit_blk, cond_blk)
+        var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+        ir.add_operand(b0, cond_blk, 1)
+        // cond 块：条件 → body / exit
+        g_cur_block = cond_blk
+        var cv = tig_expr(cond)
+        if cv < 0 {
+            return -1
+        }
+        // p.6.5.2：条件归一化 i1（`while 1` / 整型条件 → icmp ne 0；
+        // 旧实现把 i64 直接喂 cond_br，LLVM 校验失败）
+        cv = tig_cond_to_bool(cv, node_types[cond])
+        var cb = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb, cv, 0)
+        ir.add_operand(cb, body_blk, 1)
+        ir.add_operand(cb, exit_blk, 1)
+        // body 块
+        g_cur_block = body_blk
+        var bb = tig_block_stmts(body)
+        if bb < 0 {
+            return -1
+        }
+        if !block_terminated() {
+            var bb2 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+            ir.add_operand(bb2, cond_blk, 1)
+        }
+        // exit 块
+        g_cur_block = exit_blk
+        // p.9.11.4 defer：while 退出（break/条件 false 汇于 exit_blk）→ 运行本
+        // 循环体作用域 defer（g_lp_top 此刻 = 本循环体作用域，逆序）
+        if len(g_def_flags) > 0 {
+            var drr2 = tig_run_defers(g_lp_top)
+            if drr2 < 0 {
+                return -1
+            }
+        }
+        // p.6.1.4：提升候选在循环出口 build 回写 out 槽（break/条件 false 全部汇入
+        // exit_blk → 任一出口都拿到最终拼接串；sb 登记同步移除）
+        var bix: i64 = 0
+        while bix < len(cands) {
+            var cnid = cands[bix]
+            var hix = sb_find(cnid)
+            if hix >= 0 {
+                var bs = s21_sb_build(g_sb_hv[hix])
+                if scope_get(cnid) >= 0 {
+                    s21_store(g_lookup_alloca, bs, types.named(TK_STR))
+                }
+                sb_remove(cnid)
+            }
+            bix = bix + 1
+        }
+        // p.6.1.4：字节表候选 → acc 写回 t 槽（表句柄 ptr)，移除登记
+        var cbx: i64 = 0
+        while cbx < len(cbs_cands) {
+            var cid2 = cbs_cands[cbx]
+            var aiy = cbs_find(cid2)
+            if aiy >= 0 {
+                if scope_get(cid2) >= 0 {
+                    s21_store(g_lookup_alloca, g_cbs_acc[aiy], types.named(TK_STR))
+                }
+                cbs_remove(cid2)
+            }
+            cbx = cbx + 1
+        }
+        loop_pop()
+        return 0
+}
+
+pub func tig_stmt_b_108_Break(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // Break：br 到循环 exit 块
+        var tgt = loop_find_break(s_names[id])
+        if tgt < 0 {
+            return -1
+        }
+        var b = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(b, tgt, 1)
+        return 0
+}
+
+pub func tig_stmt_b_109_Continue(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // Continue：br 到循环 cond/step 块
+        var tgt = loop_find_cont(s_names[id])
+        if tgt < 0 {
+            return -1
+        }
+        var b = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(b, tgt, 1)
+        return 0
+}
+
+pub func tig_stmt_b_143(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // 三期 goto 标签（§7.1.5）：`#[tag.x]` → 目标基本块起点。
+        // 标签块 = 跳转目标：创建（或复用 goto 预登记的占位块）并作为当前块
+        // 的「新起点」——标签后的语句落入该块。前一条语句自然流到标签处，
+        // 若当前块未 terminated，补 br 到标签块（标签 = 块内跳转点）。
+        var lname = s_names[id]
+        var lblk = goto_label_block(g_cur_func, lname)
+        // 当前块未 terminated（有前置语句/空块首）→ br 到标签块；已 terminated
+        // （如 goto/return 后）则标签块仅由 goto br 可达，无需补 br
+        if !block_terminated() {
+            var b = ir.new_inst(g_cur_block, 30, -1)
+            ir.add_operand(b, lblk, 1)
+        }
+        g_cur_block = lblk
+        return 0
+}
+
+pub func tig_stmt_b_144_LLVM(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // 三期 goto（§7.1.5）：`unsafe goto #x` → 无条件 br 到目标标签块。
+        // 语义层已做 R1/R2/R3；标签块可能在前（已登记）或后（预登记占位——
+        // LLVM 允许 br 引用后文标签）。goto 后的语句是死代码（opt DCE 清），
+        // 由 tig_block_stmts 的 block_terminated 承接新块。
+        var gname = s_names[id]
+        var gblk = goto_label_block(g_cur_func, gname)
+        var b = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(b, gblk, 1)
+        return 0
+}
+
+pub func tig_stmt_b_146(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // 三期 A 组 `unsafe use g { ... }` 持证越界块（§7.1.1 + unsafe-model §13.4）：
+        // 凭据运行期无操作（编译期门禁已由语义层强制），块体正常生成。
+        // r.1.6.7：若 g 的类型是 `guard<lock>` ⇒ 块内表访问走**免锁**入口（显式凭据
+        // 去锁）。凭据是块的入参身份，退块自动回收（与 guard 生命周期一致）。
+        var is_lock = false
+        if types.is_lock_guard(esc_guard_use_ty(id)) {
+            is_lock = true
+            lock_enter()
+        }
+        var r = tig_stmtlist_as_stmt(sstate.child(id, 0))
+        if is_lock {
+            lock_leave()
+        }
+        return r
+}
+
+// `unsafe use g` 的 g 类型：N_GUARD_USE 的 name 槽已是 intern 池 id（parser 侧约定）。
+// 先查局部作用域，再查全局（凭据可来自文件级/全局声明）。
+func esc_guard_use_ty(id: i64) -> i64 {
+    var gnid = s_names[id]
+    if scope_get(gnid) >= 0 {
+        return g_lookup_ty
+    }
+    var gt = global_ty(gnid)
+    if gt >= 0 {
+        return gt
+    }
+    return 0 - 1
+}
+
+pub func tig_stmt_b_147(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // 三期 A 组 `unsafe with(share) { ... }` 临时凭据块：同上，块体正常生成。
+        // r.1.6.7：`unsafe with(lock) { ... }` ⇒ 块内表访问走**免锁**入口。
+        // 能力域名在 children[0]（N_NAMED_TYPE，name = 域名词池 id）。
+        var capn = sstate.name_str(sstate.child(id, 0))
+        var is_lock = capn == "lock"
+        if is_lock {
+            lock_enter()
+        }
+        var r = tig_stmtlist_as_stmt(sstate.child(id, 1))
+        if is_lock {
+            lock_leave()
+        }
+        return r
+}
+
+pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // Assign：name=目标名, val=op（-1 普通；0..17 复合赋值码，对齐 B_*），
+        // children=[值]。复合赋值：load 旧值 → 运算 → store（对齐 Rust 同路径）。
+        // 注意：目标槽（g_lookup_alloca）必须**先保存**——tig_expr(val) 求值会
+        // 覆盖全局槽（x = y 时 y 的 scope_get 覆盖 g_lookup_alloca），曾导致
+        // store 存错目标（a &= b 把结果存进 b）。
+        var nm = sstate.name_str(id)
+        var val = sstate.child(id, 0)
+        var op = s_vals[id]
+        var nid = interner.intern(nm)
+        // p.6.1.4：循环内字符串自加提升——sb 挂起中且为 `out = out + seg...` 形态
+        // → 段表达式逐个 sb_append（跳过 str_cat 全拷贝与 store；循环出口统一 build）。
+        // 前提由 sb_scan 静态核对（局部 string、引用纯净、无其它写/goto）。
+        if op < 0 && sb_find(nid) >= 0 && sb_is_self_add(val, nid) {
+            var hv_sb = g_sb_hv[sb_find(nid)]
+            var segs2 = sb_split_segs(val, nid)
+            var si2: i64 = 0
+            while si2 < len(segs2) {
+                var sv2 = tig_expr(segs2[si2])
+                if sv2 < 0 {
+                    return -1
+                }
+                s21_sb_append(hv_sb, sv2)
+                si2 = si2 + 1
+            }
+            return 0
+        }
+        // p.6.1.4：循环内字节表自加提升——cbs 挂起中且为 `t = byte_concat(t, seg)`
+        // → 段就地追加到私有累积表（跳过整表拷贝+旧表泄漏；t 槽循环后写回）。
+        if op < 0 && cbs_find(nid) >= 0 && cbs_is_self_concat(val, nid) {
+            var cix2 = cbs_find(nid)
+            var acc_h = g_cbs_acc[cix2]
+            var coff = sstate.slot_off(val)
+            var seg_n = sstate.child(val, coff + 1)
+            var cseg = tig_expr(seg_n)
+            if cseg < 0 {
+                return -1
+            }
+            cbs_append(acc_h, cseg)
+            return 0
+        }
+        if scope_get_global(nid) < 0 {
+            sm_err_msg = "赋值目标 '" + nm + "' 未入作用域（函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+        var tgt_alloca = g_lookup_alloca
+        var tgt_global = g_lookup_is_global
+        var tgt_ty = g_lookup_ty
+        var vv: i64 = -1
+        if op >= 0 {
+            // 复合赋值：先 load 旧值
+            var cur = ir.new_inst(g_cur_block, 21, tgt_ty)  // load
+            if tgt_global > 0 {
+                ir.add_operand(cur, tgt_alloca, 3)
+            } else {
+                ir.add_operand(cur, tgt_alloca, 0)
+            }
+            var cur_v = ir.get_value(cur)
+            var rv = tig_expr(val)
+            if rv < 0 {
+                return -1
+            }
+            vv = tig_compound_assign(op, cur_v, rv, tgt_ty)
+            if vv < 0 {
+                sm_err_msg = "复合赋值运算失败（变量 " + nm + "，函数 " + g_cur_fn_name + "）"
+                return -1
+            }
+        } else {
+            if s_tags[val] == 4 && tgt_ty == types.named(TK_TRIT) {
+                // BoolLit 适配 trit（t = true 且 t 是 trit 变量 → i8 1）
+                var tv: i64 = -1
+                if s_vals[val] == 1 {
+                    tv = 1
+                }
+                vv = tig_trit_lit(tv)
+            } else {
+                vv = tig_expr(val)
+            }
+            if vv < 0 {
+                return -1
+            }
+        }
+        // S1.3 C2/C3：赋值值类型 ≠ 目标槽类型（数字族）→ 转换（拓宽/缩窄）
+        var vt = node_types[val]
+        if op < 0 && vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
+            (types.is_int(tgt_ty) || types.is_float(tgt_ty)) && vt != tgt_ty {
+            var cv = tig_coerce(vv, vt, tgt_ty)
+            if cv < 0 {
+                return -1
+            }
+            vv = cv
+        }
+        // p.6.10.2/3：表变量赋值引用计数插桩——仅普通赋值（非复合）、RHS 表类型。
+        //  retain(新)：局部槽/全局槽接收引用时 +1；RHS 为 table_new_* 直接构造则
+        //  免（新表所有权已转移给槽）。
+        //  release(旧)：局部**非参数**目标覆盖前 -1（参数借用不回收调用方所有权）。
+        //  空句柄由 tl_tbl.tbl_release 守卫跳过。
+        //
+        // ★★ p.9.16 内存工程【2026-10-08 RCA】：原判据含 `tgt_global <= 0`——即
+        // **全局目标覆盖时不 release 旧值**，理由是「全局永驻」。该推理只对了一半：
+        // 全局**在函数退出时**不能释放（它的生命周期超出函数），但**在赋值覆盖时**
+        // 旧值确实被丢弃 ⇒ 必须 -1。漏了这一半 ⇒ 每次「全局表被重新赋值」都泄漏
+        // 整张旧表。实测（`_z/leak/glob.tie`：循环内 `g = t`，t 为 1000 元素新表，
+        // 30 万次）：**峰值 2.43 GB / 稳态 190 MB**；同形但目标为**局部**变量
+        // （`locrb.tie`）峰值仅 9.1 MB ⇒ 泄漏点唯一地落在「全局目标」这一支。
+        // 这正是 LSP 稳态随文档/编辑线性增长（tsp 每次重析都要把 ~150 个前端全局
+        // 表重绑成新空表）的根因——也是 release_ast() 单靠「重绑」收不回内存的原因。
+        // 修法：与复合赋值（上方 op>=0 分支）同款——全局槽的 load 用操作数 kind 3
+        // （OK_GLOBAL 池 id），局部槽用 kind 0（alloca）。
+        // p.6.1.7-RCA【2026-09-05】：旧值必须在 **store 之前** load——旧码在 store 后
+        // 才 load 槽，读到的是**新表**：retain(新)+1 与 release(读到的新)-1 相抵 → 新表
+        // 引用计数缺 1（别名方 cur=nxt 仍持有指针）→ 循环内表变量重入时
+        // tig_loopvar_release 把它释放到 0 → 下一轮 tbl_at 悬垂/use-after-free
+        // （0xC0000005，编译形态/分配器状态决定是否崩——p.6.1.7 家族总根因）；旧值
+        // 同时泄漏。修复：先 load 旧值，release 旧值；顺序 = load旧 → retain新 →
+        // store新 → release旧。
+        var assign_is_tbl: bool = false
+        var assign_new_tbl: bool = false
+        var assign_old_v: i64 = -1
+        if op < 0 {
+            var vt3 = node_types[val]
+            if vt3 >= 0 && types.is_table(vt3) {
+                assign_is_tbl = true
+                // p.6.1.7-RCA-3【2026-09-06】：RHS 是**函数调用**（tag 7）→ 被调方
+                // 已在其 return 路径 retain 并交出所有权（含 table_new 直接构造、用户
+                // 函数、clone/zeros 等纯表返回）→ 这里不再 retain(+1)，否则 base+retain
+                // 双引用、覆盖时只 -1 → 每个欧几里得步的 clone 重赋值泄漏 ~2KB（enode
+                // 失控根因）。仅**变量/别名** RHS（rx=nx、sy1=red，tag 6）仍 retain（两
+                // 槽共享同一表，需各自持引用）。
+                // r.1.1.4：表字面量 RHS（tag 12）同调用是瞬态值（新表 rc=1）→ 免
+                // retain（否则每轮 `t = [..]` 重绑定泄漏 1 引用 → 循环内无界增长）。
+                if s_tags[val] == 7 || s_tags[val] == 12 {
+                    assign_new_tbl = true
+                }
+            }
+        }
+        if assign_is_tbl && !assign_new_tbl {
+            tig_tbl_retain_call(vv)
+        }
+        // ★ P2b any 装箱（赋值路径补齐，与 VarDecl 同款）：目标槽是 any 且 RHS 是
+        // 具体类型 → box 为 {tag,payload}。曾缺失 ⇒ 规范 §2.10 的 any 重绑定示例
+        //（`v = "text"`）直接 LLVM 类型错（槽型 {i64,i64} vs 未装箱值，新旧编译器
+        // 同样失败）。置于 retain 块**之后**：表 RHS 的 retain 须作用于裸句柄
+        //（装箱后是聚合值，tig_tbl_retain_call 不收）。any 盒本身不参与表引用
+        // 计数（与 VarDecl 出口析构排除 any 槽同款约定），故下方旧值 load/release
+        // 对 any 目标跳过（盒按借用约定随函数生命周期，不回收）。
+        if op < 0 && tgt_ty == types.named(TK_ANY) {
+            var vt5 = node_types[val]
+            if vt5 >= 0 && vt5 != types.named(TK_ANY) {
+                var bx5 = tig_box_any(vv, vt5)
+                if bx5 < 0 {
+                    return -1
+                }
+                vv = bx5
+            }
+        }
+        if assign_is_tbl && !tig_is_param(nid) && tgt_ty != types.named(TK_ANY) {
+            var old = ir.new_inst(g_cur_block, 21, tgt_ty)  // load 旧值（store 前！）
+            if tgt_global > 0 {
+                ir.add_operand(old, tgt_alloca, 3)          // 全局槽：OK_GLOBAL 池 id
+            } else {
+                ir.add_operand(old, tgt_alloca, 0)          // 局部槽：alloca
+            }
+            assign_old_v = ir.get_value(old)
+        }
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store
+        ir.add_operand(st, tgt_ty, 2)
+        ir.add_operand(st, vv, 0)
+        if tgt_global > 0 {
+            ir.add_operand(st, tgt_alloca, 3)  // OK_GLOBAL 全局地址（池 id）
+        } else {
+            ir.add_operand(st, tgt_alloca, 0)  // 本地 alloca
+        }
+        if assign_old_v >= 0 {
+            tig_tbl_release_call(assign_old_v)
+        }
+        return 0
+}
+
+pub func tig_stmt_b_110_Switch(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // Switch：字符串比较链（driver 树仅 typekw_index 一处，字符串 subject）
+        return tig_switch(id)
+}
+
+pub func tig_stmt_b_116_IndexAssign(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // IndexAssign：t[i] = v → tie_table_set 桥
+        return tig_index_assign(id)
+}
+
+pub func tig_stmt_b_115_FieldAssign(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // FieldAssign：obj.field = v（元组/struct 字段赋值；复合赋值 op ≥ 0）
+        return tig_field_assign(id)
+}
+
+pub func tig_stmt_b_134_S2(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // S2.3：`panic("消息")` 不可恢复错误语句（N_PANIC）→ printf + exit(1)
+        return tig_panic(id)
+}
+
+pub func tig_stmt_b_122_N_STMTLIST(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // N_STMTLIST 作语句：逐子语句生成（语句位置宏 `$body` 插值块后残留的
+        // 嵌套语句列表——dev33 批次10 任务28 语句级宏）。
+        return tig_stmtlist_as_stmt(id)
+}
+
+pub func tig_stmt_b_136_N_CODE_LIT(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // N_CODE_LIT 块形式（val=1）作语句：展开内部 StmtList（`$body` 插值
+        // 块形式 code 值后残留；表达式形式 val=0 在表达式层报错）。
+        if s_vals[id] == 1 {
+            var inner = sstate.child(id, 0)
+            if inner >= 0 {
+                return tig_stmtlist_as_stmt(inner)
+            }
+        }
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "irgen 不支持 code 字面量作语句（tag=136，函数 " + g_cur_fn_name + "）"
+        return -1
+}
+
+}

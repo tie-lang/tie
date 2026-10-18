@@ -1,0 +1,239 @@
+type tie<class>
+// std/buffer.tie —— 动态字节缓冲 buffer<u8>（命名空间 buf）
+// ============================================================
+// 用途：二进制模型权重序列化 / checkpoint / raw 数据集读取。
+//
+// 【Buf 形态与可变性决策（设计说明）】
+//   tiec 的 ref 形参仅支持 table / array<T,N>（scollect.tie：
+//   "ref 修饰仅支持表参数（table/table<T>）或定长数组（array<T,N>）"），
+//   自定义 struct 不可作 ref 参数。故 Buf 采用**按值 struct + 返回新 Buf**
+//   的值语义：struct Buf { data: table<i64>; cap: i64 }。
+//   data 字段是动态表（引用，内部共享，table_push 就地扩容），cap 字段维护
+//   已写逻辑字节数（恒等于 data 长度）。调用方以链式
+//   `b = buf.push_u8(b, v)` 演进状态；表字节区经 table_push 自动扩容，天然
+//   覆盖"写越界自动扩大"需求（无需预留/手动补齐）。
+//
+// 【数值编码】
+//   整型全部小端（u16=2 字节、u32=4 字节、i64=8 字节）；f64 经 bitcast_f64_i64
+//   拆 8 字节；f32 由 f64 按 IEEE-754 舍位得 32 位模式写 4 字节。
+//   读回按同规则拼字节 → bitcast 还原；越界读返回 0 / 0.0（见各函数注释）。
+//
+// 【文件对接】
+//   write_bytes 走 byte_write（成功 true/失败 false）；load 走 byte_read，
+//   与 bytes.read 一致：byte_read 失败由底座报错并退出（不可捕获），
+//   正常路径返回读得的全部字节。
+
+// Buf：动态字节缓冲（值语义本体）。data 为字节区（元素 0..255），cap 为已写长度。
+struct Buf {
+    var data: table<i64>;
+    var cap: i64;
+}
+
+namespace buf {
+    // 私有：追加 1 字节（低位裁剪 0..255）并返回增长后的 Buf。table_push 的第 1
+    // 实参必须是表变量（字段链 b.data 不可取地址），故先取局部表 dd 再就地追加；
+    // dd 与 b.data 引用同一底层表，追加后经 b.data 构造返回新 Buf。
+    func _grow(b: Buf, v: i64) -> Buf {
+        var dd = b.data
+        table_push(dd, v & 0xFF)
+        return Buf(b.data, b.cap + 1)
+    }
+
+    // 私有：读第 off 字节；越界（off<0 或超过已写长度）返回 0。
+    func byte_at(b: Buf, off: i64) -> i64 {
+        if off < 0 {
+            return 0
+        }
+        if off >= len(b.data) {
+            return 0
+        }
+        return b.data[off]
+    }
+
+    // 私有：f64 → f32 的 32 位位模式（IEEE-754 舍位，普通数/±0/±Inf/NaN）。
+    func f64_to_f32_bits(v: f64) -> i64 {
+        var bits = bitcast_f64_i64(v)
+        var sign = (bits >> 63) & 1
+        var exp64 = (bits >> 52) & 0x7FF
+        var mant = bits & 0xFFFFFFFFFFFFF
+        var res32: i64 = 0
+        if exp64 == 2047 {
+            var e32 = 255
+            if mant == 0 {
+                res32 = (sign << 31) | (e32 << 23)
+            } else {
+                res32 = (sign << 31) | (e32 << 23) | 0x3FFFFF
+            }
+        } else if exp64 == 0 {
+            res32 = (sign << 31)
+        } else {
+            var e32 = exp64 - 1023 + 127
+            if e32 >= 255 {
+                res32 = (sign << 31) | (255 << 23)
+            } else if e32 <= 0 {
+                res32 = (sign << 31)
+            } else {
+                res32 = (sign << 31) | (e32 << 23) | ((mant >> 29) & 0x7FFFFF)
+            }
+        }
+        return res32
+    }
+
+    // 私有：f32 位模式 → f64 值（扩宽；普通数/±0/±Inf/NaN 正确，次正规按 0）。
+    func f32_bits_to_f64(b: i64) -> f64 {
+        var sign = (b >> 31) & 1
+        var e32 = (b >> 23) & 0xFF
+        var m32 = b & 0x7FFFFF
+        if e32 == 0 {
+            if m32 == 0 && sign == 1 {
+                return 0.0 * -1.0
+            }
+            return 0.0
+        }
+        if e32 == 255 {
+            var m64 = m32 << 29
+            if m32 == 0 {
+                m64 = 0
+            }
+            return bitcast_i64_f64((sign << 63) | (2047 << 52) | m64)
+        }
+        var e64 = e32 - 127 + 1023
+        return bitcast_i64_f64((sign << 63) | (e64 << 52) | (m32 << 29))
+    }
+
+    // 新建空动态字节缓冲。
+    pub func new() -> Buf {
+        return Buf(table_new_i64(), 0)
+    }
+
+    // 当前已写逻辑字节数。
+    pub func length(b: Buf) -> i64 {
+        return b.cap
+    }
+
+    // 追加 1 字节（低位裁剪到 0..255）。
+    pub func push_u8(b: Buf, v: i64) -> Buf {
+        return _grow(b, v)
+    }
+
+    // 追加 2 字节（小端 u16）。
+    pub func push_u16(b: Buf, v: i64) -> Buf {
+        var r = _grow(b, v & 0xFF)
+        return _grow(r, (v >> 8) & 0xFF)
+    }
+
+    // 追加 4 字节（小端 u32）。
+    pub func push_u32(b: Buf, v: i64) -> Buf {
+        var r = _grow(b, v & 0xFF)
+        r = _grow(r, (v >> 8) & 0xFF)
+        r = _grow(r, (v >> 16) & 0xFF)
+        return _grow(r, (v >> 24) & 0xFF)
+    }
+
+    // 追加 8 字节（小端 i64）。
+    pub func push_i64(b: Buf, v: i64) -> Buf {
+        var r = b
+        var i: i64 = 0
+        while i < 8 {
+            r = _grow(r, (v >> (i * 8)) & 0xFF)
+            i = i + 1
+        }
+        return r
+    }
+
+    // 追加 f64 为 8 字节（bitcast 位模式，小端）。
+    pub func push_f64(b: Buf, v: f64) -> Buf {
+        return push_i64(b, bitcast_f64_i64(v))
+    }
+
+    // 追加 f64（窄化为 f32 位模式）为 4 字节（小端）。
+    pub func push_f32(b: Buf, v: f64) -> Buf {
+        var bits = f64_to_f32_bits(v)
+        var r = _grow(b, bits & 0xFF)
+        r = _grow(r, (bits >> 8) & 0xFF)
+        r = _grow(r, (bits >> 16) & 0xFF)
+        return _grow(r, (bits >> 24) & 0xFF)
+    }
+
+    // 追加 C 字符串：UTF-8 全部字节（逐字节，含多字节码点）后补 1 个 NUL(0)。
+    pub func push_cstr(b: Buf, s: string) -> Buf {
+        var r = b
+        var n = len(s)
+        var i: i64 = 0
+        while i < n {
+            r = push_u8(r, str_byte(s, i))
+            i = i + 1
+        }
+        return push_u8(r, 0)
+    }
+
+    // 读第 off 字节；越界返回 0。
+    pub func u8_at(b: Buf, off: i64) -> i64 {
+        return byte_at(b, off)
+    }
+
+    // 读第 off 字节起 8 字节小端拼回 i64；越界字节按 0（越界整体返回 0 或首段）。
+    pub func i64_at(b: Buf, off: i64) -> i64 {
+        var v: i64 = 0
+        var i: i64 = 0
+        while i < 8 {
+            v = v | ((byte_at(b, off + i) & 0xFF) << (i * 8))
+            i = i + 1
+        }
+        return v
+    }
+
+    // 读第 off 字节起 8 字节小端 bitcast 回 f64；越界返回 0.0。
+    pub func f64_at(b: Buf, off: i64) -> f64 {
+        return bitcast_i64_f64(i64_at(b, off))
+    }
+
+    // 读第 off 字节起 4 字节小端 → 扩宽为 f64（返回 f64）；越界返回 0.0。
+    pub func f32_at(b: Buf, off: i64) -> f64 {
+        var bits: i64 = 0
+        var i: i64 = 0
+        while i < 4 {
+            bits = bits | ((byte_at(b, off + i) & 0xFF) << (i * 8))
+            i = i + 1
+        }
+        return f32_bits_to_f64(bits)
+    }
+
+    // 整表写入文件；成功返回 true，失败返回 false（byte_write 底座）。
+    pub func write_bytes(b: Buf, path: string) -> bool {
+        var dd = b.data
+        return byte_write(path, dd)
+    }
+
+    // 从文件读取全部字节到新 Buf；失败由 byte_read 底座报错退出（文档约定）。
+    // 注：把 byte_read 返回的表直接包进 struct 并作为库函数返回值在某种 ABI
+    // 边界下会访问违例（探针 min8 复现），故改经 _grow 逐字节重建普通表（与
+    // push_* 同一路径），功能与内存布局一致。
+    pub func load(path: string) -> Buf {
+        var t = byte_read(path)
+        var r: Buf = Buf(table_new_i64(), 0)
+        var n = len(t)
+        var i: i64 = 0
+        while i < n {
+            r = _grow(r, t[i] & 0xFF)
+            i = i + 1
+        }
+        return r
+    }
+
+    // 清空为新的空缓冲（返回新 Buf，原 Buf 引用可弃）。
+    pub func clear(b: Buf) -> Buf {
+        return Buf(table_new_i64(), 0)
+    }
+
+    // 把 b 全部字节按序追加到 a 之后（以 a 为基准，返回扩展后的 a）。
+    pub func concat(a: Buf, b: Buf) -> Buf {
+        var r = a
+        var i: i64 = 0
+        while i < b.cap {
+            r = push_u8(r, byte_at(b, i))
+            i = i + 1
+        }
+        return r
+    }
+}

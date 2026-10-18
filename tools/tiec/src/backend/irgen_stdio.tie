@@ -1,0 +1,818 @@
+type tie<class>
+// compiler/backend/irgen_stdio.tie —— 生成器 L3：标准输入输出辅助（stdin_read、stdout_write_*、read_line）
+// ============================================================
+// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// stdin_read(n) -> table<i64>：GetStdHandle(STD_INPUT_HANDLE=-10) + ReadFile 循环
+// 读**至多 n 字节**。块读（chunk = n - 已收）：管道下 ReadFile 返回可用字节
+// （< chunk），循环阻塞至凑满 n 或 EOF（ReadFile 失败 / 读计数 0）；EOF 且零
+// 收到 → 空表。返回 i64 字节表（元素 0..255）。缓冲/元素缓冲均 malloc 并与
+// s21_tbl_adopt 采纳（48 字节运行时句柄，refcount=1，杜绝旧 32 字节手排越界）。
+func tig_stdin_read(n: i64) -> i64 {
+    // r.1.6.3：Linux 分支——read(fd=0, buf+k, chunk) 直通（POSIX fd 0 =
+    // stdin，UTF-8 字节，无 CRT 文本翻译）。read 返回 ssize_t：>0 实收；
+    // <=0（EOF 0 / 出错 -1）→ 收尾（对齐 Win32 ReadFile 失败/读计数 0）。
+    if tig_is_linux() {
+        var T64 = types.named(TK_I64)
+        var I32 = types.named(TK_I32)
+        var I8 = types.named(TK_I8)
+        var P8 = types.ptr_of(types.named(TK_I8))
+        var e8 = tig_int_lit(8)
+        var fd0 = tig_int_lit_ty(0, I32)  // STDIN_FILENO
+        var slot = ir.new_inst(g_cur_block, 20, types.named(TK_STR))
+        ir.add_operand(slot, types.named(TK_STR), 2)
+        var sv = ir.get_value(slot)
+        var empty = s21_tbl_adopt(e8, tig_int_lit(0), tig_int_lit(0), s21_raw_alloc_str(e8))
+        s21_store(sv, empty, types.named(TK_STR))
+        var capb = s21_bin(0, n, e8)
+        var buf = s21_raw_alloc_str(capb)
+        var kslot = ir.new_inst(g_cur_block, 20, T64)
+        ir.add_operand(kslot, T64, 2)
+        var ksv = ir.get_value(kslot)
+        s21_store(ksv, tig_int_lit(0), T64)  // k = 0（已收字节数）
+        var b_hd = ir.new_block(g_cur_func, interner.intern("siol.rh"))
+        var b_lp = ir.new_block(g_cur_func, interner.intern("siol.rl"))
+        var b_up = ir.new_block(g_cur_func, interner.intern("siol.ru"))
+        var b_ex = ir.new_block(g_cur_func, interner.intern("siol.re"))
+        var bc0 = ir.new_inst(g_cur_block, 30, -1)  // br hd
+        ir.add_operand(bc0, b_hd, 1)
+        g_cur_block = b_hd
+        var kc = tig_icmp_c(s21_load(ksv, T64), n, 2)  // k < n（slt）
+        var cbl = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cbl, kc, 0)
+        ir.add_operand(cbl, b_lp, 1)
+        ir.add_operand(cbl, b_ex, 1)
+        // lp：chunk = n - k；read(fd0, buf+k, chunk)
+        g_cur_block = b_lp
+        var kk = s21_load(ksv, T64)
+        var chunk = s21_bin(1, n, kk)  // sub
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, I32);  table_push(avs, fd0)
+        table_push(ats, P8);   table_push(avs, s21_gep(buf, kk, false))
+        table_push(ats, T64);  table_push(avs, chunk)
+        var nr = tig_ext_call_typed("read", ats, avs, T64)  // ssize_t
+        var more = tig_icmp_c(nr, tig_int_lit(0), 3)  // nr > 0
+        var cb1 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb1, more, 0)
+        ir.add_operand(cb1, b_up, 1)
+        ir.add_operand(cb1, b_ex, 1)  // EOF/出错 → 收尾
+        g_cur_block = b_up
+        s21_store(ksv, s21_bin(0, kk, nr), T64)  // k = k + nr
+        var bru = ir.new_inst(g_cur_block, 30, -1)  // br hd（重判 k < n）
+        ir.add_operand(bru, b_hd, 1)
+        // ex：u8 缓冲 → i64 元素缓冲 → 采纳句柄（collected==0 → 空表已就绪）
+        g_cur_block = b_ex
+        var kk2 = s21_load(ksv, T64)
+        var nz = tig_cmp_zero(kk2, 0)  // collected == 0（谓词 0 = EQ）
+        var b_b = ir.new_block(g_cur_func, interner.intern("siol.rb"))
+        var b_m = ir.new_block(g_cur_func, interner.intern("siol.rm"))
+        var cb3 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb3, nz, 0)
+        ir.add_operand(cb3, b_m, 1)
+        ir.add_operand(cb3, b_b, 1)
+        g_cur_block = b_b
+        var tb = s21_raw_alloc_str(s21_bin(2, kk2, e8))  // collected*8 元素缓冲
+        var cslot = ir.new_inst(g_cur_block, 20, T64)
+        ir.add_operand(cslot, T64, 2)
+        var csv = ir.get_value(cslot)
+        s21_store(csv, tig_int_lit(0), T64)  // i = 0
+        var b_cb = ir.new_block(g_cur_func, interner.intern("siol.ch"))
+        var b_cd = ir.new_block(g_cur_func, interner.intern("siol.cd"))
+        var b_ce = ir.new_block(g_cur_func, interner.intern("siol.ce"))
+        var brc = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brc, b_cb, 1)
+        g_cur_block = b_cb
+        var ic = tig_icmp_c(s21_load(csv, T64), kk2, 2)  // i < collected
+        var cbc = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cbc, ic, 0)
+        ir.add_operand(cbc, b_cd, 1)
+        ir.add_operand(cbc, b_ce, 1)
+        g_cur_block = b_cd
+        var iv = s21_load(csv, T64)
+        var bv = s21_load(s21_gep(buf, iv, false), I8)
+        var ev = s21_zext(bv, I8)
+        s21_store(s21_gep(tb, s21_bin(2, iv, e8), false), ev, T64)
+        s21_store(csv, s21_bin(0, iv, tig_int_lit(1)), T64)  // i++
+        var brcd = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brcd, b_cb, 1)
+        g_cur_block = b_ce
+        var h2 = s21_tbl_adopt(e8, kk2, kk2, tb)
+        s21_store(sv, h2, types.named(TK_STR))
+        var brx = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brx, b_m, 1)
+        g_cur_block = b_m
+        tig_ext_call1("free", buf, types.named(TK_STR), -1)
+        return s21_load(sv, types.named(TK_STR))
+    }
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var I8 = types.named(TK_I8)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var e8 = tig_int_lit(8)
+    var nulp = tig_null_ptr()
+    var h = tig_con_handle(-10)
+    // 结果槽（表句柄 ptr 值；默认空表句柄）
+    var slot = ir.new_inst(g_cur_block, 20, types.named(TK_STR))
+    ir.add_operand(slot, types.named(TK_STR), 2)
+    var sv = ir.get_value(slot)
+    var empty = s21_tbl_adopt(e8, tig_int_lit(0), tig_int_lit(0), s21_raw_alloc_str(e8))
+    s21_store(sv, empty, types.named(TK_STR))
+    // ---- 控制台编码契约（设计稿 §4.1）：控制台 ⇒ ReadConsoleW 单次行读
+    //      （cap = max(n,1) 码元）转 UTF-8 字节表（条数按码元上限近似）；管道/
+    //      文件 ⇒ 原 ReadFile 拼满 n 字节路径（逐字节不变）。----
+    var isc = tig_con_is_console(h)
+    var b_cc = ir.new_block(g_cur_func, interner.intern("sio.cc"))
+    var b_od = ir.new_block(g_cur_func, interner.intern("sio.od"))
+    var b_m2 = ir.new_block(g_cur_func, interner.intern("sio.m2"))
+    var cbc0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbc0, isc, 0)
+    ir.add_operand(cbc0, b_cc, 1)
+    ir.add_operand(cbc0, b_od, 1)
+    // 控制台：ReadConsoleW（行模式返回含 \r\n 的一行）→ UTF-8 → i64 字节表
+    g_cur_block = b_cc
+    var capn = tig_select_i(tig_icmp_c(n, tig_int_lit(1), 2), tig_int_lit(1), n, T64)
+    var cbuf = s21_raw_alloc_str(s21_bin(2, s21_bin(0, capn, tig_int_lit(1)), tig_int_lit(2)))
+    var crn = ir.new_inst(g_cur_block, 20, I32)
+    ir.add_operand(crn, I32, 2)
+    var crnp = ir.get_value(crn)
+    s21_store(crnp, tig_int_lit_ty(0, I32), I32)
+    var cats: table<i64> = table_new_i64()
+    var cavs: table<i64> = table_new_i64()
+    table_push(cats, P8);  table_push(cavs, h)
+    table_push(cats, P8);  table_push(cavs, cbuf)
+    table_push(cats, I32); table_push(cavs, sio_trunc_i32(capn))
+    table_push(cats, P8);  table_push(cavs, crnp)
+    table_push(cats, P8);  table_push(cavs, nulp)
+    tig_ext_call_typed("ReadConsoleW", cats, cavs, I32)
+    var cnn = s21_zext(s21_load(crnp, I32), I32)
+    // NUL 终止（u16，两字节写零）
+    s21_store(s21_gep(cbuf, s21_bin(2, cnn, tig_int_lit(2)), false), tig_int_lit_ty(0, I8), I8)
+    s21_store(s21_gep(cbuf, s21_bin(0, s21_bin(2, cnn, tig_int_lit(2)), tig_int_lit(1)), false), tig_int_lit_ty(0, I8), I8)
+    var cs = tig_from_wide16(cbuf)
+    tig_ext_call1("free", cbuf, types.named(TK_STR), -1)
+    // UTF-8 串 → i64 字节表（空 ⇒ 保持默认空表）
+    var cblen = s21_str_head_len(cs)
+    var nzc = tig_cmp_zero(cblen, 0)
+    var b_ct = ir.new_block(g_cur_func, interner.intern("sio.ct"))
+    var b_cm = ir.new_block(g_cur_func, interner.intern("sio.cm"))
+    var cbc1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbc1, nzc, 0)
+    ir.add_operand(cbc1, b_cm, 1)
+    ir.add_operand(cbc1, b_ct, 1)
+    g_cur_block = b_ct
+    var ctb = s21_raw_alloc_str(s21_bin(2, cblen, e8))  // cblen*8 元素缓冲
+    var ccsl = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ccsl, T64, 2)
+    var ccsv = ir.get_value(ccsl)
+    s21_store(ccsv, tig_int_lit(0), T64)  // i = 0
+    var b_clp = ir.new_block(g_cur_func, interner.intern("sio.cl"))
+    var b_cbd = ir.new_block(g_cur_func, interner.intern("sio.cy"))
+    var b_cx = ir.new_block(g_cur_func, interner.intern("sio.cx"))
+    var cbr0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(cbr0, b_clp, 1)
+    g_cur_block = b_clp
+    var cic = tig_icmp_c(s21_load(ccsv, T64), cblen, 2)  // i < cblen
+    var cbc2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbc2, cic, 0)
+    ir.add_operand(cbc2, b_cbd, 1)
+    ir.add_operand(cbc2, b_cx, 1)
+    g_cur_block = b_cbd
+    var cbv = s21_str_byte(cs, s21_load(ccsv, T64))
+    s21_store(s21_gep(ctb, s21_bin(2, s21_load(ccsv, T64), e8), false), cbv, T64)
+    s21_store(ccsv, s21_bin(0, s21_load(ccsv, T64), tig_int_lit(1)), T64)  // i++
+    var cbr1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(cbr1, b_clp, 1)
+    g_cur_block = b_cx
+    var ch3 = s21_tbl_adopt(e8, cblen, cblen, ctb)
+    s21_store(sv, ch3, types.named(TK_STR))
+    var cbr2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(cbr2, b_cm, 1)
+    g_cur_block = b_cm
+    var cbr3 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(cbr3, b_m2, 1)
+    // ---- 管道/文件：原 ReadFile 路径（逐字节不变）----
+    g_cur_block = b_od
+    // 读缓冲 n+8 字节（n=0 亦有安全块）+ 已收计数槽 + 读计数槽
+    var capb = s21_bin(0, n, e8)
+    var buf = s21_raw_alloc_str(capb)
+    var kslot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(kslot, T64, 2)
+    var ksv = ir.get_value(kslot)
+    s21_store(ksv, tig_int_lit(0), T64)  // k = 0（已收字节数）
+    var ra = ir.new_inst(g_cur_block, 20, I32)
+    ir.add_operand(ra, I32, 2)
+    var rcp = ir.get_value(ra)
+    // 主循环：hd 判 k < n → lp / ex
+    var b_hd = ir.new_block(g_cur_func, interner.intern("sio.rh"))
+    var b_lp = ir.new_block(g_cur_func, interner.intern("sio.rl"))
+    var b_rd = ir.new_block(g_cur_func, interner.intern("sio.rd"))
+    var b_up = ir.new_block(g_cur_func, interner.intern("sio.ru"))
+    var b_fail = ir.new_block(g_cur_func, interner.intern("sio.rf"))
+    var b_ex = ir.new_block(g_cur_func, interner.intern("sio.re"))
+    var bc0 = ir.new_inst(g_cur_block, 30, -1)  // br hd
+    ir.add_operand(bc0, b_hd, 1)
+    g_cur_block = b_hd
+    var kc = tig_icmp_c(s21_load(ksv, T64), n, 2)  // k < n（slt）
+    var cbl = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbl, kc, 0)
+    ir.add_operand(cbl, b_lp, 1)
+    ir.add_operand(cbl, b_ex, 1)
+    // lp：chunk = n - k；ReadFile(h, buf+k, chunk32, &nread, NULL)
+    g_cur_block = b_lp
+    var kk = s21_load(ksv, T64)
+    var chunk = s21_bin(1, n, kk)  // sub
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8);  table_push(avs, h)
+    table_push(ats, P8);  table_push(avs, s21_gep(buf, kk, false))
+    table_push(ats, I32); table_push(avs, sio_trunc_i32(chunk))
+    table_push(ats, P8);  table_push(avs, rcp)
+    table_push(ats, P8);  table_push(avs, nulp)
+    var rf = tig_ext_call_typed("ReadFile", ats, avs, I32)
+    var okr = tig_win_ok(rf)
+    var cb1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb1, okr, 0)
+    ir.add_operand(cb1, b_rd, 1)
+    ir.add_operand(cb1, b_fail, 1)
+    // ReadFile 失败（断管等）→ 视为 EOF 收尾
+    g_cur_block = b_fail
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, b_ex, 1)
+    // rd：nread == 0 → EOF 收尾；否则 k += nread 回边 hd
+    g_cur_block = b_rd
+    var nrd = s21_zext(s21_load(rcp, I32), I32)
+    var c0 = tig_cmp_zero(nrd, 0)  // nread == 0（tig_cmp_zero 谓词 0 = EQ）
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, c0, 0)
+    ir.add_operand(cb2, b_ex, 1)
+    ir.add_operand(cb2, b_up, 1)
+    g_cur_block = b_up
+    s21_store(ksv, s21_bin(0, kk, nrd), T64)  // k = k + nread
+    var bru = ir.new_inst(g_cur_block, 30, -1)  // br hd（重判 k < n）
+    ir.add_operand(bru, b_hd, 1)
+    // ex：u8 缓冲 → i64 元素缓冲 → 采纳句柄（collected==0 → 空表已就绪）
+    g_cur_block = b_ex
+    var kk2 = s21_load(ksv, T64)
+    var nz = tig_cmp_zero(kk2, 0)  // collected == 0（谓词 0 = EQ）
+    var b_b = ir.new_block(g_cur_func, interner.intern("sio.rb"))
+    var b_m = ir.new_block(g_cur_func, interner.intern("sio.rm"))
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, nz, 0)
+    ir.add_operand(cb3, b_m, 1)
+    ir.add_operand(cb3, b_b, 1)
+    g_cur_block = b_b
+    var tb = s21_raw_alloc_str(s21_bin(2, kk2, e8))  // collected*8 元素缓冲
+    var cslot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(cslot, T64, 2)
+    var csv = ir.get_value(cslot)
+    s21_store(csv, tig_int_lit(0), T64)  // i = 0
+    var b_cb = ir.new_block(g_cur_func, interner.intern("sio.ch"))
+    var b_cd = ir.new_block(g_cur_func, interner.intern("sio.cd"))
+    var b_ce = ir.new_block(g_cur_func, interner.intern("sio.ce"))
+    var brc = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brc, b_cb, 1)
+    g_cur_block = b_cb
+    var ic = tig_icmp_c(s21_load(csv, T64), kk2, 2)  // i < collected
+    var cbc = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbc, ic, 0)
+    ir.add_operand(cbc, b_cd, 1)
+    ir.add_operand(cbc, b_ce, 1)
+    g_cur_block = b_cd
+    var iv = s21_load(csv, T64)
+    var bv = s21_load(s21_gep(buf, iv, false), I8)
+    var ev = s21_zext(bv, I8)
+    s21_store(s21_gep(tb, s21_bin(2, iv, e8), false), ev, T64)
+    s21_store(csv, s21_bin(0, iv, tig_int_lit(1)), T64)  // i++
+    var brcd = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brcd, b_cb, 1)
+    g_cur_block = b_ce
+    var h2 = s21_tbl_adopt(e8, kk2, kk2, tb)
+    s21_store(sv, h2, types.named(TK_STR))
+    var brx = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brx, b_m, 1)
+    g_cur_block = b_m
+    tig_ext_call1("free", buf, types.named(TK_STR), -1)
+    var cbr4 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(cbr4, b_m2, 1)
+    // 两路汇合（控制台/管道返回同一结果槽）
+    g_cur_block = b_m2
+    return s21_load(sv, types.named(TK_STR))
+}
+// stdout_write_str(s) -> i64：写字符串全部字节到 stdout（GetStdHandle(STD_OUTPUT_
+// HANDLE=-11) + WriteFile——**不用 CRT _write**：_write 对文本模式句柄做
+// \n→\r\n 翻译（管道重定向时 fd1 为文本模式，会把字节负载里的 \n 翻成 \r\n），
+// 协议输出必须字节精确）。返回实际写入字节数；失败 0。
+func tig_stdout_write_str(s: i64) -> i64 {
+    // r.1.6.3：Linux 分支——write(fd=1, s, len) 直通（POSIX fd 1 = stdout，
+    // 无 CRT _write 的 \n→\r\n 翻译，字节精确——对齐 Win32 用 WriteFile 的
+    // 动机）。返回实际写入字节数；失败/0 → 0（对齐 Win32 哨兵）。
+    if tig_is_linux() {
+        var T64 = types.named(TK_I64)
+        var I32 = types.named(TK_I32)
+        var P8 = types.ptr_of(types.named(TK_I8))
+        var len = s21_str_head_len(s)
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, I32); table_push(avs, tig_int_lit_ty(1, I32))  // STDOUT_FILENO
+        table_push(ats, P8);  table_push(avs, s)
+        table_push(ats, T64); table_push(avs, len)
+        var r = tig_ext_call_typed("write", ats, avs, T64)  // ssize_t
+        var slot = ir.new_inst(g_cur_block, 20, T64)
+        ir.add_operand(slot, T64, 2)
+        var sv = ir.get_value(slot)
+        var pos = tig_icmp_c(r, tig_int_lit(0), 3)  // r > 0
+        var b_ok = ir.new_block(g_cur_func, interner.intern("siol.ws.ok"))
+        var b_fl = ir.new_block(g_cur_func, interner.intern("siol.ws.fl"))
+        var b_mg = ir.new_block(g_cur_func, interner.intern("siol.ws.m"))
+        var cb = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb, pos, 0)
+        ir.add_operand(cb, b_ok, 1)
+        ir.add_operand(cb, b_fl, 1)
+        g_cur_block = b_ok
+        s21_store(sv, r, T64)
+        var br1 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br1, b_mg, 1)
+        g_cur_block = b_fl
+        s21_store(sv, tig_int_lit(0), T64)
+        var br2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br2, b_mg, 1)
+        g_cur_block = b_mg
+        return s21_load(sv, T64)
+    }
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var nulp = tig_null_ptr()
+    var h = tig_con_handle(-11)
+    // 控制台编码契约（设计稿 §4.1）：控制台 ⇒ 宽写（WriteConsoleW，LF 翻译）；
+    // 管道/文件 ⇒ 原 WriteFile 字节路径（逐字节不变）。
+    var isc = tig_con_is_console(h)
+    // 结果槽：成功 → 实收（控制台分支为实写字符数）；失败 → 0
+    var slot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(slot, T64, 2)
+    var sv = ir.get_value(slot)
+    s21_store(sv, tig_int_lit(0), T64)
+    var b_c = ir.new_block(g_cur_func, interner.intern("sio.wc"))
+    var b_od = ir.new_block(g_cur_func, interner.intern("sio.wd"))
+    var b_mg = ir.new_block(g_cur_func, interner.intern("sio.ws.m"))
+    var cb0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb0, isc, 0)
+    ir.add_operand(cb0, b_c, 1)
+    ir.add_operand(cb0, b_od, 1)
+    // 控制台：宽写（UTF-8→UTF-16→WriteConsoleW）
+    g_cur_block = b_c
+    var rc4 = tig_con_write_line(h, s, 0)
+    s21_store(sv, s21_zext(rc4, I32), T64)
+    var brc0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brc0, b_mg, 1)
+    // 管道/文件：原 WriteFile 路径
+    g_cur_block = b_od
+    var len = s21_str_head_len(s)
+    var wc = ir.new_inst(g_cur_block, 20, I32)
+    ir.add_operand(wc, I32, 2)
+    var wcp = ir.get_value(wc)
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8);  table_push(avs, h)
+    table_push(ats, P8);  table_push(avs, s)
+    table_push(ats, I32); table_push(avs, sio_trunc_i32(len))
+    table_push(ats, P8);  table_push(avs, wcp)
+    table_push(ats, P8);  table_push(avs, nulp)
+    var r = tig_ext_call_typed("WriteFile", ats, avs, I32)
+    var okr = tig_win_ok(r)
+    var b_ok = ir.new_block(g_cur_func, interner.intern("sio.ws.ok"))
+    var b_fl = ir.new_block(g_cur_func, interner.intern("sio.ws.fl"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, okr, 0)
+    ir.add_operand(cb, b_ok, 1)
+    ir.add_operand(cb, b_fl, 1)
+    g_cur_block = b_ok
+    s21_store(sv, s21_zext(s21_load(wcp, I32), I32), T64)
+    var br1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br1, b_mg, 1)
+    g_cur_block = b_fl
+    s21_store(sv, tig_int_lit(0), T64)
+    var br2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br2, b_mg, 1)
+    // 两路汇合
+    g_cur_block = b_mg
+    return s21_load(sv, T64)
+}
+// stdout_write_bytes(t) -> i64：字节表 → u8 连续缓冲（逐元素 & 0xFF 截低字节，
+// 同 tig_byte_write）→ 整块 WriteFile(hStdOut, buf, n)（同 write_str：约束队
+// \n 文本翻译，字节精确）。返回写入字节数；失败 0。
+func tig_stdout_write_bytes(t: i64) -> i64 {
+    // r.1.6.3：Linux 分支——字节表 → u8 连续缓冲 → write(fd=1, nbuf, len)
+    //（同 write_str：POSIX fd 直写无文本翻译，字节精确）。返回实收；失败 0。
+    if tig_is_linux() {
+        var T64 = types.named(TK_I64)
+        var I8 = types.named(TK_I8)
+        var I32 = types.named(TK_I32)
+        var P8 = types.ptr_of(types.named(TK_I8))
+        var len = s21_load(s21_gep(t, 8, true), T64)
+        var data = t21_data(t)
+        var esz = t21_esz(t)
+        var nbuf = s21_raw_alloc_str(s21_bin(0, len, tig_int_lit(1)))  // len+1 防 0 长 malloc
+        var kslot = ir.new_inst(g_cur_block, 20, T64)
+        ir.add_operand(kslot, T64, 2)
+        var ksv = ir.get_value(kslot)
+        s21_store(ksv, tig_int_lit(0), T64)  // k = 0
+        var b_hd = ir.new_block(g_cur_func, interner.intern("siol.wh"))
+        var b_bd = ir.new_block(g_cur_func, interner.intern("siol.wb"))
+        var b_ex = ir.new_block(g_cur_func, interner.intern("siol.we"))
+        var brh = ir.new_inst(g_cur_block, 30, -1)  // br hd
+        ir.add_operand(brh, b_hd, 1)
+        g_cur_block = b_hd
+        var kc = tig_icmp_c(s21_load(ksv, T64), len, 2)  // k < len
+        var cbl = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cbl, kc, 0)
+        ir.add_operand(cbl, b_bd, 1)
+        ir.add_operand(cbl, b_ex, 1)
+        g_cur_block = b_bd
+        var kv = s21_load(ksv, T64)
+        var el = s21_load(s21_gep(data, s21_bin(2, kv, esz), false), T64)
+        var lo = s21_bin(6, el, tig_int_lit(255))  // & 0xFF（and）
+        s21_store(s21_gep(nbuf, kv, false), s21_trunc_i8(lo), I8)
+        s21_store(ksv, s21_bin(0, kv, tig_int_lit(1)), T64)  // k++
+        var brb = ir.new_inst(g_cur_block, 30, -1)  // 回边
+        ir.add_operand(brb, b_hd, 1)
+        g_cur_block = b_ex
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, I32); table_push(avs, tig_int_lit_ty(1, I32))  // STDOUT_FILENO
+        table_push(ats, P8);  table_push(avs, nbuf)
+        table_push(ats, T64); table_push(avs, len)
+        var r = tig_ext_call_typed("write", ats, avs, T64)  // ssize_t
+        // 结果槽：r > 0 → 实收；失败/0 → 0
+        var slot = ir.new_inst(g_cur_block, 20, T64)
+        ir.add_operand(slot, T64, 2)
+        var sv = ir.get_value(slot)
+        var pos = tig_icmp_c(r, tig_int_lit(0), 3)
+        var b_ok = ir.new_block(g_cur_func, interner.intern("siol.wb.ok"))
+        var b_fl = ir.new_block(g_cur_func, interner.intern("siol.wb.fl"))
+        var b_mg = ir.new_block(g_cur_func, interner.intern("siol.wb.m"))
+        var cb = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb, pos, 0)
+        ir.add_operand(cb, b_ok, 1)
+        ir.add_operand(cb, b_fl, 1)
+        g_cur_block = b_ok
+        s21_store(sv, r, T64)
+        var br1 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br1, b_mg, 1)
+        g_cur_block = b_fl
+        s21_store(sv, tig_int_lit(0), T64)
+        var br2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br2, b_mg, 1)
+        g_cur_block = b_mg
+        tig_ext_call1("free", nbuf, types.named(TK_STR), -1)
+        return s21_load(sv, T64)
+    }
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var nulp = tig_null_ptr()
+    var len = s21_load(s21_gep(t, 8, true), T64)
+    var data = t21_data(t)
+    var esz = t21_esz(t)
+    var nbuf = s21_raw_alloc_str(s21_bin(0, len, tig_int_lit(1)))  // len+1 防 0 长 malloc
+    var kslot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(kslot, T64, 2)
+    var ksv = ir.get_value(kslot)
+    s21_store(ksv, tig_int_lit(0), T64)  // k = 0
+    var b_hd = ir.new_block(g_cur_func, interner.intern("sio.wh"))
+    var b_bd = ir.new_block(g_cur_func, interner.intern("sio.wb"))
+    var b_ex = ir.new_block(g_cur_func, interner.intern("sio.we"))
+    var brh = ir.new_inst(g_cur_block, 30, -1)  // br hd
+    ir.add_operand(brh, b_hd, 1)
+    g_cur_block = b_hd
+    var kc = tig_icmp_c(s21_load(ksv, T64), len, 2)  // k < len
+    var cbl = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbl, kc, 0)
+    ir.add_operand(cbl, b_bd, 1)
+    ir.add_operand(cbl, b_ex, 1)
+    g_cur_block = b_bd
+    var kv = s21_load(ksv, T64)
+    var el = s21_load(s21_gep(data, s21_bin(2, kv, esz), false), T64)
+    var lo = s21_bin(6, el, tig_int_lit(255))  // & 0xFF（and）
+    s21_store(s21_gep(nbuf, kv, false), s21_trunc_i8(lo), I8)
+    s21_store(ksv, s21_bin(0, kv, tig_int_lit(1)), T64)  // k++
+    var brb = ir.new_inst(g_cur_block, 30, -1)  // 回边
+    ir.add_operand(brb, b_hd, 1)
+    g_cur_block = b_ex
+    var h = tig_ext_call1("GetStdHandle", tig_int_lit_ty(-11, I32), I32, P8)
+    var wc = ir.new_inst(g_cur_block, 20, I32)
+    ir.add_operand(wc, I32, 2)
+    var wcp = ir.get_value(wc)
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8);  table_push(avs, h)
+    table_push(ats, P8);  table_push(avs, nbuf)
+    table_push(ats, I32); table_push(avs, sio_trunc_i32(len))
+    table_push(ats, P8);  table_push(avs, wcp)
+    table_push(ats, P8);  table_push(avs, nulp)
+    var r = tig_ext_call_typed("WriteFile", ats, avs, I32)
+    var okr = tig_win_ok(r)
+    // 结果槽：成功 → 实收；失败 → 0
+    var slot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(slot, T64, 2)
+    var sv = ir.get_value(slot)
+    var b_ok = ir.new_block(g_cur_func, interner.intern("sio.wb.ok"))
+    var b_fl = ir.new_block(g_cur_func, interner.intern("sio.wb.fl"))
+    var b_mg = ir.new_block(g_cur_func, interner.intern("sio.wb.m"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, okr, 0)
+    ir.add_operand(cb, b_ok, 1)
+    ir.add_operand(cb, b_fl, 1)
+    g_cur_block = b_ok
+    s21_store(sv, s21_zext(s21_load(wcp, I32), I32), T64)
+    var br1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br1, b_mg, 1)
+    g_cur_block = b_fl
+    s21_store(sv, tig_int_lit(0), T64)
+    var br2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br2, b_mg, 1)
+    g_cur_block = b_mg
+    tig_ext_call1("free", nbuf, types.named(TK_STR), -1)
+    return s21_load(sv, T64)
+}
+// ==================== p.6.4.10 read_line 内联（stdin 行读取，去 Rust 桥） ====================
+// read_line() -> string：GetStdHandle(STD_INPUT_HANDLE=-10) + ReadFile 逐字节读到
+// \n（单独）或 EOF（返回已收集串，无输入时空串）。Windows 控制台 ReadFile 也会把
+// 回车 \r\n 带进缓冲，此处规整：\r（13）跳过、\n（10）终结；支持管道（无缓冲）输入
+// 脚本交互（`echo hello | probe` → "hello"）。全 kernel32 符号（is_libc_sym 免
+// interp 链接），零 Rust 桥、零 g_used_interp。
+func tig_read_line() -> i64 {
+    // r.1.6.3：Linux 分支——read(fd=0, &c, 1) 逐字节（POSIX fd 0 = stdin；
+    // \n 终结 / \r 跳过 / EOF（0/-1）返回已收集串，语义对齐 Win32）。
+    if tig_is_linux() {
+        var T64 = types.named(TK_I64)
+        var I32 = types.named(TK_I32)
+        var I8 = types.named(TK_I8)
+        var P8 = types.ptr_of(types.named(TK_I8))
+        var fd0 = tig_int_lit_ty(0, I32)  // STDIN_FILENO
+        var rs = ir.new_inst(g_cur_block, 20, types.named(TK_STR))
+        ir.add_operand(rs, types.named(TK_STR), 2)
+        var rp = ir.get_value(rs)
+        s21_store(rp, tig_str_lit(interner.intern("\"\"")), types.named(TK_STR))
+        var ba = ir.new_inst(g_cur_block, 20, I8)
+        ir.add_operand(ba, I8, 2)
+        var bp = ir.get_value(ba)
+        var sb = s21_sb_new()
+        var b_lp = ir.new_block(g_cur_func, interner.intern("rll.lp"))
+        var b_rd = ir.new_block(g_cur_func, interner.intern("rll.rd"))
+        var b_ch = ir.new_block(g_cur_func, interner.intern("rll.ch"))
+        var b_cr = ir.new_block(g_cur_func, interner.intern("rll.cr"))
+        var b_ap = ir.new_block(g_cur_func, interner.intern("rll.ap"))
+        var b_ex = ir.new_block(g_cur_func, interner.intern("rll.ex"))
+        var b_mg = ir.new_block(g_cur_func, interner.intern("rll.m"))
+        var b0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(b0, b_lp, 1)
+        // 读循环：read(fd0, &c, 1) → ssize_t；<=0（EOF/出错）→ 收尾
+        g_cur_block = b_lp
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, I32); table_push(avs, fd0)
+        table_push(ats, P8);  table_push(avs, bp)
+        table_push(ats, T64); table_push(avs, tig_int_lit(1))
+        var nr = tig_ext_call_typed("read", ats, avs, T64)
+        var more = tig_icmp_c(nr, tig_int_lit(0), 3)  // nr > 0
+        var cb0 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb0, more, 0)
+        ir.add_operand(cb0, b_rd, 1)
+        ir.add_operand(cb0, b_ex, 1)
+        // 判字节：\n(10) → 收尾；\r(13) → 跳过回边；其余追加
+        g_cur_block = b_rd
+        var c = s21_zext(s21_load(bp, I8), I8)
+        var isnl = tig_icmp_c(c, tig_int_lit(10), 0)
+        var cb2 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb2, isnl, 0)
+        ir.add_operand(cb2, b_ex, 1)
+        ir.add_operand(cb2, b_cr, 1)
+        g_cur_block = b_cr
+        var iscr = tig_icmp_c(c, tig_int_lit(13), 0)
+        var cb3 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb3, iscr, 0)
+        ir.add_operand(cb3, b_lp, 1)
+        ir.add_operand(cb3, b_ap, 1)
+        g_cur_block = b_ap
+        s21_sb_append_byte(sb, c)
+        var brl = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brl, b_lp, 1)
+        // 收尾：行构建器 → 结果槽
+        g_cur_block = b_ex
+        s21_store(rp, s21_sb_build(sb), types.named(TK_STR))
+        var brx = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brx, b_mg, 1)
+        g_cur_block = b_mg
+        return s21_load(rp, types.named(TK_STR))
+    }
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var I8 = types.named(TK_I8)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var nulp = tig_null_ptr()
+    // 结果槽：默认空串（EOF/无输入）
+    var rs = ir.new_inst(g_cur_block, 20, types.named(TK_STR))
+    ir.add_operand(rs, types.named(TK_STR), 2)
+    var rp = ir.get_value(rs)
+    s21_store(rp, tig_str_lit(interner.intern("\"\"")), types.named(TK_STR))
+    // ---- 控制台编码契约（设计稿 §4.1）：控制台 ⇒ ReadConsoleW 行读（UTF-16
+    //      转 UTF-8，去尾 \r\n；超 4096 码元行长续读）；管道/文件 ⇒ 原 ReadFile
+    //      逐字节路径（逐字节不变）。----
+    var h = tig_con_handle(-10)
+    var isc = tig_con_is_console(h)
+    var b_clx = ir.new_block(g_cur_func, interner.intern("rlx.l"))
+    var b_old = ir.new_block(g_cur_func, interner.intern("rl.old"))
+    var b_m2 = ir.new_block(g_cur_func, interner.intern("rl.m2"))
+    var cbx0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbx0, isc, 0)
+    ir.add_operand(cbx0, b_clx, 1)
+    ir.add_operand(cbx0, b_old, 1)
+    // 控制台：ReadConsoleW 行读（行模式返回整行含 \r\n）
+    g_cur_block = b_clx
+    var rbuf = s21_raw_alloc_str(tig_int_lit(8194))  // (4096+1) 码元 × 2 字节
+    var rnw = ir.new_inst(g_cur_block, 20, I32)
+    ir.add_operand(rnw, I32, 2)
+    var rnwp = ir.get_value(rnw)
+    var sbw = s21_sb_new()
+    var l_top = ir.new_block(g_cur_func, interner.intern("rlx.t"))
+    var l_cv = ir.new_block(g_cur_func, interner.intern("rlx.v"))
+    var l_dn = ir.new_block(g_cur_func, interner.intern("rlx.d"))
+    var brl0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brl0, l_top, 1)
+    g_cur_block = l_top
+    s21_store(rnwp, tig_int_lit_ty(0, I32), I32)
+    var wats: table<i64> = table_new_i64()
+    var wavs: table<i64> = table_new_i64()
+    table_push(wats, P8);  table_push(wavs, h)
+    table_push(wats, P8);  table_push(wavs, rbuf)
+    table_push(wats, I32); table_push(wavs, tig_int_lit_ty(4096, I32))
+    table_push(wats, P8);  table_push(wavs, rnwp)
+    table_push(wats, P8);  table_push(wavs, nulp)
+    var wok = tig_ext_call_typed("ReadConsoleW", wats, wavs, I32)
+    var wn = s21_zext(s21_load(rnwp, I32), I32)
+    // NUL 终止（u16，两字节写零）
+    s21_store(s21_gep(rbuf, s21_bin(2, wn, tig_int_lit(2)), false), tig_int_lit_ty(0, I8), I8)
+    s21_store(s21_gep(rbuf, s21_bin(0, s21_bin(2, wn, tig_int_lit(2)), tig_int_lit(1)), false), tig_int_lit_ty(0, I8), I8)
+    var wokb = tig_cmp_zero(wok, 1)
+    var wpos = tig_icmp_c(wn, tig_int_lit(0), 3)  // 收到 > 0 码元
+    var wgo = tig_and_i1(wokb, wpos)
+    var cbx1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbx1, wgo, 0)
+    ir.add_operand(cbx1, l_cv, 1)
+    ir.add_operand(cbx1, l_dn, 1)  // EOF / 读失败 ⇒ 收尾
+    // 转换追加 + 行终（\n）判定：命中 ⇒ 收尾；未命中（超长行）⇒ 续读
+    g_cur_block = l_cv
+    var chunkw = tig_from_wide16(rbuf)
+    s21_sb_append(sbw, chunkw)
+    var jsl = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(jsl, T64, 2)
+    var jsp = ir.get_value(jsl)
+    s21_store(jsp, tig_int_lit(0), T64)
+    var jlen = s21_str_head_len(chunkw)
+    var s_top = ir.new_block(g_cur_func, interner.intern("rlx.s"))
+    var s_bd = ir.new_block(g_cur_func, interner.intern("rlx.b"))
+    var s_inc = ir.new_block(g_cur_func, interner.intern("rlx.i"))
+    var s_hit = ir.new_block(g_cur_func, interner.intern("rlx.h"))
+    var s_end = ir.new_block(g_cur_func, interner.intern("rlx.e"))
+    var brs0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs0, s_top, 1)
+    g_cur_block = s_top
+    var sjc = tig_icmp_c(s21_load(jsp, T64), jlen, 2)  // j < jlen
+    var cbs0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbs0, sjc, 0)
+    ir.add_operand(cbs0, s_bd, 1)
+    ir.add_operand(cbs0, s_end, 1)  // 扫完未命中 ⇒ 续读
+    g_cur_block = s_bd
+    var sjb = s21_str_byte(chunkw, s21_load(jsp, T64))
+    var sjeq = tig_icmp_c(sjb, tig_int_lit(10), 0)  // == 10（LF）
+    var cbs1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbs1, sjeq, 0)
+    ir.add_operand(cbs1, s_hit, 1)
+    ir.add_operand(cbs1, s_inc, 1)
+    g_cur_block = s_inc
+    s21_store(jsp, s21_bin(0, s21_load(jsp, T64), tig_int_lit(1)), T64)  // j++
+    var brs1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs1, s_top, 1)
+    g_cur_block = s_hit
+    var brs2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs2, l_dn, 1)
+    g_cur_block = s_end
+    var brs3 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs3, l_top, 1)
+    // 收尾：拼串 + 去尾 CR/LF（逐字节，直至非 CR/LF 或空）
+    g_cur_block = l_dn
+    var s_all = s21_sb_build(sbw)
+    var len0 = s21_str_head_len(s_all)
+    var lasl = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(lasl, T64, 2)
+    var lasp = ir.get_value(lasl)
+    s21_store(lasp, len0, T64)
+    var t_top = ir.new_block(g_cur_func, interner.intern("rlx.u"))
+    var t_chk = ir.new_block(g_cur_func, interner.intern("rlx.k"))
+    var t_dc = ir.new_block(g_cur_func, interner.intern("rlx.c"))
+    var t_en = ir.new_block(g_cur_func, interner.intern("rlx.n"))
+    var brt0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brt0, t_top, 1)
+    g_cur_block = t_top
+    var lnz = tig_cmp_zero(s21_load(lasp, T64), 0)  // len == 0?
+    var cbt0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbt0, lnz, 0)
+    ir.add_operand(cbt0, t_en, 1)
+    ir.add_operand(cbt0, t_chk, 1)
+    g_cur_block = t_chk
+    var lb = s21_str_byte(s_all, s21_bin(1, s21_load(lasp, T64), tig_int_lit(1)))
+    var lb10 = tig_icmp_c(lb, tig_int_lit(10), 0)
+    var lb13 = tig_icmp_c(lb, tig_int_lit(13), 0)
+    var lbf = tig_or_i1(lb10, lb13)
+    var cbt1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbt1, lbf, 0)
+    ir.add_operand(cbt1, t_dc, 1)
+    ir.add_operand(cbt1, t_en, 1)
+    g_cur_block = t_dc
+    s21_store(lasp, s21_bin(1, s21_load(lasp, T64), tig_int_lit(1)), T64)  // len--
+    var brt1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brt1, t_top, 1)
+    g_cur_block = t_en
+    var lres = s21_str_sub_bytes(s_all, tig_int_lit(0), s21_load(lasp, T64))
+    s21_store(rp, lres, types.named(TK_STR))
+    tig_ext_call1("free", rbuf, types.named(TK_STR), -1)
+    var brt2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brt2, b_m2, 1)
+    // ---- 管道/文件：原 ReadFile 逐字节路径（逐字节不变）----
+    g_cur_block = b_old
+    // 单字节缓冲 + 读计数槽 + 行构建器
+    var ba = ir.new_inst(g_cur_block, 20, I8)
+    ir.add_operand(ba, I8, 2)
+    var bp = ir.get_value(ba)
+    var ra = ir.new_inst(g_cur_block, 20, I32)
+    ir.add_operand(ra, I32, 2)
+    var rcp = ir.get_value(ra)
+    var sb = s21_sb_new()
+    // 读循环：ReadFile(h, &c, 1, &nread, NULL)
+    var b_lp = ir.new_block(g_cur_func, interner.intern("rl.lp"))
+    var b_rd = ir.new_block(g_cur_func, interner.intern("rl.rd"))
+    var b_ch = ir.new_block(g_cur_func, interner.intern("rl.ch"))
+    var b_cr = ir.new_block(g_cur_func, interner.intern("rl.cr"))
+    var b_ap = ir.new_block(g_cur_func, interner.intern("rl.ap"))
+    var b_ex = ir.new_block(g_cur_func, interner.intern("rl.ex"))
+    var b_mg = ir.new_block(g_cur_func, interner.intern("rl.m"))
+    var b0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b0, b_lp, 1)
+    g_cur_block = b_lp
+    s21_store(rcp, tig_int_lit_ty(0, I32), I32)
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8);  table_push(avs, h)
+    table_push(ats, P8);  table_push(avs, bp)
+    table_push(ats, I32); table_push(avs, tig_int_lit_ty(1, I32))
+    table_push(ats, P8);  table_push(avs, rcp)
+    table_push(ats, P8);  table_push(avs, nulp)
+    var rf = tig_ext_call_typed("ReadFile", ats, avs, I32)
+    var okr = tig_win_ok(rf)
+    var cb0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb0, okr, 0)
+    ir.add_operand(cb0, b_rd, 1)
+    ir.add_operand(cb0, b_ex, 1)   // ReadFile 失败 → EOF 收尾
+    // 成功：判读计数（0=EOF → 收尾；否则检查字节）
+    g_cur_block = b_rd
+    var c0 = tig_cmp_zero(s21_zext(s21_load(rcp, I32), I32), 0)
+    var cb1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb1, c0, 0)
+    ir.add_operand(cb1, b_ex, 1)
+    ir.add_operand(cb1, b_ch, 1)
+    // 判字节：\n(10) → 收尾；\r(13) → 跳过回边；其余追加
+    g_cur_block = b_ch
+    var c = s21_zext(s21_load(bp, I8), I8)
+    var isnl = tig_icmp_c(c, tig_int_lit(10), 0)
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, isnl, 0)
+    ir.add_operand(cb2, b_ex, 1)
+    ir.add_operand(cb2, b_cr, 1)
+    g_cur_block = b_cr
+    var iscr = tig_icmp_c(c, tig_int_lit(13), 0)
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, iscr, 0)
+    ir.add_operand(cb3, b_lp, 1)
+    ir.add_operand(cb3, b_ap, 1)
+    g_cur_block = b_ap
+    s21_sb_append_byte(sb, c)
+    var brl = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brl, b_lp, 1)
+    // 收尾：行构建器 → 结果槽
+    g_cur_block = b_ex
+    s21_store(rp, s21_sb_build(sb), types.named(TK_STR))
+    var brx = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brx, b_mg, 1)
+    g_cur_block = b_mg
+    var brz = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brz, b_m2, 1)
+    // 两路汇合
+    g_cur_block = b_m2
+    return s21_load(rp, types.named(TK_STR))
+}
+}

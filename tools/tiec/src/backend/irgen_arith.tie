@@ -1,0 +1,57 @@
+type tie<class>
+// compiler/backend/irgen_arith.tie —— 生成器 L2 算术/比较层 子模块
+// ============================================================
+// 从 irgen.tie 拆分而来：这是 irgen LLVM 风格分层重构的 S3（第三步）。
+// 本文件承载 L2 算术/比较层：二元/一元运算（tig_binary）、宽窄转换
+//（tig_widen/tig_coerce/tig_narrow_bin）、checked_* 溢出检测族（tig_checked）、
+// 浮点运算（tig_binary_float）、trit 运算（tig_trit_bin/tig_trit_mixed）、
+// 元组 ==/!= 比较（tig_tuple_compare）、复合赋值（tig_compound_assign）、
+// 字符串 +/比较（tig_binary_str）、短路逻辑（tig_logic_short）、
+// 块终止判断（block_terminated）等。它们生成 add/sub/mul/icmp/select/phi 等
+// 指令，被上层语句/表达式生成层裸名调用。
+//
+// 拆分范式：【同 namespace 跨文件】（文本内联）。
+// 同 irgen_builder.tie（S1）/ irgen_lit.tie（S2）。irgen.tie 顶层 import 本文件
+// 后，本文件被文本内联进同一编译单元，声明与 irgen.tie 相同的 `namespace irgen`，
+// 同名 namespace 跨文件闭合并集：
+//   - 同 namespace 函数可互相裸名调用（主文件照常裸名调用 tig_binary 等）；
+//   - 可访问主文件顶层全局 var（g_cur_block/g_cur_func/node_types/s_tags 等）；
+//   - 本文件只含函数与注释，不含顶层全局 var 声明、不含 import——
+//     全局 var 与 import 树均留在 irgen.tie 主文件，避免重复定义。
+namespace irgen {
+
+
+// ==================== S1.3 checked_* 溢出检测函数族 ====================
+// checked_add/sub/mul/div/shl/shr/neg → (值, 溢出标志) 二元组聚合值。
+// 检测用比较法（无 LLVM with.overflow 内建依赖）：
+//   有符号 add：ovf = (a>0 && b>0 && s<0) || (a<0 && b<0 && s>=0)
+//   无符号 add：ovf = s < a（ult）
+//   有符号 sub：ovf = (b>0 && s>a) || (b<0 && s<a)
+//   无符号 sub：ovf = s > a（ugt）
+//   有符号 mul：ovf = (a==-1 && b==min) || (a!=0 && b!=0 && a!=-1 && s/a!=b)
+//   无符号 mul：ovf = (b!=0 && s/b!=a)（udiv 反算）
+//   有符号 div：ovf = (b==0) || (a==min && b==-1)
+//   无符号 div：ovf = (b==0)
+//   neg：ovf = (a!=0 && a<<1==0)（a == min 的位模式检测，避开 i64 min 字面量）
+//   shl/shr：ovf = (b >= 位宽)
+// 除零/移过量等 poison 源用 select 保护（未选中分支不传播 poison）。
+
+
+// ==================== 元组 ==/!= 比较（逐字段递归，对齐 Rust 行为）====================
+// `(a,b) == (c,d)` → 逐字段比较后全部 and 合并；`!=` 对 == 结果 xor 取反。
+// 字段提取复用聚合地址 + agg_gep + load；标量 icmp/fcmp，字符串 strcmp 后
+// icmp，嵌套元组字段递归（值落内存再 GEP）。表/映射字段不支持（报错）。
+
+
+// trit 二元运算（对齐 Rust gen_binary_trit）：
+//   - 混合 trit×i64：trit 侧 sext i8→i64 后常规整数运算（返回 i64/i1）；
+//   - 同为 trit：&&=min ||=max（icmp+select）；+ - * = 饱和算术（i8 运算 + clamp）；
+//     比较 → icmp i8 → i1。
+// 由 tig_binary 分流：两侧都 trit → tig_trit_bin；一侧 trit → tig_trit_mixed。
+
+
+}
+
+import "./irgen_arith_p1.tie"
+import "./irgen_arith_p2.tie"
+import "./irgen_arith_p3.tie"

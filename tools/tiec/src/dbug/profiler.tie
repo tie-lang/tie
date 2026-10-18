@@ -1,0 +1,323 @@
+type tie<logic>
+// compiler/dbug/profiler.tie —— p.9.2.4 剖析器（CPU 采样 + 折叠栈 + 文本火焰图）
+// ============================================================
+// 交付形态：独立工具（tiec 编译成 profiler.exe）。运行期插桩对解释器求值循环做
+// **函数级调用采样**：interp.dbg_start(true) 让 call_fn 在每次 C/R 打 time_now()
+// 秒级时间戳（interp_dbug，默认关），工具据此统计每函数「调用次数 + 含子/自耗秒」，
+// 并生成：
+//   1) 折叠栈（folded stacks）文本：栈路径以 ";" 连接，权重（count，主）/含子秒（次）；
+//   2) 简单文本火焰图（按权重降序的 ASCII 条形）；
+//   3) 内存剖析为接口预留（vval.new_* 插桩计数建议见 docs/p.9.2.4.md）。
+//
+// 被测程序约定：模块式（只定义函数）、入口无参 `func main()`（同 p.9.2.1/.3）。
+// 用法: `profiler [-o <out>] <program.tie>`；退出码 0。
+
+import "../tiep/tiep.tie"
+
+// ---------- 工具 ----------
+func pr_has_prefix(s: string, p: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(p)
+    if n < m { return false }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(p, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+func pr_isspace(b: i64) -> bool {
+    return b == 32 || b == 9
+}
+func pr_trim(s: string) -> string {
+    var n = str_len(s)
+    var a: i64 = 0
+    while a < n && pr_isspace(char_code(str_char(s, a))) { a = a + 1 }
+    var b: i64 = n
+    while b > a && pr_isspace(char_code(str_char(s, b - 1))) { b = b - 1 }
+    var out = ""
+    var i: i64 = a
+    while i < b {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+// 把 `type tie<...>` 角色头替换为注释行（保留行号）。
+func pr_prepare(src: string) -> string {
+    var out = ""
+    var ln = ""
+    var i: i64 = 0
+    var n = str_len(src)
+    while i < n {
+        var c = str_char(src, i)
+        if char_code(c) == 10 {
+            var t = pr_trim(ln)
+            if pr_has_prefix(t, "type tie") { out = out + "// prof header\n" } else { out = out + ln + "\n" }
+            ln = ""
+        } else { ln = ln + c }
+        i = i + 1
+    }
+    var tl = pr_trim(ln)
+    if tl != "" {
+        if pr_has_prefix(tl, "type tie") { out = out + "// prof header" } else { out = out + ln }
+    }
+    return out
+}
+// 在全 pnames 中查 name，命中返回下标否则 -1。
+func pf_idx(names: table<string>, nm: string) -> i64 {
+    var i: i64 = 0
+    while i < len(names) {
+        if names[i] == nm { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+func main() -> i64 {
+    // 参数
+    var prog: string = ""
+    var outpath: string = ""
+    var i: i64 = 0
+    while i < arg_count() {
+        var a = arg_string(i)
+        if a == "-o" {
+            i = i + 1
+            if i < arg_count() { outpath = arg_string(i) }
+        } else if prog == "" {
+            prog = a
+        }
+        i = i + 1
+    }
+    if prog == "" {
+        println("用法: profiler [-o <out>] <program.tie>")
+        return 1
+    }
+    if file_exists(prog) == false {
+        println("剖析失败: 程序文件不存在: " + prog)
+        return 1
+    }
+    var src = pr_prepare(file_read(prog))
+
+    // 运行（插桩采样）
+    tiep.reset()
+    tiep.dbg_start(true)
+    var r1 = tiep.eval(src)
+    if w_err != "" {
+        println("剖析失败（注册）: " + w_err)
+        return 1
+    }
+    var r2 = tiep.eval("func __prof_entry__(arg: string) -> i64 { main() ; return 0 }")
+    if w_err != "" {
+        println("剖析失败（注入入口，需无参 main()）: " + w_err)
+        return 1
+    }
+    var t0 = time_now()
+    var rr = tiep.eval_call("__prof_entry__", "")
+    var _ig = rr
+    var t1 = time_now()
+
+    // 汇聚
+    var names = table_new_string()   // 函数名
+    var cnts = table_new_i64()       // 调用次数
+    var incl = table_new_i64()       // 含子秒
+    var selfE = table_new_i64()      // 自耗秒
+    // 栈
+    var sn = table_new_string()
+    var stt = table_new_i64()
+    var sch = table_new_i64()
+    var ne = tiep.dbg_ev_count()
+    var j: i64 = 0
+    while j < ne {
+        var k = tiep.dbg_ev_kind(j)
+        if k == "C" {
+            var nm = tiep.dbg_ev_name(j)
+            table_push(sn, nm)
+            table_push(stt, tiep.dbg_ev_t(j))
+            table_push(sch, 0)
+            var ix = pf_idx(names, nm)
+            if ix < 0 {
+                table_push(names, nm)
+                table_push(cnts, 1)
+                table_push(incl, 0)
+                table_push(selfE, 0)
+            } else {
+                cnts[ix] = cnts[ix] + 1
+            }
+        } else if k == "R" {
+            var top = len(sn) - 1
+            if top >= 0 {
+                var nm = sn[top]
+                var st0 = stt[top]
+                var cs = sch[top]
+                var en = tiep.dbg_ev_t(j)
+                var inc = en - st0
+                if inc < 0 { inc = 0 }
+                var sf = inc - cs
+                if sf < 0 { sf = 0 }
+                var ix = pf_idx(names, nm)
+                if ix >= 0 {
+                    incl[ix] = incl[ix] + inc
+                    selfE[ix] = selfE[ix] + sf
+                }
+                if top > 0 { sch[top - 1] = sch[top - 1] + sf }
+                sn = pr_slice_str(sn, top)
+                stt = pr_slice_i64(stt, top)
+                sch = pr_slice_i64(sch, top)
+            }
+        }
+        j = j + 1
+    }
+
+    // 折叠栈：重建每条 C 事件的完整路径 → count
+    var fp = table_new_string()   // 路径
+    var fc = table_new_i64()      // 权重
+    var st2 = table_new_string()
+    var j2: i64 = 0
+    while j2 < ne {
+        var k2 = tiep.dbg_ev_kind(j2)
+        if k2 == "C" {
+            table_push(st2, tiep.dbg_ev_name(j2))
+            var path = ""
+            var d: i64 = 0
+            while d < len(st2) {
+                if path != "" { path = path + ";" }
+                path = path + st2[d]
+                d = d + 1
+            }
+            var fxi = pf2_idx(fp, path)
+            if fxi < 0 {
+                table_push(fp, path)
+                table_push(fc, 1)
+            } else {
+                fc[fxi] = fc[fxi] + 1
+            }
+        } else if k2 == "R" {
+            if len(st2) > 0 { st2 = pr_slice_str(st2, len(st2) - 1) }
+        }
+        j2 = j2 + 1
+    }
+
+    // 排序下标（按 cnts 降序）
+    var order = pr_sort_names(cnts, len(cnts))
+
+    var sb = string_builder()
+    sb_append(sb, "=== tie 剖析器 (p.9.2.4) ===\n")
+    sb_append(sb, "程序: " + prog + "\n")
+    sb_append(sb, "总耗时: " + to_string(t1 - t0) + "s  函数数: " + to_string(len(names)) +
+        "  调用数: " + to_string(count_total(cnts)) + "  事件: " + to_string(ne) + "\n")
+    sb_append(sb, "\n--- 每函数（按调用次数降序） ---\n")
+    sb_append(sb, "函数<TAB>调用<TAB>含子s<TAB>自耗s\n")
+    var oi: i64 = 0
+    while oi < len(order) {
+        var ix = order[oi] - 1    // 1-based 下标存储
+        sb_append(sb, names[ix] + "\t" + to_string(cnts[ix]) + "\t" +
+            to_string(incl[ix]) + "\t" + to_string(selfE[ix]) + "\n")
+        oi = oi + 1
+    }
+
+    // 折叠栈
+    sb_append(sb, "\n--- 折叠栈（path<TAB>count，count 主权重） ---\n")
+    var fi: i64 = 0
+    while fi < len(fp) {
+        sb_append(sb, fp[fi] + "\t" + to_string(fc[fi]) + "\n")
+        fi = fi + 1
+    }
+
+    // 简单文本火焰图：按权重降序画 ASCII 条
+    sb_append(sb, "\n--- 文本火焰图（按调用权重降序，前 " + to_string(min_i64(len(fp), 20)) + " 条） ---\n")
+    var fmax: i64 = 1
+    var fi2: i64 = 0
+    while fi2 < len(fc) {
+        if fc[fi2] > fmax { fmax = fc[fi2] }
+        fi2 = fi2 + 1
+    }
+    var fo = pr_sort(i64_to_tab(fc), len(fc))
+    var fi3: i64 = 0
+    while fi3 < len(fo) {
+        if fi3 >= 20 { break }
+        var ix = fo[fi3] - 1
+        var bar = ""
+        var bar_len = 10
+        if fmax > 10 { bar_len = 40 }
+        var bl = (fc[ix] * bar_len) / fmax
+        var bj: i64 = 0
+        while bj < bl {
+            bar = bar + "#"
+            bj = bj + 1
+        }
+        sb_append(sb, fp[ix] + "  " + to_string(fc[ix]) + " [" + bar + "]\n")
+        fi3 = fi3 + 1
+    }
+    sb_append(sb, "\n时间口径: time_now() 秒级（毫秒级需工具自定义 clock 扩展，接口见 docs/p.9.2.4.md）\n")
+
+    var report = sb_build(sb)
+    if outpath != "" {
+        file_write(outpath, report)
+    }
+    print(report)
+    return 0
+}
+
+func count_total(cnts: table<i64>) -> i64 {
+    var s: i64 = 0
+    var i: i64 = 0
+    while i < len(cnts) { s = s + cnts[i]; i = i + 1 }
+    return s
+}
+func pf2_idx(paths: table<string>, p: string) -> i64 {
+    var i: i64 = 0
+    while i < len(paths) {
+        if paths[i] == p { return i }
+        i = i + 1
+    }
+    return -1
+}
+func pr_slice_str(t: table<string>, n: i64) -> table<string> {
+    var r = table_new_string()
+    var i: i64 = 0
+    while i < n { table_push(r, t[i]); i = i + 1 }
+    return r
+}
+func pr_slice_i64(t: table<i64>, n: i64) -> table<i64> {
+    var r = table_new_i64()
+    var i: i64 = 0
+    while i < n { table_push(r, t[i]); i = i + 1 }
+    return r
+}
+func min_i64(a: i64, b: i64) -> i64 {
+    if a < b { return a }
+    return b
+}
+func i64_to_tab(t: table<i64> ) -> table<i64> {
+    var r = table_new_i64()
+    var i: i64 = 0
+    while i < len(t) { table_push(r, t[i]); i = i + 1 }
+    return r
+}
+// 返回降序下标（1-based），对 key 排序。
+func pr_sort(key: table<i64>, n: i64) -> table<i64> {
+    var order = table_new_i64()
+    var i: i64 = 0
+    while i < n { table_push(order, i + 1); i = i + 1 }
+    // 简单选择排序（降序）
+    var a: i64 = 0
+    while a < n - 1 {
+        var maxi = a
+        var b: i64 = a + 1
+        while b < n {
+            if key[order[b] - 1] > key[order[maxi] - 1] { maxi = b }
+            b = b + 1
+        }
+        if maxi != a {
+            var t = order[a]
+            order[a] = order[maxi]
+            order[maxi] = t
+        }
+        a = a + 1
+    }
+    return order
+}
+func pr_sort_names(key: table<i64>, n: i64) -> table<i64> {
+    return pr_sort(key, n)
+}

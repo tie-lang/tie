@@ -1,0 +1,193 @@
+type tie<class>
+// compiler/frontend/scheck_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 scheck.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace scheck {
+// W00016：每编译重置累积（由 semantic.sm_warn_reset 调用）。
+pub func w16_reset() {
+    w16_keys = table_new_i64()
+    w16_cnt = table_new_i64()
+    w16_ln = table_new_i64()
+    w16_cl = table_new_i64()
+}
+
+// W00016：全部函数检查完后发射（写点 >= 2 的全局可变表）。
+pub func w16_emit() {
+    var i: i64 = 0
+    while i < len(w16_keys) {
+        if w16_cnt[i] >= 2 {
+            sm_warn_add(w16_ln[i], w16_cl[i], "可变全局表共享状态（被多处修改）")
+        }
+        i = i + 1
+    }
+}
+
+// 语句块检查（StmtList）。每块分配递增块 id，进入块时把 id 追加到块链
+// g_cur_chain（"/" 分隔），出块恢复——goto 标签 R2 校验依赖块链关系。
+pub func check_block(blk: i64) -> i64 {
+    var saved_chain = g_cur_chain
+    var saved_depth = g_cur_depth
+    var saved_blknode = g_cur_blknode
+    var saved_bn = g_block_names
+    g_gt_blk_seq = g_gt_blk_seq + 1
+    g_cur_chain = g_cur_chain + "/" + to_string(g_gt_blk_seq)
+    g_cur_depth = g_cur_depth + 1
+    g_cur_blknode = blk
+    g_block_names = table_new_i64()
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    var reachable: bool = true
+    while i < n {
+        g_cur_blkidx = i
+        g_gt_seq_cnt = g_gt_seq_cnt + 1
+        var s = sstate.child(blk, i)
+        // W00009：不可达语句（return/panic/goto/break/continue 之后的语句）
+        if !reachable {
+            sm_warn_add(s_lines[s], s_cols[s], "return 后不可达语句（语句恒不执行）")
+        }
+        var r = check_stmt(s)
+        if r < 0 {
+            return -1
+        }
+        // 更新可达性：块级无条件终止语句使后续语句不可达
+        if reachable {
+            var t = s_tags[s]
+            if t == S_N_RETURN || t == S_N_PANIC || t == S_N_GOTO ||
+                t == S_N_BREAK || t == S_N_CONTINUE {
+                reachable = false
+            }
+        }
+        i = i + 1
+    }
+    g_cur_chain = saved_chain
+    g_cur_depth = saved_depth
+    g_cur_blknode = saved_blknode
+    g_block_names = saved_bn
+    return 0
+}
+
+// p.9.11.3 try 错误聚合块检查：检查块体所有语句（含 `?` 传播校验）；末语句若为
+// N_EXPR_STMT 只取表达式值类型为 try 块的值类型（node_types），否则值为 -1（try
+// 仅作语句）。供 infer_expr(S_N_TRY_BLOCK) 调用（sinfer 无 check_block 能力）。
+pub func check_try(s: i64) -> i64 {
+    var body = sstate.child(s, 0)
+    warn_empty_block(body, s)
+    var r = check_cf_block(body, s)
+    if r < 0 {
+        return -1
+    }
+    var vt: i64 = -1
+    var nb = sstate.nchild(body)
+    if nb > 0 {
+        var last = sstate.child(body, nb - 1)
+        if s_tags[last] == S_N_EXPR_STMT && sstate.nchild(last) > 0 {
+            vt = node_types[sstate.child(last, 0)]
+            if vt < 0 {
+                vt = types.named(TK_I64)
+            }
+        }
+    }
+    node_types[s] = vt
+    g_typed = g_typed + 1
+    return 0
+}
+
+// switch case 检查（语句位）。模式/守卫检查拆分到 check_arm_patterns（供
+// p.9.10.1 表达式位复用），此处统一走模式检查后校验分支体（语句块）。
+pub func check_switch_case(c: i64, subj_ty: i64) -> i64 {
+    var rp = check_arm_patterns(c, subj_ty)
+    if rp < 0 {
+        return -1
+    }
+    var body = sstate.child(c, 2)
+    warn_empty_block(body, c)
+    return check_cf_block(body, c)
+}
+
+// 模式 + when 守卫检查（不含分支体——供 p.9.10.1 表达式位 switch 复用）。
+// 按 subject 类型分派：枚举 → check_arm_patterns_enum；否则 → plain。
+pub func check_arm_patterns(c: i64, subj_ty: i64) -> i64 {
+    if types.kind(subj_ty) == K_ENUM {
+        return check_arm_patterns_enum(c, subj_ty)
+    }
+    return check_arm_patterns_plain(c, subj_ty)
+}
+
+// 重置 switch case 去重表（每个 switch 独立；表达式位由 sinfer 入口调用）。
+pub func reset_case_seen() {
+    g_case_seen = table_new_string()
+}
+
+// p.8.1.4 穷尽检查：无 default 的 enum switch 必须覆盖全部变体。
+// 带 when 守卫的 case 不视为穷尽（守卫可能失败 → 运行期仍可能无分支命中）。
+// 返回 0 通过 / -1 未穷尽（sm_err_* 已置）。pub 供 p.9.10.1 表达式位复用。
+pub func check_enum_exhaustive(subj_ty: i64, s: i64) -> i64 {
+    var ei = types.low(subj_ty)
+    var ename = sstate.enum_name_of(ei)
+    var varoff = en_varoff[ei]
+    var nvar = en_nvar[ei]
+    var covered: table<i64> = table_new_i64()
+    var ncases = s_aux[s]
+    var k: i64 = 0
+    while k < ncases {
+        var c = sstate.child(s, 1 + k)
+        // 守卫 case 不算穷尽覆盖
+        var when_n = sstate.child(c, 1)
+        if when_n >= 0 {
+            k = k + 1
+            continue
+        }
+        var pl = sstate.child(c, 0)
+        var npat = sstate.nchild(pl)
+        var i: i64 = 0
+        while i < npat {
+            var p = sstate.child(pl, i)
+            var vr = p
+            if s_tags[p] == N_CASE_BIND {
+                vr = sstate.child(p, 0)
+            }
+            var vname = ""
+            if s_tags[vr] == S_N_FIELD_ACCESS || s_tags[vr] == S_N_VAR {
+                vname = sstate.name_str(vr)
+            }
+            if str_len(vname) > 0 {
+                var t: i64 = -1
+                var j: i64 = 0
+                while j < nvar {
+                    if intern.lookup(en_vnames[varoff + j]) == vname {
+                        t = en_vtags[varoff + j]
+                    }
+                    j = j + 1
+                }
+                if t >= 0 {
+                    table_push(covered, t)
+                }
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    var m: i64 = 0
+    while m < nvar {
+        var found: bool = false
+        var c2: i64 = 0
+        while c2 < len(covered) {
+            if covered[c2] == m {
+                found = true
+                break
+            }
+            c2 = c2 + 1
+        }
+        if !found {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "switch 不穷尽：无 default 时须覆盖全部变体，缺少 '" + ename + "." + intern.lookup(en_vnames[varoff + m]) + "'"
+            return -1
+        }
+        m = m + 1
+    }
+    return 0
+}
+
+}

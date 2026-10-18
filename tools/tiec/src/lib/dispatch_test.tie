@@ -1,0 +1,109 @@
+type tie<logic>
+// compiler/lib/dispatch_test.tie —— tie.core（dispatch）库独立自检（p.9.21 G7 库资格②）
+// ============================================================
+// 无 driver 可跑：本文件即入口（tie<logic>），只 import 被测库，
+// 覆盖 dispatch.tie 注释头声明的全部契约：
+//   - register：返回稳定序号（0 起按首次登记顺序）；重复登记幂等；
+//   - find：按名二分返回序号；未登记返回 -1（走调用方 default 兜底）；
+//   - 序号稳定不变量：后续登记不改变已有序号（值随键走）；
+//   - count / at：条目数与序号反查（互逆），越界返回空串；
+//   - 升序不变量：d_keys 恒升序（乱序登记后仍有序）。
+// 全部通过输出「dispatch 自检通过」exit 0；任一失败打印明细 exit 1。
+//
+// # 语言边界应用
+//   - 分派表是编译器级唯一全局表（D1），本自检只登记本文件前缀名，
+//     不与编译器其他阶段撞名；
+//   - 本文件不定义本地常量；前缀调用（dispatch.xxx）。
+//
+// 运行（repo 根）：
+//   compiler\tiec.exe compiler\lib\dispatch_test.tie -o <tmp>\dispatchtest.exe
+//   <tmp>\dispatchtest.exe   # -> 「dispatch 自检通过」exit 0
+
+import "./dispatch.tie"
+
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+func main() {
+    var ok: bool = true
+
+    // ---------- 登记：序号按首次登记顺序 ----------
+    var i0 = dispatch.register("selftest_alpha")
+    var i1 = dispatch.register("selftest_beta")
+    var i2 = dispatch.register("selftest_gamma")
+    if !check(i0 == 0 && i1 == 1 && i2 == 2, "登记序号 0 起递增") {
+        ok = false
+    }
+
+    // ---------- 幂等 ----------
+    if !check(dispatch.register("selftest_beta") == i1, "重复登记返回原序号") {
+        ok = false
+    }
+    if !check(dispatch.register("selftest_alpha") == i0, "乱序重复登记仍返回原序号") {
+        ok = false
+    }
+    if !check(dispatch.count() == 3, "重复登记不新增条目") {
+        ok = false
+    }
+
+    // ---------- find：命中 / 未命中 ----------
+    if !check(dispatch.find("selftest_alpha") == i0, "find 命中返回序号") {
+        ok = false
+    }
+    if !check(dispatch.find("selftest_gamma") == i2, "find 命中末登记项") {
+        ok = false
+    }
+    if !check(dispatch.find("selftest_missing") == -1, "未登记返回 -1（default 兜底）") {
+        ok = false
+    }
+    if !check(dispatch.find("selftest_alph") == -1, "前缀串不误命中（strcmp 全等）") {
+        ok = false
+    }
+
+    // ---------- 序号稳定不变量：新登记不改变已有序号 ----------
+    var i3 = dispatch.register("selftest_aardvark")
+    if !check(dispatch.find("selftest_alpha") == i0, "新登记不改变已有序号（值随键走）") {
+        ok = false
+    }
+    if !check(i3 == 3, "新登记序号接续递增") {
+        ok = false
+    }
+
+    // ---------- find / at 互逆（全覆盖）----------
+    // 升序不变量由「每个已登记名都能被二分 find 命中」间接证明：表若乱序，
+    // 二分必漏。这里逐序号验证 at/find 互为逆运算。
+    var inv: bool = true
+    var n = dispatch.count()
+    var k: i64 = 0
+    while k < n {
+        var nm = dispatch.at(k)
+        if nm == "" || dispatch.find(nm) != k {
+            inv = false
+        }
+        k = k + 1
+    }
+    if !check(inv, "全部序号上 at/find 互为逆运算") {
+        ok = false
+    }
+
+    // ---------- at：序号反查（与 find 互逆）----------
+    if !check(dispatch.at(i2) == "selftest_gamma", "at 反查函数名") {
+        ok = false
+    }
+    if !check(dispatch.at(-1) == "", "at(-1) 越界返回空串") {
+        ok = false
+    }
+    if !check(dispatch.at(n + 5) == "", "at 越上界返回空串") {
+        ok = false
+    }
+
+    // ---------- 汇总 ----------
+    if !ok {
+        exit(1)
+    }
+    println("dispatch 自检通过")
+}

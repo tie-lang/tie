@@ -1,0 +1,273 @@
+type tie<logic>
+// tests/_tensor_probe/tensor_probe.tie —— L2 张量/线性代数库探针
+// 覆盖（≥35 断言）：new 校验 / at·set 线性 / at3·set3 / at2 / at4 /
+//               reshape / slice(拷贝不动原张量) / sum·mean·max·min /
+//               fill·scale·clip / 逐元素 add·mul·sub·div + 标量广播 /
+//               y 分块 block_count·block_slice·block_write / density_sub /
+//               linalg: matmul(3x3x3, 2x4x3) / transpose(2x3) / dot / mse
+// 编译运行：compiler\tiec.exe --no-cache [-O2] tests\_tensor_probe\tensor_probe.tie
+// ABI 约定（重要）：Tensor 值语义，data≈容量池（TMAX=1024）。本工具链在「把结构体
+// 字段数组 t.data 直接作为 ref array 实参、且同函数还按值传 t」时会生成崩溃代码
+// （别名歧义）。故按 ABI 设计调用：先 `var d: array<f32,TMAX> = t.data` 抽取存储池，
+// 后续一律以 d 为 ref 通道、t 仅作形状元数据；set(d,...) 直接改存储池 d。
+// y 分块：X=Z=2、Y=256=YBLOCK（库默认 YBLOCK=256），块长 2*256*2=1024=TMAX；
+// block_count=YMAX/YBLOCK=4。库常量 TMAX=1024/YMAX=1024/YBLOCK=256（见 std/tensor.tie）。
+
+import "/ext/tensor.tie";
+import "/std/linalg.tie";
+
+var fails: i64 = 0
+
+func chk(cond: bool, msg: string) {
+    if !cond {
+        fails = fails + 1
+        println("FAIL " + msg)
+    }
+}
+
+func absf(v: f64) -> f64 {
+    if v < 0.0 {
+        return -v
+    }
+    return v
+}
+
+func near(a: f64, b: f64) -> bool {
+    if absf(a - b) < 0.0001 {
+        return true
+    }
+    return false
+}
+
+func main() {
+    // ================= tensor =================
+    // ---- new 元数据/校验 ----
+    var t3 = tensor.new([8, 8, 8, 1], 3, 0.0)
+    chk(t3.len == 512, "new 3D len = X*Y*Z")
+    chk(t3.dims == 3, "new dims == 3")
+    chk(t3.shape0 == 8 && t3.shape1 == 8 && t3.shape2 == 8, "new shapes")
+
+    var tBad = tensor.new([4, 2000, 4, 1], 3, 0.0)   // y > YMAX
+    chk(tBad.len == 0, "new y>YMAX -> len 0")
+
+    var tBig = tensor.new([16, 16, 16, 1], 3, 0.0)   // 4096 > TMAX
+    chk(tBig.len == 0, "new product>TMAX -> len 0")
+
+    var tFill = tensor.new([2, 2, 1, 1], 3, 7.5)
+    var dFill: array<f32, 1024> = tFill.data
+    chk(to_f64(tensor.at(dFill, tFill, 0)) == 7.5, "new fill applied")
+
+    // ---- at/set 线性 ----
+    var tLin = tensor.new([4, 4, 1, 1], 3, 0.0)
+    var dLin: array<f32, 1024> = tLin.data
+    tensor.set(dLin, tLin, 0, 3.0)
+    tensor.set(dLin, tLin, 5, 9.0)
+    tensor.set(dLin, tLin, 15, 2.0)
+    chk(to_f64(tensor.at(dLin, tLin, 0)) == 3.0, "at/set linear i0")
+    chk(to_f64(tensor.at(dLin, tLin, 5)) == 9.0, "at/set linear i5")
+    chk(to_f64(tensor.at(dLin, tLin, 15)) == 2.0, "at/set linear i15")
+
+    // ---- at3/set3 ----
+    var t3d = tensor.new([4, 3, 2, 1], 3, 0.0)
+    var d3d: array<f32, 1024> = t3d.data
+    tensor.set3(d3d, t3d, 1, 2, 1, 5.0)   // idx=1+4*2+4*3*1=21
+    chk(to_f64(tensor.at3(d3d, t3d, 1, 2, 1)) == 5.0, "set3/at3 roundtrip")
+    chk(to_f64(tensor.at(d3d, t3d, 21)) == 5.0, "at3 == linear idx21")
+
+    // ---- at2 / at4 ----
+    var t2d = tensor.new([3, 4, 1, 1], 2, 0.0)
+    var d2d: array<f32, 1024> = t2d.data
+    tensor.set(d2d, t2d, 8, 4.0)   // (2,2): 2+3*2=8
+    chk(to_f64(tensor.at2(d2d, t2d, 2, 2)) == 4.0, "at2 (x,y)")
+    var t4d = tensor.new([2, 2, 2, 2], 4, 0.0)
+    var d4d: array<f32, 1024> = t4d.data
+    tensor.set(d4d, t4d, 15, 8.0)  // (1,1,1,1): 1+2+4+8=15
+    chk(to_f64(tensor.at4(d4d, t4d, 1, 1, 1, 1)) == 8.0, "at4 (x,y,z,w)")
+
+    // ---- reshape ----
+    var tR = tensor.new([2, 6, 1, 1], 2, 0.0)   // len 12
+    var dR: array<f32, 1024> = tR.data
+    var tRR = tensor.reshape(dR, tR, [3, 4, 1, 1], 2)
+    chk(tRR.len == 12 && tRR.shape0 == 3 && tRR.shape1 == 4, "reshape len/shape")
+    var tRB = tensor.reshape(dR, tR, [2, 5, 1, 1], 2)
+    chk(tRB.len == 0, "reshape len mismatch -> len 0")
+
+    // ---- slice ----
+    var tS = tensor.new([4, 4, 1, 1], 2, 0.0)
+    var dS: array<f32, 1024> = tS.data
+    var iS: i64 = 0
+    while iS < 16 {
+        tensor.set(dS, tS, iS, to_f64(iS))
+        iS = iS + 1
+    }
+    var tSL = tensor.slice(dS, tS, 0, 1, 3)
+    var dSL: array<f32, 1024> = tSL.data
+    chk(tSL.shape0 == 2 && tSL.len == 8, "slice axis0 size/len")
+    // tS 为 4×4（x 最快）；slice axis0[1,3) 保留 x∈{1,2}，result(x=0,y=0)=orig(1,0)=idx1
+    chk(to_f64(tensor.at(dSL, tSL, 0)) == 1.0, "slice axis0 value")
+    tensor.set(dS, tS, 5, 99.0)   // orig idx5=(x=1,y=1)，在 slice 内
+    chk(to_f64(tensor.at(dSL, tSL, 2)) == 5.0, "slice copy independent of original")
+    var tSV = tensor.slice(dS, tS, 1, 1, 3)
+    var dSV: array<f32, 1024> = tSV.data
+    chk(tSV.shape1 == 2 && tSV.len == 8, "slice axis1 size/len")
+    // axis1(y)[1,3) 保留 y∈{1,2}；result(x=1,yr=1)=orig(x=1,y=2)=idx 1+4*2=9
+    chk(to_f64(tensor.at(dSV, tSV, 5)) == 9.0, "slice axis1 value")
+
+    // ---- sum/mean/max/min ----
+    var tM = tensor.new([5, 1, 1, 1], 1, 0.0)
+    var dM: array<f32, 1024> = tM.data
+    var iM: i64 = 0
+    while iM < 5 {
+        tensor.set(dM, tM, iM, to_f64(iM + 1))
+        iM = iM + 1
+    }
+    chk(near(tensor.sum(dM, tM), 15.0), "sum 1..5 == 15")
+    chk(near(tensor.mean(dM, tM), 3.0), "mean 1..5 == 3")
+    chk(to_f64(tensor.max(dM, tM)) == 5.0, "max == 5")
+    chk(to_f64(tensor.min(dM, tM)) == 1.0, "min == 1")
+
+    // ---- fill/scale/clip ----
+    var tF = tensor.new([4, 1, 1, 1], 1, 0.0)
+    var dF: array<f32, 1024> = tF.data
+    tensor.fill(dF, tF, 2.0)
+    chk(near(tensor.sum(dF, tF), 8.0), "fill v then sum")
+    tensor.scale(dF, tF, 3.0)
+    chk(near(tensor.sum(dF, tF), 24.0), "scale x3 then sum")
+    tensor.clip(dF, tF, 0.0, 5.0)
+    chk(near(tensor.sum(dF, tF), 20.0), "clip [0,5] on 6s -> 20")
+
+    // ---- elementwise + scalar broadcast ----
+    var ta = tensor.new([3, 1, 1, 1], 1, 0.0)
+    var dA: array<f32, 1024> = ta.data
+    var tb = tensor.new([3, 1, 1, 1], 1, 0.0)
+    var dB: array<f32, 1024> = tb.data
+    var w = tensor.new([3, 1, 1, 1], 1, 0.0)
+    tensor.set(dA, ta, 0, 1.0)
+    tensor.set(dA, ta, 1, 2.0)
+    tensor.set(dA, ta, 2, 3.0)
+    tensor.set(dB, tb, 0, 10.0)
+    tensor.set(dB, tb, 1, 20.0)
+    tensor.set(dB, tb, 2, 30.0)
+    var outb: array<f32, 1024> = array_init(0.0)
+    tensor.add(dA, ta, dB, tb, outb, w)
+    chk(near(tensor.sum(outb, w), 66.0), "add elementwise (11+22+33)")
+    tensor.mul(dA, ta, dB, tb, outb, w)
+    chk(near(tensor.sum(outb, w), 140.0), "mul elementwise (10+40+90)")
+    tensor.sub(dB, tb, dA, ta, outb, w)
+    chk(near(tensor.sum(outb, w), 54.0), "sub elementwise (9+18+27)")
+    tensor.div(dB, tb, dA, ta, outb, w)
+    chk(near(tensor.sum(outb, w), 30.0), "div elementwise (10+10+10)")
+    var tsc = tensor.new([1, 1, 1, 1], 1, 5.0)
+    var dsc: array<f32, 1024> = tsc.data
+    var wt = tensor.new([3, 1, 1, 1], 1, 0.0)
+    tensor.set(dA, ta, 0, 1.0)
+    tensor.set(dA, ta, 1, 2.0)
+    tensor.set(dA, ta, 2, 3.0)
+    tensor.add(dA, ta, dsc, tsc, outb, wt)
+    chk(near(tensor.sum(outb, wt), 21.0), "add scalar broadcast (6+7+8)")
+    tensor.add_scalar(dA, ta, 1.0)
+    chk(near(tensor.sum(dA, ta), 9.0), "add_scalar (2+3+4)")
+
+    // ---- y 分块 (X=Z=2, Y=256=YBLOCK) ----
+    var tb3 = tensor.new([2, 256, 2, 1], 3, 0.0)
+    var db3: array<f32, 1024> = tb3.data
+    chk(tensor.block_count() == 4, "block_count == YMAX/YBLOCK == 4")
+    tensor.set3(db3, tb3, 1, 100, 1, 9.0)
+    var tBlk0 = tensor.block_slice(db3, tb3, 0)
+    var b0: array<f32, 1024> = tBlk0.data
+    chk(tBlk0.len == 2 * 256 * 2, "block_slice(0) len = X*YBLOCK*Z")
+    chk(tBlk0.shape0 == 2 && tBlk0.shape1 == 256 && tBlk0.shape2 == 2, "block_slice(0) shape")
+    chk(to_f64(tensor.at3(b0, tBlk0, 1, 100, 1)) == 9.0, "block_slice copies region")
+    var tBlk1 = tensor.block_slice(db3, tb3, 1)
+    chk(tBlk1.len == 0, "block_slice out-of-range -> len 0")
+    tensor.set3(b0, tBlk0, 1, 50, 0, 7.0)
+    tensor.block_write(db3, tb3, 0, b0)
+    chk(to_f64(tensor.at3(db3, tb3, 1, 50, 0)) == 7.0, "block_write merges update")
+
+    // ---- density_sub ----
+    var tds = tensor.new([4, 4, 4, 1], 3, 0.0)
+    var dds: array<f32, 1024> = tds.data
+    tensor.set3(dds, tds, 2, 1, 2, 3.0)   // (x=2,y=1,z=2)：fx=fz=2 时被保留
+    var tsub = tensor.density_sub(dds, tds, 2, 2)
+    var dsub: array<f32, 1024> = tsub.data
+    chk(tsub.shape0 == 2 && tsub.shape2 == 2 && tsub.len == 16, "density_sub 4x4x4 /2 -> 2x4x2")
+    chk(to_f64(tensor.at3(dsub, tsub, 1, 1, 1)) == 3.0, "density_sub keeps sample")
+
+    // ================= linalg =================
+    // ---- matmul 3x3x3 (A*I==A) ----
+    var mAf: array<f32, 1024> = array_init(0.0)
+    var mBf: array<f32, 1024> = array_init(0.0)
+    var mOf: array<f32, 1024> = array_init(0.0)
+    var vv: i64 = 0
+    while vv < 9 {
+        mAf[vv] = to_f32(to_f64(vv + 1))
+        vv = vv + 1
+    }
+    mBf[0] = 1.0; mBf[4] = 1.0; mBf[8] = 1.0
+    linalg.matmul_f32(mAf, 3, 3, 3, mBf, mOf)
+    chk(near(to_f64(mOf[0]), 1.0), "matmul 3x3x3 out(0,0) A*I == 1")
+    chk(near(to_f64(mOf[4]), 5.0), "matmul 3x3x3 out(1,1) == 5")
+    chk(near(to_f64(mOf[8]), 9.0), "matmul 3x3x3 out(2,2) == 9")
+
+    // ---- matmul 2x4x3 ----
+    var mAb: array<f32, 1024> = array_init(0.0)
+    var mBb: array<f32, 1024> = array_init(0.0)
+    var mOb: array<f32, 1024> = array_init(0.0)
+    var aa: i64 = 0
+    while aa < 8 {
+        mAb[aa] = to_f32(to_f64(aa + 1))
+        aa = aa + 1
+    }
+    mBb[0] = 2.0; mBb[1] = 0.0; mBb[2] = 0.0
+    mBb[3] = 0.0; mBb[4] = 2.0; mBb[5] = 0.0
+    mBb[6] = 0.0; mBb[7] = 0.0; mBb[8] = 2.0
+    mBb[9] = 1.0; mBb[10] = 1.0; mBb[11] = 1.0
+    linalg.matmul_f32(mAb, 2, 3, 4, mBb, mOb)
+    chk(near(to_f64(mOb[0]), 6.0), "matmul 2x4x3 out(0,0) == 6")
+    chk(near(to_f64(mOb[1]), 8.0), "matmul 2x4x3 out(0,1) == 8")
+    chk(near(to_f64(mOb[2]), 10.0), "matmul 2x4x3 out(0,2) == 10")
+    chk(near(to_f64(mOb[3]), 18.0), "matmul 2x4x3 out(1,0) == 18")
+    chk(near(to_f64(mOb[5]), 22.0), "matmul 2x4x3 out(1,2) == 22")
+
+    // ---- transpose 2x3 ----
+    var tt23 = tensor.new([2, 3, 1, 1], 2, 0.0)
+    var dt23: array<f32, 1024> = tt23.data
+    var q: i64 = 0
+    while q < 6 {
+        tensor.set(dt23, tt23, q, to_f64(q + 1))
+        q = q + 1
+    }
+    var tTr = linalg.transpose(dt23, tt23)
+    var dTr: array<f32, 1024> = tTr.data
+    chk(tTr.shape0 == 3 && tTr.shape1 == 2 && tTr.len == 6, "transpose 2x3 -> 3x2")
+    chk(to_f64(tensor.at(dTr, tTr, 0)) == 1.0, "transpose t[0][0]=1")
+    chk(to_f64(tensor.at(dTr, tTr, 1)) == 4.0, "transpose t[0][1]=4")
+    chk(to_f64(tensor.at(dTr, tTr, 5)) == 6.0, "transpose t[2][1]=6")
+
+    // ---- dot ----
+    var va: array<f32, 1024> = array_init(0.0)
+    var vb: array<f32, 1024> = array_init(0.0)
+    va[0] = 1.0; va[1] = 2.0; va[2] = 3.0
+    vb[0] = 4.0; vb[1] = 5.0; vb[2] = 6.0
+    chk(near(linalg.dot(va, 3, vb, 3), 32.0), "dot [1,2,3].[4,5,6] == 32")
+
+    // ---- mse ----
+    var msa = tensor.new([3, 1, 1, 1], 1, 0.0)
+    var dA2: array<f32, 1024> = msa.data
+    var mspl = tensor.new([3, 1, 1, 1], 1, 0.0)
+    var dB2: array<f32, 1024> = mspl.data
+    tensor.set(dA2, msa, 0, 1.0)
+    tensor.set(dA2, msa, 1, 2.0)
+    tensor.set(dA2, msa, 2, 3.0)
+    tensor.set(dB2, mspl, 0, 1.0)
+    tensor.set(dB2, mspl, 1, 2.0)
+    tensor.set(dB2, mspl, 2, 2.0)
+    chk(near(linalg.mse(dA2, msa, dB2, mspl), 0.33333333), "mse [1,2,3] vs [1,2,2] == 1/3")
+
+    if fails == 0 {
+        println("PASS tensor+linalg probe")
+    } else {
+        println("FAILS=" + to_string(fails))
+        exit(1)
+    }
+}

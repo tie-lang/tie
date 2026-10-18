@@ -1,0 +1,27 @@
+type tie<logic>
+// closure_share_gate.tie —— share 域门禁正例（B 方案，2026-10-03）
+// ============================================================================
+// 规范 §10.5：把携带容器的闭包交给其他执行流时，「并发写入由书写者负责排除」。
+// 编译期把这条责任变成显式门禁：闭包**引用全局可变容器**（table/map）时，
+// spawn 需要 share 域凭据（双锁：unsafe 上下文 + 域凭据）。
+//
+// 本探针覆盖**免凭据**的三种形态（它们都不共享底层容器 ⇒ 精确判据应放行）：
+//   ① 完全纯函数闭包
+//   ② 只引用**标量**全局（i64 不共享容器）
+//   ③ 引用局部表（非全局 ⇒ 不跨执行流共享）
+// 负例见 closure_share_gate_neg.tie。
+// 凭据形态（文件级/函数级/块级）同样见负例文件的注释与 tsh 回归。
+
+var g_scalar: i64 = 100
+
+func main() {
+    // ① 纯函数闭包
+    var t1 = spawn(func() -> i64 { return 42 })
+    // ② 只引用标量全局（不共享容器）
+    var t2 = spawn(func() -> i64 { g_scalar = g_scalar + 1; return g_scalar })
+    // ③ 引用局部表（局部不跨执行流共享）
+    var loc: table<i64> = [1, 2]
+    var t3 = spawn(func() -> i64 { return len(loc) })
+    // 三者都应编译通过 ⇒ 精确判据没有误伤
+    println("PASS closure-share-gate " + to_string(t1 + t2 + t3))
+}

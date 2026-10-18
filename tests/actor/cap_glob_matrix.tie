@@ -1,0 +1,60 @@
+type tie<logic>
+// ============================================================================
+// cap_glob_matrix.tie —— actor 消息投递闭包：类型化参数 + 段偏移回归（2026-10-03）
+// ----------------------------------------------------------------------------
+// 覆盖两个已修缺陷：
+//
+// ① 前端 `sstate.actor_method_param` 段偏移漏累积（复现条件：actor 内不同方法
+//    参数个数不等）。旧式 `ac_mptys[ac_paroff[ai] + mi + k]` 把**方法序号**当
+//    **参数偏移**——`a(f,x)` 后跟 `b(f)` 时，b 的形参被取成 a 的第 2 个参数
+//    （i64）⇒ 假报 E00469「参数类型不匹配；期望 i64；实际 fn(i64)->i64」。
+//
+// ② 消息参数区「未用尾字填零」偏移写成 `k*8`（槽内第 k 字），与已用参数区
+//    **重叠**：fn 参数占 16 字节（offset 0..15），第 1 个尾字写到 offset 8 ⇒
+//    覆盖闭包聚合的 env 指针 ⇒ actor 内调用返回 0（env=null 时段错误）。
+//    修：尾字起点 = 已用区末尾（8 对齐），并加 64 字节槽边界守卫。
+//
+// 运行需要 TIE_TRM_LITE_LIB 指向 trm_lite.a。期望输出见每行注释。
+// ============================================================================
+
+var g_k: i64 = 5
+
+func plain(f: fn(i64) -> i64, x: i64) -> i64 { return f(x) }
+
+actor W {
+    var base: i64 = 0
+
+    // 两个参数的方法在前、单参数的方法在后 —— 触发 ① 的必要条件
+    pub func a(f: fn(i64) -> i64, x: i64) -> i64 { return f(x) }
+    pub func b(f: fn(i64) -> i64) -> i64 { return f(1) }
+
+    pub func setup(v: i64) -> i64 {
+        base = v
+        return v
+    }
+}
+
+func report(tag: string, got: i64, want: i64) {
+    if got == want {
+        println("PASS " + tag + "=" + to_string(got))
+    } else {
+        println("FAIL " + tag + "=" + to_string(got) + " 期望 " + to_string(want))
+    }
+}
+
+func main() {
+    var w = run W()
+    report("setup", w.setup(100), 100)
+
+    // 非 actor 路径（对照）：闭包传普通函数形参
+    report("plain_capglob", plain(func(y: i64) -> i64 { return y * g_k }, 7), 35)
+
+    // ① actor + 单参数方法 + 捕获全局的闭包（旧编译器在此假报 E00469）
+    report("actor_1capglob", w.b(func(y: i64) -> i64 { return y * g_k }), 5)
+
+    // ② 捕获局部 / 无捕获（校验 env 指针不再被尾字覆盖）
+    var kl: i64 = 9
+    report("actor_2capglob", w.a(func(y: i64) -> i64 { return y * g_k }, 7), 35)
+    report("actor_2caplocal", w.a(func(y: i64) -> i64 { return y * kl }, 7), 63)
+    report("actor_2nocap", w.a(func(y: i64) -> i64 { return y + 1 }, 7), 8)
+}

@@ -1,0 +1,89 @@
+type tie<class>
+// std/optim.tie —— L3 优化器库 optim（命名空间 optim；纯 tie，std 层）
+// ============================================================
+// 用途：微型扩散模型训练的 SGD / AdamW 参数更新与 LR 调度。
+// 训练主精度 f32（权重存储），但全部更新在 f64 中计算后 as_f32 回写（规避 f32
+// 算术误生成 opt 崩溃，并保证长步积累数值稳定）。
+//
+// 【API 约定】参数权重 w 与梯度 gw 均以 `ref array<f32,1024>` 容量池通道传入，
+// 显式收 n 个元素；一阶/二阶矩 m/v 为外部持久化状态（调用方持有并逐次传入，
+// 天然满足值语义下"动量跨步"，因为数组是 ref 可原地写回）。t 为步数（≥1），
+// 用于 AdamW 偏差校正。全部就地更新，返回 void。
+//
+// 【AdamW】w ← w - lr·( wd·w + m̂/(√v̂+eps) )
+//   m = b1·m + (1-b1)·g；v = b2·v + (1-b2)·g²；m̂=m/(1-b1ᵗ)，v̂=v/(1-b2ᵗ)。
+//   weight-decay 独立于梯度（与 Adam 时代码的 wd 混入 g 不同）。
+// EN: L3 optimizer (SGD / AdamW / LR schedule). f64 updates written back to f32.
+// Moments m/v are external persistent state passed by ref each step.
+
+namespace optim {
+
+// 一阶矩系数（Adam 默认）。EN: 1st-moment coefficient.
+const B1: f64 = 0.9
+// 二阶矩系数（Adam 默认）。EN: 2nd-moment coefficient.
+const B2: f64 = 0.999
+// 数值稳定小量（Adam 默认，十进制）。EN: numerical stability epsilon.
+const EPS: f64 = 0.00000001
+
+// 带权重衰减的随机梯度下降：w -= lr*(gw + wd*w)。逐元素独立，f64 算 f32 回写。
+// EN: SGD with weight decay: w -= lr*(gw + wd*w), elementwise, f64->f32.
+pub func sgd_step<CAP: i64 = 1024>(w: ref array<f32, CAP>, n: i64, gw: ref array<f32, CAP>, lr: f64, wd: f64) {
+    var i: i64 = 0
+    while i < n {
+        var g: f64 = to_f64(gw[i]) + wd * to_f64(w[i])
+        w[i] = to_f32(to_f64(w[i]) - lr * g)
+        i = i + 1
+    }
+}
+
+// AdamW 一步：更新 m/v,用偏差校正的 m̂/√(v̂+eps) + 独立 weight-decay 更新 w。
+// EN: AdamW step: w -= lr*(wd*w + mhat/(sqrt(vhat)+eps)); m/v updated.
+pub func adamw_step<CAP: i64 = 1024>(w: ref array<f32, CAP>, n: i64, gw: ref array<f32, CAP>,
+                    m: ref array<f32, CAP>, v: ref array<f32, CAP>, tt: i64,
+                    lr: f64, wd: f64, b1: f64, b2: f64, eps: f64) {
+    var cb1: f64 = 1.0
+    var cb2: f64 = 1.0
+    var p: f64 = to_f64(tt)
+    var k: i64 = 0
+    while k < tt {
+        cb1 = cb1 * b1
+        cb2 = cb2 * b2
+        k = k + 1
+    }
+    var b1c = 1.0 - cb1
+    var b2c = 1.0 - cb2
+    var onem1 = 1.0 - b1
+    var onem2 = 1.0 - b2
+    var i: i64 = 0
+    while i < n {
+        var g: f64 = to_f64(gw[i])
+        var mi: f64 = b1 * to_f64(m[i]) + onem1 * g
+        var vi: f64 = b2 * to_f64(v[i]) + onem2 * g * g
+        m[i] = to_f32(mi)
+        v[i] = to_f32(vi)
+        var mhat = mi / b1c
+        var vhat = vi / b2c
+        var step: f64 = wd * to_f64(w[i]) + mhat / (sqrt(vhat) + eps)
+        w[i] = to_f32(to_f64(w[i]) - lr * step)
+        i = i + 1
+    }
+}
+
+// 余弦退火 LR：min + 0.5*(base-min)*(1+cos(π*step/total))。
+// EN: cosine annealing LR: min + 0.5*(base-min)*(1+cos(pi*step/total)).
+pub func lr_cosine<CAP: i64 = 1024>(step: i64, total: i64, base: f64, min: f64) -> f64 {
+    var st: f64 = to_f64(step)
+    var tt: f64 = to_f64(total)
+    var frac: f64 = 0.0
+    if tt > 0.0 {
+        frac = st / tt
+    }
+    return min + 0.5 * (base - min) * (1.0 + cos(3.141592653589793 * frac))
+}
+
+// 恒定 LR（恒返回 lr）。EN: constant LR, returns lr as-is.
+pub func lr_constant<CAP: i64 = 1024>(lr: f64) -> f64 {
+    return lr
+}
+
+}   // namespace optim

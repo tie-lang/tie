@@ -1,0 +1,59 @@
+type tie<logic>
+
+// p.9.11.16 迭代器协议 + 惰性序列消费接线。
+// 协议（内建约定）：可迭代对象 = 用户 struct 实现两个方法（namespace <Struct 名>
+// 内，与 struct 方法约定一致，首参 self 自动 ref）：
+//   pub func has_next(self) -> bool   —— 序列中还有元素？
+//   pub func next(self) -> T          —— 取当前元素并推进（T = 元素类型）
+// for x in it / 推导式 [e for x in it] 消费：while it.has_next() { x = it.next() }。
+// 惰性链（map/filter 不物化）与 trm-lite 生成器同源（p.9.5 承载），本轮为
+// 协议 + 消费接线（探针验证）。
+
+struct Counter {
+    var cur: i64
+    var limit: i64
+}
+
+namespace Counter {
+    pub func has_next(self: Counter) -> bool {
+        return self.cur < self.limit
+    }
+    pub func next(self: Counter) -> i64 {
+        var v = self.cur
+        self.cur = self.cur + 1
+        return v
+    }
+}
+
+func gen_it() -> i64 {
+    yield 3
+    yield 4
+    yield 5
+}
+
+func main() {
+    // 1. 自定义可迭代 struct 供 for 消费
+    var it: Counter = Counter()
+    it.cur = 1
+    it.limit = 5
+    for x in it {
+        println(x)
+    }
+    // 2. 与推导式组合（重置迭代器状态）
+    var it2: Counter = Counter()
+    it2.cur = 2
+    it2.limit = 5
+    var sq = [x * x for x in it2]
+    println(len(sq))
+    println(sq[0])
+    println(sq[2])
+    // 3. 与 yield 生成器组合：生成器返回值（表）作推导式源
+    var gt = gen_it()
+    var doubled = [y * 2 for y in gt]
+    println(doubled[0])
+    println(doubled[2])
+    // 4. 生成器返回值直接 for 消费
+    for z in gen_it() {
+        println(z)
+    }
+}

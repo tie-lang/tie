@@ -1,0 +1,33 @@
+type tie<logic>
+// ============================================================
+// p.9.11.14 import 别名/重导出正例：
+//   - `import "path" as 别名`：内联模型下被导入文件顶层 namespace 首段改名为
+//     别名（M2.1.7 既有语义），经别名调用其 pub 函数；
+//   - 无别名 import：namespace 原名保留，零变化；
+//   - `pub import`：重导出（内联模型下 import 本就全量可见 = 零成本；pub 作
+//     登记标记，供后续工具/诊断显示）。
+// 期望：编译成功 + 运行打印 "import_alias 探针全过"。
+// ============================================================
+import "./imp_alias_lib.tie" as h
+import "./imp_alias_lib2.tie"
+pub import "./imp_alias_lib3.tie"
+
+func main() {
+    var g = h.greet()
+    if g != "hello" {
+        panic("别名调用错误: " + g)
+    }
+    var s = h.add(2, 3)
+    if s != 5 {
+        panic("别名函数错误")
+    }
+    var p = plain.greet()
+    if p != "plain" {
+        panic("无别名 import 错误")
+    }
+    var r = reexp.greet()
+    if r != "reexp" {
+        panic("pub import 错误")
+    }
+    println("import_alias 探针全过")
+}

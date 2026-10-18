@@ -1,0 +1,35 @@
+type tie<logic>
+// ============================================================
+// 6.11 迭代器适配正例（2026-10-13）：iter_map / iter_filter / iter_take /
+// iter_zip（元组表 + for 解构）/ iter_chain（= tbl_cat）。急求值，返回新表，
+// 数据作末参可直接接箭头链。
+// 期望：编译成功 + 运行打印 "iterops 探针全过"。
+// ============================================================
+func main() {
+    var xs: table<i64> = [1, 2, 3, 4]
+    var a = iter_map(func(v: i64) -> i64 { return v * 2 }, xs)
+    if a[3] != 8 {
+        panic("iter_map 失败")
+    }
+    var b = xs -> iter_map(func(v: i64) -> i64 { return v * 2 }) -> iter_filter(func(v: i64) -> bool { return v > 4 })
+    if len(b) != 2 || b[0] != 6 || b[1] != 8 {
+        panic("箭头链 失败")
+    }
+    var t = iter_take(2, xs)
+    if len(t) != 2 || t[1] != 2 {
+        panic("iter_take 失败")
+    }
+    var ns: table<string> = ["x", "y"]
+    var c = 0
+    for (n2, sc) in iter_zip(ns, xs) {
+        c = c + sc
+    }
+    if c != 3 {
+        panic("iter_zip 失败")
+    }
+    var ch = iter_chain(xs, t)
+    if len(ch) != 6 || ch[5] != 2 {
+        panic("iter_chain 失败")
+    }
+    println("iterops 探针全过")
+}

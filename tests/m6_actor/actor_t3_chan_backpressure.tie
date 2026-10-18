@@ -1,0 +1,61 @@
+type tie<logic>
+// p.9.5.x T3 探针：ch_send_block 背压——队满阻塞至消费者取走（精确 FIFO 无丢）。
+// 主线程 ch_send 非阻塞填满通道（64 = CH_CAP 上界），第 65 条 ch_send 返回 1
+// 证实队满；spawn 任务 ch_send_block(ch, 2000) 在队满时**阻塞**（容量 64 硬
+// 约束：未取走前不可能入队）→ 主线程逐条 ch_recv 排空 → 阻塞 send 被取走唤醒
+// 完成入队 → 精确 FIFO 1..64,2000，无丢消息。
+var g_ch: i64 = 0
+var g_send_res: i64 = -1
+var g_h: i64 = 0
+func sender() -> i64 {
+    var r = ch_send_block(g_ch, 2000)
+    g_send_res = r
+    wg_done(g_h)
+    return r
+}
+func main() {
+    g_ch = ch_open()
+    g_h = wg_new()
+    wg_add(g_h, 1)
+    var i: i64 = 0
+    var full: i64 = 0
+    while i < 64 {
+        var r = ch_send(g_ch, i + 1)
+        if r == 1 {
+            full = 1
+        }
+        i = i + 1
+    }
+    // 队满证实：非阻塞 send 第 65 条必须返回 1（无背压降级契约）
+    var r65 = ch_send(g_ch, 1000)
+    // 背压发送：队满时阻塞等待空位（Go 阻塞 send 语义）
+    spawn(sender)
+    // 主线程排空：逐条取回 1..64；阻塞 send 在首个取走后被唤醒入队
+    var bad: i64 = 0
+    var got: i64 = 0
+    var guard: i64 = 0
+    while got < 65 && guard < 200000 {
+        var v = ch_recv(g_ch)
+        if v != 0 {
+            var expect = got + 1
+            if expect <= 64 {
+                if v != expect {
+                    bad = 1
+                }
+            } else {
+                if v != 2000 {
+                    bad = 1
+                }
+            }
+            got = got + 1
+        }
+        guard = guard + 1
+    }
+    wg_wait(g_h)
+    println("full=" + to_string(full) + " r65=" + to_string(r65) + " got=" + to_string(got) + " bad=" + to_string(bad) + " send_res=" + to_string(g_send_res))
+    if full == 0 && r65 == 1 && got == 65 && bad == 0 && g_send_res == 0 {
+        println("T3 背压阻塞 send 精确 FIFO 无丢通过")
+    } else {
+        println("T3 失败 full=" + to_string(full) + " r65=" + to_string(r65) + " got=" + to_string(got) + " bad=" + to_string(bad) + " send_res=" + to_string(g_send_res))
+    }
+}

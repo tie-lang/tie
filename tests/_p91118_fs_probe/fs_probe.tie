@@ -1,0 +1,91 @@
+type tie<logic>
+// tests/_p91118_fs_probe/fs_probe.tie —— p.9.1.1.18 验收：std/fs fs 增强。
+// 全离线确定性探针：
+//   1. file_size 读取大小；
+//   2. dir_size 递归求和（多层子树）；
+//   3. copy_tree 全量复制（目录结构保留、内容一致）；
+//   4. copy_tree 含 exclude 前缀过滤（排除整个子树）；
+//   5. exclude 单文件排除。
+// 期望全部 PASS / exit 0。
+import "/std/fs.tie" as fs
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func main() {
+    var base = "tests\\_p91118_fs_probe\\src"
+    var dst = "tests\\_p91118_fs_probe\\dst"
+    var dstf = "tests\\_p91118_fs_probe\\dst_full"
+    var dstx = "tests\\_p91118_fs_probe\\dst_xsub"
+    var dsty = "tests\\_p91118_fs_probe\\dst_xfile"
+    fs.remove_all(base)
+    fs.remove_all(dst)
+    fs.remove_all(dstf)
+    fs.remove_all(dstx)
+    fs.remove_all(dsty)
+
+    // 建临时目录树
+    fs.create_dir_all(base + "\\sub\\deep")
+    fs.write_text(base + "\\a.txt", "hello")
+    fs.write_text(base + "\\sub\\b.txt", "world")
+    fs.write_text(base + "\\sub\\deep\\c.txt", "!!")
+    fs.write_text(base + "\\keep.txt", "x")
+
+    // 1) file_size
+    check(fs.file_size(base + "\\a.txt") == 5, "file_size a.txt == 5")
+    check(fs.file_size(base + "\\keep.txt") == 1, "file_size keep.txt == 1")
+    // 不存在的文件返回 -1
+    check(fs.file_size(base + "\\nope.txt") == -1, "file_size missing == -1")
+
+    // 2) dir_size 递归求和：5(hello)+5(world)+2(!!)+1(x)=13
+    check(fs.dir_size(base) == 13, "dir_size(base) == 13")
+
+    // 3) copy_tree 全量复制
+    check(fs.copy_tree(base, dst, empty_ex()), "copy_tree full returns true")
+    check(fs.file_size(dst + "\\a.txt") == 5, "copied a.txt size 5")
+    check(fs.file_size(dst + "\\sub\\b.txt") == 5, "copied sub/b.txt size 5")
+    check(fs.file_size(dst + "\\sub\\deep\\c.txt") == 2, "copied sub/deep/c.txt size 2")
+    check(fs.dir_size(dst) == 13, "copied dir_size == 13")
+
+    // 4) copy_tree + exclude 子树 "sub\\deep"
+    var ex1 = table_new_string()
+    table_push(ex1, "sub\\deep")
+    check(fs.copy_tree(base, dstx, ex1), "copy_tree exclude subtree returns true")
+    check(fs.file_size(dstx + "\\a.txt") == 5, "excluding: a.txt copied")
+    check(fs.file_size(dstx + "\\sub\\b.txt") == 5, "excluding: sub/b.txt copied")
+    check(!fs.exists(dstx + "\\sub\\deep\\c.txt"), "excluding: sub/deep/c.txt SKIPPED")
+    check(fs.dir_size(dstx) == 11, "excluding: dir_size == 11")
+
+    // 5) exclude 单文件（前缀仅谓为文件整体）
+    var ex2 = table_new_string()
+    table_push(ex2, "sub\\b.txt")
+    check(fs.copy_tree(base, dsty, ex2), "copy_tree exclude file returns true")
+    check(fs.file_size(dsty + "\\a.txt") == 5, "exclude-file: a.txt copied")
+    check(!fs.exists(dsty + "\\sub\\b.txt"), "exclude-file: sub/b.txt SKIPPED")
+    check(fs.file_size(dsty + "\\sub\\deep\\c.txt") == 2, "exclude-file: deep/c.txt copied")
+
+    fs.remove_all(base)
+    fs.remove_all(dst)
+    fs.remove_all(dstf)
+    fs.remove_all(dstx)
+    fs.remove_all(dsty)
+
+    if fails == 0 {
+        println("PASS")
+    } else {
+        println("FAILED")
+    }
+}
+
+func empty_ex() -> table<string> {
+    var t = table_new_string()
+    return t
+}

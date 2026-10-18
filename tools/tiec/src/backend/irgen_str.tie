@@ -1,0 +1,91 @@
+type tie<class>
+// compiler/backend/irgen_str.tie —— 生成器内联原语（字符串/表容器/字典/数字转字符串） 子模块
+// ============================================================
+// 从 irgen.tie 拆分而来：把 S2.1 字符串原语（s21_*）、SSO 短串池（s21_sso_* / s21_sb_* /
+// s21_str_*）、动态表容器批次6（s21_table_* / t21_*）、字典容器批次7（s21_map_*）以及
+// 数字转字符串（tig_i128_to_str / tig_i64_to_str / s21_codepoint_to_str）这批"内联原语"
+// 独立成子文件。它们全部面向 {ptr,len} 字符串、表、字典容器，生成普通 tie-IR 指令
+//（零新 opcode），供 irgen 主文件的核心区函数与 sstmt/ssexpr 生成函数裸名调用。
+//
+// 拆分范式：【同 namespace 跨文件】（文本内联）。
+// irgen.tie 顶层 import 本文件后，本文件被"文本内联"进同一编译单元，
+// 其中所有代码全局可见。本文件声明与 irgen.tie 相同的 `namespace irgen`，
+// tie 允许同名 namespace 横跨多文件（进编译单元后为同一 namespace）闭合并集。
+//   - 同 namespace 的函数可互相裸名调用（irgen.tie 主文件仍可按原样裸名调用
+//     本文件内的 s21_gep / s21_load / s21_table_push / s21_map_get / tig_i64_to_str
+//     等，无需改名）；
+//   - 同理可访问主文件顶层全局 var（g_cur_block / g_sc_top / g_* 表等，均为编译
+//     单元内顶层全局，命名空间体内不允许 var）；
+//   - 本文件经 import 文本内联，只含函数与注释，不含顶层全局 var 声明——
+//     全局 var 仍留在 irgen.tie 主文件，避免重复定义。
+//   - 本文件内对 tig_int_lit / tig_cmp_const / tig_cmp_zero / tig_and_i1 / tig_or_i1 /
+//     tig_str_lit 等核心区函数的裸名调用保持不变（同 namespace 跨文件仍解析）。
+// 依赖约定：ir.* / types / interner 等经主文件既有 import 链内联可达（本文件不重复 import）。
+
+namespace irgen {
+// ==================== S2.1 字符串 {ptr,len} 原语实现 ====================
+// 字符串运行时布局（S2.1 决策 O2 + F1）：
+//   ptr → [8 字节 i64 长度头][UTF-8 数据][\0 边界自动 NUL]
+// 长度头位于数据指针 -8 处（load i64, gep(i8, ptr, -8)）——len(s) O(1)；
+// 数据 NUL 结尾——旧 strlen/strcmp/printf 与 FFI 传方向零拷贝兼容。
+// 所有字符串值统一该布局：字面量 .rodata 带头（llvmgen emit_strings）、
+// str_cat malloc 带头（llvmgen op 56）、tie 桥返回自动补头（llvmgen op 36）、
+// sb_build 产出带头。以下辅助全部生成普通 tie-IR 指令（零新 opcode）。
+
+
+// ==================== 动态表容器批次 6（去 tie_table_* 桥） ====================
+// 表句柄 = ptr → 32 字节 {cap:i64@0, len:i64@8, data:ptr@16, esz:i64@24}。
+//   cap  = 元素容量（个）；len = 元素数；data = 元素数组首指针；esz = 单元素字节数
+//   （bool=1，其余=8）。data 缓冲大小 = newcap*esz；增长策略 1.5x：
+//   newcap = cap==0 ? max(8, need) : max(cap + cap/2, need)。string/嵌套表元素在
+//   数据区存 8 字节值句柄（ptr）。
+// 以下辅助全部生成内联 tie-IR 指令（零新 opcode、零 Rust tie_table_* 桥调用）。
+// 任意原始缓冲分配统一 s21_raw_alloc_str（K_PTR 返回，绕开 op36 对 TK_STR 的
+// strlen+memcpy 扫描——对未初始化堆缓冲 strlen 读垃圾，属漏洞 A 类隐患）。
+
+
+// ==================== P2a：表容器运行时迁入 trm-lite（tl_tbl）====================
+// 句柄 = 32 字节 {cap@0, len@8, data@16, esz@24} 原始缓冲——tl_tbl（trm_lite.a）
+// 与旧内联布局完全一致，故 len/data/esz 字段读取（s21_table_len/t21_data/t21_esz）
+// 保留内联；可变操作（new/push/at/set）委托 tl_tbl$tbl_*（g_used_trmlite 置位，
+// toolchain 自动链 trm_lite.a）。句柄在 IR 中为 ptr（TK_STR），tl_tbl extern 以
+// i64 承载指针——本层做 ptrtoint/inttoptr 桥接，调用点签名不变（零改动）。
+
+
+// struct 类型 t 的第 fidx 个字段的绝对字节偏移（C 自然对齐；与 LLVM GEP 一致）。
+// t 须为 K_STRUCT（调用方保证）；fidx 有效（0..cls_nfld-1，调用方保证）。
+pub func struct_field_off(t: i64, fidx: i64) -> i64 {
+    var si = t - BASE_STRUCT
+    agg_ensure_layout()
+    return g_stl_offs[g_stl_fbase[si] + fidx]
+}
+
+// struct 类型的对齐（最大成员对齐；与 C 对齐）。t 须为 K_STRUCT。
+pub func struct_align_of(t: i64) -> i64 {
+    var si = t - BASE_STRUCT
+    agg_ensure_layout()
+    return g_stl_align[si]
+}
+
+
+// ==================== 字典容器批次 7（去 tie_map_* 桥） ====================
+// map 句柄复用批次 6 表基座（32 字节 {cap,len,data,esz}），esz 兼作模式标记：
+//   数组模式：esz=16 → data = 按 strcmp 字节序有序的 {key:ptr,value} 16B 元素数组；
+//             查找=二分、插入=二分定位+memmove 平移、精确增长（内存零尾部浪费）。
+//   哈希模式：esz=16|1<<63（i64 负值）→ data = 开放寻址哈希表（16B/槽；
+//             key==null 判空槽）；查找=FNV-1a + 线性探测 + strcmp 验证；
+//             装填因子 >0.7 触发 1.5x 倍增 + 全量 rehash。
+// 升级阈值：数组模式插入使条目数 > 1024 时一次性升级哈希模式（小表精确内存、
+// 超大表哈希性能——用户定案两段式混合）。len@8 恒为条目数——len(m) 走
+// s21_table_len 零改动。打印两模式均按键 strcmp 升序（数组天然有序；哈希
+// 打印时提取+复用数组插入原语排序）。
+// 缺失键读：str_cat 拼 "运行时错误: map_get 键不存在：'k'" + printf + exit(1)，
+// 对齐 interp g_err 语义（不可捕获、打印即终止）。
+// 全部辅助生成内联 tie-IR（零新 opcode、零 Rust tie_map_* 桥调用）。
+
+
+}
+import "./irgen_str_p1.tie"
+import "./irgen_str_p2.tie"
+import "./irgen_str_p3.tie"
+import "./irgen_str_p4.tie"

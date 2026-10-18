@@ -1,0 +1,239 @@
+type tie<class>
+// compiler/dbug/dbgem_sym.tie —— 结构化输出·symtab 阶段 dump（p.9.22.5-7）
+// ============================================================
+// 全量符号表 = sstate 全局注册表直拷 + xref 侧表（作用域/声明/引用）：
+//   120-126 全局/外部/返回表（gb/ext/tre）   150-159 函数/签名
+//   160-163 参数扁平段                        165-172 struct/字段
+//   175-183 enum/变体                         185-186 别名
+//   188-198 xref（scope/decl/use，设计稿 §4）
+// 字段号 120-126 为本实现增补（设计稿列 150-198 之外的全局注册表——
+// gb/ext/tre 属「全量符号表」必要面；百位段 120-149 原为未分配区）。
+//
+// 产物伴生符号表（.7）：library/class 产物默认伴随 `<out>.sym.zd`（同 symtab
+// 记录字节；--no-sym 关闭）。采集门（xref）由 driver 单点开启。
+
+namespace dbgem {
+
+// sel[i] → src[sel[i]] 的间接列（struct/enum 行按 st_vals/en_vals 索引）。
+func idx_col(src: table<i64>, sel: table<i64>) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < len(sel) {
+        table_push(out, src[sel[i]])
+        i = i + 1
+    }
+    return out
+}
+
+// xref 列导出：sel 0=scope_parent 1=scope_owner。
+func xr_scope_col(sel: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    var n = xref.scope_count()
+    var i: i64 = 0
+    while i < n {
+        if sel == 0 {
+            table_push(out, xref.scope_parent_at(i))
+        } else {
+            table_push(out, xref.scope_owner_at(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// xref 列导出（decl）：sel 0=name 1=kind 2=type 3=scope 4=node 5=line 6=col。
+func xr_decl_col(sel: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    var n = xref.decl_count()
+    var i: i64 = 0
+    while i < n {
+        if sel == 0 {
+            table_push(out, xref.decl_name_at(i))
+        } else if sel == 1 {
+            table_push(out, xref.decl_kind_at(i))
+        } else if sel == 2 {
+            table_push(out, xref.decl_type_at(i))
+        } else if sel == 3 {
+            table_push(out, xref.decl_scope_at(i))
+        } else if sel == 4 {
+            table_push(out, xref.decl_node_at(i))
+        } else if sel == 5 {
+            table_push(out, xref.decl_line_at(i))
+        } else {
+            table_push(out, xref.decl_col_at(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// xref 列导出（use）：sel 0=node 1=decl。
+func xr_use_col(sel: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    var n = xref.use_count()
+    var i: i64 = 0
+    while i < n {
+        if sel == 0 {
+            table_push(out, xref.use_node_at(i))
+        } else {
+            table_push(out, xref.use_decl_at(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 全局/外部/返回表段（120-126）。
+func build_sym_gf() {
+    push_col_str_ids(120, "gb_names", gb_keys)
+    push_col_i64(121, "gb_tys", gb_vals)
+    push_col_i64(122, "gb_const", gb_const)
+    push_col_i64(123, "gb_telem", gb_telem)
+    push_col_str_ids(124, "ext_names", ext_keys)
+    push_col_str_ids(125, "tre_names", tre_keys)
+    push_col_i64(126, "tre_vals", tre_vals)
+    push_col_str_ids(150, "fn_names", fn_keys)
+    push_col_i64(151, "fn_sig_ids", fn_vals)
+    push_col_i64(152, "fn_def_nodes", fn_def_nodes)
+    push_col_i64(153, "fn_mods", idx_col(sg_mod, fn_vals))
+    push_col_i64(154, "sg_nparams", sg_nparams)
+    push_col_i64(155, "sg_required", sg_required)
+    push_col_i64(156, "sg_ret", sg_ret)
+    push_col_i64(157, "sg_pub", sg_pub)
+    push_col_i64(158, "sg_off", sg_off)
+    push_col_i64(159, "sg_gen", gen_marks)
+    push_col_i64(160, "sp_tys", sp_tys)
+    push_col_i64(161, "sp_refs", sp_refs)
+    push_col_i64(162, "sp_defs", sp_defs)
+    push_col_i64(163, "sp_vars", sp_vars)
+}
+
+// struct/字段段（165-172）。
+func build_sym_st() {
+    push_col_str_ids(165, "st_names", st_keys)
+    push_col_i64(166, "st_parent", idx_col(cls_parent, st_vals))
+    push_col_i64(167, "st_fldoff", idx_col(cls_fldoff, st_vals))
+    push_col_i64(168, "st_nfld", idx_col(cls_nfld, st_vals))
+    push_col_i64(169, "st_reprc", idx_col(st_reprc, st_vals))
+    push_col_str_ids(170, "fld_names", fld_names)
+    push_col_i64(171, "fld_tys", fld_tys)
+    push_col_i64(172, "fld_defs", fld_defs)
+}
+
+// enum/别名段（175-186）。
+func build_sym_en() {
+    push_col_str_ids(175, "en_names", en_keys)
+    push_col_i64(176, "en_nvar", idx_col(en_nvar, en_vals))
+    push_col_i64(177, "en_varoff", idx_col(en_varoff, en_vals))
+    push_col_i64(178, "en_nslot", idx_col(en_nslot, en_vals))
+    push_col_str_ids(179, "en_vnames", en_vnames)
+    push_col_i64(180, "en_vtags", en_vtags)
+    push_col_i64(181, "en_vfldoff", en_vfldoff)
+    push_col_i64(182, "en_vnfld", en_vnfld)
+    push_col_i64(183, "en_ftys", en_ftys)
+    push_col_str_ids(185, "alias_names", alias_keys)
+    push_col_i64(186, "alias_nodes", alias_vals)
+}
+
+// xref 段（188-198）。
+func build_sym_xr() {
+    push_col_i64(188, "scope_parent", xr_scope_col(0))
+    push_col_i64(189, "scope_owner", xr_scope_col(1))
+    push_col_str_ids(190, "decl_names", xr_decl_col(0))
+    push_col_i64(191, "decl_kinds", xr_decl_col(1))
+    push_col_i64(192, "decl_tys", xr_decl_col(2))
+    push_col_i64(193, "decl_scopes", xr_decl_col(3))
+    push_col_i64(194, "decl_nodes", xr_decl_col(4))
+    push_col_i64(195, "decl_lines", xr_decl_col(5))
+    push_col_i64(196, "decl_cols", xr_decl_col(6))
+    push_col_i64(197, "use_nodes", xr_use_col(0))
+    push_col_i64(198, "use_decls", xr_use_col(1))
+}
+
+// symtab 阶段列构建（顺序 = 字段号升序）。
+pub func build_sym() {
+    cols_reset()
+    build_sym_gf()
+    build_sym_st()
+    build_sym_en()
+    build_sym_xr()
+    // 段 8 就绪标记（tieir.serialize 消费；cols_reset 已置 0）
+    dg_sym_ready = 1
+}
+
+// ---------- tieir 段 8（.8） ----------
+
+// 段 8 字节（段头 + 段体）：供 tieir.set_sec8 注入。
+// 体布局（大端 i64 序列）：列数；每列「字段号 + kind + 行数 + 行值」；
+// kind 1 的行值 = 字符串池 id（-1 = 无），与 tieir 读侧 parse_semsys 对称。
+pub func sym8_section() -> table<i64> {
+    var body = table_new_i64()
+    push_be(body, len(dc_fno), 8)
+    var c: i64 = 0
+    while c < len(dc_fno) {
+        push_be(body, dc_fno[c], 8)
+        push_be(body, dc_kind[c], 8)
+        push_be(body, dc_len[c], 8)
+        var off = dc_off[c]
+        var n = dc_len[c]
+        var i: i64 = 0
+        while i < n {
+            if dc_kind[c] == 0 {
+                push_be(body, dc_i64[off + i], 8)
+            } else {
+                push_be(body, dc_ids[off + i], 8)
+            }
+            i = i + 1
+        }
+        c = c + 1
+    }
+    var out = table_new_i64()
+    push_be(out, 8, 8)           // 段号 SEC_SEMSYS
+    push_be(out, len(body), 8)   // 段体长度
+    out = byte_concat(out, body)
+    return out
+}
+
+// ---------- 产物伴生符号表（.7） ----------
+
+// 伴生路径：与后端产物同名 + .sym.zd（-o 优先；缺省按角色/共享规则推）。
+pub func sym_sidecar_path() -> string {
+    var out = g_output
+    if str_len(out) == 0 {
+        if g_shared {
+            if is_linux_target(driver.normalize_target(g_target)) {
+                out = replace_ext(g_input, "so")
+            } else {
+                out = replace_ext(g_input, "dll")
+            }
+        } else {
+            out = replace_ext(g_input, "a")
+        }
+    }
+    return out + ".sym.zd"
+}
+
+// library/class 伴生 .sym.zd 是否需要（driver/前端出口单一判据）。
+pub func sym_sidecar_wanted() -> i64 {
+    if g_no_sym {
+        return 0
+    }
+    if driver.role_output(str.clone(g_role)) != "lib" {
+        return 0
+    }
+    return 1
+}
+
+// 伴生 .sym.zd 落盘（构建 + 写；返回 0 成功 / -1 失败）。
+pub func write_sym_sidecar() -> i64 {
+    build_sym()
+    var p = sym_sidecar_path()
+    if zd_write(3, p) {
+        dbg_txt("[sym] " + p)
+        return 0
+    }
+    dbg_txt(diagcode.render_error(-1, -1, "伴生符号表落盘失败: " + p))
+    return -1
+}
+
+}   // namespace dbgem

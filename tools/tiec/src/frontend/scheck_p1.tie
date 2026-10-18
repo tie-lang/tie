@@ -1,0 +1,683 @@
+type tie<class>
+// compiler/frontend/scheck_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 scheck.tie。
+namespace scheck {
+// W00008 / W00005 判定：声明同名变量 / for 变量时调用（lv_insert 之前）。
+// 已存在 lv_keys 的绑定：若也在当前块声明集合 g_block_names → 同块重复声明
+//（W00005）；否则为内层遮蔽外层（W00008）。最后把本名记入当前块集合。
+func decl_warn(nid: i64, line: i64, col: i64) {
+    var ex = sstate.bs_find(lv_keys, nid)
+    if ex >= 0 {
+        if sstate.seg_has(g_block_names, 0, len(g_block_names), nid) == 1 {
+            sm_warn_add(line, col, "变量重复声明（同名变量再次声明，后者覆盖前者）")
+        } else {
+            sm_warn_add(line, col, "变量遮蔽（内层同名变量遮蔽外层）")
+        }
+    }
+    table_push(g_block_names, nid)
+}
+
+// W00010：完全空的块（StmtList nchild==0）报警。仅用于控制流体
+//（if/while/for/try/defer/unsafe/guard），函数体与 switch 缺省分支不报
+//（合法空实现，且无法读取注释区分占位，宁可漏报避免误伤）。
+func warn_empty_block(blk: i64, s: i64) {
+    if blk >= 0 && blk != s && s_tags[blk] == S_N_STMTLIST && sstate.nchild(blk) == 0 {
+        // 位置取父语句而非块节点：块节点（StmtList）不记录自身位置，
+        // s_lines[blk] 拿到的是继承/默认值，会把空块报到上一条语句上
+        // （实测 `if n>0 {}` 报成前一行 @4:14 / @4:5）。父语句行列可靠。
+        sm_warn_add(s_lines[s], s_cols[s], "空语句块（无内容且无注释占位）")
+    }
+}
+
+// W00013 辅助：子树内是否存在对 nm 的写方法调用（追加/删除类）。
+// 不依赖 MethodCall 的 children 精确布局——扫描该节点全部子节点，
+// 只要同时出现「名字 == nm」与「名字是写方法」即认定（同名即同一张表）。
+func mod_walk(node: i64, nm: string) -> i64 {
+    if node < 0 {
+        return 0
+    }
+    // 不判节点 tag：tie 的表操作是函数式 API（table_push(t, v)），其调用节点的
+    // tag 不一定是 S_N_CALL。只要某节点同时含有「写函数名」与「被遍历的表名」
+    // 两个子名字，就认定在遍历中改表（同名即同一张表）。
+    var has_recv: bool = false
+    var is_write: bool = false
+    var nc = sstate.nchild(node)
+    var k: i64 = 0
+    while k < nc {
+        var cn = sstate.name_str(sstate.child(node, k))
+        if cn == nm {
+            has_recv = true
+        }
+        if cn == "table_push" || cn == "table_pop" || cn == "table_set" ||
+            cn == "table_remove" || cn == "table_insert" || cn == "table_clear" ||
+            cn == "table_trunc" || cn == "table_append" || cn == "table_append_raw" ||
+            cn == "table_reserve" {
+            is_write = true
+        }
+        k = k + 1
+    }
+    if has_recv && is_write {
+        return 1
+    }
+    var n = sstate.nchild(node)
+    var i: i64 = 0
+    while i < n {
+        if mod_walk(sstate.child(node, i), nm) == 1 {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// W00005 / W00011 / W00015 子树遍历：收集全部局部声明节点（decls）、可变 var
+// 声明节点（mvars）、被赋值目标名、被读取名。
+// 递归覆盖闭包体（FN_LIT 子树），故闭包内对外层变量的读取/修改均计入，
+// 避免对捕获变量误报「未使用 / 未修改」。
+func diag_walk(node: i64, ref mvars: table<i64>, ref assigned: table<i64>, ref reads: table<i64>, ref decls: table<i64>) {
+    if node < 0 {
+        return
+    }
+    var t = s_tags[node]
+    if t == S_N_VAR_DECL {
+        // 全部局部声明（var 与 const）登记，供 W00005「未使用变量」判定
+        table_push(decls, node)
+        if s_vals[node] == 0 {
+            table_push(mvars, node)
+        }
+    } else if t == S_N_VAR {
+        var nid = s_names[node]
+        if nid >= 0 {
+            table_push(reads, nid)
+        }
+    } else if t == S_N_CALL {
+        // N_CALL 的**被调名存于节点自身的 name**（pexpr：new_node(N_CALL, 被调名, …)；
+        // children[0] 是泛型槽、其余是实参）。fn 值变量以 `fv(args)` 被调用时，被调名
+        // 不会作为 S_N_VAR 子节点出现，故显式把被调名登记为「读取」，避免对「仅被调用
+        // 读取」的 fn 值变量误报未使用。名字为全局函数名时不会命中任何局部声明，无副作用。
+        var cnm = sstate.name_str(node)
+        if len(cnm) > 0 {
+            table_push(reads, intern.intern(cnm))
+        }
+    } else if t == S_N_ASSIGN {
+        var nid = s_names[node]
+        if nid >= 0 {
+            table_push(assigned, nid)
+        }
+    } else if t == S_N_FIELD_ASSIGN {
+        var root = sstate.im_root(sstate.child(node, 0))
+        if root >= 0 {
+            table_push(assigned, root)
+        }
+    } else if t == S_N_INDEX_ASSIGN {
+        var tgt = sstate.child(node, 0)
+        if tgt >= 0 {
+            var root = sstate.im_root(sstate.child(tgt, 0))
+            if root >= 0 {
+                table_push(assigned, root)
+            }
+        }
+    }
+    var nc = sstate.nchild(node)
+    var k: i64 = 0
+    while k < nc {
+        diag_walk(sstate.child(node, k), mvars, assigned, reads, decls)
+        k = k + 1
+    }
+}
+
+// 名 → 计数递增（线性查找，表很小）
+func wbump(ref keys: table<i64>, ref vals: table<i64>, nid: i64) {
+    var i: i64 = 0
+    while i < len(keys) {
+        if keys[i] == nid {
+            vals[i] = vals[i] + 1
+            return
+        }
+        i = i + 1
+    }
+    table_push(keys, nid)
+    table_push(vals, 1)
+}
+
+// 名 → 计数读取（0 = 无记录；W00019 仅登记正长度，故 0 安全表示「未记录」）
+func wget(keys: table<i64>, vals: table<i64>, nid: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(keys) {
+        if keys[i] == nid {
+            return vals[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// W00019 每函数重置（在 check_fn 入口调用）。
+func w19_reset() {
+    w19_len_keys = table_new_i64()
+    w19_len_vals = table_new_i64()
+    w19_occ_keys = table_new_i64()
+    w19_occ_vals = table_new_i64()
+    w19_idx_keys = table_new_i64()
+    w19_idx_vals = table_new_i64()
+}
+
+// W00019 单遍遍历：登记「表字面量声明」的静态长度 + 名字出现次数 + 下标赋值目标次数。
+func w19_collect(node: i64) {
+    if node < 0 {
+        return
+    }
+    var t = s_tags[node]
+    if t == S_N_VAR_DECL {
+        var init = sstate.child(node, 1)
+        if init >= 0 && s_tags[init] == S_N_TABLE_LIT && sstate.nchild(init) > 0 {
+            var nid = s_names[node]
+            if nid >= 0 && wget(w19_len_keys, w19_len_vals, nid) == 0 {
+                table_push(w19_len_keys, nid)
+                table_push(w19_len_vals, sstate.nchild(init))
+            }
+        }
+    } else if t == S_N_VAR {
+        var nid = s_names[node]
+        if nid >= 0 {
+            wbump(w19_occ_keys, w19_occ_vals, nid)
+        }
+    } else if t == S_N_INDEX_ASSIGN {
+        var root = sstate.im_root(sstate.child(node, 0))
+        if root >= 0 {
+            wbump(w19_idx_keys, w19_idx_vals, root)
+        }
+    }
+    var nc = sstate.nchild(node)
+    var k: i64 = 0
+    while k < nc {
+        w19_collect(sstate.child(node, k))
+        k = k + 1
+    }
+}
+
+// W00019 单遍遍历：对「仅被下标赋值使用」的表字面量变量，检查常量下标是否越界。
+func w19_check(node: i64) {
+    if node < 0 {
+        return
+    }
+    if s_tags[node] == S_N_INDEX_ASSIGN {
+        var target = sstate.child(node, 0)
+        if s_tags[target] == S_N_INDEX {
+            var base_node = sstate.child(target, 0)
+            if s_tags[base_node] == S_N_VAR {
+                var nid = s_names[base_node]
+                if nid >= 0 {
+                    var ln = wget(w19_len_keys, w19_len_vals, nid)
+                    // 安全条件：该变量的全部出现都是下标赋值目标（无读取/传参/重赋值），
+                    // 故声明时的字面量长度在整段函数体内恒定不变。
+                    if ln > 0 && wget(w19_occ_keys, w19_occ_vals, nid) == wget(w19_idx_keys, w19_idx_vals, nid) {
+                        var (ic, iv) = stype.arr_const_index(sstate.child(target, 1))
+                        if ic && iv >= ln {
+                            sm_warn_add(s_lines[node], s_cols[node], "表元素越界写静默失败（t[i] = v 且 i >= len 时丢弃）")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    var nc = sstate.nchild(node)
+    var k: i64 = 0
+    while k < nc {
+        w19_check(sstate.child(node, k))
+        k = k + 1
+    }
+}
+
+// W00016：登记一个全局可变表的写点（nid = 已解析的全局键，见调用点）。
+func w16_record(nid: i64, ln: i64, cl: i64) {
+    if nid < 0 {
+        return
+    }
+    var ty = sinfer.gb_find(nid)
+    if ty < 0 || !types.is_table(ty) {
+        return
+    }
+    if (sinfer.gb_const_of(nid) & 1) == 1 {
+        return
+    }
+    var i: i64 = 0
+    while i < len(w16_keys) {
+        if w16_keys[i] == nid {
+            w16_cnt[i] = w16_cnt[i] + 1
+            return
+        }
+        i = i + 1
+    }
+    table_push(w16_keys, nid)
+    table_push(w16_cnt, 1)
+    table_push(w16_ln, ln)
+    table_push(w16_cl, cl)
+}
+
+// 判定 for 迭代对象是否为字符串码点迭代器调用 `s.chars()`（dev33 批次4）。
+// 结构：MethodCall，方法名 == "chars"，接收者（child[slot_off]）类型为 string
+// 且无实参。用于 S_N_FOR 分支把循环变量登记为单字符 string。
+func is_chars_iter(iter: i64) -> bool {
+    if s_tags[iter] != S_N_METHOD_CALL {
+        return false
+    }
+    if sstate.name_str(iter) != "chars" {
+        return false
+    }
+    // 接收者类型须为 string（全局/局部变量或表达式均可，.chars() 语义上
+    // 恒作用于字符串）；实参个数须为 0。
+    var recv = sstate.child(iter, sstate.slot_off(iter))
+    var rt = sinfer.infer_expr(recv)
+    if rt < 0 || rt != types.named(TK_STR) {
+        return false
+    }
+    if sstate.nchild(iter) > sstate.slot_off(iter) + 1 {
+        return false
+    }
+    return true
+}
+
+// W00017：控制流嵌套深度计数包装。进入控制流体 +1，深度 > 5 报警。
+// 位置要求：check_block 之后（依赖它）、所有控制流调用点之前（tie 先定义后使用）。
+func check_cf_block(blk: i64, s: i64) -> i64 {
+    g_cf_depth = g_cf_depth + 1
+    if g_cf_depth > 5 {
+        sm_warn_add(s_lines[s], s_cols[s], "嵌套过深（控制流嵌套超过 5 层）")
+    }
+    var r = check_block(blk)
+    g_cf_depth = g_cf_depth - 1
+    return r
+}
+
+// p.8.2.11：guard else 块（N_STMTLIST）是否以跳转语句收尾。
+func guard_else_ends_in_jump(list: i64) -> bool {
+    var n = sstate.nchild(list)
+    if n == 0 {
+        return false
+    }
+    var last = sstate.child(list, n - 1)
+    var t = s_tags[last]
+    return t == S_N_RETURN || t == S_N_BREAK || t == S_N_CONTINUE || t == S_N_GOTO || t == S_N_PANIC
+}
+
+// p.9.11.4 defer 块内禁止的流控语句判定（return/break/continue/goto/panic）。
+func defer_forbidden_jump(t: i64) -> bool {
+    return t == S_N_RETURN || t == S_N_BREAK || t == S_N_CONTINUE ||
+        t == S_N_GOTO || t == S_N_PANIC
+}
+
+// p.9.11.4 defer 语句检查：检查块体（表达式/赋值/读变量均正常推断），并
+// 递归拒绝块内出现 return/break/continue/goto/panic/嵌套 defer（资源释放
+// 语句在退出时线性执行，不允许提前跳转/不可恢复退出/再注册）。递归扫描
+// 允许结构块（if/while/for/switch/try/unsafe），但在仍碰见禁止语句即报诊断。
+func check_defer(s: i64) -> i64 {
+    var body = sstate.child(s, 0)
+    // 先拒绝块内禁止的流控语句（return/break/continue/goto/panic/嵌套 defer）
+    var rf = check_defer_block(body)
+    if rf < 0 {
+        return -1
+    }
+    if body < 0 {
+        return 0
+    }
+    // 再类型检查块体语句（表达式/赋值/读作用域变量正常推断）
+    warn_empty_block(body, s)
+    return check_cf_block(body, s)
+}
+
+// 递归校验 defer 块体。返回 0 成功，-1 失败（诊断）。
+func check_defer_block(blk: i64) -> i64 {
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var st = sstate.child(blk, i)
+        var stag = s_tags[st]
+        if defer_forbidden_jump(stag) {
+            sm_err_line = s_lines[st]
+            sm_err_col = s_cols[st]
+            sm_err_msg = "defer 块内禁止 return/break/continue/goto/panic（资源释放应线性执行到块尾）"
+            return -1
+        }
+        if stag == S_N_DEFER {
+            sm_err_line = s_lines[st]
+            sm_err_col = s_cols[st]
+            sm_err_msg = "defer 块内禁止嵌套 defer"
+            return -1
+        }
+        // 结构块递归下潜（查其上层禁止语句）
+        if stag == S_N_IF {
+            if check_defer_sub(sstate.child(st, 1)) < 0 {
+                return -1
+            }
+            if check_defer_sub(sstate.child(st, 2)) < 0 {
+                return -1
+            }
+        } else if stag == S_N_WHILE || stag == S_N_FOR {
+            if check_defer_sub(sstate.child(st, 1)) < 0 {
+                return -1
+            }
+        } else if stag == S_N_SWITCH {
+            var c2: i64 = 1
+            while c2 < sstate.nchild(st) {
+                if check_defer_sub(sstate.child(st, c2)) < 0 {
+                    return -1
+                }
+                c2 = c2 + 1
+            }
+        } else if stag == S_N_TRY_BLOCK || stag == S_N_UNSAFE_BLOCK {
+            if check_defer_sub(sstate.child(st, 0)) < 0 {
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 单语句或块下潜（结构块的子树，子节点为 StmtList）。
+func check_defer_sub(n: i64) -> i64 {
+    if n < 0 {
+        return 0
+    }
+    return check_defer_block(n)
+}
+
+// 块链前缀判定：prefix 是 full 的前缀（同块或外层块）。"/" 分隔段精确匹配，
+// 避免 "1" 误配 "12"（块 id 整数段）。prefix == full 也算前缀（同块）。
+func chain_is_prefix(prefix: string, full: string) -> bool {
+    if str.starts_with(full, prefix) {
+        var pn = str_len(prefix)
+        var fn = str_len(full)
+        if pn == fn {
+            return true
+        }
+        if pn > 0 && str_char(full, pn) == "/" {
+            return true
+        }
+    }
+    return false
+}
+
+// 查 goto 标签表（函数级），返回下标；未找到 -1
+func gt_find(name_id: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_gt_keys) {
+        if g_gt_keys[i] == name_id {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 指定块 StmtList 的 [lo, hi) 直接语句区间内是否存在 var/const 声明（R3 用）
+func blk_has_var_decl(blk: i64, lo: i64, hi: i64) -> bool {
+    var j = lo
+    while j < hi {
+        var st = sstate.child(blk, j)
+        if st >= 0 && s_tags[st] == S_N_VAR_DECL {
+            return true
+        }
+        j = j + 1
+    }
+    return false
+}
+
+// 字面量节点 → 整数值（IntLit 取 val；CharLit 取 name 池 id 对应码点；
+// Unary NEG + IntLit 取负值）。用于 switch case 区间的 start < end 比较
+// （对齐 Rust literal_cmp/literal_value）。
+func int_lit_val(n: i64) -> i64 {
+    var tag = s_tags[n]
+    if tag == S_N_INT_LIT {
+        return s_vals[n]
+    }
+    if tag == S_N_CHAR_LIT {
+        var lid = s_names[n]
+        if lid >= 0 {
+            var txt = intern.lookup(lid)
+            if str_len(txt) >= 3 {
+                // 引号剥掉后取第一个码点
+                return char_code(str_char(txt, 1))
+            }
+        }
+        return 0
+    }
+    if tag == S_N_UNARY {
+        // 前缀负号 + 整数 → 取负值（case -1 等）
+        var op = s_vals[n]
+        var operand = sstate.child(n, 0)
+        if op == 0 {
+            var v = int_lit_val(operand)
+            return 0 - v
+        }
+    }
+    return 0
+}
+
+// 字面量 key（重复检测用）：int → "i:<val>"，char → "c:<code>"，str → "s:<lexeme>"，bool → "b:<0/1>"
+func lit_key(n: i64) -> string {
+    var tag = s_tags[n]
+    if tag == S_N_INT_LIT {
+        return "i:" + to_string(s_vals[n])
+    }
+    if tag == S_N_UNARY {
+        // case -1：前缀负号 + 整数 → "i:-<val>"
+        var op = s_vals[n]
+        if op == 0 {
+            var v = int_lit_val(n)
+            return "i:" + to_string(v)
+        }
+    }
+    if tag == S_N_CHAR_LIT {
+        return "c:" + to_string(int_lit_val(n))
+    }
+    if tag == S_N_BOOL_LIT {
+        return "b:" + to_string(s_vals[n])
+    }
+    if tag == S_N_STR_LIT {
+        return "s:" + sstate.name_str(n)
+    }
+    return "?"
+}
+
+// case 值是否编译期字面量（对齐 Rust is_const_literal：整数/浮点/字符/布尔/字符串；
+// 前缀负号 + 数字字面量也算——case -1 是 Unary NEG + IntLit）
+func is_case_literal(n: i64) -> bool {
+    var tag = s_tags[n]
+    if tag == S_N_INT_LIT || tag == S_N_FLOAT_LIT || tag == S_N_CHAR_LIT || tag == S_N_BOOL_LIT || tag == S_N_STR_LIT {
+        return true
+    }
+    if tag == S_N_UNARY {
+        var op = s_vals[n]
+        if op == 0 {
+            var operand = sstate.child(n, 0)
+            var otag = s_tags[operand]
+            if otag == S_N_INT_LIT || otag == S_N_FLOAT_LIT {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// 非枚举 subject 的 case 模式/守卫检查（原 check_switch_case 非枚举段）。
+func check_arm_patterns_plain(c: i64, subj_ty: i64) -> i64 {
+    var plist = sstate.child(c, 0)
+    var when_n = sstate.child(c, 1)
+    var np = sstate.nchild(plist)
+    var i: i64 = 0
+    while i < np {
+        var p = sstate.child(plist, i)
+        // 区间 pattern：通用 range 只允许整数，但 switch case 区间允许整数或字符
+        if s_tags[p] == S_N_RANGE {
+            var st = sinfer.infer_expr(sstate.child(p, 0))
+            if st < 0 {
+                return -1
+            }
+            var en = sinfer.infer_expr(sstate.child(p, 1))
+            if en < 0 {
+                return -1
+            }
+            var st_int = types.is_int(st)
+            var en_int = types.is_int(en)
+            var st_chr = st == TK_CHAR
+            var en_chr = en == TK_CHAR
+            if !((st_int && en_int) || (st_chr && en_chr)) {
+                sm_err_line = s_lines[c]
+                sm_err_col = s_cols[c]
+                sm_err_msg = "case 区间两端必须是整数或字符字面量（浮点区间不支持）"
+                return -1
+            }
+            // 普通范围要求 start < end；闭区间允许 start == end。
+            // 字符按码点比较，边界标志来自 N_RANGE.val。
+            var stv = int_lit_val(sstate.child(p, 0))
+            var env = int_lit_val(sstate.child(p, 1))
+            var inclusive = s_vals[p] == 1
+            if (inclusive && stv > env) || (!inclusive && stv >= env) {
+                sm_err_line = s_lines[c]
+                sm_err_col = s_cols[c]
+                if inclusive {
+                    sm_err_msg = "case 闭区间必须 start <= end"
+                } else {
+                    sm_err_msg = "case 区间必须 start < end（左闭右开）"
+                }
+                return -1
+            }
+            if (st_chr && subj_ty != TK_CHAR) || (st_int && !types.is_int(subj_ty)) {
+                sm_err_line = s_lines[c]
+                sm_err_col = s_cols[c]
+                sm_err_msg = "case 区间类型与 switch 对象类型 " + types.type_name(subj_ty) + " 不匹配"
+                return -1
+            }
+            i = i + 1
+            continue
+        }
+        // P2c：any 主体 struct 匹配/绑定——`case Point:`（N_VAR 解析为 struct 名）
+        // 与 `case Point(p):`（N_CASE_BIND 解构，绑定变量类型 = struct）
+        if subj_ty == types.named(TK_ANY) {
+            var bind_id2: i64 = -1
+            var ref2 = p
+            if s_tags[p] == N_CASE_BIND {
+                ref2 = sstate.child(p, 0)
+                bind_id2 = sstate.child(p, 1)
+            }
+            if s_tags[ref2] == S_N_VAR {
+                var sname = sstate.name_str(ref2)
+                var sidx = sstate.bs_find(st_keys, intern.intern(sname))
+                if sidx >= 0 {
+                    // struct 类型匹配（case Point: / case Point(p): 绑定）
+                    var s_ty = types.struct_of(st_vals[sidx])
+                    if bind_id2 >= 0 {
+                        sinfer.lv_insert(bind_id2, s_ty, 0, -1, 0)
+                        // p.9.22.6 全量符号表：case 绑定声明登记（kind 5；
+                        // 绑定名 id 存于 N_CASE_BIND 槽，节点取该绑定节点）。
+                        xref.reg_decl(bind_id2, 5, s_ty, p)
+                    }
+                    var key2 = "s:" + sname
+                    var dd: i64 = 0
+                    var dup2: bool = false
+                    while dd < len(g_case_seen) {
+                        if g_case_seen[dd] == key2 {
+                            dup2 = true
+                            break
+                        }
+                        dd = dd + 1
+                    }
+                    if dup2 {
+                        sm_err_line = s_lines[c]
+                        sm_err_col = s_cols[c]
+                        sm_err_msg = "重复的 case 值 " + key2
+                        return -1
+                    }
+                    table_push(g_case_seen, key2)
+                    i = i + 1
+                    continue
+                }
+            }
+        }
+        // case 类型匹配 pattern（对齐 Rust）：any 动态对象上匹配可装箱类型
+        //（tag 约定见 tig_box_any）；其余静态类型一律报错（须在 infer_expr 前
+        // 拦截，因为 infer_expr 对 TypeLit 直接报通用错误）
+        if s_tags[p] == S_N_TYPE_LIT {
+            var tynode = sstate.child(p, 0)
+            var tmatch_ty = sgen.parse_generic_type_node(tynode)
+            var tyname = types.type_name(tmatch_ty)
+            if subj_ty == types.named(TK_ANY) {
+                // P2b：any 主体类型匹配——case 类型必须可装箱
+                //（整数/浮点/bool/string/char；装箱 tag 见 tig_box_any）
+                var boxable: bool = false
+                if types.is_int(tmatch_ty) || types.is_float(tmatch_ty) ||
+                    tmatch_ty == types.named(TK_BOOL) || tmatch_ty == types.named(TK_STR) ||
+                    tmatch_ty == types.named(TK_CHAR) {
+                    boxable = true
+                }
+                if !boxable {
+                    sm_err_line = s_lines[c]
+                    sm_err_col = s_cols[c]
+                    sm_err_msg = "case 类型匹配（" + tyname + "）不是可装箱类型（整数/浮点/bool/string/char）"
+                    return -1
+                }
+                i = i + 1
+                continue
+            }
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "case 类型匹配（" + tyname + "）仅支持 any 动态类型，当前 switch 对象是 " + types.type_name(subj_ty)
+            return -1
+        }
+        var pt = sinfer.infer_expr(p)
+        if pt < 0 {
+            return -1
+        }
+        // case 值必须是编译期字面量（对齐 Rust is_const_literal）
+        if !is_case_literal(p) {
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "case 值必须是字面量（整数/浮点/字符/布尔/字符串）"
+            return -1
+        }
+        if !stype.types_compatible(subj_ty, pt) && !stype.types_match(subj_ty, pt, p) {
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "case 值类型 " + types.type_name(pt) + " 与 switch 对象类型 " + types.type_name(subj_ty) + " 不匹配"
+            return -1
+        }
+        // 重复 case 检测（对齐 Rust seen 表）
+        var key = lit_key(p)
+        var d: i64 = 0
+        var dup: bool = false
+        while d < len(g_case_seen) {
+            if g_case_seen[d] == key {
+                dup = true
+                break
+            }
+            d = d + 1
+        }
+        if dup {
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "重复的 case 值 " + key
+            return -1
+        }
+        table_push(g_case_seen, key)
+        i = i + 1
+    }
+    if when_n >= 0 {
+        var wt = sinfer.infer_expr(when_n)
+        if wt < 0 {
+            return -1
+        }
+        if !types.is_bool_like(wt) {
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "when 守卫必须是布尔表达式，实际是 " + types.type_name(wt)
+            return -1
+        }
+    }
+    return 0
+}
+
+}

@@ -1,0 +1,26 @@
+type tie<logic>
+// tests/_cap_probe/cap_lib_probe.tie —— g8 库层 <CAP> 参数化：1280 档显式实例化
+// ============================================================
+// 验证调用方按数据大小显式实例化库函数（optim.adamw_step/loss.mse/mse_grad
+// 的 <1280> 槽），库保持通用（默认 1024，显式按档）。
+import "/ext/optim.tie";
+import "/ext/loss.tie";
+
+func main() {
+    var w: array<f32, 1280> = array_init(0.0)
+    var gw: array<f32, 1280> = array_init(0.0)
+    var m: array<f32, 1280> = array_init(0.0)
+    var v: array<f32, 1280> = array_init(0.0)
+    w[0] = 3.0
+    optim.adamw_step<1280>(w, 1280, gw, m, v, 1, 0.01, 0.0001, 0.9, 0.999, 0.00000001)
+    var a: array<f32, 1280> = array_init(0.0)
+    var bb: array<f32, 1280> = array_init(0.0)
+    a[0] = 1.0
+    bb[0] = 3.0
+    var L = loss.mse<1280>(a, 2, bb, 2)
+    var g: array<f32, 1280> = array_init(0.0)
+    loss.mse_grad<1280>(g, a, bb, 2)
+    println("L=" + to_string(L) + " w0=" + to_string(w[0]))
+    if L < 1.9 || L > 2.1001 { exit(1) }
+    println("CAP1280 LIB PROBE PASS")
+}

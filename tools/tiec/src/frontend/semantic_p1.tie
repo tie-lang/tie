@@ -1,0 +1,754 @@
+type tie<class>
+// compiler/frontend/semantic_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 semantic.tie。
+namespace semantic {
+// 路径目录：返回最后一个 '/' 之前的子串（含 '/'）；无 '/' 返回 ""。
+func path_dir(path: string) -> string {
+    var n = str_len(path)
+    var i: i64 = n - 1
+    var last: i64 = -1
+    while i >= 0 {
+        if str_char(path, i) == "/" {
+            last = i
+            break
+        }
+        i = i - 1
+    }
+    if last < 0 {
+        return ""
+    }
+    return str.slice(path, 0, last + 1)
+}
+
+// 归一化路径：折叠 "段/../"（"a/b/../c" → "a/c"），循环直到稳定。
+// S3.2：import 展开去重按**字符串**比较，未归一化路径（如 llvmgen 经
+// "./../middle/ir.tie" 展开得 "compiler/backend/../middle/ir.tie"，而
+// ir_meta 经 "./ir.tie" 得 "compiler/middle/ir.tie"）字符串不同 → 去重
+// 失效 → 同一文件二次内联 → 全局变量/函数重复定义。所有解析结果统一
+// 归一化后，多入口（driver 树 + tieir_ser 树）正确去重。
+// 边界：开头 "../"（相对路径上溯到根外）保留不折叠；"./" 前缀不产生
+// 折叠段（"." 段不删）。
+// 整合说明：s33 分支另有分段栈实现（功能等价），取本循环折叠版。
+func normalize_path(p: string) -> string {
+    var out = p
+    var changed: bool = true
+    while changed {
+        changed = false
+        var n = str_len(out)
+        var i: i64 = 0
+        while i + 3 < n {
+            // 命中 "/../"（段分隔 + 两点 + 斜杠）
+            if str_char(out, i) == "/" && str_char(out, i + 1) == "." &&
+                str_char(out, i + 2) == "." && str_char(out, i + 3) == "/" {
+                // 找 i 之前的最后一个 '/'（被折叠段的起点）
+                var seg_start: i64 = -1
+                var j: i64 = i - 1
+                while j >= 0 {
+                    if str_char(out, j) == "/" {
+                        seg_start = j
+                        break
+                    }
+                    j = j - 1
+                }
+                var remove_start: i64 = 0
+                if seg_start >= 0 {
+                    // 删除 [seg_start+1, i+4)：保留段前 '/'（"a/b/../c" 删
+                    // "b/../" 得 "a/c"——seg_start 指向 "a/" 的 '/'，须 +1）
+                    remove_start = seg_start + 1
+                }
+                // 特例：remove_start == 0 且路径以 "../" 开头 → 根外上溯，
+                // 无法折叠，跳过该处（如 "../lib/x.tie"）
+                if remove_start == 0 && str_len(out) >= 2 &&
+                    str_char(out, 0) == "." && str_char(out, 1) == "." {
+                    i = i + 4
+                    continue
+                }
+                var remove_end = i + 4
+                var prefix = str.slice(out, 0, remove_start)
+                var suffix = str.slice(out, remove_end, str_len(out))
+                out = prefix + suffix
+                changed = true
+                break
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// p.9.13.7-B：判定 import 是否为内置库根别名（/std、/ext、/rdu、/sys 前缀）。
+func is_lib_alias(path: string) -> bool {
+    if sstate.has_prefix_str(path, "/std/") { return true }
+    if sstate.has_prefix_str(path, "/ext/") { return true }
+    if sstate.has_prefix_str(path, "/rdu/") { return true }
+    if sstate.has_prefix_str(path, "/sys/") { return true }
+    return false
+}
+
+// p.9.13.7-B：内置库根解析。CLI set_lib_root > TIE_LIB_ROOT 环境变量 >
+// 默认 ~/.tiec-lib/tlib。惰性求值，首次命中后缓存到 g_lib_root。
+func lib_root() -> string {
+    if str_len(g_lib_root) > 0 {
+        return g_lib_root
+    }
+    var ev = get_env("TIE_LIB_ROOT")
+    if str_len(ev) > 0 {
+        g_lib_root = ev
+        return g_lib_root
+    }
+    var home = get_env("USERPROFILE")
+    if str_len(home) == 0 {
+        home = get_env("HOME")
+    }
+    var hn = str_len(home)
+    if hn > 0 && str_char(home, hn - 1) == "/" {
+        home = str.slice(home, 0, hn - 1)
+    }
+    hn = str_len(home)
+    if hn > 0 && str_char(home, hn - 1) == "\\" {
+        home = str.slice(home, 0, hn - 1)
+    }
+    g_lib_root = home + "/.tiec-lib/tlib"
+    return g_lib_root
+}
+
+// 已导入集合线性查找（文件少，线性足够）
+func imported_has(p: string) -> bool {
+    // p.9.14.2：用 intern id 有序二分替代对 g_imported 的线性查找（import 病态
+    // 主因，driver 数百文件 O(n²)）。intern.intern 对同字符串返回同 id（intern
+    // 池去重），二分查 g_imp_idkeys 即等价于"已导入含 p"判断。
+    return sstate.bs_find(g_imp_idkeys, intern.intern(p)) >= 0
+}
+
+// 剥离文件类型声明行（`type tie` / `type tie<X>`）：头部区 = 最前连续行
+// （允许空行），声明行空行占位（行号不变）；其余行原样。
+// 与 Rust 链清理脚本 prep/clean.tie 同规则——被导入文件（std/库等）现在带
+// 类型声明头部（新文件类型声明体系），import 展开须先剥离再解析。
+// 性能（import 展开热点）：单遍扫描 + 正文整拷（str_sub_bytes 一次 memcpy），
+// 替代旧实现 str.split(src,"\n") 全量切数组 + str.join 全量重建（每文件 3 次
+// 全量分配；driver 树几十个库文件累积可观）。头部通常仅 1-3 行，正文原样。
+func strip_type_decl(src: string) -> string {
+    // n = 字节长度（len 而非 str_len）：str_byte/str_sub_bytes 是字节级，
+    // str_len 返回码点数——库文件含中文注释（UTF-8 多字节）时按码点数截断
+    // 会提前结束文件（std/string.tie 388 行解析到 303 行即文件结束的根因）。
+    var n = len(src)
+    var i: i64 = 0
+    var out: string = ""
+    var in_header: bool = true
+    while in_header {
+        // 逐行扫描：行 = [ln_s, ln_e)，换行（若有）在 ln_e；next_i 越过换行
+        var ln_s = i
+        var ln_e = i
+        while ln_e < n && str_byte(src, ln_e) != 10 {
+            ln_e = ln_e + 1
+        }
+        var has_nl = ln_e < n
+        var next_i = ln_e
+        if has_nl {
+            next_i = ln_e + 1
+        }
+        var t = str.trim(str_sub_bytes(src, ln_s, ln_e))
+        if str_len(t) == 0 {
+            // 头部区空行：保留（占位，行号不变）
+            out = out + str_sub_bytes(src, ln_s, next_i)
+        } else if sstate.has_prefix_str(t, "type tie") {
+            var rest = str.trim(str.slice(t, 8, str_len(t)))
+            // 合法声明：`type tie` 或 `type tie<X>`（无尾随内容）→ 空行占位
+            if str_len(rest) == 0 || (str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">") {
+                if has_nl {
+                    out = out + "\n"
+                }
+            } else {
+                // 非法形态（如 `type tie<data> extra`）：头部区结束，本行原样
+                out = out + str_sub_bytes(src, ln_s, n)
+                in_header = false
+            }
+        } else {
+            // 第一个非声明内容行：头部区结束，本行起原样保留（正文整拷）
+            out = out + str_sub_bytes(src, ln_s, n)
+            in_header = false
+        }
+        i = next_i
+        if in_header && i >= n {
+            // 整个文件都是头部区（无正文）→ 结束
+            in_header = false
+        }
+    }
+    return out
+}
+
+// 名字命中 → 标记保留位
+func sel_mark_name(nm: i64, names: table<i64>, ref flags: table<i64>) {
+    var i: i64 = 0
+    while i < len(names) {
+        if names[i] == nm {
+            flags[i] = 1
+            return
+        }
+        i = i + 1
+    }
+}
+
+// 递归收集 node 子树内对同文件顶层名的引用并标记
+func sel_collect_refs(node: i64, names: table<i64>, ref flags: table<i64>) {
+    if node < 0 {
+        return
+    }
+    var t = s_tags[node]
+    if t == 6 || t == 7 || t == 18 || t == 202 {
+        var nm = s_names[node]
+        if nm >= 0 {
+            sel_mark_name(nm, names, flags)
+        }
+    }
+    var i: i64 = 0
+    while i < sstate.nchild(node) {
+        sel_collect_refs(sstate.child(node, i), names, flags)
+        i = i + 1
+    }
+}
+
+func expand_one_import(imp_node: i64) -> i64 {
+    var p = sstate.name_str(imp_node)
+    var full = resolve_import_path(p)
+    // p.9.13.7-B：库根别名但库根目录缺失 → 明确诊断（提示 fetch-lib / 环境变量）
+    if is_lib_alias(p) && !file_is_dir(lib_root()) {
+        sm_err_line = s_lines[imp_node]
+        sm_err_col = s_cols[imp_node]
+        sm_err_msg = "内置库根缺失: '" + lib_root() + "'（运行 scripts/fetch-lib.ps1 或设置 TIE_LIB_ROOT / --lib-root）"
+        return -1
+    }
+    if imported_has(full) {
+        // 别名 × 已加载文件（2026-10-12 增名修复二）：重复导入直接跳过时别名
+        // 仍须可用——按词干定位已加载文件的根，登记 别名 → 该文件顶层命名空间
+        // 的当前名（未改名时即原名；解析未命中回退再试）。
+        var al2 = s_aux[imp_node]
+        if al2 >= 0 {
+            var anm2 = intern.lookup(al2)
+            var st2 = sstate.stem_of_path(full)
+            var fi: i64 = 0
+            while fi < len(g_file_stem) {
+                if g_file_stem[fi] == st2 && fi < len(g_file_roots) {
+                    var fro2 = g_file_roots[fi]
+                    var ci2: i64 = 0
+                    while ci2 < sstate.nchild(fro2) {
+                        var ch2 = sstate.child(fro2, ci2)
+                        if s_tags[ch2] == S_N_NAMESPACE {
+                            var fseg2 = sstate.child(ch2, 0)
+                            sstate.ns_rename_add(anm2, intern.lookup(s_names[fseg2]))
+                            ci2 = sstate.nchild(fro2)
+                        } else {
+                            ci2 = ci2 + 1
+                        }
+                    }
+                    fi = len(g_file_stem)
+                } else {
+                    fi = fi + 1
+                }
+            }
+        }
+        return 0
+    }
+    table_push(g_imported, full)
+    // p.9.14.2：同步维护 intern id 有序索引（imported_has 二分免去线性扫描）。
+    sstate.sorted_insert(g_imp_idkeys, g_imp_idvals, intern.intern(full), 0)
+    // 批次1-任务1（import 段错误修复）：file_read 原语对不存在的文件会触发
+    // 运行时段错误（0xC0000005——运行时 tie_file_read 对缺失文件返回无效指针，
+    // 运行时在独立仓库 tiec_rust，主仓库 0-Rust 铁律无法修改）。故必须在调用
+    // file_read 之前用 file_exists 拦截，输出带文件路径与 import 语句位置的
+    // 明确错误（语义错误 @行:列: 无法读取导入文件 '...'），而非崩溃。
+    if !file_exists(full) {
+        sm_err_line = s_lines[imp_node]
+        sm_err_col = s_cols[imp_node]
+        sm_err_msg = "无法读取导入文件 '" + full + "'（文件不存在）"
+        return -1
+    }
+    var src = file_read(full)
+    if src == "" {
+        sm_err_line = s_lines[imp_node]
+        sm_err_col = s_cols[imp_node]
+        sm_err_msg = "无法读取导入文件 '" + full + "'"
+        return -1
+    }
+    // 细分计时（TIEC_TIME=1）：strip / lex / fill / build / append 五段。
+    // 计时变量显式声明在函数级（unsafe 块内声明的变量不外泄到嵌套块外）。
+    var tt0: i64 = 0
+    var tt1: i64 = 0
+    var tt2: i64 = 0
+    var tt3: i64 = 0
+    var tt4: i64 = 0
+    var tt5: i64 = 0
+    unsafe { tt0 = GetTickCount() }
+    // 2026-10-01 逐模块授权（两件事一起修）：
+    //   ① **越权**：原先 import 解析期间 s_file_caps 仍是**主文件**的值 ⇒ 主文件
+    //      若声明了 `unsafe:mem`，被导入的模块会**白拿**这份授权。必须先切到
+    //      被导入文件**自己的**头部声明。
+    //   ② **失效**：被导入文件自己的 `type tie<..., unsafe:ext>` 原先被完全丢弃
+    //      （strip_type_decl 只剥行不解读）⇒ 库文件无法按模块授权。
+    // 父模块授权**不继承**（与「文件级授权不随 import 扩散」同一规则，方向相反
+    // 的那一半）：子模块要什么域，自己头部声明。
+    // p.9.11.13 扩展（2026-10-12）：被导入文件的 #cfg 预处理（与主文件同规则；
+    // target/profile 由 driver 经 semantic.set_cfg_env 单点注入）——此前仅主
+    // 文件过预处理，库文件中的 #cfg 行会被词法器当作 `#[` 属性误判（E00449）。
+    // 先于一切状态变更（defer 之前），错误路径直接返回、无需恢复。
+    var src_c = cfgpre.preprocess(src, g_cfg_env_target, g_cfg_env_profile)
+    if sstate.has_prefix_str(src_c, "ERR:") {
+        sm_err_line = s_lines[imp_node]
+        sm_err_col = s_cols[imp_node]
+        sm_err_msg = "导入文件 '" + full + "' 的 #cfg 预处理失败: " + src_c
+        return -1
+    }
+    var saved_imp_fc = sstate.file_caps()
+    // 用 defer 覆盖本函数的**全部** return 路径：本函数 return 点多（文件不存在、
+    // 解析失败、别名重复、append 失败…），逐点恢复必漏。
+    defer { sstate.set_file_caps(saved_imp_fc) }
+    sstate.set_file_caps(sstate.scan_file_caps(src_c))
+    // 2026-10-07：上下文（`unsafe`）与域凭据**同一规则的另一半** —— 上面 2026-10-01
+    // 只修了 caps。若只切 caps，则 ① 主文件声明了 `unsafe` 时，其上下文会**扩散给
+    // 被导入的模块**（模块白拿）；② 模块自己头部的 `unsafe` 被完全忽略（库无法自证）。
+    // 两者都违反规范 §11.6「文件级授权只作用于这个文件；被引入的模块也不继承引入方
+    // 的授权」。故同样按模块切到**它自己的**声明，并在 defer 里还原。
+    var saved_imp_uc = sstate.file_uctx()
+    defer { sstate.set_file_uctx(saved_imp_uc) }
+    sstate.set_file_uctx(sstate.scan_file_unsafe(src_c))
+    var src2 = strip_type_decl(src_c)
+    unsafe { tt1 = GetTickCount() }
+    sm_t_imp_strip = sm_t_imp_strip + (tt1 - tt0)
+    // T5.3 内存版 + 细分计时：lex 与语法构建分开计量（run_lex → stage1 →
+    // stage2 与 parse_ast 内部逐行等价）
+    var lok = lexer.run_lex(src2)
+    unsafe { tt2 = GetTickCount() }
+    sm_t_imp_lex = sm_t_imp_lex + (tt2 - tt1)
+    var prc: i64 = 0
+    if !lok {
+        prc = -1
+        tt3 = tt2
+        tt4 = tt2
+    } else {
+        var f = parser.parse_ast_lexed_stage1()
+        unsafe { tt3 = GetTickCount() }
+        sm_t_imp_fill = sm_t_imp_fill + (tt3 - tt2)
+        prc = parser.parse_ast_lexed_stage2()
+        unsafe { tt4 = GetTickCount() }
+        sm_t_imp_build = sm_t_imp_build + (tt4 - tt3)
+    }
+    if prc < 0 {
+        sm_err_line = s_lines[imp_node]
+        sm_err_col = s_cols[imp_node]
+        // 错误消息与原协议完全一致：原 ast_text 为 "ERR:<line> <col> <msg>"
+        //（parse_src 返回），现由 parser.ast_err_protocol() 组装同格式文本
+        sm_err_msg = "导入文件 '" + full + "' 解析失败: " + parser.ast_err_protocol()
+        return -1
+    }
+    var base = append_ast_mem()
+    // 本模块装载完毕 ⇒ 按其基址提交域信息（文件级授权 + 函数级属性）。
+    // 此时 s_file_caps 仍是**本模块的**（defer 尚未触发）。
+    sstate.cap_apply_file(base)
+    unsafe { tt5 = GetTickCount() }
+    sm_t_imp_append = sm_t_imp_append + (tt5 - tt4)
+    if base < 0 {
+        return -1
+    }
+    // import as 别名（M2.1.7）：alias = imp_node.aux（字符串池 id，-1 = 无别名）。
+    // 有别名时，把被导入文件顶层 namespace 的段名替换为别名（f2 作为唯一入口）。
+    var alias_id = s_aux[imp_node]
+    var new_root = len(s_tags) - 1
+    // 别名改名传播（修复：别名 × 分片库命名空间分裂）：记录被改名 ns 的原名
+    // 段 id，供递归展开的分片（多文件共享同名 namespace）继承改名。
+    var rn_orig: table<i64> = table_new_i64()
+    if alias_id >= 0 {
+        // p.9.11.14：别名登记 + 重复诊断（编译单元内 import 别名必须唯一；
+        // 别名映射 → g_imp_alias_names/paths 平行表，供后续工具/诊断显示）。
+        // 语义等价：别名 = 被导入文件顶层 namespace 的命名记录（内联模型下
+        // 别名经改名生效，非纯解析糖——M2.1.7 既有行为）。
+        var anm = intern.lookup(alias_id)
+        var ak2: i64 = 0
+        var adup: bool = false
+        while ak2 < len(g_imp_alias_names) {
+            if g_imp_alias_names[ak2] == anm {
+                adup = true
+                ak2 = len(g_imp_alias_names)
+            } else {
+                ak2 = ak2 + 1
+            }
+        }
+        if adup {
+            sm_err_line = s_lines[imp_node]
+            sm_err_col = s_cols[imp_node]
+            sm_err_msg = "import 别名 '" + anm + "' 重复（编译单元内 import 别名必须唯一）"
+            return -1
+        }
+        table_push(g_imp_alias_names, anm)
+        table_push(g_imp_alias_paths, full)
+        var an = sstate.nchild(new_root)
+        var ak: i64 = 0
+        while ak < an {
+            var as_ = sstate.child(new_root, ak)
+            if s_tags[as_] == S_N_NAMESPACE {
+                var nsegs = s_aux[as_]
+                if nsegs > 0 {
+                    // 只改第一段（namespace fmt → namespace f2）
+                    var first_seg = sstate.child(as_, 0)
+                    table_push(rn_orig, s_names[first_seg])
+                    // 增名兼容（2026-10-12 缺陷修复）：登 旧名→别名，旧名解析自动落新名
+                    sstate.ns_rename_add(intern.lookup(s_names[first_seg]), anm)
+                    s_names[first_seg] = alias_id
+                }
+            }
+            ak = ak + 1
+        }
+    }
+    // dev33 批次10 任务29：记录导入文件顶层 StmtList 根 → 文件 id（宏可见性）
+    table_push(g_file_roots, new_root)
+    // 2026-10-12：文件名词干（顶层限定通道：`文件词干.顶层成员`，裸名保持可用）
+    table_push(g_file_stem, sstate.stem_of_path(full))
+    g_file_count = g_file_count + 1
+    // p.9.21.6-1 模块边界显式化：登记本文件节点基址（append_ast_mem 已返回
+    // base；节点 id ∈ [base, base+本文件节点数)——递归展开的后续文件基址
+    // 只会更大，g_file_base 恒升序，file_id_of_node 二分正确）。
+    table_push(g_file_base, base)
+    // 递归：新文件顶层中的 import 立即展开；其余进 g_extra_tops
+    var saved_dir = g_cur_dir
+    g_cur_dir = path_dir(full)
+    // p.9.11.31 选择性导入：N_IMPORT 子节点非空 = `import "path".{a, b}`。
+    // 过滤策略（内联模型）：保留集 = 选中名 + 其依赖闭包（保留符号体里引用
+    // 的同文件顶层名，不动点收敛）——被选符号的内部依赖自动跟随保留；
+    // 未列入且不在闭包内的顶层声明不进 g_extra_tops（不登记不发射），
+    // 主文件引用它们 → 既有「未定义」诊断。
+    var nsel = sstate.nchild(imp_node)
+    if nsel > 0 {
+        var sel_names: table<i64> = table_new_i64()
+        var k2: i64 = 0
+        while k2 < nsel {
+            var sn = sstate.child(imp_node, k2)
+            table_push(sel_names, s_names[sn])
+            k2 = k2 + 1
+        }
+        // 顶层名表（非 import 顶层；平行 flags）
+        var tops: table<i64> = table_new_i64()
+        var tnames: table<i64> = table_new_i64()
+        var flags: table<i64> = table_new_i64()
+        var k: i64 = 0
+        while k < sstate.nchild(new_root) {
+            var s = sstate.child(new_root, k)
+            if s_tags[s] != S_N_IMPORT {
+                table_push(tops, s)
+                table_push(tnames, s_names[s])
+                table_push(flags, 0)
+            }
+            k = k + 1
+        }
+        // 种子标记（选中名必须命中本文件顶层声明，否则诊断）
+        var i2: i64 = 0
+        while i2 < len(sel_names) {
+            var found = false
+            var j: i64 = 0
+            while j < len(tnames) {
+                if tnames[j] == sel_names[i2] {
+                    flags[j] = 1
+                    found = true
+                    j = len(tnames)
+                }
+                j = j + 1
+            }
+            if !found {
+                g_cur_dir = saved_dir
+                sm_err_line = s_lines[imp_node]
+                sm_err_col = s_cols[imp_node]
+                sm_err_msg = "选择性导入：'" + intern.lookup(sel_names[i2]) + "' 不是 '" + full + "' 的顶层声明"
+                return -1
+            }
+            i2 = i2 + 1
+        }
+        // 依赖闭包（不动点）
+        var changed = true
+        while changed {
+            changed = false
+            var i3: i64 = 0
+            while i3 < len(tops) {
+                if flags[i3] == 1 {
+                    var before: i64 = 0
+                    var i4: i64 = 0
+                    while i4 < len(flags) {
+                        before = before + flags[i4]
+                        i4 = i4 + 1
+                    }
+                    sel_collect_refs(tops[i3], tnames, flags)
+                    var after: i64 = 0
+                    i4 = 0
+                    while i4 < len(flags) {
+                        after = after + flags[i4]
+                        i4 = i4 + 1
+                    }
+                    if after > before {
+                        changed = true
+                    }
+                }
+                i3 = i3 + 1
+            }
+        }
+        // 只 push 保留节点；import 照常递归展开
+        var k3: i64 = 0
+        while k3 < sstate.nchild(new_root) {
+            var s2 = sstate.child(new_root, k3)
+            if s_tags[s2] == S_N_IMPORT {
+                var fr3 = len(g_file_roots)
+                var r = expand_one_import(s2)
+                if r < 0 {
+                    g_cur_dir = saved_dir
+                    return -1
+                }
+                alias_propagate(fr3, alias_id, rn_orig)
+            } else {
+                var keep = false
+                var j2: i64 = 0
+                while j2 < len(tops) {
+                    if tops[j2] == s2 {
+                        if flags[j2] == 1 {
+                            keep = true
+                        }
+                        j2 = len(tops)
+                    }
+                    j2 = j2 + 1
+                }
+                if keep {
+                    table_push(g_extra_tops, s2)
+                }
+            }
+            k3 = k3 + 1
+        }
+        g_cur_dir = saved_dir
+        return 0
+    }
+    var nc = sstate.nchild(new_root)
+    var k: i64 = 0
+    while k < nc {
+        var s = sstate.child(new_root, k)
+        if s_tags[s] == S_N_IMPORT {
+            var fr0 = len(g_file_roots)
+            var r = expand_one_import(s)
+            if r < 0 {
+                g_cur_dir = saved_dir
+                return -1
+            }
+            alias_propagate(fr0, alias_id, rn_orig)
+        } else {
+            table_push(g_extra_tops, s)
+        }
+        k = k + 1
+    }
+    g_cur_dir = saved_dir
+    return 0
+}
+
+// 别名改名传播（修复：别名 × 分片库命名空间分裂，2026-10-12）。
+// 背景：被导入文件内部递归展开的分片（多文件共享同名 namespace）不经该文件
+// 的别名改名 ⇒ 主文件 ns 改名而分片保持原名 ⇒ 命名空间分裂（跨文件裸调用
+// 全部「未定义」）。本函数把本次递归展开区间 [fr, len(g_file_roots)) 内、
+// 顶层 ns 首段名命中 rn_orig（改名前的原名集合）的文件一并改名。
+// 边界：显式 as 展开的分片在其自身展开内已改为自己的别名（≠ 原名），不会
+// 二次命中；无别名（alias_id < 0）或原名集为空时零开销直接返回。
+func alias_propagate(fr: i64, alias_id: i64, rn_orig: table<i64>) -> i64 {
+    if alias_id < 0 || len(rn_orig) == 0 {
+        return 0
+    }
+    var i = fr
+    while i < len(g_file_roots) {
+        var rt = g_file_roots[i]
+        var ncs = sstate.nchild(rt)
+        var ks: i64 = 0
+        while ks < ncs {
+            var st = sstate.child(rt, ks)
+            if s_tags[st] == S_N_NAMESPACE {
+                var nseg = s_aux[st]
+                if nseg > 0 {
+                    var seg0 = sstate.child(st, 0)
+                    var nm = s_names[seg0]
+                    var j: i64 = 0
+                    while j < len(rn_orig) {
+                        if rn_orig[j] == nm {
+                            s_names[seg0] = alias_id
+                            j = len(rn_orig)
+                        } else {
+                            j = j + 1
+                        }
+                    }
+                }
+            }
+            ks = ks + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// import 展开总入口：主文件顶层进 g_extra_tops，import 递归展开
+func expand_imports() -> i64 {
+    g_imported = table_new_string()
+    // p.9.21.6-1 模块边界显式化：每文件节点基址表复位（文件 0 = 主文件，基址 0；
+    // 导入文件经 append_ast_mem 连续追加节点，expand_one_import 推进基址表）。
+    g_file_base = table_new_i64()
+    table_push(g_file_base, 0)
+    // p.9.14.2：intern id 去重索引随每次编译清零（防跨编译累积污染）。
+    g_imp_idkeys = table_new_i64()
+    g_imp_idvals = table_new_i64()
+    g_extra_tops = table_new_i64()
+    // p.9.11.14：import 别名登记表重置（编译单元一次）
+    g_imp_alias_names = table_new_string()
+    sstate.ns_rename_reset()
+    g_imp_alias_paths = table_new_string()
+    // dev33 批次10 任务29：文件起源跟踪复位；g_file_roots[文件 id] = 顶层
+    // StmtList 根 id（平行表；主文件 = 0，导入文件按展开顺序递增）
+    g_file_roots = table_new_i64()
+    g_file_count = 1
+    table_push(g_file_roots, g_root)   // 文件 0 = 主文件顶层根
+    // 2026-10-12：词干表与 roots 对齐（主文件占位空串；导入文件在展开点推入）
+    g_file_stem = table_new_string()
+    g_entry_name = ""
+    table_push(g_file_stem, "")
+    var n = sstate.nchild(g_root)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(g_root, i)
+        if s_tags[s] == S_N_IMPORT {
+            var r = expand_one_import(s)
+            if r < 0 {
+                return -1
+            }
+        } else {
+            table_push(g_extra_tops, s)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ==================== 内存版 AST 表复制（T5.3 消除协议往返）====================
+// 把 parser.parse_ast 留在内存的 ast 节点池（ast 命名空间 9 列全局表）复制到
+// sstate 的 s_* 9 列表。语义与 sstate.load_ast(协议文本) 完全等价——协议文本
+// 就是 build_protocol 对 ast 表的逐字节序列化，此处改为直接内存复制，
+// 省去大文件数千次 to_string / parse_row / str.slice 子串分配。
+// 返回 0（成功；正常不会失败）。
+func copy_ast_tables() -> i64 {
+    var cnt = ast.count()
+    s_n = cnt
+    // 重建 9 列 + node_types（对应 sstate.load_ast 的预分配占位 + 逐行覆写；
+    // 此处直接 push 真实值，表内容完全一致）
+    s_tags = table_new_i64()
+    s_names = table_new_i64()
+    s_vals = table_new_i64()
+    s_aux = table_new_i64()
+    s_coff = table_new_i64()
+    s_nchild = table_new_i64()
+    s_children = table_new_i64()
+    s_lines = table_new_i64()
+    s_cols = table_new_i64()
+    node_types = table_new_i64()
+    var k: i64 = 0
+    while k < cnt {
+        table_push(s_tags, ast.tag(k))
+        table_push(s_names, ast.name(k))
+        table_push(s_vals, ast.val(k))
+        table_push(s_aux, ast.aux(k))
+        table_push(s_coff, 0)
+        table_push(s_nchild, ast.child_count(k))
+        table_push(s_lines, ast.line(k))
+        table_push(s_cols, ast.col(k))
+        table_push(node_types, -1)
+        k = k + 1
+    }
+    // 主文件装载完毕（基址 0）⇒ 提交其域信息。主文件与 import 模块共用同一套
+    // 提交逻辑，差别只在基址（0 vs g_file_base[k]）。
+    sstate.cap_apply_file(0)
+    // 第二遍：前缀和计算子段偏移（与 sstate.load_ast 相同的 s_coff 布局）
+    var off: i64 = 0
+    var j: i64 = 0
+    while j < cnt {
+        s_coff[j] = off
+        off = off + s_nchild[j]
+        j = j + 1
+    }
+    // 第三遍：预分配扁平子段后逐节点填充（ast.child_at 越界返回 -1 哨兵，
+    // 与协议字段 f[8+c] 的值域一致）
+    s_children = table_new_i64()
+    var z: i64 = 0
+    while z < off {
+        table_push(s_children, 0)
+        z = z + 1
+    }
+    var i: i64 = 0
+    while i < cnt {
+        var nc = s_nchild[i]
+        var base = s_coff[i]
+        var c: i64 = 0
+        while c < nc {
+            s_children[base + c] = ast.child_at(i, c)
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 把当前内存 ast 节点池（最近一次 parser.parse_ast 的结果）追加到 sstate 表
+// 末尾（import 展开用）。语义与 sstate.append_ast(协议文本) 完全等价：
+// 新节点 id = 原 id + base（调用前 s_tags 长度）；子节点 id >= 0 时 +base
+// 偏移，-1 哨兵保持。返回新节点段起点 base（调用方用 base + 新文件节点数 - 1
+// 定位该文件的顶层 StmtList root）。
+func append_ast_mem() -> i64 {
+    var cnt = ast.count()
+    var base = len(s_tags)
+    // 第一遍：逐节点 push 属性列 + node_types=-1（与 sstate.append_ast 的
+    // 逐行追加完全对应；new_offs 暂存各新节点的子段偏移占位）
+    var new_offs: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < cnt {
+        table_push(s_tags, ast.tag(i))
+        table_push(s_names, ast.name(i))
+        table_push(s_vals, ast.val(i))
+        table_push(s_aux, ast.aux(i))
+        table_push(s_coff, 0)
+        table_push(s_nchild, ast.child_count(i))
+        table_push(s_lines, ast.line(i))
+        table_push(s_cols, ast.col(i))
+        table_push(node_types, -1)
+        table_push(new_offs, 0)
+        i = i + 1
+    }
+    // 第二遍：计算新节点子段偏移（相对 s_children 当前末尾的前缀和）
+    var off = len(s_children)
+    var j: i64 = 0
+    while j < cnt {
+        new_offs[j] = off
+        off = off + s_nchild[base + j]
+        j = j + 1
+    }
+    // 第三遍：填充子节点（id 偏移 +base，-1 哨兵保持）并落盘 s_coff。
+    // N_CASE_BIND 特判（对齐 scollect.contains_yield / sgen.clone_inner）：
+    // children[0] = 变体引用节点 id（照常 +base）；children[1..] = 绑定变量
+    // 名池 id（parser 直接把 intern id 塞进 children，非节点 id）——不平移，
+    // 平移会破坏被导入文件里 case 载荷绑定的登记/查找一致（E00488，
+    // findings §18.2）。
+    var k: i64 = 0
+    while k < cnt {
+        s_coff[base + k] = new_offs[k]
+        var is_cb = ast.tag(k) == N_CASE_BIND
+        var nc = s_nchild[base + k]
+        var c: i64 = 0
+        while c < nc {
+            var cid = ast.child_at(k, c)
+            if cid >= 0 && !(is_cb && c >= 1) {
+                cid = cid + base
+            }
+            table_push(s_children, cid)
+            c = c + 1
+        }
+        k = k + 1
+    }
+    s_n = len(s_tags)
+    return base
+}
+
+}

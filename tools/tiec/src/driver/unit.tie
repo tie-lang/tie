@@ -1,0 +1,381 @@
+type tie<class>
+// compiler/driver/unit.tie —— 单编译单元执行体（CLI 与服务模式共用）
+// ============================================================
+// 自 driver.tie 的 main() 抽出：参数解析 / 子命令 / --tink-serve 分派留在 main，
+// 本文件承载「一个编译单元从读源码到产物落盘」。两个调用方：
+//   ① 一次性 CLI（main 末尾 `return driver.run_unit()`）；
+//   ② 常驻编译服务（--serve-compile 的 op=2 编译请求，逐请求复位后调用）。
+// 共用同一份实现 = 服务模式与命令行语义不会漂移（第二份拷贝必漂移）。
+// 前提：调用方已把请求参数落到同名 CLI 全局（g_input/g_output/g_llvm_opt…），
+// 并已做单元级复位（driver.unit_reset）。
+namespace driver {
+pub func run_unit() -> i64 {
+    // 运行期安全检查（表越界 / 表负下标 / 除零）**常开、不可关闭** ——
+    // 依规范 8.5 的裁决：「这些检查不可关闭，因为它们的成本相对故障后果可以忽略」。
+    // 实测三项全开的净代价 +0.9%（自编译 34475 → 34807 ms），该理由成立。
+    // 需要「越界即缺失」的宽松语义时用 3.13 的 `?[`（与检查开关无关，两者互补）。
+    // `--check-bounds` 保留为**幂等**的显式声明（既有脚本继续可用）；
+    // `TIE_CB_AUDIT=1` 切「只报告不中断」模式，用于一次收全所有越界点。
+    irgen.set_check_bounds(true)
+    // 机器码档（clang -O）接线：-c<0-2> / --codegen-opt / config codegen_opt
+    tc.set_clang_opt(driver.effective_clang_opt())
+    irgen.set_esc_audit(g_cli_esc_audit)
+    // p.9.20.5 tail call：t>=1 启用文本级 tail 提示（t0 保持不动点基线）
+    llvmgen.set_tail_enable(driver.effective_tie_opt() >= 1 ? 1 : 0)
+    tc.set_fast_math(g_cli_fast_math)
+    tc.set_no_warn(g_no_warn)
+    // p.9.13.7-B：CLI 显式库根（--lib-root）注入前端 import 解析。
+    if str_len(g_lib_root_cli) > 0 {
+        semantic.set_lib_root(g_lib_root_cli)
+    }
+    // --lsp：启动 tie 语言服务器（compiler/lsp/tsp.exe，LSP over stdio）。
+    // stdio 继承当前进程（vscode-languageclient spawn `tie --lsp` 即与之直连），
+    // exec_code 阻塞直至 tsp 退出（Exit 消息），退出码透传。
+    if g_lsp {
+        var tsp_path = ""
+        if file_exists("compiler/lsp/tsp.exe") {
+            tsp_path = "compiler/lsp/tsp.exe"
+        } else if file_exists("lsp/tsp.exe") {
+            tsp_path = "lsp/tsp.exe"
+        }
+        if str_len(tsp_path) == 0 {
+            dbg_txt("tsp 未找到：请先构建 compiler/lsp/server.tie → compiler/lsp/tsp.exe")
+            return 1
+        }
+        return exec_code(tsp_path)
+    }
+    // S3.2：--dump-irt 短路——只读 .tir 输出可读摘要（不编译）
+    if str_len(g_dump_irt) > 0 {
+        var drc = tieir.read(g_dump_irt)
+        if drc != 0 {
+            dbg_txt(diagcode.render_error(-1, -1, "tieir 读取失败: " + tieir.err_msg()))
+            return 1
+        }
+        print(tieir.dump_text())
+        return 0
+    }
+    // 读源码
+    if !file_exists(g_input) {
+        dbg_txt("读取源码失败: " + g_input)
+        return 1
+    }
+    // --compress-data：td → zd 压缩数据（表字面量 → DFS 平铺 → zd record）。
+    // 短接普通编译管线；输出缺省 = 输入名 + ".zd"。
+    if g_compress_data {
+        var outp: string = g_output
+        if str_len(outp) == 0 {
+            outp = g_input + ".zd"
+        }
+        if tdzd.compress_data(g_input, outp) {
+            dbg_txt("[compress-data] " + g_input + " -> " + outp)
+            return 0
+        }
+        dbg_txt(diagcode.render_error(-1, -1, "compress-data 失败: " + tdzd.err_msg()))
+        return 1
+    }
+    // zd 二进制预判：xxx.zd.tie 是二进制文件（压缩的 tie:data），人类不可读，
+    // 必须在 file_read（文本读取）之前按文件名后缀预判并直接短接——二进制
+    // 内容文本解码必然失败/乱码。zd 文件由 tiedb compact/decompress 原语处理。
+    var zd_len: i64 = str_len(g_input)
+    if zd_len >= 7 && slice(str.clone(g_input), zd_len - 7, zd_len) == ".zd.tie" {
+        dbg_txt("[预处理] 识别为 zd 压缩数据文件（头: " + g_input + "），tie:data 压缩格式，用 tiedb compact/decompress 处理")
+        return 0
+    }
+    // tsh 脚本预判：xxx.tsh.tie 是可读文本的 shell 脚本（由 tie 自己的 tshell
+    // 运行）。不短接（须走 file_read + 头部扫描验证 type tie<tsh>）；此处按扩展名
+    // 预写角色，保证在头部缺失/不一致时仍按 tsh 分派，也满足 R3 文件名-头部一致性。
+    var tsh_len: i64 = str_len(g_input)
+    if tsh_len >= 8 && slice(str.clone(g_input), tsh_len - 8, tsh_len) == ".tsh.tie" {
+        g_role = "tsh"
+    }
+    var src = file_read(g_input)
+    if str_len(src) == 0 {
+        dbg_txt("读取源码失败: " + g_input)
+        return 1
+    }
+    // S3.4：自定义角色注册表需先于头部扫描可用（config.data.tie roles 段）。 
+    // 分层合并：无配置文件时返回内置默认根；config 语法错误 → 报错退出。
+    if !g_cfg_loaded {
+        g_cfg_root = config.load_merge(g_config_path, g_cli_profile)
+        if g_cfg_root < 0 {
+            dbg_txt("构建配置加载失败: " + config.err_msg())
+            return 1
+        }
+        g_cfg_loaded = true
+    }
+    // 角色注册引导：内建默认表 → config roles → 项目 roles.data.tie
+    // → .tie/deps/*/roles.data.tie（包定制角色 = 纯数据声明，不扩展加载器）
+    driver.role_registry_boot(base_dir_of(str.clone(g_input)))
+    // p.9.11.13 #cfg 条件编译预处理：词法前按行裁剪（#cfg/#else/#end/#endif）。
+    // 必须在头部扫描（scan_header）之前——否则 #cfg 行会被当成头部首个非声明
+    // 内容终止角色识别；裁剪后源码再走 scan_header + strip_type_header。
+    // 条件求值源：--target > 配置 target > 主机（os/target 键）；生效 profile
+    // （--profile > 配置顶层 profile 键，dev=debug / release=release）。
+    var cfg_target = driver.normalize_target(g_target)
+    if str_len(cfg_target) == 0 {
+        if g_cfg_root >= 0 {
+            cfg_target = driver.normalize_target(config.get_str(g_cfg_root, "target"))
+        }
+    }
+    var cfg_profile = g_cli_profile
+    if str_len(cfg_profile) == 0 {
+        if g_cfg_root >= 0 {
+            cfg_profile = config.get_str(g_cfg_root, "profile")
+        }
+    }
+    // p.9.11.13 扩展（2026-10-12）：向 semantic 注入 #cfg 求值环境——被导入
+    // 文件的预处理（expand_one_import）复用同一 target/profile 判据。
+    semantic.set_cfg_env(cfg_target, cfg_profile)
+    var pruned = cfgpre.preprocess(src, cfg_target, cfg_profile)
+    if has_prefix(str.clone(pruned), "ERR:") {
+        dbg_txt(diagcode.render_err_proto(pruned))
+        return 1
+    }
+    src = pruned
+    // 头部扫描（文件类型声明 / 角色）
+    var _sh_r = driver.scan_header(str.clone(src))
+    if _sh_r < 0 {
+        return 1
+    }
+    // r.1.6.7：文件级 lock 授权（`type tie<logic, unsafe:lock>`）——头部角色声明
+    // 中的修饰角色 `unsafe:lock` ⇒ 整文件的表访问置于**去锁**作用域（文件级持证
+    // 形态，见 unsafe-credential-lock.md §3）。注入 irgen，供函数体生成时判定。
+
+    // 剥离头部声明行（`type tie` / `type tie<X>` 是真语法行，须从正文移除；
+    // 旧 `// tie:` 是注释由 lexer 跳过，无需处理）
+    var clean = strip_type_header(src)
+    // p.9.11.29：--dump-docs 短路——解析后输出 doc 注释注册表摘要（不编译）。
+    // 修复 2026-09-29：原短路置于头部剥离之前，对任何含规范 §1.1 头部的文件
+    // （`type tie<X>` 为真语法行、必须位于文件最前）一律 E00000 解析失败，故
+    // tlib 全部文件不可用。现移至此——src 已过 #cfg 裁剪，clean 已剥离头部行，
+    // 与正文路径同一前置；行号空间自洽（doc 注册表与符号行同基于 clean）。
+    // 置于 prelude_inject 之前：dump 只看用户所写内容，不受注入行位移影响。
+    if g_dump_docs {
+        if parser.parse_ast(clean) < 0 {
+            dbg_txt(diagcode.render_err_proto(parser.ast_err_protocol()))
+            return 1
+        }
+        print(pstmt_top.pdoc_dump())
+        return 0
+    }
+    // p.9.13.2 语言前置注入：应用代码（logic/script）自动获得 str/math 域基元的
+    // 裸名（免 import、免前缀）。同名用户定义优先遮蔽（using 语义已保证）。
+    clean = prelude_inject(clean, g_role, src)
+    // S1.4 R3 文件名-头部一致性检查（F1）：`xxx.<基础>[-<参数>][-<修饰>...].tie`
+    // 与头部声明不一致 = 编译错误（单一真相，升级自现状警告）。
+    var fname = file_name_of(str.clone(g_input))
+    var name_role = role_from_filename(fname)
+    if str_len(name_role) > 0 {
+        var mismatch: string = ""
+        if name_role != g_role {
+            mismatch = "基础角色不一致: 文件名 '" + name_role + "' vs 头部 '" + g_role + "'"
+        } else if str_len(g_name_param) > 0 && g_name_param != g_role_param {
+            mismatch = "角色参数不一致: 文件名 '" + g_name_param + "' vs 头部 '" + g_role_param + "'"
+        } else {
+            // 修饰角色集合比较（顺序无关）
+            var k2: i64 = 0
+            while k2 < len(g_name_mods) {
+                var found2 = false
+                var j2: i64 = 0
+                while j2 < len(g_role_mods) {
+                    if g_role_mods[j2] == g_name_mods[k2] {
+                        found2 = true
+                        break
+                    }
+                    j2 = j2 + 1
+                }
+                if !found2 {
+                    mismatch = "修饰角色不一致: 文件名含 '" + g_name_mods[k2] + "'，头部未声明"
+                    break
+                }
+                k2 = k2 + 1
+            }
+        }
+        if str_len(mismatch) > 0 {
+            dbg_txt(diagcode.render_error(-1, -1, "文件名与头部角色声明不一致: " + mismatch))
+            dbg_txt("（R3 单一真相原则：文件名与头部都是角色声明源，不一致 = 编译错误）")
+            return 1
+        }
+    }
+    // S1.2 文件级 unsafe 角色（type tie<..., unsafe>）：整文件 unsafe 上下文。
+    // 2026-10-07：此处原先**全局**抬升 g_unsafe_depth，造成两个偏差（均违反规范 §11.6）：
+    //   ① 上下文**扩散给被 import 的模块**（父授权不继承 —— 与 caps 同类的越权，
+    //      2026-10-01 只修了 caps 那一半）；
+    //   ② 语义检查在解析**之后**统一走，届时全局量已不代表「函数所属模块」。
+    // 现改为在 front_end 登记「本文件声明了 unsafe」，由 cap_apply_file 逐模块落到
+    // 函数上、检查时按函数抬升（与域凭据完全对称）。调用方签名不受影响。
+    if g_prep_only {
+        dbg_txt("[预处理] 识别为 " + g_role + " 文件（头: " + g_input + "）")
+        return 0
+    }
+    // 角色分派（表驱动，角色体系完全由注册表决定）：
+    //   pass → 提示转交对应工具链（内建 data/ui/db/port/zd 或包注册的 pass 角色）
+    //   check → 仅生成 LLVM IR（.ll，d覆 opt/clang 链接，等价 --emit-ir 由角色触发）
+    //   lib/exe/空 → 后端输出判定处按角色落入静态库/可执行管线
+    var disp = driver.role_output(str.clone(g_role))
+    if disp == "pass" {
+        if g_role == "data" {
+            dbg_txt("[预处理] 识别为 data 数据交换文件（头: " + g_input + "），可用 --compress-data 压缩为 zd（见 tdzd）")
+        } else if g_role == "ui" {
+            dbg_txt("[预处理] 识别为 ui 界面文件（头: " + g_input + "），已转交 UI 工具链 —— v0.1 UI 工具链尚未实现")
+        } else if g_role == "db" {
+            dbg_txt("[预处理] 识别为 db 数据库文件（头: " + g_input + "），已转交数据库工具链 —— v0.1 数据库工具链尚未实现")
+        } else if g_role == "port" {
+            dbg_txt("[预处理] 识别为 port 端口文件（头: " + g_input + "），已转交端口工具链 —— v0.1 端口工具链尚未实现")
+        } else if g_role == "zd" {
+            dbg_txt("[预处理] 识别为 zd 压缩数据文件（头: " + g_input + "），tie:data 压缩格式，用 tiedb compact/decompress 处理")
+        } else if g_role == "tsh" {
+            dbg_txt("[预处理] 识别为 tsh 脚本文件（头: " + g_input + "），推荐由 tshell 运行")
+            return driver.tsh_dispatch(g_input)
+        } else {
+            dbg_txt("[预处理] 识别为 " + g_role + " 角色文件（头: " + g_input + "），已转交对应工具链 —— 由注册包提供，v0.1 尚未实现")
+        }
+        return 0
+    }
+    if disp == "check" {
+        g_emit_ir = true
+    }
+    // M5 动态库模式（dev33 批次 12）：--shared 或输出扩展名 .dll/.so → 动态库。
+    // 要求 library 角色（class/type，无 main）；通知 irgen 标记导出面（dllexport）
+    // 并做边界检查（表/struct 不跨库）。
+    if detect_shared_mode() {
+        if g_role != "class" && g_role != "type" {
+            dbg_txt(diagcode.render_error(-1, -1, "动态库模式错误: 要求 library 角色（type tie<class> / type tie<type>）"))
+            return 1
+        }
+        // 置位 g_shared（.dll/.so 扩展名触发的动态库模式也要让后续分派识别）
+        g_shared = true
+        irgen.set_dynlib(true)
+        irgen.set_dll_export(g_dll_export_cli)
+    }
+    // S3.1 构建配置：分层合并（内置默认 < 用户 config < 项目 config < profile < CLI；
+    // 已由角色注册表预加载时（scan_header 前）直接复用，避免重复解析文件）
+    if !g_cfg_loaded {
+        g_cfg_root = config.load_merge(g_config_path, g_cli_profile)
+        if g_cfg_root < 0 {
+            dbg_txt(diagcode.render_error(-1, -1, "构建配置加载失败: " + config.err_msg()))
+            return 1
+        }
+    }
+    // CLI 显式参数 → 覆盖合并结果（最高优先；CLI 是显式意图，不警告）
+    // p.9.20 双轴：llvm_opt / tiec_opt 两键独立覆盖
+    if g_llvm_set {
+        g_cfg_root = config.apply_cli(g_cfg_root, "llvm_opt", to_string(g_llvm_opt))
+    }
+    if g_tie_set {
+        g_cfg_root = config.apply_cli(g_cfg_root, "tiec_opt", to_string(g_tie_opt))
+    }
+    // p.9.1.2：编译资源可调——内存上限 / 并发度写入配置（降档逻辑在
+    // effective_llvm_opt，见 kpass_link）。（mem_limit>0 才覆盖；0=不限跳过）
+    if g_mem_limit != 0 {
+        g_cfg_root = config.apply_cli(g_cfg_root, "tiec.mem_limit", to_string(g_mem_limit))
+    }
+    if g_jobs != 0 {
+        g_cfg_root = config.apply_cli(g_cfg_root, "advanced.threads", to_string(g_jobs))
+    }
+    if str_len(g_target) > 0 {
+        g_cfg_root = config.apply_cli(g_cfg_root, "target", g_target)
+    }
+    // --backend 实现选择（P4b 验收）：CLI 显式 > 配置 tiec.backend
+    // -Werror 的配置兜底：`tiec.warn_error = true`（配置里写 `["tiec": ["warn_error": true]]`）。
+    // CLI 未显式给出时按配置生效；只能**开**，不能用来关 CLI 已开的开关。
+    // 注：config 有自己的语法（数组容器 `[...]` + `"键": 值`），**不是** tie:data 的
+    // `{...}`/`k = v` 形态——照后者写会报「config 值意外字符（位置 0）」。实测已确认可用。
+    if !g_warn_error && config.get_bool(g_cfg_root, "tiec.warn_error") {
+        g_warn_error = true
+        g_front_warn = true
+    }
+    var backend = g_backend_cli
+    if str_len(backend) == 0 {
+        backend = config.get_str(g_cfg_root, "tiec.backend")
+    }
+    if str_len(backend) > 0 && backend != "win32" && backend != "trm" {
+        dbg_txt(diagcode.render_error(-1, -1, "后端实现未接入: tiec.backend=" + backend + "；可选 win32 / trm"))
+        return 1
+    }
+    var crc0 = driver.compile_program(clean)
+    // p.9.22.10 tinker 发送出口（--tink / --tink-file）：编译后统一发帧
+    //（stage 记录帧 / 失败 diag 帧 / 产物 artifact 帧；人为文本已在 stderr）。
+    if g_tink || str_len(g_tink_file) > 0 {
+        tinker.run_send(crc0)
+    }
+    return crc0
+}
+
+// 单元级复位：常驻服务逐请求调用（一次性 CLI 每进程只编一个单元，用不到）。
+// 三处分工：前端 AST/语义表 + intern/节点池（semantic.release_ast）、
+// 类型登记表（types.reset_registries）、后端单元级累加器与置位旗标
+// （irgen/llvmgen.unit_reset）。
+// ⚠ **不在这里调 dbgem.boot()**：那是「单元内」的初始化，CLI 在 compile_program
+// 里做（role_registry_boot 之后）。提前到这里会改变**名字池的登记顺序**，进而
+// 改变字符串池 id ⇒ 与一次性 CLI 的产物不再逐字节相同（实测 3 个用例多出
+// @tie_str_free_if_heap：释放判定扫操作数时，池 id 与值 id 数值相同即被误判为
+// 使用——见 backend/llvmgen_inst_p1.tie 的已知缺陷注记）。
+// **对齐纪律**：新增跨单元累加的全局时，必须同时挂到对应 unit_reset 上，
+// 否则第二个单元会带上一个单元的状态（产物静默漂移，且往往没有报错）。
+pub func unit_reset() {
+    semantic.release_ast()
+    types.reset_registries()
+    irgen.unit_reset()
+    llvmgen.unit_reset()
+    // 跨文件表的「单元级累加器」：这些表各自住在 scheck.tie / pstmt_top.tie，
+    // 不能在 sstate.compile_unit_reset（那是 sstate 的单元边界，且独立编译
+    // sstate_q1.tie 时这些名字不可见 —— 实测 `_zp.tie`/`interp_eval.tie` 报
+    // E00600「赋值目标 w16_keys 未声明」）。服务逐请求在这里清：
+    // 位置同样合法（run_unit → parser 之前），CLI 一次性路径不受影响。
+    w16_keys = table_new_i64()
+    w16_cnt = table_new_i64()
+    w16_ln = table_new_i64()
+    w16_cl = table_new_i64()
+    w19_idx_keys = table_new_i64()
+    w19_idx_vals = table_new_i64()
+    w19_len_keys = table_new_i64()
+    w19_len_vals = table_new_i64()
+    w19_occ_keys = table_new_i64()
+    w19_occ_vals = table_new_i64()
+    g_gt_keys = table_new_i64()
+    g_gt_seq = table_new_i64()
+    g_gt_chain = table_new_string()
+    g_gt_depths = table_new_i64()
+    g_gt_blknode = table_new_i64()
+    g_gt_blkidx = table_new_i64()
+    g_gtg_keys = table_new_i64()
+    g_gtg_seq = table_new_i64()
+    g_gtg_chain = table_new_string()
+    g_gtg_line = table_new_i64()
+    g_gtg_col = table_new_i64()
+    g_gtg_blkidx = table_new_i64()
+    g_case_seen = table_new_string()
+    g_block_names = table_new_i64()
+    g_ann_arg_ids = table_new_i64()
+    g_ann_arg_off = table_new_i64()
+    g_ann_arg_cnt = table_new_i64()
+    g_ann_names = table_new_i64()
+    g_ann_lines = table_new_i64()
+    g_ann_cols = table_new_i64()
+    g_ann_nodes = table_new_i64()
+    doc_claimed = table_new_i64()
+    g_doc_nodes = table_new_i64()
+    g_doc_texts = table_new_i64()
+    g_doc_dlines = table_new_i64()
+    // 惰性一次的**逐单元**缓存：不清则第二个单元沿用第一个单元的路径/指纹
+    //（ir_paths_init 以「非空即已算」为判据）。⚠ g_tiec_build_stamp 不在此列——
+    // 它是**本编译器的身份常量**（构建时烘入初值），清了会让缓存键退化为手工盐。
+    g_ir_path_g = ""
+    g_opt_path_g = ""
+    g_ir_prefix_g = ""
+    g_ir_lock = ""
+    g_src_stamp = ""
+    // 名字池已被 release_ast 清空 ⇒ 持有池 id 的**注册表必须重建**：
+    // 角色表（t_cr_* 由 role_registry_init_default 整体重建）与配置（roles 段合并源）。
+    // 否则角色名 id 悬空 ⇒ 后续单元的 role 判定落到别的名字上。
+    g_roles_booted = false
+    // 名字池已被 release_ast 清空 ⇒ 持有池 id 的**注册表必须重建**：
+    // 角色表（t_cr_* 由 role_registry_init_default 整体重建）与配置（roles 段合并源）。
+    // 否则角色名 id 悬空 ⇒ 后续单元的 role 判定落到别的名字上。
+    // 配置**逐单元重载**：g_cfg_root 是可变节点，run_unit 会用 --target/-l/-t 覆盖它
+    //（config.apply_cli）。若跨单元沿用，上一请求的覆盖值会变成本请求的「配置默认」，
+    // 于是「不传 -l」不再等于命令行默认。重载成本 = 解析一个小文件。
+    g_cfg_loaded = false
+}
+}   // namespace driver

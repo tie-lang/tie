@@ -1,0 +1,117 @@
+type tie<class>
+// compiler/driver/prelude.tie —— p.9.13.2 语言前置注入
+// EN: p.9.13.2 language prelude injection.
+// ============================================================
+// 职责：为**应用代码**（logic / tsc 角色）在正文首部隐式注入 prelude，
+// 使其免 import、免前缀即可使用 str / math 域的精选平台无关基元。
+// prelude 内的 pub 函数经 `using` 暴露为裸名；**同名用户定义优先遮蔽**
+// （tie 的 using 语义，实测：用户自定义 trim 覆盖 str.trim）。
+//
+// 边界（刻意收窄，两道风险闸门）：
+//   1) **只注入 logic / script，不注入 class** —— 于是 tiec 自身（class 角色）
+//      的自举完全不受影响；也避免与各模块既有的同名 helper（contains / slice /
+//      clone / find 等在编译器源码里大量存在）产生解析歧义与遮蔽。
+//   2) **prelude 文件缺失即静默跳过**（降级）—— 不让前置成为编译的硬依赖，
+//      库根未配置 / tlib 未随发行版携带时，一切照旧编译。
+//
+// 注入形态：在正文（头部已剥离）首部拼两行——import + using。import 用编译器
+// 既有的库别名解析（/std/... → 库根），故不依赖调用方传入绝对路径。
+//
+// 性能说明：注入只发生在**主输入文件**（被 import 的模块走 semantic 的 import
+// 展开，不经此处），故不会按模块数放大；且 prelude 仅两行转发声明，实际成本
+// 由 std/string.tie 与 std/math.tie 的既有编译承担（二者是常用库，本身多被引用）。
+
+// 是否需要前置（应用代码角色）。
+func prelude_role_ok(immut r: string) -> bool {
+    if r == "logic" {
+        return true
+    }
+    if r == "tsc" {
+        return true
+    }
+    return false
+}
+
+// 库/编译器自身判定：头部声明 `<class>` 的源不注入。
+// 必要性（实测根因）：编译 tiec 自身时 driver.tie 的角色被识别为 logic
+// （头部 `type tie<class>` 未进入角色识别的判定路径），故不能只靠 role 判断；
+// 直接看原始源里的 `<class>` 声明，可靠排除编译器与库文件，避免前置的 using
+// 引入与编译器源码里既有裸名 helper 的冲突。
+func prelude_is_lib(immut raw: string) -> bool {
+    if str.find(raw, "<class>") >= 0 {
+        return true
+    }
+    return false
+}
+
+// 库根下的 prelude 路径；不可用返回空串。
+func prelude_path() -> string {
+    var root = get_env("TIE_LIB_ROOT")
+    if str_len(root) == 0 {
+        var home = get_env("USERPROFILE")
+        if str_len(home) == 0 {
+            home = get_env("HOME")
+        }
+        if str_len(home) == 0 {
+            return ""
+        }
+        root = home + "/.tiec-lib/tlib"
+    }
+    var p = root + "/std/prelude.tie"
+    if file_exists(p) {
+        return p
+    }
+    return ""
+}
+
+// p.9.0-S.8 内建 Result/Option：是否应注入 std/result.tie 的导入。
+// 规范 §2.11 / §8.1 假定 Result/Option 开箱可用；实现上它们定义在
+// `tlib/std/result.tie`（生态统一，与用户自定义 enum 无差别）。
+// 由隐式前置自动引入 → 应用代码无需 import 即可用 Result/Option。
+//
+// **兼容策略（必需）**：以下两种文件**不注入**，避免「泛型模板重复定义」
+// （E00523）——既有代码零变化：
+//   ① 已显式 `import` 了 std/result.tie（重复 import 同一文件同样报错，实测）；
+//   ② 自行定义了同名枚举（`enum Result` / `enum Option`）。
+// 判定用源文本扫描（与 prelude_is_lib 的 `<class>` 扫描同款做法）；
+// 文本命中宁可保守跳过注入，也不冒重复定义的风险。
+func prelude_needs_result(immut raw: string) -> bool {
+    if str.find(raw, "std/result.tie") >= 0 {
+        return false
+    }
+    if str.find(raw, "enum Result") >= 0 {
+        return false
+    }
+    if str.find(raw, "enum Option") >= 0 {
+        return false
+    }
+    return true
+}
+
+// 注入前置：命中角色且 prelude 可用时在正文首部拼入 import + using；否则原样返回。
+// 注 1：形参名不可用 `code`（tie 保留类型名：宏参类型），故用 `body`。
+// 注 2：import 的**别名必须与 prelude 内的命名空间同名**（lang），否则 `using`
+//       找不到该命名空间（tie 的 using 按名匹配命名空间，实测）。
+pub func prelude_inject(body: string, role: string, raw: string) -> string {
+    if !prelude_role_ok(role) {
+        return body
+    }
+    if prelude_is_lib(raw) {
+        return body
+    }
+    if str_len(prelude_path()) == 0 {
+        return body
+    }
+    var head = "import \"/std/prelude.tie\" as lang\nusing lang;\n"
+    // 内建 Result/Option：无别名 import（顶层 enum 对导入方裸名可见，实测）
+    if prelude_needs_result(raw) {
+        head = "import \"/std/result.tie\"\n" + head
+    }
+    // ★ 追加到**末尾**，不置于首部（2026-10-07 修）：
+    //   首部注入把正文整体下移注入行数，而诊断行号**没有行映射** ⇒ 主文件全部
+    //   告警/错误行号 +2（实测：`var` 在第 3 行报 `@5:5`），用户按报的行号改会
+    //   **改错行**。tie 的 import / using 与「使用点」的相对位置无关（顶层声明
+    //   先登记后解析），故末尾注入语义等价，且**零行位移**。
+    //   ★ 必须补一个换行：正文若以行注释结尾且无尾换行，追加内容会被注释吞掉。
+    return body + "\n" + head
+}

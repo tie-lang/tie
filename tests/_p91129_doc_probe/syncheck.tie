@@ -1,0 +1,59 @@
+type tie<logic>
+// tests/_p91129_doc_probe/syncheck.tie —— 语法快检（临时工具）
+// 对本轮修改的编译器源文件逐个跑 parser.parse_ast，只验语法不验语义。
+
+import "../../compiler/frontend/parser.tie"
+
+func check_file(path: string) -> bool {
+    if !file_exists(path) {
+        println("缺失: " + path)
+        return false
+    }
+    var src = file_read(path)
+    // 剥 `type tie...` 头行（对齐 semantic.strip_type_decl 最小行为）
+    if str_len(src) >= 8 && str.slice(src, 0, 8) == "type tie" {
+        var nl = -1
+        var i: i64 = 0
+        while i < str_len(src) {
+            if str_char(src, i) == "\n" {
+                nl = i
+                i = str_len(src)
+            }
+            i = i + 1
+        }
+        if nl >= 0 {
+            src = str.slice(src, nl + 1, str_len(src))
+        }
+    }
+    var rc = parser.parse_ast(src)
+    if rc < 0 {
+        println("语法错误 " + path + ": " + parser.ast_err_protocol())
+        return false
+    }
+    println("OK " + path)
+    return true
+}
+
+func main() {
+    var ok: bool = true
+    ok = check_file("compiler/frontend/lex_state.tie") && ok
+    ok = check_file("compiler/frontend/lex_tokdefs.tie") && ok
+    ok = check_file("compiler/frontend/lex_scan.tie") && ok
+    ok = check_file("compiler/frontend/lexer.tie") && ok
+    ok = check_file("compiler/frontend/lex_symtab.tie") && ok
+    ok = check_file("compiler/frontend/ast.tie") && ok
+    ok = check_file("compiler/frontend/sstate.tie") && ok
+    ok = check_file("compiler/frontend/pstmt_top.tie") && ok
+    ok = check_file("compiler/frontend/sgen.tie") && ok
+    ok = check_file("compiler/frontend/semantic.tie") && ok
+    ok = check_file("compiler/frontend/scollect_port.tie") && ok
+    ok = check_file("compiler/frontend/sinfer.tie") && ok
+    ok = check_file("compiler/backend/irgen_agg.tie") && ok
+    ok = check_file("compiler/driver.tie") && ok
+    ok = check_file("compiler/_slim.tie") && ok
+    if ok {
+        println("syncheck ALL PASS")
+        exit(0)
+    }
+    exit(1)
+}

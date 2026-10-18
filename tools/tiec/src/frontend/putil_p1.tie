@@ -1,0 +1,223 @@
+type tie<class>
+// compiler/frontend/putil_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 putil.tie。
+namespace putil {
+// 分裂当前 token（Shr/Ge/ShrEq）为两个：当前位置按 Gt 消费，remainder 成为下一 token。
+// 分裂映射：Shr→余 Gt、Ge→余 Eq、ShrEq→余 Ge（Ge 再经一轮分裂为 Gt + Eq）。
+// 语义约定：调用方（expect_type_gt）对分裂类 token 返回 true = 已消费第 1 个
+// 字符（'>'），分裂出的 remainder（第 2 个字符）顶替当前位置供下一次消费。
+func split_current_gt(remainder: i64) {
+    if g_pending_idx < g_pend_n {
+        // 当前在 pending 队列中：原位覆盖为 remainder（第 2 个字符），
+        // **不推进游标**——第 1 个 '>' 已由 expect_type_gt 的 return true 隐含
+        // 消费，下一次 peek 读到 remainder。
+        // 曾误推进 g_pending_idx：`table<table<i64>>` 的 >> 分裂后第 2 个 '>'
+        // 被跳过直接读到 RParen（语法错误 @9:34 期望 '>' 实得 RParen）。
+        // p.9.14.3：覆盖前记日志（旧值 4 列），restore_pos 逆序回放撤销——
+        // 免去 save_pos 整队列复制。
+        table_push(g_j_idx, g_pending_idx)
+        table_push(g_j_tag, g_pending[g_pending_idx])
+        table_push(g_j_line, g_pending_lines[g_pending_idx])
+        table_push(g_j_col, g_pending_cols[g_pending_idx])
+        table_push(g_j_lex, g_pending_lexemes[g_pending_idx])
+        g_j_n = g_j_n + 1
+        g_pending[g_pending_idx] = remainder
+    } else {
+        // 当前在真实 token 流：记录 span，push remainder 到队尾，消费原位
+        // p.9.14.3：写逻辑水位线位置（物理表可能留有上次探测回退的垃圾尾部），
+        // 四表同步（旧实现漏 lexemes 列，补齐），并推进 g_pend_n。
+        if g_pend_n < len(g_pending) {
+            g_pending[g_pend_n] = remainder
+            g_pending_lines[g_pend_n] = lexer.token_line(g_pos)
+            g_pending_cols[g_pend_n] = lexer.token_col(g_pos)
+            g_pending_lexemes[g_pend_n] = lexer.token_lexeme_id(g_pos)
+        } else {
+            table_push(g_pending, remainder)
+            table_push(g_pending_lines, lexer.token_line(g_pos))
+            table_push(g_pending_cols, lexer.token_col(g_pos))
+            table_push(g_pending_lexemes, lexer.token_lexeme_id(g_pos))
+        }
+        g_pend_n = g_pend_n + 1
+        g_pos = g_pos + 1
+    }
+}
+
+// 扫描「类型实参列表」：至少一个类型实参，实参间逗号分隔，以 '>' 闭合。
+// 闭合支持 Shr/Ge/ShrEq 复合 token 分裂（与 expect_type_gt 同款映射——
+// 分裂副作用由调用方 save/restore 还原）。
+func scan_type_arg_list() -> bool {
+    if !scan_one_type_arg() {
+        return false
+    }
+    var d = false
+    while !d {
+        var tag = peek_tag()
+        if tag == lex_comma {
+            advance()
+            if !scan_one_type_arg() {
+                return false
+            }
+        } else if tag == lex_gt {
+            advance()
+            d = true
+        } else if tag == lex_shr {
+            // >> 分裂：第 1 个 '>' 为闭合，余下 Gt 顶替当前位置
+            split_current_gt(lex_gt)
+            d = true
+        } else if tag == lex_ge {
+            split_current_gt(lex_eq)
+            d = true
+        } else if tag == lex_shreq {
+            split_current_gt(lex_ge)
+            d = true
+        } else {
+            return false
+        }
+    }
+    return true
+}
+
+// 扫描单个类型实参（token 形态）：内建类型关键字（含 table/map 嵌套泛型）、
+// 标识符（含嵌套泛型类型引用）、元组类型 `(...)`。与 pexpr_type.parse_type
+// 接受的形态一致（探测结果与正式解析保证等价）。
+func scan_one_type_arg() -> bool {
+    var tag = peek_tag()
+    if tag == lex_int {
+        // v2 值参数实参：整型字面量（如 `conv<1280>`）——泛型调用探测放行
+        advance()
+        return true
+    }
+    if tag == lex_typekw {
+        var lex = peek_lexeme()
+        advance()
+        if lex == "table" || lex == "map" {
+            if peek_tag() == lex_lt {
+                advance()   // '<'
+                if !scan_type_arg_list() {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+    if tag == lex_ident {
+        var lex = peek_lexeme()
+        advance()
+        // L1 定长数组类型实参：`array<T, N>`——第二实参是**整数字面量**非类型，
+        // 单独扫描（类型实参列表的普通类型扫描处理不了整数）。
+        if lex == "array" && peek_tag() == lex_lt {
+            advance()   // '<'
+            if !scan_one_type_arg() {
+                return false
+            }
+            if peek_tag() == lex_comma {
+                advance()
+                if peek_tag() == lex_int {
+                    advance()
+                } else {
+                    return false
+                }
+            }
+            if peek_tag() == lex_gt {
+                advance()
+            } else if peek_tag() == lex_shr {
+                split_current_gt(lex_gt)
+            } else if peek_tag() == lex_ge {
+                split_current_gt(lex_eq)
+            } else if peek_tag() == lex_shreq {
+                split_current_gt(lex_ge)
+            } else {
+                return false
+            }
+            return true
+        }
+        if peek_tag() == lex_lt {
+            advance()   // '<'
+            if !scan_type_arg_list() {
+                return false
+            }
+        }
+        return true
+    }
+    if tag == lex_lparen {
+        // 元组类型 (T1, T2) / (name: T1, ...)：圆括号配平跳过（内部可含
+        // 表/泛型等任意类型 token，遇到 ')' 才结束）
+        advance()
+        var depth: i64 = 1
+        var d = false
+        while !d {
+            var t2 = peek_tag()
+            if t2 == lex_eof {
+                return false
+            }
+            if t2 == lex_lparen {
+                depth = depth + 1
+            } else if t2 == lex_rparen {
+                depth = depth - 1
+                if depth == 0 {
+                    advance()
+                    d = true
+                }
+            }
+            if !d {
+                advance()
+            }
+        }
+        return true
+    }
+    return false
+}
+
+// 单个字符的数值（0-9 a-f A-F → 0-15；其余 -1）
+func digit_val(c: string) -> i64 {
+    var cc = char_code(c)
+    if cc >= 48 {
+        if cc <= 57 {
+            return cc - 48
+        }
+    }
+    if cc >= 97 {
+        if cc <= 102 {
+            return cc - 87
+        }
+    }
+    if cc >= 65 {
+        if cc <= 70 {
+            return cc - 55
+        }
+    }
+    return -1
+}
+
+// 子串辅助（码点级，越界裁剪）
+func slice_str(s: string, start: i64, end: i64) -> string {
+    var n = str_len(s)
+    var lo = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    if lo >= hi {
+        return ""
+    }
+    var out: string = ""
+    var i: i64 = lo
+    while i < hi {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+}

@@ -1,0 +1,411 @@
+type tie<class>
+// compiler/frontend/pstmt_flow.tie — T2.5 parser 语句分派+控制流（再拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
+// 原 pstmt.tie 拆出的「语句分派 parse_stmt + 块/if/while/for/标签/
+// switch/return 控制流」部分。
+// 依赖：./pstmt.tie（var 声明/表达式赋值，经其传递可达 pexpr/putil/ast）。
+// 树式无环：由 pstmt_top.tie import。
+import "./pstmt.tie"
+
+namespace pstmt_flow {
+
+pub func parse_stmt() -> i64 {
+    var tag = putil.peek_tag()
+    if tag == lex_var {
+        return pstmt.parse_var_decl(0)
+    }
+    if tag == lex_const {
+        return pstmt.parse_var_decl(1)
+    }
+    if tag == lex_if {
+        return parse_if()
+    }
+    if tag == lex_while {
+        return parse_while(-1)
+    }
+    if tag == lex_for {
+        return parse_for(-1)
+    }
+    if tag == lex_switch {
+        return parse_switch()
+    }
+    if tag == lex_return {
+        return parse_return()
+    }
+    if tag == lex_yield {
+        // p.9.11.15 yield 生成器产出语句：`yield expr;`
+        return parse_yield()
+    }
+    if tag == lex_break {
+        return parse_loop_jump(false)
+    }
+    if tag == lex_continue {
+        return parse_loop_jump(true)
+    }
+    if tag == lex_ident {
+        if is_loop_label_ahead() {
+            return parse_labeled_loop()
+        }
+        // p.9.11.4 defer 资源释放：`defer { ... }`（defer 非保留字，仅当紧跟 `{`
+        // 按 defer 语句解析，否则落回表达式/赋值路径，规避用户变量名 defer）。
+        // try 属表达式（parse_primary 处理），此处不拦。
+        if putil.peek_lexeme() == "defer" {
+            if putil.peek_n(1) == lex_lbrace {
+                return parse_defer()
+            }
+        }
+        // p.8.2.11 guard else 早退：`guard <cond> else { ... }`。guard 非保留字
+        //（guard<cap> 是类型名），此处语境识别——语句位 `guard` 后不跟 `<`（该
+        // 情形是类型 `guard<cap>`，本就不该作语句）且不跟 `=`（guard 作变量赋值）
+        // 时按 guard 语句解析。
+        if putil.peek_lexeme() == "guard" {
+            var gn = putil.peek_n(1)
+            if gn != lex_lt && gn != lex_eq {
+                return parse_guard_else()
+            }
+        }
+        return pstmt.parse_expr_or_assign()
+    }
+    if tag == lex_lbrace {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "函数体内不能有裸代码块")
+        return -1
+    }
+    if tag == lex_extern {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "extern 声明只能出现在文件顶层")
+        return -1
+    }
+    if tag == lex_unsafe {
+        // S1.2 U3：`unsafe { ... }` 局部逃逸块（块内可触底）
+        // 三期 goto：`unsafe goto #x`（§7.1.5）——unsafe 后跟 goto 关键字
+        // 是 goto 跳转语句（无条件 br），否则按 unsafe 块解析。
+        // 三期 A 组（§7.1.1 + unsafe-model §13.4）：
+        //   `unsafe use g { ... }` 持证越界块 / `unsafe with(share) { ... }`
+        //   临时凭据块（unsafe 后跟 use/with 关键字）；
+        //   `unsafe.get(share)` 是表达式（unsafe 后跟 . 或标识符调用），
+        //   落回 parse_expr_or_assign（parse_primary 识别 N_GUARD_GET）。
+        var nxt = putil.peek_n(1)
+        if nxt == lex_goto {
+            return parse_goto_stmt()
+        }
+        if nxt == lex_ident && putil.peek_lexeme_n(1) == "use" {
+            return parse_guard_use()
+        }
+        // p.9.11.6：`with` 已保留字化（lex_with），`unsafe with(share)` 的 with
+        // 现为关键词 token；此处改用 lex_with 判定（与其 lexeme 文本一致）。
+        if nxt == lex_with {
+            return parse_guard_with()
+        }
+        // `unsafe.get(share)` 表达式：unsafe 后跟 `.`（get 是方法名）
+        if nxt == lex_dot {
+            return pstmt.parse_expr_or_assign()
+        }
+        return parse_unsafe_block()
+    }
+    if tag == lex_hash {
+        // 三期 goto：`#[tag.x]` 语句位置标签（§7.1.5）。`#[]` 紧跟声明
+        // = 属性；紧跟语句 + `tag.` 前缀 = 跳转标签（与循环标签命名空间分离）。
+        return parse_goto_label()
+    }
+    if tag == lex_panic {
+        // S2.3：`panic(expr)` 不可恢复错误语句
+        return parse_panic()
+    }
+    if tag == lex_func {
+        // S3.3：准引用块内语句起始位置的 `func name() {...}` 按函数定义
+        // 解析（宏生成函数，见 parse_fn_def_in_block）；普通函数体内 func
+        // 保持闭包字面量语义（走 parse_expr_or_assign → 闭包）。
+        if g_in_quasi_block != 0 {
+            return parse_fn_def_in_block()
+        }
+        return pstmt.parse_expr_or_assign()
+    }
+    return pstmt.parse_expr_or_assign()
+}
+
+
+// ---------- 顶层 import / using / namespace / extern ----------
+
+// import 语句：`import "./x.tie"` 或 `import "./x.tie" as 别名`
+pub func parse_block() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        if putil.peek_tag() == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if putil.peek_tag() == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else {
+            var s = parse_stmt()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        }
+    }
+    var list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    ast.set_children(list, stmts)
+    return list
+}
+
+// ---------- S2.2 延迟闭包函数体回填 ----------
+
+// 回填延迟闭包函数体：parse_primary 解析闭包字面量（func(x: i64) -> i64 {
+// ... }）时只解析头部，函数体 token 流被配平跳过并登记快照（pexpr 在
+// import 树底层无法调用本模块的语句解析——成环）。整份文件解析完后
+// （parse_program 末尾）调用本函数：逐闭包恢复快照 → parse_block 解析
+// 函数体 → 追加到 N_FN_LIT 的 children 末尾（布局与 N_FN_DEF 一致）。
+// 嵌套闭包：外层闭包函数体内若再有闭包字面量，parse_block 解析时会再次
+// 登记到延迟表队尾——循环条件用动态 defer_closure_count()，外层回填后
+// 内层自动继续处理。注意从 g_defer_done 游标起处理，仅回填本轮新增闭包：
+// parse_deferred_all 外层 while 会反复调用本函数，若不记游标则会重复 parse
+// 已回填的闭包体，把其内层闭包二次登记 → count 无限增长死循环（内存爆炸）。
+pub func parse_deferred_closures() -> i64 {
+    var i: i64 = g_defer_done
+    while i < putil.defer_closure_count() {
+        var node = putil.defer_closure_node_at(i)
+        putil.defer_closure_restore(i)
+        var body = parse_block()
+        if body < 0 {
+            return -1
+        }
+        // 追加函数体：读旧 children（泛型槽、返回类型、参数...）重建
+        var n = ast.child_count(node)
+        var kids: table<i64> = table_new_i64()
+        var k: i64 = 0
+        while k < n {
+            table_push(kids, ast.child_at(node, k))
+            k = k + 1
+        }
+        table_push(kids, body)
+        ast.set_children(node, kids)
+        i = i + 1
+        g_defer_done = i   // 游标推进：本轮已回填到 i，外层循环重复调用时从 i 继续
+    }
+    return 0
+}
+
+// ---------- S3.3 延迟准引用块体回填 ----------
+
+// 回填延迟准引用块体：parse_primary 解析 `` `{ stmts } `` 时只登记
+// N_CODE_LIT 节点 + 块体 token 流快照（pexpr 在 import 树底层无法调用
+// 本模块的语句解析——成环，与 S2.2 闭包同款）。整份文件解析完后由
+// pstmt_top.parse_deferred_all 调用本函数：逐块恢复快照 → parse_block
+// 解析块体 → 回填到 N_CODE_LIT 的 children[0]（块形式子 AST = StmtList）。
+// 嵌套：外层准引用块体内若再有准引用块，parse_block 解析时会再次登记到
+// 延迟表队尾——循环条件用动态 defer_code_count()，外层回填后内层自动继续。
+// 与闭包同款游标 g_defer_code_done：仅回填本轮新增，避免 parse_deferred_all
+// 外层循环重复 parse 已回填块体导致二次登记死循环。
+pub func parse_deferred_code_blocks() -> i64 {
+    var i: i64 = g_defer_code_done
+    while i < putil.defer_code_count() {
+        var node = putil.defer_code_node_at(i)
+        putil.defer_code_restore(i)
+        var body = parse_block()
+        if body < 0 {
+            return -1
+        }
+        // 块体解析完成：退出准引用块上下文（函数定义解析仅块内生效）
+        g_in_quasi_block = 0
+        // 回填块体：N_CODE_LIT 块形式 children = [StmtList]（占位 -1 被替换）
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, body)
+        ast.set_children(node, kids)
+        i = i + 1
+        g_defer_code_done = i   // 游标推进
+    }
+    return 0
+}
+
+
+// p.9.13.1 单箭头统一：switch 表达式分支臂分隔符由 `=>` 改为 `->`（p.8.2.8
+// 数据流箭头 lex_arrow），语义零变化。`_` 作通配缺省臂。臂之间用 `,` 分隔
+// （不允许多模式臂——逗号即臂分隔，避免歧义）。产出：
+//   N_SWITCH_EXPR[aux=ncases, val=1=含 `_` 通配臂,
+//                 children=[subject, caseExpr1..caseExprN, defaultExpr 或 -1]]
+//   caseExpr = N_SWITCH_CASE[children=[N_PATTERN_LIST, when 或 -1, bodyExpr]]
+pub func parse_switch_expr(line: i64, col: i64) -> i64 {
+    putil.advance()   // switch
+    putil.enter_cond()   // p.8.2.9：判分子表达式内不判定尾随闭包
+    var subject = pexpr.parse_expr()
+    putil.exit_cond()
+    if subject < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var cases: table<i64> = table_new_i64()
+    var default_expr = -1
+    var has_wild: i64 = 0
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if tag == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else {
+            var cl = putil.peek_line()
+            var cc = putil.peek_col()
+            var pats: table<i64> = table_new_i64()
+            var is_wild: bool = false
+            // `_` 通配臂：仅当 `_` 后直接跟 `->` 才算通配（否则落普通表达式/模式）
+            if tag == lex_ident && putil.peek_lexeme() == "_" && putil.peek_n(1) == lex_arrow {
+                is_wild = true
+                putil.advance()   // 消费 `_`
+            } else {
+                var p = parse_case_pattern()
+                if p < 0 {
+                    return -1
+                }
+                table_push(pats, p)
+            }
+            var when_expr = -1
+            if putil.eat(lex_when) {
+                // p.9.13.1 单箭头统一：守卫用 parse_ternary（不消费顶层 `->`），
+                // 保证紧随的臂分隔符 `->` 不被管道判定吃走；臂体在 `->` 之后用
+                // parse_expr 解析（体内 `->` 才是数据流管道）。
+                when_expr = pexpr.parse_ternary()
+                if when_expr < 0 {
+                    return -1
+                }
+            }
+            if !putil.expect(lex_arrow, "'->'") {
+                return -1
+            }
+            var body_expr = pexpr.parse_expr()
+            if body_expr < 0 {
+                return -1
+            }
+            if is_wild {
+                if default_expr >= 0 {
+                    putil.set_err(cl, cc, "switch 表达式不允许重复的 `_` 通配臂")
+                    return -1
+                }
+                default_expr = body_expr
+                has_wild = 1
+            } else {
+                var c = ast.new_node(N_SWITCH_CASE, -1, -1, -1, cl, cc)
+                var pl = ast.new_node(N_PATTERN_LIST, -1, -1, -1, cl, cc)
+                ast.set_children(pl, pats)
+                var ckids: table<i64> = table_new_i64()
+                table_push(ckids, pl)
+                table_push(ckids, when_expr)
+                table_push(ckids, body_expr)
+                ast.set_children(c, ckids)
+                table_push(cases, c)
+            }
+            // 臂分隔：`,`（向后继续）或 `}` / 文件尾（结束）。tie 的 ASI 在臂体
+            // 非逗号/花括号收尾换行时行尾补分号（如末臂 `_ -> "many"` 换行后紧跟
+            // `}`），先吃掉可能的分号再判分隔符。
+            putil.eat(lex_semi)
+            if putil.eat(lex_comma) {
+                // continue
+            } else if putil.peek_tag() == lex_rbrace || putil.peek_tag() == lex_eof {
+                // loop 尾部统一处理
+            } else {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "switch 表达式分支之间需用 ',' 或右花括号 '}' 分隔，实际是 " + putil.describe(putil.peek_tag()))
+                return -1
+            }
+        }
+    }
+    var n = ast.new_node(N_SWITCH_EXPR, -1, has_wild, len(cases), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, subject)
+    var i: i64 = 0
+    while i < len(cases) {
+        table_push(kids, cases[i])
+        i = i + 1
+    }
+    table_push(kids, default_expr)
+    ast.set_children(n, kids)
+    return n
+}
+
+
+// ---------- if 表达式 ----------
+// `if cond { thenExpr } else { elseExpr }` / else if 链（表达式起始位，由
+// pexpr.parse_primary 分派——对齐 switch 表达式的 parse_switch_expr 挂载方式）。
+// 纯糖（对齐 parse_if_let 的脱糖先例）：脱糖为 N_TERNARY[cond, then, else]——
+// 复用三目的条件 bool 检查 + 两臂类型统一（infer_expr_ternary）与分支 phi 汇合
+//（tig_ternary），零新增节点、零后端改动。与语句位 if 分层：
+//   * 语句位（pstmt_flow.parse_stmt 分派）→ parse_if（N_IF，else 可省，臂为块）；
+//   * 表达式起始位 → 本函数（else 必须有——表达式须产出值；臂为单个表达式）。
+// 多行臂：臂体表达式行尾 ASI 补分号 → 先 eat 再吃 `}`（对齐 parse_switch_expr
+// 臂分隔对 lex_semi 的处理）；`}` 行尾不补分号（no_semi_end），跨行 `else` 无碍。
+pub func parse_if_expr(line: i64, col: i64) -> i64 {
+    putil.advance()   // if
+    putil.enter_cond()   // p.8.2.9：条件内不判定尾随闭包（对齐 parse_if）
+    var cond = pexpr.parse_expr()
+    putil.exit_cond()
+    if cond < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var then_v = pexpr.parse_expr()
+    if then_v < 0 {
+        return -1
+    }
+    putil.eat(lex_semi)   // 臂体行尾 ASI 补分号
+    if !putil.expect(lex_rbrace, "'}'") {
+        return -1
+    }
+    if putil.peek_tag() != lex_else {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "if 表达式必须有 else 分支（表达式位 if 须产出值）")
+        return -1
+    }
+    putil.advance()   // else
+    var else_v: i64 = -1
+    if putil.peek_tag() == lex_if {
+        // else if 链：右递归 → 嵌套三元
+        var el = putil.peek_line()
+        var ec = putil.peek_col()
+        else_v = parse_if_expr(el, ec)
+        if else_v < 0 {
+            return -1
+        }
+    } else {
+        if !putil.expect(lex_lbrace, "'{'") {
+            return -1
+        }
+        else_v = pexpr.parse_expr()
+        if else_v < 0 {
+            return -1
+        }
+        putil.eat(lex_semi)   // 臂体行尾 ASI 补分号
+        if !putil.expect(lex_rbrace, "'}'") {
+            return -1
+        }
+    }
+    var n = ast.new_node(N_TERNARY, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, cond)
+    table_push(kids, then_v)
+    table_push(kids, else_v)
+    ast.set_children(n, kids)
+    return n
+}
+
+
+// `var name[: Ty] [= expr]` / `const ...`（解构返回 StmtList）
+
+}
+
+import "./pstmt_flow_p1.tie"
+import "./pstmt_flow_p2.tie"

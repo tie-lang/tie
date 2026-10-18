@@ -1,0 +1,78 @@
+type tie<class, unsafe:mem>
+// embed.tie —— tiel 宿主嵌入面（C ABI；--shared 构建为 tiel.dll）
+// ============================================================
+// 构建：tiec --shared --dll-export "tiel$check,tiel$free_result" embed.tie -o tiel.dll
+// 约定：输入输出全部走「整数地址」，宿主无需了解 tie 内部对象布局——
+//   源码：src_ptr + src_len 两个整数（UTF-8 字节）
+//   文本：返回数据地址 + out_len 出参（i64 写回；0 = 通过）
+// 导出（符号前缀 tiel$）：
+//   check(src_ptr, src_len, out_len_addr) -> data_addr
+//       校验源码。out_len_addr 处写回文本长度；通过（无错误）时为 0。
+//       有错误时返回错误文本数据地址（UTF-8；用 free_result 释放）。
+//   free_result(data_addr) -> i64
+//       释放 check 返回的文本数据。
+// C 侧（示例）：
+//   typedef char* (*FnCheck)(long long, long long, long long);
+//   typedef long long (*FnFree)(long long);
+//   long long outn = 0;
+//   char* p = check((long long)src, srclen, (long long)&outn);
+//   if (outn > 0) { fwrite(p, 1, outn, stdout); free_result((long long)p); }
+// 备注：非线程安全（内部共享字符串构造器）；请与同版本源构建使用。
+import "./tiel.tie"
+import "./emcodes.tie"
+import "./emit.tie"
+import "./lex.tie"
+import "./parse.tie"
+import "./render.tie"
+
+var g_sb: i64 = -1
+
+namespace tiel {
+
+// 校验源码；返回错误文本数据地址（通过时返回零指针且 out_len 写 0）。
+pub unsafe func check(src_ptr: i64, src_len: i64, out_len_addr: i64) -> string {
+    // 源字节 → string（逐字节；入口一次拷贝）
+    var sb0 = string_builder()
+    var pb: ptr<u8> = int_to_ptr(src_ptr)
+    var i: i64 = 0
+    while i < src_len {
+        sb_append_byte(sb0, to_i64(deref(ptr_add(pb, i))))
+        i = i + 1
+    }
+    var srcs = sb_build(sb0)
+    var err = tiel_check(srcs)
+    var n = len(err)
+    // 长度写回（通过 = 0；总是写，宿主无需初始化）。
+    // 注：deref_write 的写宽 = 指针元素（ptr<u8> 只写 1 字节）且 int_to_ptr
+    // 恒返回 ptr<u8>——故此处显式逐字节写 8 次（小端 i64）。
+    var pb2: ptr<u8> = int_to_ptr(out_len_addr)
+    var w: i64 = 0
+    while w < 8 {
+        deref_write(ptr_add(pb2, w), (n >> (w * 8)) & 0xFF)
+        w = w + 1
+    }
+    if n == 0 {
+        return ""
+    }
+    // 错误文本 → 输出串（模块级 builder 复用）
+    if g_sb <= 0 {
+        g_sb = string_builder()
+    } else {
+        sb_reset(g_sb)
+    }
+    var h = g_sb
+    var j: i64 = 0
+    while j < n {
+        sb_append_byte(h, str_byte(err, j))
+        j = j + 1
+    }
+    return sb_build(h)
+}
+
+// 释放 check 返回的文本（data_addr = 返回数据指针；数据前置 8 字节头部）
+pub unsafe func free_result(data_addr: i64) -> i64 {
+    var p: ptr<u8> = int_to_ptr(data_addr - 8)
+    free(p)
+    return 0
+}
+}

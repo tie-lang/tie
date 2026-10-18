@@ -1,0 +1,272 @@
+type tie<logic>
+// tests/_trng_probe/trng_probe.tie —— L2 随机扩展库 trng 探针
+// 覆盖：确定性（同 seed 恒同序列）、float01/range/int_range 界限、
+//       gauss/gauss_pair/normal 统计、shuffle16/256 集合守恒。
+// 编译运行：compiler\tiec.exe --no-cache tests\_trng_probe\trng_probe.tie
+
+import "/ext/trng.tie"
+
+var fails: i64 = 0
+
+func chk(cond: bool, msg: string) {
+    if !cond {
+        fails = fails + 1
+        println("FAIL " + msg)
+    }
+}
+
+func absf(v: f64) -> f64 {
+    if v < 0.0 {
+        return -v
+    }
+    return v
+}
+
+func main() {
+    // ---- 1) 确定性：同 seed 两次 new 后各取 10 个 next 完全相等 ----
+    var rA = trng.new(42)
+    var rB = trng.new(42)
+    var same: bool = true
+    var k: i64 = 0
+    while k < 10 {
+        var pA = trng.next(rA)
+        rA = pA.r2
+        var pB = trng.next(rB)
+        rB = pB.r2
+        if pA.v2 != pB.v2 {
+            same = false
+        }
+        k = k + 1
+    }
+    chk(same, "determinism: same seed -> same 10 next values")
+
+    // ---- 2) float01 ∈ [0,1)（1000 次全在界内 + 跨度覆盖中点）----
+    var rf = trng.new(7)
+    var ok: bool = true
+    var fmin: f64 = 9.0
+    var fmax: f64 = -9.0
+    k = 0
+    while k < 1000 {
+        var p = trng.float01(rf)
+        rf = p.r2
+        var x = p.v2
+        if x < 0.0 || x >= 1.0 {
+            ok = false
+        }
+        if x < fmin {
+            fmin = x
+        }
+        if x > fmax {
+            fmax = x
+        }
+        k = k + 1
+    }
+    chk(ok, "float01 in [0,1) over 1000 samples")
+    chk(fmin < 0.5 && fmax > 0.5, "float01 spread spans midpoint")
+
+    // ---- 3) float01/int_range 确定性 ----
+    var rc1 = trng.new(9)
+    var rc2 = trng.new(9)
+    chk(trng.float01(rc1).v2 == trng.float01(rc2).v2, "float01 deterministic same seed")
+    chk(trng.int_range(rc1, 0, 100).v2 == trng.int_range(rc2, 0, 100).v2, "int_range deterministic same seed")
+
+    // ---- 4) range 界限（正区间 [5,10)、负区间 [-5,2)）----
+    var rr = trng.new(8)
+    ok = true
+    k = 0
+    while k < 500 {
+        var p = trng.range(rr, 5.0, 10.0)
+        rr = p.r2
+        if p.v2 < 5.0 || p.v2 >= 10.0 {
+            ok = false
+        }
+        k = k + 1
+    }
+    chk(ok, "range in [5,10) over 500 samples")
+    ok = true
+    k = 0
+    while k < 500 {
+        var p = trng.range(rr, -5.0, 2.0)
+        rr = p.r2
+        if p.v2 < -5.0 || p.v2 >= 2.0 {
+            ok = false
+        }
+        k = k + 1
+    }
+    chk(ok, "range in [-5,2) over 500 samples")
+
+    // ---- 5) int_range 界限（正区间、负区间、全覆盖、退化 lo==hi）----
+    ok = true
+    k = 0
+    while k < 500 {
+        var p = trng.int_range(rr, 0, 10)
+        rr = p.r2
+        if p.v2 < 0 || p.v2 >= 10 {
+            ok = false
+        }
+        k = k + 1
+    }
+    chk(ok, "int_range in [0,10) over 500 samples")
+    ok = true
+    k = 0
+    while k < 500 {
+        var p = trng.int_range(rr, -7, 3)
+        rr = p.r2
+        if p.v2 < -7 || p.v2 >= 3 {
+            ok = false
+        }
+        k = k + 1
+    }
+    chk(ok, "int_range in [-7,3) over 500 samples")
+    var mn: i64 = 99
+    var mx: i64 = -99
+    k = 0
+    while k < 2000 {
+        var p = trng.int_range(rr, 0, 10)
+        rr = p.r2
+        var x = p.v2
+        if x < mn {
+            mn = x
+        }
+        if x > mx {
+            mx = x
+        }
+        k = k + 1
+    }
+    chk(mx - mn == 9, "int_range covers all 10 values (mx-mn==9)")
+    chk(trng.int_range(rr, 5, 5).v2 == 5, "int_range lo==hi returns lo")
+
+    // ---- 6) gauss 统计：4000 样本均值/方差 ----
+    var rg = trng.new(100)
+    var sum: f64 = 0.0
+    var sum2: f64 = 0.0
+    var cnt: f64 = 4000.0
+    var posHit: bool = false
+    var negHit: bool = false
+    k = 0
+    while k < 4000 {
+        var p = trng.gauss(rg)
+        rg = p.r2
+        var x = p.v2
+        sum = sum + x
+        sum2 = sum2 + x * x
+        if x > 0.5 {
+            posHit = true
+        }
+        if x < -0.5 {
+            negHit = true
+        }
+        k = k + 1
+    }
+    var gmean = sum / cnt
+    var gvar = sum2 / cnt - gmean * gmean
+    chk(absf(gmean) < 0.1, "gauss mean |mu|<0.1, got " + to_string(gmean))
+    chk(absf(gvar - 1.0) < 0.1, "gauss var |s2-1|<0.1, got " + to_string(gvar))
+    chk(posHit && negHit, "gauss non-degenerate (both sides)")
+
+    // ---- 7) gauss_pair：一次两均匀数产两正态（4000 对）----
+    sum = 0.0
+    sum2 = 0.0
+    cnt = 8000.0
+    k = 0
+    while k < 4000 {
+        var p = trng.gauss_pair(rg)
+        rg = p.r2
+        var x = p.g1
+        var y = p.g2
+        sum = sum + x
+        sum2 = sum2 + x * x
+        sum = sum + y
+        sum2 = sum2 + y * y
+        k = k + 1
+    }
+    gmean = sum / cnt
+    gvar = sum2 / cnt - gmean * gmean
+    chk(absf(gmean) < 0.1, "gauss_pair mean |mu|<0.1")
+    chk(absf(gvar - 1.0) < 0.1, "gauss_pair var |s2-1|<0.1")
+
+    // ---- 8) normal(0,2)：均值≈0、标准差≈2 ----
+    var rn = trng.new(200)
+    var nmin: f64 = 9.0
+    var nmax: f64 = -9.0
+    sum = 0.0
+    sum2 = 0.0
+    cnt = 4000.0
+    k = 0
+    while k < 4000 {
+        var p = trng.normal(rn, 0.0, 2.0)
+        rn = p.r2
+        var x = p.v2
+        sum = sum + x
+        sum2 = sum2 + x * x
+        if x < nmin {
+            nmin = x
+        }
+        if x > nmax {
+            nmax = x
+        }
+        k = k + 1
+    }
+    var nmean = sum / cnt
+    var nvar = sum2 / cnt - nmean * nmean
+    var nstd = sqrt(nvar)
+    chk(absf(nmean) < 0.15, "normal mean ~ 0, got " + to_string(nmean))
+    chk(absf(nstd - 2.0) < 0.3, "normal std ~ 2, |std-2|<0.3, got " + to_string(nstd))
+    chk(nmax > nmin, "normal spread nonzero")
+
+    // ---- 9) shuffle16 / shuffle256：混洗后元素集合守恒 ----
+    var rsh = trng.new(5)
+    var arr16: array<i64, 16> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    rsh = trng.shuffle16(rsh, arr16)
+    ok = true
+    var v: i64 = 0
+    while v < 16 {
+        var c: i64 = 0
+        var idx: i64 = 0
+        while idx < 16 {
+            if arr16[idx] == v {
+                c = c + 1
+            }
+            idx = idx + 1
+        }
+        if c != 1 {
+            ok = false
+        }
+        v = v + 1
+    }
+    chk(ok, "shuffle16 preserves element multiset")
+
+    var arr256: array<i64, 256> = array_init(0)
+    k = 0
+    while k < 256 {
+        arr256[k] = k
+        k = k + 1
+    }
+    rsh = trng.shuffle256(rsh, arr256)
+    ok = true
+    v = 0
+    while v < 256 {
+        var c: i64 = 0
+        var idx: i64 = 0
+        while idx < 256 {
+            if arr256[idx] == v {
+                c = c + 1
+            }
+            idx = idx + 1
+        }
+        if c != 1 {
+            ok = false
+        }
+        v = v + 1
+    }
+    chk(ok, "shuffle256 preserves element multiset")
+
+    // ---- 10) 不同 seed 应产生不同首值 ----
+    chk(trng.next(trng.new(1)).v2 != trng.next(trng.new(2)).v2, "different seeds differ")
+
+    if fails == 0 {
+        println("PASS all (" + to_string(22) + " asserts)")
+    } else {
+        println("FAIL total=" + to_string(fails))
+    }
+}

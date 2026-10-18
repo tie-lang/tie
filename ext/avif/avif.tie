@@ -1,0 +1,65 @@
+type tie<class>
+// ============================================================================
+// ext/avif/avif.tie —— AVIF 解码（命名空间 avif）p.9.1.1.3
+// AVIF decode (namespace avif). AVIF = HEIF(ISO-BMFF) 容器 + AV1(ISOBMFF) 编码，
+// 规格庞大且现代压缩，纯 tie 自写不可行，规范路径为 unsafe FFI 绑定已完成且成熟的
+// libavif/libaom（对齐 ext/gfx 的 thunk/FFI 模式；ext/webp 为纯 tie 子集仅因 VP8L
+// 可手写，AVIF 需真编码器）。
+//
+// ---- C 库在位判定（2026-09-13，先探再定）----
+// 本机**无可用 libavif/libaom**：扫描 C:\vcpkg（不存在）、skia out 构建产物
+// （dist-release\stage\win\ext\gfx\skia\out\tie_raster_release\ 仅有 libpng.lib/
+// skia.lib/skcms.lib/zlib.lib，webp_decoder/avif 仅为 ninja 定义未产出 .lib）、
+// LLVM bin、System32 均无 libavif/.dll 与 aom C ABI 符号；搜索到 flutter_avif.dll
+// 系 Dart 插件（非 libavif C ABI），trae 运行时库不可作为提交库的可复现依赖。
+//
+// 故本文件为**如实登记**：本环境无 libavif，FFI 依赖待库到位后落地。绝不凑数实现
+// 伪解码。可用性由 available() 显式返回 false；decode 恒返回 ok=false + 说明。
+//
+// 落地待办（FFI 落地时接续）：
+//   - 依赖：libavif >= 1.0（含 libaom/libyuv/libpng 可选）、导入库/头文件；
+//   - unsafe extern fn 绑定：avifDecoderNew / avifDecoderParse / avifDecoderNextImage /
+//     avifDecoderGetIOMatrix / avifImageGetPlane(PLANES[AVIF_PLANE_Y|U|V]) -> ptr<u8>；
+//   - 数据平面：解码后 YUV → RGBA table<i64> 输出，构图对齐 ext/png/WebPImage。
+// This file is an HONEST REGISTRATION: no usable libavif in this environment, so the
+// FFI binding lands when the library is provisioned; nothing fake is implemented.
+// ============================================================================
+
+struct AvifImage {
+    var ok: bool = false
+    var err: string = ""
+    var w: i64 = 0
+    var h: i64 = 0
+    var bit_depth: i64 = 0
+    var rgba: table<i64> = table_new_i64()   // R,G,B,A 逐像素平铺（解码就绪后填充）
+}
+
+namespace avif {
+
+// 本环境是否有可用 libavif（FFI 依赖）。当前恒 false（如实登记）。
+pub func available() -> bool {
+    return false
+}
+
+// decode：解析并解码 AVIF 字节 → AvifImage。
+// 当前环境无 libavif → 恒返回 {ok=false, err=说明}，绝不伪解码／伪解析。
+pub func decode(bytesz: table<i64>) -> AvifImage {
+    var img = AvifImage()
+    if len(bytesz) < 1 {
+        img.err = "empty input"
+        return img
+    }
+    img.err = "本环境无 libavif/libaom，FFI 解码依赖待库到位后落地 (no libavif in this env; FFI pending)"
+    return img
+}
+
+// probe：探测本机 libavif 可用性入口（供探针/工具诊断，非解码）。
+pub func probe() -> string {
+    var st = "unavailable"
+    if available() {
+        st = "available"
+    }
+    return "libavif: NOT in-place; " + st + "(awaiting provisioning)"
+}
+
+}   // namespace avif

@@ -1,0 +1,416 @@
+type tie<class>
+// compiler/frontend/scollect_port_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 scollect_port.tie。
+namespace scollect {
+// ==================== S2.4 port / impl 收集（接口模型）====================
+// port 声明收集：登记 port + 方法签名（方法必须 pub func、第一参数 self、
+// 无函数体——默认实现暂不支持，port-model.md §10 未决问题 1 后置）。
+// 方法签名 = 参数类型表（self 槽占位 TK_VOID，签名匹配时跳过）+ 返回类型。
+// p.9.11.21 扩展：N_PORT.val == 1 = interface（结构性接口）——声明语法与
+// 收集校验与 port 完全一致（方法签名集合），差别在**实现关系判定**：port
+// 需显式 impl 块，interface 由 stype.impl_has_ty 做结构性签名兼容判定
+// （命名空间方法签名匹配即实现，鸭子多态的类型安全升级），并置 pm_iface
+// 标记供消费方（泛型约束/提升检查）区分诊断消息。
+func collect_port(s: i64) -> i64 {
+    var is_iface = s_vals[s] == 1
+    var kword = "port"
+    var kword_m = "port 方法"
+    if is_iface {
+        kword = "interface"
+        kword_m = "interface 方法"
+    }
+    var nm = sstate.name_str(s)
+    // 冲突检查：port/interface 名不能与 struct/enum/函数/泛型模板同名（类型解析歧义）
+    var nid = intern.intern(nm)
+    if sstate.bs_find(st_keys, nid) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = kword + " 名 '" + nm + "' 与 struct 名冲突"
+        return -1
+    }
+    if sstate.bs_find(en_keys, nid) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = kword + " 名 '" + nm + "' 与枚举名冲突"
+        return -1
+    }
+    if sstate.bs_find(fn_keys, nid) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = kword + " 名 '" + nm + "' 与函数名冲突"
+        return -1
+    }
+    if sstate.gt_find(nm) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = kword + " 名 '" + nm + "' 与泛型模板名冲突"
+        return -1
+    }
+    var pi = sstate.reg_port(nm)
+    if pi < 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        return -1
+    }
+    if is_iface {
+        pm_iface[pi] = 1   // interface 标记：结构性实现判定（鸭子风格）
+    }
+    // 方法：children[slot_off ..]（泛型槽 -1 → slot_off = 1）
+    var soff = sstate.slot_off(s)
+    var nmeth = sstate.nchild(s) - soff
+    var k: i64 = 0
+    while k < nmeth {
+        var m = sstate.child(s, soff + k)
+        var mname = sstate.name_str(m)
+        // 方法必须 pub（port/interface 方法对外可见）
+        if (s_vals[m] & 1) == 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = kword_m + " '" + mname + "' 必须标注 pub（`pub func " + mname + "`）"
+            return -1
+        }
+        var nparams = s_aux[m]
+        // 第一参数必须是 self（接口是对象行为的抽象，接收者统一 self）
+        if nparams < 1 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = kword_m + " '" + mname + "' 必须有 self 接收者（第一参数）"
+            return -1
+        }
+        var p0 = sstate.child(m, sstate.slot_off(m) + 1)
+        if sstate.name_str(p0) != "self" {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = kword_m + " '" + mname + "' 的第一参数必须是 self"
+            return -1
+        }
+        // 无函数体（默认实现暂不支持，第一版 port/interface 只声明签名）
+        var body: i64 = -1
+        if sstate.nchild(m) > 2 + nparams {
+            body = sstate.child(m, 2 + nparams)
+        }
+        if body >= 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            if is_iface {
+                sm_err_msg = "interface 默认实现暂不支持（第一版：interface 方法只声明签名，请用命名空间方法提供实现）"
+            } else {
+                sm_err_msg = "port 默认实现暂不支持（第一版：port 方法只声明签名，请用 impl 块提供实现）"
+            }
+            return -1
+        }
+        // 参数类型解析（self 槽占位；其余类型必须可解析——port 不支持泛型，
+        // TypeVar 引用自然报「类型未定义」）
+        var ptys: table<i64> = table_new_i64()
+        var j: i64 = 0
+        while j < nparams {
+            var p = sstate.child(m, sstate.slot_off(m) + 1 + j)
+            if j == 0 {
+                table_push(ptys, types.named(TK_VOID))  // self 槽占位
+            } else {
+                var pt = sgen.parse_generic_type_node(sstate.child(p, 0))
+                if pt < 0 {
+                    sm_err_line = s_lines[p]
+                    sm_err_col = s_cols[p]
+                    return -1
+                }
+                table_push(ptys, pt)
+            }
+            j = j + 1
+        }
+        var ret_ty = sgen.parse_generic_type_node(sstate.child(m, sstate.slot_off(m)))
+        if ret_ty < 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            return -1
+        }
+        if sstate.reg_port_method(pi, mname, ptys, ret_ty) < 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            return -1
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+// 单个 impl 块处理（collect_impl_fns 内部）
+func collect_impl_one(im: i64) -> i64 {
+    // N_IMPL children = [port 类型节点, struct 类型节点, 方法 FnDef...]
+    var pnode = sstate.child(im, 0)
+    var snode = sstate.child(im, 1)
+    var pname = sstate.name_str(pnode)
+    var sname = sstate.name_str(snode)
+    var pi = sstate.port_find(pname)
+    if pi < 0 {
+        sm_err_line = s_lines[im]
+        sm_err_col = s_cols[im]
+        sm_err_msg = "impl 引用的 port '" + pname + "' 未定义"
+        return -1
+    }
+    var sidx = sstate.bs_find(st_keys, intern.intern(sname))
+    if sidx < 0 {
+        sm_err_line = s_lines[im]
+        sm_err_col = s_cols[im]
+        sm_err_msg = "impl 引用的 struct '" + sname + "' 未定义"
+        return -1
+    }
+    var si = st_vals[sidx]
+    // 方法全名表（按 port 方法声明序；-1 = 缺实现）
+    var nport_m = pm_n[pi]
+    var mnames: table<i64> = table_new_i64()
+    var mi: i64 = 0
+    while mi < nport_m {
+        table_push(mnames, -1)
+        mi = mi + 1
+    }
+    var nc = sstate.nchild(im)
+    var k: i64 = 2
+    while k < nc {
+        var m = sstate.child(im, k)
+        var mname = sstate.name_str(m)
+        var nparams = s_aux[m]
+        // 方法必须有函数体（实现）
+        var body: i64 = -1
+        if sstate.nchild(m) > 2 + nparams {
+            body = sstate.child(m, 2 + nparams)
+        }
+        if body < 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = "impl 方法 '" + mname + "' 必须有函数体（impl 块 = 实现，不能只声明签名）"
+            return -1
+        }
+        // 第一参数必须是 self
+        if nparams < 1 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = "impl 方法 '" + mname + "' 必须有 self 接收者（第一参数）"
+            return -1
+        }
+        var p0 = sstate.child(m, sstate.slot_off(m) + 1)
+        if sstate.name_str(p0) != "self" {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = "impl 方法 '" + mname + "' 的第一参数必须是 self"
+            return -1
+        }
+        // self 参数类型节点改写：占位（name="self"）→ struct 类型节点。
+        // collect_fn 按 <struct>::<方法> 全名登记时 M2.1.8 检查首参类型 ==
+        // struct 类型 → 自动按引用传递（与手写 namespace 方法一致）。
+        var pty_node = sstate.child(p0, 0)
+        s_tags[pty_node] = S_N_STRUCT_TYPE
+        s_names[pty_node] = intern.intern(sname)
+        s_vals[pty_node] = -1
+        // 方法改名 <struct 名>::<方法名>，push g_extra_tops 供 check_fn_walk /
+        // irgen gen_ast / find_fn_node 按全名查找，collect_fn 登记签名
+        var full = sname + "::" + mname
+        s_names[m] = intern.intern(full)
+        table_push(g_extra_tops, m)
+        var r = collect_fn(m, full)
+        if r < 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            return -1
+        }
+        // 匹配 port 方法序号（额外方法允许，不参与该 port）
+        var pmi = sstate.port_method_idx(pi, mname)
+        if pmi >= 0 {
+            if mnames[pmi] < 0 {
+                mnames[pmi] = intern.intern(full)
+            } else {
+                sm_err_line = s_lines[m]
+                sm_err_col = s_cols[m]
+                sm_err_msg = "impl '" + pname + " for " + sname + "' 的方法 '" + mname + "' 重复定义"
+                return -1
+            }
+        }
+        k = k + 1
+    }
+    // 完整性检查：port 每个方法都有实现（漏方法 = 编译错误）
+    var mi2: i64 = 0
+    while mi2 < nport_m {
+        if mnames[mi2] < 0 {
+            sm_err_line = s_lines[im]
+            sm_err_col = s_cols[im]
+            sm_err_msg = "impl '" + pname + " for " + sname + "' 缺少方法 '" + sstate.port_method_name(pi, mi2) + "'（port 方法必须全部实现）"
+            return -1
+        }
+        mi2 = mi2 + 1
+    }
+    // 签名匹配检查（去 self）：impl 方法签名 vs port 方法签名
+    var mi3: i64 = 0
+    while mi3 < nport_m {
+        var full2 = intern.lookup(mnames[mi3])
+        var sig = sstate.fn_sig(full2)
+        if sig < 0 {
+            sm_err_line = s_lines[im]
+            sm_err_col = s_cols[im]
+            sm_err_msg = "内部错误：impl 方法 '" + full2 + "' 无签名"
+            return -1
+        }
+        var pnp = sstate.port_method_nparams(pi, mi3)  // 含 self
+        var fnp = sg_nparams[sig]
+        if fnp != pnp {
+            sm_err_line = s_lines[im]
+            sm_err_col = s_cols[im]
+            sm_err_msg = "impl 方法 '" + sstate.port_method_name(pi, mi3) + "' 参数个数与 port 签名不匹配：期望 " + to_string(pnp) + "，实际 " + to_string(fnp)
+            return -1
+        }
+        // 参数类型逐项匹配（self 槽跳过；其余精确相等——第一版不做隐式转换）
+        var j: i64 = 1
+        var sig_ok: bool = true
+        while j < pnp {
+            var want = sstate.port_method_param(pi, mi3, j)
+            var got = sp_tys[sg_off[sig] + j]
+            if want != got {
+                sig_ok = false
+                break
+            }
+            j = j + 1
+        }
+        if !sig_ok {
+            sm_err_line = s_lines[im]
+            sm_err_col = s_cols[im]
+            sm_err_msg = "impl 方法 '" + sstate.port_method_name(pi, mi3) + "' 参数类型与 port 签名不匹配（port 方法参数必须类型一致）"
+            return -1
+        }
+        var want_ret = sstate.port_method_ret(pi, mi3)
+        if sg_ret[sig] != want_ret {
+            sm_err_line = s_lines[im]
+            sm_err_col = s_cols[im]
+            sm_err_msg = "impl 方法 '" + sstate.port_method_name(pi, mi3) + "' 返回类型与 port 签名不匹配：期望 " + types.type_name(want_ret) + "，实际 " + types.type_name(sg_ret[sig])
+            return -1
+        }
+        mi3 = mi3 + 1
+    }
+    // 登记 impl 记录（vtable 生成 / 约束校验 / 提升判定共用）
+    if sstate.reg_impl(pi, si, mnames) < 0 {
+        sm_err_line = s_lines[im]
+        sm_err_col = s_cols[im]
+        return -1
+    }
+    return 0
+}
+
+// 顶层 enum 声明登记分派（泛型语法 2026-08-15，对齐 collect_struct_decl）：
+// children[0] == N_TYPE_PARAMS → 泛型 enum 模板登记（sstate.reg_generic →
+// gt_* 表，gty_is_struct=2 表示 enum；**本阶段只登记不实例化**——模板变体
+// payload 的 TypeVar 类型无法静态解析，collect_enum_variants 会报错，故跳过）；
+// 否则普通 reg_enum + set_enum_name。返回 0 成功 / -1 错误（sm_err_* 已置）。
+func collect_enum_decl(s: i64) -> i64 {
+    var nm = sstate.name_str(s)
+    if sstate.nchild(s) > 0 {
+        var slot0 = sstate.child(s, 0)
+        if slot0 >= 0 {
+            var st0 = s_tags[slot0]
+            if st0 == S_N_TYPE_PARAMS {
+                var gret = sstate.reg_generic(nm, s, 2)
+                if gret < 0 {
+                    return -1
+                }
+                return 0
+            }
+        }
+    }
+    // enum 与函数名冲突（对齐 Rust check_struct_namespace 的构造调用歧义拦截）
+    var enid = intern.intern(nm)
+    if sstate.bs_find(fn_keys, enid) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "枚举名 '" + nm + "' 与函数名冲突"
+        return -1
+    }
+    // enum 与 struct 名冲突（类型解析先查 st_keys，同名会使 enum 不可达）
+    if sstate.bs_find(st_keys, enid) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "枚举名 '" + nm + "' 与 struct 名冲突"
+        return -1
+    }
+    var idx = sstate.reg_enum(enid)
+    if idx < 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        return -1
+    }
+    // p.9.22.6 全量符号表：enum 声明登记（kind 2；type = enum_of(idx)）。
+    xref.reg_decl(enid, 2, types.enum_of(idx), s)
+    // enum 名登记（types.type_name / 泛型 mangling 片段还原用；追加式与
+    // reg_enum 索引顺序一致）
+    types.set_enum_name(idx, nm)
+    return 0
+}
+
+// 命名空间体内递归查找 enum 节点（含嵌套 namespace）
+func find_enum_in_ns(blk: i64, name: string) -> i64 {
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(blk, i)
+        var tag = s_tags[s]
+        if tag == S_N_ENUM {
+            if sstate.name_str(s) == name {
+                return s
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var j: i64 = 0
+            while j < nsegs {
+                sstate.ns_push(s_names[sstate.child(s, j)])
+                j = j + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var found = find_enum_in_ns(body, name)
+            j = 0
+            while j < nsegs {
+                sstate.ns_pop()
+                j = j + 1
+            }
+            if found >= 0 {
+                return found
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 命名空间体内递归查找函数节点（含嵌套 namespace）
+func find_fn_in_ns(blk: i64, full: string) -> i64 {
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(blk, i)
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            if sstate.ns_full_name(sstate.name_str(s)) == full {
+                return s
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var j: i64 = 0
+            while j < nsegs {
+                var seg = sstate.child(s, j)
+                sstate.ns_push(s_names[seg])
+                j = j + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var found = find_fn_in_ns(body, full)
+            j = 0
+            while j < nsegs {
+                ns_top = ns_top - 1
+                j = j + 1
+            }
+            if found >= 0 {
+                return found
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+}

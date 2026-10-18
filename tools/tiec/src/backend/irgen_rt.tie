@@ -1,0 +1,40 @@
+type tie<class>
+// compiler/backend/irgen_rt.tie —— 生成器运行时错误处理/回调/默认值 子模块（try/panic/catch/cb_ptr/default_val）
+// ============================================================
+// 从 irgen.tie 的运行时控制片拆出（同 namespace irgen 文本内联跨文件）；本文件只含函数，
+// 不含顶层全局 var。依赖经主文件 import 链内联可达，不重复 import。
+namespace irgen {
+
+
+// ---------- 一期并发 A4 执行层：per-actor 运行期（纯 codegen 零运行时） ----------
+// per-actor record 布局（字节偏移；纯 codegen 直接分配原始缓冲）：
+//   @0   : i64 magic（0xAC70524E 校验句柄/记录）
+//   @8   : mailbox_ch（per-actor 消息通道句柄，ch_open() 返回值；消息入口经
+//           ch_send 入队 method_id 令牌，actor_task 经 ch_recv 取出）
+// p.9.5.x 零锁清理：废弃 @8 lock(40B)/@48 cv 死字段，状态零锁约束。
+// 布局常量用内联字面量（namespace 体内不允许 const/var 声明）。
+
+
+// ---------- p.9.5.x T2 actor 消息队列原语（LLVM 原子指令直接生成，seq_cst） ----------
+// 原子操作 = 非锁（状态零锁约束）；record 槽地址由 s21_gep 生成（kind 0 值）。
+// 内存序统一 seq_cst（4）：正确性优先，actor 消息规模下性能可忽略。
+
+
+// ==================== Step4b-2：actor 方法 dispatch + 同步 RPC（B 组多参数） ====================
+// per-actor dispatch 函数 `actor_disp_<aidx>`（fn(ptr env, i64 mid) -> i64）：
+// 按 method_id switch 调用对应 handler（actor_m_<aidx>_<mi>），缺省返回 0。
+// handler 签名 fn(i64 rec, 方法形参...) -> ret，内部把 actor 私有状态字段绑定到
+// record 槽（scope_put 字段 → gep(rec, foff)），再编译方法 body（tig_block_stmts）。
+// 二者于模块生成开始时急切生成（gen_actor_dispatch_eager），run 把 dispatch 地址
+// 存 record @112；actor_task 零锁等 pending → 置 0 → 跑 dispatch → 存 result@96/
+// done@104 → 唤醒调用方。方法实参从 record 消息槽段 @32+k*8 读出（可变参数）。
+
+
+// ---------- 阶段1块2：yield 排空 + actor 等待循环 + 同步 RPC（简单执行体承载） ----------
+
+
+}
+
+import "./irgen_rt_p1.tie"
+import "./irgen_rt_p2.tie"
+import "./irgen_rt_p3.tie"

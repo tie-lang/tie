@@ -1,0 +1,777 @@
+type tie<class>
+// compiler/backend/irgen_arith_p1.tie —— irgen_arith 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 irgen_arith.tie。
+namespace irgen {
+// P1 数据流箭头生成（仅裸 Var 目标到达——调用/下标/字段目标已在解析器脱糖）。
+// Fwd(->)：数据=LHS 目标=RHS；Rev(<-)：数据=RHS 目标=LHS。
+// 目标 = 函数类型 → 传参（`f(data)`，data 作唯一实参，tig_call_fn_value）；
+// 目标 = 数据变量 → 赋值 store（对齐 N_ASSIGN 的 tag-103 逻辑）+ 返回数据值。
+func tig_arrow(op: i64, lhs: i64, rhs: i64) -> i64 {
+    var data_n = lhs
+    var tgt_n = rhs
+    if op == B_ARROW_REV {
+        data_n = rhs
+        tgt_n = lhs
+    }
+    var tgt_ty = node_types[tgt_n]
+    if tgt_ty >= 0 && types.is_fn(tgt_ty) {
+        // 传参：f(data)
+        var fv = tig_expr(tgt_n)
+        if fv < 0 {
+            return -1
+        }
+        var dv = tig_expr(data_n)
+        if dv < 0 {
+            return -1
+        }
+        var argvals: table<i64> = table_new_i64()
+        var argkinds: table<i64> = table_new_i64()
+        table_push(argvals, dv)
+        table_push(argkinds, 0)
+        return tig_call_fn_value(fv, tgt_ty, argvals, argkinds)
+    }
+    // 赋值：store 数据值到变量槽 + 返回该值（目标槽须先保存——tig_expr(data)
+    // 会覆盖 g_lookup_* 全局槽）
+    var nm = sstate.name_str(tgt_n)
+    var nid = interner.intern(nm)
+    if scope_get_global(nid) < 0 {
+        sm_err_msg = "箭头赋值目标 '" + nm + "' 未入作用域（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var tgt_alloca = g_lookup_alloca
+    var tgt_global = g_lookup_is_global
+    var tgt_ty2 = g_lookup_ty
+    var dv2 = tig_expr(data_n)
+    if dv2 < 0 {
+        return -1
+    }
+    // S1.3 数字族转换（对齐 N_ASSIGN 的 C2/C3）
+    var vty = node_types[data_n]
+    if vty >= 0 && (types.is_int(vty) || types.is_float(vty)) &&
+        (types.is_int(tgt_ty2) || types.is_float(tgt_ty2)) && vty != tgt_ty2 {
+        var cv = tig_coerce(dv2, vty, tgt_ty2)
+        if cv < 0 {
+            return -1
+        }
+        dv2 = cv
+    }
+    var st = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st, tgt_ty2, 2)
+    ir.add_operand(st, dv2, 0)
+    if tgt_global > 0 {
+        ir.add_operand(st, tgt_alloca, 3)  // OK_GLOBAL 全局地址（池 id）
+    } else {
+        ir.add_operand(st, tgt_alloca, 0)  // 本地 alloca
+    }
+    return dv2
+}
+
+// 二元运算：生成左右操作数后按 op 生成算术/比较/逻辑/位运算指令。
+// 字符串操作（+ 拼接 / 比较）走运行时桥（str_cat / strcmp），由 node_types 判定。
+// && || 走短路（cond_br + phi 汇合，对齐 Rust ir.rs 短路模式）。
+// --check-bounds 下的除零检查：除数为 0 → 诊断 + exit(1)。
+// 与表越界检查共用同一范式（panic 块 + printf + exit + 死 br）。
+func tig_div_zero_check(rv: i64, rty: i64) -> i64 {
+    if !g_check_bounds {
+        return 0
+    }
+    // ★ `< 0` 才是「未知」：**TK_I8 = 0 是合法类型 id**（node_types 未登记哨兵为 -1）。
+    //   曾用 `<= 0` ⇒ i8 除数被误判为未知而**跳过检查**。
+    var rt = rty
+    if rt < 0 || !types.is_int(rt) {
+        // 浮点除数：`1.0 / 0.0` 得 inf/nan 是 IEEE 定义行为（大量程序依赖它），
+        // **不检查**；类型未知也不检查（避免对 double 生成 icmp）。
+        return 0
+    }
+    // ★ 与零比较用**除数自型**常量，不做 sext —— 除数若是 i128，`sext i128 to i64`
+    //   是**非法 IR**（实测 i128_full 编译挂；该 bug 由本检查引入并已修）。
+    var z = tig_cmp_const(rv, 0, 0, rt)          // 除数 == 0（自型比较）
+    var pnb = ir.new_block(g_cur_func, interner.intern("dz.n"))   // 除零 panic
+    var okb = ir.new_block(g_cur_func, interner.intern("dz.o"))   // 正常继续
+    var cbr = ir.new_inst(g_cur_block, 31, -1)                    // cond_br
+    ir.add_operand(cbr, z, 0)
+    ir.add_operand(cbr, pnb, 1)
+    ir.add_operand(cbr, okb, 1)
+    g_cur_block = pnb
+    var fmt = interner.intern("division by zero in " + g_cur_fn_name + "\n")
+    var pin = ir.new_inst(g_cur_block, 41, types.named(TK_I32))   // call_vararg
+    ir.add_operand(pin, fmt, 0)
+    // 与 `panic`/越界检查同一失败语义（受 catch_panic 捕获 → longjmp；未受捕 → exit）
+    tig_panic_tail(okb)
+    return 0
+}
+
+func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
+    // P1 数据流箭头：非算术/比较——`x <- data` / `data -> x`（裸 Var 目标）。
+    // 目标 = 函数 → 传参（data 作唯一实参）；= 变量 → 赋值 store + 值。
+    if op == B_ARROW_FWD || op == B_ARROW_REV {
+        return tig_arrow(op, lhs, rhs)
+    }
+    // p.8.1.5 `?:` 安全默认值（Option<T> ?: T）→ cond_br + phi 解包
+    if op == B_ELVIS {
+        return tig_elvis(lhs, rhs)
+    }
+    // p.8.2.4 运算符重载：任一操作数为用户 struct 且声明对应 op_ 方法 → 发射方法调用
+    //（调度规则与 sinfer.try_op_overload_binary 一致：左 struct 优先，其次右，两侧内置绝不）。
+    if op >= 0 && op <= 10 {
+        var olhs_t = node_types[lhs]
+        var orhs_t = node_types[rhs]
+        if olhs_t >= 0 && types.kind(olhs_t) == K_STRUCT {
+            var of = op_method_full_ir(olhs_t, op, 1)
+            if of != "" {
+                var oargs: table<i64> = table_new_i64()
+                table_push(oargs, rhs)
+                return tig_op_overload(of, lhs, olhs_t, oargs)
+            }
+        }
+        if orhs_t >= 0 && types.kind(orhs_t) == K_STRUCT {
+            var of2 = op_method_full_ir(orhs_t, op, 1)
+            if of2 != "" {
+                var oargs2: table<i64> = table_new_i64()
+                table_push(oargs2, lhs)
+                return tig_op_overload(of2, rhs, orhs_t, oargs2)
+            }
+        }
+    }
+    // trit 判定先行（对齐 Rust tig_binary 分派顺序）：trit 的 &&/|| 是 Kleene
+    // min/max（非短路），混合 trit×i64 走 gen_binary_trit——短路分支只服务 bool
+    var lhs_t = node_types[lhs]
+    var rhs_t = node_types[rhs]
+    if lhs_t == types.named(TK_TRIT) || rhs_t == types.named(TK_TRIT) {
+        var lv0 = tig_expr(lhs)
+        if lv0 < 0 {
+            return -1
+        }
+        var rv0 = tig_expr(rhs)
+        if rv0 < 0 {
+            return -1
+        }
+        // 分流：两侧都 trit → Kleene/饱和/icmp i8；一侧 trit（×i64 混合）→ sext
+        if lhs_t == types.named(TK_TRIT) && rhs_t == types.named(TK_TRIT) {
+            return tig_trit_bin(op, lv0, rv0)
+        }
+        return tig_trit_mixed(op, lhs_t == types.named(TK_TRIT), lv0, rv0)
+    }
+    // 逻辑短路：&&（11）/ ||（12）→ cond_br + phi（两侧类型 i1）
+    if op == 11 || op == 12 {
+        return tig_logic_short(op, lhs, rhs)
+    }
+    var lv = tig_expr(lhs)
+    if lv < 0 {
+        return -1
+    }
+    var rv = tig_expr(rhs)
+    if rv < 0 {
+        return -1
+    }
+    // ★ --check-bounds 下的**除零/模零**检查（op 3=`/` 4=`%` 24=`\` 26=`%%`）。
+    //   无检查时 x86 的 `sdiv`/`srem` 遇除数为 0 触发硬件异常，实测**进程挂死**
+    //   （不是崩溃也不是陷阱：rc=124 超时）⇒ 比崩溃更难排查。`10 / 2` 正常。
+    //   判据「除数 == 0」对有无符号一致；放这里可同时覆盖窄整数与 i64 两条路径。
+    if (op == 3 || op == 4 || op == 24 || op == 26) && tig_cb_target() == 1 {
+        if tig_div_zero_check(rv, node_types[rhs]) < 0 {
+            return -1
+        }
+    }
+    // p.9.11.9 checked 运算（+? -? *? op 21-23）：整数溢出即运行期报错。
+    // 语义层已保证两侧为整数；此处直接分派（lv/rv 已求值，避免二次求值副作用）。
+    if op >= 21 && op <= 23 {
+        return tig_check_bin(op, lv, rv, lhs_t, rhs_t)
+    }
+    // 字符串判定（node_types 语义类型；driver 树比较/拼接两侧为 string）
+    var lhs_str = lhs_t == types.named(TK_STR)
+    var rhs_str = rhs_t == types.named(TK_STR)
+    // p.9.13.3 `+` 扩展：一侧 string、另一侧标量（int/float/bool）→ 把标量侧
+    // 转成字符串再拼接。**顺序严格按左右操作数**（`5 + "x"` 得 "5x"，不是 "x5"）——
+    // 两侧各自转字符串，字符串侧原样透传，再 str_cat(lhs_s, rhs_s)。
+    // 转换用值级 helper（`tig_scalar_to_str`）直接做，不造调用节点。
+    if op == 0 && lhs_str != rhs_str {
+        var ls = lv
+        if !lhs_str {
+            ls = tig_scalar_to_str(lv, lhs_t)
+            if ls < 0 {
+                return -1
+            }
+        }
+        var rs = rv
+        if !rhs_str {
+            rs = tig_scalar_to_str(rv, rhs_t)
+            if rs < 0 {
+                return -1
+            }
+        }
+        var cat = ir.new_inst(g_cur_block, 56, types.named(TK_STR))  // str_cat
+        ir.add_operand(cat, ls, 0)
+        ir.add_operand(cat, rs, 0)
+        return ir.get_value(cat)
+    }
+    if lhs_str || rhs_str {
+        return tig_binary_str(op, lv, rv)
+    }
+    // 浮点判定（f64/f32 字面量与算术；对齐 Rust：类型以一侧为准，语义已统一）。
+    // f32 算术语义（S1.3，2026-10-09 落实）：操作数提升 f64 计算，结果按语义
+    // 类型回窄——f32+f32 → f32（sinfer rt=lhs）；混 f64 → f64（sinfer 816 行）。
+    // 此前操作数/结果类型与语义层脱节（f32 值落 double），任何 f32 算术路径
+    // 在 LLVM 层类型错。
+    var lhs_f = lhs_t == types.named(TK_F64) || lhs_t == types.named(TK_F32)
+    var rhs_f = rhs_t == types.named(TK_F64) || rhs_t == types.named(TK_F32)
+    if lhs_f || rhs_f {
+        var fsem = types.named(TK_F64)
+        if lhs_t == types.named(TK_F32) && rhs_t == types.named(TK_F32) {
+            fsem = types.named(TK_F32)
+        }
+        var lf = tig_coerce(lv, lhs_t, types.named(TK_F64))
+        var rf = tig_coerce(rv, rhs_t, types.named(TK_F64))
+        return tig_binary_float(op, lf, rf, fsem)
+    }
+    // 元组 ==/!=：逐字段递归比较（语义层已校验两侧为结构相等元组；
+    // < > <= >= 在语义层已被拦截，此处仅处理 5/6）
+    if types.kind(lhs_t) == K_TUPLE {
+        return tig_tuple_compare(op, lhs, rhs, lv, rv)
+    }
+    // op 码（ast）：0=+ 1=- 2=* 3=/ 4=% 5== 6!= 7< 8> 9<= 10>= 11&& 12||
+    // 13& 14| 15^ 16<< 17>>（逻辑已在短路分支处理；此处为位运算）
+    // tie-IR opcode：add(0) sub(1) mul(2) div(3) mod(4) icmp(12) and(6) or(7)
+    // xor(8) shl(10) shr(11)
+    var iop: i64 = -1
+    if op == 0 {
+        iop = 0
+    } else if op == 1 {
+        iop = 1
+    } else if op == 2 {
+        iop = 2
+    } else if op == 3 {
+        iop = 3
+    } else if op == 24 {
+        // p.9.0-S.7：整除 `\` 的 floor 语义由 tig_floor_divmod 前置处理（见本函数
+        // 窄整数分支与 i64 分支的拦截）；此处的 sdiv 保留为**防御**——若将来新增
+        // 未拦截的调用路径，退化为截断除而非生成非法 IR。
+        iop = 3
+    } else if op == 4 {
+        iop = 4
+    } else if op == 26 {
+        // p.9.0-S.7：`%%` 同理由 tig_floor_divmod 前置处理；此处 srem 为防御兜底。
+        iop = 4
+    } else if op == 5 {
+        iop = 12
+    } else if op == 6 {
+        iop = 12
+    } else if op == 7 {
+        iop = 12
+    } else if op == 8 {
+        iop = 12
+    } else if op == 9 {
+        iop = 12
+    } else if op == 10 {
+        iop = 12
+    } else if op == 13 {
+        iop = 6  // &
+    } else if op == 14 {
+        iop = 7  // |
+    } else if op == 15 {
+        iop = 8  // ^
+    } else if op == 16 {
+        iop = 10  // <<
+    } else if op == 17 {
+        iop = 11  // >>
+    } else {
+        return -1
+    }
+    // S1.3 A1 窄整数运算：任一侧不是 i64 → 按公共宽度生成（窄侧拓宽）。
+    // 公共宽度 = 与 sinfer 一致的 L2 字面量上下文推断：字面量侧常量在
+    // 对方窄类型范围 → 对方类型；两侧变量 → 宽者；两侧字面量 → i64 默认。
+    if types.is_int(lhs_t) && types.is_int(rhs_t) &&
+        (lhs_t != types.named(TK_I64) || rhs_t != types.named(TK_I64)) {
+        var common = lhs_t
+        var l_lit = s_tags[lhs] == 0
+        var r_lit = s_tags[rhs] == 0
+        if l_lit && !r_lit {
+            if lit_in_range_irgen(s_vals[lhs], rhs_t) {
+                common = rhs_t
+            } else if stype.int_width(rhs_t) > stype.int_width(lhs_t) {
+                common = rhs_t
+            } else {
+                common = lhs_t
+            }
+        } else if r_lit && !l_lit {
+            if lit_in_range_irgen(s_vals[rhs], lhs_t) {
+                common = lhs_t
+            } else if stype.int_width(lhs_t) > stype.int_width(rhs_t) {
+                common = lhs_t
+            } else {
+                common = rhs_t
+            }
+        } else if !l_lit && !r_lit {
+            if stype.int_width(rhs_t) > stype.int_width(lhs_t) {
+                common = rhs_t
+            }
+        } else {
+            // 两侧字面量：默认 i64——但后缀字面量（i128/u128 等）按宽者
+            // （`1i128 << 64`：lhs 明确 i128，common 须 i128，否则 trunc 到
+            // i64 类型错；批次 2 修复）
+            if stype.int_width(rhs_t) > stype.int_width(lhs_t) {
+                common = rhs_t
+            } else if stype.int_width(lhs_t) > stype.int_width(rhs_t) {
+                common = lhs_t
+            } else {
+                common = types.named(TK_I64)
+            }
+        }
+        // p.9.0-S.7：整除 `\` / 成对取余 `%%` 按公共宽度走 floor 语义（规范 §3.3）
+        if op == 24 || op == 26 {
+            var lf = tig_widen(lv, lhs_t, common)
+            if lf < 0 {
+                return -1
+            }
+            var rf = tig_widen(rv, rhs_t, common)
+            if rf < 0 {
+                return -1
+            }
+            return tig_floor_divmod(op, lf, rf, common)
+        }
+        return tig_narrow_bin(op, iop, lv, rv, lhs_t, rhs_t, common)
+    }
+    // p.6.8.1 typed ptr ==/!=（一等指针相等）：指针经 ptrtoint 后整数 icmp。
+    // 语义层仅放行 ptr==/ptr!=（见 sinfer 比较分支）；< > <= >= 已被拦截。
+    // 指针比较转 i64 整型比较，避免 llvmgen icmp 对 alloca/gep 地址的 cmp_ty
+    // 推导偏差（ins_ty 承载元素语义类型非 ptr）——先正确后性能，等值语义无损。
+    if types.is_ptr(lhs_t) || types.is_ptr(rhs_t) {
+        return tig_binary_ptr(op, lv, rv, lhs_t, rhs_t)
+    }
+    // p.9.0-S.7：整除 `\` / 成对取余 `%%` 的 floor 语义（i64 路径；窄整数见上）
+    if op == 24 || op == 26 {
+        return tig_floor_divmod(op, lv, rv, types.named(TK_I64))
+    }
+    var inst = ir.new_inst(g_cur_block, iop, types.named(3))
+    ir.add_operand(inst, lv, 0)
+    ir.add_operand(inst, rv, 0)
+    if op >= 5 && op <= 10 {
+        // 比较：追加比较码立即数（0=eq 1=ne 2=lt 3=gt 4=le 5=ge）
+        var cmp: i64 = 0
+        if op == 5 {
+            cmp = 0
+        } else if op == 6 {
+            cmp = 1
+        } else if op == 7 {
+            cmp = 2
+        } else if op == 8 {
+            cmp = 3
+        } else if op == 9 {
+            cmp = 4
+        } else if op == 10 {
+            cmp = 5
+        }
+        ir.add_operand(inst, cmp, 2)
+    }
+    return ir.get_value(inst)
+}
+
+// 窄整数公共宽度提升（S1.3 A1）：i8+i16 等混合宽度运算，窄侧先拓宽到
+// 公共宽度（有符号 sext / 无符号 zext）。同宽度直传（LLVM 位模式一致）。
+// src 宽于 dst（字面量 i64 → 窄公共宽度）→ trunc 缩窄（常量回绕语义）。
+// 返回新值 id（未拓宽原样返回）。
+func tig_ptrtoint(v: i64) -> i64 {
+    var pi = ir.new_inst(g_cur_block, 24, types.named(TK_I64))
+    ir.add_operand(pi, v, 0)
+    return ir.get_value(pi)
+}
+
+// p.6.8.1 typed ptr ==/!=：指针经 ptrtoint 转 i64 后整数 icmp（等值语义无损）。
+// op 仅 5(==)/6(!=)——语义层已拦截 < > <= >=。左右若是指针则各自 ptrtoint；
+// 非指针侧（理论上不出现）原样保留。
+func tig_binary_ptr(op: i64, lv: i64, rv: i64, lhs_t: i64, rhs_t: i64) -> i64 {
+    var l = lv
+    var r = rv
+    if types.is_ptr(lhs_t) {
+        l = tig_ptrtoint(l)
+    }
+    if types.is_ptr(rhs_t) {
+        r = tig_ptrtoint(r)
+    }
+    var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(ic, l, 0)
+    ir.add_operand(ic, r, 0)
+    if op == 5 {
+        ir.add_operand(ic, 0, 2)  // eq
+    } else {
+        ir.add_operand(ic, 1, 2)  // ne
+    }
+    return ir.get_value(ic)
+}
+
+func tig_widen(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
+    if src_ty == dst_ty {
+        return v
+    }
+    var sw = stype.int_width(src_ty)
+    var dw = stype.int_width(dst_ty)
+    if sw == dw {
+        // 同宽不同符号（u128→i128 等）：位模式一致，直传——LLVM 不允许
+        // 同宽 sext/zext（曾生成 zext i128 to i128 类型错；批次 2 修复）
+        return v
+    }
+    if sw > dw {
+        // 缩窄：trunc（opcode 37）
+        var tr = ir.new_inst(g_cur_block, 37, dst_ty)
+        ir.add_operand(tr, src_ty, 2)
+        ir.add_operand(tr, v, 0)
+        return ir.get_value(tr)
+    }
+    var ss = stype.is_signed(src_ty)
+    if ss {
+        return tig_sext(v, src_ty, dst_ty)
+    }
+    // 无符号：zext（opcode 29）
+    var z = ir.new_inst(g_cur_block, 29, dst_ty)
+    ir.add_operand(z, src_ty, 2)
+    ir.add_operand(z, v, 0)
+    return ir.get_value(z)
+}
+
+// 值类型转换（S1.3 C2/C3/as_* 的 IR 层）：src 类型值 → dst 类型。
+// 覆盖：同符号整数拓宽（sext/zext）、缩窄（trunc）、int→float（sitofp）、
+// float→int（fptosi）、f32↔f64（fpext/fptrunc）；同宽 i↔u 位模式一致直传；
+// 字符串/表/聚合类型不做转换（原样返回）。返回新值 id。
+func tig_coerce(v: i64, src: i64, dst: i64) -> i64 {
+    if src == dst || src < 0 || dst < 0 {
+        return v
+    }
+    // 整数族
+    if types.is_int(src) && types.is_int(dst) {
+        var sw = stype.int_width(src)
+        var dw = stype.int_width(dst)
+        if sw == dw {
+            return v  // 同宽（含 i↔u）：位模式一致，直传
+        }
+        if sw < dw {
+            return tig_widen(v, src, dst)  // 拓宽
+        }
+        // 缩窄：trunc（opcode 37）
+        var tr = ir.new_inst(g_cur_block, 37, dst)
+        ir.add_operand(tr, src, 2)
+        ir.add_operand(tr, v, 0)
+        return ir.get_value(tr)
+    }
+    // int → float：sitofp（opcode 28）
+    if types.is_int(src) && types.is_float(dst) {
+        var s = ir.new_inst(g_cur_block, 28, dst)
+        ir.add_operand(s, src, 2)
+        ir.add_operand(s, v, 0)
+        return ir.get_value(s)
+    }
+    // float → int：fptosi（opcode 38，向零截断）
+    if types.is_float(src) && types.is_int(dst) {
+        var ft = ir.new_inst(g_cur_block, 38, dst)
+        ir.add_operand(ft, src, 2)
+        ir.add_operand(ft, v, 0)
+        return ir.get_value(ft)
+    }
+    // f32 ↔ f64：fpext/fptrunc（opcode 39）
+    if types.is_float(src) && types.is_float(dst) && src != dst {
+        var fx = ir.new_inst(g_cur_block, 39, dst)
+        ir.add_operand(fx, src, 2)
+        ir.add_operand(fx, v, 0)
+        return ir.get_value(fx)
+    }
+    return v  // 其他类型：原样
+}
+
+// 常量值是否在类型范围内（与 sinfer.lit_in_range 同套边界；irgen 侧副本）
+func lit_in_range_irgen(v: i64, ty: i64) -> bool {
+    if ty == TK_I8 && (v < -128 || v > 127) {
+        return false
+    }
+    if ty == TK_I16 && (v < -32768 || v > 32767) {
+        return false
+    }
+    if ty == TK_I32 && (v < -2147483648 || v > 2147483647) {
+        return false
+    }
+    if ty == TK_U8 && (v < 0 || v > 255) {
+        return false
+    }
+    if ty == TK_U16 && (v < 0 || v > 65535) {
+        return false
+    }
+    if ty == TK_U32 && (v < 0 || v > 4294967295) {
+        return false
+    }
+    return true
+}
+
+// 窄整数二元运算（S1.3 A1）：整数操作数按公共宽度（宽者）生成算术指令，
+// 窄侧先 sext/zext 拓宽——LLVM add i8 直接支持但两侧必须同型，i8+i16
+// 混合须先提升。比较（icmp）操作数同样公共宽度，结果仍 i1（LLVM 自动）。
+// 返回结果值 id。
+func tig_narrow_bin(op: i64, iop: i64, lv: i64, rv: i64, lt: i64, rt: i64, common: i64) -> i64 {
+    var l2 = tig_widen(lv, lt, common)
+    if l2 < 0 {
+        return -1
+    }
+    var r2 = tig_widen(rv, rt, common)
+    if r2 < 0 {
+        return -1
+    }
+    // S1.3 B2 移位语义（无 UB）：窄类型移位量 >= 位宽 → 有定义结果。
+    // 左移（16）→ 0；算术右移（17，有符号）→ 符号位（0 或 -1，用
+    // ashr(位宽-1) 求）；逻辑右移 → 0。LLVM shift 该场景 poison，select 保护。
+    if op == 16 || op == 17 {
+        var w = stype.int_width(common)
+        var sh_bad = tig_cmp_const(r2, 5, w, common)  // 移位量 >= w
+        var z3 = tig_int_lit_ty(0, common)
+        var sv3 = ir.new_inst(g_cur_block, iop, common)
+        ir.add_operand(sv3, l2, 0)
+        ir.add_operand(sv3, r2, 0)
+        var svv = ir.get_value(sv3)
+        if op == 17 && stype.is_signed(common) {
+            var s4 = ir.new_inst(g_cur_block, 11, common)  // ashr
+            ir.add_operand(s4, l2, 0)
+            ir.add_operand(s4, w - 1, 2)
+            return tig_select_i(sh_bad, ir.get_value(s4), svv, common)
+        }
+        return tig_select_i(sh_bad, z3, svv, common)
+    }
+    var inst = ir.new_inst(g_cur_block, iop, common)
+    ir.add_operand(inst, l2, 0)
+    ir.add_operand(inst, r2, 0)
+    if op >= 5 && op <= 10 {
+        // 比较：追加比较码立即数（与主整数分支同款）
+        var cmp: i64 = 0
+        if op == 5 {
+            cmp = 0
+        } else if op == 6 {
+            cmp = 1
+        } else if op == 7 {
+            cmp = 2
+        } else if op == 8 {
+            cmp = 3
+        } else if op == 9 {
+            cmp = 4
+        } else if op == 10 {
+            cmp = 5
+        }
+        ir.add_operand(inst, cmp, 2)
+    }
+    return ir.get_value(inst)
+}
+
+// icmp 快捷（cc：0=eq 1=ne 2=slt 3=sgt 4=sle 5=sge 6=ult 7=ugt 8=ule 9=uge）
+func tig_icmp_c(v0: i64, v1: i64, cc: i64) -> i64 {
+    var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(ic, v0, 0)
+    ir.add_operand(ic, v1, 0)
+    ir.add_operand(ic, cc, 2)
+    return ir.get_value(ic)
+}
+
+// 比较 v0 与字面 0（IMM 操作数，非值引用）。
+// 修复（段拷 bug 根因）：旧 `tig_icmp_c(v, 0, cc)` 把 0 作 VALUE 操作数 → 引用
+// 「值 id 0」（模块首个常量，如 const 8），跨函数悬挂引用 + 与形参 %0 撞号 →
+// renumber 误判为形参引用 → IR 类型错误（`icmp sle i64 %X, %0`，%0=ptr）。
+// 对齐 is_null 内置的写法（立即数 0 必须 IMM）：llvmgen icmp 对 ptr 上下文自动
+// 把字面 0 转 null（`icmp eq ptr %kp, null`）。
+func tig_cmp_zero(v0: i64, cc: i64) -> i64 {
+    var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(ic, v0, 0)
+    ir.add_operand(ic, 0, 2)  // IMM 0（llvmgen ptr 上下文 → null）
+    ir.add_operand(ic, cc, 2)
+    return ir.get_value(ic)
+}
+
+// p.6.5.2 修复（直面编译器缺陷）：语句/表达式条件统一归一化为 i1——
+// cond_br 的条件操作数必须是 i1，而字面量/整型条件（`while 1`、`if x` x:i64）
+// 过去把 i64 值直接喂给 cond_br（LLVM 校验失败：-O0 报 invalid redefinition、
+// -O2 报 "defined with type 'i64' but expected 'i1'"）。Bool 型直接用；
+// 整型族（i8..u128/char/trit）经 icmp ne 0 转 i1（非零即真）；其余原样
+//（浮点/其它不该出现在条件位，保持旧行为，语义层应有拦截）。
+func tig_is_int_ty(t: i64) -> bool {
+    if t == types.named(TK_I8) || t == types.named(TK_I16) {
+        return true
+    }
+    if t == types.named(TK_I32) || t == types.named(TK_I64) || t == types.named(TK_I128) {
+        return true
+    }
+    if t == types.named(TK_U8) || t == types.named(TK_U16) {
+        return true
+    }
+    if t == types.named(TK_U32) || t == types.named(TK_U64) || t == types.named(TK_U128) {
+        return true
+    }
+    if t == types.named(TK_CHAR) || t == types.named(TK_TRIT) {
+        return true
+    }
+    return false
+}
+
+func tig_cond_to_bool(cv: i64, ty: i64) -> i64 {
+    if ty == types.named(TK_BOOL) {
+        return cv
+    }
+    if tig_is_int_ty(ty) {
+        return tig_icmp_c(cv, tig_int_lit_ty(0, ty), 1)  // ne 0 → i1
+    }
+    return cv
+}
+
+// and i1 快捷
+func tig_and_i1(v0: i64, v1: i64) -> i64 {
+    var a2 = ir.new_inst(g_cur_block, 6, types.named(TK_BOOL))
+    ir.add_operand(a2, v0, 0)
+    ir.add_operand(a2, v1, 0)
+    return ir.get_value(a2)
+}
+
+// or i1 快捷
+func tig_or_i1(v0: i64, v1: i64) -> i64 {
+    var o2 = ir.new_inst(g_cur_block, 7, types.named(TK_BOOL))
+    ir.add_operand(o2, v0, 0)
+    ir.add_operand(o2, v1, 0)
+    return ir.get_value(o2)
+}
+
+// 常量比较（值 vs 立即数常量，类型跟随值）
+func tig_cmp_const(v: i64, cc: i64, cval: i64, cty: i64) -> i64 {
+    var cv = tig_int_lit_ty(cval, cty)
+    return tig_icmp_c(v, cv, cc)
+}
+
+// select i1 快捷（opcode 34）：cond ? tval : fval（同类型）
+func tig_select_i(cond: i64, tval: i64, fval: i64, ty: i64) -> i64 {
+    var sl = ir.new_inst(g_cur_block, 34, ty)
+    ir.add_operand(sl, cond, 0)
+    ir.add_operand(sl, tval, 0)
+    ir.add_operand(sl, fval, 0)
+    return ir.get_value(sl)
+}
+
+// ---------- p.9.0-S.7 整除 `\` / 成对取余 `%%` 的 floor 语义（规范 §3.3）----------
+// 规范定义：整除给出**向下取整**的商，`%%` 给出与之配对的余数（余数符号跟随除数），
+// 二者满足 a == (a \ b) * b + (a %% b)。C 风格截断在负数上不满足该式。
+//
+// 实现：先取截断结果（sdiv / srem），当**余数非零且与除数异号**时调整一格——
+// 商减一、余数加除数。无符号与 char/trit 无负值，截断即 floor，原样返回
+// （这一分支同时保证既有无符号路径的指令序列零变化）。
+//
+// 注意本实现不把结束端点改写为别的数值，且对 i64 最小值/除数 -1 的
+// 溢出情形与截断路径同态（LLVM sdiv 的既有 UB 边界不变）。
+
+// 截断商 → floor 商（余数与除数异号则减一）。
+func tig_floor_fix_div(a: i64, trunc_q: i64, b: i64, ty: i64) -> i64 {
+    if !stype.is_signed(ty) {
+        return trunc_q
+    }
+    var z0 = tig_int_lit_ty(0, ty)
+    var rem = ir.new_inst(g_cur_block, 4, ty)  // srem：取截断余数
+    ir.add_operand(rem, a, 0)
+    ir.add_operand(rem, b, 0)
+    var r = ir.get_value(rem)
+    var r_nonzero = tig_icmp_c(r, z0, 1)           // ne
+    var r_neg = tig_icmp_c(r, z0, 2)               // slt
+    var b_neg = tig_icmp_c(b, z0, 2)               // slt
+    var sign_diff = tig_icmp_c(r_neg, b_neg, 1)   // i1 不等 = 符号异或
+    var adjust = tig_and_i1(r_nonzero, sign_diff)
+    var one = tig_int_lit_ty(1, ty)
+    var dec = ir.new_inst(g_cur_block, 1, ty)  // sub：商 - 1
+    ir.add_operand(dec, trunc_q, 0)
+    ir.add_operand(dec, one, 0)
+    return tig_select_i(adjust, ir.get_value(dec), trunc_q, ty)
+}
+
+// 截断余数 → 成对余数（与除数异号则加除数）。
+func tig_floor_fix_mod(trunc_r: i64, b: i64, ty: i64) -> i64 {
+    if !stype.is_signed(ty) {
+        return trunc_r
+    }
+    var z0 = tig_int_lit_ty(0, ty)
+    var r_nonzero = tig_icmp_c(trunc_r, z0, 1)
+    var r_neg = tig_icmp_c(trunc_r, z0, 2)
+    var b_neg = tig_icmp_c(b, z0, 2)
+    var sign_diff = tig_icmp_c(r_neg, b_neg, 1)
+    var adjust = tig_and_i1(r_nonzero, sign_diff)
+    var inc = ir.new_inst(g_cur_block, 0, ty)  // add：余数 + 除数
+    ir.add_operand(inc, trunc_r, 0)
+    ir.add_operand(inc, b, 0)
+    return tig_select_i(adjust, ir.get_value(inc), trunc_r, ty)
+}
+
+// 整数二元 floor 整除（op 24）/ 成对取余（op 26）统一入口。
+func tig_floor_divmod(op: i64, a: i64, b: i64, ty: i64) -> i64 {
+    var base: i64 = 3  // sdiv
+    if op == 26 {
+        base = 4  // srem
+    }
+    var inst = ir.new_inst(g_cur_block, base, ty)
+    ir.add_operand(inst, a, 0)
+    ir.add_operand(inst, b, 0)
+    var res = ir.get_value(inst)
+    if op == 26 {
+        return tig_floor_fix_mod(res, b, ty)
+    }
+    return tig_floor_fix_div(a, res, b, ty)
+}
+
+// 二元组聚合构造：(v0, v1) → alloca 聚合 + 逐字段 agg_gep/store + load
+func make_tuple2(v0: i64, t0: i64, v1: i64, t1: i64, agg: i64) -> i64 {
+    var alloca = ir.new_inst(g_cur_block, 20, agg)
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    var g0 = ir.new_inst(g_cur_block, 27, agg)
+    ir.add_operand(g0, ap, 0)
+    ir.add_operand(g0, 0, 2)
+    var s0 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(s0, t0, 2)
+    ir.add_operand(s0, v0, 0)
+    ir.add_operand(s0, ir.get_value(g0), 0)
+    var g1 = ir.new_inst(g_cur_block, 27, agg)
+    ir.add_operand(g1, ap, 0)
+    ir.add_operand(g1, 1, 2)
+    var s1 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(s1, t1, 2)
+    ir.add_operand(s1, v1, 0)
+    ir.add_operand(s1, ir.get_value(g1), 0)
+    var ld = ir.new_inst(g_cur_block, 21, agg)
+    ir.add_operand(ld, ap, 0)
+    return ir.get_value(ld)
+}
+
+// slice<T> 聚合构造：(指针, 长度) → slice 类型聚合值。元素类型仅语义信息
+// （LLVM 类型固定 {ptr, i64}）。
+func make_slice2(p: i64, len: i64, elem_ty: i64) -> i64 {
+    return make_tuple2(p, types.named(TK_STR), len, types.named(TK_I64), types.slice_of(elem_ty))
+}
+
+// slice<T> 字段提取：0 = 指针，1 = 长度（聚合值先落内存 → agg_gep + load）
+func slice_field(s: i64, f: i64) -> i64 {
+    var agg = types.slice_of(types.named(TK_I64))  // 类型仅用于 agg_gep 布局（固定 {ptr,i64}）
+    var alloca = ir.new_inst(g_cur_block, 20, agg)
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    var st = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st, agg, 2)
+    ir.add_operand(st, s, 0)
+    ir.add_operand(st, ap, 0)
+    var gp = ir.new_inst(g_cur_block, 27, agg)
+    ir.add_operand(gp, ap, 0)
+    ir.add_operand(gp, f, 2)
+    var fty = types.named(TK_I64)
+    if f == 0 {
+        fty = types.named(TK_STR)
+    }
+    var ld = ir.new_inst(g_cur_block, 21, fty)
+    ir.add_operand(ld, ir.get_value(gp), 0)
+    return ir.get_value(ld)
+}
+
+// a 是否为类型最小值（位模式检测：a!=0 && a<<1==0，避开 i64 min 字面量）
+func tig_is_min(a: i64, ty: i64) -> i64 {
+    var nz = tig_icmp_c(a, tig_int_lit_ty(0, ty), 1)  // a != 0
+    var sh = ir.new_inst(g_cur_block, 10, ty)  // shl a, 1
+    ir.add_operand(sh, a, 0)
+    ir.add_operand(sh, 1, 2)
+    var z = tig_icmp_c(ir.get_value(sh), tig_int_lit_ty(0, ty), 0)  // a<<1 == 0
+    return tig_and_i1(nz, z)
+}
+
+}

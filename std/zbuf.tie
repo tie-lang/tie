@@ -1,0 +1,474 @@
+type tie<class>
+// tlib/std/zbuf.tie —— 原始字节缓冲抽象（namespace zbuf；自 tiedb 提炼）
+// ============================================================================
+// **载体 = tie 字符串**：tie 字符串是 `(ptr, len)`，`len(s)` 是**字节数**、
+// `str_byte(s, i)` 按**字节**索引、`sb_append` 按**字节** memcpy ⇒ 密度 **1×**
+// 且二进制安全（含 0x00 / 0xFF）。与之对照，`table<i64>` 承载字节时每个字节
+// 独占 8 字节槽 ⇒ **8×**，且下标访问 `t[i]` 走容器锁（实测 27–28ns）而
+// `str_byte` 是单指令（实测 6ns）。
+//
+// 本模块提供三件事（**纯新增，不改任何既有语义**）：
+//   1. **写端**：StringBuilder 组装的 `bw_*`（批量，memcpy 级）+ 单值 `enc_*`
+//      （小对象便捷形）。
+//   2. **读端**：`br_*`（纯函数，入参 (缓冲, 位置)，返回 (值, 新位置)；
+//      越界一律返回 `next = -1`，与 tdb/zd 既有约定一致）。
+//   3. **边界互换**：`to_table` / `from_table`（与既有 `table<i64>` API 对接）、
+//      `file_load` / `file_store`（走内置 `file_read`/`file_write`，**1×**；
+//      对照内置 `byte_read` 是「u8 临时缓冲 → 逐字节零扩展成 8 字节槽」的
+//      **8× + 双次分配**）。
+//
+// **使用纪律（决定收益能否兑现）**：字节数据应在整个处理链路上保持字符串载体，
+// **只在真正存在 table<i64> 签名 API 的边界处**做 `to_table`/`from_table`——
+// 两者都是逐字节 O(n)（`to_table` 每元素一次 `table_push`，实测 32–39ns），
+// 若在热循环里反复互换，收益会被边界成本吃掉。
+//
+// **文本 ≠ 字节**：本模块只做**原始字节**搬运，不做码点↔UTF-8 转换。
+// 需要把字符串按**码点**编码为 UTF-8 字节请用 `zd.utf8_encode`（那是文本语义）。
+
+import "./zd.tie"
+
+namespace zbuf {
+
+// ==================== 写端：StringBuilder 组装 ====================
+
+// 新建写端（StringBuilder 句柄；无类型名，以 i64 承载）。
+pub func bw_new() -> i64 {
+    return string_builder()
+}
+
+// 重置写端以复用（容量保留，避免重复分配）。
+pub func bw_reset(bw: i64) {
+    sb_reset(bw)
+}
+
+// 追加单个字节（值自动规范化为 0..255）。
+pub func bw_put_u8(bw: i64, b: i64) {
+    sb_append_byte(bw, b & 0xFF)
+}
+
+// 追加一段**原始字节**（整串按字节 memcpy，不解释码点）——批量写入首选。
+pub func bw_put_bytes(bw: i64, s: string) {
+    sb_append(bw, s)
+}
+
+// ---------- 定宽大端 ----------
+
+pub func bw_put_u16_be(bw: i64, n: i64) {
+    sb_append_byte(bw, (n >> 8) & 0xFF)
+    sb_append_byte(bw, n & 0xFF)
+}
+
+pub func bw_put_u32_be(bw: i64, n: i64) {
+    sb_append_byte(bw, (n >> 24) & 0xFF)
+    sb_append_byte(bw, (n >> 16) & 0xFF)
+    sb_append_byte(bw, (n >> 8) & 0xFF)
+    sb_append_byte(bw, n & 0xFF)
+}
+
+pub func bw_put_u64_be(bw: i64, n: i64) {
+    sb_append_byte(bw, (n >> 56) & 0xFF)
+    sb_append_byte(bw, (n >> 48) & 0xFF)
+    sb_append_byte(bw, (n >> 40) & 0xFF)
+    sb_append_byte(bw, (n >> 32) & 0xFF)
+    sb_append_byte(bw, (n >> 24) & 0xFF)
+    sb_append_byte(bw, (n >> 16) & 0xFF)
+    sb_append_byte(bw, (n >> 8) & 0xFF)
+    sb_append_byte(bw, n & 0xFF)
+}
+
+// ---------- 定宽小端 ----------
+
+pub func bw_put_u16_le(bw: i64, n: i64) {
+    sb_append_byte(bw, n & 0xFF)
+    sb_append_byte(bw, (n >> 8) & 0xFF)
+}
+
+pub func bw_put_u32_le(bw: i64, n: i64) {
+    sb_append_byte(bw, n & 0xFF)
+    sb_append_byte(bw, (n >> 8) & 0xFF)
+    sb_append_byte(bw, (n >> 16) & 0xFF)
+    sb_append_byte(bw, (n >> 24) & 0xFF)
+}
+
+pub func bw_put_u64_le(bw: i64, n: i64) {
+    sb_append_byte(bw, n & 0xFF)
+    sb_append_byte(bw, (n >> 8) & 0xFF)
+    sb_append_byte(bw, (n >> 16) & 0xFF)
+    sb_append_byte(bw, (n >> 24) & 0xFF)
+    sb_append_byte(bw, (n >> 32) & 0xFF)
+    sb_append_byte(bw, (n >> 40) & 0xFF)
+    sb_append_byte(bw, (n >> 48) & 0xFF)
+    sb_append_byte(bw, (n >> 56) & 0xFF)
+}
+
+// ---------- f64（IEEE 754 位模式；bitcast 逐位精确） ----------
+
+pub func bw_put_f64_be(bw: i64, x: f64) {
+    bw_put_u64_be(bw, bitcast_f64_i64(x))
+}
+
+pub func bw_put_f64_le(bw: i64, x: f64) {
+    bw_put_u64_le(bw, bitcast_f64_i64(x))
+}
+
+// ---------- varint / zigzag ----------
+
+// varint（Protobuf 7 位分组，LEB128）。负数按 0 处理（与 zd.write_varint 一致：
+// 有符号数请先 zigzag，或用 bw_put_zigzag）。
+pub func bw_put_varint(bw: i64, n: i64) {
+    if n < 0 {
+        sb_append_byte(bw, 0)
+        return
+    }
+    var v: i64 = n
+    while v >= 0x80 {
+        sb_append_byte(bw, (v & 0x7F) | 0x80)
+        v = v >> 7
+    }
+    sb_append_byte(bw, v)
+}
+
+// zigzag（有符号 → 无符号：0,-1,1,-2,2… → 0,1,2,3,4…）+ varint。
+pub func bw_put_zigzag(bw: i64, n: i64) {
+    bw_put_varint(bw, (n << 1) ^ (n >> 63))
+}
+
+// ---------- 长度前缀字节串（zd 的 string/bytes 框式） ----------
+
+// 追加「varint 字节数 + 原始字节」（与 zd.encode_string / encode_bytes 同形）。
+pub func bw_put_len_bytes(bw: i64, s: string) {
+    bw_put_varint(bw, len(s))
+    sb_append(bw, s)
+}
+
+// 收束为字符串（写端可继续复用；`sb_build` 为拷贝语义）。
+pub func bw_build(bw: i64) -> string {
+    return sb_build(bw)
+}
+
+// 当前已写字节数。**O(n)**（需先收束取长度）——仅供断言/日志，不要在热循环用；
+// 热循环请调用方自持计数器。
+pub func bw_len(bw: i64) -> i64 {
+    return len(sb_build(bw))
+}
+
+// ==================== 单值便捷形（小对象/元数据） ====================
+
+pub func enc_u8(b: i64) -> string {
+    var bw = string_builder()
+    sb_append_byte(bw, b & 0xFF)
+    return sb_build(bw)
+}
+
+pub func enc_u16_be(n: i64) -> string {
+    var bw = string_builder()
+    bw_put_u16_be(bw, n)
+    return sb_build(bw)
+}
+
+pub func enc_u32_be(n: i64) -> string {
+    var bw = string_builder()
+    bw_put_u32_be(bw, n)
+    return sb_build(bw)
+}
+
+pub func enc_u64_be(n: i64) -> string {
+    var bw = string_builder()
+    bw_put_u64_be(bw, n)
+    return sb_build(bw)
+}
+
+pub func enc_f64_be(x: f64) -> string {
+    var bw = string_builder()
+    bw_put_f64_be(bw, x)
+    return sb_build(bw)
+}
+
+pub func enc_varint(n: i64) -> string {
+    var bw = string_builder()
+    bw_put_varint(bw, n)
+    return sb_build(bw)
+}
+
+pub func enc_len_bytes(s: string) -> string {
+    var bw = string_builder()
+    bw_put_len_bytes(bw, s)
+    return sb_build(bw)
+}
+
+// ==================== 读端（纯函数：(缓冲, 位置) → (值, 新位置)） ====================
+// 越界/畸形一律 `next = -1`（值位为 0）。调用方须检查 next。
+
+// 缓冲的**字节**长度。
+pub func br_len(s: string) -> i64 {
+    return len(s)
+}
+
+// 剩余字节数（pos 越界则 0）。
+pub func br_remaining(s: string, pos: i64) -> i64 {
+    var n: i64 = len(s)
+    if pos < 0 || pos >= n {
+        return 0
+    }
+    return n - pos
+}
+
+// 边界判定：自 pos 起是否还有 n 字节。
+pub func br_has(s: string, pos: i64, n: i64) -> bool {
+    if pos < 0 || n < 0 {
+        return false
+    }
+    return pos + n <= len(s)
+}
+
+// 单个字节（不经读取器；越界返回 0）。
+pub func br_at(s: string, i: i64) -> i64 {
+    if i < 0 || i >= len(s) {
+        return 0
+    }
+    return str_byte(s, i) & 0xFF
+}
+
+pub func br_u8(s: string, pos: i64) -> (i64, i64) {
+    if !br_has(s, pos, 1) {
+        return (0, -1)
+    }
+    return (str_byte(s, pos) & 0xFF, pos + 1)
+}
+
+// ---------- 定宽大端 ----------
+
+pub func br_u16_be(s: string, pos: i64) -> (i64, i64) {
+    if !br_has(s, pos, 2) {
+        return (0, -1)
+    }
+    return (((str_byte(s, pos) & 0xFF) << 8) | (str_byte(s, pos + 1) & 0xFF), pos + 2)
+}
+
+pub func br_u32_be(s: string, pos: i64) -> (i64, i64) {
+    if !br_has(s, pos, 4) {
+        return (0, -1)
+    }
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < 4 {
+        v = (v << 8) | (str_byte(s, pos + i) & 0xFF)
+        i = i + 1
+    }
+    return (v, pos + 4)
+}
+
+pub func br_u64_be(s: string, pos: i64) -> (i64, i64) {
+    if !br_has(s, pos, 8) {
+        return (0, -1)
+    }
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        v = (v << 8) | (str_byte(s, pos + i) & 0xFF)
+        i = i + 1
+    }
+    return (v, pos + 8)
+}
+
+// ---------- 定宽小端 ----------
+
+pub func br_u16_le(s: string, pos: i64) -> (i64, i64) {
+    if !br_has(s, pos, 2) {
+        return (0, -1)
+    }
+    return ((str_byte(s, pos) & 0xFF) | ((str_byte(s, pos + 1) & 0xFF) << 8), pos + 2)
+}
+
+pub func br_u32_le(s: string, pos: i64) -> (i64, i64) {
+    if !br_has(s, pos, 4) {
+        return (0, -1)
+    }
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < 4 {
+        v = v | ((str_byte(s, pos + i) & 0xFF) << (i * 8))
+        i = i + 1
+    }
+    return (v, pos + 4)
+}
+
+pub func br_u64_le(s: string, pos: i64) -> (i64, i64) {
+    if !br_has(s, pos, 8) {
+        return (0, -1)
+    }
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        v = v | ((str_byte(s, pos + i) & 0xFF) << (i * 8))
+        i = i + 1
+    }
+    return (v, pos + 8)
+}
+
+// ---------- f64 ----------
+
+pub func br_f64_be(s: string, pos: i64) -> (f64, i64) {
+    var (bits, p2) = br_u64_be(s, pos)
+    if p2 < 0 {
+        return (0.0, -1)
+    }
+    return (bitcast_i64_f64(bits), p2)
+}
+
+pub func br_f64_le(s: string, pos: i64) -> (f64, i64) {
+    var (bits, p2) = br_u64_le(s, pos)
+    if p2 < 0 {
+        return (0.0, -1)
+    }
+    return (bitcast_i64_f64(bits), p2)
+}
+
+// ---------- varint / zigzag ----------
+
+pub func br_varint(s: string, pos: i64) -> (i64, i64) {
+    var v: i64 = 0
+    var shift: i64 = 0
+    var p: i64 = pos
+    var n: i64 = len(s)
+    while p < n {
+        var b: i64 = str_byte(s, p) & 0xFF
+        v = v | ((b & 0x7F) << shift)
+        if (b & 0x80) == 0 {
+            return (v, p + 1)
+        }
+        shift = shift + 7
+        if shift > 63 {
+            return (0, -1)
+        }
+        p = p + 1
+    }
+    return (0, -1)
+}
+
+pub func br_zigzag(s: string, pos: i64) -> (i64, i64) {
+    var (u, p2) = br_varint(s, pos)
+    if p2 < 0 {
+        return (0, -1)
+    }
+    return ((u >> 1) ^ (0 - (u & 1)), p2)
+}
+
+// ---------- 长度前缀字节串 / 切片 ----------
+
+// 读「varint 字节数 + 原始字节」→ (字节串, 新位置)。
+pub func br_len_bytes(s: string, pos: i64) -> (string, i64) {
+    var (n, p1) = br_varint(s, pos)
+    if p1 < 0 || n < 0 {
+        return ("", -1)
+    }
+    if !br_has(s, p1, n) {
+        return ("", -1)
+    }
+    return (str_sub_bytes(s, p1, p1 + n), p1 + n)
+}
+
+// 按**字节**区间切片 [lo, hi)（单次 memcpy；越界 clamp）。
+pub func br_slice(s: string, lo: i64, hi: i64) -> string {
+    return str_sub_bytes(s, lo, hi)
+}
+
+// ==================== 与 table<i64> 的边界互换 ====================
+// ⚠ 两者都是**逐字节 O(n)**，`to_table` 每元素一次 `table_push`（32–39ns/元素）。
+// 只在真正存在 table<i64> 签名 API 的边界处调用，不要在热循环里反复互换。
+
+// 字符串载体 → table<i64>（元素 0..255）。
+pub func to_table(s: string) -> table<i64> {
+    var t = table_new_i64()
+    var n: i64 = len(s)
+    var i: i64 = 0
+    while i < n {
+        table_push(t, str_byte(s, i) & 0xFF)
+        i = i + 1
+    }
+    return t
+}
+
+// table<i64>（元素 0..255）→ 字符串载体。
+pub func from_table(t: table<i64>) -> string {
+    var bw = string_builder()
+    var n: i64 = len(t)
+    var i: i64 = 0
+    while i < n {
+        sb_append_byte(bw, t[i] & 0xFF)
+        i = i + 1
+    }
+    return sb_build(bw)
+}
+
+// ==================== 文件 I/O（1× 载体） ====================
+// 走内置 `file_read`/`file_write`（字符串载体，**1×**）。
+// 对照内置 `byte_read`：先读入 u8 临时缓冲、再**逐字节零扩展**成 8 字节槽
+// （`tb[i*8] = u8[i]`）⇒ 峰值 **8× + 双次分配**；`byte_write` 则需先把
+// table<i64> 重新压紧。故字节负载的文件进出应优先走本模块。
+
+// 读文件全部字节 → 字符串载体（不存在/读失败：内置语义为打印并 exit(1)；
+// 需可探测的失败请先用内置 `file_exists`）。
+pub func file_load(path: string) -> string {
+    return file_read(path)
+}
+
+// 写文件全部字节（字符串载体，按字节写，二进制安全）。成功 true。
+pub func file_store(path: string, s: string) -> bool {
+    return file_write(path, s)
+}
+
+// 追加写（二进制安全）。
+pub func file_append_bytes(path: string, s: string) -> bool {
+    return file_append(path, s)
+}
+
+// ==================== 十六进制（诊断/探针用） ====================
+
+// 字节串 → 小写 hex 文本（1× 增长；供日志/KAT 比对）。
+pub func to_hex(s: string) -> string {
+    var bw = string_builder()
+    var n: i64 = len(s)
+    var i: i64 = 0
+    while i < n {
+        var b = str_byte(s, i) & 0xFF
+        sb_append_byte(bw, char_code(str_char("0123456789abcdef", b >> 4)))
+        sb_append_byte(bw, char_code(str_char("0123456789abcdef", b & 0xF)))
+        i = i + 1
+    }
+    return sb_build(bw)
+}
+
+// hex 文本 → 字节串（含非 hex 字符则以当前位置 stop=-1 拒绝）。
+pub func from_hex(h: string) -> (string, i64) {
+    var bw = string_builder()
+    var n: i64 = len(h)
+    if (n & 1) != 0 {
+        return ("", -1)
+    }
+    var i: i64 = 0
+    while i < n {
+        var hi = hex_val(str_byte(h, i) & 0xFF)
+        var lo = hex_val(str_byte(h, i + 1) & 0xFF)
+        if hi < 0 || lo < 0 {
+            return ("", -1)
+        }
+        sb_append_byte(bw, ((hi << 4) | lo) & 0xFF)
+        i = i + 2
+    }
+    return (sb_build(bw), n)
+}
+
+func hex_val(c: i64) -> i64 {
+    if c >= 0x30 && c <= 0x39 {
+        return c - 0x30
+    }
+    if c >= 0x61 && c <= 0x66 {
+        return c - 0x61 + 10
+    }
+    if c >= 0x41 && c <= 0x46 {
+        return c - 0x41 + 10
+    }
+    return 0 - 1
+}
+}

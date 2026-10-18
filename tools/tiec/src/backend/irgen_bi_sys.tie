@@ -1,0 +1,295 @@
+type tie<class>
+// compiler/backend/irgen_bi_sys.tie —— 内置生成器：系统能力（M4/M6）
+// ============================================================
+// 自 irgen_expr.tie 的 builtin_expr 拆出（p.9.21.2 两步制①）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `pow`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_pow(nm: string, id: i64) -> i64 {
+if nm == "pow" {
+    var pv1 = tig_expr(call_arg(id, 0))
+    if pv1 < 0 {
+        return -1
+    }
+    var pv2 = tig_expr(call_arg(id, 1))
+    if pv2 < 0 {
+        return -1
+    }
+    var p1t = node_types[call_arg(id, 0)]
+    var p2t = node_types[call_arg(id, 1)]
+    var pf1 = tig_to_f64(pv1, p1t)
+    var pf2 = tig_to_f64(pv2, p2t)
+    if pf1 < 0 || pf2 < 0 {
+        return -1
+    }
+    g_builtin_res = tig_ext_call2("pow", pf1, types.named(TK_F64), pf2, types.named(TK_F64), types.named(TK_F64))
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `read_line`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_read_line(nm: string, id: i64) -> i64 {
+if nm == "read_line" {
+    g_builtin_res = tig_read_line()
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `cwd`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_cwd(nm: string, id: i64) -> i64 {
+if nm == "cwd" {
+    // p.6.4.1：内联 GetCurrentDirectoryW + UTF-16→UTF-8（非 interp 桥）
+    g_builtin_res = tig_cwd()
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `http_get`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_http_get(nm: string, id: i64) -> i64 {
+if nm == "http_get" {
+    // p.6.4.9：http_get 内联 HTTP/1.1（去 Rust 桥 tie_http_get）——URL 解析 +
+    // 连接 + GET + 读响应体；仅 http://，失败返回空串。置位 g_used_wsock。
+    g_used_wsock = true
+    var sv = tig_expr(call_arg(id, 0))
+    if sv < 0 {
+        return -1
+    }
+    g_builtin_res = tig_http_get(sv)
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `path_basename`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_path_basename(nm: string, id: i64) -> i64 {
+if nm == "path_basename" {
+    return tig_path_basename(id)
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `path_dirname`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_path_dirname(nm: string, id: i64) -> i64 {
+if nm == "path_dirname" {
+    return tig_path_dirname(id)
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `path_abs`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_path_abs(nm: string, id: i64) -> i64 {
+if nm == "path_abs" {
+    return tig_path_abs(id)
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `path_normalize`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_path_normalize(nm: string, id: i64) -> i64 {
+if nm == "path_normalize" {
+    return tig_path_normalize(id)
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `eval`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_eval(nm: string, id: i64) -> i64 {
+if nm == "eval" {
+    // p.6.4.10：eval 降级——tie:script 解释器未内嵌（完整实现=内嵌解释器，
+    // 工作量巨大，留待 p.6.6 后补）。保留签名但语义降级：返回空串，**不置
+    // g_used_interp**（不再经 tie_eval_expr Rust 桥，不链 tie_interp.lib）。
+    // 原语义（docs/tie-script.md：eval 注册模块顶层定义）在纯 tie 解释器
+    // compiler/interp（interp.eval）中已实现；builtin eval/eval_call 仅被
+    // examples/script_demo.tie / repl/repl.tie（demo）使用。
+    g_builtin_res = tig_str_lit(interner.intern("\"\""))
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `eval_call`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_eval_call(nm: string, id: i64) -> i64 {
+if nm == "eval_call" {
+    // p.6.4.10：eval_call 降级——同 eval（tie:script 解释器未内嵌，留待
+    // p.6.6 后补）。保留签名但返回空串，**不置 g_used_interp**（去 tie_eval_call
+    // Rust 桥，不链 tie_interp.lib）。原语义见 docs/tie-script.md。
+    g_builtin_res = tig_str_lit(interner.intern("\"\""))
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `path_join`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_path_join(nm: string, id: i64) -> i64 {
+if nm == "path_join" {
+    return tig_path_join(id)
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `regex_find`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_regex_find(nm: string, id: i64) -> i64 {
+if nm == "regex_find" {
+    return tig_regex_find(id)
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `regex_replace`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_regex_replace(nm: string, id: i64) -> i64 {
+if nm == "regex_replace" {
+    return tig_regex_replace(id)
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `regex_group`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_regex_group(nm: string, id: i64) -> i64 {
+if nm == "regex_group" {
+    return tig_regex_group(id)
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `regex_match`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_regex_match(nm: string, id: i64) -> i64 {
+if nm == "regex_match" {
+    return tig_regex_match(id)
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `remove_dir_all`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_remove_dir_all(nm: string, id: i64) -> i64 {
+if nm == "remove_dir_all" {
+    var rv = tig_expr(call_arg(id, 0))
+    if rv < 0 {
+        return -1
+    }
+    g_builtin_res = tig_remove_dir_all(rv)
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `byte_read`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_byte_read(nm: string, id: i64) -> i64 {
+if nm == "byte_read" {
+    var pv = tig_expr(call_arg(id, 0))
+    if pv < 0 {
+        return -1
+    }
+    g_builtin_res = tig_byte_read(pv)
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `byte_write`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_byte_write(nm: string, id: i64) -> i64 {
+if nm == "byte_write" {
+    var w1 = tig_expr(call_arg(id, 0))
+    if w1 < 0 {
+        return -1
+    }
+    var w2 = tig_expr(call_arg(id, 1))
+    if w2 < 0 {
+        return -1
+    }
+    g_builtin_res = tig_byte_write(w1, w2)
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `stdin_read`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_stdin_read(nm: string, id: i64) -> i64 {
+if nm == "stdin_read" {
+    var sn = tig_expr(call_arg(id, 0))
+    if sn < 0 {
+        return -1
+    }
+    g_builtin_res = tig_stdin_read(sn)
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `bit_read`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_bit_read(nm: string, id: i64) -> i64 {
+if nm == "bit_read" {
+    var b1 = tig_expr(call_arg(id, 0))
+    if b1 < 0 {
+        return -1
+    }
+    var b2 = tig_expr(call_arg(id, 1))
+    if b2 < 0 {
+        return -1
+    }
+    g_builtin_res = tig_bit_read(b1, b2)
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `bit_write`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_bit_write(nm: string, id: i64) -> i64 {
+if nm == "bit_write" {
+    var bw1 = tig_expr(call_arg(id, 0))
+    if bw1 < 0 {
+        return -1
+    }
+    var bw2 = tig_expr(call_arg(id, 1))
+    if bw2 < 0 {
+        return -1
+    }
+    var bw3 = tig_expr(call_arg(id, 2))
+    if bw3 < 0 {
+        return -1
+    }
+    g_builtin_res = tig_bit_write(bw1, bw2, bw3)
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `byte_concat`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_byte_concat(nm: string, id: i64) -> i64 {
+if nm == "byte_concat" {
+    var c1 = tig_expr(call_arg(id, 0))
+    if c1 < 0 {
+        return -1
+    }
+    var c2 = tig_expr(call_arg(id, 1))
+    if c2 < 0 {
+        return -1
+    }
+    g_builtin_res = tig_byte_concat(c1, c2)
+    return 0
+}
+}
+
+// M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）
+// 内置 `set_env`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_set_env(nm: string, id: i64) -> i64 {
+if nm == "set_env" {
+    var e1 = tig_expr(call_arg(id, 0))
+    if e1 < 0 {
+        return -1
+    }
+    var e2 = tig_expr(call_arg(id, 1))
+    if e2 < 0 {
+        return -1
+    }
+    tig_set_env(e1, e2)
+    g_builtin_res = tig_int_lit(0)  // void：哑值
+    return 0
+}
+}
+
+}

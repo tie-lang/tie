@@ -1,0 +1,245 @@
+type tie<class>
+// compiler/backend/llvmgen_p2.tie —— llvmgen 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 llvmgen.tie。
+namespace llvmgen {
+// 单个函数生成
+func gen_func(fid: i64) {
+    g_pfid = fid
+    g_pcnt = ir.func_params_cnt(fid)
+    var name = intern.lookup(ir.func_name(fid))
+    // 命名空间函数全名 → LLVM 符号：`::` 转 `$`（对齐 Rust ns_symbol；
+    // 调用点 call(35) 同约定，保证定义与调用两侧符号一致）
+    var sym = str.clone(name)
+    var ns_pos = find_sub(name, "::")
+    if ns_pos >= 0 {
+        sym = ns_replace(name)
+    }
+    // 程序入口：主文件的 main（可能在命名空间内）以 C 入口符号 @main 发射。
+    // 其余同名 main（库函数）仍按命名空间符号，不抢入口。
+    if str_len(g_entry_name) > 0 && name == g_entry_name {
+        sym = "main"
+    }
+    var ret_llvm = llvm_ty(ir.func_ret(fid))
+    // main 特殊：void main → define i32 @main
+    if sym == "main" && ret_llvm == "void" {
+        ret_llvm = "i32"
+    }
+    // r.1.6.3：Linux 目标 + 程序用 arg_*（g_linux_args）→ main 定义带
+    // `i32 %0, ptr %1`（argc/argv，C 运行期注入；tie main 本身无参，LLVM 层
+    // 附加形参，irgen 生成的指令不引用它们）。Windows 保持无参（IR 逐字节
+    // 不变，CommandLineToArgvW 既有路径）。形参 %0/%1 在 renumber 时按
+    // N < g_pcnt 原样保留（ren_ref），entry 捕获 store 行于重编号后插入，
+    // 不参与映射。
+    var linux_main: bool = g_linux_target == 1 && g_linux_args == 1 && sym == "main"
+    // r.1.6.3：Linux main 附加形参占位——renumber 起始编号须避开形参 %0/%1
+    //（普通函数 = g_pcnt；Linux main = 2，见 g_ren_base 注释）。
+    if linux_main {
+        g_ren_base = 2
+    } else {
+        g_ren_base = g_pcnt
+    }
+    // 形参列表：`i64 %0, ptr %1, ...`（参数值 id 是全局编号，形参按位置
+    // %0..%n-1 命名；opnd_ref 经 param_ref 把参数值 id 映射到位置号）
+    var params_llvm = ""
+    if linux_main {
+        params_llvm = "i32 %0, ptr %1"
+    } else {
+        var pk: i64 = 0
+        while pk < g_pcnt {
+            if pk > 0 {
+                params_llvm = params_llvm + ", "
+            }
+            params_llvm = params_llvm + llvm_ty(ir.func_param_ty(fid, pk)) + " %" + to_string(pk)
+            pk = pk + 1
+        }
+    }
+    // M5 动态库导出面（dev33 批次 12）：动态库模式下，irgen 登记的导出函数
+    // （顶层函数 + 命名空间 pub func，ir.func_exported==1）带 dllexport——
+    // Windows lld-link 据此自动导出符号（Linux ELF 忽略该存储类，符号默认
+    // 可见）。内部辅助函数（私有/非导出）不标记。
+    var exp_kw = ""
+    if g_dynlib && ir.func_exported(fid) == 1 {
+        exp_kw = "dllexport "
+    }
+    // p.9.11.10 inline fn：附加 LLVM 函数内联属性。裁决——统一用 `alwaysinline`
+    //（强制内联，-O0 也生效；据优化档在 -O1+ 用 `inlinehint` 可交优化器裁断，
+    // 但 alwaysinline 保证语义可见且语义安全：inline 仅作用于显式标注函数，对
+    // 递归/编译器自身（未标 inline）无影响，LLVM 对 alwaysinline 递归只内联限定
+    // 层后停止，不强制展开死循环）。函数属性放 define 头参数列表后、`{` 前。
+    var inl_kw = ""
+    if ir.func_inline(fid) == 1 {
+        inl_kw = " alwaysinline"
+    }
+    line("define " + exp_kw + ret_llvm + " @" + sym + "(" + params_llvm + ")" + inl_kw + " {")
+    // F1 增强：临时 alloca 提升到 entry block——本函数全部 alloca（含循环体内
+    // 的 ok 槽）前置输出，再对函数体行级重编号解决编号倒挂。流程：
+    // 1) 切函数级缓冲 g_fn_lines（line() 重定向）；
+    // 2) 收集本函数 alloca 指令 id；
+    // 3) 遍历输出：entry block 标签后统一输出全部 alloca（收集序），
+    //    gen_inst 对已登记 alloca 跳过（op==20 分支）；
+    // 4) renumber_lines() 行级重编号 %N → 1..N 连续；
+    // 5) 并入全局 out_lines，恢复全局缓冲。
+    g_fn_lines = table_new_string()
+    g_fn_mode = 1
+    // p.6.1.7 落地（2026-09-06）：每函数重建收集数组（杜绝跨函数累积——旧码只重置
+    // g_hoisted_cnt 不清表 → fid>0 函数出口读上一函数条目）。全量收集 + 入口零初始化
+    // = 循环体 alloca 全部静态化 → 根治「逐迭代动态栈分配 → 0xC00000FD」（RCA-2，
+    // repro2_sort 大 string 冒泡；配合 irgen_stmt 引用计数修复系列 8e62a46/81b5775）。
+    g_hoisted_allocas = table_new_i64()
+    g_hoisted_cnt = 0
+    // tail call 收集：块尾 ret 的直接来源 call（p.9.20.5）
+    g_tail_ids = table_new_i64()
+    if g_inst_blk_ready == 0 {
+        build_inst_blk()
+    }
+    var tb: i64 = 0
+    var tnb = ir.block_count()
+    while tb < tnb {
+        if ir.block_func(tb) != fid {
+            tb = tb + 1
+            continue
+        }
+        var ts = ir_blocks_start[tb]
+        var te = ir_blocks_end[tb]
+        if te - ts >= 2 && ir.ins_op(te - 1) == 32 && ir.ins_ops_cnt(te - 1) >= 1 && ir.ins_opnd_kind(te - 1, 0) == 0 {
+            var trv = ir.ins_opnd(te - 1, 0)
+            var tci = te - 2
+            var top = ir.ins_op(tci)
+            if (top == 35 || top == 36) && ir.ins_val(tci) == trv && ir.ins_val(tci) >= 0 {
+                table_push(g_tail_ids, tci)
+            }
+        }
+        tb = tb + 1
+    }
+    // 性能：只遍历本函数指令区间 [lo, hi)（build_fn_inst_ranges 一次构建），
+    // 替代全表扫描 O(F×N)（此前每函数都扫全部指令表）。保留 block_func 过滤
+    // 防区间交叉（按连续假设区间精确，过滤仅兜底，不影响 O(N)）。
+    var lo = g_fn_inst_lo[fid]
+    var hi = g_fn_inst_hi[fid]
+    var ia: i64 = lo
+    while ia < hi {
+        var blk_a: i64 = -1
+        if ia < len(g_inst_blk) {
+            blk_a = g_inst_blk[ia]
+        }
+        if blk_a >= 0 && ir.block_func(blk_a) == fid && ir.ins_op(ia) == 20 {
+            table_push(g_hoisted_allocas, ia)
+            g_hoisted_cnt = g_hoisted_cnt + 1
+        }
+        ia = ia + 1
+    }
+    // 按指令 id 序遍历本函数全部块（块首输出标签）——保证值编号单调递增。
+    // entry block（首块）标签后统一输出收集的 alloca——LLVM 要求 alloca 在
+    // entry block 内静态分配（循环内 alloca → 动态栈分配，栈溢出）。
+    var eblk = ir.func_entry(fid)
+    var entry_alloca_done: i64 = 0
+    var ii: i64 = lo
+    while ii < hi {
+        var blk: i64 = -1
+        if ii < len(g_inst_blk) {
+            blk = g_inst_blk[ii]
+        }
+        if blk >= 0 && ir.block_func(blk) == fid {
+            if ii == ir.block_start(blk) {
+                // 块标签：统一用块 id（bb<N>），避免 block_name 多 if/for 冲突
+                line("bb" + to_string(blk) + ":")
+                // F1 增强：entry block 标签后统一输出全部收集的 alloca——
+                // 编号按收集序（值 id 全局递增）严格递增，无回退；后续
+                // gen_inst 对已登记 alloca 跳过（op==20 分支）。
+                if blk == eblk && entry_alloca_done == 0 {
+                    var eh: i64 = 0
+                    while eh < g_hoisted_cnt {
+                        var ainst = g_hoisted_allocas[eh]
+                        var ty_a = llvm_ty(ir.ins_ty(ainst))
+                        var v_a = ir.ins_val(ainst)
+                        if v_a >= 0 {
+                            line("%" + to_string(v_a) + " = alloca " + ty_a)
+                            // p.6.1.7 落地：入口零初始化（提升后槽位跨迭代复用，未初始
+                            // 化读从「每轮新鲜垃圾」变为 0）。ren_ref 对行内 %N（N<g_pcnt）
+                            // 按形参原样保留——小号 id 的 alloca 补 store 会写成对形参的
+                            // store（opt reject：defined i64 expected ptr），跳过即可。
+                            if v_a >= g_pcnt {
+                                // r.1.1.1 全类型入口零初始化：此前仅 i64/i8/ptr/double
+                                // 四型覆盖（i1/i32 等槽位提升后读旧值/垃圾，语义不确定）。
+                                // 实测编译器自身 IR 含 i1×249/i32×11/聚合×21 等未清零 alloca；
+                                // 补齐后任何提升槽首读必得确定 0（分析确认当前无读先于写，
+                                // 故零初始化语义透明，纯防御加固）。聚合/any 用 zeroinitializer。
+                                if ty_a == "i64" {
+                                    line("store i64 0, ptr %" + to_string(v_a))
+                                } else if ty_a == "i8" {
+                                    line("store i8 0, ptr %" + to_string(v_a))
+                                } else if ty_a == "i16" {
+                                    line("store i16 0, ptr %" + to_string(v_a))
+                                } else if ty_a == "i32" {
+                                    line("store i32 0, ptr %" + to_string(v_a))
+                                } else if ty_a == "i128" {
+                                    line("store i128 0, ptr %" + to_string(v_a))
+                                } else if ty_a == "i1" {
+                                    line("store i1 false, ptr %" + to_string(v_a))
+                                } else if ty_a == "ptr" {
+                                    line("store ptr null, ptr %" + to_string(v_a))
+                                } else if ty_a == "float" {
+                                    line("store float 0.0, ptr %" + to_string(v_a))
+                                } else if ty_a == "double" {
+                                    line("store double 0.0, ptr %" + to_string(v_a))
+                                } else {
+                                    line("store " + ty_a + " zeroinitializer, ptr %" + to_string(v_a))
+                                }
+                            }
+                        }
+                        eh = eh + 1
+                    }
+                    entry_alloca_done = 1
+                }
+            }
+            gen_inst(ii)
+        }
+        ii = ii + 1
+    }
+    line("}")
+    line("")
+    // 函数级缓冲收尾：行级重编号（%N → 连续新编号，解决 alloca 提升后的
+    // 编号倒挂）后并入全局 out_lines，恢复全局 line() 目标。
+    // 子计时（累加至全局，emit 报告）：
+    var gft0: i64 = 0
+    unsafe {
+        gft0 = GetTickCount()
+    }
+    renumber_lines()
+    unsafe {
+        var gft1 = GetTickCount()
+    }
+    g_t_ren = g_t_ren + (gft1 - gft0)
+    // r.1.6.3：Linux main 入口捕获 store——重编号后插入（store 引用的 %0/%1
+    // 是形参，renumber 前插入会被 ren_ref 误映射为指令值 id）。entry 块标签
+    // 行（"bb{eblk}:"）后首行插入两条 store，把 argc/argv 落全局槽供
+    // arg_count/arg_string 读取；LLVM 对 store 位置只要求在被引用前（SSA），
+    // 形参在函数头已定义，插在 entry 首条（alloca 提升行前）安全。
+    if linux_main {
+        var nl2 = table_new_string()
+        var ins_done: i64 = 0
+        var eblk2 = ir.func_entry(fid)
+        var elabel = "bb" + to_string(eblk2) + ":"
+        var rj: i64 = 0
+        while rj < len(g_fn_lines) {
+            table_push(nl2, g_fn_lines[rj])
+            if ins_done == 0 && g_fn_lines[rj] == elabel {
+                table_push(nl2, "store i32 %0, ptr @__tig_argc")
+                table_push(nl2, "store ptr %1, ptr @__tig_argv")
+                ins_done = 1
+            }
+            rj = rj + 1
+        }
+        g_fn_lines = nl2
+    }
+    var rn: i64 = 0
+    while rn < len(g_fn_lines) {
+        table_push(out_lines, g_fn_lines[rn])
+        rn = rn + 1
+    }
+    g_fn_mode = 0
+}
+
+}

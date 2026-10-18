@@ -1,0 +1,105 @@
+type tie<logic>
+// tests/_p912_grow_probe/grow_probe.tie —— p.9.12.2 表下标写越界自动扩容回归探针。
+// 覆盖：空表越界写自动扩容、连续写增长、大跨度零填充、各元素类型（i64/f64/
+// string/bool）扩容、复合赋值同语义、局部表与全局表、既有越界读（高侧）返零回归。
+// 负下标与越界读的高侧行为分别由 companion 探针 grow_neg_probe.tie 验证
+//（负诊断 exit(1)，无法在本 PASS 探针内断言）。
+
+var g_fail: i64 = 0
+var g_gt: table<i64> = []  // 全局表（越界写扩容回归）
+
+// 检查 cond 为真，否则记失败并打印上下文
+func expect(cond: bool, msg: string) {
+    if !cond {
+        println("FAIL: " + msg)
+        g_fail = g_fail + 1
+    }
+}
+
+func main() -> i64 {
+    // 1. 空表写 t[5]=42 → len 6 且 t[5]==42
+    var t = table_new_i64()
+    expect(len(t) == 0, "空表初始 len 应为 0")
+    t[5] = 42
+    expect(len(t) == 6, "t[5]=42 后 len 应为 6")
+    expect(t[5] == 42, "t[5] 应读回 42")
+    expect(t[0] == 0 && t[4] == 0, "t[0..4] 应为零填充 0")
+
+    // 2. 连续写增长（顺序 push 等价量）
+    var c = table_new_i64()
+    var k: i64 = 0
+    while k < 100 {
+        c[k] = k * k
+        expect(len(c) == k + 1, "连续写后 len 应随下标增长")
+        k = k + 1
+    }
+    expect(len(c) == 100, "连续写 100 个元素后 len 应为 100")
+    expect(c[99] == 9801, "c[99] 应回读 99*99")
+    expect(c[50] == 2500, "c[50] 应回读 50*50")
+
+    // 3. 大跨度 t[1000] → 扩容到 1001，零填充部分正确
+    var big = table_new_i64()
+    big[1000] = 7
+    expect(len(big) == 1001, "big[1000]=7 后 len 应为 1001")
+    expect(big[1000] == 7, "big[1000] 应读回 7")
+    expect(big[999] == 0 && big[0] == 0 && big[500] == 0, "大跨度零填充部分应为 0")
+    // 再回写一个中间零槽，确认可读写既有槽
+    big[500] = 123
+    expect(big[500] == 123, "回写既有中间零槽应成功")
+
+    // 4. string 元素扩容
+    var s = table_new_string()
+    s[3] = "hello"
+    expect(len(s) == 4, "string 表扩容后 len 应为 4")
+    expect(s[3] == "hello", "string 表 s[3] 应回读 hello")
+    expect(s[0] == "" && s[2] == "", "string 表零填新槽应为空串")
+    s[1] = "a"
+    expect(s[1] == "a" && s[3] == "hello", "string 表既有槽与新增槽并存")
+
+    // 5. f64 元素扩容
+    var f = table_new_f64()
+    f[2] = 3.14
+    expect(len(f) == 3, "f64 表扩容后 len 应为 3")
+    expect(f[2] == 3.14, "f64 表 f[2] 应回读 3.14")
+    expect(f[0] == 0.0 && f[1] == 0.0, "f64 表零填新槽应为 0.0")
+
+    // 6. bool 元素扩容
+    var b = table_new_bool()
+    b[4] = true
+    expect(len(b) == 5, "bool 表扩容后 len 应为 5")
+    expect(b[4] == true, "bool 表 b[4] 应回读 true")
+    expect(b[0] == false && b[3] == false, "bool 表零填新槽应为 false")
+
+    // 7. 复合赋值：空表 t[j]=t[j]+1 → 先保证槽存在（读零）再改写
+    var jmu = table_new_i64()
+    jmu[7] = jmu[7] + 1
+    expect(len(jmu) == 8, "复合赋值后 len 应为 8")
+    expect(jmu[7] == 1, "复合赋值 t[7]+=1 后应回读 1")
+    expect(jmu[0] == 0, "复合赋值其余槽应为 0")
+    jmu[7] = jmu[7] + 5
+    expect(jmu[7] == 6, "复合赋值再次累加后应回读 6")
+    // 复合赋值就地自增：t[i] += 2
+    jmu[3] += 2
+    expect(jmu[3] == 2, "复合赋值 t[3]+=2（此前为0）后应回读 2")
+
+    // 8. 局部表与全局表
+    expect(len(g_gt) == 0, "全局表初始 len 应为 0")
+    g_gt[20] = 555
+    expect(len(g_gt) == 21, "全局表越界写后 len 应为 21")
+    expect(g_gt[20] == 555, "全局表 g_gt[20] 应回读 555")
+    expect(g_gt[3] == 0, "全局表零填充应正确")
+
+    // 9. 既有越界读（高侧 i>=len）返回零值回归（本次修复不改越界读语义）
+    var erf = table_new_i64()
+    expect(erf[50] == 0, "空表高侧越界读应返回 0")
+    erf[1] = 9
+    expect(erf[10] == 0, "非空表高侧越界读应返回 0")
+    expect(erf[1] == 9, "越界读不影响既有合法槽读")
+
+    if g_fail == 0 {
+        println("_p912_grow_probe ALL PASS")
+        return 0
+    }
+    println("_p912_grow_probe FAILED: " + to_string(g_fail) + " 项失败")
+    return 1
+}

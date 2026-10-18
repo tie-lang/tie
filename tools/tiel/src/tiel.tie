@@ -1,0 +1,42 @@
+type tie<class>
+// tiel.tie —— tiel 包门面（嵌入集成入口；详见 tie.pkg）
+// ============================================================
+// 用法（tie 软件内源码级嵌入）：
+//     import "<到 tiel 目录>/tiel.tie"
+//     var err = tiel_check(src)          // 校验一段 tsc 源码
+//     if str_len(err) > 0 { println(err); return 1 }
+// 面：
+//   tiel_check(src) -> string   —— 跑一遍前端（词法→语法）；返回 CLI 形态
+//                                  错误行（error[E#####] @行:列: 消息。）；
+//                                  通过则返回空串。
+//   （结构账直接用 em_stats()；错误槽访问器见 emit.tie。）
+// 说明：能力在各子文件——emit（表示层）/ lex（词法）/ parse（语法）/
+//   emcodes（错误码表）/ render（CLI 形态拼装）；本文件只是聚合门面，
+//   不引入新状态，也不改变任何子文件的行为。
+import "./parse.tie"
+import "./render.tie"
+import "./emcodes.tie"
+import "./emit.tie"
+import "./lex.tie"
+namespace tiel;
+
+// 校验一段源码：先全词法扫描（词法错即停），再语法解析。
+// 返回错误行（CLI 形态）或空串（通过）。
+pub func tiel_check(src: string) -> string {
+    lx_start(src)
+    var g: i64 = 0
+    while g < 100000000 {
+        if !lx_next() {
+            return rd_err_slot()
+        }
+        if lx_kind() == K_EOF {
+            break
+        }
+        g = g + 1
+    }
+    var r = ps_parse(src)
+    if r < 0 || !em_ok() {
+        return rd_err_slot()
+    }
+    return ""
+}

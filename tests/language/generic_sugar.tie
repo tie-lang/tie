@@ -1,0 +1,86 @@
+type tie<logic>
+// ============================================================
+// p.8.2.6 泛型糖验收：默认类型参数 + 约束简化
+//
+// 覆盖场景：
+//   1. 函数通用模板默认类型参数：<T=string> 显式实参覆盖 > 推断 > 默认
+//   2. 双参数默认：首参必填、次参默认 <U=string>
+//   3. struct 泛型默认：部分显式类型实参缺省尾部 → 自动补默认
+//   4. 约束简化：<T, U: Drawable> 一条约束同时约束 T 与 U
+//   5. 约束既有语法 <T: Drawable> 不受影响
+//
+// 语义（糖 → 既有 AST/语义 映射）：
+//   - 默认类型参数：N_TYPE_PARAM.children[1] = 默认类型节点；实例化/推断
+//     收尾（finish_args / fill_missing_defaults）在显式实参与推断均未绑定时
+//     自动解析默认类型代入。优先级：显式 > 推断 > 默认。
+//   - 约束简化：<T, U: Drawable> 解析期把 U 的约束克隆回填到前面未约束的
+//     T（N_TYPE_PARAM.children[0]），产物 AST 与逐参数写 <T: Drawable,
+//     U: Drawable> 完全等价。
+// ============================================================
+
+port Shape2 {
+    pub func area(self) -> i64
+}
+struct Rect2 {
+    var w: i64 = 0
+    var h: i64 = 0
+}
+impl Shape2 for Rect2 {
+    pub func area(self) -> i64 {
+        return self.w * self.h
+    }
+}
+
+// 1. 默认类型参数（函数）：U=string，但调用点总有推断 → 推断优先于默认
+func pick_sugar<T, U=string>(a: T, b: U) -> string {
+    return "pick(" + to_string(len("xy")) + ")"
+}
+
+// 泛型默认仅在无显式实参且无推断时启用。这里用"默认在返回类型、无实参可推"
+// 的函数验证默认代入（换掉默认值会让 return "" 类型失配）。
+func fresh_text<U=string>() -> U {
+    return ""
+}
+
+// 2. 双参数默认 + 推断覆盖：T 推断为 i64（推断 > 默认 string）
+func first_val<T, U=string>(x: T, y: U) -> T {
+    return x
+}
+
+// 3. struct 泛型默认：struct Pair<T, U=string>，PairBox<i64> 省略 U → 默认 string
+struct PairDef<T, U=string> {
+    var k: T = 0
+    var v: U = 0
+}
+
+// 4+5. 约束简化：<Tp, Up: Shape2> 一条约束约束 Tp 与 Up（等价逐参数写）；
+// 既有逐参数 <T: Drawable> 形态仍可用。area_of 求面积。
+func area_of<Tp, Up: Shape2>(a: Tp, b: Up) -> i64 {
+    return a.area() + b.area()
+}
+
+func main() {
+    // 1. 推断优先于默认：两实参类型都用实参推，正常运行
+    println(pick_sugar(1, "hi"))
+    // 1b. 默认类型生效：无实参可推，U 自动用默认 string
+    var f = fresh_text()
+    println("fresh len=" + to_string(len(f)))
+    // 2. 双参数：T 推断、U 由第二个实参推断（推断 > 默认）
+    println("first=" + to_string(first_val(7, "x")))
+    // 2b. 显式实参覆盖默认：first_val<i64>(9, "x") T 显式 i64
+    println("first2=" + to_string(first_val<i64>(9, "x")))
+    // 3. struct 默认：PairDef<i64> 部分实参 → U 自动补默认 string
+    var pd = PairDef(1, "abc")
+    var pv = PairDef<i64>(2, "def")
+    println("pair v len=" + to_string(len(pv.v)))
+    // 4. 约束简化：<Draww, Up: Shape2> → Draww 与 Up 都受 Shape2 约束
+    var r1 = Rect2()
+    r1.w = 3
+    r1.h = 4
+    var r2 = Rect2()
+    r2.w = 5
+    r2.h = 2
+    var total = area_of(r1, r2)
+    println("area=" + to_string(total))
+    println("done")
+}

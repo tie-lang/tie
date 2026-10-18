@@ -1,0 +1,625 @@
+type tie<class>
+// compiler/backend/irgen_bi_mem.tie —— 内置生成器：unsafe 指针/内存（S1.2）
+// ============================================================
+// 自 irgen_expr.tie 的 builtin_expr 拆出（p.9.21.2 两步制①）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// S1.2 unsafe 指针/内存内置
+// 内置 `addr_of`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_addr_of(nm: string, id: i64) -> i64 {
+if nm == "addr_of" {
+    // addr_of(x) → 变量槽地址（ptr<变量类型>）；非变量表达式 → 求值落
+    // 内存后取地址（临时 alloca）
+    var arg = call_arg(id, 0)
+    var at = node_types[arg]
+    if at < 0 {
+        sm_err_msg = "addr_of() 实参类型未知（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    if s_tags[arg] == 6 {  // Var
+        var nid = interner.intern(sstate.name_str(arg))
+        if scope_get_global(nid) >= 0 {
+            g_builtin_res = g_lookup_alloca
+            return 0
+        }
+    }
+    var v = tig_expr(arg)
+    if v < 0 {
+        return -1
+    }
+    var alloca = ir.new_inst(g_cur_block, 20, at)
+    ir.add_operand(alloca, at, 2)
+    var ap = ir.get_value(alloca)
+    var st = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st, at, 2)
+    ir.add_operand(st, v, 0)
+    ir.add_operand(st, ap, 0)
+    g_builtin_res = ap
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `addr_of_field`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_addr_of_field(nm: string, id: i64) -> i64 {
+if nm == "addr_of_field" {
+    // addr_of_field(obj, "field") → 聚合字段地址（agg_gep）。
+    // obj 为变量（槽地址）或表达式（落内存）。字段名是字符串字面量。
+    var obj = call_arg(id, 0)
+    var fname_node = call_arg(id, 1)
+    var agg_ty = node_types[obj]
+    if agg_ty < 0 {
+        sm_err_msg = "addr_of_field() 对象类型未知（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var fname = ""
+    if s_tags[fname_node] == 2 {  // StrLit
+        var raw = interner.lookup(s_names[fname_node])
+        var rn = str_len(raw)
+        if rn >= 2 && str_char(raw, 0) == "\"" && str_char(raw, rn - 1) == "\"" {
+            fname = str_slice(raw, 1, rn - 1)
+        }
+    }
+    if str_len(fname) == 0 {
+        sm_err_msg = "addr_of_field() 字段名必须是字符串字面量（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var fidx = agg_field_index(agg_ty, fname)
+    if fidx < 0 {
+        sm_err_msg = "addr_of_field() 字段 '" + fname + "' 不存在（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var oaddr: i64 = -1
+    if s_tags[obj] == 6 {
+        var nid2 = interner.intern(sstate.name_str(obj))
+        if scope_get_global(nid2) >= 0 {
+            oaddr = g_lookup_alloca
+        }
+    }
+    if oaddr < 0 {
+        var ov = tig_expr(obj)
+        if ov < 0 {
+            return -1
+        }
+        var alloca2 = ir.new_inst(g_cur_block, 20, agg_ty)
+        ir.add_operand(alloca2, agg_ty, 2)
+        oaddr = ir.get_value(alloca2)
+        var st2 = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(st2, agg_ty, 2)
+        ir.add_operand(st2, ov, 0)
+        ir.add_operand(st2, oaddr, 0)
+    }
+    var gp = ir.new_inst(g_cur_block, 27, agg_ty)  // agg_gep
+    ir.add_operand(gp, oaddr, 0)
+    ir.add_operand(gp, fidx, 2)
+    g_builtin_res = ir.get_value(gp)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `deref`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_deref(nm: string, id: i64) -> i64 {
+if nm == "deref" {
+    // deref(p) → load 元素类型
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    var pt = node_types[call_arg(id, 0)]
+    var et = types.table_elem(pt)
+    if et < 0 {
+        sm_err_msg = "deref() 实参必须是指针类型（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var ld = ir.new_inst(g_cur_block, 21, et)  // load
+    ir.add_operand(ld, p, 0)
+    g_builtin_res = ir.get_value(ld)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `deref_write`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_deref_write(nm: string, id: i64) -> i64 {
+if nm == "deref_write" {
+    // deref_write(p, v) → store 元素类型
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    var pt = node_types[call_arg(id, 0)]
+    var et = types.table_elem(pt)
+    if et < 0 {
+        sm_err_msg = "deref_write() 第 1 实参必须是指针类型（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var v = tig_expr(call_arg(id, 1))
+    if v < 0 {
+        return -1
+    }
+    var vt = node_types[call_arg(id, 1)]
+    if vt >= 0 && vt != et && (types.is_int(vt) || types.is_float(vt)) {
+        var cv = tig_coerce(v, vt, et)
+        if cv < 0 {
+            return -1
+        }
+        v = cv
+    }
+    var st = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st, et, 2)
+    ir.add_operand(st, v, 0)
+    ir.add_operand(st, p, 0)
+    g_builtin_res = tig_int_lit(0)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `volatile_load`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_volatile_load(nm: string, id: i64) -> i64 {
+if nm == "volatile_load" {
+    // volatile_load(p) → load volatile 元素类型（任务15：MMIO/硬件寄存器读，
+    // 发射 volatile 标志——LLVM 保证不被优化删除/合并/重排）。
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    var pt = node_types[call_arg(id, 0)]
+    var et = types.table_elem(pt)
+    if et < 0 {
+        sm_err_msg = "volatile_load() 实参必须是指针类型（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var vl = ir.new_inst(g_cur_block, 71, et)  // volatile_load（op 71）
+    ir.add_operand(vl, p, 0)
+    g_builtin_res = ir.get_value(vl)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `volatile_store`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_volatile_store(nm: string, id: i64) -> i64 {
+if nm == "volatile_store" {
+    // volatile_store(p, v) → store volatile 元素类型（任务15：MMIO/硬件寄存器写，
+    // volatile 标志禁止优化删除/重排/合并）。
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    var pt = node_types[call_arg(id, 0)]
+    var et = types.table_elem(pt)
+    if et < 0 {
+        sm_err_msg = "volatile_store() 第 1 实参必须是指针类型（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var v = tig_expr(call_arg(id, 1))
+    if v < 0 {
+        return -1
+    }
+    var vt = node_types[call_arg(id, 1)]
+    if vt >= 0 && vt != et && (types.is_int(vt) || types.is_float(vt)) {
+        var cv = tig_coerce(v, vt, et)
+        if cv < 0 {
+            return -1
+        }
+        v = cv
+    }
+    var vs = ir.new_inst(g_cur_block, 72, -1)  // volatile_store（op 72）
+    ir.add_operand(vs, et, 2)  // 值类型 IMM
+    ir.add_operand(vs, v, 0)   // 值
+    ir.add_operand(vs, p, 0)   // 地址
+    g_builtin_res = tig_int_lit(0)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `is_null`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// r.1.6.15 `share(x)`：**恒等传递**——值不变，效果在**绑定处**（目标变量登记为
+// 「显式共享」⇒ 写路径跳过 COW）。这是值语义的逃生舱：需要零拷贝就地改、且能
+// 自行证明并发安全时用它。危险面由域门禁（unsafe 上下文 + share 凭据）承担。
+pub func bi_share(nm: string, id: i64) -> i64 {
+if nm == "share" {
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    g_builtin_res = v
+    return 0
+}
+}
+
+pub func bi_is_null(nm: string, id: i64) -> i64 {
+if nm == "is_null" {
+    // is_null(p) → icmp eq p, null（llvmgen ptr 比较自动把 0 写 null；
+    // 立即数 0 必须 IMM 操作数——值 0 会被当值 id 查定义）
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(ic, p, 0)
+    ir.add_operand(ic, 0, 2)  // IMM 0（llvmgen ptr 上下文 → null）
+    ir.add_operand(ic, 0, 2)  // eq
+    g_builtin_res = ir.get_value(ic)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `ptr_add`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_ptr_add(nm: string, id: i64) -> i64 {
+if nm == "ptr_add" {
+    // ptr_add(p, n) → p + n 元素步长（gep 单索引）
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    var pt = node_types[call_arg(id, 0)]
+    var et = types.table_elem(pt)
+    if et < 0 {
+        sm_err_msg = "ptr_add() 第 1 实参必须是指针类型（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var n = tig_expr(call_arg(id, 1))
+    if n < 0 {
+        return -1
+    }
+    var gp = ir.new_inst(g_cur_block, 23, et)  // gep（步长 = 元素大小）
+    ir.add_operand(gp, p, 0)
+    ir.add_operand(gp, n, 0)
+    g_builtin_res = ir.get_value(gp)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `ptr_to_int`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_ptr_to_int(nm: string, id: i64) -> i64 {
+if nm == "ptr_to_int" {
+    // ptr_to_int(p) → ptrtoint i64
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    var pi = ir.new_inst(g_cur_block, 24, types.named(TK_I64))
+    ir.add_operand(pi, p, 0)
+    g_builtin_res = ir.get_value(pi)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `int_to_ptr`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_int_to_ptr(nm: string, id: i64) -> i64 {
+if nm == "int_to_ptr" {
+    // int_to_ptr(i) → inttoptr ptr（字节指针 ptr<u8>）
+    var i = tig_expr(call_arg(id, 0))
+    if i < 0 {
+        return -1
+    }
+    var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr → ptr
+    ir.add_operand(ip, i, 0)
+    g_builtin_res = ir.get_value(ip)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `alloc`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_alloc(nm: string, id: i64) -> i64 {
+if nm == "alloc" {
+    // alloc(n) → 原始字节缓冲（ptr<u8>，LLVM ptr 直传）。
+    // 修复（漏洞 A 类隐患）：裸 malloc 若标 TK_STR，llvmgen op36 会对它做
+    // 字符串补头扫描（strlen + tie_sso_alloc + memcpy）——对**未初始化**
+    // 堆缓冲 strlen 读的是垃圾，返回缓冲实际容量 = 垃圾长度：小则 4096 字节
+    // 写入越界（SSO 静态池/堆损坏，多会话交错读写出现字节串线/丢失），
+    // 大则扫描越界读未映射内存崩溃。故走 s21_raw_alloc_str（K_PTR 返回绕开
+    // 扫描，ptrtoint+inttoptr 包回 TK_STR 值），与编译器内部原始分配同范式。
+    var n = tig_expr(call_arg(id, 0))
+    if n < 0 {
+        return -1
+    }
+    g_builtin_res = s21_raw_alloc_str(n)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `free`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_free(nm: string, id: i64) -> i64 {
+if nm == "free" {
+    // free(p) → libc free
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    tig_ext_call1("free", p, types.named(TK_STR), -1)
+    g_builtin_res = tig_int_lit(0)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `memcpy`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_memcpy(nm: string, id: i64) -> i64 {
+if nm == "memcpy" {
+    // memcpy(dst, src, n) → libc @memcpy(ptr, ptr, i64)
+    // 走 extern_call + extern_decl 映射（模块头不重复 declare）。
+    // 曾用 llvm.memcpy.p0.p0.i64 内在：user_extern_decl 按调用签名重建
+    // 声明 → 与模块头 4 参声明重复 → opt 报「invalid redefinition」。
+    var dst = tig_expr(call_arg(id, 0))
+    if dst < 0 {
+        return -1
+    }
+    var src = tig_expr(call_arg(id, 1))
+    if src < 0 {
+        return -1
+    }
+    var n = tig_expr(call_arg(id, 2))
+    if n < 0 {
+        return -1
+    }
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, dst)
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, src)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, n)
+    tig_ext_call_typed("memcpy", ats, avs, -1)
+    g_builtin_res = tig_int_lit(0)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `memset`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_memset(nm: string, id: i64) -> i64 {
+if nm == "memset" {
+    // memset(p, val, n) → libc @memset(ptr, i8, i64)
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    var val = tig_expr(call_arg(id, 1))
+    if val < 0 {
+        return -1
+    }
+    var n = tig_expr(call_arg(id, 2))
+    if n < 0 {
+        return -1
+    }
+    var val8 = s21_trunc_i8(val)  // val 为 i64 → trunc i8（@memset 第二参 i8）
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, p)
+    table_push(ats, types.named(TK_I8))
+    table_push(avs, val8)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, n)
+    tig_ext_call_typed("memset", ats, avs, -1)
+    g_builtin_res = tig_int_lit(0)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `slice_of`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_slice_of(nm: string, id: i64) -> i64 {
+if nm == "slice_of" {
+    // slice_of(obj, start, len) → slice<元素类型> 聚合：指针 + 长度。
+    // 字符串路径：数据指针直接 + len（第一版）。
+    // 动态表路径（任务16）：表 → 连续内存切片——alloc 连续缓冲 + 逐元素
+    // tie_table_at_* 拷贝（全 .tie，无新增 Rust 桥；运行时表数据区在桥内）。
+    var arr = call_arg(id, 0)
+    var at2 = node_types[arr]
+    if types.is_table(at2) {
+        // ---------- 动态表 → 连续内存切片（任务16）----------
+        // 元素类型：table_elem（typed table<T>）→ var_table_elem（table_new_i64
+        // 等语义登记，裸 table 无元素信息）→ i64 兜底。
+        var etab: i64 = types.named(TK_I64)
+        var te2 = types.table_elem(at2)
+        if te2 >= 0 {
+            etab = te2
+        } else if s_tags[arr] == 6 {
+            var te3 = sinfer.var_table_elem(intern.intern(sstate.name_str(arr)))
+            if te3 >= 0 {
+                etab = te3
+            }
+        }
+        var tb = tig_expr(arr)
+        if tb < 0 {
+            return -1
+        }
+        var start = tig_expr(call_arg(id, 1))
+        if start < 0 {
+            return -1
+        }
+        var cnt = tig_expr(call_arg(id, 2))
+        if cnt < 0 {
+            return -1
+        }
+        // 分配连续缓冲：cnt * elem_size 字节（malloc 返回 ptr<u8>）
+        var esz = elem_size(etab)
+        var esz_v = tig_int_lit_ty(esz, types.named(TK_I64))
+        var m = ir.new_inst(g_cur_block, 2, types.named(TK_I64))  // mul
+        ir.add_operand(m, esz_v, 0)
+        ir.add_operand(m, cnt, 0)
+        var buf = s21_raw_alloc_str(ir.get_value(m))  // 原始缓冲：绕开 TK_STR 补头扫描（漏洞 A 类）
+        // LLVM opaque ptr：malloc 结果 ptr 直接用于 gep（元素类型 = ins_ty，
+        // 步长按 etab）；无需 bitcast。
+        var bp = buf
+        var suffix = bridge_suffix(etab)
+        var ret_ty: i64 = types.named(TK_I64)
+        if suffix == "string" {
+            ret_ty = types.named(TK_STR)
+        } else if suffix == "f64" {
+            ret_ty = types.named(TK_F64)
+        } else if suffix == "bool" {
+            ret_ty = types.named(TK_BOOL)
+        }
+        // 运行时循环（cnt/start 是运行期值，不能用编译期展开）：计数器 i
+        // alloca 0..cnt，body 每次迭代 tie_table_at 读 + 写连续缓冲。
+        var i_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))  // alloca i64
+        ir.add_operand(i_a, types.named(TK_I64), 2)
+        var i_ptr = ir.get_value(i_a)
+        var i_zero = tig_int_lit_ty(0, types.named(TK_I64))
+        var st0 = ir.new_inst(g_cur_block, 22, -1)  // store 0 → i
+        ir.add_operand(st0, types.named(TK_I64), 2)
+        ir.add_operand(st0, i_zero, 0)
+        ir.add_operand(st0, i_ptr, 0)
+        var cond_blk = ir.new_block(g_cur_func, interner.intern("slc.cond"))
+        var body_blk = ir.new_block(g_cur_func, interner.intern("slc.body"))
+        var step_blk = ir.new_block(g_cur_func, interner.intern("slc.step"))
+        var exit_blk = ir.new_block(g_cur_func, interner.intern("slc.exit"))
+        var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+        ir.add_operand(b0, cond_blk, 1)
+        // cond 块：i < cnt → body，否则 exit
+        g_cur_block = cond_blk
+        var cur = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load i
+        ir.add_operand(cur, i_ptr, 0)
+        var cur_v = ir.get_value(cur)
+        var cnd = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp slt
+        ir.add_operand(cnd, cur_v, 0)
+        ir.add_operand(cnd, cnt, 0)
+        ir.add_operand(cnd, 2, 2)  // slt
+        var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+        ir.add_operand(cb, ir.get_value(cnd), 0)
+        ir.add_operand(cb, body_blk, 1)
+        ir.add_operand(cb, exit_blk, 1)
+        // body 块：idx = start + i；读表元素；写缓冲 buf + i 元素步长
+        g_cur_block = body_blk
+        var cur2 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load i
+        ir.add_operand(cur2, i_ptr, 0)
+        var i_v = ir.get_value(cur2)
+        var idx = ir.new_inst(g_cur_block, 0, types.named(TK_I64))  // add start + i
+        ir.add_operand(idx, start, 0)
+        ir.add_operand(idx, i_v, 0)
+        var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+        ir.add_operand(ok_slot, types.named(TK_I8), 2)
+        var val = s21_table_at(tb, ir.get_value(idx), ir.get_value(ok_slot), ret_ty)
+        if val < 0 {
+            return -1
+        }
+        // 写缓冲：buf + i 元素步长（gep 单索引，i 为运行期值）
+        var gp = ir.new_inst(g_cur_block, 23, etab)
+        ir.add_operand(gp, bp, 0)
+        ir.add_operand(gp, i_v, 0)
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store
+        ir.add_operand(st, etab, 2)
+        ir.add_operand(st, val, 0)
+        ir.add_operand(st, ir.get_value(gp), 0)
+        var bb = ir.new_inst(g_cur_block, 30, -1)  // br step
+        ir.add_operand(bb, step_blk, 1)
+        // step 块：i += 1
+        g_cur_block = step_blk
+        var cur3 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load i
+        ir.add_operand(cur3, i_ptr, 0)
+        var i3 = ir.get_value(cur3)
+        var one = tig_int_lit_ty(1, types.named(TK_I64))
+        var inc = ir.new_inst(g_cur_block, 0, types.named(TK_I64))  // add i + 1
+        ir.add_operand(inc, i3, 0)
+        ir.add_operand(inc, one, 0)
+        var st2 = ir.new_inst(g_cur_block, 22, -1)  // store i+1 → i
+        ir.add_operand(st2, types.named(TK_I64), 2)
+        ir.add_operand(st2, ir.get_value(inc), 0)
+        ir.add_operand(st2, i_ptr, 0)
+        var sb = ir.new_inst(g_cur_block, 30, -1)  // br cond
+        ir.add_operand(sb, cond_blk, 1)
+        // exit 块
+        g_cur_block = exit_blk
+        g_builtin_res = make_slice2(buf, cnt, etab)
+        return 0
+    }
+    if at2 != TK_STR {
+        sm_err_msg = "slice_of() 第一版只支持字符串或动态表（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var et: i64 = types.named(TK_U8)
+    var pv: i64 = -1
+    if s_tags[arr] == 6 {
+        var nid3 = interner.intern(sstate.name_str(arr))
+        if scope_get_global(nid3) >= 0 {
+            pv = g_lookup_alloca
+        }
+    }
+    if pv < 0 {
+        pv = tig_expr(arr)
+        if pv < 0 {
+            return -1
+        }
+        // 字符串字面量（const_str = i64 指针整数）→ inttoptr 转 ptr
+        if s_tags[arr] == 2 {
+            var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))
+            ir.add_operand(ip, pv, 0)
+            pv = ir.get_value(ip)
+        }
+    }
+    var start = tig_expr(call_arg(id, 1))
+    if start < 0 {
+        return -1
+    }
+    var cnt = tig_expr(call_arg(id, 2))
+    if cnt < 0 {
+        return -1
+    }
+    // 基址 + start 元素步长（u8 → 字节偏移）
+    var gp2 = ir.new_inst(g_cur_block, 23, et)
+    ir.add_operand(gp2, pv, 0)
+    ir.add_operand(gp2, start, 0)
+    var base = ir.get_value(gp2)
+    g_builtin_res = make_slice2(base, cnt, et)
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `slice_len`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_slice_len(nm: string, id: i64) -> i64 {
+if nm == "slice_len" {
+    var s = tig_expr(call_arg(id, 0))
+    if s < 0 {
+        return -1
+    }
+    g_builtin_res = slice_field(s, 1)  // 长度字段
+    return 0
+}
+}
+
+// S1.2 unsafe 指针/内存内置
+// 内置 `slice_index`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_slice_index(nm: string, id: i64) -> i64 {
+if nm == "slice_index" {
+    // slice_index(s, i) → s[i]：gep 元素步长 + load
+    var s = tig_expr(call_arg(id, 0))
+    if s < 0 {
+        return -1
+    }
+    var st_ty = node_types[call_arg(id, 0)]
+    var et = types.table_elem(st_ty)
+    if et < 0 {
+        sm_err_msg = "slice_index() 实参必须是切片类型（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var i = tig_expr(call_arg(id, 1))
+    if i < 0 {
+        return -1
+    }
+    var sp = slice_field(s, 0)  // 指针字段
+    var gp3 = ir.new_inst(g_cur_block, 23, et)
+    ir.add_operand(gp3, sp, 0)
+    ir.add_operand(gp3, i, 0)
+    var ld2 = ir.new_inst(g_cur_block, 21, et)
+    ir.add_operand(ld2, ir.get_value(gp3), 0)
+    g_builtin_res = ir.get_value(ld2)
+    return 0
+}
+}
+
+}

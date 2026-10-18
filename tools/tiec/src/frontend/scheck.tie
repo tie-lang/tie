@@ -1,0 +1,72 @@
+type tie<class>
+// compiler/frontend/scheck.tie —— T2.6 语句/函数检查（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）完整语义分析
+// 拆分为 8 模块之一（本文件 = 语句检查 + 函数体检查 + switch case 检查）。
+// 对应 proto/semantic.tie 3007-3437（check_stmt/check_switch_case/check_block/
+// check_var_decl）+ 3554-3597（check_fn）+ 3694-3768（check_fn_walk）逻辑搬移。
+// 依赖：./sstate.tie（AST 全局 + 符号表 + 工具）+ ./stype.tie（类型匹配）+
+// ./sinfer.tie（表达式推断）。树式无环：由 semantic.tie import。
+import "./scollect.tie"
+
+// switch case 值去重表（跨 case 检测重复；switch 分支检查时重置）
+pub var g_case_seen: table<string>;
+// 三期 goto 标签表（§7.1.5，函数级）：标签名 → 所在块链/块内序号/全局序号。
+// 每函数 check_fn 重置。R1 同函数 / R2 同块或已执行外层块 / R3 不越过初始化。
+pub var g_gt_keys: table<i64>;      // 标签名池 id
+pub var g_gt_chain: table<string>;  // 标签所在块链（"/" 分隔块 id）
+pub var g_gt_blkidx: table<i64>;    // 标签在所在块内语句序号
+pub var g_gt_seq: table<i64>;       // 标签全局语句序号（函数内单调）
+pub var g_gt_depths: table<i64>;    // 标签块深度
+pub var g_gt_blknode: table<i64>;   // 标签所在块 StmtList 节点（R3 扫描用）
+// goto 请求表（延迟校验）：goto 可能在标签前（前向跳），函数体检查完统一校验。
+// 与标签表同位布局：目标名 / goto 所在块链 / 块内序号 / 全局序号 / 行列。
+pub var g_gtg_keys: table<i64>;
+pub var g_gtg_chain: table<string>;
+pub var g_gtg_blkidx: table<i64>;
+pub var g_gtg_seq: table<i64>;
+pub var g_gtg_line: table<i64>;
+pub var g_gtg_col: table<i64>;
+// 当前块追踪（函数级）：块链 / 块深度 / 块内语句序号 / 当前块 StmtList 节点
+pub var g_cur_chain: string = "";   // 当前块链
+pub var g_cur_depth: i64 = 0;       // 当前块深度
+pub var g_cur_blkidx: i64 = 0;      // 当前块内语句序号（check_block 循环设置）
+pub var g_cur_blknode: i64 = -1;    // 当前块 StmtList 节点（R3 扫描用）
+pub var g_gt_seq_cnt: i64 = 0;      // 函数内语句全局序号
+pub var g_gt_blk_seq: i64 = 0;      // 块 id 计数器（函数级）
+// 警告辅助：当前块内已声明名集合（控制变量遮蔽 vs 重复声明的判定）。
+// check_block 进入/退出 save/restore，使同名内层声明可被识别为遮蔽外层。
+pub var g_block_names: table<i64> = []
+// 警告辅助：控制流嵌套深度（W00017，进入 if/while/for/switch/try/... 体 +1）
+pub var g_cf_depth: i64 = 0
+
+
+// ==================== W00019 / W00016 全局状态与辅助 ====================
+
+// W00019：静态长度可确定的表变量（`var t = [字面量...]`）长度表（名池 id → 长度）。
+pub var w19_len_keys: table<i64> = []
+pub var w19_len_vals: table<i64> = []
+// 名池 id → 出现次数（S_N_VAR 读节点数）
+pub var w19_occ_keys: table<i64> = []
+pub var w19_occ_vals: table<i64> = []
+// 名池 id → 作为下标赋值目标的次数（S_N_INDEX_ASSIGN 的根变量）
+pub var w19_idx_keys: table<i64> = []
+pub var w19_idx_vals: table<i64> = []
+
+// W00016：全局可变表写点累积（名池 id → 写点计数 / 首个写点位置）。
+pub var w16_keys: table<i64> = []
+pub var w16_cnt: table<i64> = []
+pub var w16_ln: table<i64> = []
+pub var w16_cl: table<i64> = []
+
+namespace scheck {
+
+
+}
+
+import "./scheck_p1.tie"
+import "./scheck_p2.tie"
+
+import "./scheck_q1.tie"
+import "./scheck_q2.tie"
+import "./scheck_q3.tie"

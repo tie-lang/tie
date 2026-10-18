@@ -1,0 +1,311 @@
+type tie<class>
+// compiler/interp/interp_call_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 interp_call.tie。
+// 内置名单 nid 表（p.9.17.3 后半；namespace 外——tie 全局必须顶层）。
+// 名单数据源在 is_builtin_nid 内内联惰性构建（勿在此处另抄一份）。
+var bi_nids: table<i64>;
+var bi_nids_ready: bool = false;
+
+namespace tiep {
+// 函数调用：内置函数 → 用户函数 → 报错。nid 版主实现（p.9.17.3 后半）：
+// 入口直传 interned id——免 nname_str 构造、内置名单与函数表查找全部整数键
+// （对齐变量环境 env_nids 先例）；name 只供 ns 前缀段 / dbg / 错误文本，
+// 由 interner.lookup 还原一次。args = 实参值表；arg_nodes = 实参 AST 节点表。
+func call_fn_nid(nid: i64, args: table<Value>, arg_nodes: table<i64>) -> Value {
+    // 内置函数（对齐 Rust call_fn 的 match name 分支）
+    if is_builtin_nid(nid) {
+        return call_builtin_nid(nid, args)
+    }
+    // 用户函数（REPL 中定义的；命名空间函数以全名注册）
+    var f = isess.f_get_nid(nid)
+    if f < 0 {
+        w_err = "未定义的函数 '" + interner.lookup(nid) + "'"
+        return Value.Nil
+    }
+    var name = interner.lookup(nid)
+    // FnDef 泛型槽偏移：children = [类型参数槽, 返回类型, 参数..., 函数体]，
+    // 形参从 1 + soff 起（对齐 sstate.slot_off——曾按旧布局读 children[1+i]，
+    // 泛型槽引入后把槽/返回类型误当形参绑定，函数调用全错位）
+    var fsoff: i64 = 0
+    if isess.nchild(f) > 1 {
+        var fc0 = isess.nchild_at(f, 0)
+        if fc0 < 0 {
+            fsoff = 1
+        } else if isess.ntag(fc0) == N_TYPE_PARAMS {
+            fsoff = 1
+        }
+    }
+    // 参数个数区间检查（默认值参数）：实参数必须在 [必选数, 总形参数] 内；
+    // 变参（最后一个形参 aux==1）：无上界，必选数不含变参本身
+    var total = isess.naux(f)
+    var has_var: bool = false
+    var required: i64 = 0
+    var pi: i64 = 0
+    while pi < total {
+        var p = isess.nchild_at(f, 1 + fsoff + pi)
+        if isess.naux(p) == 1 {
+            has_var = true   // 变参形参（aux 标记）
+        } else if isess.nchild_at(p, 1) < 0 {
+            required = required + 1
+        }
+        pi = pi + 1
+    }
+    if len(args) < required || (!has_var && len(args) > total) {
+        var cnt_desc = ""
+        if has_var {
+            cnt_desc = to_string(required) + "+"
+        } else if required == total {
+            cnt_desc = to_string(total)
+        } else {
+            cnt_desc = to_string(required) + "-" + to_string(total)
+        }
+        w_err = "函数 '" + name + "' 期望 " + cnt_desc + " 个参数，实际 " + to_string(len(args)) + " 个"
+        return Value.Nil
+    }
+    // 函数体执行期间，裸调用按本函数命名空间前缀补全
+    var saved_ns = isess.ns_save()
+    if rfind_ns_str(name) >= 0 {
+        env_ns = ns_prefix_of_name(name)
+    }
+    // 保存调用者的作用域起点，压参后本函数作用域从参数作用域开始
+    var saved_base = env_base
+    isess.scope_push()
+    isess.ref_push()
+    var i: i64 = 0
+    while i < total {
+        var p = isess.nchild_at(f, 1 + fsoff + i)
+        var pname = isess.nname_str(p)
+        if isess.naux(p) == 1 {
+            // 变参：剩余全部实参打包为 Value 表（支持 len/下标/for）
+            var tv = vval.new_table()
+            var ai: i64 = i
+            while ai < len(args) {
+                tv = vval.table_push_val(tv, args[ai])
+                ai = ai + 1
+            }
+            isess.var_declare(pname, tv)
+        } else if isess.nval(p) == 1 {
+            // T0.3 by_ref：实参必须是可寻址表变量；引用槽记录调用方变量名。
+            // 注意：tie 的 || 不短路，先判越界再取节点
+            if i >= len(arg_nodes) {
+                w_err = "函数 '" + name +
+                    "' 的 ref 参数需要可寻址的表变量实参（字面量/下标/调用结果不可取地址）"
+                isess.ref_pop()
+                isess.scope_pop()
+                env_base = saved_base
+                isess.ns_restore(saved_ns)
+                return Value.Nil
+            }
+            if isess.ntag(arg_nodes[i]) != N_VAR {
+                w_err = "函数 '" + name +
+                    "' 的 ref 参数需要可寻址的表变量实参（字面量/下标/调用结果不可取地址）"
+                isess.ref_pop()
+                isess.scope_pop()
+                env_base = saved_base
+                isess.ns_restore(saved_ns)
+                return Value.Nil
+            }
+            isess.ref_add(pname, isess.nname_str(arg_nodes[i]))
+        } else {
+            var v: Value = Value.Nil
+            if i < len(args) {
+                v = args[i]
+            } else {
+                // 缺省参数按默认值表达式求值补齐（限字面量/空表，无作用域依赖）
+                var def = isess.nchild_at(p, 1)
+                if def >= 0 {
+                    v = gen_expr(def)
+                    if w_err != "" {
+                        isess.ref_pop()
+                        isess.scope_pop()
+                        env_base = saved_base
+                        isess.ns_restore(saved_ns)
+                        return Value.Nil
+                    }
+                } else {
+                    w_err = "函数 '" + name + "' 缺少第 " + to_string(i + 1) +
+                        " 个参数且无默认值"
+                    isess.ref_pop()
+                    isess.scope_pop()
+                    env_base = saved_base
+                    isess.ns_restore(saved_ns)
+                    return Value.Nil
+                }
+            }
+            isess.var_declare(pname, v)
+        }
+        i = i + 1
+    }
+    env_base = isess.scope_top()
+    var body = isess.nchild_at(f, isess.nchild(f) - 1)
+    if dbg_on {
+        dbg_enter(name, isess.nline(body))
+    }
+    exec_block(body)
+    if dbg_on {
+        dbg_leave()
+    }
+    isess.ref_pop()
+    isess.scope_pop()
+    env_base = saved_base
+    isess.ns_restore(saved_ns)
+    if w_err != "" {
+        return Value.Nil
+    }
+    // 处理 return 传播
+    if g_flow == FL_RETURN {
+        g_flow = FL_NORMAL
+        return g_flow_val
+    }
+    if g_flow == FL_BREAK {
+        w_err = "break" + label_space(g_flow_label) + "逃出函数体（内部错误）"
+        return Value.Nil
+    }
+    if g_flow == FL_CONTINUE {
+        w_err = "continue" + label_space(g_flow_label) + "逃出函数体（内部错误）"
+        return Value.Nil
+    }
+    g_flow = FL_NORMAL
+    if g_has_last {
+        return g_lastval
+    }
+    return vval.new_void()
+}
+
+// 字符串兼容薄包装（冷路径：REPL 协议 / 宏展开等文本入口，intern 一次转 nid 版）。
+func call_fn(name: string, args: table<Value>, arg_nodes: table<i64>) -> Value {
+    return call_fn_nid(interner.intern(name), args, arg_nodes)
+}
+
+// 内置函数名单（对齐 Rust call_fn 的内置分支；T4.1 核心子集）。
+// p.9.17.3 后半：名单数据源 = is_builtin_nid 内的 bi_nids（interned id 表，
+// **内联惰性构建**——教训：经辅助函数取名单 = 每次判定多付一次完整解释器
+// 函数调用，F_call 实测 +28%）。字符串版 is_builtin 转薄包装。
+pub func is_builtin(name: string) -> bool {
+    return is_builtin_nid(interner.intern(name))
+}
+
+// nid 版判定（热路径）：名单惰性 intern 一次，整数线性扫描（免逐条字符串比较）。
+pub func is_builtin_nid(nid: i64) -> bool {
+    if !bi_nids_ready {
+        // 核心标量/表/求值内建
+        table_push(bi_nids, interner.intern("println"))
+        table_push(bi_nids, interner.intern("print"))
+        table_push(bi_nids, interner.intern("len"))
+        table_push(bi_nids, interner.intern("str_len"))
+        table_push(bi_nids, interner.intern("str_char"))
+        table_push(bi_nids, interner.intern("char_code"))
+        table_push(bi_nids, interner.intern("to_string"))
+        table_push(bi_nids, interner.intern("parse_int"))
+        table_push(bi_nids, interner.intern("parse_float"))
+        table_push(bi_nids, interner.intern("parse_trit"))
+        table_push(bi_nids, interner.intern("to_trit"))
+        table_push(bi_nids, interner.intern("trit_val"))
+        table_push(bi_nids, interner.intern("table_new_i64"))
+        table_push(bi_nids, interner.intern("table_new_f64"))
+        table_push(bi_nids, interner.intern("table_new_string"))
+        table_push(bi_nids, interner.intern("table_new_bool"))
+        table_push(bi_nids, interner.intern("table_at"))
+        table_push(bi_nids, interner.intern("eval"))
+        table_push(bi_nids, interner.intern("eval_call"))
+        // 卫生/编译期代码生成（S3.3：gensym 显式卫生唯一标识符、eval_code
+        // 编译期代码生成——仅宏体环境可用，运行期语义层拦截）
+        table_push(bi_nids, interner.intern("gensym"))
+        table_push(bi_nids, interner.intern("eval_code"))
+        table_push(bi_nids, interner.intern("eval_expr"))
+        // M4（dev33 批次9 任务27）：compile_error("消息") 宏内主动报编译错误——
+        // 置 w_err 上抛，mexpand 以调用点行列号报「宏展开失败」。
+        table_push(bi_nids, interner.intern("compile_error"))
+        // M4 过程宏（dev33 批次9）：token 流 API——tokenize（源码→token 流）、
+        // deparse（token 流→源码）、token_len/token_tag_at/token_lexeme_at
+        // （token 流检视）。仅宏环境（编译期 interp）可用。
+        table_push(bi_nids, interner.intern("tokenize"))
+        table_push(bi_nids, interner.intern("deparse"))
+        table_push(bi_nids, interner.intern("token_len"))
+        table_push(bi_nids, interner.intern("token_tag_at"))
+        table_push(bi_nids, interner.intern("token_lexeme_at"))
+        // tsh 脚本运行时（shell 角色，p.9.4）：把过程/环境/文件桥开放给解释器
+        // 求值——基础原语在编译端内联到 libc/win32（无 tie_interp 依赖），直调。
+        table_push(bi_nids, interner.intern("get_env"))
+        table_push(bi_nids, interner.intern("set_env"))
+        table_push(bi_nids, interner.intern("exec_code"))
+        table_push(bi_nids, interner.intern("exec_output"))
+        table_push(bi_nids, interner.intern("cwd"))
+        table_push(bi_nids, interner.intern("time_now"))
+        table_push(bi_nids, interner.intern("file_read"))
+        table_push(bi_nids, interner.intern("file_write"))
+        table_push(bi_nids, interner.intern("file_append"))
+        table_push(bi_nids, interner.intern("file_exists"))
+        table_push(bi_nids, interner.intern("path_join"))
+        table_push(bi_nids, interner.intern("mkdir_all"))
+        table_push(bi_nids, interner.intern("remove_dir_all"))
+        // tsh 脚本字符串/目录/参数/哈希/超时内建（p.9.4 脚本语义升级）：
+        // 字面 `|` 逃逸 pipe_char；目录枚举 list_dir/walk_dir；脚本参数
+        // arg_count/arg_at；file SHA256 get_file_hash；exit(n) 条件退出。
+        table_push(bi_nids, interner.intern("contains"))
+        table_push(bi_nids, interner.intern("has_prefix"))
+        table_push(bi_nids, interner.intern("has_suffix"))
+        table_push(bi_nids, interner.intern("split_lines"))
+        table_push(bi_nids, interner.intern("split_char"))
+        table_push(bi_nids, interner.intern("substr"))
+        table_push(bi_nids, interner.intern("replace_all"))
+        table_push(bi_nids, interner.intern("is_empty"))
+        table_push(bi_nids, interner.intern("pipe_char"))
+        table_push(bi_nids, interner.intern("path_basename"))
+        table_push(bi_nids, interner.intern("list_dir"))
+        table_push(bi_nids, interner.intern("walk_dir"))
+        table_push(bi_nids, interner.intern("arg_count"))
+        table_push(bi_nids, interner.intern("arg_at"))
+        table_push(bi_nids, interner.intern("get_file_hash"))
+        table_push(bi_nids, interner.intern("exec_code_timeout"))
+        table_push(bi_nids, interner.intern("exit"))
+        // 动态加载原语（p.9.17.4 第一步：编译端 p.6.6.20 四件套移植）
+        table_push(bi_nids, interner.intern("load_library"))
+        table_push(bi_nids, interner.intern("get_proc"))
+        table_push(bi_nids, interner.intern("dyn_call"))
+        table_push(bi_nids, interner.intern("dyn_call_p"))
+        table_push(bi_nids, interner.intern("cstr_to_string"))
+        // p.9.17.4 第二步：JIT 源码库查询
+        table_push(bi_nids, interner.intern("fn_source"))
+        // 批次④确定性内建：remove_file（确定删单文件，替代 exec del 的 flake）、
+        // sort_strings（字符串表按字节序排序）、regex_findstr（findstr 正则子集
+        // 命中判断）、sleep_ms（libc Sleep 短暂等待）。
+        table_push(bi_nids, interner.intern("remove_file"))
+        table_push(bi_nids, interner.intern("sort_strings"))
+        table_push(bi_nids, interner.intern("regex_findstr"))
+        table_push(bi_nids, interner.intern("sleep_ms"))
+        bi_nids_ready = true
+        // 构建后插入排序（一次性；查询走二分——运行时数组逐项线性扫的
+        // 边界检查/加载成本 ~27ns/项，62 项 ≈ 1.7µs/调用，二分降至 ~6 次）
+        var a: i64 = 1
+        while a < len(bi_nids) {
+            var key = bi_nids[a]
+            var b: i64 = a - 1
+            while b >= 0 && bi_nids[b] > key {
+                bi_nids[b + 1] = bi_nids[b]
+                b = b - 1
+            }
+            bi_nids[b + 1] = key
+            a = a + 1
+        }
+    }
+    var lo: i64 = 0
+    var hi: i64 = len(bi_nids) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        var v = bi_nids[mid]
+        if v == nid {
+            return true
+        }
+        if v < nid {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return false
+}
+
+}

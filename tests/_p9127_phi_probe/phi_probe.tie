@@ -1,0 +1,100 @@
+type tie<logic>
+// p.9.12.7 正例探针：单函数内多臂各做多段字符串拼接——触发后端
+// 「PHI 未分组」（ungrouped PHI / chain of phi nodes not grouped at top）。
+//
+// 设计：刻意把一个含 ≥3 个 if/switch 臂、每臂一条 `"a" + x + "b"` 拼接链
+// 的函数放进同一编译单元（multi），让分支合流处的多入口 string PHI 堆积，
+// 暴露 tiec irgen→LLVM opt 阶段的 PHI 未提到块顶缺陷（应修复后 PASS）。
+//
+// 覆盖（探针矩阵，见第 4 步）：
+//   1) 2-arm if  2) 3-arm if/else-if  3) 多臂 switch 返回拼接值
+//   4) 嵌套 if  5) switch 臂内拼接链  6) 函数返回拼接值
+//   7) 与 `->` 数据流管道组合
+func chk(cond: bool, name: string) {
+    if cond {
+        println("PASS " + name)
+    } else {
+        println("FAIL " + name)
+        exit(1)
+    }
+}
+
+// 2-arm if：每臂一条多段拼接链
+func cat2(n: i64) -> string {
+    if n == 0 {
+        return "[A:" + to_string(n) + ":ok]"
+    } else {
+        return "[A:" + to_string(n) + ":no]"
+    }
+}
+
+// 3-arm if/else-if：每臂一条多段拼接链
+func cat3(n: i64) -> string {
+    if n == 1 {
+        return "one-" + to_string(n) + "-a" + "-b"
+    } else if n == 2 {
+        return "two-" + to_string(n) + "-c" + "-d"
+    } else {
+        return "oth-" + to_string(n) + "-e" + "-f"
+    }
+}
+
+// 多臂 switch 返回拼接值
+func catsw(n: i64) -> string {
+    return switch n {
+        1 -> "sw1:" + to_string(n) + ":go",
+        2 -> "sw2:" + to_string(n) + ":up",
+        3 -> "sw3:" + to_string(n) + ":hi",
+        _ -> "swd:" + to_string(n) + ":no"
+    }
+}
+
+// 嵌套 if：内层 if 的拼接结果再拼一段
+func catnest(n: i64) -> string {
+    var inner = ""
+    if n >= 0 {
+        if n == 0 {
+            inner = "z" + to_string(n) + "p"
+        } else {
+            inner = "p" + to_string(n) + "q"
+        }
+    } else {
+        inner = "n" + to_string(n) + "r"
+    }
+    return "out=" + inner + ";"
+}
+
+// 函数返回拼接值（直接 return 一段拼接链）
+func catret(n: i64) -> string {
+    return "ret(" + to_string(n) + ")." + to_string(n + 1)
+}
+
+// 与 `->` 数据流管道组合：拼接结果作为末参传入
+func wrap(prefix: string, x: string) -> string {
+    return prefix + ":" + x
+}
+
+// single 函数：`->` 数据流管道把前段拼接结果作为末参传入
+func sous(hdr: string, v: i64) -> string {
+    var inner = "v" + to_string(v)
+    var parts = (inner -> wrap(hdr)) // wrap(hdr, inner) -> hdr + ":" + inner
+    return parts
+}
+
+func main() {
+    chk(cat2(0) == "[A:0:ok]" && cat2(5) == "[A:5:no]", "2-arm if concat")
+    chk(cat3(1) == "one-1-a-b" && cat3(2) == "two-2-c-d" && cat3(9) == "oth-9-e-f", "3-arm if/else-if concat")
+    chk(catsw(1) == "sw1:1:go" && catsw(3) == "sw3:3:hi" && catsw(7) == "swd:7:no", "multi-arm switch concat")
+    chk(catnest(0) == "out=z0p;" && catnest(4) == "out=p4q;" && catnest(-2) == "out=n-2r;", "nested if concat")
+    chk(catret(6) == "ret(6).7", "return concat value")
+    chk(sous("h", 9) == "h:v9", "pipe + concat")
+
+    // 逐字节验证一串拼接结果（含边界字段）
+    var big = cat2(1) + "|" + catsw(2) + "|" + catnest(3)
+    var expected = "[A:1:no]|sw2:2:up|out=p3q;"
+    chk(big == expected, "chain byte-exact")
+    if big == expected {
+        println("got=" + big)
+        println("p.9.12.7 phi_probe all pass")
+    }
+}

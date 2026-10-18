@@ -1,0 +1,188 @@
+type tie<class>
+// tlib/std/zd_stream.tie —— zd 流式分块 + 帧边界/CRC + 压缩变体声明（namespace zd_stream；自 tiedb 提炼）
+// ============================================================================
+// 格式契约（zd v2 设计文档 §4.7/§6.6/§10，语言无关）：
+//   帧 = [len: u32 BE][payload: len 字节][crc: u32 BE]
+//     len = payload 字节数；crc = CRC32-IEEE(payload)（多项式 0xEDB88320，
+//     反射式逐位，无查表；校验向量 crc32("123456789") == 0xCBF43926）。
+//   压缩变体声明 = [0xC9 变体标签][algo: 1 字节][body]；
+//     algo：0=无 / 1=zstd / 2=lz4。**只声明不解压**（§10：压缩算法不内嵌实现，
+//     读端据 algo 自行接 zstd/lz4 解压）。
+//   头部 flags：bit3 = 流式（stream_flag() == 8）、bit4 = 压缩变体
+//     （compress_flag() == 16），配合 zd_doc 的 header_flags 读容器头 flags 判定。
+// 字节一律 table<i64>（0..255）；错误哨兵 -1，不 panic。
+// 复用 src/zd.tie 基础原语（u8_at / write_u32_be / read_u32_be / slice）。
+//
+// 调用：import 后 zd_stream.crc32(...) / chunk_encode / chunk_next / chunk_skip /
+//   chunks_concat / chunks_iter / encode_compressed / decode_compressed /
+//   stream_flag / compress_flag。
+
+import "./zd.tie"
+import "./zbuf.tie"
+
+namespace zd_stream {
+
+// ---------- CRC32-IEEE（反射式逐位，无表） ----------
+// 与 tink 帧协议同多项式 0xEDB88320、同标准校验向量。
+// i64 的 `>>` 为算术右移，但 c 每步 < 2^32 且恒正，算术右移即逻辑右移。
+pub func crc32(bytes: table<i64>) -> i64 {
+    var c: i64 = 0xFFFFFFFF
+    var n: i64 = len(bytes)
+    var i: i64 = 0
+    while i < n {
+        c = c ^ (bytes[i] & 0xFF)
+        var k: i64 = 0
+        while k < 8 {
+            var lsb: i64 = c & 1
+            c = c >> 1
+            if lsb != 0 {
+                c = c ^ 0xEDB88320
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return c ^ 0xFFFFFFFF
+}
+
+// crc32_str：同一 CRC32-IEEE 算法作用于**字符串载体**（r.1.6.7 字节缓冲抽象）。
+// 逐位无表实现与表版逐位一致；`str_byte` 单指令（实测 6ns）vs 表 `t[i]`（27–28ns）
+// ⇒ 同一载荷下字符串载体明显更快，且内存 1× vs 8×。
+// 与 `crc32(table<i64>)` **必须逐位同值**（探针 probe_zbuf 交叉断言）。
+pub func crc32_str(s: string) -> i64 {
+    var c: i64 = 0xFFFFFFFF
+    var n: i64 = len(s)
+    var i: i64 = 0
+    while i < n {
+        c = c ^ (str_byte(s, i) & 0xFF)
+        var k: i64 = 0
+        while k < 8 {
+            var lsb: i64 = c & 1
+            c = c >> 1
+            if lsb != 0 {
+                c = c ^ 0xEDB88320
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return c ^ 0xFFFFFFFF
+}
+
+// ---------- 流式分块帧（r.1.6.7：**字符串载体**） ----------
+// 载体说明：payload/帧/流一律用 tie **字符串**（字节密度 1×、`str_byte` 单指令、
+// `sb_append` 按字节 memcpy），替代 `table<i64>`（8×、逐元素索引走容器锁）。
+// **线上字节格式完全不变**（迁移前后逐字节比对通过，见 tests/_golden_stream.tie）。
+// 一处顺带的实质改进：旧版 `chunk_encode` 把 payload **逐元素 push** 进新表
+// （每字节一次 `table_push`），现改为 `bw_put_bytes` **单次 memcpy**；
+// `chunk_next` 取 payload 也从逐元素拷贝改为 `str_sub_bytes` **单次切片拷贝**。
+
+// chunk_encode：payload → 完整帧字节（len u32 BE + payload + crc u32 BE）。
+pub func chunk_encode(payload: string) -> string {
+    var bw = zbuf.bw_new()
+    zbuf.bw_put_u32_be(bw, len(payload))
+    zbuf.bw_put_bytes(bw, payload)          // 单次 memcpy（旧版为逐元素 push）
+    zbuf.bw_put_u32_be(bw, crc32_str(payload))
+    return zbuf.bw_build(bw)
+}
+
+// chunk_next：从 bytes[pos..] 解析一帧 → (payload, next_pos)；失败 ("", -1)。
+// 严格校验 CRC；len 声称的字节越界亦拒绝。
+pub func chunk_next(bytes: string, pos: i64) -> (string, i64) {
+    var nb: i64 = len(bytes)
+    if pos < 0 || pos + 8 > nb {
+        return ("", -1)
+    }
+    var (n, p1) = zbuf.br_u32_be(bytes, pos)
+    if p1 < 0 || n < 0 || pos + 8 + n > nb {
+        return ("", -1)
+    }
+    var payload = zbuf.br_slice(bytes, pos + 4, pos + 4 + n)   // 单次切片拷贝
+    var (c, p2) = zbuf.br_u32_be(bytes, pos + 4 + n)
+    if p2 < 0 {
+        return ("", -1)
+    }
+    if crc32_str(payload) != c {
+        return ("", -1)
+    }
+    return (payload, pos + 8 + n)
+}
+
+// chunk_skip：零拷贝跳过一帧 → next_pos；失败 -1。不校验 CRC，适合大 payload
+// 只读不拷、或批量帧快速定位（zd v2 偏移表思路的帧级版）。
+pub func chunk_skip(bytes: string, pos: i64) -> i64 {
+    var nb: i64 = len(bytes)
+    if pos < 0 || pos + 8 > nb {
+        return -1
+    }
+    var (n, p1) = zbuf.br_u32_be(bytes, pos)
+    if p1 < 0 || n < 0 || pos + 8 + n > nb {
+        return -1
+    }
+    return pos + 8 + n
+}
+
+// ---------- 多帧组装 ----------
+// chunks_concat：各 payload（字符串，各自为一段字节）→ 各自成帧后串接为流。
+pub func chunks_concat(chunks: table<string>) -> string {
+    var bw = zbuf.bw_new()
+    var n: i64 = len(chunks)
+    var i: i64 = 0
+    while i < n {
+        zbuf.bw_put_bytes(bw, chunk_encode(chunks[i]))   // 帧整体 memcpy 追加
+        i = i + 1
+    }
+    return zbuf.bw_build(bw)
+}
+
+// chunks_iter：按 chunk_next 循环取帧，收集各 payload → (payloads, next_pos)。
+// 任取帧失败返回 (已收集, -1)；流恰好耗尽时 next_pos == len(bytes)。
+pub func chunks_iter(bytes: string, pos: i64) -> (table<string>, i64) {
+    var out = table_new_string()
+    var p: i64 = pos
+    var nb: i64 = len(bytes)
+    while p < nb {
+        var (payload, np) = chunk_next(bytes, p)
+        if np < 0 {
+            return (out, -1)
+        }
+        table_push(out, payload)
+        p = np
+    }
+    return (out, p)
+}
+
+// ---------- 压缩变体声明（只声明，不解压） ----------
+// encode_compressed：body → [0xC9][algo][body]。algo：0=无 / 1=zstd / 2=lz4。
+pub func encode_compressed(body: string, algo: i64) -> string {
+    var bw = zbuf.bw_new()
+    zbuf.bw_put_u8(bw, 0xC9)
+    zbuf.bw_put_u8(bw, algo)
+    zbuf.bw_put_bytes(bw, body)
+    return zbuf.bw_build(bw)
+}
+
+// decode_compressed：读回变体声明 → (algo, body, next_pos)；非 0xC9 前缀失败
+// (-1, "", -1)。读端据 algo 自行接 zstd/lz4 解压。
+pub func decode_compressed(bytes: string, pos: i64) -> (i64, string, i64) {
+    if zbuf.br_at(bytes, pos) != 0xC9 {
+        return (-1, "", -1)
+    }
+    var nb: i64 = len(bytes)
+    if pos + 2 > nb {
+        return (-1, "", -1)
+    }
+    var algo = zbuf.br_at(bytes, pos + 1)
+    return (algo, zbuf.br_slice(bytes, pos + 2, nb), nb)
+}
+
+// ---------- 头部 flags 位（配合 zd_doc.header_flags 判定流式/压缩） ----------
+// 容器头 flags bit3 = 流式、bit4 = 压缩变体。
+pub func stream_flag() -> i64 {
+    return 1 << 3
+}
+
+pub func compress_flag() -> i64 {
+    return 1 << 4
+}
+}

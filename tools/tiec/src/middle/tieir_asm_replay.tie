@@ -1,0 +1,307 @@
+type tie<class>
+// compiler/middle/tieir_asm_replay.tie —— p.9.21.11 §5.0 拆解：装配重放侧
+// ============================================================
+// 自 tieir_asm.tie 拆出（同 namespace 跨文件文本内联；铁律 11 单文件 ≤500
+// 行纪律）：asm_build_seq（装配序匹配 + head/extra/tail 四段）与 asm_replay
+// （全局单趟重放，bulk 表 + ops_append/ops_meta_bulk）。全局状态表声明在
+// tieir_asm.tie（同 namespace 共享）。
+import "./ir.tie"
+
+namespace tieir {
+
+pub func asm_build_seq(order: table<string>) -> i64 {
+    var head: table<i64> = table_new_i64()
+    var tail: table<i64> = table_new_i64()
+    var matched: table<i64> = table_new_i64()
+    var f0 = asm_f_base[0]
+    var f0_end = asm_f_base[1]
+    var seen_match: bool = false
+    // p.9.21.10 性能：名字匹配从 O(order×records) 字符串扫描（driver 实测
+    // ~1100 万次比较）改为 interner id 直接索引（O(1) 查，索引表 ~interner 容量）。
+    var cap = interner.len()
+    var order_flag: table<i64> = table_new_i64()
+    var t: i64 = 0
+    while t < cap {
+        table_push(order_flag, 0)
+        t = t + 1
+    }
+    var oi0: i64 = 0
+    if get_env("TIEC_ASMDBG") == "2" {
+        println("ASMDBG order_len=" + to_string(len(order)) + " cap=" + to_string(cap))
+    }
+    while oi0 < len(order) {
+        var oid0 = interner.intern(order[oi0])
+        if get_env("TIEC_ASMDBG") == "2" {
+            println("ASMDBG order[" + to_string(oi0) + "]=" + order[oi0])
+        }
+        if oid0 >= 0 && oid0 < cap {
+            order_flag[oid0] = 1
+        }
+        oi0 = oi0 + 1
+    }
+    var fi0: i64 = f0
+    while fi0 < f0_end {
+        var nid0 = asm_f_gname[fi0]
+        if nid0 >= 0 && nid0 < cap && order_flag[nid0] == 1 {
+            seen_match = true
+        } else {
+            if seen_match {
+                table_push(tail, fi0)
+            } else {
+                table_push(head, fi0)
+            }
+        }
+        fi0 = fi0 + 1
+    }
+    // 全部函数记录按名登记（**同名链表**：泛型展开可在多/同模块产生同名函数
+    // ——p.9.21.11 修复：a7d4211 的「name_rec 后写覆盖」单槽表在同名 ≥2 条记录
+    // 时第二条永远无法被装配序匹配（driver 实测 assert::assert_eq$i64 未覆盖
+    // 降级全量）。改 head/tail 链表（FIFO = 记录升序），每名匹配取链首未用
+    // 记录，语义与旧 O(order×records) 线性扫描一致，查名仍 O(1)。
+    var name_head: table<i64> = table_new_i64()
+    var name_tail: table<i64> = table_new_i64()
+    var t: i64 = 0
+    while t < cap {
+        table_push(name_head, -1)
+        table_push(name_tail, -1)
+        t = t + 1
+    }
+    var rec_next: table<i64> = table_new_i64()   // 记录（相对 f0）→ 下一同名记录
+    var fr: i64 = f0
+    var frend = asm_f_base[len(asm_frag_fn)]
+    while fr < frend {
+        var nidr = asm_f_gname[fr]
+        table_push(rec_next, -1)
+        if nidr >= 0 && nidr < cap {
+            if name_head[nidr] < 0 {
+                name_head[nidr] = fr
+            } else {
+                rec_next[name_tail[nidr] - f0] = fr
+            }
+            name_tail[nidr] = fr
+        }
+        fr = fr + 1
+    }
+    // order 序：每名取链首未用记录
+    var oi2: i64 = 0
+    while oi2 < len(order) {
+        var found = -1
+        var oid2 = interner.intern(order[oi2])
+        if oid2 >= 0 && oid2 < cap {
+            var w = name_head[oid2]
+            while w >= 0 && found < 0 {
+                if asm_f_used[w] == 0 {
+                    found = w
+                }
+                w = rec_next[w - f0]
+            }
+        }
+        if found >= 0 && asm_f_used[found] == 0 {
+            asm_f_used[found] = 1
+            table_push(matched, found)
+        }
+        // 未找到 = 模板声明等不产 IR 的项——跳过
+        oi2 = oi2 + 1
+    }
+    var hi: i64 = 0
+    while hi < len(head) {
+        table_push(asm_seq, head[hi])
+        hi = hi + 1
+    }
+    var mi: i64 = 0
+    while mi < len(matched) {
+        table_push(asm_seq, matched[mi])
+        mi = mi + 1
+    }
+    // p.9.21.11：irgen 期展开的泛型函数 → extra 段。机制：调用点兜底实例化
+    //（instantiate_fn）发生在 irgen 遍历中，clone 追加 g_extra_tops 与注册表
+    // 登记都在装配序构建**之后**——装配序快照必然缺名（driver 实测
+    // assert::assert_eq$i64 反复覆盖失败）。未匹配的非主片段记录即此类展开：
+    // 按记录序插到 matched 之后、tail 之前——与 tig_ast 创建序一致（原始
+    // 顶层 → 克隆（追加在遍历中、由同一遍历取用）→ 尾部合成）；重放函数表
+    // 序不影响语义正确性（值/块/指令空间 per-function + per-fragment 基址，
+    // 与重放序无关）。ASMDBG=1 打印 extra 明细备查。
+    var covered: table<i64> = table_new_i64()
+    var fc: i64 = f0
+    while fc < frend {
+        table_push(covered, 0)
+        fc = fc + 1
+    }
+    var hc: i64 = 0
+    while hc < len(head) {
+        covered[head[hc] - f0] = 1
+        hc = hc + 1
+    }
+    var tc: i64 = 0
+    while tc < len(tail) {
+        covered[tail[tc] - f0] = 1
+        tc = tc + 1
+    }
+    var extra: table<i64> = table_new_i64()
+    var fx: i64 = f0
+    while fx < frend {
+        if asm_f_used[fx] == 0 && covered[fx - f0] == 0 {
+            table_push(extra, fx)
+        }
+        fx = fx + 1
+    }
+    if get_env("TIEC_ASMDBG") == "1" {
+        var ei0: i64 = 0
+        while ei0 < len(extra) {
+            println("ASMDBG extra[" + to_string(ei0) + "] frag=" + to_string(asm_rec_frag(extra[ei0])) +
+                " name=" + interner.name_str(asm_f_gname[extra[ei0]]))
+            ei0 = ei0 + 1
+        }
+    }
+    var xi: i64 = 0
+    while xi < len(extra) {
+        table_push(asm_seq, extra[xi])
+        xi = xi + 1
+    }
+    var ti: i64 = 0
+    while ti < len(tail) {
+        table_push(asm_seq, tail[ti])
+        ti = ti + 1
+    }
+    // 覆盖校验（p.9.21.11 重构）：全部记录必经 head/matched/extra/tail 四段
+    // 之一（extra 段吸收 irgen 期泛型展开）——不再有「未覆盖」失败路径；
+    // 片段记录全集 == 重放函数全集由 asm_from_slices 末尾的函数数校验兜底。
+    return 0
+}
+
+// ---------- 重放 ----------
+// 按 asm_seq 把片段记录重放为 ir 全局状态。返回 0 成功；失败 set_err -1。
+pub func asm_replay() -> i64 {
+    ir.new_module()
+    ir_meta.reset_meta()
+    // 元数据重放（v3：片段头/sym/exp 转存 → ir_meta；多片段后写覆盖——
+    // 真实产物各片段头部一致，sym/exp 按片段子集并集恢复）
+    var mm: i64 = 0
+    while mm < len(asm_frag_fn) {
+        ir_meta.set_pkg_name(asm_m_pkg[mm])
+        ir_meta.set_pkg_version(asm_m_ver[mm])
+        ir_meta.set_ir_version(asm_m_irver[mm])
+        ir_meta.set_compiler_version(asm_m_cver[mm])
+        ir_meta.set_tie_opt(asm_m_topt[mm])
+        ir_meta.set_pass_ver(asm_m_pver[mm])
+        var db = asm_m_dep_base[mm]
+        while db < asm_m_dep_base[mm + 1] {
+            ir_meta.set_dep(asm_m_dep[db], asm_m_dep[db + 1])
+            db = db + 2
+        }
+        var sb2 = asm_sym_base[mm]
+        while sb2 < asm_sym_base[mm + 1] {
+            ir_meta.set_sym(asm_sym[sb2], asm_sym[sb2 + 1], asm_sym[sb2 + 2],
+                            asm_sym[sb2 + 3], asm_sym[sb2 + 4], asm_sym[sb2 + 5])
+            sb2 = sb2 + 6
+        }
+        var eb = asm_exp_base[mm]
+        while eb < asm_exp_base[mm + 1] {
+            ir_meta.export_add(asm_exp[eb], asm_exp[eb + 1], asm_exp[eb + 2], asm_exp[eb + 3])
+            eb = eb + 4
+        }
+        mm = mm + 1
+    }
+    // 指令 gid 回执表（先占位，第一趟填）
+    asm_i_gid = table_new_i64()
+    var gi0: i64 = 0
+    while gi0 < len(asm_i_op) {
+        table_push(asm_i_gid, -1)
+        gi0 = gi0 + 1
+    }
+    // p.9.21.11 批量化（撤）：vmap 预填与块记录片段号预计算随 bulk 实验一并
+    // 回退（铁律 4）——v3i 逐条 add_operand 版实测 7.0s 全绿，为唯一已验证
+    // 形态；批量方向留待专项勘察（嫌疑 = 大表按值传参整表拷贝，铁律 11 #7）。
+    var k: i64 = 0
+    while k < len(asm_seq) {
+        var r = asm_seq[k]
+        var pc = asm_f_pcnt[r]
+        var ptys: table<i64> = table_new_i64()
+        var j: i64 = 0
+        while j < pc {
+            table_push(ptys, asm_f_pty[asm_f_pty_base[r] + j])
+            j = j + 1
+        }
+        var fid = ir.new_func(asm_f_gname[r], asm_f_ret[r], ptys)
+        ir.func_export_set(fid, asm_f_ex[r])
+        // 参数值登记（片段值域：f_vbase[r] + j；与 write_mod_slice 的 f_vbase
+        // 同式——参数在 new_func 时连续领号，必落在 [vbase, vbase+pc)）
+        var fm_r = asm_rec_frag(r)
+        var pj: i64 = 0
+        while pj < pc {
+            asm_vmap_set(asm_frag_vbase[fm_r] + asm_f_vbase[r] + pj, ir.param_val(fid, pj))
+            pj = pj + 1
+        }
+        // 块重放（按函数分组段；段内即块表相对序 = 原创建序）
+        var bb = asm_f_blk_base[r]
+        var b: i64 = 0
+        while b < asm_f_blk_cnt[r] {
+            var brec = asm_fb_idx[bb + b]
+            asm_b_gid[brec] = ir.new_block(fid, asm_b_gname[brec])
+            b = b + 1
+        }
+        // 指令重放见下方全局单趟（p.9.21.10：片段指令流已按 id 序 = 创建序
+        // 写出，跨函数单趟重放即创建序；建指令即补操作数，无前向引用）
+        k = k + 1
+    }
+    // 指令全局单趟重放：片段指令流 = id 序（write_mod_slice p.9.21.10 改造），
+    // 建指令即补操作数（ir.add_operand 段连续断言满足）；每块指令在流中连续
+    // → 重建后块区间仍连续。vmap 直查（值域是否交错无关）。
+    // p.9.21.11 批量化实验回退（铁律 4）：bulk 表 + ops_append + ops_meta_bulk
+    // 版在 driver 规模出现 >110s 异常（且与产物缓存命中状态翻摆纠缠，本地
+    // 无法稳定归因）；v3i 逐条 add_operand 版实测 7.0s 全绿，回退到已验证
+    // 形态。批量方向（消灭 3M 跨命名空间调用）留待专项勘察：嫌疑 = 大表按值
+    // 传参整表拷贝（铁律 11 敌人 #7）与缓存命中翻摆的交互，须在可测环境下
+    // 先分账再动手。
+    var gi: i64 = 0
+    while gi < len(asm_i_op) {
+        var blkrec = asm_i_blk[gi]
+        var fm_i = asm_rec_frag(asm_b_fid[blkrec])
+        var gid = ir.new_inst(asm_b_gid[blkrec], asm_i_op[gi], asm_i_ty[gi])
+        var vv = asm_i_val[gi]
+        if vv >= 0 {
+            asm_vmap_set(asm_frag_vbase[fm_i] + vv, ir.get_value(gid))
+        }
+        var ok: i64 = 0
+        while ok < asm_i_cnt[gi] {
+            var idx = asm_i_obase[gi] + ok
+            var ov = asm_o_v[idx]
+            var okd = asm_o_k[idx]
+            if asm_o_pool[idx] == 1 {
+                ir.add_operand(gid, ov, okd)
+            } else {
+                if okd == 0 {
+                    // 值操作数：片段值 id + 片段基址 → 全局 vmap 键
+                    var key = asm_frag_vbase[fm_i] + ov
+                    if ov < 0 || key >= len(asm_vmap) || asm_vmap[key] < 0 {
+                        set_err("asm: 值操作数未登记（v=" + to_string(ov) + "）")
+                        return -1
+                    }
+                    ov = asm_vmap[key]
+                } else {
+                    if okd == 1 {
+                        // 块操作数载荷 = 片段内块 lid，按片段块表基址定位
+                        if ov < 0 || asm_b_base[fm_i] + ov >= asm_b_base[fm_i + 1] {
+                            set_err("asm: 块操作数越界（lid=" + to_string(ov) + "）")
+                            return -1
+                        }
+                        ov = asm_b_gid[asm_b_base[fm_i] + ov]
+                    }
+                }
+                ir.add_operand(gid, ov, okd)
+            }
+            ok = ok + 1
+        }
+        gi = gi + 1
+    }
+    return 0
+}
+
+// ---------- 入口 ----------
+// paths = 全部模块片段路径（模块序）；order = driver 注入的装配序全名。
+// 返回 0 成功（ir/ir_meta 已就绪）；失败 set_err -1（driver 降级全量）。
+// llvmgen 置位恢复查询（driver 装配成功后据此刻调 sso/wsock/catch_enable——
+// 与 irgen 生成引用时的置位等价；白名单对齐 llvmgen_inst_p1）。
+
+
+}   // namespace tieir

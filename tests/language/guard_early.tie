@@ -1,0 +1,43 @@
+type tie<logic>
+
+// ============================================================
+// p.8.2.11 guard else 早退（guard-else）验收：
+//   `guard <cond> else { <stmts> }` — 前置条件检查。条件为假则执行 else 块
+//   （该块必须以 return/break/continue 等跳转语句收尾，scheck 约束），随后不
+//   再继续；为真则继续向下执行。语义等价 `if not(cond) { else块 }`。
+//   guard 非保留字（guard<cap> 是类型名），语句位语境识别。
+//
+// 覆盖两路：
+//   - sign：入口 guard 两例（pass=条件为真继续 / fail=为假走 else 提前返回）
+//   - check：guard 通过后继续执行到函数末尾
+//
+// 期望输出（逐行）：pos / zero / neg / small:1 / big
+// ============================================================
+
+func sign(x: i64) -> string {
+    guard x >= 0 else {
+        return "neg"
+    }
+    // 条件为真：继续向下
+    if x == 0 {
+        return "zero"
+    }
+    return "pos"
+}
+
+func check(n: i64) -> string {
+    guard n < 3 else {
+        return "big"
+    }
+    // 条件为真：继续执行
+    var s = "small:" + to_string(n)
+    return s
+}
+
+func main() {
+    println(sign(5))    // pos
+    println(sign(0))    // zero
+    println(sign(-7))   // neg
+    println(check(1))   // small:1
+    println(check(9))   // big
+}

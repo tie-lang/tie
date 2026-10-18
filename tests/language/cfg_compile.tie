@@ -1,0 +1,65 @@
+type tie<logic>
+// ============================================================
+// p.9.11.13 #cfg 条件编译正例：词法前按行裁剪（#cfg/#else/#end）。
+//   - debug/release 分支（默认 profile=dev → debug 真；--profile release 反向）
+//   - #else 反向
+//   - ! 取反
+//   - os/target 键（os=="windows" 引号形态；本机 Windows 默认真）
+//   - 恒假分支（未知 os 值）内含语法错误 → 被裁剪 → 仍编译通过
+// 期望：编译成功 + 运行打印 "cfg_compile 探针全过"（--profile dev/release 均可）。
+// ============================================================
+
+#cfg(debug)
+var g_mode: string = "debug"
+#else
+var g_mode: string = "release"
+#end
+
+#cfg(release)
+var g_rel: string = "release"
+#else
+var g_rel: string = "not-release"
+#end
+
+#cfg(!debug)
+var g_neg: string = "non-debug"
+#else
+var g_neg: string = "debug"
+#end
+
+#cfg(os=plan9)
+    this is not valid tie syntax @@@ (恒假分支：被裁剪，不 lex/parse)
+#else
+var g_plat: string = "known-os"
+#end
+
+#cfg(os=="windows")
+var g_q: string = "qwin"
+#else
+var g_q: string = "qother"
+#end
+
+#cfg(target=windows)
+var g_tgt: string = "twindows"
+#else
+var g_tgt: string = "tother"
+#end
+
+func main() {
+    if g_mode != "debug" && g_mode != "release" {
+        panic("debug/release 分支错误")
+    }
+    if g_mode == "debug" {
+        if g_rel != "not-release" || g_neg != "debug" {
+            panic("默认 dev 分支组合错误")
+        }
+    } else {
+        if g_rel != "release" || g_neg != "non-debug" {
+            panic("release 分支组合错误")
+        }
+    }
+    if g_plat != "known-os" || len(g_q) == 0 || len(g_tgt) == 0 {
+        panic("os/target 分支错误")
+    }
+    println("cfg_compile 探针全过")
+}

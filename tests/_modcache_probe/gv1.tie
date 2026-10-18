@@ -1,0 +1,40 @@
+type tie<logic>
+// tests/_modcache_probe/gv1.tie —— p.9.21.9 装配收口探针（含全局 VarDecl 单元）
+// ============================================================
+// 菱形导入（gv1 → gv2/gv3 → gv4）+ 三类全局登记：
+//   ① 标量全局（正/负整数字面量 + 字符串 const 初值）
+//   ② 表全局（空表 + 非空表字面量初值，main 入口建表 + 逐元素 push）
+//   ③ 命名空间 const（gvns::NK，全名登记 → llvmgen @gvns$NK）
+// 验收：装配路径（全片段命中）与全量路径（--no-cache）的 exe 输出逐字节一致。
+import "./gv2.tie"
+import "./gv3.tie"
+
+var g_scalar: i64 = 42
+var g_neg: i64 = -7
+const g_str: string = "hi"
+const g_k: i64 = 11
+var g_tbl: table<i64> = []
+var g_tbl2: table<i64> = [7, 8]
+
+namespace gvns {
+pub const NK: i64 = 5
+pub func nsf() -> i64 {
+    return NK + 1
+}
+}
+
+func main() {
+    table_push(g_tbl, 1)
+    table_push(g_tbl, 2)
+    println(to_string(g_scalar))
+    println(to_string(g_neg))
+    println(g_str)
+    println(to_string(g_k))
+    println(to_string(len(g_tbl)))
+    println(to_string(g_tbl2[0]))
+    println(to_string(g_tbl2[1]))
+    println(to_string(gvns::NK))
+    println(to_string(gvns::nsf()))
+    println(to_string(other2::g()))
+    println(to_string(third2::h()))
+}

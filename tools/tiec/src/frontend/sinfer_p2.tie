@@ -1,0 +1,103 @@
+type tie<class>
+// compiler/frontend/sinfer_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 sinfer.tie。
+namespace sinfer {
+// 一元取负重载入口（S_N_UNARY 分支内，op==0 且操作数类型已推断）。
+func try_op_overload_neg(operand: i64, id: i64) -> i64 {
+    var oty = node_types[operand]
+    if oty < 0 || types.kind(oty) != K_STRUCT {
+        return -2
+    }
+    var full = op_method_full(oty, 0, 0)
+    if full == "" {
+        return -2
+    }
+    var argn: table<i64> = table_new_i64()
+    return finish_op_overload(full, operand, oty, argn, id)
+}
+
+// ==================== 泛型方法调用（T3b） ====================
+// 接收者 = 实例化 struct（rec 为其 gin 记录），目标 = 模板方法（tmpl_method
+// 如 "Box::get"）。类型实参：首参（接收者，Box<T> ↔ recv_ty）匹配 + 其余实参
+// 推断；然后展开方法模板（mangled = Box$i64::get，与 irgen 方法分派一致）。
+// 返回实例化返回类型；失败 -1（推断/展开失败已报错；未报错 = 不适用）。
+func infer_generic_method(rec: i64, m_gti: i64, tmpl_method: string, recv: i64, recv_ty: i64, args: table<i64>, id: i64) -> i64 {
+    // 显式类型实参（MethodCall 的 N_TYPE_ARGS，`b.get<i64>(...)`）
+    var explicit = parse_explicit_args(id)
+    if len(explicit) == 0 && str_len(sm_err_msg) > 0 {
+        return -1
+    }
+    // 实参类型表：接收者为首参（类型 = 实例化 struct）
+    var m_args_t: table<i64> = table_new_i64()
+    table_push(m_args_t, recv_ty)
+    var k: i64 = 0
+    while k < len(args) {
+        var at = infer_expr(args[k])
+        if at < 0 {
+            return -1
+        }
+        table_push(m_args_t, at)
+        k = k + 1
+    }
+    // 推断类型实参（首参 Box<T> ↔ recv_ty 绑定 T，其余实参补全）
+    var tmpl_node = gty_node[m_gti]
+    var args_t = sgen.infer_type_args(tmpl_node, m_gti, explicit, 0, m_args_t, id)
+    if len(args_t) == 0 {
+        return -1  // 推断失败/冲突已报错
+    }
+    // 展开方法模板（mangled = Box$i64::get，与 irgen gen_method_call 分派名一致）
+    var mangled = sgen.mangle(tmpl_method, args_t)
+    var sig2 = sgen.instantiate_fn(m_gti, args_t, s_lines[id], s_cols[id])
+    if sig2 < 0 {
+        return -1
+    }
+    // 可见性校验
+    var vr = sstate.check_visibility(mangled, sig2, id)
+    if vr < 0 {
+        return -1
+    }
+    // 参数个数（含接收者对象）
+    var req_m = sg_required[sig2]
+    var total = sg_nparams[sig2]
+    var n_args = len(args) + 1
+    if n_args < req_m || n_args > total {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "方法 '" + tmpl_method + "' 期望 " + to_string(req_m) + "-" + to_string(total) + " 个参数（含接收者对象），实际 " + to_string(n_args) + " 个"
+        return -1
+    }
+    // 接收者类型匹配（首参 = 实例化 struct，与实例化形参一致）
+    var off = sg_off[sig2]
+    var want = sp_tys[off]
+    if !stype.types_compatible(want, recv_ty) {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "方法 '" + tmpl_method + "' 首参类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(recv_ty)
+        return -1
+    }
+    // 其余实参类型检查（实例化形参已具体化）
+    var j: i64 = 0
+    while j < len(args) {
+        var at = infer_expr(args[j])
+        if at < 0 {
+            return -1
+        }
+        var want2 = sp_tys[off + 1 + j]
+        if !stype.types_compatible(want2, at) && !stype.types_match(want2, at, args[j]) &&
+            !stype.types_narrow_int(want2, at, args[j]) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "方法 '" + tmpl_method + "' 参数类型不匹配：期望 " + types.type_name(want2) + "，实际 " + types.type_name(at)
+            return -1
+        }
+        j = j + 1
+    }
+    var rt = sg_ret[sig2]
+    node_types[id] = rt
+    g_typed = g_typed + 1
+    return rt
+}
+
+}

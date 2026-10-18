@@ -1,0 +1,678 @@
+type tie<class>
+// compiler/backend/irgen_agg_p2.tie —— irgen_agg 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 irgen_agg.tie。
+namespace irgen {
+// struct 名判定（构造调用：Call 名命中 st_keys）
+func is_struct_name(nm: string) -> bool {
+    var nid = interner.intern(nm)
+    return sstate.bs_find(st_keys, nid) >= 0
+}
+
+// enum 名判定（2026-08-15 enum 语言特性）：枚举名命中 en_keys。
+// 仿 is_struct_name——构造分派点（FieldAccess/MethodCall/Call）用。
+func is_enum_name(nm: string) -> bool {
+    var nid = interner.intern(nm)
+    return sstate.bs_find(en_keys, nid) >= 0
+}
+
+// 枚举变体 tag 解析：枚举名 + 变体名 → tag 值（0..nvar-1）；-1 = 未找到。
+// 在 en_vnames 拍平段（en_varoff[ei] 起 en_nvar[ei] 个）线性查找变体名。
+// 供 tig_enum_construct（构造）与 tig_switch（case 模式 → tag 常量）共用。
+func enum_variant_tag(ei: i64, vname: string) -> i64 {
+    var varoff = en_varoff[ei]
+    var nvar = en_nvar[ei]
+    var k: i64 = 0
+    while k < nvar {
+        if intern.lookup(en_vnames[varoff + k]) == vname {
+            return en_vtags[varoff + k]
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// 枚举 switch 的 case 模式 → tag 常量（-1 = 非法模式）。
+// 模式形态：FieldAccess(Enum.Variant)——base 是枚举名 Var，name 是变体名。
+// 枚举名解析：普通 enum 直接查 en_keys；泛型 enum 模板名（如 Option）经
+// gin 记录反查——subject 是对应模板的实例化时，解析到 subject 的实例
+//（scheck 已做同款校验，此处防御性复核）。返回变体 tag 值（0..nvar-1）。
+func enum_case_tag(pat: i64, subj_ty: i64) -> i64 {
+    var ei = types.low(subj_ty)
+    // 批次 7：N_CASE_BIND（`case Ok(v)` 解构）→ 取其变体引用子节点
+    if s_tags[pat] == N_CASE_BIND {
+        pat = sstate.child(pat, 0)
+    }
+    // 变体引用：FieldAccess（Enum.Variant）或裸 Var（Variant，枚举名取 subject）
+    if s_tags[pat] != 15 && s_tags[pat] != 6 {
+        return -1  // 非变体引用（scheck 已拦截，防御）
+    }
+    var bname = ""
+    if s_tags[pat] == 15 {
+        var base = sstate.child(pat, 0)
+        if s_tags[base] != 6 {
+            return -1  // base 非 Var（scheck 已拦截，防御）
+        }
+        bname = sstate.name_str(base)
+    } else {
+        bname = sstate.enum_name_of(ei)
+    }
+    var eidx = sstate.bs_find(en_keys, interner.intern(bname))
+    var ei2: i64 = -1
+    if eidx >= 0 {
+        ei2 = en_vals[eidx]
+    } else {
+        // 泛型 enum 模板：subject 必须是对应模板的实例化
+        var gidx = sstate.gt_find(bname)
+        if gidx >= 0 && gty_is_struct[gidx] == 2 {
+            var rec = sstate.gin_find(sstate.enum_name_of(ei))
+            if rec >= 0 && gin_tmpl[rec] == gidx {
+                ei2 = ei
+            }
+        }
+    }
+    if ei2 != ei {
+        return -1  // base 不是同枚举（scheck 已拦截，防御）
+    }
+    return enum_variant_tag(ei, sstate.name_str(pat))
+}
+
+// 批次 7：枚举变体解构 `case Ok(v)` 的 payload 绑定（在绑定块内调用）。
+// p.8.1.4：多字段解构 `case Both(x, t)`——逐 payload 槽（1..nfld）提取绑定。
+// subject 已求值（tig_expr 结果，聚合值）；从槽 j 提取 payload，还原成绑定
+// 变量类型（string/table → inttoptr / f64 → load double / 窄整数 → trunc），
+// 存入新建 alloca 并 scope_put。
+func tig_case_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
+    var ei = types.low(subj_ty)
+    var ptag = enum_case_tag(pat, subj_ty)
+    if ptag < 0 {
+        return -1
+    }
+    var T64 = types.named(TK_I64)
+    // payload 类型段（变体 nfld 字段，scheck 已校验绑定数一致）
+    var varoff = en_varoff[ei]
+    var foff = en_vfldoff[varoff + ptag]
+    var nfld = en_vnfld[varoff + ptag]
+    // subject 聚合地址
+    var eaddr = tig_agg_addr(subject, subj_ty)
+    if eaddr < 0 {
+        return -1
+    }
+    var j: i64 = 0
+    while j < nfld {
+        var pty = en_ftys[foff + j]
+        var gj = ir.new_inst(g_cur_block, 27, subj_ty)  // agg_gep 下标 1+j
+        ir.add_operand(gj, eaddr, 0)
+        ir.add_operand(gj, 1 + j, 2)
+        var gjp = ir.get_value(gj)
+        var ld = ir.new_inst(g_cur_block, 21, T64)  // load i64 payload
+        ir.add_operand(ld, gjp, 0)
+        var pv = ir.get_value(ld)
+        // 还原 payload 类型（对齐 tig_try：string → inttoptr；f64 → load double；
+        // table/map → inttoptr；窄整数 → trunc）
+        var bv: i64 = pv
+        if pty == types.named(TK_STR) {
+            var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
+            ir.add_operand(ip, pv, 0)
+            bv = ir.get_value(ip)
+        } else if pty == types.named(TK_F64) {
+            // f64 payload（p.6.2.1）：槽存 double（8B type-punned）→ load double 直用
+            var ldf = ir.new_inst(g_cur_block, 21, pty)
+            ir.add_operand(ldf, gjp, 0)
+            bv = ir.get_value(ldf)
+        } else if types.is_table(pty) || types.is_map(pty) {
+            // table/map payload（p.6.2.1）：槽存 ptrtoint → inttoptr 还原 ptr
+            var ip2 = ir.new_inst(g_cur_block, 25, pty)  // inttoptr → ptr
+            ir.add_operand(ip2, pv, 0)
+            bv = ir.get_value(ip2)
+        } else if pty != T64 && pty != types.named(TK_U64) && types.is_int(pty) {
+            var cv = tig_coerce(bv, T64, pty)
+            if cv < 0 {
+                return -1
+            }
+            bv = cv
+        }
+        // 绑定变量：新建 alloca（payload 类型）+ store + 登记作用域（body 可引用）
+        var bind_name = sstate.child(pat, 1 + j)
+        var va = ir.new_inst(g_cur_block, 20, pty)  // alloca pty
+        ir.add_operand(va, pty, 2)
+        var vap = ir.get_value(va)
+        s21_store(vap, bv, pty)
+        scope_put(bind_name, vap, pty)
+        j = j + 1
+    }
+    return 0
+}
+
+// P2c：any 主体 struct 解构——`case Point(p):` 命中后调用。subject 是 any 值，
+// payload@[1] = 指向堆上按值拷贝的 Point 的指针（i64）→ inttoptr → load struct →
+// 绑定变量 p（alloca + store + scope_put，body 可引用）。
+func tig_case_struct_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
+    var sref_n = sstate.child(pat, 0)
+    var bind_name = sstate.child(pat, 1)
+    var sname = sstate.name_str(sref_n)
+    var sidx = sstate.bs_find(st_keys, interner.intern(sname))
+    if sidx < 0 {
+        return -1
+    }
+    var s_ty = types.struct_of(st_vals[sidx])
+    var T64 = types.named(TK_I64)
+    // subject any 落 alloca → 读 payload@[1]（堆指针 i64）
+    var saddr = tig_agg_addr(subject, subj_ty)
+    if saddr < 0 {
+        return -1
+    }
+    var g1 = ir.new_inst(g_cur_block, 27, subj_ty)  // agg_gep 下标 1
+    ir.add_operand(g1, saddr, 0)
+    ir.add_operand(g1, 1, 2)
+    var g1p = ir.get_value(g1)
+    var ld1 = ir.new_inst(g_cur_block, 21, T64)
+    ir.add_operand(ld1, g1p, 0)
+    var pv = ir.get_value(ld1)
+    // inttoptr → 堆 ptr → load struct
+    var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
+    ir.add_operand(ip, pv, 0)
+    var spp = ir.get_value(ip)
+    var ld2 = ir.new_inst(g_cur_block, 21, s_ty)  // load struct
+    ir.add_operand(ld2, spp, 0)
+    var sv = ir.get_value(ld2)
+    // 绑定变量：alloca struct + store + 登记作用域（body 可引用）
+    var va = ir.new_inst(g_cur_block, 20, s_ty)
+    ir.add_operand(va, s_ty, 2)
+    var vap = ir.get_value(va)
+    s21_store(vap, sv, s_ty)
+    scope_put(bind_name, vap, s_ty)
+    return 0
+}
+
+// p.9.11.6 表不可变更新 `t with {k: v}` → 新表/新映射（左表不被修改，值语义）。
+// 实现（映射/记录路径；数组 with 因 RHS 是 ident/string 键故不表达，留待）：
+//   1. s21_map_new 建新映射；
+//   2. 拷贝 base 全部键值对（map_keys → 循环 map_get + map_set 入新映射）——
+//      未变部分也逐对复制（裁决：容器为扁平数组无结构化共享，故全复制，
+//      非零拷贝共享）；
+//   3. 应用 with 右侧更新 map 字面量各 (键:值) → map_set 覆盖。
+// 值类型：base 的 map 值类型（scalar/string）；any 走 P2c 装箱路径。
+func tig_with(id: i64) -> i64 {
+    var base = sstate.child(id, 0)
+    var upd = sstate.child(id, 1)
+    var T64 = types.named(TK_I64)
+    // p.9.11.33：基为 struct → 结构体不可变更新（须在 tig_expr(base) 之前
+    // 分派——struct 路径走 tig_agg_addr 取槽，避免非 Var 基表达式双重发射）
+    var bt0 = node_types[base]
+    if types.kind(bt0) == K_STRUCT {
+        return tig_with_struct(id, base, upd, bt0)
+    }
+    var t = tig_expr(base)
+    if t < 0 {
+        return -1
+    }
+    // 值类型与槽类型：map 值类型（table_elem）；字符串/表/映射/端口 → ptr 槽
+    var vty: i64 = types.named(TK_I64)
+    var bt = node_types[base]
+    if types.is_map(bt) || types.is_table(bt) {
+        var le = types.table_elem(bt)
+        if le > 0 {
+            vty = le
+        }
+    }
+    var is_any: bool = (vty == types.named(TK_ANY))
+    var pty = types.named(TK_I64)
+    if vty == types.named(TK_STR) || vty == types.named(TK_BOOL) {
+        pty = vty
+    } else if is_any {
+        // any 值槽存堆指针 → ptr 槽
+        pty = types.named(TK_STR)
+    } else if types.is_table(vty) || types.is_map(vty) || types.kind(vty) == K_PORT {
+        pty = types.named(TK_STR)
+    }
+    var nm = s21_map_new()
+    // ---- 步骤 2：拷贝 base 键值对 ----
+    var keys = s21_map_extract(t, types.named(TK_STR), true)  // table<string> 键
+    if keys < 0 {
+        return -1
+    }
+    var klen = s21_table_len(keys)
+    var idx_a = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(idx_a, T64, 2)
+    var idx_p = ir.get_value(idx_a)
+    s21_store(idx_p, tig_int_lit(0), T64)
+    var kc = ir.new_block(g_cur_func, interner.intern("wth.c"))
+    var kb = ir.new_block(g_cur_func, interner.intern("wth.b"))
+    var ks = ir.new_block(g_cur_func, interner.intern("wth.s"))
+    var kx = ir.new_block(g_cur_func, interner.intern("wth.x"))
+    var b0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b0, kc, 1)
+    g_cur_block = kc
+    var ci = s21_load(idx_p, T64)
+    var clt = tig_icmp_c(ci, klen, 2)  // idx < klen
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, clt, 0)
+    ir.add_operand(cb, kb, 1)
+    ir.add_operand(cb, kx, 1)
+    g_cur_block = kb
+    var ok1 = ir.new_inst(g_cur_block, 20, types.named(TK_I8))
+    ir.add_operand(ok1, types.named(TK_I8), 2)
+    var kv = s21_table_at(keys, ci, ir.get_value(ok1), types.named(TK_STR))
+    if kv < 0 {
+        return -1
+    }
+    var srcv: i64 = -1
+    if is_any {
+        // any 读：值槽存堆指针 → 读堆还原 {i64,i64}（对齐 tig_index_read map<any>）
+        var hp0 = s21_map_get(t, kv, types.named(TK_STR))
+        srcv = s21_load(hp0, types.named(TK_ANY))
+    } else {
+        srcv = s21_map_get(t, kv, pty)
+    }
+    if srcv < 0 {
+        return -1
+    }
+    if is_any {
+        // any 写：装箱拷贝到新堆 → 存指针
+        var hp = s21_raw_alloc_str(tig_int_lit(16))
+        if hp < 0 {
+            return -1
+        }
+        s21_store(hp, srcv, types.named(TK_ANY))
+        s21_map_set(nm, kv, hp, types.named(TK_STR))
+    } else {
+        s21_map_set(nm, kv, srcv, pty)
+    }
+    var sb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(sb, ks, 1)
+    g_cur_block = ks
+    var nxt_i = s21_bin(0, ci, tig_int_lit(1))
+    s21_store(idx_p, nxt_i, T64)
+    var sb2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(sb2, kc, 1)
+    g_cur_block = kx
+    // ---- 步骤 3：应用 RHS 覆盖 ----
+    var nc = sstate.nchild(upd)
+    var i: i64 = 0
+    while i < nc {
+        var cell = sstate.child(upd, i)
+        var cid = sstate.child(cell, 0)   // TableId（字符串键）
+        var keyname = sstate.name_str(cid)
+        var k2 = tig_str_lit(interner.intern(keyname))
+        var val = sstate.child(cell, 1)
+        var vv = tig_expr(val)
+        if vv < 0 {
+            return -1
+        }
+        if is_any {
+            var vt3 = node_types[val]
+            var sv: i64 = vv
+            if vt3 >= 0 && vt3 != types.named(TK_ANY) {
+                var bx = tig_box_any(vv, vt3)
+                if bx < 0 {
+                    return -1
+                }
+                sv = bx
+            }
+            var hp3 = s21_raw_alloc_str(tig_int_lit(16))
+            if hp3 < 0 {
+                return -1
+            }
+            s21_store(hp3, sv, types.named(TK_ANY))
+            s21_map_set(nm, k2, hp3, types.named(TK_STR))
+        } else {
+            s21_map_set(nm, k2, vv, pty)
+        }
+        i = i + 1
+    }
+    return nm
+}
+
+// p.9.11.33 struct 的 with：`p with {x: 1}` → 值语义复制 + 指定字段覆盖。
+// 发射：alloca 新槽 → 全字段逐个 GEP load/store 拷贝（引用/表字段拷指针 =
+// 编译期共享，未提及字段零额外成本）→ 覆盖字段按记录字面量键定位 GEP store
+//（S1.3 窄整收窄 + any 装箱对齐 tig_struct_construct）→ load 聚合值返回。
+// 右侧恒为记录形态（`with {` 后花括号消歧恒记录，p.9.11.5 同族）。
+func tig_with_struct(id: i64, base: i64, upd: i64, bt: i64) -> i64 {
+    var nf = cls_nfld[bt - BASE_STRUCT]
+    var src = tig_agg_addr(base, bt)
+    if src < 0 {
+        return -1
+    }
+    var agg = bt
+    var alloca = ir.new_inst(g_cur_block, 20, agg)
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    // ---- 步骤 1：全字段拷贝（先拷后覆盖，覆盖任意子集均正确）----
+    var i: i64 = 0
+    while i < nf {
+        var fty = agg_field_ty(bt, i)
+        // agg_gep（inst 27）实例类型 = 聚合类型（对齐 tig_struct_construct/字段读路径）
+        var gp1 = ir.new_inst(g_cur_block, 27, agg)
+        ir.add_operand(gp1, src, 0)
+        ir.add_operand(gp1, i, 2)
+        var gp1p = ir.get_value(gp1)
+        var ld = ir.new_inst(g_cur_block, 21, fty)
+        ir.add_operand(ld, gp1p, 0)
+        var v = ir.get_value(ld)
+        var gp2 = ir.new_inst(g_cur_block, 27, agg)
+        ir.add_operand(gp2, ap, 0)
+        ir.add_operand(gp2, i, 2)
+        var gp2p = ir.get_value(gp2)
+        var st = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(st, fty, 2)
+        ir.add_operand(st, v, 0)
+        ir.add_operand(st, gp2p, 0)
+        i = i + 1
+    }
+    // ---- 步骤 2：覆盖字段 ----
+    var nc = sstate.nchild(upd)
+    var k: i64 = 0
+    while k < nc {
+        var cell = sstate.child(upd, k)
+        var cid = sstate.child(cell, 0)
+        var fname = sstate.name_str(cid)
+        var fidx = agg_field_index(bt, fname)
+        if fidx < 0 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "struct 字段 '" + fname + "' 未定义（with 覆盖，函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+        var fty = agg_field_ty(bt, fidx)
+        var val = sstate.child(cell, 1)
+        var vv = tig_expr(val)
+        if vv < 0 {
+            return -1
+        }
+        var vt = node_types[val]
+        if vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
+            (types.is_int(fty) || types.is_float(fty)) && vt != fty {
+            var cv = tig_coerce(vv, vt, fty)
+            if cv < 0 {
+                return -1
+            }
+            vv = cv
+        }
+        if fty == types.named(TK_ANY) && vt >= 0 && vt != types.named(TK_ANY) {
+            var bx = tig_box_any(vv, vt)
+            if bx < 0 {
+                return -1
+            }
+            vv = bx
+        }
+        var gp3 = ir.new_inst(g_cur_block, 27, agg)
+        ir.add_operand(gp3, ap, 0)
+        ir.add_operand(gp3, fidx, 2)
+        var gp3p = ir.get_value(gp3)
+        var st2 = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(st2, fty, 2)
+        ir.add_operand(st2, vv, 0)
+        ir.add_operand(st2, gp3p, 0)
+        k = k + 1
+    }
+    // ---- 步骤 3：load 聚合值返回（值语义）----
+    var ld2 = ir.new_inst(g_cur_block, 21, agg)
+    ir.add_operand(ld2, ap, 0)
+    return ir.get_value(ld2)
+}
+
+// 元素 LLVM 槽类型（s21_table_at/table_push 的槽类型）：复合 → 自身；表/映射/端口
+// → ptr（TK_STR）；标量按 bridge_suffix。
+func elem_llvm_slot(elem: i64) -> i64 {
+    var k = types.kind(elem)
+    if k == K_STRUCT || k == K_ENUM || k == K_FN || k == K_TUPLE || elem == types.named(TK_ANY) {
+        return elem
+    }
+    if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
+        return types.named(TK_STR)
+    }
+    var suffix = bridge_suffix(elem)
+    if suffix == "string" {
+        return types.named(TK_STR)
+    }
+    if suffix == "bool" {
+        return types.named(TK_BOOL)
+    }
+    if suffix == "f64" {
+        return types.named(TK_F64)
+    }
+    return types.named(TK_I64)
+}
+
+// p.9.11.7 切片/区间 `t[1..3]`：base 为表/数组 → 建同元素类型新表 + 复制
+// [start,end) 子区间（左闭右开）；base 为字符串 → 字节子串。端点 -1 表示缺省
+//（start→0、end→len）。越界裁决：**clamp** 到 [0,len]（对齐 str_sub_bytes 内建
+// clamp，与一维下标越界报错不同——切片默认收敛）；负端 clamp 至 0/len；
+// start≥end 空结果。表切片 = 新表（拷贝非视图）。
+func tig_slice(id: i64) -> i64 {
+    var base = sstate.child(id, 0)
+    var s1 = sstate.child(id, 1)
+    var s2 = sstate.child(id, 2)
+    var T64 = types.named(TK_I64)
+    var base_ty = node_types[base]
+    if base_ty == types.named(TK_STR) {
+        // 字符串字节子串（str_sub_bytes 已内建 clamp；end 缺省 + 大数钳到 len）
+        var vs = tig_expr(base)
+        if vs < 0 {
+            return -1
+        }
+        var lo: i64 = tig_int_lit(0)
+        if s1 >= 0 {
+            lo = tig_expr(s1)
+            if lo < 0 {
+                return -1
+            }
+        }
+        var hi: i64 = tig_int_lit(1073741824)  // 1<<30（clamp 到 len 的大上界）
+        if s2 >= 0 {
+            hi = tig_expr(s2)
+            if hi < 0 {
+                return -1
+            }
+        }
+        return s21_str_sub_bytes(vs, lo, hi)
+    }
+    // ---- 表/数组切片 ----
+    var elem: i64 = types.named(TK_I64)
+    if types.is_table(base_ty) {
+        var le = types.table_elem(base_ty)
+        if le > 0 {
+            elem = le
+        }
+    }
+    var t = tig_expr(base)
+    if t < 0 {
+        return -1
+    }
+    var tlen = s21_table_len(t)
+    if tlen < 0 {
+        return -1
+    }
+    // lo/hi（运行时值）：start 缺省 0；end 缺省 len；再 clamp 到 [0,len]
+    var lo0: i64 = tig_int_lit(0)
+    if s1 >= 0 {
+        lo0 = tig_expr(s1)
+        if lo0 < 0 {
+            return -1
+        }
+    }
+    var hi0: i64 = tlen
+    if s2 >= 0 {
+        hi0 = tig_expr(s2)
+        if hi0 < 0 {
+            return -1
+        }
+    }
+    var lo_neg = tig_cmp_zero(lo0, 4)           // lo0 < 0
+    var lo1 = tig_select_i(lo_neg, tig_int_lit(0), lo0, T64)
+    var lo_big = tig_icmp_c(lo1, tlen, 3)       // lo1 > tlen
+    var lo = tig_select_i(lo_big, tlen, lo1, T64)
+    var hi_neg = tig_cmp_zero(hi0, 4)
+    var hi1 = tig_select_i(hi_neg, tig_int_lit(0), hi0, T64)
+    var hi_big = tig_icmp_c(hi1, tlen, 3)
+    var hi = tig_select_i(hi_big, tlen, hi1, T64)
+    // 结果表
+    var esz = elem_size(elem)
+    var esz_v = tig_int_lit_ty(esz, T64)
+    var rt = s21_table_new_ty(elem, esz_v)
+    // 循环 i in [lo, hi)：push t[i]
+    var idx_a = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(idx_a, T64, 2)
+    var idx_p = ir.get_value(idx_a)
+    s21_store(idx_p, lo, T64)
+    var sc = ir.new_block(g_cur_func, interner.intern("slc.c"))
+    var sb2 = ir.new_block(g_cur_func, interner.intern("slc.b"))
+    var ss = ir.new_block(g_cur_func, interner.intern("slc.s"))
+    var sx = ir.new_block(g_cur_func, interner.intern("slc.x"))
+    var b0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b0, sc, 1)
+    g_cur_block = sc
+    var ci = s21_load(idx_p, T64)
+    var clt = tig_icmp_c(ci, hi, 2)  // i < hi
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, clt, 0)
+    ir.add_operand(cb, sb2, 1)
+    ir.add_operand(cb, sx, 1)
+    g_cur_block = sb2
+    var ok2 = ir.new_inst(g_cur_block, 20, types.named(TK_I8))
+    ir.add_operand(ok2, types.named(TK_I8), 2)
+    var ev = s21_table_at(t, ci, ir.get_value(ok2), elem_llvm_slot(elem))
+    if ev < 0 {
+        return -1
+    }
+    s21_table_push(rt, elem_llvm_slot(elem), ev)
+    var sb3 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(sb3, ss, 1)
+    g_cur_block = ss
+    var ni2 = s21_bin(0, ci, tig_int_lit(1))
+    s21_store(idx_p, ni2, T64)
+    var sb4 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(sb4, sc, 1)
+    g_cur_block = sx
+    return rt
+}
+
+// 枚举构造：EnumName.Variant(args) → 聚合值。
+// eidx：en_keys 下标（构造名反查的枚举）；vname：变体名；id：AST 节点
+//（MethodCall 取实参；FieldAccess 无实参）；arg_start：实参起始 child
+// 布局（对齐 tig_struct_construct）：alloca %enum.X → store tag（槽 0）→
+// 逐 payload 槽 store（实参覆盖前 nfld 个；其余槽零值）→ load 聚合值。
+// 槽类型统一 i64：窄整数/字符/布尔 payload 经 sext 升宽到 i64（一期白名单
+// 限整数系；string payload 无现成 ptr↔i64 桥 → 报"暂不支持"）。
+func tig_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i64 {
+    var ei = en_vals[eidx]
+    var ename = sstate.enum_name_of(ei)
+    var tag = enum_variant_tag(ei, vname)
+    if tag < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "枚举 '" + ename + "' 没有变体 '" + vname + "'（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var varoff = en_varoff[ei]
+    var nfld = en_vnfld[varoff + tag]
+    var foff = en_vfldoff[varoff + tag]
+    var nslot = en_nslot[ei]
+    var agg = types.enum_of(ei)
+    // alloca 聚合（类型 = %enum.X）
+    var alloca = ir.new_inst(g_cur_block, 20, agg)
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    // store tag（槽 0，i64）
+    var tagv = tig_int_lit_ty(tag, types.named(TK_I64))
+    var g0 = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 下标 0
+    ir.add_operand(g0, ap, 0)
+    ir.add_operand(g0, 0, 2)
+    var g0p = ir.get_value(g0)
+    var st0 = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st0, types.named(TK_I64), 2)
+    ir.add_operand(st0, tagv, 0)
+    ir.add_operand(st0, g0p, 0)
+    // 逐 payload 槽（槽下标 1..nslot；i 从 0 起对应槽 1+i）
+    var i: i64 = 0
+    while i < nslot {
+        var fty: i64 = types.named(TK_I64)
+        var st_ty: i64 = types.named(TK_I64)  // 槽存储类型（f64 payload → double，8B type-punned）
+        var v: i64 = -1
+        if i < nfld {
+            fty = en_ftys[foff + i]
+            var arg = sstate.child(id, arg_start + i)
+            if fty == types.named(TK_STR) {
+                // string payload（S2.3）：槽是 i64，已按 i64 指针值发射的 string
+                // 表达式可直接存储——两类：字符串字面量（const_str 发射为
+                // ptrtoint i64）与字符串拼接（str_cat 输出同为 ptrtoint i64，
+                // 见 llvmgen op==56）；其余 string 变量/调用返回值是 ptr 值，
+                // 需 ptrtoint 转 i64 后存储。读取侧（switch case 绑定 / ? 解包）
+                // 由消费方按需 inttoptr 还原 ptr。
+                v = tig_expr(arg)
+                if v < 0 {
+                    return -1
+                }
+                // 跳过转换：字面量（S_N_STR_LIT=2）或字符串拼接（S_N_BINARY=9
+                // 且语义类型为 string——比较类二元返回 bool 不会命中）
+                var is_i64_ptrval = s_tags[arg] == 2 ||
+                    (s_tags[arg] == 9 && node_types[arg] == types.named(TK_STR))
+                if !is_i64_ptrval {
+                    var pi = ir.new_inst(g_cur_block, 24, types.named(TK_I64))  // ptrtoint
+                    ir.add_operand(pi, v, 0)
+                    v = ir.get_value(pi)
+                }
+            } else if fty == types.named(TK_F64) {
+                // f64 payload（p.6.2.1）：double 与 i64 槽同宽 8B，type-punned 直存
+                //（对齐 any 装箱 P2b tag=1 的 f64 处理；读侧以 double 还原）
+                v = tig_expr(arg)
+                if v < 0 {
+                    return -1
+                }
+                st_ty = fty
+            } else if types.is_table(fty) || types.is_map(fty) {
+                // table/map payload（p.6.2.1）：值是 ptr → ptrtoint 存 i64 槽
+                //（与 string 桥同构；读侧按消费方 inttoptr 还原 ptr）
+                v = tig_expr(arg)
+                if v < 0 {
+                    return -1
+                }
+                var pi = ir.new_inst(g_cur_block, 24, types.named(TK_I64))  // ptrtoint
+                ir.add_operand(pi, v, 0)
+                v = ir.get_value(pi)
+            } else {
+                // 窄整数字段 + 整数字面量：按字段类型生成常量（i32 槽 i32 值）——
+                // 否则字面量走 tig_expr 恒 i64，sext i32 %i64 类型不匹配。
+                // 非字面量（变量/表达式）tig_expr 产出天然窄类型（i32 变量 load i32、
+                // 字符/布尔字面量 i32/i1），sext 源类型与 fty 一致。
+                if fty != types.named(TK_I64) && fty != types.named(TK_U64) && s_tags[arg] == 0 {
+                    v = tig_int_lit_ty(s_vals[arg], fty)
+                } else {
+                    v = tig_expr(arg)
+                }
+                if v < 0 {
+                    return -1
+                }
+                // 窄整数/字符/布尔/trit → sext 升宽到 i64（槽统一 i64；u 类型
+                // 升宽用 sext——一期仅 i64 payload 参与验收，符号扩展边界已注释；
+                // string 已是 i64 指针值，不参与升宽）
+                if fty != types.named(TK_I64) && fty != types.named(TK_U64) {
+                    var se = ir.new_inst(g_cur_block, 19, types.named(TK_I64))  // sext
+                    ir.add_operand(se, fty, 2)
+                    ir.add_operand(se, v, 0)
+                    v = ir.get_value(se)
+                }
+            }
+        } else {
+            // 无 payload 变体 / 超出实参的槽：零值（聚合不含未定义位）
+            v = tig_int_lit_ty(0, types.named(TK_I64))
+        }
+        var gp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 下标 1+i
+        ir.add_operand(gp, ap, 0)
+        ir.add_operand(gp, 1 + i, 2)
+        var gpp = ir.get_value(gp)
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store i64
+        ir.add_operand(st, st_ty, 2)
+        ir.add_operand(st, v, 0)
+        ir.add_operand(st, gpp, 0)
+        i = i + 1
+    }
+    var ld = ir.new_inst(g_cur_block, 21, agg)  // load 聚合值
+    ir.add_operand(ld, ap, 0)
+    return ir.get_value(ld)
+}
+
+}

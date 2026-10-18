@@ -1,0 +1,20 @@
+type tie<logic>
+// tests/_p9124_nsconst_probe/nsconst_neg_probe.tie —— p.9.12.4 负例伴生探针
+// ============================================================
+// EN: negative companion probe — reassigning a namespace const (bare name
+// inside the namespace) must be REJECTED at compile time
+//（期望编译失败：error 不能给 const 变量 'BASE' 赋值）。
+// 验证：tiec 编译本文件必须非零退出；若编译成功即为回归（FAIL）。
+
+namespace calc {
+    const BASE: i64 = 100
+
+    pub func try_write() -> i64 {
+        BASE = 200
+        return BASE
+    }
+}
+
+func main() {
+    println("UNREACHED " + to_string(calc::try_write()))
+}

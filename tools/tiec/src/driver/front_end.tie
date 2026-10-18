@@ -1,0 +1,163 @@
+type tie<class>
+// compiler/driver/front_end.tie —— driver 前端调用与诊断输出子模块
+// ============================================================
+// 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
+// 拆分范式：同编译单元跨文件（文本内联）——本文件只含函数与注释，
+// 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
+// 风格 ns：函数在 `namespace driver` 内，一律 pub（driver 库 API 面）；
+// 主文件顶层 main() 以 driver.<名>() 调用。
+namespace driver {
+pub func frontend(src: string, base_dir: string) -> i64 {
+    // T5.3 内存版：parse_ast 返回 0/-1（成功时 AST 在 ast 节点池内存），
+    // 失败时由 parser.ast_err_protocol() 组装与 parse_src 相同的 "ERR:line col msg"
+    unsafe {
+        var t0 = clock()
+    }
+    // r.1.6.7：文件级 lock 授权（`type tie<logic, unsafe:lock>`）须在**解析之前**
+    // 告知 parser —— 只有 parser 知道「本文件」的边界（`parse_ast` 仅对主输入文件
+    // 调用；import 的模块走语义层另一条路径），故文件级授权在 parser 内展开为
+    // 「本文件每个函数隐式持 lock 域」，范围天然精确、不会波及 import 的模块。
+    sstate.compile_unit_reset()
+    sstate.set_file_caps(driver.role_unsafe_caps())
+    // 2026-10-07：文件级不安全上下文（`type tie<角色, unsafe>`）与域凭据并行登记。
+    // 由 cap_apply_file 落到**本文件**的每个函数上 ⇒ 范围精确，不波及 import 的模块。
+    sstate.set_file_uctx(driver.role_has_bare_unsafe())
+    var prc = parser.parse_ast(src)
+    unsafe {
+        var t0e = clock()
+    }
+    g_t_parse = t0e - t0
+    if prc < 0 {
+        dbg_txt(diagcode.render_err_proto(parser.ast_err_protocol()))
+        // p.9.22：解析失败——错误槽落定（--emit diag:* 落盘与 tinker diag 帧共用；
+        // 无条件，不在 emit 分支内——tink 管道同样要拿到真实错误文本）。
+        dbgem.set_err_proto(parser.ast_err_protocol())
+        if len(g_emit_specs) > 0 {
+            dbgem.run_emit_dumps(1)
+        }
+        return -1
+    }
+    unsafe {
+        var t1 = clock()
+    }
+    diagcode.warn_unreg_reset()
+    // p.9.14.2 独立警告 pass：把前端警告开关传给 semantic（-w 开启、默认只报错）。
+    // 必须在 check_ast 之前设置——语义侧警告收集/遍历全程由该开关门控。
+    semantic.set_warn_enabled(g_front_warn)
+    // p.9.21.4 II1 可见性梯度：把 CLI 档位传给语义层（默认 1 = A1b = 历史行为）。
+    // 必须在 check_ast 之前设置——check_visibility 在调用解析点全程消费该档位。
+    sstate.set_visibility(g_cli_visibility)
+    var sem = semantic.check_ast(base_dir)
+    unsafe {
+        var t1e = clock()
+    }
+    g_t_sem = t1e - t1
+    if has_prefix(str.clone(sem), "ERR:") {
+        dbg_txt(diagcode.render_err_proto(sem))
+        // p.9.22：语义失败——错误槽落定（同解析路径，无条件）。
+        dbgem.set_err_proto(sem)
+        if len(g_emit_specs) > 0 {
+            dbgem.run_emit_dumps(1)
+        }
+        return -1
+    }
+    // p.9.14.1：语义警告改结构化事件直发（driver 从 semantic.warn_* 直读渲染，
+    // 不再解析 OK 协议中的 ;W: 文本段）。
+    // 服务模式（--tink-serve）例外：警告只进结构化记录（diag 211），不向 stderr
+    // 打印——LSP 场景 stderr 管道无人清读，全库警告会塞满管道致服务阻塞（实测）。
+    if !g_tink_serve {
+        print_warns()
+    }
+    // p.9.22：结构化输出落盘（--emit ...；辅助输出——失败只打印，不改变编译结果）
+    dbgem.run_emit_dumps(0)
+    // p.9.22.7：library/class 伴生 .sym.zd（--no-sym 关闭；采集未开时跳过）
+    dbgem.run_sidecar()
+    // -Werror：有任何警告即中止，不进入中端/后端（不产出任何中间产物与可执行文件）。
+    if warn_gate() != 0 {
+        return -1
+    }
+    return 0
+}
+
+// driver 侧告警统一渲染入口：与 diagcode.render_warning 同形，**额外累计计数**，
+// 使角色注册/优化档降级等「不经 semantic 警告表」的告警也纳入 -Werror 判定。
+// 调用方仍各自保留 `if !g_no_warn` 守卫（--no-warn 时本就不打印，计数自然为 0）。
+pub func warn_render(line: i64, col: i64, core: string) -> string {
+    g_warn_seen = g_warn_seen + 1
+    return diagcode.render_warning(line, col, core)
+}
+
+// -Werror 闸门：0 = 通过（未开该开关，或确实没有警告）；1 = 有警告且要求当错误，
+// 调用方须以非 0 退出码中止。总结只打印一次（早退点 + 末段各调一次也只报一句）。
+pub func warn_gate() -> i64 {
+    if !g_warn_error {
+        return 0
+    }
+    // 口径 = **主输入文件**的警告（模块序号 0）+ driver 侧告警（角色/优化档等，
+    // 直接关系到本次编译的意图）。导入模块（std/prelude 等）自身的告警不计入，
+    // 否则任何编译都会失败；但它们**如实报出条数**，不隐藏。
+    var main_n = semantic.warn_main_count() + g_warn_seen
+    var other_n = semantic.warn_other_count()
+    if main_n == 0 {
+        return 0
+    }
+    if !g_warn_failed {
+        g_warn_failed = true
+        var msg = "警告按错误处理（-Werror）：主文件 " + to_string(main_n) + " 条警告"
+        if other_n > 0 {
+            msg = msg + "（另有导入模块 " + to_string(other_n) + " 条，不计入）"
+        }
+        dbg_txt(msg)
+    }
+    return 1
+}
+
+// p.9.14.1：从 semantic 结构化警告事件直读渲染（warning[W#####] @l:c: 名字；建议。）。
+// 替代旧的 ";W:l c msg" 文本协议解析（序列化→再解析→二次归一化）。渲染仅一次
+// （diagcode.render_warning 输出端归一化），渲染结果与旧路径逐字节等价。
+pub func print_warns() -> string {
+    // --no-warn：整个前端警告段不打印
+    if g_no_warn {
+        return ""
+    }
+    var n = semantic.warn_count()
+    var i: i64 = 0
+    while i < n {
+        dbg_txt(diagcode.render_warning(semantic.warn_line_at(i), semantic.warn_col_at(i), semantic.warn_msg_at(i)))
+        i = i + 1
+    }
+    // 未登记警告审计（TIEC_WARN_AUDIT=1）：新增了警告发射点却忘了 warn_reg 时立刻暴露，
+    // 而不是静默渲染成 W00000。与错误侧 E00000 兜底的可观测性对齐。
+    if get_env("TIEC_WARN_AUDIT") == "1" {
+        var uc = diagcode.warn_unreg_count()
+        if uc > 0 {
+            dbg_txt("[warn-audit] 未登记警告 " + to_string(uc) + " 条：" + diagcode.warn_unreg_list())
+        }
+    }
+    return ""
+}
+
+// ERR 协议文本 → "行:列: 消息"（协议 ERR:<line> <col> <msg>）。
+pub func err_span(proto: string) -> string {
+    var rest = slice(str.clone(proto), 4, str_len(proto))
+    var sp1 = find_char(str.clone(rest), " ")
+    if sp1 < 0 {
+        return proto
+    }
+    var sp2: i64 = -1
+    var i: i64 = sp1 + 1
+    while i < str_len(rest) {
+        if str_char(rest, i) == " " {
+            sp2 = i
+            break
+        }
+        i = i + 1
+    }
+    if sp2 < 0 {
+        return rest
+    }
+    return "@" + slice(str.clone(rest), 0, sp1) + ":" + slice(str.clone(rest), sp1 + 1, sp2) + ": " +
+        slice(str.clone(rest), sp2 + 1, str_len(rest))
+}
+
+}

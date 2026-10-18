@@ -1,0 +1,198 @@
+type tie<class>
+// compiler/backend/irgen_bi_str.tie —— 内置生成器：字符串 {ptr,len} 原语（S2.1）
+// ============================================================
+// 自 irgen_expr.tie 的 builtin_expr 拆出（p.9.21.2 两步制①）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `str_byte`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_str_byte(nm: string, id: i64) -> i64 {
+if nm == "str_byte" {
+    // str_byte(s, i)：取第 i 字节（0 ≤ i < len(s)；越界未定义——调用方保证）
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    var i = tig_expr(call_arg(id, 1))
+    if i < 0 {
+        return -1
+    }
+    g_builtin_res = s21_str_byte(v, i)
+    return 0
+}
+}
+
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `utf8_seq_len`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_utf8_seq_len(nm: string, id: i64) -> i64 {
+if nm == "utf8_seq_len" {
+    // utf8_seq_len(s, i)：字节 i 起的 UTF-8 序列长度（1-4，按首字节判定）
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    var i = tig_expr(call_arg(id, 1))
+    if i < 0 {
+        return -1
+    }
+    g_builtin_res = s21_utf8_seq_len(v, i)
+    return 0
+}
+}
+
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `utf8_char_at`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_utf8_char_at(nm: string, id: i64) -> i64 {
+if nm == "utf8_char_at" {
+    // utf8_char_at(s, i)：字节 i 起的 UTF-8 码点值（分支按序列长度解码）
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    var i = tig_expr(call_arg(id, 1))
+    if i < 0 {
+        return -1
+    }
+    g_builtin_res = s21_utf8_char_at(v, i)
+    return 0
+}
+}
+
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `sso_malloc_count`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_sso_malloc_count(nm: string, id: i64) -> i64 {
+if nm == "sso_malloc_count" {
+    llvmgen.sso_enable()
+    var cnt_id = interner.intern("@s21_sso_malloc_cnt")
+    var ldc = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load
+    ir.add_operand(ldc, cnt_id, 3)  // OK_GLOBAL → @s21_sso_malloc_cnt
+    g_builtin_res = ir.get_value(ldc)
+    return 0
+}
+}
+
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `catch_panic`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_catch_panic(nm: string, id: i64) -> i64 {
+if nm == "catch_panic" {
+    var r = tig_catch_panic(id)
+    if r < 0 {
+        return -1
+    }
+    return 0
+}
+}
+
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `cb_ptr`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_cb_ptr(nm: string, id: i64) -> i64 {
+if nm == "cb_ptr" {
+    var r2 = tig_cb_ptr(id)
+    if r2 < 0 {
+        return -1
+    }
+    return 0
+}
+}
+
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `string_builder`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_string_builder(nm: string, id: i64) -> i64 {
+if nm == "string_builder" {
+    // string_builder()：新建 StringBuilder 句柄（i64；两级指针 {cap,len,data}）
+    g_builtin_res = s21_sb_new()
+    return 0
+}
+}
+
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `sb_append`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_sb_append(nm: string, id: i64) -> i64 {
+if nm == "sb_append" {
+    // sb_append(h, s)：原地追加字符串（容量不足自动倍增重分配）；返回 0
+    var h = tig_expr(call_arg(id, 0))
+    if h < 0 {
+        return -1
+    }
+    var v = tig_expr(call_arg(id, 1))
+    if v < 0 {
+        return -1
+    }
+    s21_sb_append(h, v)
+    g_builtin_res = tig_int_lit(0)
+    return 0
+}
+}
+
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `sb_append_byte`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_sb_append_byte(nm: string, id: i64) -> i64 {
+if nm == "sb_append_byte" {
+    // sb_append_byte(h, b)：原地追加单字节（0-255，二进制安全含 \0）；返回 0
+    var h = tig_expr(call_arg(id, 0))
+    if h < 0 {
+        return -1
+    }
+    var b = tig_expr(call_arg(id, 1))
+    if b < 0 {
+        return -1
+    }
+    s21_sb_append_byte(h, b)
+    g_builtin_res = tig_int_lit(0)
+    return 0
+}
+}
+
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `sb_build`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_sb_build(nm: string, id: i64) -> i64 {
+if nm == "sb_build" {
+    // sb_build(h)：一次性产出 string（{头, 数据, \0}；句柄仍有效可复用）
+    var h = tig_expr(call_arg(id, 0))
+    if h < 0 {
+        return -1
+    }
+    g_builtin_res = s21_sb_build(h)
+    return 0
+}
+}
+
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `sb_reset`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_sb_reset(nm: string, id: i64) -> i64 {
+if nm == "sb_reset" {
+    // sb_reset(h)：清空复用（len=0，cap/data 缓冲保留；build 后续写必须 reset）
+    var h = tig_expr(call_arg(id, 0))
+    if h < 0 {
+        return -1
+    }
+    g_builtin_res = s21_sb_reset(h)
+    return 0
+}
+}
+
+// S2.1 字符串 {ptr,len} 原语
+// 内置 `str_sub_bytes`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_str_sub_bytes(nm: string, id: i64) -> i64 {
+if nm == "str_sub_bytes" {
+    // str_sub_bytes(s, lo, hi)：字节区间子串 [lo, hi)（clamp 越界；
+    // 配合码点→字节偏移表实现 lexeme 切片零重扫）
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    var lo = tig_expr(call_arg(id, 1))
+    if lo < 0 {
+        return -1
+    }
+    var hi = tig_expr(call_arg(id, 2))
+    if hi < 0 {
+        return -1
+    }
+    g_builtin_res = s21_str_sub_bytes(v, lo, hi)
+    return 0
+}
+}
+
+}

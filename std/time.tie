@@ -1,0 +1,105 @@
+type tie<class>
+// time.tie：标准库——时间/计时工具（命名空间 time），基于底座原语
+// time_now 实现 + p.9.1.1.20 新增单调高分辨率时钟（libc GetTickCount）。
+//
+// 底座原语语义（对齐 crates/tie-interp/src/lib.rs tie_time_now）：
+// - time_now() 返回 **Unix 纪元秒**（SystemTime 距 1970-01-01 的整秒数，i64）。
+//   注意单位是**秒**不是毫秒——因此本模块提供 now_ms() 秒→毫秒换算，
+//   tick_ms()/elapsed_ms() 内部都做 *1000 换算，调用方拿到的都是毫秒。
+// - time_now 是**唯一**时间原语：没有日期拆分能力（无年/月/日/时/分/秒
+//   拆分函数），需要日历时间需由调用方自行基于纪元秒换算。
+//
+// 计时用途：tick_start() 记录起点到模块级全局变量 t_tick_start（秒），
+// tick_ms() 返回起点到当前经过的毫秒数。t_tick_start 是顶层持久变量
+// （T0.4 全局变量机制，编译期映射为 IR 全局槽），跨函数共享。
+//
+// p.9.1.1.20 单调高分辨率时钟：
+// - 墙钟 time_now/now() 是挂钟时间（Unix 纪元秒），可能因系统校时/闰秒**回跳**
+//   （非单调），且精度仅到秒——不适合测量代码耗时。
+// - 单调时钟 mono_ms() 走 libc GetTickCount（kernel32，自系统启动起的**单调**
+//   **毫秒**，绝不回退），用于高分辨率耗时测量。tie 无指针类型，无法直接
+//   extern 声明 QueryPerformanceCounter/clock_gettime（两者都需 LARGE_INTEGER*
+//   /timespec* 指针参数，std/process 已记录该限制），故取 GetTickCount 包装
+//   并注明：粒度为系统定时器周期（默认约 15.625ms，非纳秒级），且为 32 位
+//   DWORD（约 49.7 天后回绕，单次 elapsed 若跨回绕点会失真）；如需纳秒级
+//   精度或 64 位时长需底层 QPC/clock_gettime64（待 tie 引入指针类型后接入）。
+//   GetTickCount 已在编译器 is_libc_sym 白名单（kernel32 符号，免 interp 桥
+//   链接），故 extern 声明即可编译链接，零 Rust 桥。
+//
+// 调用：import 后 time.now() / time.tick_start() / time.tick_ms() / ...
+//        以及 time.mono_ms() / time.mono_start() / time.mono_elapsed_ms()。
+// 命名规范：命名空间内函数不加 time_；pub func 显式导出（Harbor M2.1.7）。
+
+// 墙钟计时起点（Unix 纪元秒，time_now 单位）。0 = 尚未 tick_start。
+var t_tick_start: i64 = 0;
+// 单调时钟启动点（GetTickCount 的毫秒值，模块级持久变量）。0 = 尚未 mono_start。
+var t_mono_start: i64 = 0;
+
+// extern 声明：libc/kernel32 GetTickCount（无参数，返回自系统启动以来毫秒数，
+// 单调不递减，DWORD 32 位）。仅顶层裸名。C 原型 `DWORD GetTickCount(void)`。
+unsafe extern fn GetTickCount() -> i64;
+
+namespace time {
+// 当前 Unix 纪元秒数（i64）。time_now 原语包装。
+// 单位：**秒**（确认自 tie_time_now 实现：`d.as_secs() as i64`）。
+pub func now() -> i64 {
+    return time_now()
+}
+
+// 当前 Unix 纪元毫秒数（秒 × 1000）。因 time_now 单位为秒，此为换算便捷函数。
+pub func now_ms() -> i64 {
+    return now() * 1000
+}
+
+// 记录计时起点（now() 的秒值）到模块级全局变量 t_tick_start。
+// 之后调用 tick_ms() 返回自此刻起经过的毫秒数。
+pub func tick_start() {
+    t_tick_start = now()
+}
+
+// 从 tick_start() 记录的时刻到当前的毫秒数（起点秒差 × 1000）。
+// 未调用 tick_start()（t_tick_start 仍为 0）时返回的是自纪元起的毫秒数，
+// 语义无定义——使用约定：先 tick_start() 再 tick_ms()。
+pub func tick_ms() -> i64 {
+    return (now() - t_tick_start) * 1000
+}
+
+// 从给定起点（Unix 纪元秒，通常取 now() 返回值）到当前的毫秒数。
+// 起点比当前更晚（future 起点）时返回负值——由调用方决定是否接受。
+pub func elapsed_ms(start: i64) -> i64 {
+    return (now() - start) * 1000
+}
+
+// 秒 → 毫秒换算（time_now 单位为秒，秒值 × 1000 得毫秒）。
+// 保持该函数：单位语义在此显式化，避免调用方各自散写 * 1000。
+pub func seconds(s: i64) -> i64 {
+    return s * 1000
+}
+
+// ====================================================================
+// p.9.1.1.20 单调高分辨率时钟（GetTickCount 包装）
+// ====================================================================
+
+// 单调毫秒：自系统启动起的毫秒数（libc GetTickCount，DWORD 32 位）。**单调**，
+// 绝不因校时/闰秒回退，用于耗时测量。与 now()（墙钟秒，可回跳）正交。
+// 外层命名对应里程碑语法的 time_mono_ms()；命名空间内裸名 mono_ms()。
+pub func mono_ms() -> i64 {
+    unsafe {
+        return GetTickCount()
+    }
+}
+
+// 记录单调时钟起点（mono_ms() 的当前值）到模块级全局变量 t_mono_start。
+// 之后 mono_elapsed_ms() 返回自此刻起的单调毫秒数。
+pub func mono_start() {
+    t_mono_start = mono_ms()
+}
+
+// 自 mono_start() 记录时刻起的单调毫秒数 = mono_ms() - t_mono_start。
+// 外层命名对应里程碑语法的 time_elapsed_ms()；命名空间内裸名 mono_elapsed_ms()。
+// 未调用 mono_start()（t_mono_start 仍为 0）时返回自系统启动起的毫秒数——
+// 使用约定：先 mono_start() 再 mono_elapsed_ms()。
+pub func mono_elapsed_ms() -> i64 {
+    return mono_ms() - t_mono_start
+}
+}

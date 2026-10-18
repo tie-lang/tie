@@ -1,0 +1,189 @@
+type tie<class>
+// compiler/backend/irgen_huff.tie —— 生成器 L3：解压 Huffman 码表构建与解码
+// ============================================================
+// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// 由码长数组 lengths[0..n) 构建规范 Huffman 表（canonical；失败置 ok 槽 0）
+func tig_huff_build(n: i64, lengths: i64, huff: i64, ok_p: i64) {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    // 清零 counts/first/offset（16 槽各，编译期展开）
+    var z: i64 = 0
+    while z < 48 {
+        s21_store(s21_gep(huff, z*8, true), tig_int_lit(0), T64)
+        z = z + 1
+    }
+    // 清零 symbol[0..n)（运行时循环）
+    var za = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(za, T64, 2)
+    var zp = ir.get_value(za)
+    s21_store(zp, tig_int_lit(0), T64)
+    var zh = ir.new_block(g_cur_func, interner.intern("hb.zh"))
+    var zb = ir.new_block(g_cur_func, interner.intern("hb.zb"))
+    var zx = ir.new_block(g_cur_func, interner.intern("hb.zx"))
+    var brz = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brz, zh, 1)
+    g_cur_block = zh
+    var zv = s21_load(zp, T64)
+    var zc = tig_icmp_c(zv, n, 2)
+    var cbz = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbz, zc, 0)
+    ir.add_operand(cbz, zb, 1)
+    ir.add_operand(cbz, zx, 1)
+    g_cur_block = zb
+    var zv2 = s21_load(zp, T64)
+    s21_store(s21_gep(huff, s21_bin(0, s21_bin(2, zv2, tig_int_lit(8)), tig_int_lit(384)), false), tig_int_lit(0), T64)
+    s21_store(zp, s21_bin(0, zv2, tig_int_lit(1)), T64)
+    var brzb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brzb, zh, 1)
+    // counts[l]++（运行时循环 i）
+    g_cur_block = zx
+    var ia = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ia, T64, 2)
+    var ip = ir.get_value(ia)
+    s21_store(ip, tig_int_lit(0), T64)
+    var hd = ir.new_block(g_cur_func, interner.intern("hb.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("hb.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("hb.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var iv = s21_load(ip, T64)
+    var ic = tig_icmp_c(iv, n, 2)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, ic, 0)
+    ir.add_operand(cb, bd, 1)
+    ir.add_operand(cb, ex, 1)
+    g_cur_block = bd
+    var iv2 = s21_load(ip, T64)
+    var l = s21_zext(s21_load(s21_gep(lengths, iv2, false), I8), I8)
+    var gtz = tig_icmp_c(l, tig_int_lit(0), 3)
+    var bDo = ir.new_block(g_cur_func, interner.intern("hb.do"))
+    var bSk = ir.new_block(g_cur_func, interner.intern("hb.sk"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, gtz, 0)
+    ir.add_operand(cb2, bDo, 1)
+    ir.add_operand(cb2, bSk, 1)
+    g_cur_block = bDo
+    var caddr = s21_gep(huff, s21_bin(2, l, tig_int_lit(8)), false)   // counts[l]
+    var cv = s21_load(caddr, T64)
+    s21_store(caddr, s21_bin(0, cv, tig_int_lit(1)), T64)
+    var brd = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brd, bSk, 1)
+    g_cur_block = bSk
+    s21_store(ip, s21_bin(0, iv2, tig_int_lit(1)), T64)
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)
+    // 规范 first/offset（编译期展开；first[1]=offset[1]=0 已清零）
+    g_cur_block = ex
+    var L: i64 = 2
+    while L < 16 {
+        var cprev = s21_load(s21_gep(huff, (L-1)*8, true), T64)
+        var fprev = s21_load(s21_gep(huff, 128+(L-1)*8, true), T64)
+        s21_store(s21_gep(huff, 128+L*8, true), s21_bin(10, s21_bin(0, fprev, cprev), tig_int_lit(1)), T64)
+        var oprev = s21_load(s21_gep(huff, 256+(L-1)*8, true), T64)
+        s21_store(s21_gep(huff, 256+L*8, true), s21_bin(0, oprev, cprev), T64)
+        L = L + 1
+    }
+    // pos 槽 = offset[l]（编译期初始化）
+    var posb = s21_raw_alloc_str(tig_int_lit(128))  // 16 i64
+    var L2: i64 = 0
+    while L2 < 16 {
+        s21_store(s21_gep(posb, L2*8, true), s21_load(s21_gep(huff, 256+L2*8, true), T64), T64)
+        L2 = L2 + 1
+    }
+    // symbol 填充（运行时循环 j）
+    var ja = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ja, T64, 2)
+    var jp = ir.get_value(ja)
+    s21_store(jp, tig_int_lit(0), T64)
+    var jh = ir.new_block(g_cur_func, interner.intern("hb.jh"))
+    var jb = ir.new_block(g_cur_func, interner.intern("hb.jb"))
+    var jx = ir.new_block(g_cur_func, interner.intern("hb.jx"))
+    var brj = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brj, jh, 1)
+    g_cur_block = jh
+    var jv = s21_load(jp, T64)
+    var jc = tig_icmp_c(jv, n, 2)
+    var cbj = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbj, jc, 0)
+    ir.add_operand(cbj, jb, 1)
+    ir.add_operand(cbj, jx, 1)
+    g_cur_block = jb
+    var jv2 = s21_load(jp, T64)
+    var l2 = s21_zext(s21_load(s21_gep(lengths, jv2, false), I8), I8)
+    var gtz2 = tig_icmp_c(l2, tig_int_lit(0), 3)
+    var bD2 = ir.new_block(g_cur_func, interner.intern("hb.d2"))
+    var bS2 = ir.new_block(g_cur_func, interner.intern("hb.s2"))
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, gtz2, 0)
+    ir.add_operand(cb3, bD2, 1)
+    ir.add_operand(cb3, bS2, 1)
+    g_cur_block = bD2
+    var paddr = s21_gep(posb, s21_bin(2, l2, tig_int_lit(8)), false)   // pos[l2]
+    var pv = s21_load(paddr, T64)
+    s21_store(s21_gep(huff, s21_bin(0, s21_bin(2, pv, tig_int_lit(8)), tig_int_lit(384)), false), jv2, T64)  // symbol[pos]=j
+    s21_store(paddr, s21_bin(0, pv, tig_int_lit(1)), T64)
+    var brd2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brd2, bS2, 1)
+    g_cur_block = bS2
+    s21_store(jp, s21_bin(0, jv2, tig_int_lit(1)), T64)
+    var brjb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brjb, jh, 1)
+    g_cur_block = jx
+    s21_store(ok_p, tig_int_lit(1), T64)
+}
+// 规范 Huffman 解码 1 符号：逐长度尝试（1..15 位，位按 LSB-first 读入后高位拼接）。
+// 返回符号；15 位内未命中（无效码）→ -1。
+func tig_huff_decode(huff: i64, st: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var rs = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(rs, T64, 2)
+    var rp = ir.get_value(rs)
+    s21_store(rp, tig_int_lit(-1), T64)
+    var ca = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ca, T64, 2)
+    var cp = ir.get_value(ca)
+    s21_store(cp, tig_int_lit(0), T64)
+    var ex = ir.new_block(g_cur_func, interner.intern("hd.x"))
+    var L: i64 = 1
+    while L < 16 {
+        var blk = ir.new_block(g_cur_func, interner.intern("hd.l"))
+        var br = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br, blk, 1)
+        g_cur_block = blk
+        var cde = s21_load(cp, T64)
+        var b = tig_ib_read1(st)
+        var cde2 = s21_bin(7, s21_bin(10, cde, tig_int_lit(1)), b)
+        s21_store(cp, cde2, T64)
+        var cnt = s21_load(s21_gep(huff, L*8, true), T64)
+        var fst = s21_load(s21_gep(huff, 128+L*8, true), T64)
+        var diff = s21_bin(1, cde2, fst)
+        var cgt = tig_icmp_c(cnt, tig_int_lit(0), 3)   // cnt > 0
+        var ge0 = tig_icmp_c(diff, tig_int_lit(0), 5)  // diff >= 0
+        var ltc = tig_icmp_c(diff, cnt, 2)             // diff < cnt
+        var hit = tig_and_i1(tig_and_i1(cgt, ge0), ltc)
+        var bHit = ir.new_block(g_cur_func, interner.intern("hd.hit"))
+        var bNxt = ir.new_block(g_cur_func, interner.intern("hd.n"))
+        var cb = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb, hit, 0)
+        ir.add_operand(cb, bHit, 1)
+        ir.add_operand(cb, bNxt, 1)
+        g_cur_block = bHit
+        var offL = s21_load(s21_gep(huff, 256+L*8, true), T64)
+        var idx = s21_bin(0, offL, diff)
+        var sym = s21_load(s21_gep(huff, s21_bin(0, s21_bin(2, idx, tig_int_lit(8)), tig_int_lit(384)), false), T64)
+        s21_store(rp, sym, T64)
+        var brh = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brh, ex, 1)
+        g_cur_block = bNxt
+        L = L + 1
+    }
+    var brx = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brx, ex, 1)
+    g_cur_block = ex
+    return s21_load(rp, T64)
+}
+}

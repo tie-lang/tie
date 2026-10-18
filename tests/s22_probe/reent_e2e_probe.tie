@@ -1,0 +1,64 @@
+type tie<tsc, unsafe:raw>
+
+// p.9.11 `reentrant`（规范 §10.7）探针（async 形态）：A.slow（async + reentrant）
+// 在消费者线程上阻塞于 B 的同步 RPC 期间，main 投递的异步消息 quick() 被嵌套
+// 处理 ⇒ hits 序 S1,Q,S2（用 i64 位标记录，避开 actor string 字段既有缺陷）。
+// 编码：S1=1, Q=2, S2=4；断言最终 marks == 7 且 Q 位在 S1 后 S2 前置位。
+
+// volatile 忙等：纯计数循环会被 LLVM 归约成常量（实测），必须经内存强制真实执行
+func spin(n: i64) -> i64 {
+    var i: i64 = 0
+    unsafe {
+        var p = addr_of(i)
+        while volatile_load(p) < n {
+            volatile_store(p, volatile_load(p) + 1)
+        }
+    }
+    return i
+}
+
+actor B {
+    pub func wait_a_bit() -> i64 {
+        return spin(400000000)
+    }
+}
+
+actor A {
+    var marks: i64
+    pub async reentrant func slow() {
+        marks = marks * 10 + 1     // S1 = 1
+        var b = run B()
+        var r = b.wait_a_bit()
+        marks = marks * 10 + 3     // S2 = 3
+    }
+    pub async func quick() {
+        marks = marks * 10 + 2     // Q = 2
+    }
+    pub func getmarks() -> i64 { return marks }
+}
+
+func busy(n: i64) -> i64 {
+    return spin(n)
+}
+
+func main() -> i64 {
+    var a = run A()
+    a.slow()                // async：立即返回；消费者 S1 → 阻塞于 B → 等待期嵌套排空
+    busy(100000000)         // 等 slow 进入等待期
+    a.quick()               // async 投递（syncf=0）：落在等待窗口内 ⇒ 被嵌套排空消费
+    busy(600000000)         // 等 slow 完成
+    var m = a.getmarks()
+    println("marks=" + to_string(m))
+    if m == 123 {
+        println("VERDICT OK (reentrant: Q 在等待期被嵌套处理)")
+        return 0
+    }
+    if m == 132 {
+        println("VERDICT FAIL（Q 在 S2 之后才处理 = 未重入）")
+        exit(1)
+        return 0
+    }
+    println("VERDICT FAIL marks=" + to_string(m))
+    exit(1)
+    return 0
+}

@@ -1,0 +1,949 @@
+type tie<class>
+// compiler/frontend/sinfer_ret_q2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sinfer_ret.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace sinfer {
+pub func infer_call(id: i64) -> i64 {
+    var fnm = sstate.name_str(id)
+    // 实参收集：Call children = [泛型槽(-1或N_TYPE_ARGS), 实参...]，
+    // 实参从 children[slot_off] 起（slot_off 恒 1，统一走辅助保证一致）
+    var args: table<i64> = table_new_i64()
+    var off = sstate.slot_off(id)
+    var nc = sstate.nchild(id) - off
+    var i: i64 = 0
+    while i < nc {
+        table_push(args, sstate.child(id, off + i))
+        i = i + 1
+    }
+    // ---------- S1.3 checked_* 溢出检测函数族 ----------
+    // checked_add/sub/mul/div/shl/shr（2 参整数）+ checked_neg（1 参整数）
+    // → 返回 (T, bool) 元组（T = 公共宽度类型；bool = 溢出标志）。
+    // 先于 builtin_call（返回 -3 会误入用户函数路径报"无签名"）。
+    if fnm == "checked_add" || fnm == "checked_sub" || fnm == "checked_mul" ||
+        fnm == "checked_div" || fnm == "checked_shl" || fnm == "checked_shr" ||
+        fnm == "checked_neg" {
+        var need = 2
+        if fnm == "checked_neg" {
+            need = 1
+        }
+        if nc != need {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = fnm + "() 期望 " + to_string(need) + " 个参数，实际 " + to_string(nc) + " 个"
+            return -1
+        }
+        var t0 = infer_expr(args[0])
+        if t0 < 0 {
+            return -1
+        }
+        if !types.is_int(t0) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = fnm + "() 参数必须是整数，实际是 " + types.type_name(t0)
+            return -1
+        }
+        var ct = t0
+        if need == 2 {
+            var t1 = infer_expr(args[1])
+            if t1 < 0 {
+                return -1
+            }
+            if !types.is_int(t1) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = fnm + "() 参数必须是整数，实际是 " + types.type_name(t1)
+                return -1
+            }
+            if stype.int_width(t1) > stype.int_width(t0) {
+                ct = t1
+            }
+            if stype.is_signed(t0) != stype.is_signed(t1) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = fnm + "() 不支持有符号与无符号混合（" + types.type_name(t0) + " 与 " + types.type_name(t1) + "）"
+                return -1
+            }
+        }
+        var rt = tuple2_of(ct, types.named(TK_BOOL))
+        node_types[id] = rt
+        g_typed = g_typed + 1
+        return rt
+    }
+    // share 域门禁 · ④记录 spawn 调用点（B 方案，2026-10-03）
+    // 判定**不在此处**：全局引用的打点发生在闭包体 infer 时，而 spawn 的实参需要
+    // 先 infer 才登记闭包 ⇒ 同一时刻判据尚不完整。故此处只**登记调用点 + 快照凭据**，
+    // 判定延到 scheck 末段（`scheck_p2` 的 `check_spawn_share_gate`）——那时打点与
+    // 子闭包传播都已完成，而凭据状态已随作用域出栈，只能靠快照。
+    if fnm == "spawn" && len(args) == 1 {
+        // 主动 infer 实参：spawn 的返回类型由符号表/后端给（实测 builtin_call 对它是
+        // 死代码），实参**不经前端 infer** ⇒ 闭包不登记、全局引用不打点。
+        if node_types[args[0]] < 0 {
+            var at_s = infer_expr(args[0])
+            if at_s < 0 {
+                return -1
+            }
+        }
+        table_push(g_spawn_nodes, id)
+        table_push(g_spawn_args, args[0])
+        table_push(g_spawn_caps, g_held_caps)
+        table_push(g_spawn_unsafe, g_unsafe_depth)
+        table_push(g_spawn_force, 0)
+    }
+    // 内置函数：先校验个数（-2=参数错误已报），通过后逐个推断实参
+    var br = sbuiltin.builtin_call(fnm, args, id)
+    if br >= -1 && br != -3 {
+        // 安全边界：unsafe 内置（**操作级**危险面）在安全代码中调用 = 编译错误。
+        //
+        // 这是重分类后**唯一**的指针类门禁（类型级门禁已撤销，see scheck_q3.tie /
+        // scollect.tie）。清单的判据 = **「带安全前提」**（借用 Rust 的表述）：
+        // 一个操作是 unsafe 的，当且仅当它要求调用方先满足某个安全前提——前提可以是
+        // 「指针有效」也可以是「内存已初始化 / 未释放」。
+        //
+        //   保留（带安全前提，维持 unsafe）：
+        //     deref / deref_write —— 前提：指针有效、在界内、所指已初始化
+        //     alloc / free        —— 前提：返回的缓冲未初始化（读前须写）；
+        //                            free 的指针须来自 alloc 且未释放过
+        //     memcpy / memset     —— 前提：目标区间有效（长度不越界）
+        //     volatile_load/store —— 对内存的读写（须有效地址），且语义为「不可优化」
+        //   已移出（无任何安全前提，→ 安全）：
+        //     is_null（指针比较）· slice_of / slice_len / slice_index（切片视图与
+        //       带边界检查的下标，越界是可捕获失败）
+        //     addr_of / addr_of_field · ptr_add · ptr_to_int / int_to_ptr ——
+        //       **产出/计算指针值**：纯值运算，不触碰内存，结果即便无效也只在
+        //       被解引用时才成为问题，而解引用另有门禁 ⇒ 无独立危害面。
+        //     边界因此一句话：**产出指针值安全，用指针触碰内存须 unsafe**。
+        //
+        // 与 Rust 判法一致：`addr_of!` / `ptr as usize` / `without_provenance` /
+        // `wrapping_offset` 都是安全函数，只有 read/write/alloc 因带前提而 unsafe。
+        // 设计背景见 tie-main/docs/designs/domain-classification.md 与
+        // safe-unsafe-reclassification.md。
+        // ---- 双锁判定（2026-10-01 起完整）----
+        // 归属查表：`types.builtin_domain`（与 domain-classification.md 的承载表
+        // 逐项对应）。返回 0 = 不在清单内（安全内置，直接放行）。
+        var need = types.builtin_domain(fnm)
+        if need != 0 {
+            // 锁一：门禁上下文
+            if g_unsafe_depth == 0 {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "调用 unsafe 内置 '" + fnm + "' 必须在 unsafe 块或 unsafe 函数中（安全代码禁止触底）"
+                return -1
+            }
+            // 锁二：域凭据 —— 与锁一相互独立：进了门不等于拿到了该域的钥匙。
+            // 凭据来源见 sstate.g_held_caps 的说明（文件级授权 / 函数级属性 /
+            // 块级 unsafe.with / unsafe use）。
+            if (g_held_caps & need) == 0 {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                var held = types.cap_set_name(g_held_caps)
+                if str_len(held) == 0 {
+                    held = "none"
+                }
+                sm_err_msg = "调用 '" + fnm + "' 需要 " + types.cap_name_of_bit(need) +
+                    " 域凭据（当前作用域持：" + held + "）。持证方式：文件头 `type tie<角色, unsafe:" +
+                    types.cap_name_of_bit(need) + ">`、函数级 `#[unsafe." + types.cap_name_of_bit(need) +
+                    "]`、或块级 `unsafe.with(" + types.cap_name_of_bit(need) + ") { }` / `unsafe use g { }`"
+                return -1
+            }
+            // 双锁通过 ⇒ 记「本域在作用域内被真正使用」（W00030 凭据挂空告警的判据）。
+            g_used_caps = g_used_caps | need
+        }
+        // 实参类型推断（未声明变量/类型错误在此暴露；只做检查不改结果）
+        var ka: i64 = 0
+        while ka < nc {
+            var at = infer_expr(args[ka])
+            if at < 0 {
+                return -1
+            }
+            ka = ka + 1
+        }
+        // S1.2 动态返回类型特判（builtin_call 无法静态确定）：
+        // addr_of(x) → ptr<实参类型>；deref(p) → 指针元素类型；
+        // slice_of(a, s, n) → slice<元素类型>；ptr_add(p, n) → ptr<元素类型>
+        if fnm == "addr_of" {
+            var a0 = infer_expr(args[0])
+            if a0 < 0 {
+                return -1
+            }
+            node_types[id] = types.ptr_of(a0)
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        // L1 定长数组：array_init(v) 广播初始化。目标数组类型由上下文
+        //（var 标注/形参/返回）决定——此处只推断实参并登记占位类型（misc），
+        // 实参与元素类型的匹配由调用点（scheck var-decl / stype.types_match）
+        // 校验，irgen 调用点按其目标数组类型生成 [N x T] 全等值填充。
+        if fnm == "array_init" {
+            var a0 = infer_expr(args[0])
+            if a0 < 0 {
+                return -1
+            }
+            node_types[id] = types.named(TK_MISC)
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        if fnm == "deref" || fnm == "ptr_add" {
+            var p0 = infer_expr(args[0])
+            if p0 < 0 {
+                return -1
+            }
+            if !types.is_ptr(p0) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = fnm + "() 第 1 个参数必须是指针类型，实际是 " + types.type_name(p0)
+                return -1
+            }
+            var e0 = types.table_elem(p0)
+            if fnm == "deref" {
+                node_types[id] = e0
+            } else {
+                node_types[id] = types.ptr_of(e0)
+            }
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        if fnm == "share" {
+            // share(x) → x 的类型（恒等：共享别名与原值同型）
+            var s0 = infer_expr(args[0])
+            if s0 < 0 {
+                return -1
+            }
+            node_types[id] = s0
+            g_typed = g_typed + 1
+            return s0
+        }
+        if fnm == "volatile_load" {
+            // volatile_load(p) → 指针元素类型（任务15：MMIO/硬件寄存器读）
+            var p0 = infer_expr(args[0])
+            if p0 < 0 {
+                return -1
+            }
+            if !types.is_ptr(p0) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "volatile_load() 第 1 个参数必须是指针类型，实际是 " + types.type_name(p0)
+                return -1
+            }
+            node_types[id] = types.table_elem(p0)
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        if fnm == "slice_of" {
+            var a1 = infer_expr(args[0])
+            if a1 < 0 {
+                return -1
+            }
+            // S1.2：字符串 → slice<u8>（ptr 即数据指针）；
+            // 任务16：动态表 → slice<元素类型>（irgen 桥：连续缓冲 + 逐元素拷贝）。
+            // 表元素类型：table_elem（typed table<T>）→ var_table_elem（table_new_i64
+            // 等语义登记，裸 table 无元素信息）→ u8 兜底。
+            var et1: i64 = types.named(TK_U8)
+            if types.is_table(a1) {
+                var te1 = types.table_elem(a1)
+                if te1 >= 0 {
+                    et1 = te1
+                } else {
+                    var tn1 = args[0]
+                    if s_tags[tn1] == 6 {
+                        var te2 = var_table_elem(intern.intern(sstate.name_str(tn1)))
+                        if te2 >= 0 {
+                            et1 = te2
+                        }
+                    }
+                }
+            } else if a1 != TK_STR {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "slice_of() 只支持字符串或动态表，实际是 " + types.type_name(a1)
+                return -1
+            }
+            node_types[id] = types.slice_of(et1)
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        if fnm == "slice_index" {
+            var s0 = infer_expr(args[0])
+            if s0 < 0 {
+                return -1
+            }
+            if !types.is_slice(s0) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "slice_index() 第 1 个参数必须是切片类型，实际是 " + types.type_name(s0)
+                return -1
+            }
+            node_types[id] = types.table_elem(s0)
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        if fnm == "slice_len" {
+            var s1 = infer_expr(args[0])
+            if s1 < 0 {
+                return -1
+            }
+            if !types.is_slice(s1) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "slice_len() 参数必须是切片类型，实际是 " + types.type_name(s1)
+                return -1
+            }
+            node_types[id] = types.named(TK_I64)
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        // p.8.1.6 表删除/缩表原语（动态返回类型特判）：
+        // table_pop(t) → 表元素类型（table<T> → T；裸 table → var_table_elem 兜底
+        // → i64）。语义：弹出表尾元素，所有权转移给调用方（rc 不变，与 push 对称）。
+        if fnm == "table_pop" {
+            var p0 = infer_expr(args[0])
+            if p0 < 0 {
+                return -1
+            }
+            if !types.is_table(p0) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "table_pop() 第 1 个参数必须是表，实际是 " + types.type_name(p0)
+                return -1
+            }
+            var et: i64 = -1
+            if p0 != types.named(TK_TABLE) {
+                et = types.table_elem(p0)
+            }
+            if et < 0 {
+                var tn1 = args[0]
+                if s_tags[tn1] == 6 {
+                    et = var_table_elem(intern.intern(sstate.name_str(tn1)))
+                }
+            }
+            if et < 0 {
+                et = types.named(TK_I64)
+            }
+            node_types[id] = et
+            g_typed = g_typed + 1
+            return et
+        }
+        // table_trunc(t, n) → void：第 1 参数须为表（n 为 i64，由通用实参推断校验）。
+        if fnm == "table_trunc" {
+            var p1 = infer_expr(args[0])
+            if p1 < 0 {
+                return -1
+            }
+            if !types.is_table(p1) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "table_trunc() 第 1 个参数必须是表，实际是 " + types.type_name(p1)
+                return -1
+            }
+            node_types[id] = types.named(TK_VOID)
+            g_typed = g_typed + 1
+            return types.named(TK_VOID)
+        }
+        // table_append(dst, src, n) → void：前两个参数须为表（n 为 i64，由通用实参
+        // 推断校验；两侧元素一致性由 irgen 复核）。
+        if fnm == "table_append" {
+            var pa = infer_expr(args[0])
+            if pa < 0 {
+                return -1
+            }
+            if !types.is_table(pa) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "table_append() 第 1 个参数必须是表，实际是 " + types.type_name(pa)
+                return -1
+            }
+            var pb = infer_expr(args[1])
+            if pb < 0 {
+                return -1
+            }
+            if !types.is_table(pb) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "table_append() 第 2 个参数必须是表，实际是 " + types.type_name(pb)
+                return -1
+            }
+            node_types[id] = types.named(TK_VOID)
+            g_typed = g_typed + 1
+            return types.named(TK_VOID)
+        }
+        // table_reserve(t, n) → void：首参须为表（容量预留，不动 len）。
+        if fnm == "table_reserve" {
+            var ta = infer_expr(args[0])
+            if ta < 0 { return -1 }
+            if !types.is_table(ta) {
+                sm_err_line = s_lines[id]; sm_err_col = s_cols[id]
+                sm_err_msg = "table_reserve() 第 1 个参数必须是表，实际是 " + types.type_name(ta)
+                return -1
+            }
+            var tb2 = infer_expr(args[1])
+            if tb2 < 0 { return -1 }
+            node_types[id] = types.named(TK_VOID)
+            g_typed = g_typed + 1
+            return types.named(TK_VOID)
+        }
+        // table_append_raw(t, ptr, n) → void：首参须为表；指针侧与个数按通用推断。
+        if fnm == "table_append_raw" {
+            var ta2 = infer_expr(args[0])
+            if ta2 < 0 { return -1 }
+            if !types.is_table(ta2) {
+                sm_err_line = s_lines[id]; sm_err_col = s_cols[id]
+                sm_err_msg = "table_append_raw() 第 1 个参数必须是表，实际是 " + types.type_name(ta2)
+                return -1
+            }
+            var tp2 = infer_expr(args[1])
+            if tp2 < 0 { return -1 }
+            var tn2 = infer_expr(args[2])
+            if tn2 < 0 { return -1 }
+            node_types[id] = types.named(TK_VOID)
+            g_typed = g_typed + 1
+            return types.named(TK_VOID)
+        }
+        // as_* 特殊检查（S1.3 数值转换 + P2b any 拆箱重载）：
+        // 数字参数 → 数值转换；any 参数 → 拆箱（运行时 tag 检查）。
+        // as_bool/as_string/as_char 仅支持 any（无数值转换语义）。
+        var as_is_any_only: bool = false
+        if fnm == "as_bool" || fnm == "as_string" || fnm == "as_char" ||
+            fnm == "as_table_i64" || fnm == "as_table_string" || fnm == "as_table_bool" ||
+            fnm == "as_table_f64" || fnm == "as_table_char" || fnm == "as_table_any" {
+            as_is_any_only = true
+        }
+        if fnm == "as_i8" || fnm == "as_i16" || fnm == "as_i32" || fnm == "as_i64" ||
+            fnm == "as_u8" || fnm == "as_u16" || fnm == "as_u32" || fnm == "as_u64" ||
+            fnm == "as_f32" || fnm == "as_f64" ||
+            fnm == "as_i128" || fnm == "as_u128" || as_is_any_only {
+            var a_ty = infer_expr(args[0])
+            if a_ty < 0 {
+                return -1
+            }
+            if a_ty == types.named(TK_ANY) {
+                // P2b：any 拆箱——返回目标类型（br 已由 builtin_call 给定）
+                node_types[id] = br
+                g_typed = g_typed + 1
+                return br
+            }
+            if as_is_any_only {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = fnm + "() 参数必须是 any，实际是 " + types.type_name(a_ty)
+                return -1
+            }
+            if !types.is_number(a_ty) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = fnm + "() 参数必须是数字（整数/浮点）或 any，实际是 " + types.type_name(a_ty)
+                return -1
+            }
+            node_types[id] = br
+            g_typed = g_typed + 1
+            return br
+        }
+        // P2c：any_tag(x)——参数必须是 any
+        if fnm == "any_tag" {
+            var at2 = infer_expr(args[0])
+            if at2 < 0 {
+                return -1
+            }
+            if at2 != types.named(TK_ANY) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "any_tag() 参数必须是 any，实际是 " + types.type_name(at2)
+                return -1
+            }
+            node_types[id] = br
+            g_typed = g_typed + 1
+            return br
+        }
+        // P2d-D3：map 高阶——map_keys(m)/map_values(m) 第 1 参必须 map；
+        // map_values 返回类型 = table<map 值类型>（动态，覆盖占位 br）
+        if fnm == "map_keys" || fnm == "map_values" {
+            var mt = infer_expr(args[0])
+            if mt < 0 {
+                return -1
+            }
+            if !types.is_map(mt) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = fnm + "() 第 1 个参数必须是 map，实际是 " + types.type_name(mt)
+                return -1
+            }
+            if fnm == "map_values" {
+                var mv_ty: i64 = types.named(TK_I64)
+                var mlv = types.low(mt)
+                if mlv > 0 {
+                    mv_ty = mlv
+                }
+                node_types[id] = types.table_of(mv_ty)
+                g_typed = g_typed + 1
+                return node_types[id]
+            }
+            node_types[id] = br
+            g_typed = g_typed + 1
+            return br
+        }
+        if fnm == "map_contains" {
+            var mct = infer_expr(args[0])
+            if mct < 0 {
+                return -1
+            }
+            if !types.is_map(mct) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "map_contains() 第 1 个参数必须是 map，实际是 " + types.type_name(mct)
+                return -1
+            }
+            var kct = infer_expr(args[1])
+            if kct < 0 {
+                return -1
+            }
+            if kct != types.named(TK_STR) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "map_contains() 第 2 个参数必须是 string，实际是 " + types.type_name(kct)
+                return -1
+            }
+            node_types[id] = br
+            g_typed = g_typed + 1
+            return br
+        }
+        // table_push 特殊检查（对齐 Rust）：第 1 参数必须表变量 + 动态表 + 元素类型匹配
+        if fnm == "table_push" {
+            var t0 = s_tags[args[0]]
+            if t0 != S_N_VAR {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "table_push() 第 1 个参数必须是表变量（不能是字面量/下标）"
+                return -1
+            }
+            var tnm = sstate.name_str(args[0])
+            var tnid = intern.intern(tnm)
+            var elem = var_table_elem(tnid)
+            if elem < 0 {
+                // 查找失败：默认 i64
+                elem = types.named(TK_I64)
+            }
+            var x_ty = infer_expr(args[1])
+            if x_ty < 0 {
+                return -1
+            }
+            if !stype.types_match(elem, x_ty, args[1]) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "table_push() 元素类型不匹配：表 '" + tnm + "' 的元素是 " + types.type_name(elem) + "，推入的是 " + types.type_name(x_ty)
+                return -1
+            }
+            node_types[id] = types.named(TK_VOID)
+            g_typed = g_typed + 1
+            return types.named(TK_VOID)
+        }
+        // table_at 特殊检查（对齐 Rust）：下标必须整数
+        if fnm == "table_at" {
+            var i_ty = infer_expr(args[1])
+            if i_ty < 0 {
+                return -1
+            }
+            if !types.is_int(i_ty) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "table_at() 下标必须是整数，实际是 " + types.type_name(i_ty)
+                return -1
+            }
+            node_types[id] = br
+            g_typed = g_typed + 1
+            return br
+        }
+        // eval 特殊检查（对齐 Rust）：参数必须是字符串
+        if fnm == "eval" {
+            var e_ty = infer_expr(args[0])
+            if e_ty < 0 {
+                return -1
+            }
+            if e_ty != TK_STR {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "eval() 参数必须是字符串，实际是 " + types.type_name(e_ty)
+                return -1
+            }
+            node_types[id] = types.named(TK_STR)
+            g_typed = g_typed + 1
+            return types.named(TK_STR)
+        }
+        if br == -1 {
+            // void
+            node_types[id] = types.named(TK_VOID)
+            g_typed = g_typed + 1
+            return types.named(TK_VOID)
+        }
+        node_types[id] = br
+        g_typed = g_typed + 1
+        return br
+    }
+    if br == -2 {
+        return -1
+    }
+    // struct 构造
+    var snid = intern.intern(fnm)
+    var sidx = sstate.bs_find(st_keys, snid)
+    if sidx >= 0 {
+        var si = st_vals[sidx]
+        var nf = cls_nfld[si]
+        if nc > nf {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "构造 '" + fnm + "' 最多 " + to_string(nf) + " 个参数（字段数），实际 " + to_string(nc) + " 个"
+            return -1
+        }
+        // 字段类型匹配
+        var off = cls_fldoff[si]
+        var j: i64 = 0
+        while j < nc {
+            var at = infer_expr(args[j])
+            if at < 0 {
+                return -1
+            }
+            if !stype.types_match(fld_tys[off + j], at, args[j]) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "构造 '" + fnm + "' 参数类型不匹配：字段 '" + intern.lookup(fld_names[off + j]) + "' 期望 " + types.type_name(fld_tys[off + j]) + "，实际 " + types.type_name(at)
+                return -1
+            }
+            j = j + 1
+        }
+        node_types[id] = types.struct_of(si)
+        g_typed = g_typed + 1
+        return types.struct_of(si)
+    }
+    // T3b 泛型（2026-08-14）：普通函数/struct 未命中但 gt_* 模板表命中 →
+    // 泛型调用路径（构造或函数，调用点推断 + 单态化展开）
+    var full_name = resolve_call_name(fnm)
+    var gti = sstate.gt_find(full_name)
+    if gti >= 0 && gty_is_struct[gti] == 1 {
+        return infer_generic_struct_construct(full_name, gti, id, args)
+    }
+    if gti >= 0 && gty_is_struct[gti] == 0 {
+        return infer_generic_fn_call(full_name, gti, id, args)
+    }
+    // 用户函数（裸调用解析：顶层 / 当前命名空间补全 / using 前缀补全）
+    var sig = sstate.fn_sig(full_name)
+    // p.8.2.2 命名实参：`f(x: 1, y: 2)` → 按形参名重排并改写调用节点 children
+    if sig >= 0 {
+        var rn = reorder_named_args(id, args, full_name, sig, 0)
+        if rn < 0 {
+            return -1
+        }
+    }
+    if sig < 0 {
+        // S2.2 闭包函数值调用：函数签名未命中时，若调用名是 fn 类型变量
+        // （闭包字面量 / 函数值参数），按函数值调用检查：参数个数、参数
+        // 类型逐个匹配，返回类型 = fn 返回类型。
+        var fv_nid = intern.intern(fnm)
+        var fv_ty = lv_find(fv_nid)
+        if fv_ty < 0 {
+            fv_ty = gb_find(fv_nid)
+        }
+        if fv_ty >= 0 && types.is_fn(fv_ty) {
+            // 2026-10-13：**被调也是一种使用**——闭包体内调用捕获的 fn 值必须
+            // 在此收录捕获（VAR 分支的捕获分析只扫值节点，被调名不在 child 里，
+            // 实测 ncap=0 → irgen 走按名调用报「无签名」）。守卫与 VAR 分支同款。
+            // ★ 安全对齐（2026-10-13）：**仅对局部（lv）来源收录**——全局不入
+            // 捕获集（§5.10；VAR 分支经 lv 未命中走全局路径、无捕获动作）。若
+            // 把 gb 来源也收录，会把全局 fn 值按**创建时快照**捕进闭包 ⇒ 全局
+            // 重赋值后闭包调用的仍是旧值（活读语义被破坏）。全局 fn 亦非
+            // table/map 容器，不触发 cl_grefs share 门禁（对齐 VAR 分支）。
+            var is_lv_src = lv_find(fv_nid) >= 0
+            if is_lv_src && g_clo_depth > 0 && g_clo_cur >= 0 {
+                var ci_c = g_clo_cur
+                var is_param_c = sstate.seg_has(cl_params, cl_paramoff[ci_c], cl_nparams[ci_c], fv_nid)
+                if is_param_c == 0 {
+                    var is_local_c = sstate.seg_has(cl_locals, cl_locloff[ci_c], len(cl_locals) - cl_locloff[ci_c], fv_nid)
+                    if is_local_c == 0 {
+                        if ci_c < len(cl_owner_unsafe) && cl_owner_unsafe[ci_c] == 0 && ci_c < len(cl_owner_sig) &&
+                            sstate.is_ref_param_of(cl_owner_sig[ci_c], fnm) == 1 {
+                            sm_err_line = s_lines[id]
+                            sm_err_col = s_cols[id]
+                            sm_err_msg = "安全区禁止闭包捕获 ref 形参 '" + fnm + "'（捕获 ref 是借用而非副本，闭包逃逸会导致悬垂引用；需在 unsafe 块内或改用值/immut 形参）"
+                            return -1
+                        }
+                        var is_cap_c = sstate.seg_has(cl_capkeys, cl_capoff[ci_c], len(cl_capkeys) - cl_capoff[ci_c], fv_nid)
+                        if is_cap_c == 0 {
+                            table_push(cl_capkeys, fv_nid)
+                            table_push(cl_capvals, fv_ty)
+                        }
+                    }
+                }
+            }
+            var fn_np = types.fn_nparams_of(fv_ty)
+            var fn_var = types.fn_has_var_of(fv_ty)
+            var req_fn = fn_np
+            if fn_var == 1 {
+                req_fn = fn_np - 1   // 变参：末位 table 可省略 + 任意多个元素实参
+            }
+            if nc < req_fn || (fn_var == 0 && nc > fn_np) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                var cnt_fn = ""
+                if fn_var == 1 {
+                    cnt_fn = to_string(req_fn) + "+"
+                } else if req_fn == fn_np {
+                    cnt_fn = to_string(fn_np)
+                } else {
+                    cnt_fn = to_string(req_fn) + "-" + to_string(fn_np)
+                }
+                sm_err_msg = "函数值调用 '" + fnm + "' 期望 " + cnt_fn + " 个参数，实际 " + to_string(nc) + " 个"
+                return -1
+            }
+            var kf: i64 = 0
+            while kf < nc {
+                var want = types.fn_param_of(fv_ty, kf)
+                var var_elem: i64 = -1
+                if fn_var == 1 && kf >= fn_np - 1 {
+                    // 变参多余实参：与变参元素类型 T 匹配（签名末位 table<T>）
+                    var_elem = types.table_elem(types.fn_param_of(fv_ty, fn_np - 1))
+                    want = var_elem
+                }
+                // p.9.11.34 短闭包实参位（上下文消歧）：固定形参位且形参是 fn 类型
+                if (fn_var == 0 || kf < fn_np - 1) && types.is_fn(want) {
+                    var lam_fv = try_lambda_arg(id, sstate.slot_off(id) + kf, args[kf], want)
+                    if lam_fv >= 0 {
+                        args[kf] = lam_fv
+                    }
+                }
+                var at = infer_expr(args[kf])
+                if at < 0 {
+                    return -1
+                }
+                // p.6.2.4 ref 参数实参校验：必须是可寻址的表/定长数组变量，且类型匹配
+                if kf < fn_np && types.fn_param_ref(fv_ty, kf) == 1 {
+                    if s_tags[args[kf]] != 6 {
+                        sm_err_line = s_lines[id]
+                        sm_err_col = s_cols[id]
+                        sm_err_msg = "函数值调用 '" + fnm + "' 的 ref 参数需要可寻址的表/定长数组变量实参（字面量/下标/调用结果不可取地址）"
+                        return -1
+                    }
+                    var rf_nid = intern.intern(sstate.name_str(args[kf]))
+                    var rf_ty = lv_find(rf_nid)
+                    if rf_ty < 0 {
+                        rf_ty = gb_find(rf_nid)
+                    }
+                    if rf_ty < 0 || (!types.is_table(rf_ty) && !types.is_array(rf_ty)) {
+                        sm_err_line = s_lines[id]
+                        sm_err_col = s_cols[id]
+                        sm_err_msg = "函数值调用 '" + fnm + "' 的 ref 参数需要表/定长数组变量实参（实际 " + (rf_ty >= 0 ? types.type_name(rf_ty) : "未声明") + "）"
+                        return -1
+                    }
+                }
+                if !stype.types_compatible(want, at) && !stype.types_match(want, at, args[kf]) &&
+                    !stype.types_narrow_int(want, at, args[kf]) {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "函数值调用 '" + fnm + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+                    return -1
+                }
+                kf = kf + 1
+            }
+            var frt = types.fn_ret_ty(fv_ty)
+            node_types[id] = frt
+            g_typed = g_typed + 1
+            return frt
+        }
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "未定义的函数 '" + fnm + "'"
+        return -1
+    }
+    // 可见性校验
+    var vr = sstate.check_visibility(full_name, sig, id)
+    if vr < 0 {
+        return -1
+    }
+    // S1.2 安全边界：unsafe 函数（含 extern）在安全代码中调用 = 编译错误
+    if sstate.sig_unsafe(sig) == 1 && g_unsafe_depth == 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "调用 unsafe 函数 '" + fnm + "' 必须在 unsafe 块或 unsafe 函数中（安全代码禁止触底）"
+        return -1
+    }
+    var req = sg_required[sig]
+    var total = sg_nparams[sig]
+    var has_var = sstate.fn_has_variadic(sig) == 1
+    // p.8.2.10 展开实参探测：首展开位置 + 是否存在展开。
+    var first_spread: i64 = -1
+    var cnt_sp: i64 = 0
+    var it2: i64 = 0
+    while it2 < nc {
+        if s_tags[args[it2]] == N_SPREAD_ARG {
+            if first_spread < 0 {
+                first_spread = it2
+            }
+            cnt_sp = cnt_sp + 1
+        }
+        it2 = it2 + 1
+    }
+    if first_spread >= 0 {
+        // 展开仅支持带变长形参 `...T` 的普通函数；且展开位置须在变参区
+        //（第 total-1 个实参之后——前 total-1 个固定形参用普通实参补齐）。
+        if !has_var {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "函数 '" + fnm + "' 带展开实参 '...' 但没有变长形参 '...T'，无法进行运行期展开"
+            return -1
+        }
+        if first_spread < total - 1 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "函数 '" + fnm + "' 的展开实参 '...' 必须位于变长形参区（前 " + to_string(total - 1) + " 个固定实参之后）"
+            return -1
+        }
+    } else if nc < req || (!has_var && nc > total) {
+        // 变参函数：实参数无上界（固定部分 + 任意个额外元素实参）
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        var cnt_desc = ""
+        if has_var {
+            cnt_desc = to_string(req) + "+"
+        } else if req == total {
+            cnt_desc = to_string(total)
+        } else {
+            cnt_desc = to_string(req) + "-" + to_string(total)
+        }
+        sm_err_msg = "函数 '" + fnm + "' 期望 " + cnt_desc + " 个参数，实际 " + to_string(nc) + " 个"
+        return -1
+    }
+    var off = sg_off[sig]
+    var j2: i64 = 0
+    while j2 < nc {
+        // ★ 变长：实参数 nc 可超出固定形参数（total-1），此时 off+j2 越出本签名在
+        //   sp_tys 的区段。原写法「先读表、再被变参元素类型覆盖」依赖**越界读返回
+        //   零值**，检查常开后触发诊断。改为先判归属再读表 ⇒ 语义等价、不再越界。
+        //   （同一形态另见 sinfer_q3 的 infer_generic_fn_call 与 sinfer_p1 的
+        //    运算符重载路径 —— 三处必须一致，见仓库「同一判定散落多处」条目。）
+        var want: i64 = 0
+        // 变参：超过固定形参数（total-1）的实参与变参元素类型 T 匹配
+        var want_fixed: bool = true
+        if has_var && j2 >= total - 1 {
+            want = sstate_fn_variadic_elem(sig)
+            want_fixed = false
+        } else {
+            want = sp_tys[off + j2]
+        }
+        // p.8.2.10 展开实参：operand 是表，其元素类型须与变参元素匹配
+        if s_tags[args[j2]] == N_SPREAD_ARG {
+            var op0 = sstate.child(args[j2], 0)
+            var ot = infer_expr(op0)
+            if ot < 0 {
+                return -1
+            }
+            if !types.is_table(ot) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "调用 '" + fnm + "' 的展开实参 '...' 被展开对象必须是表/数组，实际是 " + types.type_name(ot)
+                return -1
+            }
+            if !want_fixed {
+                var se = types.table_elem(ot)
+                if se >= 0 && !stype.types_compatible(want, se) && !stype.types_match(want, se, op0) &&
+                    !stype.types_narrow_int(want, se, op0) {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "调用 '" + fnm + "' 的展开实参表元素类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(se)
+                    return -1
+                }
+            }
+            node_types[args[j2]] = ot
+            j2 = j2 + 1
+            continue
+        }
+        // p.9.11.34 短闭包实参位（上下文消歧，用户裁决 2026-10-09）：实参是
+        // `ident -> expr` 形态且**固定形参**类型是 fn ⇒ 语义期展开为闭包并
+        // 原位替换实参 child。解析期该形态恒按管道解析；此处按形参类型分流
+        //（形参 fn 时管道解释不可能成立，消歧确定）。非 fn 形参原样保留
+        //（管道/箭头既有语义与诊断一字不变）。变参区实参不展开（元素类型）。
+        if want_fixed && types.is_fn(want) {
+            var lam_uc = try_lambda_arg(id, sstate.slot_off(id) + j2, args[j2], want)
+            if lam_uc >= 0 {
+                args[j2] = lam_uc
+            }
+        }
+        var at = infer_expr(args[j2])
+        if at < 0 {
+            // S2.3 目标类型引导：泛型 enum 构造实参（Result.Err("x") / Option.None）
+            // 类型参数推断不全时（Err 不含 T / None 无 payload），用形参类型补全。
+            // 与 scheck 赋值/return/var 声明三处引导同模式：保存-恢复错误三件套。
+            if want_fixed {
+                var sv_l = sm_err_line
+                var sv_c = sm_err_col
+                var sv_m = sm_err_msg
+                var hv = try_enum_construct_hinted(args[j2], want)
+                if hv >= 0 {
+                    sm_err_line = 0
+                    sm_err_col = 0
+                    sm_err_msg = ""
+                    at = hv
+                } else {
+                    if sm_err_msg == sv_m {
+                        // 引导未命中（非泛型 enum 构造）：恢复原错误
+                        sm_err_line = sv_l
+                        sm_err_col = sv_c
+                        sm_err_msg = sv_m
+                    }
+                    return -1
+                }
+            } else {
+                return -1
+            }
+        }
+        // 表形参（table<T>）的元素不匹配留给 A1 专用检查；非表类型 mismatch 报通用消息
+        var want_is_tbl = types.kind(want) == K_TABLE
+        var at_is_tbl = types.kind(at) == K_TABLE
+        if !stype.types_compatible(want, at) && !stype.types_match(want, at, args[j2]) &&
+            !stype.types_narrow_int(want, at, args[j2]) {
+            if !(want_is_tbl && at_is_tbl) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "调用 '" + fnm + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+                return -1
+            }
+        }
+        // A1：形参 table<T> 的元素类型校验——实参表字面量/动态表变量/返回表的调用，
+        // 其元素类型须与 T 一致（裸 table 形参不校验，对齐 Rust）
+        if want_fixed && want_is_tbl && !(want == TK_TABLE) {
+            var want_elem = types.table_elem(want)
+            var got_elem = arg_table_elem_ty(args[j2])
+            if got_elem >= 0 {
+                if !stype.types_compatible(want_elem, got_elem) {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "调用 '" + fnm + "' 表参数元素类型不匹配：期望 table<" + types.type_name(want_elem) + ">，实际 table<" + types.type_name(got_elem) + ">"
+                    return -1
+                }
+            }
+        }
+        // ref 参数实参校验（对齐 Rust T0.3 by_ref）：实参必须是可寻址变量（变量/字段链），
+        // 且必须是动态表（table_new_* 创建）——IR 需取地址写回。L1：**定长数组**
+        // ref 实参不作动表要求（数组变量槽地址天然可写回，零拷贝传参）。
+        if want_fixed && sp_refs[off + j2] == 1 {
+            if !sstate.is_addressable(args[j2]) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "调用 '" + fnm + "' 的 ref 参数需要可寻址的变量实参（不能是字面量/下标/调用结果等不可取地址）"
+                return -1
+            }
+            if s_tags[args[j2]] == S_N_VAR && !types.is_array(want) {
+                var vname = sstate.name_str(args[j2])
+                var vnid = intern.intern(vname)
+                if var_dyn(vnid) != 1 {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "调用 '" + fnm + "' 的 ref 参数实参 '" + vname + "' 必须是动态表（table_new_* 创建），'" + vname + "' 是定长表"
+                    return -1
+                }
+            }
+        }
+        j2 = j2 + 1
+    }
+    var rt = sg_ret[sig]
+    node_types[id] = rt
+    g_typed = g_typed + 1
+    return rt
+}
+
+}

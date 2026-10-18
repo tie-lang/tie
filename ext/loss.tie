@@ -1,0 +1,92 @@
+type tie<class>
+// std/loss.tie —— L3 损失库 loss（命名空间 loss；纯 tie，std 层）
+// ============================================================
+// 用途：微型扩散模型训练的前向损失与对应梯度。
+// 与 linalg.mse 的区别：此处还有 mae 与前向损失，且提供写回差梯度（mse_grad/
+// mae_grad），供手写反向流水直接取用。均在 f64 中计算，平均项 1/n。
+//
+// 【API】数组经 `ref array<f32,1024>` 容量池传入，显式收 n；返回 f64 标量
+// （小元数据，不做巨型 struct 值返回）。mse_grad out = 2(a-b)/n；mae_grad
+// out = sign(a-b)/n。EN: L3 loss + loss-grads (mse/mae), scalar f64 returns.
+
+namespace loss {
+
+// 均方误差：mean((a-b)²)；取公共 min 长度，na/nb 任一为 0 返回 0。
+// EN: mean squared error over min(n_a,n_b); 0 when either length is 0.
+pub func mse<CAP: i64 = 1024>(ma: ref array<f32, CAP>, na: i64, mb: ref array<f32, CAP>, nb: i64) -> f64 {
+    var L = na
+    if nb < L {
+        L = nb
+    }
+    if L <= 0 {
+        return 0.0
+    }
+    var s: f64 = 0.0
+    var i: i64 = 0
+    while i < L {
+        var d: f64 = to_f64(ma[i]) - to_f64(mb[i])
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_f64(L)
+}
+
+// 平均绝对误差：mean(|a-b|)；取公共 min 长度。
+// EN: mean absolute error over min(n_a,n_b).
+pub func mae<CAP: i64 = 1024>(ma: ref array<f32, CAP>, na: i64, mb: ref array<f32, CAP>, nb: i64) -> f64 {
+    var L = na
+    if nb < L {
+        L = nb
+    }
+    if L <= 0 {
+        return 0.0
+    }
+    var s: f64 = 0.0
+    var i: i64 = 0
+    while i < L {
+        var d: f64 = to_f64(ma[i]) - to_f64(mb[i])
+        if d < 0.0 {
+            d = -d
+        }
+        s = s + d
+        i = i + 1
+    }
+    return s / to_f64(L)
+}
+
+// MSE 梯度：out[i] = 2(a[i]-b[i])/n（对 a 的梯度）。EN: mse grad 2(a-b)/n.
+pub func mse_grad<CAP: i64 = 1024>(gout: ref array<f32, CAP>, ma: ref array<f32, CAP>, mb: ref array<f32, CAP>, n: i64) {
+    if n <= 0 {
+        return
+    }
+    var inv: f64 = 2.0 / to_f64(n)
+    var i: i64 = 0
+    while i < n {
+        var d: f64 = to_f64(ma[i]) - to_f64(mb[i])
+        gout[i] = to_f32(d * inv)
+        i = i + 1
+    }
+}
+
+// MAE 梯度：out[i] = sign(a[i]-b[i])/n。EN: mae grad sign(a-b)/n.
+pub func mae_grad<CAP: i64 = 1024>(gout: ref array<f32, CAP>, ma: ref array<f32, CAP>, mb: ref array<f32, CAP>, n: i64) {
+    if n <= 0 {
+        return
+    }
+    var inv: f64 = 1.0 / to_f64(n)
+    var i: i64 = 0
+    while i < n {
+        var a: f64 = to_f64(ma[i])
+        var b: f64 = to_f64(mb[i])
+        var out: f64 = 0.0
+        if a > b {
+            out = 1.0
+        } else if a < b {
+            out = -1.0
+        }
+        gout[i] = to_f32(out * inv)
+        i = i + 1
+    }
+}
+
+}   // namespace loss

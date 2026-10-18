@@ -1,0 +1,157 @@
+type tie<class>
+// compiler/backend/irgen_console.tie —— 控制台编码契约内联（设计稿 §4.1）
+// ============================================================
+// 运行时打印/输入家族一次性适配（Windows；POSIX 保持字节流）：
+//   - 输出：写前 GetConsoleMode 判目标句柄是否控制台——控制台 ⇒ 内部 UTF-8
+//     串（LF→CRLF 翻译，对齐 CRT 文本模式旧行为）转 UTF-16 后 WriteConsoleW，
+//     显示正确与代码页无关；管道/文件 ⇒ 各调用点原字节路径（逐字节不变）。
+//   - 保序：控制台直写前 fflush(NULL)，先冲掉此前 CRT 缓冲（数字 printf
+//     路径仍走 printf），使「中文串 / 数字」混排顺序不变。
+//   - 输入（各调用点）：控制台 ⇒ ReadConsoleW 读 UTF-16 转 UTF-8；
+//     管道/文件保持 ReadFile 字节直通。
+//   - 临时串（sb/wide16 产物）按既有约定不显式释放（会话/进程周期回收）。
+// 符号登记：GetConsoleMode/WriteConsoleW/ReadConsoleW 在 irgen_p1.tie
+// is_libc_sym 白名单（否则 tig_ext_call_typed 误判 tie-interp 桥）。
+namespace irgen {
+
+// 取 std 句柄（sel：-10 stdin / -11 stdout / -12 stderr）→ P8 指针值。
+func tig_con_handle(sel: i64) -> i64 {
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    return tig_ext_call1("GetStdHandle", tig_int_lit_ty(sel, I32), I32, P8)
+}
+
+// 判句柄是否控制台：GetConsoleMode(h, &mode) != 0 → i1 值。
+func tig_con_is_console(h: i64) -> i64 {
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var mslot = ir.new_inst(g_cur_block, 20, I32)  // alloca i32（模式出参）
+    ir.add_operand(mslot, I32, 2)
+    var mp = ir.get_value(mslot)
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8); table_push(avs, h)
+    table_push(ats, P8); table_push(avs, mp)
+    var ok = tig_ext_call_typed("GetConsoleMode", ats, avs, I32)
+    return tig_cmp_zero(ok, 1)  // ne 0
+}
+
+// 控制台直写：s（UTF-8）→ 逐字节 LF→CRLF 翻译 → 可选尾 CRLF（nl=1）→
+// UTF-16 → fflush + WriteConsoleW。返回实写字符数（i32 值）。
+// 调用方保证已经 tig_con_is_console 确认（本函数不判）。
+func tig_con_write_line(h: i64, s: i64, nl: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var I8 = types.named(TK_I8)
+    var P8 = types.ptr_of(I8)
+    var nulp = tig_null_ptr()
+    // 保序：先冲掉此前 CRT 缓冲（printf 数字/ASCII 路径）
+    tig_ext_call1("fflush", nulp, P8, I32)
+    var sb = s21_sb_new()
+    // LF→CRLF 翻译（与旧控制台经 CRT 文本模式的行为一致）
+    var ksl = ir.new_inst(g_cur_block, 20, T64)  // alloca i64（字节游标）
+    ir.add_operand(ksl, T64, 2)
+    var ksp = ir.get_value(ksl)
+    s21_store(ksp, tig_int_lit(0), T64)
+    var blen = s21_str_head_len(s)
+    var b_top = ir.new_block(g_cur_func, interner.intern("con.t"))
+    var b_bd = ir.new_block(g_cur_func, interner.intern("con.b"))
+    var b_cr = ir.new_block(g_cur_func, interner.intern("con.c"))
+    var b_nc = ir.new_block(g_cur_func, interner.intern("con.n"))
+    var b_ex = ir.new_block(g_cur_func, interner.intern("con.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, b_top, 1)
+    g_cur_block = b_top
+    var kc = tig_icmp_c(s21_load(ksp, T64), blen, 2)  // k < blen
+    var cb0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb0, kc, 0)
+    ir.add_operand(cb0, b_bd, 1)
+    ir.add_operand(cb0, b_ex, 1)
+    g_cur_block = b_bd
+    var bv = s21_str_byte(s, s21_load(ksp, T64))
+    var islf = tig_icmp_c(bv, tig_int_lit(10), 0)  // == 10
+    var cb1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb1, islf, 0)
+    ir.add_operand(cb1, b_cr, 1)
+    ir.add_operand(cb1, b_nc, 1)
+    g_cur_block = b_cr
+    s21_sb_append_byte(sb, tig_int_lit(13))
+    var br1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br1, b_nc, 1)
+    g_cur_block = b_nc
+    s21_sb_append_byte(sb, bv)
+    s21_store(ksp, s21_bin(0, s21_load(ksp, T64), tig_int_lit(1)), T64)  // k++
+    var br2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br2, b_top, 1)
+    g_cur_block = b_ex
+    if nl == 1 {
+        s21_sb_append_byte(sb, tig_int_lit(13))
+        s21_sb_append_byte(sb, tig_int_lit(10))
+    }
+    var s2 = s21_sb_build(sb)
+    var w = tig_wide16(s2)  // UTF-16LE + 双字节 NUL
+    var units = s21_bin(11, s21_bin(1, s21_str_head_len(w), tig_int_lit(2)), tig_int_lit(1))
+    var wc = ir.new_inst(g_cur_block, 20, I32)  // alloca i32（实写字数出参）
+    ir.add_operand(wc, I32, 2)
+    var wcp = ir.get_value(wc)
+    var ats2: table<i64> = table_new_i64()
+    var avs2: table<i64> = table_new_i64()
+    table_push(ats2, P8);  table_push(avs2, h)
+    table_push(ats2, P8);  table_push(avs2, w)
+    table_push(ats2, I32); table_push(avs2, sio_trunc_i32(units))
+    table_push(ats2, P8);  table_push(avs2, wcp)
+    table_push(ats2, P8);  table_push(avs2, nulp)
+    tig_ext_call_typed("WriteConsoleW", ats2, avs2, I32)
+    return s21_load(wcp, I32)
+}
+
+// println/print 字符串参数分派：控制台 ⇒ 宽写（含 LF 翻译与尾换行）；
+// 管道/文件 ⇒ 原 printf("%s"+nl) 字节路径（逐字节不变）。
+// 返回 i32 值（对齐原 printf 结果的类型位）。
+func tig_print_str_line(s: i64, newline: bool) -> i64 {
+    var nlstr = "\n"
+    if !newline {
+        nlstr = ""
+    }
+    var fmt = interner.intern("%s" + nlstr)
+    if tig_is_linux() {
+        var inst0 = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+        ir.add_operand(inst0, fmt, 0)
+        ir.add_operand(inst0, s, 0)
+        return ir.get_value(inst0)
+    }
+    var I32 = types.named(TK_I32)
+    var h = tig_con_handle(-11)
+    var isc = tig_con_is_console(h)
+    var b_c = ir.new_block(g_cur_func, interner.intern("psl.c"))
+    var b_p = ir.new_block(g_cur_func, interner.intern("psl.p"))
+    var b_m = ir.new_block(g_cur_func, interner.intern("psl.m"))
+    var rslot = ir.new_inst(g_cur_block, 20, I32)  // 结果槽（两分支各存 i32）
+    ir.add_operand(rslot, I32, 2)
+    var rsp = ir.get_value(rslot)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, isc, 0)
+    ir.add_operand(cb, b_c, 1)
+    ir.add_operand(cb, b_p, 1)
+    // 控制台：宽写
+    g_cur_block = b_c
+    var nl1: i64 = 0
+    if newline {
+        nl1 = 1
+    }
+    var rw = tig_con_write_line(h, s, nl1)
+    s21_store(rsp, rw, I32)
+    var brc = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brc, b_m, 1)
+    // 管道/文件：原 printf
+    g_cur_block = b_p
+    var inst1 = ir.new_inst(g_cur_block, 41, types.named(TK_I32))
+    ir.add_operand(inst1, fmt, 0)
+    ir.add_operand(inst1, s, 0)
+    s21_store(rsp, ir.get_value(inst1), I32)
+    var brp = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brp, b_m, 1)
+    g_cur_block = b_m
+    return s21_load(rsp, I32)
+}
+}

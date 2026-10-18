@@ -1,0 +1,612 @@
+type tie<class>
+// compiler/frontend/sstate.tie —— T2.6 语义分析全局状态（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）完整语义分析
+// 拆分为 8 模块之一（本文件 = AST 9 列 + 符号表全局 + 协议解析 + 节点访问 +
+// 工具/登记函数，零依赖除 interner/string/lex 原语）。import 树最深层。
+// 对应 proto/semantic.tie 142-231（状态）+ 238-377（load_ast）+ 380-520
+// （节点访问/可寻址/可见性）+ 642-755（bs_find/sorted_insert/reg_fn/
+// reg_struct/fn_sig）+ 1250-1264（ns_push/ns_pop）逻辑搬移。
+// 依赖：无（intern/str 原语直接可用，与 T2.4/T2.5 一致不显式 import）。
+// S2.4：port 登记调用 types.set_port_name（port 名表还原）——types 在
+// middle（../middle/types.tie），须显式 import（interp_eval 等独立场景
+// 的 import 链不保证传递可见；s24 分支曾因缺 import 报未定义）。
+import "../middle/types.tie"
+// 由 stype.tie import（传递可达上层全部）。
+
+// ==================== AST 全局列式表（协议解析结果）====================
+pub var s_tags: table<i64>;       // 节点 tag
+pub var s_names: table<i64>;      // 字符串池 id（-1=无）
+pub var s_vals: table<i64>;       // 主整数值（字面量值/运算符/标志）
+pub var s_aux: table<i64>;        // 次整数值（nparams/nsegs/ncases/label）
+pub var s_coff: table<i64>;       // 子节点偏移（s_children 段起点）
+pub var s_nchild: table<i64>;     // 子节点数
+pub var s_children: table<i64>;   // 扁平子节点 id 段
+pub var s_lines: table<i64>;      // 起始行（1-based）
+pub var s_cols: table<i64>;       // 起始列（1-based）
+pub var s_n: i64 = 0;             // 节点总数
+// r.1.6.7 → 2026-10-01 泛化：带 `#[unsafe.<域>]` 属性的函数节点及其**域位集**。
+// 为什么需要：属性附着原先**只置 val bit3 = has_attr 并丢弃属性名**，故各域无法区分。
+// 两个并行表（节点 id → 域位集）保留「哪些函数持哪些域」，供两处消费：
+//   · irgen 把持 lock 的函数体置于去锁作用域（codegen 语义）；
+//   · 语义层做**域匹配**判定（2026-10-01 起）。
+pub var s_fn_cap_nodes: table<i64> = []
+pub var s_fn_cap_vals: table<i64> = []
+// 2026-10-01：**本模块的待提交登记**（交错存 [parser 局部 id, 域位集, ...]）。
+// 为什么必须分两步：parser 侧的节点 id 是**本模块内部**的（0 起），而 semantic 侧
+// 的 s_* 池在 import 场景下从 g_file_base[k] 起 —— 两者相差一个基址。若 parser 直接
+// 登记（`fn_cap_put`），id 会错位，域信息落在**别的节点**上。故 parser 只记局部表，
+// 由 `cap_apply_file(from_nid)` 在装载完成后统一 +from_nid 提交。
+// 主文件基址是 0（+0 即恒等），故同一套逻辑同时服务两条路径。
+pub var s_imp_cap_nodes: table<i64> = []
+pub var s_imp_cap_vals: table<i64> = []
+// 2026-10-01：本文件（**本次 parser 解析的文件**）获授权的**域位集**。
+// driver 在调 parse_ast 前按头部角色声明（`type tie<role, unsafe:mem, unsafe:ext>`）设置。
+// 这是文件级授权能精确限定范围的**关键**：`parse_ast` 只对**主输入文件**调用一次，
+// import 的模块走语义层的另一条解析路径 ⇒ 不会读到 ⇒ 不会被误授权。
+pub var s_file_caps: i64 = 0
+// 2026-10-07：**本文件是否声明裸 `unsafe`**（`type tie<角色, unsafe>` =
+// 「整个文件处于不安全上下文」，规范 §11.6）。与 s_file_caps 平行：
+// caps 给的是**域凭据**，本标志给的是**上下文** —— §11.6 的两道锁各一道。
+// 同样必须按模块保存/恢复：父模块的上下文不继承给子模块，反向亦然。
+pub var s_file_uctx: i64 = 0
+// 2026-10-07：文件级 unsafe 上下文**落库到函数**（与 s_fn_cap_nodes 平行）。
+// 为什么不能只靠全局 g_unsafe_depth：语义检查在主文件解析**结束之后**统一走，
+// 那时全局量早已不是「该函数所属模块」的值 ⇒ 与域凭据一样必须按函数登记。
+pub var s_fn_uctx_nodes: table<i64> = []
+pub var s_fn_uctx_vals: table<i64> = []
+// 2026-10-02 W00030 凭据挂空告警：
+//   · s_fn_attr_* —— 函数级**属性**位集（`#[unsafe.域]`），与合并表分开存。
+//     逐函数判定只针对属性位：文件级授权是规范明文认可的**粗粒度**授权
+//     （「适用范围是整块代码都属同一域的场合」），逐函数比对会产生大量噪声
+//     （tlib 实测 12 个模块 68 条全属此类），故文件级按**文件**粒度单独判定。
+//   · g_file_idle_* —— 按模块序号的「文件级授权位集 / 该文件内实际用到的域位集」。
+pub var s_fn_attr_nodes: table<i64> = []
+pub var s_fn_attr_vals: table<i64> = []
+pub var g_file_idle_auth: table<i64> = []
+pub var g_file_idle_used: table<i64> = []
+
+// ==================== 符号表全局 ====================
+pub var fn_keys: table<i64>;      // 函数全名 id（升序）
+pub var fn_vals: table<i64>;      // 签名 id
+pub var fn_def_nodes: table<i64>; // 函数定义 AST 节点 id（与 fn_keys 平行；性能重构：
+                              // check_fn_walk 查表 O(log n) 定位，替代每函数线性
+                              // 扫全部顶层 + ns_full_name 拼串比较的 O(N×M) 平方）
+pub var sg_nparams: table<i64>;   // 签名表：参数总数
+pub var sg_required: table<i64>;  // 必选参数数（默认值前）
+pub var sg_ret: table<i64>;       // 返回类型 id
+pub var sg_pub: table<i64>;       // 0/1
+pub var sg_off: table<i64>;       // 参数段偏移（sp_tys/sp_refs/sp_defs）
+// p.9.11.22：签名 → 函数定义 AST 节点（与 sg_* 下标对齐）。供「按签名查形参名」
+// 用（形参名只存于声明节点，sg_* 表只有类型/修饰标志）。首个消费者：捕获面
+// 白名单的「禁止捕获 ref 形参」判定（需按当前函数签名反查形参名与 ref 标志）。
+pub var sg_defnode: table<i64>;
+pub var sp_tys: table<i64>;       // 参数类型 id（扁平段）
+pub var sp_refs: table<i64>;      // 参数 by_ref 标志（扁平段）
+pub var sp_defs: table<i64>;      // 参数有默认值（扁平段）
+pub var sp_vars: table<i64>;      // 参数变参标志（扁平段；1 = `name: ...T`）
+// p.9.11.15 生成器标记（与 sg_* 下标对齐）：0=普通函数 1=生成器函数（含 yield；
+// 签名返回类型已登记为 table<elem>）。scheck/irgen 读 is_gen 分派。
+pub var gen_marks: table<i64>;
+
+// p.9.11.11 immut 只读形参名集合（每函数 check_fn 重置；变量名池 id）。
+pub var g_im_keys: table<i64>;
+pub var g_im_vals: table<i64>;
+
+// r.1.6.10 **全部按值形参**名集合（每函数 check_fn 重置；变量名池 id）。
+// 与 immut 集合分开：immut 用于「禁写」拒绝（主检查路径），本集合用于
+// 「按值形参的字段改不到调用方」告警（警告 pass）。按值形参的表字段重绑定
+// 是**无声失效**——语法合法、运行无效果、代码读起来像改了调用方，
+// 属最该出声音的一类，故单列一集合供 W00031 判定。
+pub var g_vp_keys: table<i64>;
+
+// 规范 §13.1「不可观测写入」目标集合（2026-10-12，常开检查用、每函数重置）：
+// 非 ref / 非 shared / 非 move 的**表**形参名（与 irgen r.1.6.14 入口 retain
+// 条件同源——正是会触发写时复制分离的那一类形参）。登记见 scheck_q3.check_fn，
+// 消费见 scheck_ie_ie1.uw_write_check。
+pub var g_uwt_keys: table<i64>;
+
+pub var st_keys: table<i64>;      // struct 名 id（升序）
+pub var st_vals: table<i64>;      // struct 索引
+// p.9.11.32 类型别名注册表（名 id 升序；val = S_N_TYPE_ALIAS 节点 id）
+pub var alias_keys: table<i64>;
+pub var alias_vals: table<i64>;
+pub var cls_parent: table<i64>;   // struct 父名 id（-1=无）
+pub var cls_fldoff: table<i64>;   // 字段段偏移（fld_names/fld_tys）
+pub var cls_nfld: table<i64>;     // 字段数（含继承拍平）
+pub var cls_done: table<i64>;     // struct 字段收集完成标志（0/1，拍平递归防重）
+pub var st_reprc: table<i64>;     // struct 索引 -> repr(C) 显式 C ABI 布局标志（1=repr(C)/0=默认；p.6.8.2）
+pub var fld_names: table<i64>;    // 拍平字段名 id
+pub var fld_tys: table<i64>;      // 拍平字段类型 id
+pub var fld_defs: table<i64>;     // 拍平字段默认值表达式节点 id（-1 = 无；Point.y = 10）
+
+// ==================== enum 状态表（2026-08-15 enum 语言特性）====================
+// enum 表按「名 id（升序）→ 索引」登记，索引行号 = types.enum_of 的负载。
+// 变体信息拍平段（en_vnames/en_vtags/en_vfldoff/en_vnfld 共用 en_varoff 段偏移；
+// payload 类型单独拍平进 en_ftys，变体经 en_vfldoff 定位其字段段）。
+pub var en_keys: table<i64>;      // enum 名 id（升序，二分）
+pub var en_vals: table<i64>;      // enum 索引
+pub var en_done: table<i64>;      // 变体收集完成标志（0/1，防重复收集）
+pub var en_nvar: table<i64>;      // 变体数
+pub var en_varoff: table<i64>;    // 变体段偏移（en_vnames/en_vtags/en_vfldoff/en_vnfld 共用段）
+pub var en_nslot: table<i64>;     // 槽数 K（所有变体 payload 字段数最大值；后端聚合布局用）
+pub var en_vnames: table<i64>;    // 变体名 id（拍平段）
+pub var en_vtags: table<i64>;     // 变体 tag 值（0..nvar-1，拍平段）
+pub var en_vfldoff: table<i64>;   // 变体 payload 字段段偏移（en_ftys）
+pub var en_vnfld: table<i64>;     // 变体 payload 字段数
+pub var en_ftys: table<i64>;      // 变体 payload 字段类型 id（拍平段）
+
+pub var gb_keys: table<i64>;      // 全局变量名 id（升序）
+pub var gb_vals: table<i64>;      // 类型 id
+pub var gb_const: table<i64>;     // 0/1
+pub var gb_telem: table<i64>;     // 全局表元素类型 id（-1=非表）
+
+pub var ext_keys: table<i64>;     // extern 函数名 id（升序）
+
+// S1.2：unsafe 上下文深度（0 = 安全代码）。unsafe fn 体 / unsafe 块 /
+// 文件级 type tie<unsafe> 各 +1；语义层触底操作检查 g_unsafe_depth == 0 报错。
+pub var g_unsafe_depth: i64 = 0;
+// 2026-10-01「域匹配」：当前作用域**持有的域位集**（0=share 1=mem 2=ext 3=lock 4=raw）。
+// 与 g_unsafe_depth 的分工正是双锁：
+//   · g_unsafe_depth  = 锁一「门禁上下文」（unsafe 块 / unsafe fn）
+//   · g_held_caps     = 锁二「域凭据」（文件级授权 / 函数级属性 / 块级持证）
+// 二者都满足才放行受门禁的构造。凭据来源：
+//   函数级 = 文件级授权位集 | 该函数的属性位集（check_fn 入口设置）
+//   块级   = `unsafe.with(域) { }` 与 `unsafe use g`（g: guard<域>）临时并入，退块恢复
+// 凭据**不跨函数继承**（闭包体/方法体独立清零），与 lock 域的去锁作用域同规则。
+pub var g_held_caps: i64 = 0;
+// 2026-10-02「凭据挂空」告警：当前作用域内**实际用到的域位集**。
+// 与 g_held_caps 配对进出每一个持证作用域（块级 unsafe.with / unsafe use、
+// 函数级），退域时比对：本域新持、却一次未用 ⇒ 该凭据挂空，报 W00030。
+// 累加而非清零：作用域内任意深处（含嵌套普通块）命中的域都算本作用域用过。
+pub var g_used_caps: i64 = 0;
+
+pub var tre_keys: table<i64>;     // 返回表的函数名 id（升序）
+pub var tre_vals: table<i64>;     // 元素类型 id
+
+pub var node_types: table<i64>;   // 节点 id -> 类型 id（-1=未推断）
+
+// p.8.2.7 计算属性（computed property）：成员访问节点 id -> getter/setter 方法全名
+//（intern id）。读取 `obj.attr` 命中 getter（<Struct>::attr）或写入 `obj.attr=v`
+// 命中 setter（<Struct>::attr_set）时由语义层登记，irgen 据此发射方法调用而非
+// 存储槽访问。实现形态 = 子项 p.8.2.4 的结构绑定命名空间方法（getter/setter 复用
+// tig_op_overload 发射）。-1 = 普通字段（缺省，不产方法调用）。
+pub var g_cmp_getter: table<i64>;  // 节点 id -> 计算属性 getter 全名（intern id）；-1 = 无
+pub var g_cmp_setter: table<i64>;  // 节点 id -> 计算属性 setter 全名（intern id）；-1 = 无
+
+// ==================== 每函数重置的局部状态 ====================
+pub var lv_keys: table<i64>;      // 作用域变量名 id（升序）
+pub var lv_vals: table<i64>;      // 类型 id
+pub var lv_const: table<i64>;     // 0/1
+pub var lv_telem: table<i64>;     // 表变量元素类型 id（-1=非表）
+pub var lv_dyn: table<i64>;       // 表变量动态标志（0/1）
+// S1.5 移动语义：变量状态跟踪（live/moved）。**独立升序表**（非 lv_* 并行）：
+// 存在即 moved（bs_find >= 0）。移动规则（docs/plans/ui-framework.md §4.2）：
+// 堆类型（string/table/含堆字段聚合）赋值/按值传参/返回即转移所有权，源变量
+// moved；此后读取 = 编译错误（"use of moved value"）。栈类型不跟踪。
+// 维护点：scheck.check_var_decl/check_stmt（赋值/返回移动登记）+ sinfer
+// infer_expr S_N_VAR（读取检查）；函数边界（check_fn）重置。独立表的好处：
+// 不依赖 lv_insert 同步（lv_* 并行表由 sinfer 维护，S1.2-1.4 并行会话在改）。
+pub var lv_moved: table<i64>;     // 已移动变量名 id（升序，二分）
+// r.1.6.7 凭据层级与撤销状态（函数级，随函数边界重置）：
+//   gr_rel      —— 派生关系，交错存 [子凭据名 id, 父凭据名 id, ...]。
+//                  `var sub = g.delegate(mem)` 登记 (sub → g)。
+//   gr_dead     —— 已撤销（失效）的凭据名 id 列表。`unsafe.revoke(g)` 把 g 及其
+//                  **传递**派生出的凭据全部登记进来；此后使用这些凭据报诊断。
+// 撤销是流敏感且单调的：语句按序检查，撤销点之后失效，不回生。
+pub var gr_rel: table<i64>;
+pub var gr_dead: table<i64>;
+
+pub var lp_stack: table<i64>;     // 循环标签栈（break/continue 上下文；-1=无标签）
+pub var lp_top: i64 = 0;          // lp_stack 逻辑栈顶游标（tie 表无法截断，用游标模拟 pop）
+pub var ns_stack: table<i64>;     // 命名空间段栈（全名补全）
+pub var ns_top: i64 = 0;          // ns_stack 逻辑栈顶游标（同 lp_top）
+pub var using_prefixes: table<i64>;  // using 引入的命名空间段名 id（扁平段 + 长度表）
+pub var using_lens: table<i64>;      // using 前缀段数（与 using_prefixes 并行，按段号分组）
+
+// 返回表的内置函数预登记（元素类型 id）
+pub var tre_bi_keys: table<i64>;  // 内置名 id
+pub var tre_bi_vals: table<i64>;  // 元素类型 id
+
+// ==================== 错误状态 ====================
+pub var sm_err_line: i64 = 0;
+pub var sm_err_col: i64 = 0;
+pub var sm_err_msg: string = "";
+
+// 当前函数全名 id（check_fn 期间；IR 全局初始化不支持负数）
+pub var g_curfn: i64 = 0;
+// 当前扫描函数节点（collect 阶段返回表元素预扫描用）
+pub var g_cur_scan_fn: i64 = 0;
+// 当前命名空间深度（裸名解析用）
+pub var g_ns_depth: i64 = 0;
+// 表达式类型计数（OK: 返回）
+pub var g_typed: i64 = 0;
+
+// struct/tuple 类型 id 缓存与 tuple 字段段
+pub var struct_tys: table<i64>;   // struct 索引 -> 3<<40|idx
+pub var tuple_tys: table<i64>;    // tuple 索引 -> 4<<40|idx
+pub var tup_names: table<i64>;    // tuple 字段名 id（扁平段）
+pub var tup_tys: table<i64>;      // tuple 字段类型 id（扁平段）
+pub var tup_offs: table<i64>;     // tuple 字段段偏移
+pub var tup_n: table<i64>;        // tuple 字段数
+
+// ==================== 泛型模板登记（T3b 单态化展开器预置，2026-08-14）====================
+// T1 泛型语法（`func max<T>` / `struct Box<T>`）落地后，本表预置模板登记
+// 结构：供 T3b 单态化展开器使用（本任务只建结构 + 查询/登记辅助函数，不实现
+// 展开）。登记时机：scollect.collect_fn / collect_struct_decl 检测到 children[0]
+// == N_TYPE_PARAMS 时调用 sstate.reg_generic。所有表在 semantic.check_impl /
+// check_ast 状态重置时清零。
+pub var gty_keys: table<i64>;      // 泛型模板全名 id（intern，升序）
+pub var gty_vals: table<i64>;      // 模板索引（与 gty_keys 并行，sorted_insert 同插）
+pub var gty_full: table<i64>;      // 模板索引 -> 模板全名 id（intern；gty_keys 按名排序
+                               // 是位置表，模板索引与其不一致时不能 gty_keys[gti] 取名）
+pub var gtyp_nparams: table<i64>;  // 模板索引 -> 类型参数个数
+pub var gtyp_off: table<i64>;      // 模板索引 -> 类型参数名段偏移（gtyp_names 扁平段）
+pub var gtyp_names: table<i64>;    // 类型参数名 id（intern，扁平段；取自 N_TYPE_PARAM.name）
+pub var gty_node: table<i64>;      // 模板索引 -> 定义 AST 节点 id（FnDef / Struct）
+pub var gty_is_struct: table<i64>; // 模板索引 -> 0=函数模板 1=struct 模板
+// S2.4 泛型约束段（port 约束，port-model.md §2.3）：gtyp_conoff[模板索引] ->
+// gtyp_cons 段偏移；段长 = gtyp_nparams（每类型参数 1 槽，-1 = 无约束）。
+// 槽值 = 约束 port 名 id（intern；语义层校验是已登记 port）。
+// 实例化（sgen.instantiate_fn/struct）实参化时校验：实参类型必须 impl 该 port。
+pub var gtyp_conoff: table<i64>;  // 模板索引 -> 约束段偏移（gtyp_cons）
+pub var gtyp_cons: table<i64>;    // 约束 port 名 id 扁平段（-1 = 无约束）
+
+// v2 值参数（容量参数）段：gtyp_kindoff[模板索引] -> gtyp_kinds 段偏移；段长 =
+// gtyp_nparams（每参数 1 槽：0=类型参数，1=值参数(i64)）。值参数不占约束槽
+//（cons = -1），其默认值节点（N_INT_LIT / N_VAR，取自 N_TYPE_PARAM.children[1]）
+// 存于 gtyp_defs 段——语义层对值参数槽按「整型常量」解析而非类型。
+pub var gtyp_kindoff: table<i64>;  // 模板索引 -> 参数 kind 段偏移（gtyp_kinds）
+pub var gtyp_kinds: table<i64>;    // 参数 kind 扁平段（0=类型参数，1=值参数）
+
+// 整型常量表（v2 数组长度/值参数求值）：gval_kkeys[名 id] -> gval_kvals[整型值]。
+// const 名在数组长度 / 值参数默认值处引用时按此解析（编译期常量，值 > 0）。
+pub var gval_kkeys: table<i64>;
+pub var gval_kvals: table<i64>;
+
+// p.8.2.6 泛型默认类型参数段：gtyp_defoff[模板索引] -> gtyp_defs 段偏移；
+// 段长 = gtyp_nparams（每类型参数 1 槽）。槽值 = 默认类型**类型节点 id**
+//（N_NAMED_TYPE/N_TABLE_TYPE/N_STRUCT_TYPE 等，取自 N_TYPE_PARAM.children[1]；
+// 调用处用 sgen.parse_generic_type_node 解析为类型 id；-1 = 无默认类型）
+pub var gtyp_defoff: table<i64>;  // 模板索引 -> 默认类型段偏移（gtyp_defs）
+pub var gtyp_defs: table<i64>;    // 默认类型节点 id 扁平段（-1 = 无默认）
+
+// 实例化记录表（gin_*，T3b 单态化展开器 2026-08-14）：
+// 同（模板名, 类型实参组合）只展开一次——mangled 名即去重键。
+// gin_keys/gin_vals：mangled 名 id（升序）→ 记录索引（sorted_insert 同插）。
+// gin_tmpl/gin_off/gin_nargs/gin_is_struct：记录索引 → 模板索引 / 类型实参
+// 段偏移（garg_vals 扁平段）/ 实参个数 / 0=函数 1=struct。
+// garg_vals：类型实参 id 扁平段（按模板类型参数顺序）。
+// 所有表在 semantic.check_impl / check_ast 状态重置时清零。
+pub var gin_keys: table<i64>;      // 实例化 mangled 名 id（升序）
+pub var gin_vals: table<i64>;      // 记录索引（与 gin_keys 并行）
+pub var gin_tmpl: table<i64>;      // 记录索引 -> 模板索引（gty_vals）
+pub var gin_off: table<i64>;       // 记录索引 -> 类型实参段偏移（garg_vals）
+pub var gin_nargs: table<i64>;     // 记录索引 -> 类型实参个数
+pub var gin_is_struct: table<i64>; // 记录索引 -> 0=函数 1=struct
+pub var garg_vals: table<i64>;     // 类型实参 id 扁平段
+// 实例化递归深度计数（防无限递归，上限 64）
+pub var g_inst_depth: i64 = 0;
+
+// ==================== 闭包语义状态表（S2.2，2026-08-16）====================
+// 闭包（N_FN_LIT func 字面量）延迟检查队列 + 捕获分析。
+// infer_expr 遇 N_FN_LIT 时：① 解析返回/参数类型 → types.fn_of 登记 fn 类型；
+// ② 保存「登记时 lv 快照」（捕获基准：闭包体检查重建作用域用）；③ 入队
+// g_clo_pending（FIFO）。闭包体（语句块）检查延迟到语义主流程末尾由
+// scheck.check_pending_closures() 统一处理（sinfer 无 check_block 能力，且
+// import 树禁止 sinfer → scheck）。捕获判定在 sinfer S_N_VAR 分支（命中
+// lv 且非闭包参数/局部 → 登记 cl_capkeys/cl_capvals）。所有表在
+// semantic.check_impl / check_ast 状态重置时清零。
+pub var g_clo_pending: table<i64>;  // 待检查闭包 N_FN_LIT 节点 id（FIFO 登记顺序）
+// p.9.11.22：闭包索引 -> **外层函数签名**（登记时的 g_curfn）。
+// 必要性：捕获分析是**批量后置**的（所有函数查完后 FIFO 处理 g_clo_pending），
+// 那时全局 g_curfn 已停留在他处（实测指向前置注入的 str_has），无法代表该闭包
+// 的外层函数。故在**登记时**（外层函数上下文内）把签名存下来备查。
+pub var cl_owner_sig: table<i64>;
+// p.9.11.22：闭包索引 -> 登记时是否处于 **unsafe 上下文**（1/0）。
+// 同为「后置批量分析丢失上下文」的补救：g_unsafe_depth 在批量阶段已复位，
+// 故在登记时把「当时是否 unsafe」定下来。判据 = 深度 >0 **或** 外层函数本身
+// 是 unsafe func（两者都属开发者担责区，捕获面白名单在此放宽）。
+pub var cl_owner_unsafe: table<i64>;
+pub var cl_ret: table<i64>;         // 闭包索引 -> 返回类型 id
+pub var cl_nparams: table<i64>;     // 闭包索引 -> 参数个数
+pub var cl_paroff: table<i64>;      // 闭包索引 -> 参数类型段偏移（cl_ptys）
+pub var cl_ptys: table<i64>;        // 参数类型 id 扁平段
+pub var cl_off: table<i64>;         // 闭包索引 -> lv 快照段偏移（cl_okeys 等）
+pub var cl_nouter: table<i64>;      // 闭包索引 -> 快照条数（登记时 lv_keys 长度）
+pub var cl_okeys: table<i64>;       // 快照变量名 id（扁平段）
+pub var cl_ovals: table<i64>;       // 快照类型 id
+pub var cl_oconst: table<i64>;      // 快照 const 标志
+pub var cl_otelem: table<i64>;      // 快照表元素类型 id
+pub var cl_odyn: table<i64>;        // 快照动态标志
+pub var cl_paramoff: table<i64>;    // 闭包索引 -> 参数名段偏移（cl_params）
+pub var cl_params: table<i64>;      // 闭包参数名 id（扁平段；捕获遮蔽判定）
+pub var cl_locloff: table<i64>;     // 闭包索引 -> 局部名段偏移（cl_locals）
+pub var cl_locals: table<i64>;      // 闭包内声明局部名 id（扁平段；捕获遮蔽判定）
+pub var cl_capoff: table<i64>;      // 闭包索引 -> 捕获段偏移（cl_capkeys/cl_capvals)
+// ===== share 域门禁（B 方案，2026-10-03）：闭包跨执行流共享可变数据 =====
+// cl_grefs[ci]：闭包 ci（含其嵌套子闭包）是否引用了**全局可变容器**（table/map）。
+// ★ 打点位置 = 全局引用的解析处（infer_expr_var 的 gb_find_ns_key 分支）——全局变量
+// **不经捕获通道**（规范 §5.10：全局始终可见），故 `cl_capkeys` 里**永远没有**全局
+// （实测 ncap=0），判据只能在这里打点。
+pub var cl_grefs: table<i64>;
+// spawn 调用点记录（infer 阶段登记，判定延到 scheck 末段——那时判据与传播都已完成）。
+// 凭据状态一并**快照**：末段时作用域已出栈，`g_held_caps`/`g_unsafe_depth` 不可再读。
+pub var g_spawn_nodes: table<i64>;    // 调用节点（诊断行列）
+pub var g_spawn_args: table<i64>;     // 实参节点（判据用）
+pub var g_spawn_caps: table<i64>;     // 当时的 g_held_caps 快照
+pub var g_spawn_unsafe: table<i64>;   // 当时是否在 unsafe 上下文（g_unsafe_depth > 0）
+// g_spawn_force[i]：该投递点**必定共享**（1）。并行池的 `fs` 是运行期
+// `table_push(fs, f)` 组装的批量任务表，编译期看不到池里有哪些闭包 ⇒ 无法逐个判；
+// 按 share 域语义（批量投递的并发写入责任在书写者）一律判「共享」。
+pub var g_spawn_force: table<i64>;
+pub var cl_capkeys: table<i64>;     // 捕获变量名 id（扁平段）
+pub var cl_capvals: table<i64>;     // 捕获变量类型 id（扁平段）
+pub var g_clo_depth: i64 = 0;       // 闭包体检查深度（>0 = 在闭包体内）
+pub var g_clo_cur: i64 = -1;        // 当前闭包索引（捕获登记目标；-1 = 无）
+pub var g_clo_ret_stack: table<i64>;// 闭包返回类型栈（S_N_RETURN / ? 解包用）
+pub var g_clo_ret_top: i64 = 0;     // 返回类型栈逻辑栈顶游标（tie 表无法截断）
+pub var cl_parent: table<i64>;      // 闭包索引 -> 父闭包索引（sinfer 登记时 g_clo_cur；
+                                // -1 = 直接嵌套在普通函数体）。捕获传播（任务21）
+                                // 沿此链把内层闭包捕获上溯到祖先闭包的 env。
+
+// ==================== 顶层 StmtList 根（parse_program 创建的最后节点 id）
+pub var g_root: i64 = 0;
+
+// ==================== 一期并发 actor 状态表 ====================
+// actor 表：ac_keys（actor 名 id，升序）→ ac_vals（actor 索引）。索引与
+// types.BASE_ACTOR 行号对应（scollect 收集时 set_actor_name 登记同名）。
+pub var ac_keys: table<i64>;
+pub var ac_vals: table<i64>;
+// actor 方法签名表（行 = actor 索引）：
+//   ac_moff[actor] -> 方法名段偏移（ac_mnames，声明顺序）
+//   ac_mn[actor]   -> 方法个数
+//   ac_mpar[actor] -> 参数个数表段偏移（ac_mnpars 扁平段）
+//   ac_paroff[actor]-> 参数类型段偏移（ac_mptys 扁平段）
+//   ac_mret[actor] -> 返回类型表段偏移（ac_mrets 扁平段）
+// 方法 m 的签名：参数个数 = ac_mnpars[ac_mpar + m]，参数段 =
+// ac_mptys[ac_paroff + m .. +个数]，返回 = ac_mrets[ac_mret + m]。
+// actor 方法无显式 self 参数（状态隐式，msg 参数即显式形参）。
+pub var ac_moff: table<i64>;
+pub var ac_mn: table<i64>;
+pub var ac_mpar: table<i64>;
+pub var ac_paroff: table<i64>;
+pub var ac_mret: table<i64>;
+pub var ac_mnames: table<i64>;   // 方法名 id 扁平段（声明顺序）
+pub var ac_mnpars: table<i64>;   // 每方法参数个数扁平段
+pub var ac_mptys: table<i64>;    // 每方法参数类型扁平段
+pub var ac_mrets: table<i64>;    // 每方法返回类型扁平段
+pub var ac_masync: table<i64>;   // 每方法是否 async（fire-and-forget；与 ac_mrets 同位对齐）
+pub var ac_mreent: table<i64>;   // 每方法是否 reentrant（规范 §10.7 重入；与 ac_mrets 同位对齐）
+// actor 私有状态字段布局（行 = actor 索引；Step4b 起 per-actor state 真实槽位）：
+//   ac_fnoff[actor] -> 字段名段偏移（ac_fnames）
+//   ac_fncnt[actor] -> 字段个数
+//   ac_ftyoff[actor]-> 字段类型段偏移（ac_ftys）
+//   ac_fvoff[actor] -> 记录内字节偏移段偏移（ac_foffs；relative 到字段区基址）
+// // 同一字段名/类型/偏移按下标对齐。record 固定头 + 字段区（8 字节对齐）。
+pub var ac_fnoff: table<i64>;
+pub var ac_fncnt: table<i64>;
+pub var ac_ftyoff: table<i64>;
+pub var ac_fvoff: table<i64>;
+pub var ac_fnames: table<i64>;   // 字段名 id 扁平段（声明顺序）
+pub var ac_ftys: table<i64>;     // 字段类型扁平段
+pub var ac_fdefs: table<i64>;    // 字段显式初值节点（-1 = 零值）
+pub var ac_foffs: table<i64>;    // 字段在记录内的字节偏移扁平段（含固定头）
+// actor 方法全名 → 所属 actor 索引（与 fn_keys 平行登记的**副表**，按 interned
+// 全名查）。用途：语义主流程按 `fn_keys` 遍历函数体时，actor 消息方法体也在其中
+// （见 scollect_port_q2 的 `actor$N::m` 内部全名登记），但它的作用域里还须绑定
+// **actor 私有状态字段**（后端 irgen_rt_p3 用 scope_put 绑 record 槽，前端必须
+// 同样把字段名登记为局部变量，否则方法体访问字段报「未声明的变量」）。
+// 两表 key 同为 interned 全名 id，长度与 fn_keys 同步增长。
+pub var afn_keys: table<i64>;
+pub var afn_actor: table<i64>;
+
+// ==================== S2.4 port / impl 状态表（接口模型）====================
+// port 表：pt_keys（port 名 id，升序）→ pt_vals（port 索引）。
+// port 方法签名表（行 = port 索引）：
+//   pm_off[port]  -> pm_names 段偏移（方法名 id，声明顺序 = vtable 字段序）
+//   pm_n[port]    -> 方法个数
+//   pm_npar[port] -> 方法参数个数表段偏移（pm_npars 扁平段，含 self）
+//   pm_paroff[port] -> 参数类型段偏移（pm_ptys 扁平段）
+//   pm_ret[port]  -> 返回类型表段偏移（pm_rets 扁平段）
+// 方法 m 的签名：参数个数 = pm_npars[pm_npar + m]，参数段 =
+// pm_ptys[pm_paroff + m .. +个数]，返回 = pm_rets[pm_ret + m]。
+// 参数 0 恒为 self（接收者，类型 = 实现 struct 的占位——签名匹配时跳过）。
+pub var pt_keys: table<i64>;      // port 名 id（升序，二分）
+pub var pt_vals: table<i64>;      // port 索引
+pub var pm_off: table<i64>;       // port 索引 -> 方法名段偏移（pm_names）
+pub var pm_n: table<i64>;         // port 索引 -> 方法个数
+pub var pm_npar: table<i64>;      // port 索引 -> 参数个数表段偏移（pm_npars）
+pub var pm_paroff: table<i64>;    // port 索引 -> 参数类型段偏移（pm_ptys）
+pub var pm_ret: table<i64>;       // port 索引 -> 返回类型表段偏移（pm_rets）
+pub var pm_names: table<i64>;     // 方法名 id 扁平段（声明顺序 = vtable 字段序）
+pub var pm_npars: table<i64>;     // 每方法参数个数（含 self）扁平段
+pub var pm_ptys: table<i64>;      // 每方法参数类型扁平段（含 self 槽位，签名匹配跳过）
+pub var pm_rets: table<i64>;      // 每方法返回类型扁平段
+// p.9.11.21 interface 标记段（行 = port 索引）：0=port（S2.4 名义接口，实现
+// 关系 = 显式 impl 块登记）；1=interface（结构性接口，实现关系 = 该类型命名
+// 空间方法签名兼容，无需显式 impl——鸭子多态的类型安全升级）。
+pub var pm_iface: table<i64>;     // port 索引 -> 1=interface 0=port
+// impl 表：im_keys（升序键 = intern(port名 + "::" + struct名)）→ im_vals（impl 索引）。
+// impl 记录（行 = impl 索引）：
+//   im_port[impl]  -> port 索引
+//   im_struct[impl] -> struct 索引
+//   im_poff[impl]  -> im_mnames 段偏移（按 port 方法声明顺序的实现函数全名 id）
+//   im_n[impl]     -> 方法个数（= port 方法数，完整性检查后恒等）
+pub var im_keys: table<i64>;      // impl 键 id（升序，二分）
+pub var im_vals: table<i64>;      // impl 索引
+pub var im_port: table<i64>;      // impl 索引 -> port 索引
+pub var im_struct: table<i64>;    // impl 索引 -> struct 索引
+pub var im_poff: table<i64>;      // impl 索引 -> 方法实现全名段偏移（im_mnames）
+pub var im_n: table<i64>;         // impl 索引 -> 方法个数
+pub var im_mnames: table<i64>;    // 方法实现函数全名 id 扁平段（"Struct::method"）
+
+// ==================== import 展开状态（semantic 主入口驱动）====================
+pub var g_imported: table<string>;   // 已导入文件路径集合（去重/防环）
+pub var g_extra_tops: table<i64>;    // 全部文件顶层语句 id（主 + 被导入；collect/查找统一遍历）
+// dev33 批次10 任务29 跨文件宏：文件起源跟踪——顶层 StmtList 根 id → 文件 id
+//（主文件 0，导入文件按展开顺序递增），供 mexpand 判定宏定义/调用所属文件，
+// 实现 pub 宏跨文件可见、非 pub 宏同文件私有。
+pub var g_file_roots: table<i64>;    // 顶层 StmtList 根 id → 文件 id
+pub var g_file_count: i64 = 1;       // 已分配文件 id 数（主文件 0 占位）
+// p.9.11.14 import 别名登记（平行表：别名 → 导入路径；编译单元内别名唯一，
+// 重复 = 诊断）。别名同时经 M2.1.7 语义把被导入文件顶层 namespace 首段改名。
+pub var g_imp_alias_names: table<string>;   // 别名（字符串）
+pub var g_ns_rename_old: table<string>;     // 别名改名映射：旧命名空间名（2026-10-12 增名兼容修复）
+pub var g_ns_rename_new: table<string>;     // → 新名（别名）；解析未命中时回退再试
+pub var g_imp_alias_paths: table<string>;   // 对应导入路径（归一化）
+// p.9.21.6-1 模块边界显式化（p921-prompt §1 第 1 步）：来源模块维度。
+// 模块 = import 的文件（主文件 = 模块 0，导入文件按展开顺序 1..k）。
+// g_file_base：每文件 AST 节点基址（升序）——文件 k 的节点 id ∈
+// [g_file_base[k], g_file_base[k+1])（append_ast_mem 逐文件连续追加；
+// expand_imports 推进）。file_id_of_node 对基址二分定位任意节点的来源模块。
+pub var g_file_base: table<i64>;    // 文件 id -> 该文件首节点基址（升序；主文件 0）
+pub var g_file_stem: table<string>; // 文件 id -> 文件名词干（顶层限定通道，2026-10-12；宏展开文件为空）
+// 程序入口全名（主文件 file id 0 里最后一段为 main 的函数；命名空间内的
+// main 记 "ns::main"）。llvmgen 据此以 C 入口符号 @main 发射。
+pub var g_entry_name: string = "";
+// 符号表来源模块列（与各表行对齐；登记时由 def_node 反查文件 id）：
+pub var sg_mod: table<i64>;         // 签名行来源模块（行号 = 签名 id，与 sg_* 对齐）
+pub var gb_mod: table<i64>;         // 全局变量行来源模块（与 gb_keys/vals 行对齐）
+pub var st_mod: table<i64>;         // struct 行来源模块（行号 = struct 索引，与 cls_* 对齐）
+
+pub const S_N_INT_LIT: i64 = 0;
+pub const S_N_FLOAT_LIT: i64 = 1;
+pub const S_N_STR_LIT: i64 = 2;
+pub const S_N_CHAR_LIT: i64 = 3;
+pub const S_N_BOOL_LIT: i64 = 4;
+pub const S_N_TRIT_LIT: i64 = 5;
+pub const S_N_VAR: i64 = 6;
+pub const S_N_CALL: i64 = 7;
+pub const S_N_UNARY: i64 = 8;
+pub const S_N_BINARY: i64 = 9;
+pub const S_N_TERNARY: i64 = 10;
+pub const S_N_RANGE: i64 = 11;
+pub const S_N_TABLE_LIT: i64 = 12;
+pub const S_N_INDEX: i64 = 13;
+pub const S_N_TUPLE_LIT: i64 = 14;
+pub const S_N_FIELD_ACCESS: i64 = 15;
+pub const S_N_PATH: i64 = 16;
+pub const S_N_TYPE_LIT: i64 = 17;
+pub const S_N_METHOD_CALL: i64 = 18;
+const S_N_TABLE_CELL: i64 = 19;
+pub const S_N_TABLE_ID: i64 = 20;
+pub const S_N_TUPLE_FIELD: i64 = 21;
+const S_N_SEGMENT: i64 = 22;
+pub const S_N_VAR_DECL: i64 = 100;
+pub const S_N_FN_DEF: i64 = 101;
+pub const S_N_EXPR_STMT: i64 = 102;
+pub const S_N_ASSIGN: i64 = 103;
+pub const S_N_RETURN: i64 = 104;
+pub const S_N_IF: i64 = 105;
+pub const S_N_WHILE: i64 = 106;
+pub const S_N_FOR: i64 = 107;
+pub const S_N_BREAK: i64 = 108;
+pub const S_N_CONTINUE: i64 = 109;
+pub const S_N_SWITCH: i64 = 110;
+pub const S_N_IMPORT: i64 = 111;
+pub const S_N_NAMESPACE: i64 = 112;
+pub const S_N_USING: i64 = 113;
+pub const S_N_STRUCT: i64 = 114;
+pub const S_N_FIELD_ASSIGN: i64 = 115;
+pub const S_N_INDEX_ASSIGN: i64 = 116;
+pub const S_N_EXTERN: i64 = 117;
+pub const S_N_PARAM: i64 = 118;
+pub const S_N_SWITCH_CASE: i64 = 120;
+const S_N_PATTERN_LIST: i64 = 121;
+pub const S_N_STMTLIST: i64 = 122;
+const S_N_CLASS_FIELD: i64 = 123;
+pub const S_N_TUPLE_TYPE_FIELD: i64 = 124;
+pub const S_N_NAMED_TYPE: i64 = 200;
+pub const S_N_TUPLE_TYPE: i64 = 201;
+pub const S_N_STRUCT_TYPE: i64 = 202;
+pub const S_N_TABLE_TYPE: i64 = 203;
+pub const S_N_MAP_TYPE: i64 = 204;
+// 泛型语法节点（2026-08-14，与 ast.tie 同号权威）：N_TYPE_PARAMS（声明点
+// 类型参数列表）/ N_TYPE_PARAM（单个类型参数）/ N_TYPE_ARGS（使用点类型
+// 实参列表）。语义层在 FnDef/Struct/Call/MethodCall/StructType 的 children
+// 头部读取「泛型槽」时用这三个常量判定（配合 sstate.slot_off 统一偏移）。
+pub const S_N_TYPE_PARAMS: i64 = 125;
+const S_N_TYPE_PARAM: i64 = 126;
+pub const S_N_TYPE_ARGS: i64 = 127;
+pub const S_N_ENUM: i64 = 128;
+pub const S_N_ENUM_VARIANT: i64 = 129;
+pub const S_N_UNSAFE_BLOCK: i64 = 130;  // unsafe 块（S1.2 U3）
+pub const S_N_ASM: i64 = 131;           // asm! 内联汇编（S1.2 I1）
+pub const S_N_TRY: i64 = 133;           // ? 后缀解包（S2.3，与 ast.tie N_TRY 同号）
+pub const S_N_PANIC: i64 = 134;         // panic 语句（S2.3，与 ast.tie N_PANIC 同号）
+pub const S_N_FN_LIT: i64 = 132;        // func 字面量（S2.2 闭包，与 ast.tie N_FN_LIT 同号）
+pub const S_N_CALL_EXPR: i64 = 148;     // 调用表达式（P2a，与 ast.tie N_CALL_EXPR 同号）
+pub const S_N_FN_TYPE: i64 = 205;       // 函数值类型（S2.2，与 ast.tie N_FN_TYPE 同号）
+pub const S_N_ARRAY_TYPE: i64 = 206;    // L1 定长数组类型（与 ast.tie N_ARRAY_TYPE 同号）
+pub const S_N_IS: i64 = 207;            // `is` 类型判定（与 ast.tie N_IS 同号，规范 §3.16）
+// S2.4 port 接口模型（与 ast.tie N_PORT/N_IMPL 同号权威）：
+//   编号 138/139：与 S3.3 宏节点（135-137）错开（整合时统一，见 ast.tie）。
+pub const S_N_PORT: i64 = 138;          // port 声明：Port[name=port 名, children=[泛型槽(-1), 方法 FnDef...]]
+pub const S_N_IMPL: i64 = 139;          // impl 块：Impl[children=[port 类型, struct 类型, 方法 FnDef...]]
+// S3.3 宏/元编程（与 ast.tie 同号）：
+pub const S_N_MACRO_DEF: i64 = 135;     // 宏定义（M3）
+pub const S_N_CODE_LIT: i64 = 136;      // 准引用字面量（C1）
+const S_N_CODE_INTERP: i64 = 137;   // 插值表达式（$x / $(expr)）
+// 一期并发 actor（与 ast.tie N_ACTOR 同号）：
+pub const S_N_ACTOR: i64 = 141;         // actor 声明：Actor[name=actor 名, aux=items 数,
+                                    //   children=[字段 ClassField..., 方法 FnDef...]]
+                                    //   （方法 async 标记经 FnDef val bit2）
+pub const S_N_RUN_ACTOR: i64 = 142;     // run 表达式（run 上下文识别，非保留字）
+// 三期 goto/标签（与 ast.tie N_GOTO_LABEL/N_GOTO 同号）：
+pub const S_N_GOTO_LABEL: i64 = 143;    // `#[tag.x]` 语句位置标签
+pub const S_N_GOTO: i64 = 144;          // `unsafe goto #x` 无条件跳转
+pub const S_N_GUARD_STMT: i64 = 153;    // p.8.2.11 guard else 早退（与 ast.tie N_GUARD_STMT 同号）
+pub const S_N_SWITCH_EXPR: i64 = 156;   // p.9.10.1 match/switch 表达式（与 ast.tie 同号）
+pub const S_N_TRY_BLOCK: i64 = 157;     // p.9.11.3 try 错误聚合块（与 ast.tie N_TRY_BLOCK 同号）
+pub const S_N_DEFER: i64 = 158;         // p.9.11.4 defer 资源释放（与 ast.tie N_DEFER 同号）
+pub const S_N_TYPE_ALIAS: i64 = 160;    // p.9.11.32 类型别名（与 ast.tie N_TYPE_ALIAS 同号）
+pub const S_N_YIELD: i64 = 161;         // p.9.11.15 yield 产出语句（与 ast.tie N_YIELD 同号）
+// p.9.13.4 块管道 `x -> { v -> expr }`（与 ast.tie N_BLOCK_PIPE 同号）。
+// tag 162：YIELD(161) 之后的首个空闲号（注意 ast.tie 里 160 被 N_TYPE_ALIAS 与
+// N_SLICE 重复占用，属既有重号，勿再复用该值）。
+pub const S_N_BLOCK_PIPE: i64 = 162;
+// p.9.11.34 语义期类型引用（与 ast.tie N_SEM_TYPE 同号）：val = 语义类型 id。
+pub const S_N_SEM_TYPE: i64 = 163;
+// 三期 A 组 guard<cap> 凭据（与 ast.tie N_GUARD_GET/N_GUARD_USE/N_GUARD_WITH 同号）
+pub const S_N_GUARD_GET: i64 = 145;     // `unsafe.get(share)` 取得凭据（表达式）
+pub const S_N_GUARD_USE: i64 = 146;     // `unsafe use g { ... }` 持证越界块
+pub const S_N_GUARD_WITH: i64 = 147;    // `unsafe with(share) { ... }` 临时凭据块
+// r.1.6.7：`unsafe.revoke(g)` 凭据撤销（与 ast.tie N_GUARD_REVOKE 同号）
+pub const S_N_GUARD_REVOKE: i64 = 149;
+namespace sstate {
+
+
+// ==================== S1.5 移动语义：变量 live/moved 状态 ====================
+// 独立升序表 lv_moved：存在即 moved（复用 bs_find 二分）。函数边界（check_fn
+// 入口）调用 lv_moved_reset 清空；赋值/按值传参/返回移动时 lv_moved_mark 登记；
+// 读取变量前 lv_moved_is 查询——moved 则报 "use of moved value"。
+// 表为独立存储（不并入 lv_* 并行表）：S1.2-1.4 并行会话在改 sinfer 的
+// lv_insert 五表同步，本表由 scheck/sinfer 额外维护，避免与该同步耦合。
+
+
+// ==================== 泛型模板登记辅助（T3b 单态化展开器预置）====================
+
+
+// ==================== S2.4 port / impl 登记辅助 ====================
+
+
+// ==================== 实例化记录辅助（T3b 单态化展开器）====================
+
+
+// v2 数组长度上限（内存安全护栏）：定长数组元素数不得超过此值——超过即拒绝，
+// 防超大数组拖垮 LLVM 后端/clang（既有已知边界 N≥65536 编译崩溃，取 2^18 作
+// 全局硬上限，留足容量池语义余量）。可调：与容量档位族共同治理。
+const MAX_ARRAY_LEN: i64 = 262144
+
+
+}
+
+// p.9.22.6：结构化输出·交叉引用侧表（零依赖叶）。置于本文件全局定义之后、
+// 分片之前——分片与其它 frontend 文件（scollect/scheck/sinfer）的函数体
+// 均在此后文本展开，先定义后使用即可命中。
+import "./xref.tie"
+
+import "./sstate_q1.tie"
+import "./sstate_q2.tie"
+import "./sstate_q3.tie"

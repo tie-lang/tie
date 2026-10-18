@@ -1,0 +1,79 @@
+type tie<class>
+// compiler/frontend/putil_q2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 putil.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace putil {
+// 消费赋值运算符；普通 = 返回 -1，复合返回对应二元 op 码，未匹配返回 -2
+pub func eat_assign_op() -> i64 {
+    var tag = peek_tag()
+    var op = -2
+    if tag == lex_eq {
+        op = -1
+    } else if tag == lex_pluseq {
+        op = B_ADD
+    } else if tag == lex_minuseq {
+        op = B_SUB
+    } else if tag == lex_stareq {
+        op = B_MUL
+    } else if tag == lex_slasheq {
+        op = B_DIV
+    } else if tag == lex_percenteq {
+        op = B_MOD
+    } else if tag == lex_percentpercenteq {
+        op = B_FLOORMOD  // p.9.11 `%%=` 取余复合赋值（与 `%%` 同运算符）
+    } else if tag == lex_backslasheq {
+        op = B_IDIV  // p.9.13.3 `\=` 整除复合赋值
+    } else if tag == lex_ampeq {
+        op = B_BITAND
+    } else if tag == lex_pipeeq {
+        op = B_BITOR
+    } else if tag == lex_careteq {
+        op = B_BITXOR
+    } else if tag == lex_shleq {
+        op = B_SHL
+    } else if tag == lex_shreq {
+        op = B_SHR
+    }
+    if op != -2 {
+        advance()
+    }
+    return op
+}
+
+// 表达式是否可寻址（字段赋值 base 校验）：Var / FieldAccess 链 / 表下标 t[i]
+//（P2a：`t[i].field = v` 读-改-写回槽；read 侧走值拷贝）。
+pub func is_addressable_base(id: i64) -> bool {
+    if id < 0 {
+        return false
+    }
+    var tag = ast.tag(id)
+    if tag == N_VAR {
+        return true
+    }
+    if tag == N_FIELD_ACCESS {
+        return is_addressable_base(ast.child_at(id, 0))
+    }
+    if tag == N_INDEX {
+        return true
+    }
+    return false
+}
+
+// 字符串前缀判断（strcmp 逐字符）
+pub func has_prefix(s: string, pre: string) -> bool {
+    var n = str_len(pre)
+    if str_len(s) < n {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) != str_char(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+}

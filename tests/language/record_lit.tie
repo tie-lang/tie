@@ -1,0 +1,95 @@
+type tie<logic>
+
+// ============================================================
+// p.9.11.5 映射/记录字面量 {k: v} 验收：
+//   - 基本构建 {name: "x", age: 3}（→ 键化表 map 模型）
+//   - 点取 rec.name 与下标取 rec["name"] 一致（均为 map_get）
+//   - 字符串键 {"k": v} 与标识符键 {k: v} 等价
+//   - 函数实参：记录字面量可直接作 map<string> 形参
+//   - 任意表达式值：value 可为嵌套字面量/调用结果等（此处值=标量表达式）
+//   - 与普通表 [a,b,c] 共存（同函数内互不干扰）
+//   - {} 空记录（空表语义，len==0）
+//
+// 花括号消歧判定（写死规则，见 pexpr.parse_record_lit / parse_primary）：
+//   表达式起始位 `{` + 首元素「标识符/字符串 + ':'」→ 记录；`}` → 空记录；
+//   其它 → 语法错误。语句位 `{` 仍是块；`expr { }` 尾随闭包不受影响。
+//
+// record 类型裁决：记录**不新建独立类型**，desugar 为键化表 map<string,V>
+//（复用既有 N_TABLE_LIT+N_TABLE_ID 字符串键 cell 路径：sinfer→map<V>、
+// irgen→s21_map 句柄）。`rec.k` 与 `rec["k"]` 一致由 map 字符串键读取保障。
+// 已知限制：「map 值 = 另一 map/表」的深嵌套记录存储受容器值槽表示约束
+// （8B 槽存 ptr 需整容器改造）——本批值限定标量/字符串/任意（any），
+// 深嵌套 map-of-map 留待容器表示升级。
+//
+// 期望输出（与 println 一一对应）：
+//   PASS build / PASS dot_sub / PASS str_key / PASS farg /
+//   PASS exprval / PASS coexist / PASS empty
+// ============================================================
+
+func full_name(m: map<string>) -> string {
+    // 函数实参：记录字面量传入，兼测点取与下标取一致
+    return m.first + ":" + m["last"]
+}
+
+func main() {
+    // 1. 基本构建 + 点取（map 字段访问）与下标取一致
+    var p = {name: "x", city: "NY"}
+    if p.name == "x" && p["name"] == "x" && p.city == "NY" && p["city"] == "NY" &&
+        len(p) == 2 {
+        println("PASS build")
+    } else {
+        println("FAIL build " + p.name)
+        exit(1)
+    }
+    // 2. 点取 / 下标取一致性对拍（map<string>；homogeneous）
+    var q = {first: "li", last: "ming"}
+    if q.first == "li" && q["first"] == "li" && q.last == "ming" && q["last"] == "ming" {
+        println("PASS dot_sub")
+    } else {
+        println("FAIL dot_sub")
+        exit(1)
+    }
+    // 3. 字符串字面量键与标识符键等价
+    var s = {"k": "v1", "j": "v2"}
+    var t = {k: "v1", j: "v2"}
+    if s["k"] == "v1" && s.j == "v2" && t["k"] == "v1" && t.j == "v2" {
+        println("PASS str_key")
+    } else {
+        println("FAIL str_key")
+        exit(1)
+    }
+    // 4. 函数实参：记录字面量直接传入 map<string> 形参
+    var who = full_name({first: "a", last: "b"})
+    if who == "a:b" {
+        println("PASS farg")
+    } else {
+        println("FAIL farg " + who)
+        exit(1)
+    }
+    // 5. 任意表达式值：value 可为标量表达式（值求值后入 map）
+    var n = {a: 1 + 1, b: 3 * 2}
+    if n.a == 2 && n.b == 6 && len(n) == 2 {
+        println("PASS exprval")
+    } else {
+        println("FAIL exprval")
+        exit(1)
+    }
+    // 6. 与普通表共存：map 记录与 [1,2,3] 数组同函数互不干扰
+    var nums = [1, 2, 3]
+    var r = {tag: "rec"}
+    if len(nums) == 3 && nums[0] == 1 && nums[2] == 3 && r.tag == "rec" &&
+        len(r) == 1 {
+        println("PASS coexist")
+    } else {
+        println("FAIL coexist")
+        exit(1)
+    }
+    // 7. 空记录 {}（须带类型标注——与空数组 [] 一致，空字面量值类型由标注定）
+    var e: map<i64> = {}
+    if len(e) == 0 {
+        println("PASS empty")
+    } else {
+        println("FAIL empty")
+        exit(1)
+    }
+}

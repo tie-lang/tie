@@ -1,0 +1,27 @@
+type tie<logic>
+// ============================================================
+// case-bind 结构回边回归（2026-10-13）：N_CASE_BIND(140) 的 child1 引用其
+// case 祖先（parser 结构回边）——§13.1 的 uw 走查曾盲目全孩子递归 ⇒ 死循环
+// 栈溢出（138k 层段错误，编译期静默崩）。修复=访问集防环（两遍独立）。
+// 本语料=最小复现形态（全局枚举 subject + case 绑定）。
+// 期望：编译成功 + 运行打印 "switch cbind 探针全过"。
+// ============================================================
+enum E5 { A(i64) B }
+pub var ge5: E5 = E5.A(9)
+func main() {
+    switch ge5 {
+        case E5.A(v):
+            if v != 9 {
+                panic("case-bind 取值失败")
+            }
+        case E5.B:
+            panic("变体错")
+    }
+    var l = E5.B
+    switch l {
+        case E5.A(v2):
+            panic("变体错 2")
+        case E5.B:
+            println("switch cbind 探针全过")
+    }
+}

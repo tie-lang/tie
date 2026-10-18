@@ -1,0 +1,453 @@
+type tie<class>
+// compiler/middle/passes_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 passes.tie。
+namespace passes {
+// 操作数取常量值：IMM 直接取；VALUE 查常量表。非常量返回 (false, 0)。
+func opnd_const(inst: i64, k: i64, const_of: table<i64>, has_const: table<bool>) -> (bool, i64) {
+    var v = ir.ins_opnd(inst, k)
+    var kind = ir.ins_opnd_kind(inst, k)
+    if kind == P_IMM {
+        return (true, v)
+    }
+    if kind == P_VAL && v >= 0 && v < len(has_const) {
+        if has_const[v] {
+            return (true, const_of[v])
+        }
+    }
+    return (false, 0)
+}
+
+// 整型算术 / icmp 的折叠与化简（单指令）。
+func fold_int(inst: i64, op: i64, rv: i64, ref const_of: table<i64>, ref has_const: table<bool>, ref repl: table<i64>) {
+    var nvals = len(has_const)
+    if rv < 0 || rv >= nvals {
+        return
+    }
+    var (ok1, a) = opnd_const(inst, 0, const_of, has_const)
+    var (ok2, b) = opnd_const(inst, 1, const_of, has_const)
+    var k0val = ir.ins_opnd(inst, 0)
+    var k0isval = ir.ins_opnd_kind(inst, 0) == P_VAL
+    // ---- 恒等式化简（②侧常量）----
+    if ok2 && k0isval {
+        if b == 0 && (op == P_ADD || op == P_SUB || op == P_OR || op == P_XOR || op == P_SHL || op == P_SHR) {
+            repl[rv] = k0val
+            return
+        }
+        if b == 1 && (op == P_MUL || op == P_DIV) {
+            repl[rv] = k0val
+            return
+        }
+        if b == 0 && (op == P_MUL || op == P_AND) {
+            ir.rewrite_to_const(inst, P_CONST_I, 0)
+            has_const[rv] = true
+            const_of[rv] = 0
+            return
+        }
+    }
+    // 0 + x → x（①侧字面 0；折叠暴露场景）
+    if op == P_ADD && ok1 && a == 0 && ir.ins_opnd_kind(inst, 0) == P_IMM {
+        if ir.ins_opnd_kind(inst, 1) == P_VAL && ir.ins_opnd(inst, 1) >= 0 && ir.ins_opnd(inst, 1) < nvals {
+            repl[rv] = ir.ins_opnd(inst, 1)
+            return
+        }
+    }
+    // ---- 双常量折叠 ----
+    if !(ok1 && ok2) {
+        return
+    }
+    var r: i64 = 0
+    var can = false
+    if op == P_ADD {
+        r = a + b
+        can = true
+    } else if op == P_SUB {
+        r = a - b
+        can = true
+    } else if op == P_MUL {
+        r = a * b
+        can = true
+    } else if op == P_DIV {
+        if b != 0 {
+            r = a / b
+            can = true
+        }
+    } else if op == P_MOD {
+        if b != 0 {
+            r = a % b
+            can = true
+        }
+    } else if op == P_AND {
+        r = a & b
+        can = true
+    } else if op == P_OR {
+        r = a | b
+        can = true
+    } else if op == P_XOR {
+        r = a ^ b
+        can = true
+    }
+    // shl/shr：tie 无移位运算符，不折叠（仅保留上面的恒等化简）
+    if !can {
+        return
+    }
+    ir.rewrite_to_const(inst, P_CONST_I, r)
+    has_const[rv] = true
+    const_of[rv] = r
+}
+
+// 符号池 id 槽判定：kind=0（VALUE）但内容是字符串池 id 的历史约定槽——
+// call(35)/extern_call(36)/call_vararg(41)/const_f(51)/const_str(62)/
+// const_global(63)/inline_asm(65) 的操作数①。值传播与 DCE 扫描必须跳过：
+// 把池 id 当值 id 替换会改写被调符号名（llvmgen 查池得错名 → 非法 declare），
+// 误标 used 会让 DCE 漏删/错保。
+func is_sym_slot(op: i64, k: i64) -> bool {
+    if k != 0 {
+        return false
+    }
+    return op == 35 || op == 36 || op == 41 || op == 51 || op == 62 || op == 63 || op == 65
+}
+
+// 替代表链压缩 + 全量回写操作数（值传播）。
+func apply_repl(ref repl: table<i64>, nvals: i64) {
+    var v: i64 = 0
+    while v < nvals {
+        var r = repl[v]
+        if r >= 0 {
+            // 跟链至终点（depth 防御环；登记序保证无环，仅防御）
+            var depth: i64 = 0
+            while r >= 0 && r < nvals && repl[r] >= 0 && depth <= nvals {
+                r = repl[r]
+                depth = depth + 1
+            }
+            repl[v] = r
+        }
+        v = v + 1
+    }
+    var total = ir.inst_count()
+    var inst: i64 = 0
+    while inst < total {
+        var op = ir.ins_op(inst)
+        var cnt = ir.ins_ops_cnt(inst)
+        var k: i64 = 0
+        while k < cnt {
+            if k == 0 && is_sym_slot(op, k) {
+                k = k + 1
+                continue
+            }
+            if ir.ins_opnd_kind(inst, k) == P_VAL {
+                var val = ir.ins_opnd(inst, k)
+                if val >= 0 && val < nvals && repl[val] >= 0 {
+                    ir.set_opnd(inst, k, repl[val], P_VAL)
+                }
+            }
+            k = k + 1
+        }
+        inst = inst + 1
+    }
+}
+
+// 纯指令判定（无副作用、删除安全）：NUM 组全纯 + CONST 组全纯 +
+// MEM 组仅 ptrtoint(24)/inttoptr(25)/bitcast(26)。
+// 不删：alloca/load/store/gep（内存）、phi（块引用）、call 族、str_cat（malloc）、
+// atomic/volatile（显式副作用）。
+func is_pure_op(op: i64) -> bool {
+    var g = ir.op_group(op)
+    if g == 0 || g == 5 {
+        return true
+    }
+    if op == 24 || op == 25 || op == 26 {
+        return true
+    }
+    return false
+}
+
+// DCE：标记无使用者的纯指令并物理压缩。compact 拒绝（孤儿指令前提不满足）
+// 时返回 0——保守放弃删除，不报错（折叠/传播效果已保留）。
+func dce() -> i64 {
+    var total = ir.inst_count()
+    var nvals = ir.value_count()
+    var used = table_new_bool()
+    var i: i64 = 0
+    while i < nvals {
+        table_push(used, false)
+        i = i + 1
+    }
+    // 函数形参保守标记（形参值可能被 llvmgen 隐式消费）
+    var nf = ir.func_count()
+    var f: i64 = 0
+    while f < nf {
+        var pc = ir.func_params_cnt(f)
+        var k: i64 = 0
+        while k < pc {
+            var pv = ir.param_val(f, k)
+            if pv >= 0 && pv < nvals {
+                used[pv] = true
+            }
+            k = k + 1
+        }
+        f = f + 1
+    }
+    // 全量扫操作数（OK_BLOCK 块引用不进 used；符号池槽跳过——池 id 不是值）
+    var inst: i64 = 0
+    while inst < total {
+        var op = ir.ins_op(inst)
+        var cnt = ir.ins_ops_cnt(inst)
+        var k: i64 = 0
+        while k < cnt {
+            if k == 0 && is_sym_slot(op, k) {
+                k = k + 1
+                continue
+            }
+            if ir.ins_opnd_kind(inst, k) == P_VAL {
+                var val = ir.ins_opnd(inst, k)
+                if val >= 0 && val < nvals {
+                    used[val] = true
+                }
+            }
+            k = k + 1
+        }
+        inst = inst + 1
+    }
+    var dead = table_new_bool()
+    var n: i64 = 0
+    inst = 0
+    while inst < total {
+        var op = ir.ins_op(inst)
+        var rv = ir.ins_val(inst)
+        var kill = false
+        if rv >= 0 && rv < nvals && !used[rv] && is_pure_op(op) {
+            kill = true
+        }
+        table_push(dead, kill)
+        if kill {
+            n = n + 1
+        }
+        inst = inst + 1
+    }
+    if n == 0 {
+        return 0
+    }
+    var rc = ir.compact_dead(dead)
+    if rc < 0 {
+        // 前提不满足（存在孤儿指令）：放弃物理删除，保守成功
+        return 0
+    }
+    return 0
+}
+
+func run_t1() -> i64 {
+    var nvals = ir.value_count()
+    var const_of = table_new_i64()
+    var has_const = table_new_bool()
+    var repl = table_new_i64()
+    var i: i64 = 0
+    while i < nvals {
+        table_push(const_of, 0)
+        table_push(has_const, false)
+        table_push(repl, 0 - 1)
+        i = i + 1
+    }
+    // A. 单遍扫描：const 登记 + 折叠/化简（定义先于使用，同序传播）
+    var total = ir.inst_count()
+    var inst: i64 = 0
+    while inst < total {
+        var op = ir.ins_op(inst)
+        var rv = ir.ins_val(inst)
+        if op == P_CONST_I {
+            if rv >= 0 && rv < nvals && ir.ins_ops_cnt(inst) >= 1 && ir.ins_opnd_kind(inst, 0) == P_IMM {
+                has_const[rv] = true
+                const_of[rv] = ir.ins_opnd(inst, 0)
+            }
+        } else if op == P_ADD || op == P_SUB || op == P_MUL || op == P_DIV || op == P_MOD ||
+            op == P_AND || op == P_OR || op == P_XOR {
+            // icmp 不折叠（2026-09-21 实证：存在 ins_ty=TK_I64 的 icmp 指令，
+            // rewrite 成 const_i 后 llvmgen 按 ins_ty 输出 i64，与 br i1 类型断裂；
+            // 常量条件由前端 consteval 与 LLVM opt 兜底，此处收益低风险高）
+            fold_int(inst, op, rv, const_of, has_const, repl)
+        }
+        inst = inst + 1
+    }
+    // B. 值传播
+    apply_repl(repl, nvals)
+    // C. 死值消除
+    return dce()
+}
+
+// 指令 CSE 签名：opcode / ty / 操作数（值+kind）织入乘法哈希（i64 wrap 无妨）。
+func cse_hash(inst: i64, op: i64) -> i64 {
+    var h = (op + 1) * 1000003 + ir.ins_ty(inst) * 31 + ir.ins_ops_cnt(inst) * 7
+    var k: i64 = 0
+    var cnt = ir.ins_ops_cnt(inst)
+    while k < cnt {
+        h = h * 1000003 + (ir.ins_opnd(inst, k) + 1) * (ir.ins_opnd_kind(inst, k) + 2)
+        k = k + 1
+    }
+    if h < 0 {
+        h = 0 - h
+        if h < 0 {
+            h = 1   // i64 最小值取负仍负（防御）
+        }
+    }
+    return h
+}
+
+// 全等比对（防哈希碰撞误合并）：opcode / ty / 逐操作数（值+kind）。
+func cse_same(a: i64, b: i64) -> bool {
+    if ir.ins_op(a) != ir.ins_op(b) || ir.ins_ty(a) != ir.ins_ty(b) {
+        return false
+    }
+    var ca = ir.ins_ops_cnt(a)
+    if ca != ir.ins_ops_cnt(b) {
+        return false
+    }
+    var k: i64 = 0
+    while k < ca {
+        if ir.ins_opnd(a, k) != ir.ins_opnd(b, k) || ir.ins_opnd_kind(a, k) != ir.ins_opnd_kind(b, k) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// 块内 CSE：重复纯指令的结果值替代为首次出现者。返回替代登记数。
+func cse_blockwise(ref repl: table<i64>, nvals: i64) -> i64 {
+    var merged: i64 = 0
+    var nb = ir.block_count()
+    var bi: i64 = 0
+    while bi < nb {
+        var s = ir.block_start(bi)
+        var e = ir.block_end(bi)
+        var n = e - s
+        if n > 1 {
+            // 块内开放寻址哈希表（容量 2 的幂，负载 < 1/2）
+            var cap = 64
+            while cap < n * 2 {
+                cap = cap * 2
+            }
+            var hkeys = table_new_i64()   // 签名（-1 = 空槽）
+            var hinst = table_new_i64()   // 首现指令 id
+            var i: i64 = 0
+            while i < cap {
+                table_push(hkeys, 0 - 1)
+                table_push(hinst, 0 - 1)
+                i = i + 1
+            }
+            var ii = s
+            while ii < e {
+                var op = ir.ins_op(ii)
+                var rv = ir.ins_val(ii)
+                if rv >= 0 && rv < nvals && is_pure_op(op) {
+                    var h = cse_hash(ii, op)
+                    var slot = h % cap
+                    var probe: i64 = 0
+                    var hit = 0 - 1
+                    while probe < cap {
+                        var kk = hkeys[slot]
+                        if kk < 0 {
+                            break   // 空槽：无匹配
+                        }
+                        if kk == h && cse_same(hinst[slot], ii) {
+                            hit = hinst[slot]
+                            break
+                        }
+                        slot = (slot + 1) % cap
+                        probe = probe + 1
+                    }
+                    if hit >= 0 {
+                        // 命中：当前指令的结果值替代为首现结果值（死指令由 DCE 清理）
+                        repl[rv] = ir.ins_val(hit)
+                        merged = merged + 1
+                    } else if probe < cap {
+                        // 空槽插入
+                        hkeys[slot] = h
+                        hinst[slot] = ii
+                    }
+                    // 探测耗尽（表满，负载 < 1/2 不可能）：放弃该指令
+                }
+                ii = ii + 1
+            }
+        }
+        bi = bi + 1
+    }
+    return merged
+}
+
+func run_t2() -> i64 {
+    var nvals = ir.value_count()
+    var repl = table_new_i64()
+    var i: i64 = 0
+    while i < nvals {
+        table_push(repl, 0 - 1)
+        i = i + 1
+    }
+    cse_blockwise(repl, nvals)
+    apply_repl(repl, nvals)
+    // appfuse：逐元素表操作循环 → 批量原语（passes_p3；见文件头）
+    var ra = appfuse()
+    if ra != 0 {
+        return ra
+    }
+    return dce()
+}
+
+// call(35) → 被调函数 id（符号名池 id 与函数名池 id 相等比较；-1 = 未找到）
+func callee_of(inst: i64) -> i64 {
+    var nid = ir.ins_opnd(inst, 0)
+    var nf = ir.func_count()
+    var f: i64 = 0
+    while f < nf {
+        if ir.func_name(f) == nid {
+            return f
+        }
+        f = f + 1
+    }
+    return 0 - 1
+}
+
+// 被调函数是否为「单块 + 唯一 ret 置于块尾 + 无 phi + 非递归 + ≤阈值」候选。
+// 单块是硬前提：多块函数（循环/分支，即使只有唯一尾置 ret，如 to_string 的
+// 循环+尾部 return）的 CFG 不能直线展开——2026-09-21 RCA：漏检块数导致
+// to_string 的循环块被拍平进调用者，块文本序错乱、空块炸 LLVM 解析。
+func inline_candidate(fid: i64, lo: i64, hi: i64, nblocks: i64) -> bool {
+    if fid < 0 || nblocks != 1 || hi - lo == 0 || hi - lo > INLINE_MAX_INSTS {
+        return false
+    }
+    var name = ir.func_name(fid)
+    var nret: i64 = 0
+    var nphi: i64 = 0
+    var ii = lo
+    while ii < hi {
+        var op = ir.ins_op(ii)
+        if op == 32 {
+            nret = nret + 1
+            if ii != hi - 1 {
+                return false   // ret 不在块尾（多语句后置返回），本版不展开
+            }
+        } else if op == 33 {
+            nphi = nphi + 1
+        }
+        ii = ii + 1
+    }
+    if nret != 1 || nphi != 0 {
+        return false
+    }
+    // 递归防护：块内任何 call 指向自己
+    ii = lo
+    while ii < hi {
+        var op = ir.ins_op(ii)
+        if op == 35 {
+            var c = callee_of(ii)
+            if c == fid {
+                return false
+            }
+            // 内联链深控制：被调者又调用候选（展开放大），只查直接递归
+        }
+        ii = ii + 1
+    }
+    return true
+}
+
+}

@@ -1,0 +1,788 @@
+// compiler/frontend/consteval.tie —— p.8.1.1 const fn 编译期求值器
+// ============================================================
+// const fn 是**纯编译期函数**：既生成普通运行期函数代码（后端照常发射），
+// 也允许在编译期常量上下文（全局标量初始化折叠）中被直接求值——静态元编程
+// 基础（编译期算表大小 / 生成常量 / 预计算）。
+//
+// 值模型（对齐 irgen.global_init_fold 元组）：(has, is_str, is_fp, intv, sid)
+//   has=false = 无法折叠（调用方保持零值语义）；is_fp 恒 false（const fn 首版
+//   不支持 f64 运算——浮点字面量/运算报失败，避免 double 位模式文本往返）。
+//   字符串值 = 去引号原文的池 id（str_unescape 同语义）；整数/布尔/字符 = intv。
+// 局部变量表（列式，名升序）：lc_keys / lc_str(0=整值 1=串值) / lc_intv / lc_sid。
+// 控制流：cv_flow（0=正常 1=return 2=break 3=continue）+ g_ret 元组。
+// 失败短路：cv_failed 置位后所有求值立即返回 false（递归深度/死循环/不支持操作）。
+// 支持子集（首版）：
+//   表达式：字面量（int/float-拒绝/bool/char/string）/ 局部变量 / 一元取负/取反 /
+//           二元（算术 + - * / % \ %%、比较 == != < > <= >=、逻辑 && ||）/ 三元 ?: /
+//           const fn 调用（递归，深度 ≤ 256）
+//   语句：var 声明 / 表达式语句 / 赋值（含复合 += -= *= /= %= \=）/ if-else /
+//         while / break / continue / return（含 void）
+//   其余（表/结构体/闭包/指针/运行时内置/for/switch）→ 失败（不折叠）。
+// ============================================================
+import "./sstate.tie"
+
+// ==================== 求值器状态（顶层全局，frontend 惯例）====================
+var lc_keys: table<i64>;
+var lc_str: table<i64>;
+var lc_intv: table<i64>;
+var lc_sid: table<i64>;
+var cv_flow: i64 = 0;
+var cv_failed: bool = false;
+var cv_depth: i64 = 0;
+var cv_ret_str: i64 = 0;
+var cv_ret_iv: i64 = 0;
+var cv_ret_sid: i64 = -1;
+const MAX_DEPTH: i64 = 256
+const MAX_LOOP: i64 = 1000000
+// env_get 输出槽（标量 ref 不支持——tie ref 仅表参数，用全局槽传递）
+var cv_out_str: i64 = 0;
+var cv_out_iv: i64 = 0;
+var cv_out_sid: i64 = -1;
+
+namespace consteval {
+
+// p.9.0-S.7 规范 §3.3：floor 整除与成对取余（编译期折叠用）。
+// 与 AOT（tig_floor_divmod）和解释器（idiv_floor_i64/floormod_i64）同一定义：
+// 先取截断结果，余数非零且与除数异号时调整一格。不用布尔 != 比较，避免
+// 依赖布尔不等运算在求值器子集里的可用性。
+func cv_idiv_floor(a: i64, b: i64) -> i64 {
+    var q = a / b
+    var r = a % b
+    if r != 0 {
+        if (r < 0 && b > 0) || (r > 0 && b < 0) {
+            return q - 1
+        }
+    }
+    return q
+}
+func cv_floormod(a: i64, b: i64) -> i64 {
+    var r = a % b
+    if r != 0 {
+        if (r < 0 && b > 0) || (r > 0 && b < 0) {
+            return r + b
+        }
+    }
+    return r
+}
+
+// 局部表重置（每次 const fn 调用进入时清空）
+func env_reset() {
+    lc_keys = table_new_i64()
+    lc_str = table_new_i64()
+    lc_intv = table_new_i64()
+    lc_sid = table_new_i64()
+}
+
+func env_find(nid: i64) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(lc_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if lc_keys[mid] == nid {
+            return mid
+        }
+        if lc_keys[mid] < nid {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// env_get 输出槽注释见文件顶部声明
+func env_get(nid: i64) -> bool {
+    var i = env_find(nid)
+    if i < 0 {
+        cv_failed = true
+        return false
+    }
+    cv_out_str = lc_str[i]
+    cv_out_iv = lc_intv[i]
+    cv_out_sid = lc_sid[i]
+    return true
+}
+func env_set(nid: i64, is_str: i64, iv: i64, sid: i64) {
+    var i = env_find(nid)
+    if i >= 0 {
+        lc_str[i] = is_str
+        lc_intv[i] = iv
+        lc_sid[i] = sid
+        return
+    }
+    // 有序插入（升序）
+    var k: i64 = 0
+    while k < len(lc_keys) && lc_keys[k] < nid {
+        k = k + 1
+    }
+    table_push(lc_keys, 0)
+    table_push(lc_str, 0)
+    table_push(lc_intv, 0)
+    table_push(lc_sid, 0)
+    var j: i64 = len(lc_keys) - 1
+    while j > k {
+        lc_keys[j] = lc_keys[j - 1]
+        lc_str[j] = lc_str[j - 1]
+        lc_intv[j] = lc_intv[j - 1]
+        lc_sid[j] = lc_sid[j - 1]
+        j = j - 1
+    }
+    lc_keys[k] = nid
+    lc_str[k] = is_str
+    lc_intv[k] = iv
+    lc_sid[k] = sid
+}
+
+// 字符字面量解码（对齐 irgen.fold_char_code：去引号 + 转义）
+func const_char_code(name_id: i64) -> i64 {
+    var raw = interner.lookup(name_id)
+    var n: i64 = str_len(raw)
+    if n >= 3 && str_char(raw, 0) == "'" && str_char(raw, n - 1) == "'" {
+        raw = slice(raw, 1, n - 1)
+    }
+    var ch: string = ""
+    var m: i64 = str_len(raw)
+    if m >= 2 && str_char(raw, 0) == "\\" {
+        var e = str_char(raw, 1)
+        if e == "n" {
+            ch = "\n"
+        } else if e == "t" {
+            ch = "\t"
+        } else if e == "r" {
+            ch = "\r"
+        } else if e == "\\" {
+            ch = "\\"
+        } else if e == "'" {
+            ch = "'"
+        } else if e == "0" {
+            var fc0 = string_builder()
+            sb_append_byte(fc0, 0)
+            ch = sb_build(fc0)
+        } else {
+            ch = e
+        }
+    } else {
+        ch = str_char(raw, 0)
+    }
+    return char_code(ch)
+}
+
+// 字符串字面量解码（去引号 + 反转义）→ 池 id（与 irgen.global_init_fold STR 分支同）
+func const_str_unescape(name_id: i64) -> i64 {
+    var raw = interner.lookup(name_id)
+    var n = str_len(raw)
+    if n >= 2 && str_char(raw, 0) == "\"" && str_char(raw, n - 1) == "\"" {
+        raw = slice(raw, 1, n - 1)
+    }
+    return intern.intern(raw)
+}
+
+// 字符串拼接（两侧均为串值）→ 池 id
+func const_str_cat(sid1: i64, sid2: i64) -> i64 {
+    var sb = string_builder()
+    var i: i64 = 0
+    var t1 = interner.lookup(sid1)
+    while i < str_len(t1) {
+        sb_append_byte(sb, str_byte(t1, i))
+        i = i + 1
+    }
+    i = 0
+    var t2 = interner.lookup(sid2)
+    while i < str_len(t2) {
+        sb_append_byte(sb, str_byte(t2, i))
+        i = i + 1
+    }
+    return intern.intern(sb_build(sb))
+}
+
+// 表达式编译期求值 → (has, is_str, is_fp, intv, sid)
+pub func eval_const_expr(id: i64) -> (bool, bool, bool, i64, i64) {
+    if cv_failed {
+        return (false, false, false, 0, -1)
+    }
+    var tag = s_tags[id]
+    if tag == 0 {
+        // INT_LIT
+        return (true, false, false, s_vals[id], -1)
+    }
+    if tag == 1 {
+        // FLOAT_LIT：const fn 首版不支持 f64 运算
+        cv_failed = true
+        return (false, false, false, 0, -1)
+    }
+    if tag == 2 {
+        // STR_LIT
+        return (true, true, false, 0, const_str_unescape(s_names[id]))
+    }
+    if tag == 3 {
+        // CHAR_LIT
+        return (true, false, false, const_char_code(s_names[id]), -1)
+    }
+    if tag == 4 {
+        // BOOL_LIT（0/1）
+        return (true, false, false, s_vals[id], -1)
+    }
+    if tag == 6 {
+        // VAR：局部变量
+        var nid = intern.intern(sstate.name_str(id))
+        var es: i64 = 0
+        var ei: i64 = 0
+        var esid: i64 = -1
+        if !env_get(nid) {
+            return (false, false, false, 0, -1)
+        }
+        es = cv_out_str
+        ei = cv_out_iv
+        esid = cv_out_sid
+        return (true, es == 1, false, ei, esid)
+    }
+    if tag == 7 {
+        // CALL：const fn 调用（实参逐一折叠）
+        var fnm = sstate.name_str(id)
+        // 实参收集（children 从 slot_off 起）
+        var off = sstate.slot_off(id)
+        var nc = sstate.nchild(id) - off
+        var a_str: table<i64> = table_new_i64()
+        var a_iv: table<i64> = table_new_i64()
+        var a_sid: table<i64> = table_new_i64()
+        var k: i64 = 0
+        while k < nc {
+            var (h, hs, hf, iv, sid) = eval_const_expr(sstate.child(id, off + k))
+            if !h {
+                return (false, false, false, 0, -1)
+            }
+            table_push(a_str, hs == true ? 1 : 0)
+            table_push(a_iv, iv)
+            table_push(a_sid, sid)
+            k = k + 1
+        }
+        return eval_const_call(fnm, a_str, a_iv, a_sid)
+    }
+    if tag == 8 {
+        // UNARY：U_NEG=0（整数取负）、U_NOT=1（布尔取反）
+        var op = s_vals[id]
+        var (h, hs, hf, iv, sid) = eval_const_expr(sstate.child(id, 0))
+        if !h {
+            return (false, false, false, 0, -1)
+        }
+        if op == 0 {
+            if hs {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, 0 - iv, -1)
+        }
+        if op == 1 {
+            if hs {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, iv == 0 ? 1 : 0, -1)
+        }
+        if op == U_BIT_NOT {
+            if hs {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, 0 - iv - 1, -1)
+        }
+        cv_failed = true
+        return (false, false, false, 0, -1)
+    }
+    if tag == 9 {
+        // BINARY：算术/比较/逻辑（对齐 B_* 码）
+        var op = s_vals[id]
+        var (h1, s1, f1, i1, d1) = eval_const_expr(sstate.child(id, 0))
+        var (h2, s2, f2, i2, d2) = eval_const_expr(sstate.child(id, 1))
+        if !h1 || !h2 {
+            return (false, false, false, 0, -1)
+        }
+        if op == 0 {
+            // B_ADD：字符串拼接 / 整数加法
+            if s1 && s2 {
+                return (true, true, false, 0, const_str_cat(d1, d2))
+            }
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 + i2, -1)
+        }
+        if op == 1 {
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 - i2, -1)
+        }
+        if op == 2 {
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 * i2, -1)
+        }
+        if op == 3 {
+            if s1 || s2 || i2 == 0 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 / i2, -1)
+        }
+        if op == 4 {
+            if s1 || s2 || i2 == 0 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 % i2, -1)
+        }
+        // p.9.0-S.7 整除 `\`（规范 §3.3：向下取整的商）
+        if op == 24 {
+            if s1 || s2 || i2 == 0 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, cv_idiv_floor(i1, i2), -1)
+        }
+        // p.9.0-S.7 成对取余 `%%`（与 `\` 配对，余数符号跟随除数）
+        if op == 26 {
+            if s1 || s2 || i2 == 0 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, cv_floormod(i1, i2), -1)
+        }
+        if op == 5 {
+            // B_EQ：整数相等 / 字符串同文（池 id 相同）
+            if s1 || s2 {
+                if s1 && s2 {
+                    return (true, false, false, d1 == d2 ? 1 : 0, -1)
+                }
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 == i2 ? 1 : 0, -1)
+        }
+        if op == 6 {
+            // B_NOTEQ
+            if s1 || s2 {
+                if s1 && s2 {
+                    return (true, false, false, d1 != d2 ? 1 : 0, -1)
+                }
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 != i2 ? 1 : 0, -1)
+        }
+        if op == 7 {
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 < i2 ? 1 : 0, -1)
+        }
+        if op == 8 {
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 > i2 ? 1 : 0, -1)
+        }
+        if op == 9 {
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 <= i2 ? 1 : 0, -1)
+        }
+        if op == 10 {
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 >= i2 ? 1 : 0, -1)
+        }
+        if op == 11 {
+            // B_AND（短路）
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, (i1 != 0 && i2 != 0) ? 1 : 0, -1)
+        }
+        if op == 12 {
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, (i1 != 0 || i2 != 0) ? 1 : 0, -1)
+        }
+        // p.9.23 缺陷修复（D1）：位运算与移位此前**无分支**，落 cv_failed →
+        // 调用方按「未折叠」静默取 0（`const A: i64 = 1 << 4` 得 0，无诊断）。
+        // 补齐 B_BITAND(13)/B_BITOR(14)/B_BITXOR(15)/B_SHL(16)/B_SHR(17)；
+        // 位移量越界（<0 或 >=64）为 UB，一律不折叠。
+        if op == 13 {
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 & i2, -1)
+        }
+        if op == 14 {
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 | i2, -1)
+        }
+        if op == 15 {
+            if s1 || s2 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 ^ i2, -1)
+        }
+        if op == 16 {
+            if s1 || s2 || i2 < 0 || i2 >= 64 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 << i2, -1)
+        }
+        if op == 17 {
+            if s1 || s2 || i2 < 0 || i2 >= 64 {
+                cv_failed = true
+                return (false, false, false, 0, -1)
+            }
+            return (true, false, false, i1 >> i2, -1)
+        }
+        cv_failed = true
+        return (false, false, false, 0, -1)
+    }
+    if tag == 10 {
+        // N_TERNARY：cond ? a : b
+        var (h0, s0, f0, i0, d0) = eval_const_expr(sstate.child(id, 0))
+        if !h0 || s0 {
+            cv_failed = true
+            return (false, false, false, 0, -1)
+        }
+        return eval_const_expr(sstate.child(id, i0 != 0 ? 1 : 2))
+    }
+    // 其余表达式（表/结构体/闭包/指针/运行时内置等）→ 失败
+    cv_failed = true
+    return (false, false, false, 0, -1)
+}
+
+// 语句执行：返回 0 正常 / -1 失败（cv_failed 已置位）
+func exec_stmt(st: i64) -> i64 {
+    if cv_failed {
+        return -1
+    }
+    var tag = s_tags[st]
+    if tag == 100 {
+        // N_VAR_DECL：局部变量声明（初始化表达式必须可折叠）
+        var init = sstate.child(st, 1)
+        if init < 0 {
+            cv_failed = true
+            return -1
+        }
+        var (h, hs, hf, iv, sid) = eval_const_expr(init)
+        if !h {
+            return -1
+        }
+        env_set(intern.intern(sstate.name_str(st)), hs == true ? 1 : 0, iv, sid)
+        return 0
+    }
+    if tag == 102 {
+        // N_EXPR_STMT：表达式语句（求值丢弃；const fn 调用副作用 = 纯计算）
+        var e = sstate.child(st, 0)
+        var (h, hs, hf, iv, sid) = eval_const_expr(e)
+        if !h {
+            return -1
+        }
+        return 0
+    }
+    if tag == 103 {
+        // N_ASSIGN：普通/复合赋值（目标为局部变量）
+        var name = s_names[st]
+        var op = s_vals[st]
+        var vnode = sstate.child(st, 0)
+        var (h, hs, hf, iv, sid) = eval_const_expr(vnode)
+        if !h {
+            return -1
+        }
+        var nid = intern.intern(sstate.name_str(st))
+        var cur_str: i64 = 0
+        var cur_iv: i64 = 0
+        var cur_sid: i64 = -1
+        if !env_get(nid) {
+            return -1
+        }
+        cur_str = cv_out_str
+        cur_iv = cv_out_iv
+        cur_sid = cv_out_sid
+        if op < 0 {
+            // 普通 '='：直接覆盖
+            env_set(nid, hs == true ? 1 : 0, iv, sid)
+            return 0
+        }
+        // 复合赋值（+= 0 -= 1 *= 2 /= 3 %= 4；目标必须整值）
+        if hs || cur_str == 1 {
+            cv_failed = true
+            return -1
+        }
+        var nv: i64 = 0
+        if op == 0 {
+            nv = cur_iv + iv
+        } else if op == 1 {
+            nv = cur_iv - iv
+        } else if op == 2 {
+            nv = cur_iv * iv
+        } else if op == 3 {
+            if iv == 0 {
+                cv_failed = true
+                return -1
+            }
+            nv = cur_iv / iv
+        } else if op == 24 {
+            // p.9.0-S.7 `\=`：floor 整除（规范 §3.3）
+            if iv == 0 {
+                cv_failed = true
+                return -1
+            }
+            nv = cv_idiv_floor(cur_iv, iv)
+        } else if op == 4 {
+            if iv == 0 {
+                cv_failed = true
+                return -1
+            }
+            nv = cur_iv % iv
+        } else if op == 26 {
+            // p.9.11 `%%=`：floor 取余复合赋值（与二元 %% 同语义，规范 §3.3）
+            if iv == 0 {
+                cv_failed = true
+                return -1
+            }
+            nv = cv_floormod(cur_iv, iv)
+        } else {
+            cv_failed = true
+            return -1
+        }
+        env_set(nid, 0, nv, -1)
+        return 0
+    }
+    if tag == 104 {
+        // N_RETURN
+        var e = sstate.child(st, 0)
+        if e < 0 {
+            cv_flow = 1
+            return 0
+        }
+        var (h, hs, hf, iv, sid) = eval_const_expr(e)
+        if !h {
+            return -1
+        }
+        cv_ret_str = hs == true ? 1 : 0
+        cv_ret_iv = iv
+        cv_ret_sid = sid
+        cv_flow = 1
+        return 0
+    }
+    if tag == 105 {
+        // N_IF：children=[cond, then_list, else_list]
+        var (h, hs, hf, iv, sid) = eval_const_expr(sstate.child(st, 0))
+        if !h || hs {
+            cv_failed = true
+            return -1
+        }
+        var br: i64 = sstate.child(st, 1)
+        if iv == 0 {
+            br = sstate.child(st, 2)
+        }
+        // 条件为假且源码没写 else（else 槽 = -1）：无语句可执行。
+        if br < 0 {
+            return 0
+        }
+        var nb = sstate.nchild(br)
+        var i: i64 = 0
+        while i < nb {
+            var r = exec_stmt(sstate.child(br, i))
+            if r < 0 {
+                return -1
+            }
+            if cv_flow != 0 {
+                break
+            }
+            i = i + 1
+        }
+        return 0
+    }
+    if tag == 106 {
+        // N_WHILE：children=[cond, body]
+        var cond = sstate.child(st, 0)
+        var body = sstate.child(st, 1)
+        var guard: i64 = 0
+        while cv_flow == 0 {
+            guard = guard + 1
+            if guard > MAX_LOOP {
+                cv_failed = true
+                return -1
+            }
+            var (h, hs, hf, iv, sid) = eval_const_expr(cond)
+            if !h || hs {
+                cv_failed = true
+                return -1
+            }
+            if iv == 0 {
+                break
+            }
+            var nb = sstate.nchild(body)
+            var i: i64 = 0
+            while i < nb {
+                var r = exec_stmt(sstate.child(body, i))
+                if r < 0 {
+                    return -1
+                }
+                if cv_flow != 0 {
+                    break
+                }
+                i = i + 1
+            }
+            if cv_flow == 2 {
+                cv_flow = 0
+                break
+            }
+            if cv_flow == 3 {
+                cv_flow = 0
+            }
+        }
+        return 0
+    }
+    if tag == 108 {
+        // N_BREAK
+        cv_flow = 2
+        return 0
+    }
+    if tag == 109 {
+        // N_CONTINUE
+        cv_flow = 3
+        return 0
+    }
+    cv_failed = true
+    return -1
+}
+
+// 执行函数体（N_STMTLIST 或块）：返回 0 / -1
+func exec_body(stmts: i64) -> i64 {
+    var nb = sstate.nchild(stmts)
+    var i: i64 = 0
+    while i < nb {
+        var r = exec_stmt(sstate.child(stmts, i))
+        if r < 0 {
+            return -1
+        }
+        if cv_flow != 0 {
+            break
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// const fn 调用求值：fnm = 解析后全名（与 sstate.fn_def_node 同键）。
+// a_str/a_iv/a_sid 为实参平行表（a_str[i]=1 串值 / 0 整值）。返回值同元组。
+// 入口须先检查调用方折叠上下文（fn 非 const / 未定义 → 返回 false）。
+pub func eval_const_call(fnm: string, a_str: table<i64>, a_iv: table<i64>, a_sid: table<i64>) -> (bool, bool, bool, i64, i64) {
+    if cv_failed {
+        return (false, false, false, 0, -1)
+    }
+    cv_depth = cv_depth + 1
+    if cv_depth > MAX_DEPTH {
+        cv_failed = true
+        return (false, false, false, 0, -1)
+    }
+    // 查函数定义节点 + const 标志（val bit4）
+    var fnode = sstate.fn_def_node(fnm)
+    if fnode < 0 {
+        cv_failed = true
+        return (false, false, false, 0, -1)
+    }
+    if (s_vals[fnode] & 16) == 0 {
+        // 非 const fn：编译期不可求值
+        cv_failed = true
+        return (false, false, false, 0, -1)
+    }
+    // 参数绑定：children = [泛型槽, 返回类型, 参数..., 函数体]
+    var nparams = s_aux[fnode]
+    var nc = sstate.nchild(fnode)
+    if len(a_str) != nparams || nc < 2 + nparams {
+        cv_failed = true
+        return (false, false, false, 0, -1)
+    }
+    // 保存调用方局部表（递归重入）
+    var save_keys = lc_keys
+    var save_str = lc_str
+    var save_iv = lc_intv
+    var save_sid = lc_sid
+    var save_flow = cv_flow
+    var save_ret_str = cv_ret_str
+    var save_ret_iv = cv_ret_iv
+    var save_ret_sid = cv_ret_sid
+    env_reset()
+    cv_flow = 0
+    var p: i64 = 0
+    while p < nparams {
+        var pnode = sstate.child(fnode, 2 + p)
+        env_set(intern.intern(sstate.name_str(pnode)), a_str[p], a_iv[p], a_sid[p])
+        p = p + 1
+    }
+    var body = sstate.child(fnode, 2 + nparams)
+    var r = exec_body(body)
+    var ok: bool = false
+    var res_str: i64 = 0
+    var res_iv: i64 = 0
+    var res_sid: i64 = -1
+    if r == 0 && cv_failed == false {
+        if cv_flow == 1 {
+            ok = true
+            res_str = cv_ret_str
+            res_iv = cv_ret_iv
+            res_sid = cv_ret_sid
+        } else {
+            // 函数体贯穿（无 return）→ 编译期视为无值：失败
+            cv_failed = true
+        }
+    }
+    // 恢复调用方环境
+    lc_keys = save_keys
+    lc_str = save_str
+    lc_intv = save_iv
+    lc_sid = save_sid
+    cv_flow = save_flow
+    cv_ret_str = save_ret_str
+    cv_ret_iv = save_ret_iv
+    cv_ret_sid = save_ret_sid
+    cv_depth = cv_depth - 1
+    if ok {
+        return (true, res_str == 1, false, res_iv, res_sid)
+    }
+    return (false, false, false, 0, -1)
+}
+
+// 是否正处于 const fn 求值会话中（顶层折叠调用方据此决定是否重置全局状态）
+pub func in_session() -> bool {
+    return cv_depth > 0
+}
+
+// 全局状态重置（编译单文件前调用，防跨文件残留）
+pub func consteval_reset() {
+    cv_flow = 0
+    cv_failed = false
+    cv_depth = 0
+    cv_ret_str = 0
+    cv_ret_iv = 0
+    cv_ret_sid = -1
+    env_reset()
+}
+
+}

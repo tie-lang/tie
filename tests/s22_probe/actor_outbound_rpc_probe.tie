@@ -1,0 +1,26 @@
+type tie<tsc>
+
+// 最小拓扑：actor 方法内 run 另一 actor + 出站同步 RPC（无 quick、无 reentrant）
+
+actor B {
+    pub func val() -> i64 { return 5 }
+}
+
+actor A {
+    var marks: i64
+    pub async func slow() {
+        var b = run B()
+        var r = b.val()
+        marks = r
+    }
+    pub func getmarks() -> i64 { return marks }
+}
+
+func main() -> i64 {
+    var a = run A()
+    a.slow()
+    var i: i64 = 0
+    while i < 200000000 { i = i + 1 }
+    println("marks=" + to_string(a.getmarks()))
+    return 0
+}

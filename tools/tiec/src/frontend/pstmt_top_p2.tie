@@ -1,0 +1,678 @@
+type tie<class>
+// compiler/frontend/pstmt_top_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 pstmt_top.tie。
+namespace pstmt_top {
+// 命名空间声明：
+//   `namespace tcmsg { ... }` / `namespace tcmsg.error { ... }`（块式）
+//   `namespace tcmsg` / `namespace tcmsg;`（单文件模式，2026-08-14）：无 '{'，
+//     文件其余全部顶层语句（直到 EOF）归入该命名空间；其中再遇 namespace
+//     声明（块式或单文件式）递归嵌套。
+func parse_namespace() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // namespace
+    var segs: table<i64> = table_new_i64()
+    var s = putil.expect_ident()
+    if s < 0 {
+        return -1
+    }
+    table_push(segs, s)
+    while putil.eat(lex_dot) {
+        s = putil.expect_ident()
+        if s < 0 {
+            return -1
+        }
+        table_push(segs, s)
+    }
+    var body_stmts: table<i64> = table_new_i64()
+    var done = false
+    if putil.peek_tag() == lex_lbrace {
+        // ---- 块式：{ ... } ----
+        putil.advance()
+        while !done {
+            var tag = putil.peek_tag()
+            if tag == lex_rbrace {
+                putil.advance()
+                done = true
+            } else if tag == lex_eof {
+                if !putil.expect(lex_rbrace, "命名空间声明必须跟 '}'") {
+                    return -1
+                }
+                done = true
+            } else if tag == lex_func {
+                var st = parse_fn_def()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_pub {
+                // p.9.21.5 II2：pub func / pub const（val bit1 = ispub，
+                // 常量可见性跟随 L1 梯度）；2026-10-13 增 pub var；
+                // 其余 pub 形态落到 parse_fn_def
+                if putil.peek_n(1) == lex_const {
+                    putil.advance()   // pub
+                    var sc = pstmt.parse_var_decl(1)
+                    if sc < 0 {
+                        return -1
+                    }
+                    ast.set_val(sc, ast.val(sc) + 2)   // val bit1 = ispub
+                    table_push(body_stmts, sc)
+                } else if putil.peek_n(1) == lex_var {
+                    putil.advance()   // pub
+                    var sv = pstmt.parse_var_decl(0)
+                    if sv < 0 {
+                        return -1
+                    }
+                    ast.set_val(sv, ast.val(sv) + 2)   // val bit1 = ispub
+                    table_push(body_stmts, sv)
+                } else {
+                    var st = parse_fn_def()
+                    if st < 0 {
+                        return -1
+                    }
+                    table_push(body_stmts, st)
+                }
+            } else if tag == lex_var {
+                // 命名空间内私有全局变量（var，不导出）；pub var 走上一个分支。
+                // collect_ns 以 ns_full_name 登记为 "ns::name"（模块私有）。
+                var sv = pstmt.parse_var_decl(0)
+                if sv < 0 {
+                    return -1
+                }
+                table_push(body_stmts, sv)
+            } else if tag == lex_unsafe {
+                // S1.2：unsafe fn / unsafe extern（按下一 token 分派）
+                var nxtb = putil.peek_n(1)
+                if nxtb == lex_extern {
+                    var st = parse_extern()
+                    if st < 0 {
+                        return -1
+                    }
+                    table_push(body_stmts, st)
+                } else {
+                    var st = parse_fn_def()
+                    if st < 0 {
+                        return -1
+                    }
+                    table_push(body_stmts, st)
+                }
+            } else if tag == lex_repr {
+                var st = parse_struct()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_struct {
+                var st = parse_struct()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_actor {
+                // 一期并发：命名空间内 actor 声明
+                var st = parse_actor()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_enum {
+                var st = parse_enum()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_port {
+                // S2.4：命名空间内 port 声明
+                var st = parse_port()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_interface {
+                // p.9.11.21：命名空间内 interface 声明（结构性接口）
+                var st = parse_interface()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_impl {
+                // S2.4：命名空间内 impl 块
+                var st = parse_impl()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_namespace {
+                var st = parse_namespace()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_const {
+                // p.9.12.4：`const fn` / `const func`（命名空间内）→ const fn 定义；
+                // 否则 const 命名空间常量（以 ns::NAME 全名登记全局符号，
+                // 语义/IR 复用顶层 const 全局通道；引用端 ns::NAME / 裸名 + 前缀补全）
+                if putil.peek_lexeme_n(1) == "fn" || putil.peek_lexeme_n(1) == "func" {
+                    var st = parse_fn_def()
+                    if st < 0 {
+                        return -1
+                    }
+                    table_push(body_stmts, st)
+                } else {
+                    var st = pstmt.parse_var_decl(1)
+                    if st < 0 {
+                        return -1
+                    }
+                    table_push(body_stmts, st)
+                }
+            } else {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "命名空间体内只允许函数定义、类定义或嵌套命名空间，实际是 " + putil.describe(tag))
+                return -1
+            }
+        }
+    } else {
+        // ---- 单文件模式：无 '{'，剩余全部顶层语句归入（直到 EOF） ----
+        // 行尾分号（ASI 补全或显式 `namespace foo;`）与本模式等价，直接吞掉
+        putil.eat(lex_semi)
+        while !done {
+            var tag = putil.peek_tag()
+            if tag == lex_eof {
+                done = true
+            } else if tag == lex_pub {
+                // pub 后：pub func / pub import / p.9.21.5 II2 pub const /
+                // 2026-10-13 pub var（val bit1 = ispub，跨文件引用须 pub）
+                if putil.peek_n(1) == lex_import {
+                    var st = parse_import()
+                    if st < 0 {
+                        return -1
+                    }
+                    table_push(body_stmts, st)
+                } else if putil.peek_n(1) == lex_const {
+                    putil.advance()   // pub
+                    var sc = pstmt.parse_var_decl(1)
+                    if sc < 0 {
+                        return -1
+                    }
+                    ast.set_val(sc, ast.val(sc) + 2)   // val bit1 = ispub
+                    table_push(body_stmts, sc)
+                } else if putil.peek_n(1) == lex_var {
+                    putil.advance()   // pub
+                    var sv = pstmt.parse_var_decl(0)
+                    if sv < 0 {
+                        return -1
+                    }
+                    ast.set_val(sv, ast.val(sv) + 2)   // val bit1 = ispub
+                    table_push(body_stmts, sv)
+                } else {
+                    var st = parse_fn_def()
+                    if st < 0 {
+                        return -1
+                    }
+                    table_push(body_stmts, st)
+                }
+            } else if tag == lex_func {
+                var st = parse_fn_def()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_unsafe {
+                // S1.2：unsafe fn / unsafe extern（按下一 token 分派）
+                var nxts = putil.peek_n(1)
+                if nxts == lex_extern {
+                    var st = parse_extern()
+                    if st < 0 {
+                        return -1
+                    }
+                    table_push(body_stmts, st)
+                } else {
+                    var st = parse_fn_def()
+                    if st < 0 {
+                        return -1
+                    }
+                    table_push(body_stmts, st)
+                }
+            } else if tag == lex_repr {
+                var st = parse_struct()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_import {
+                var st = parse_import()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_using {
+                var st = parse_using()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_struct {
+                var st = parse_struct()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_actor {
+                // 一期并发：命名空间内 actor 声明
+                var st = parse_actor()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_enum {
+                var st = parse_enum()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_port {
+                // S2.4：命名空间内 port 声明
+                var st = parse_port()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_interface {
+                // p.9.11.21：命名空间内 interface 声明（结构性接口）
+                var st = parse_interface()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_impl {
+                // S2.4：命名空间内 impl 块
+                var st = parse_impl()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_namespace {
+                var st = parse_namespace()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_extern {
+                var st = parse_extern()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_var {
+                var st = pstmt.parse_var_decl(0)
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_const {
+                // p.8.1.1：`const fn` / `const func`（命名空间内）→ const fn 定义；
+                // 否则 const 全局变量
+                if putil.peek_lexeme_n(1) == "fn" || putil.peek_lexeme_n(1) == "func" {
+                    var st = parse_fn_def()
+                    if st < 0 {
+                        return -1
+                    }
+                    table_push(body_stmts, st)
+                } else {
+                    var st = pstmt.parse_var_decl(1)
+                    if st < 0 {
+                        return -1
+                    }
+                    table_push(body_stmts, st)
+                }
+            } else {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、enum、命名空间声明、extern 声明或全局变量，实际是 " + putil.describe(tag))
+                return -1
+            }
+        }
+    }
+    var n = ast.new_node(N_NAMESPACE, -1, -1, len(segs), line, col)
+    var kids: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < len(segs) {
+        table_push(kids, ast.new_node(N_SEGMENT, segs[i], -1, -1, line, col))
+        i = i + 1
+    }
+    table_push(kids, ast.new_node(N_STMTLIST, -1, -1, -1, line, col))
+    ast.set_children(n, kids)
+    // 最后一个子节点（body StmtList）填充体语句
+    ast.set_children(ast.child_at(n, len(segs)), body_stmts)
+    return n
+}
+
+// extern 函数声明（T0.7）：`[unsafe] extern fn name(a: i64, b: string) -> bool;`
+// S1.2 E3：extern 声明必须带 unsafe 标注（val = 1），调用必须在 unsafe 上下文。
+func parse_extern() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var unsafe_flag: i64 = 0
+    if putil.peek_tag() == lex_unsafe {
+        unsafe_flag = 1
+        putil.advance()
+    }
+    putil.advance()   // extern
+    if putil.peek_tag() == lex_ident {
+        if putil.peek_lexeme() == "fn" {
+            putil.advance()
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "extern 声明必须跟 'fn'，实际是 " + putil.describe(lex_ident))
+            return -1
+        }
+    } else {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "extern 声明必须跟 'fn'，实际是 " + putil.describe(putil.peek_tag()))
+        return -1
+    }
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    if !putil.eat(lex_rparen) {
+        var d = false
+        while !d {
+            var pname = putil.expect_ident()
+            if pname < 0 {
+                return -1
+            }
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var pty = pexpr_type.parse_type()
+            if pty < 0 {
+                return -1
+            }
+            var p = ast.new_node(N_PARAM, pname, 0, -1, putil.peek_line(), putil.peek_col())
+            var pkids: table<i64> = table_new_i64()
+            table_push(pkids, pty)
+            table_push(pkids, -1)
+            ast.set_children(p, pkids)
+            table_push(params, p)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    var ret_ty = -1
+    if putil.eat(lex_arrow) {
+        ret_ty = pexpr_type.parse_type()
+        if ret_ty < 0 {
+            return -1
+        }
+    } else {
+        ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), 14, -1, line, col)
+    }
+    if !putil.expect(lex_semi, "extern 声明结束的分号") {
+        return -1
+    }
+    var e = ast.new_node(N_EXTERN, name, unsafe_flag, len(params), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ret_ty)
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    ast.set_children(e, kids)
+    return e
+}
+
+// 类型参数列表（声明点）：`<T1, T2, ...>` → N_TYPE_PARAMS 节点
+// （children = N_TYPE_PARAM 序列，每个 name 字段 = 类型参数名）。
+// S2.4 泛型约束：`<T: Drawable>` —— N_TYPE_PARAM 增加 children：
+// [约束类型节点或 -1]（第一版单约束：`T: Port`；多约束后置，见
+// port-model.md §2.3）。约束类型节点 = pexpr_type.parse_type 产出的
+// N_STRUCT_TYPE（语义层校验必须是已登记的 port）。
+// 前提：当前 peek 为 '<'（函数名/struct 名后）。函数/struct 名后的 '<'
+// 一定是类型参数列表（非泛型场景不存在），解析失败直接报错，不做 try 回退。
+// p.9.11.32 类型别名：`alias Name = TypeNode;` / `alias Pair<T, U> = (T, U);`
+// 纯透明别名：无新类型、无标称区分，语义层（sgen.parse_generic_type_node）
+// 命中别名注册表时展开替换为目标类型（泛型别名做形参代换）。
+// 产出 N_TYPE_ALIAS[name=别名, children=[类型参数(-1 或 N_TYPE_PARAMS), 目标类型节点]]。
+func parse_alias() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // alias
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    var tparams = -1
+    if putil.peek_tag() == lex_lt {
+        tparams = parse_type_params()
+        if tparams < 0 {
+            return -1
+        }
+    }
+    if !putil.expect(lex_eq, "'='") {
+        return -1
+    }
+    var target = pexpr_type.parse_type()
+    if target < 0 {
+        return -1
+    }
+    if !putil.expect_stmt_end() {
+        return -1
+    }
+    var n = ast.new_node(N_TYPE_ALIAS, name, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, tparams)
+    table_push(kids, target)
+    ast.set_children(n, kids)
+    return n
+}
+
+func parse_type_params() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    if !putil.expect(lex_lt, "'<'") {
+        return -1
+    }
+    var ps: table<i64> = table_new_i64()
+    var p = putil.expect_ident()
+    if p < 0 {
+        return -1
+    }
+    table_push(ps, parse_type_param_one(p, line, col))
+    while putil.eat(lex_comma) {
+        p = putil.expect_ident()
+        if p < 0 {
+            return -1
+        }
+        table_push(ps, parse_type_param_one(p, line, col))
+    }
+    if !putil.expect_type_gt("类型参数列表后需 '>'") {
+        return -1
+    }
+    // p.8.2.6 泛型糖之一：**约束简化**。`<T, U: Drawable>` 一条约束作用于
+    // 从上一个约束组之后到当前参数的所有未约束参数（含当前）——不必为每个
+    // 参数重复书写 `T: Drawable`。纯书写糖，导出 AST 形态与逐参数写约束
+    // 完全一致（为回填参数克隆同名的 N_STRUCT_TYPE 约束节点，不共享节点 id，
+    // 保持 AST 为严格树）。向后兼容：无共享场景时此回填恒为空操作。
+    //   `<A: X, B: Y>`   → A:X, B:Y        （各自约束，不变）
+    //   `<T, U: Drawable>` → T:Drawable, U:Drawable （U 的约束回填到 T）
+    //   `<A: X, B, C: Y>` → A:X, B:Y, C:Y  （B 继承最近约束 Y）
+    var lastc: i64 = -1
+    var i: i64 = 0
+    while i < len(ps) {
+        var pp = ps[i]
+        if ast.tag(pp) == N_TYPE_PARAM && ast.child_count(pp) > 0 {
+            var c0 = ast.child_at(pp, 0)
+            if c0 >= 0 {
+                var k = lastc + 1
+                while k < i {
+                    var q = ps[k]
+                    // v2：值参数（val==1）是整型容量参数，不接受 port 约束回填
+                    if ast.tag(q) == N_TYPE_PARAM && ast.child_count(q) > 0 && ast.child_at(q, 0) < 0 && ast.val(q) == 0 {
+                        var qd = -1
+                        if ast.child_count(q) > 1 {
+                            qd = ast.child_at(q, 1)
+                        }
+                        // 克隆约束节点（N_STRUCT_TYPE 同名 + children=[-1] 槽），
+                        // 避免多父共享同一 AST 节点 id
+                        var nid = ast.name(c0)
+                        var clone = ast.new_node(N_STRUCT_TYPE, nid, -1, -1, ast.line(q), ast.col(q))
+                        var kk: table<i64> = table_new_i64()
+                        table_push(kk, -1)
+                        ast.set_children(clone, kk)
+                        var qkids: table<i64> = table_new_i64()
+                        table_push(qkids, clone)
+                        table_push(qkids, qd)
+                        ast.set_children(q, qkids)
+                    }
+                    k = k + 1
+                }
+                lastc = i
+            }
+        }
+        i = i + 1
+    }
+    var n = ast.new_node(N_TYPE_PARAMS, -1, -1, -1, line, col)
+    ast.set_children(n, ps)
+    return n
+}
+
+// p.8.1.3 显式特化实参列表：`<i64>` / `<i64, string>` / `<table<i64>>` → N_TYPE_ARGS
+//（与调用点显式类型实参同节点形态；语义层 collect_fn 按 N_TYPE_ARGS 槽识别特化）
+// 值参数（v2）：整型字面量实参 `<1280>`（N_INT_LIT）与类型实参同表混排；语义层
+// 按模板参数 kind 分流。注：常量名值实参 `<CAP_X>` 一期不支持（用字面量；常量名
+// 限于默认值处使用），避免与单标识符类型实参（`<Foo>`）在解析层产生歧义。
+func parse_fn_spec_args() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    if !putil.expect(lex_lt, "'<'") {
+        return -1
+    }
+    var kids: table<i64> = table_new_i64()
+    var d = false
+    while !d {
+        if putil.peek_tag() == lex_int {
+            var vline = putil.peek_line()
+            var vcol = putil.peek_col()
+            if putil.int_lit_overflow(putil.peek_lexeme()) {
+                putil.set_err(vline, vcol, "值实参超出 i64 可表示范围")
+                return -1
+            }
+            var nv = putil.parse_int_lit(putil.peek_lexeme())
+            putil.advance()
+            var nn = ast.new_node(N_INT_LIT, -1, nv, -1, vline, vcol)
+            table_push(kids, nn)
+        } else {
+            var t = pexpr_type.parse_type()
+            if t < 0 {
+                return -1
+            }
+            table_push(kids, t)
+        }
+        if putil.eat(lex_comma) {
+            // 继续
+        } else {
+            if !putil.expect_type_gt("类型实参列表后需 '>'") {
+                return -1
+            }
+            d = true
+        }
+    }
+    var n = ast.new_node(N_TYPE_ARGS, -1, -1, -1, line, col)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 单个类型参数节点：`T` 或 `T: Drawable`（S2.4 约束）+ p.8.2.6 默认类型参数
+// `T=string` / `T: Drawable = string`。
+// 值参数（容量参数，v2）：`CAP: i64`（内建整型标量关键词标注）→ kind=1（val 字段），
+// 可选默认整值 `CAP: i64 = 1280`（children[1] 存 N_INT_LIT 或 N_VAR(const 名)）。
+// 产出 N_TYPE_PARAM[name=参数名, val=kind(0类型/1值), children=[约束或 -1, 默认值或 -1]]。
+func parse_type_param_one(p: i64, line: i64, col: i64) -> i64 {
+    var cons: table<i64> = table_new_i64()
+    var kind: i64 = 0
+    if putil.eat(lex_colon) {
+        // 值参数标注：`: i64`（内建整型标量关键词）。tie 类型关键词与普通
+        // 标识符同为 lex_ident，此处按 lexeme 字符串比对判定，避免与
+        // `<T: Drawable>` 的 port 约束混淆。其余一律走既有约束分支。
+        var lx = putil.peek_lexeme()
+        if lx == "i64" {
+            kind = 1
+            putil.advance()   // 消费 "i64"（标注统一为 i64；语义层只认整型值参数）
+            table_push(cons, -1)
+        } else {
+            // `T: Drawable`：冒号后必须是 port 类型引用（语义层校验）
+            var cty = pexpr_type.parse_type()
+            if cty < 0 {
+                return -1
+            }
+            table_push(cons, cty)
+        }
+    } else {
+        table_push(cons, -1)
+    }
+    // 默认值：`=` 后。值参数取整型字面量或常量名；类型参数取默认类型。
+    var dflt: i64 = -1
+    if putil.eat(lex_eq) {
+        if kind == 1 {
+            if putil.peek_tag() == lex_int {
+                if putil.int_lit_overflow(putil.peek_lexeme()) {
+                    putil.set_err(line, col, "值参数默认值超出 i64 可表示范围")
+                    return -1
+                }
+                var nv = putil.parse_int_lit(putil.peek_lexeme())
+                putil.advance()
+                dflt = ast.new_node(N_INT_LIT, -1, nv, -1, line, col)
+            } else if putil.peek_tag() == lex_ident {
+                var cid = putil.expect_ident()
+                dflt = ast.new_node(N_VAR, cid, -1, -1, line, col)
+            } else {
+                putil.set_err(line, col, "值参数默认值必须是整型字面量或常量名")
+                return -1
+            }
+        } else {
+            dflt = pexpr_type.parse_type()
+            if dflt < 0 {
+                return -1
+            }
+        }
+    }
+    table_push(cons, dflt)
+    var n = ast.new_node(N_TYPE_PARAM, p, kind, -1, line, col)
+    ast.set_children(n, cons)
+    return n
+}
+
+// 返回类型节点是否 void（显式 `-> void` 或缺省；缺省时同样是 void 语义）
+func fn_ret_is_void(ret_ty: i64) -> bool {
+    if ast.tag(ret_ty) == N_NAMED_TYPE {
+        if interner.lookup(ast.name(ret_ty)) == "void" {
+            return true
+        }
+    }
+    return false
+}
+
+// 单表达式体省略判定：语句类 tag 排除（声明/赋值/控制流/异常/defer/unsafe/asm
+// 等一律不触发省略）。漏排的语句 tag（如宏语句）会在语义层报返回类型不匹配
+// ——编译期可见，无静默误编译面。
+func fn_eligible_expr_stmt(t: i64) -> bool {
+    if t == N_VAR_DECL || t == N_ASSIGN || t == N_RETURN || t == N_IF ||
+        t == N_WHILE || t == N_FOR || t == N_BREAK || t == N_CONTINUE ||
+        t == N_SWITCH || t == N_FIELD_ASSIGN || t == N_INDEX_ASSIGN ||
+        t == N_UNSAFE_BLOCK || t == N_ASM || t == N_PANIC ||
+        t == N_GUARD_STMT || t == N_DEFER {
+        return false
+    }
+    return true
+}
+
+}

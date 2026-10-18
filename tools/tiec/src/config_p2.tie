@@ -1,0 +1,435 @@
+type tie<class>
+// compiler/config_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 config.tie。
+namespace config {
+// 数组追加合并：a 元素 + b 元素 → 新数组节点。仅字符串元素保留（配置列表
+// 元素均为字符串）；非字符串元素跳过（防类型混杂）。
+func concat_arrays(a: i64, b: i64) -> i64 {
+    var nd = new_node(5)
+    c_kids[nd] = len(c_elem_flat)
+    c_ovals[nd] = 0
+    var i: i64 = 0
+    var n1: i64 = c_ovals[a]
+    while i < n1 {
+        var e = c_elem_flat[c_kids[a] + i]
+        if type_of(e) == 4 {
+            arr_add(nd, e)
+        }
+        i = i + 1
+    }
+    var j: i64 = 0
+    var n2: i64 = c_ovals[b]
+    while j < n2 {
+        var e2 = c_elem_flat[c_kids[b] + j]
+        if type_of(e2) == 4 {
+            arr_add(nd, e2)
+        }
+        j = j + 1
+    }
+    return nd
+}
+
+// 单值合并：决定同键下 base 值 bv 与 layer 值 lv 的合并结果。
+// 规则（P3 §5.2）：
+//   - 双方都是表 → 递归深合并（merge_maps）；
+//   - 双方都是数组 → 追加合并；
+//   - layer 值为字符串 "=" → 重置为空数组（清空父层列表）；
+//   - 其余（标量/类型不匹配）→ layer 覆盖 base。
+func merge_value(bv: i64, lv: i64) -> i64 {
+    var bt = type_of(bv)
+    var lt = type_of(lv)
+    if bt == 6 && lt == 6 {
+        return merge_maps(bv, lv)
+    }
+    if lt == 4 && str_val(lv) == "=" {
+        // 重置标记：空数组
+        var en = new_node(5)
+        c_kids[en] = len(c_elem_flat)
+        c_ovals[en] = 0
+        return en
+    }
+    if bt == 5 && lt == 5 {
+        return concat_arrays(bv, lv)
+    }
+    return lv
+}
+
+// 深合并两个表节点 → 新表节点（不修改原节点）。
+// 过程：先复制 base 全部键值（同键用 merge_value 合并 layer 值）；
+// 再追加 layer 独有的键。键值收集到局部表后统一登记（同 parse_map_body
+// 的原因：merge_value 递归合并子表时会向全局扁平表 push，若边合并边
+// 登记，子表条目会插入本表键区间中间，破坏 map_get 的区间扫描）。
+func merge_maps(b: i64, l: i64) -> i64 {
+    var nd = new_node(6)
+    var keys: table<string> = table_new_string()
+    var vals: table<i64> = table_new_i64()
+    // 1) base 的键：同键合并 / 独有保留
+    var b_start: i64 = c_kids[b]
+    var b_cnt: i64 = c_ovals[b]
+    var i: i64 = 0
+    while i < b_cnt {
+        var key = c_strs[c_key_flat[b_start + i]]
+        var bv = c_val_flat[b_start + i]
+        var lv = map_get(l, key)
+        if lv >= 0 {
+            var mv = merge_value(bv, lv)
+            table_push(keys, key)
+            table_push(vals, mv)
+        } else {
+            table_push(keys, key)
+            table_push(vals, bv)
+        }
+        i = i + 1
+    }
+    // 2) layer 独有的键（base 中不存在的）→ 直接追加
+    var l_start: i64 = c_kids[l]
+    var l_cnt: i64 = c_ovals[l]
+    var j: i64 = 0
+    while j < l_cnt {
+        var lkey = c_strs[c_key_flat[l_start + j]]
+        var in_base: bool = (map_get(b, lkey) >= 0)
+        if !in_base {
+            table_push(keys, lkey)
+            table_push(vals, c_val_flat[l_start + j])
+        }
+        j = j + 1
+    }
+    commit_map(nd, keys, vals)
+    return nd
+}
+
+// 构造内置默认配置根（表节点）。D1-D7 域默认值 + profiles 节。
+// 返回根节点 id。
+// 布局纪律：所有表均「先收集键值到局部表，最后 commit_map 统一登记」，
+// 保证每个表的键在全局 c_key_flat 中连续——嵌套子表若边构造边 push，
+// 子表键会插入父表键区间中间，破坏 map_get 的区间扫描。
+func build_defaults() -> i64 {
+    // ---------- 子树：tiec ----------
+    var tiec_keys: table<string> = table_new_string()
+    var tiec_vals: table<i64> = table_new_i64()
+    table_push(tiec_keys, "backend")
+    table_push(tiec_vals, new_str_node("win32"))
+    // D4 features：空列表（语言特性开关）
+    var feats = new_node(5)
+    c_kids[feats] = len(c_elem_flat)
+    c_ovals[feats] = 0
+    table_push(tiec_keys, "features")
+    table_push(tiec_vals, feats)
+    // D6 link：空列表（系统库）
+    var links = new_node(5)
+    c_kids[links] = len(c_elem_flat)
+    c_ovals[links] = 0
+    table_push(tiec_keys, "link")
+    table_push(tiec_vals, links)
+    // D3 细分：emit 产出形态、bounds_check 越界检查
+    table_push(tiec_keys, "emit")
+    table_push(tiec_vals, new_str_node("exe"))
+    var bc_n = new_node(1)
+    c_ivals[bc_n] = 0
+    table_push(tiec_keys, "bounds_check")
+    table_push(tiec_vals, bc_n)
+    // p.9.1.2：编译资源——内存上限（MB，0 = 不限）>-0 时 -O3 降为 O2
+    var ml_n = new_node(2)
+    c_ivals[ml_n] = 0
+    table_push(tiec_keys, "mem_limit")
+    table_push(tiec_vals, ml_n)
+    var tiec = new_node(6)
+    commit_map(tiec, tiec_keys, tiec_vals)
+    // ---------- 子树：prep ----------
+    var prep_keys: table<string> = table_new_string()
+    var prep_vals: table<i64> = table_new_i64()
+    var mods = new_node(5)
+    c_kids[mods] = len(c_elem_flat)
+    c_ovals[mods] = 0
+    table_push(prep_keys, "modules")
+    table_push(prep_vals, mods)
+    var sr_n = new_node(1)
+    c_ivals[sr_n] = 0
+    table_push(prep_keys, "strict_roles")
+    table_push(prep_vals, sr_n)
+    var prep = new_node(6)
+    commit_map(prep, prep_keys, prep_vals)
+    // ---------- 子树：pkg ----------
+    var pkg_keys: table<string> = table_new_string()
+    var pkg_vals: table<i64> = table_new_i64()
+    table_push(pkg_keys, "registry")
+    table_push(pkg_vals, new_str_node(""))
+    table_push(pkg_keys, "cache_dir")
+    table_push(pkg_vals, new_str_node(".tie/deps"))
+    var vs_n = new_node(1)
+    c_ivals[vs_n] = 0
+    table_push(pkg_keys, "verify_signature")
+    table_push(pkg_vals, vs_n)
+    var pkg = new_node(6)
+    commit_map(pkg, pkg_keys, pkg_vals)
+    // ---------- 子树：roles ----------
+    var roles_keys: table<string> = table_new_string()
+    var roles_vals: table<i64> = table_new_i64()
+    var tests = new_node(5)
+    c_kids[tests] = len(c_elem_flat)
+    c_ovals[tests] = 0
+    arr_add(tests, new_str_node("tests/"))
+    table_push(roles_keys, "test")
+    table_push(roles_vals, tests)
+    var benchs = new_node(5)
+    c_kids[benchs] = len(c_elem_flat)
+    c_ovals[benchs] = 0
+    arr_add(benchs, new_str_node("bench/"))
+    table_push(roles_keys, "bench")
+    table_push(roles_vals, benchs)
+    var roles = new_node(6)
+    commit_map(roles, roles_keys, roles_vals)
+    // ---------- 子树：advanced ----------
+    var adv_keys: table<string> = table_new_string()
+    var adv_vals: table<i64> = table_new_i64()
+    var adv_en = new_node(1)
+    c_ivals[adv_en] = 0
+    table_push(adv_keys, "enabled")
+    table_push(adv_vals, adv_en)
+    var th_n = new_node(2)
+    c_ivals[th_n] = 0
+    table_push(adv_keys, "threads")
+    table_push(adv_vals, th_n)
+    var adv = new_node(6)
+    commit_map(adv, adv_keys, adv_vals)
+    // ---------- 子树：cache ----------
+    var cache_keys: table<string> = table_new_string()
+    var cache_vals: table<i64> = table_new_i64()
+    var size_n = new_node(2)
+    c_ivals[size_n] = 268435456
+    table_push(cache_keys, "size")
+    table_push(cache_vals, size_n)
+    table_push(cache_keys, "storage")
+    table_push(cache_vals, new_str_node("memory"))
+    table_push(cache_keys, "path")
+    table_push(cache_vals, new_str_node(".tie-cache"))
+    // p.9.1.3：编译缓存目录（空 = 自动 ~/.tiec-cache）
+    table_push(cache_keys, "dir")
+    table_push(cache_vals, new_str_node(""))
+    var cache = new_node(6)
+    commit_map(cache, cache_keys, cache_vals)
+    // ---------- 子树：profiles（dev / release） ----------
+    // dev：debug=true, opt=0, tiec.bounds_check=true
+    var dev_tiec_keys: table<string> = table_new_string()
+    var dev_tiec_vals: table<i64> = table_new_i64()
+    var dev_bc = new_node(1)
+    c_ivals[dev_bc] = 1
+    table_push(dev_tiec_keys, "bounds_check")
+    table_push(dev_tiec_vals, dev_bc)
+    var dev_tiec = new_node(6)
+    commit_map(dev_tiec, dev_tiec_keys, dev_tiec_vals)
+    var dev_keys: table<string> = table_new_string()
+    var dev_vals: table<i64> = table_new_i64()
+    var dev_dbg = new_node(1)
+    c_ivals[dev_dbg] = 1
+    table_push(dev_keys, "debug")
+    table_push(dev_vals, dev_dbg)
+    // p.9.20 双轴：llvm_opt（LLVM/clang 轴）+ tiec_opt（tiec 中端轴）
+    var dev_llvm = new_node(2)
+    c_ivals[dev_llvm] = 0
+    table_push(dev_keys, "llvm_opt")
+    table_push(dev_vals, dev_llvm)
+    var dev_tie = new_node(2)
+    c_ivals[dev_tie] = 0
+    table_push(dev_keys, "tiec_opt")
+    table_push(dev_vals, dev_tie)
+    table_push(dev_keys, "tiec")
+    table_push(dev_vals, dev_tiec)
+    var dev = new_node(6)
+    commit_map(dev, dev_keys, dev_vals)
+    // release：debug=false, opt=2, tiec.bounds_check=false
+    var rel_tiec_keys: table<string> = table_new_string()
+    var rel_tiec_vals: table<i64> = table_new_i64()
+    var rel_bc = new_node(1)
+    c_ivals[rel_bc] = 0
+    table_push(rel_tiec_keys, "bounds_check")
+    table_push(rel_tiec_vals, rel_bc)
+    var rel_tiec = new_node(6)
+    commit_map(rel_tiec, rel_tiec_keys, rel_tiec_vals)
+    var rel_keys: table<string> = table_new_string()
+    var rel_vals: table<i64> = table_new_i64()
+    var rel_dbg = new_node(1)
+    c_ivals[rel_dbg] = 0
+    table_push(rel_keys, "debug")
+    table_push(rel_vals, rel_dbg)
+    var rel_llvm = new_node(2)
+    c_ivals[rel_llvm] = 2
+    table_push(rel_keys, "llvm_opt")
+    table_push(rel_vals, rel_llvm)
+    var rel_tie = new_node(2)
+    c_ivals[rel_tie] = 0
+    table_push(rel_keys, "tiec_opt")
+    table_push(rel_vals, rel_tie)
+    table_push(rel_keys, "tiec")
+    table_push(rel_vals, rel_tiec)
+    var rel = new_node(6)
+    commit_map(rel, rel_keys, rel_vals)
+    var profiles_keys: table<string> = table_new_string()
+    var profiles_vals: table<i64> = table_new_i64()
+    table_push(profiles_keys, "dev")
+    table_push(profiles_vals, dev)
+    table_push(profiles_keys, "release")
+    table_push(profiles_vals, rel)
+    var profiles = new_node(6)
+    commit_map(profiles, profiles_keys, profiles_vals)
+    // ---------- 根 ----------
+    var root_keys: table<string> = table_new_string()
+    var root_vals: table<i64> = table_new_i64()
+    // D1 target：空 = 本机
+    table_push(root_keys, "target")
+    table_push(root_vals, new_str_node(""))
+    // D3 双轴优化档（p.9.20）：llvm_opt 默认 2（与 CLI 默认一致）、tiec_opt 默认
+    // 0（零 pass，自举不动点不变）；debug：默认 false
+    var opt_n = new_node(2)
+    c_ivals[opt_n] = 2
+    table_push(root_keys, "llvm_opt")
+    table_push(root_vals, opt_n)
+    var tie_n = new_node(2)
+    c_ivals[tie_n] = 0
+    table_push(root_keys, "tiec_opt")
+    table_push(root_vals, tie_n)
+    var dbg_n = new_node(1)
+    c_ivals[dbg_n] = 0
+    table_push(root_keys, "debug")
+    table_push(root_vals, dbg_n)
+    // P3 profile：默认 dev（Cargo 风格）
+    table_push(root_keys, "profile")
+    table_push(root_vals, new_str_node("dev"))
+    // 子树引用（值节点已构造并登记，此处只登记键）
+    table_push(root_keys, "tiec")
+    table_push(root_vals, tiec)
+    table_push(root_keys, "prep")
+    table_push(root_vals, prep)
+    table_push(root_keys, "pkg")
+    table_push(root_vals, pkg)
+    table_push(root_keys, "roles")
+    table_push(root_vals, roles)
+    table_push(root_keys, "advanced")
+    table_push(root_vals, adv)
+    table_push(root_keys, "cache")
+    table_push(root_vals, cache)
+    table_push(root_keys, "profiles")
+    table_push(root_vals, profiles)
+    var root = new_node(6)
+    commit_map(root, root_keys, root_vals)
+    return root
+}
+
+// 用户级配置路径（Windows: %USERPROFILE%\.config\tie\config.data.tie）。
+// get_env 取不到时返回空串（调用方跳过用户层）。
+func user_config_path() -> string {
+    var home = get_env("USERPROFILE")
+    if str_len(home) == 0 {
+        home = get_env("HOME")
+    }
+    if str_len(home) == 0 {
+        return ""
+    }
+    return home + "/.config/tie/config.data.tie"
+}
+
+// 按字符串值构造标量节点（自动判定类型：true/false → bool；纯数字 → int；
+// 含 . 数字 → float；其余 → string）。
+func scalar_from_str(v: string) -> i64 {
+    if v == "true" {
+        var tb = new_node(1)
+        c_ivals[tb] = 1
+        return tb
+    }
+    if v == "false" {
+        var fb = new_node(1)
+        c_ivals[fb] = 0
+        return fb
+    }
+    var n: i64 = str_len(v)
+    var is_num: bool = true
+    var is_float: bool = false
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(v, i)
+        var cp: i64 = char_code(c)
+        if cp == 45 {
+            // 负号仅允许首位
+            if i != 0 {
+                is_num = false
+            }
+        } else if cp == 46 {
+            is_float = true
+        } else if cp >= 48 && cp <= 57 {
+        } else {
+            is_num = false
+        }
+        i = i + 1
+    }
+    if is_num && n > 0 {
+        if is_float {
+            var fn = new_node(3)
+            c_fvals[fn] = parse_float(v)
+            return fn
+        }
+        var in_n = new_node(2)
+        c_ivals[in_n] = parse_int(v)
+        return in_n
+    }
+    return new_str_node(v)
+}
+
+// 值节点 → 单行摘要文本（字符串带引号；数组 [a,b]；表 {...} 简写计数）。
+func val_brief(n: i64) -> string {
+    var t = type_of(n)
+    if t == 2 {
+        return to_string(c_ivals[n])
+    }
+    if t == 3 {
+        return to_string(c_fvals[n])
+    }
+    if t == 1 {
+        if c_ivals[n] != 0 {
+            return "true"
+        }
+        return "false"
+    }
+    if t == 4 {
+        return c_strs[c_ivals[n]]
+    }
+    if t == 5 {
+        var out: string = "["
+        var cnt: i64 = c_ovals[n]
+        var i: i64 = 0
+        while i < cnt {
+            if i > 0 {
+                out = out + ","
+            }
+            out = out + val_brief(c_elem_flat[c_kids[n] + i])
+            i = i + 1
+        }
+        return out + "]"
+    }
+    if t == 6 {
+        return "{ " + to_string(c_ovals[n]) + " 键 }"
+    }
+    return "null"
+}
+
+// 表 → 多行摘要文本（每行 `key = value`；嵌套表递归缩进）。
+func map_brief(n: i64, indent: string) -> string {
+    var out: string = ""
+    var cnt: i64 = c_ovals[n]
+    var i: i64 = 0
+    while i < cnt {
+        var key = c_strs[c_key_flat[c_kids[n] + i]]
+        var v = c_val_flat[c_kids[n] + i]
+        out = out + indent + key + " = "
+        if type_of(v) == 6 {
+            out = out + "\n" + map_brief(v, indent + "  ")
+        } else {
+            out = out + val_brief(v) + "\n"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+}

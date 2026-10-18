@@ -1,0 +1,880 @@
+type tie<class>
+// json5.tie：标准库——JSON5 解析与序列化（命名空间 json5），p.9.1.1.6。
+// ============================================================
+// 定位：JSON 超集。完全复用 std/json 的「平行表节点模型」与访问器表面
+// （同一个树结构、同一套 type_of/obj_get/arr_at/to_str API），在此基础上
+// 扩展 JSON5 文法。故 json5 解析出的树与 json 一致，可无缝切换。
+//
+// JSON5 相对标准 JSON 的扩展（本实现覆盖）：
+//   1. 注释：// 行注释、/* */ 块注释（出现在任何允许空白处）；
+//   2. 尾逗号：对象/数组的最后一个元素后允许逗号；
+//   3. 单引号字符串：'...' 与双引号等价；
+//   4. 无引号键：对象键可用标识符（ASCII：字母/下划线/$ 开头，后接
+//      字母/数字/下划线/$；含 true/false/null 保留字）；
+//   5. 十六进制数字：0x/0X 前缀（可有符号）；
+//   6. + 号数字：显式正号 +123；
+//   7. 多行字符串：字符串内允许裸换行；反斜杠续行（\ ⟂ 换行）被折叠。
+// 另支持的 JSON5 字符串转义：\v(0x0B) \0(null) \xHH；其余同 JSON
+// （\" \\ \/ \b \f \n \r \t \uXXXX 含代理对）。
+// 数字另支持前导/尾随小数点（.5 / 5.）。
+//
+// 节点表示（平行表，节点 id 为下标；与 std/json 一致）：
+//   j5_types[i]  节点类型：0=null 1=bool 2=int 3=float 4=str 5=array 6=object
+//   j5_ivals[i]  int/bool 值；str 节点存字符串表索引
+//   j5_fvals[i]  float 值
+//   j5_strs      字符串表（str 节点文本 + object 键文本）
+//   j5_kids[i]   array/object 子元素在扁平登记表中的起始下标
+//   j5_ovals[i]  array/object 子元素个数
+//   j5_elem_flat / j5_key_flat / j5_val_flat  扁平登记表
+//   j5_err_msg   最近一次 parse 的错误消息
+//
+// 位置推进：复刻 std/json —— 模块级全局 g5_pos 由各 parse_* 共享推进。
+// 失败约定：parse 返回 -1 且置 j5_err_msg；访问器对非法 id 返回安全值。
+//
+// 调用：import 后 json5.parse(...) / json5.type_of(...) / json5.to_str(...)；
+// 命名空间内互调为裸调用（命名前缀 j5_ 仅修饰存储表，函数不加 json 前缀）。
+// library-v2：parse_file 返回 Result<i64,string>（同 std/json）。
+// ============================================================
+
+import "./result.tie"
+
+// ==================== 节点存储（模块级全局，命名空间外） ====================
+var j5_types: table<i64>;
+var j5_ivals: table<i64>;
+var j5_fvals: table<f64>;
+var j5_strs: table<string>;
+var j5_kids: table<i64>;
+var j5_ovals: table<i64>;
+var j5_elem_flat: table<i64>;
+var j5_key_flat: table<i64>;
+var j5_val_flat: table<i64>;
+var j5_err_msg: string = "";
+var g5_pos: i64 = 0;
+
+namespace json5 {
+// ---------- 节点构造（内部） ----------
+func new_node(ty: i64) -> i64 {
+    table_push(j5_types, ty)
+    table_push(j5_ivals, 0)
+    table_push(j5_fvals, 0.0)
+    table_push(j5_strs, "")
+    table_push(j5_kids, -1)
+    table_push(j5_ovals, 0)
+    return len(j5_types) - 1
+}
+func new_str_node(content: string) -> i64 {
+    var n = new_node(4)
+    table_push(j5_strs, content)
+    j5_ivals[n] = len(j5_strs) - 1
+    return n
+}
+
+// ---------- 解析（递归下降） ----------
+
+pub func parse(s: string) -> i64 {
+    j5_types = table_new_i64()
+    j5_ivals = table_new_i64()
+    j5_fvals = table_new_f64()
+    j5_strs = table_new_string()
+    j5_kids = table_new_i64()
+    j5_ovals = table_new_i64()
+    j5_elem_flat = table_new_i64()
+    j5_key_flat = table_new_i64()
+    j5_val_flat = table_new_i64()
+    j5_err_msg = ""
+    g5_pos = 0
+    var root = parse_value(s)
+    if root < 0 {
+        return -1
+    }
+    skip_ws(s)
+    if g5_pos < len(s) {
+        j5_err_msg = "JSON5 根值后有额外内容（位置 " + to_string(g5_pos) + "）"
+        return -1
+    }
+    return root
+}
+
+pub func parse_file(path: string) -> Result<i64, string> {
+    var content = file_read(path)
+    if str_len(content) == 0 {
+        j5_err_msg = "JSON5 文件为空或读取失败: " + path
+        return Result.Err(j5_err_msg)
+    }
+    var root = parse(content)
+    if root < 0 {
+        return Result.Err(j5_err_msg)
+    }
+    return Result.Ok(root)
+}
+
+// 跳过空白（含注释）：空格/制表/换行/回车/换页/纵向制表 + // 与 /* */。
+func skip_ws(s: string) {
+    var n: i64 = len(s)
+    while g5_pos < n {
+        var b: i64 = str_byte(s, g5_pos)
+        if b == 32 || b == 9 || b == 10 || b == 13 || b == 11 || b == 12 {
+            g5_pos = g5_pos + 1
+        } else if b == 47 && g5_pos + 1 < n && str_byte(s, g5_pos + 1) == 47 {
+            // // 行注释：到换行或串尾
+            while g5_pos < n && str_byte(s, g5_pos) != 10 && str_byte(s, g5_pos) != 13 {
+                g5_pos = g5_pos + 1
+            }
+        } else if b == 47 && g5_pos + 1 < n && str_byte(s, g5_pos + 1) == 42 {
+            // /* 块注释 */
+            g5_pos = g5_pos + 2
+            while g5_pos + 1 < n && !(str_byte(s, g5_pos) == 42 && str_byte(s, g5_pos + 1) == 47) {
+                g5_pos = g5_pos + 1
+            }
+            if g5_pos + 1 < n {
+                g5_pos = g5_pos + 2
+            } else {
+                g5_pos = n
+            }
+        } else {
+            return
+        }
+    }
+}
+
+func parse_value(s: string) -> i64 {
+    skip_ws(s)
+    var n: i64 = len(s)
+    if g5_pos >= n {
+        j5_err_msg = "JSON5 值意外结束"
+        return -1
+    }
+    var b: i64 = str_byte(s, g5_pos)
+    if b == 123 {
+        return parse_object(s)
+    }
+    if b == 91 {
+        return parse_array(s)
+    }
+    if b == 34 || b == 39 {
+        return parse_string(s, b)
+    }
+    if b == 116 {
+        return parse_literal(s, "true", 1)
+    }
+    if b == 102 {
+        return parse_literal(s, "false", 0)
+    }
+    if b == 110 {
+        return parse_literal(s, "null", -1)
+    }
+    if b == 45 || b == 43 || b == 46 || (b >= 48 && b <= 57) {
+        return parse_number(s)
+    }
+    j5_err_msg = "JSON5 值意外字符（位置 " + to_string(g5_pos) + "）"
+    return -1
+}
+
+func parse_literal(s: string, word: string, value: i64) -> i64 {
+    var m: i64 = len(word)
+    var n: i64 = len(s)
+    var i: i64 = 0
+    while i < m {
+        if g5_pos + i >= n || str_byte(s, g5_pos + i) != str_byte(word, i) {
+            j5_err_msg = "JSON5 字面量不完整（位置 " + to_string(g5_pos) + "）"
+            return -1
+        }
+        i = i + 1
+    }
+    g5_pos = g5_pos + m
+    if value == -1 {
+        return new_node(0)
+    }
+    var nd = new_node(1)
+    j5_ivals[nd] = value
+    return nd
+}
+
+// 解析数字：JSON5 语法。
+//   十进制：[+-]? ( int('.' [0-9]*)? | '.' [0-9]+ ) ([eE] [+-]? [0-9]+)?
+//   十六进制：[+-]? 0[xX] [0-9a-fA-F]+
+func parse_number(s: string) -> i64 {
+    var n: i64 = len(s)
+    var neg: bool = false
+    var b0: i64 = str_byte(s, g5_pos)
+    // 显式正/负号
+    if b0 == 43 {
+        g5_pos = g5_pos + 1
+    } else if b0 == 45 {
+        neg = true
+        g5_pos = g5_pos + 1
+    }
+    if g5_pos >= n {
+        j5_err_msg = "JSON5 数字缺少数字（位置 " + to_string(g5_pos) + "）"
+        return -1
+    }
+    // 十六进制：0x / 0X
+    if str_byte(s, g5_pos) == 48 && g5_pos + 1 < n {
+        var nx0: i64 = str_byte(s, g5_pos + 1)
+        if nx0 == 120 || nx0 == 88 {
+            g5_pos = g5_pos + 2
+            var val: i64 = 0
+            var cnt: i64 = 0
+            while g5_pos < n {
+                var hv = hex_val(str_byte(s, g5_pos))
+                if hv < 0 {
+                    break
+                }
+                val = val * 16 + hv
+                cnt = cnt + 1
+                g5_pos = g5_pos + 1
+            }
+            if cnt == 0 {
+                j5_err_msg = "JSON5 十六进制数字缺少位数（位置 " + to_string(g5_pos) + "）"
+                return -1
+            }
+            var nd = new_node(2)
+            if neg {
+                val = -val
+            }
+            j5_ivals[nd] = val
+            return nd
+        }
+    }
+    // 十进制
+    var is_float: bool = false
+    var sb = string_builder()
+    if neg {
+        sb_append(sb, "-")
+    }
+    var intpart: bool = false
+    while g5_pos < n {
+        var d: i64 = str_byte(s, g5_pos)
+        if d >= 48 && d <= 57 {
+            sb_append_byte(sb, d)
+            intpart = true
+            g5_pos = g5_pos + 1
+        } else {
+            break
+        }
+    }
+    // 小数点（前导 .5 或常规 5. / 5.5）
+    if g5_pos < n && str_byte(s, g5_pos) == 46 {
+        is_float = true
+        if !intpart {
+            // 前导小数点：补 0 使 parse_float 可解析
+            sb_append(sb, "0")
+        }
+        sb_append(sb, ".")
+        g5_pos = g5_pos + 1
+        while g5_pos < n {
+            var dd: i64 = str_byte(s, g5_pos)
+            if dd >= 48 && dd <= 57 {
+                sb_append_byte(sb, dd)
+                g5_pos = g5_pos + 1
+            } else {
+                break
+            }
+        }
+    }
+    // 指数部分
+    if g5_pos < n {
+        var eb2: i64 = str_byte(s, g5_pos)
+        if eb2 == 101 || eb2 == 69 {
+            is_float = true
+            sb_append_byte(sb, 101)
+            g5_pos = g5_pos + 1
+            if g5_pos < n {
+                var sb2: i64 = str_byte(s, g5_pos)
+                if sb2 == 43 || sb2 == 45 {
+                    sb_append_byte(sb, sb2)
+                    g5_pos = g5_pos + 1
+                }
+            }
+            var estarted: bool = false
+            while g5_pos < n {
+                var b3: i64 = str_byte(s, g5_pos)
+                if b3 >= 48 && b3 <= 57 {
+                    sb_append_byte(sb, b3)
+                    estarted = true
+                    g5_pos = g5_pos + 1
+                } else {
+                    break
+                }
+            }
+            if !estarted {
+                j5_err_msg = "JSON5 数字指数部分缺少数字（位置 " + to_string(g5_pos) + "）"
+                return -1
+            }
+        }
+    }
+    // 无任何数字（如只有符号）
+    if !intpart && !is_float {
+        j5_err_msg = "JSON5 数字缺少数字（位置 " + to_string(g5_pos) + "）"
+        return -1
+    }
+    if is_float {
+        return mknf(sb_build(sb))
+    }
+    return mkni(parse_int(sb_build(sb)))
+}
+// 构造 float 节点（尾随小数点 5. → 5.0，供 parse_float 解析）。
+func mknf(d: string) -> i64 {
+    var nd = new_node(3)
+    j5_fvals[nd] = parse_float(strip_trail_dot(d))
+    return nd
+}
+// 构造 int 节点。
+func mkni(v: i64) -> i64 {
+    var nd = new_node(2)
+    j5_ivals[nd] = v
+    return nd
+}
+// 去除尾随小数点（"5." → "5"），使 parse_float 接受。
+func strip_trail_dot(d: string) -> string {
+    var n: i64 = len(d)
+    if n > 0 && str_byte(d, n - 1) == 46 && n > 1 {
+        return str_sub_bytes(d, 0, n - 1)
+    }
+    return d
+}
+
+// 解析字符串（JSON5）：支持单引号/双引号、JSON5 转义、多行字符串、续行。
+func parse_string(s: string, q: i64) -> i64 {
+    var n: i64 = len(s)
+    g5_pos = g5_pos + 1
+    var sb = string_builder()
+    while g5_pos < n {
+        var b: i64 = str_byte(s, g5_pos)
+        if b == q {
+            g5_pos = g5_pos + 1
+            return new_str_node(sb_build(sb))
+        }
+        if b == 92 {
+            if g5_pos + 1 >= n {
+                j5_err_msg = "JSON5 字符串转义不完整（位置 " + to_string(g5_pos) + "）"
+                return -1
+            }
+            var e: i64 = str_byte(s, g5_pos + 1)
+            if e == q || e == 34 || e == 39 {
+                sb_append_byte(sb, e)
+                g5_pos = g5_pos + 2
+            } else if e == 92 {
+                sb_append(sb, "\\")
+                g5_pos = g5_pos + 2
+            } else if e == 47 {
+                sb_append(sb, "/")
+                g5_pos = g5_pos + 2
+            } else if e == 98 {
+                sb_append_byte(sb, 8)
+                g5_pos = g5_pos + 2
+            } else if e == 102 {
+                sb_append_byte(sb, 12)
+                g5_pos = g5_pos + 2
+            } else if e == 110 {
+                sb_append(sb, "\n")
+                g5_pos = g5_pos + 2
+            } else if e == 114 {
+                sb_append(sb, "\r")
+                g5_pos = g5_pos + 2
+            } else if e == 116 {
+                sb_append(sb, "\t")
+                g5_pos = g5_pos + 2
+            } else if e == 118 {
+                sb_append_byte(sb, 11)
+                g5_pos = g5_pos + 2
+            } else if e == 48 {
+                // \0（null），仅当其不是八进制前导数字时
+                var nx: i64 = -1
+                if g5_pos + 2 < n {
+                    nx = str_byte(s, g5_pos + 2)
+                }
+                if nx >= 48 && nx <= 57 {
+                    j5_err_msg = "JSON5 无效转义 \\0" + to_string(nx - 48) + "（位置 " + to_string(g5_pos) + "）"
+                    return -1
+                }
+                sb_append_byte(sb, 0)
+                g5_pos = g5_pos + 2
+            } else if e == 120 {
+                // \xHH → 单字符
+                if g5_pos + 4 >= n {
+                    j5_err_msg = "JSON5 \\x 转义不完整（位置 " + to_string(g5_pos) + "）"
+                    return -1
+                }
+                var hi = hex_val(str_byte(s, g5_pos + 2))
+                var lo = hex_val(str_byte(s, g5_pos + 3))
+                if hi < 0 || lo < 0 {
+                    j5_err_msg = "JSON5 \\x 含非十六进制字符（位置 " + to_string(g5_pos) + "）"
+                    return -1
+                }
+                sb_append_byte(sb, hi * 16 + lo)
+                g5_pos = g5_pos + 4
+            } else if e == 117 {
+                // \uXXXX
+                if g5_pos + 6 >= n {
+                    j5_err_msg = "JSON5 \\u 转义不完整（位置 " + to_string(g5_pos) + "）"
+                    return -1
+                }
+                var cp: i64 = u4_hex(s, g5_pos + 2, n)
+                if cp == -1 {
+                    j5_err_msg = "JSON5 \\u 含非十六进制字符（位置 " + to_string(g5_pos) + "）"
+                    return -1
+                }
+                var adv: i64 = 6
+                if cp >= 0xD800 && cp <= 0xDBFF {
+                    if g5_pos + 12 >= n {
+                        j5_err_msg = "JSON5 \\u 高代理缺少低代理（位置 " + to_string(g5_pos) + "）"
+                        return -1
+                    }
+                    if str_byte(s, g5_pos + 6) != 92 || str_byte(s, g5_pos + 7) != 117 {
+                        j5_err_msg = "JSON5 \\u 高代理缺少低代理（位置 " + to_string(g5_pos) + "）"
+                        return -1
+                    }
+                    var lo2: i64 = u4_hex(s, g5_pos + 8, n)
+                    if lo2 == -1 {
+                        j5_err_msg = "JSON5 \\u 含非十六进制字符（位置 " + to_string(g5_pos) + "）"
+                        return -1
+                    }
+                    if lo2 < 0xDC00 || lo2 > 0xDFFF {
+                        j5_err_msg = "JSON5 \\u 高代理后需低代理（位置 " + to_string(g5_pos) + "）"
+                        return -1
+                    }
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo2 - 0xDC00)
+                    adv = 12
+                } else if cp >= 0xDC00 && cp <= 0xDFFF {
+                    j5_err_msg = "JSON5 \\u 孤立低代理（位置 " + to_string(g5_pos) + "）"
+                    return -1
+                }
+                sb_append(sb, utf_from_code(cp))
+                g5_pos = g5_pos + adv
+            } else if e == 10 {
+                // 行续行：\ + LF → 折叠（不输出换行）
+                g5_pos = g5_pos + 2
+            } else if e == 13 {
+                g5_pos = g5_pos + 2
+                if g5_pos < n && str_byte(s, g5_pos) == 10 {
+                    g5_pos = g5_pos + 1
+                }
+            } else {
+                j5_err_msg = "JSON5 未知转义（位置 " + to_string(g5_pos) + "）"
+                return -1
+            }
+        } else {
+            // 普通字符：含裸换行（多行字符串，JSON5 允许）
+            sb_append_byte(sb, b)
+            g5_pos = g5_pos + 1
+        }
+    }
+    j5_err_msg = "JSON5 字符串未闭合"
+    return -1
+}
+
+// 解析无引号键（标识符）。ASCII：字母/下划线/$ 开头，后接字母/数字/下划线/$。
+// 含保留字 true/false/null 作为键也允许。返回键文本。
+func parse_identifier_key(s: string) -> string {
+    var n: i64 = len(s)
+    var b = str_byte(s, g5_pos)
+    if !id_start(b) {
+        j5_err_msg = "JSON5 期望无引号键（位置 " + to_string(g5_pos) + "）"
+        return ""
+    }
+    var sb = string_builder()
+    while g5_pos < n {
+        var c = str_byte(s, g5_pos)
+        if id_part(c) {
+            sb_append_byte(sb, c)
+            g5_pos = g5_pos + 1
+        } else {
+            break
+        }
+    }
+    return sb_build(sb)
+}
+func id_start(b: i64) -> bool {
+    if b >= 65 && b <= 90 {
+        return true
+    }
+    if b >= 97 && b <= 122 {
+        return true
+    }
+    if b == 95 || b == 36 {
+        return true
+    }
+    return false
+}
+func id_part(b: i64) -> bool {
+    if id_start(b) {
+        return true
+    }
+    if b >= 48 && b <= 57 {
+        return true
+    }
+    return false
+}
+
+// 解析数组 [v1, v2, ...]，支持尾逗号与注释。
+func parse_array(s: string) -> i64 {
+    var n: i64 = len(s)
+    var nd = new_node(5)
+    var elems = table_new_i64()
+    var cnt: i64 = 0
+    g5_pos = g5_pos + 1
+    skip_ws(s)
+    if g5_pos < n && str_byte(s, g5_pos) == 93 {
+        g5_pos = g5_pos + 1
+        j5_kids[nd] = len(j5_elem_flat)
+        j5_ovals[nd] = 0
+        return nd
+    }
+    while true {
+        var v = parse_value(s)
+        if v < 0 {
+            return -1
+        }
+        table_push(elems, v)
+        cnt = cnt + 1
+        skip_ws(s)
+        if g5_pos >= n {
+            j5_err_msg = "JSON5 数组未闭合"
+            return -1
+        }
+        var b: i64 = str_byte(s, g5_pos)
+        if b == 44 {
+            g5_pos = g5_pos + 1
+            skip_ws(s)
+            // 尾逗号：其后是 ] 则结束
+            if g5_pos < n && str_byte(s, g5_pos) == 93 {
+                g5_pos = g5_pos + 1
+                break
+            }
+        } else if b == 93 {
+            g5_pos = g5_pos + 1
+            break
+        } else {
+            j5_err_msg = "JSON5 数组期望 , 或 ]（位置 " + to_string(g5_pos) + "）"
+            return -1
+        }
+    }
+    var start: i64 = len(j5_elem_flat)
+    var i: i64 = 0
+    while i < cnt {
+        table_push(j5_elem_flat, elems[i])
+        i = i + 1
+    }
+    j5_kids[nd] = start
+    j5_ovals[nd] = cnt
+    return nd
+}
+
+// 解析对象 {k: v, ...}：键可为引号串或无引号标识符，支持尾逗号与注释。
+func parse_object(s: string) -> i64 {
+    var n: i64 = len(s)
+    var nd = new_node(6)
+    var keys = table_new_i64()
+    var vals = table_new_i64()
+    var cnt: i64 = 0
+    g5_pos = g5_pos + 1
+    skip_ws(s)
+    if g5_pos < n && str_byte(s, g5_pos) == 125 {
+        g5_pos = g5_pos + 1
+        j5_kids[nd] = len(j5_key_flat)
+        j5_ovals[nd] = 0
+        return nd
+    }
+    while true {
+        skip_ws(s)
+        if g5_pos >= n {
+            j5_err_msg = "JSON5 对象未闭合"
+            return -1
+        }
+        var ks: i64 = -1
+        var cb: i64 = str_byte(s, g5_pos)
+        if cb == 34 || cb == 39 {
+            var kn = parse_string(s, cb)
+            if kn < 0 {
+                return -1
+            }
+            ks = j5_ivals[kn]
+        } else {
+            var ktxt = parse_identifier_key(s)
+            if len(ktxt) == 0 {
+                return -1
+            }
+            table_push(j5_strs, ktxt)
+            ks = len(j5_strs) - 1
+        }
+        table_push(keys, ks)
+        skip_ws(s)
+        if g5_pos >= n || str_byte(s, g5_pos) != 58 {
+            j5_err_msg = "JSON5 对象期望 :（位置 " + to_string(g5_pos) + "）"
+            return -1
+        }
+        g5_pos = g5_pos + 1
+        var v = parse_value(s)
+        if v < 0 {
+            return -1
+        }
+        table_push(vals, v)
+        cnt = cnt + 1
+        skip_ws(s)
+        if g5_pos >= n {
+            j5_err_msg = "JSON5 对象未闭合"
+            return -1
+        }
+        var b: i64 = str_byte(s, g5_pos)
+        if b == 44 {
+            g5_pos = g5_pos + 1
+            skip_ws(s)
+            if g5_pos < n && str_byte(s, g5_pos) == 125 {
+                g5_pos = g5_pos + 1
+                break
+            }
+        } else if b == 125 {
+            g5_pos = g5_pos + 1
+            break
+        } else {
+            j5_err_msg = "JSON5 对象期望 , 或 }（位置 " + to_string(g5_pos) + "）"
+            return -1
+        }
+    }
+    var start: i64 = len(j5_key_flat)
+    var i: i64 = 0
+    while i < cnt {
+        table_push(j5_key_flat, keys[i])
+        table_push(j5_val_flat, vals[i])
+        i = i + 1
+    }
+    j5_kids[nd] = start
+    j5_ovals[nd] = cnt
+    return nd
+}
+
+// ---------- 序列化 ----------
+pub func to_str(n: i64) -> string {
+    if n < 0 || n >= len(j5_types) {
+        return "null"
+    }
+    var ty = j5_types[n]
+    if ty == 0 {
+        return "null"
+    }
+    if ty == 1 {
+        if j5_ivals[n] != 0 {
+            return "true"
+        }
+        return "false"
+    }
+    if ty == 2 {
+        return to_string(j5_ivals[n])
+    }
+    if ty == 3 {
+        return to_string(j5_fvals[n])
+    }
+    if ty == 4 {
+        return escape_str(j5_strs[j5_ivals[n]])
+    }
+    if ty == 5 {
+        return arr_to_str(n)
+    }
+    if ty == 6 {
+        return obj_to_str(n)
+    }
+    return "null"
+}
+func arr_to_str(n: i64) -> string {
+    var sb = string_builder()
+    sb_append(sb, "[")
+    var start: i64 = j5_kids[n]
+    var cnt: i64 = j5_ovals[n]
+    var i: i64 = 0
+    while i < cnt {
+        if i > 0 {
+            sb_append(sb, ",")
+        }
+        sb_append(sb, to_str(j5_elem_flat[start + i]))
+        i = i + 1
+    }
+    sb_append(sb, "]")
+    return sb_build(sb)
+}
+func obj_to_str(n: i64) -> string {
+    var sb = string_builder()
+    sb_append(sb, "{")
+    var start: i64 = j5_kids[n]
+    var cnt: i64 = j5_ovals[n]
+    var i: i64 = 0
+    while i < cnt {
+        if i > 0 {
+            sb_append(sb, ",")
+        }
+        sb_append(sb, escape_str(j5_strs[j5_key_flat[start + i]]))
+        sb_append(sb, ":")
+        sb_append(sb, to_str(j5_val_flat[start + i]))
+        i = i + 1
+    }
+    sb_append(sb, "}")
+    return sb_build(sb)
+}
+func escape_str(s: string) -> string {
+    var sb = string_builder()
+    sb_append(sb, "\"")
+    var n: i64 = len(s)
+    var i: i64 = 0
+    while i < n {
+        var b: i64 = str_byte(s, i)
+        if b == 34 {
+            sb_append(sb, "\\\"")
+        } else if b == 92 {
+            sb_append(sb, "\\\\")
+        } else if b == 8 {
+            sb_append(sb, "\\b")
+        } else if b == 12 {
+            sb_append(sb, "\\f")
+        } else if b == 10 {
+            sb_append(sb, "\\n")
+        } else if b == 13 {
+            sb_append(sb, "\\r")
+        } else if b == 9 {
+            sb_append(sb, "\\t")
+        } else {
+            sb_append_byte(sb, b)
+        }
+        i = i + 1
+    }
+    sb_append(sb, "\"")
+    return sb_build(sb)
+}
+
+// ---------- 访问器（与 std/json 一致） ----------
+pub func type_of(n: i64) -> i64 {
+    if n < 0 || n >= len(j5_types) {
+        return -1
+    }
+    return j5_types[n]
+}
+pub func is_null(n: i64) -> bool {
+    return type_of(n) == 0
+}
+pub func is_bool(n: i64) -> bool {
+    return type_of(n) == 1
+}
+pub func is_int(n: i64) -> bool {
+    return type_of(n) == 2
+}
+pub func is_float(n: i64) -> bool {
+    return type_of(n) == 3
+}
+pub func is_str(n: i64) -> bool {
+    return type_of(n) == 4
+}
+pub func is_array(n: i64) -> bool {
+    return type_of(n) == 5
+}
+pub func is_object(n: i64) -> bool {
+    return type_of(n) == 6
+}
+pub func int_val(n: i64) -> i64 {
+    if n < 0 || n >= len(j5_types) {
+        return 0
+    }
+    if j5_types[n] == 1 || j5_types[n] == 2 {
+        return j5_ivals[n]
+    }
+    return 0
+}
+pub func float_val(n: i64) -> f64 {
+    if n < 0 || n >= len(j5_types) {
+        return 0.0
+    }
+    if j5_types[n] == 3 {
+        return j5_fvals[n]
+    }
+    return 0.0
+}
+pub func str_val(n: i64) -> string {
+    if n < 0 || n >= len(j5_types) {
+        return ""
+    }
+    if j5_types[n] == 4 {
+        return j5_strs[j5_ivals[n]]
+    }
+    return ""
+}
+pub func arr_len(n: i64) -> i64 {
+    if type_of(n) != 5 {
+        return 0
+    }
+    return j5_ovals[n]
+}
+pub func arr_at(n: i64, i: i64) -> i64 {
+    if type_of(n) != 5 {
+        return -1
+    }
+    if i < 0 || i >= j5_ovals[n] {
+        return -1
+    }
+    return j5_elem_flat[j5_kids[n] + i]
+}
+pub func obj_keys(n: i64) -> table<string> {
+    var out = table_new_string()
+    if type_of(n) != 6 {
+        return out
+    }
+    var start: i64 = j5_kids[n]
+    var cnt: i64 = j5_ovals[n]
+    var i: i64 = 0
+    while i < cnt {
+        table_push(out, j5_strs[j5_key_flat[start + i]])
+        i = i + 1
+    }
+    return out
+}
+pub func obj_get(n: i64, key: string) -> i64 {
+    if type_of(n) != 6 {
+        return -1
+    }
+    var start: i64 = j5_kids[n]
+    var cnt: i64 = j5_ovals[n]
+    var found: i64 = -1
+    var i: i64 = 0
+    while i < cnt {
+        if j5_strs[j5_key_flat[start + i]] == key {
+            found = j5_val_flat[start + i]
+        }
+        i = i + 1
+    }
+    return found
+}
+pub func err_msg() -> string {
+    return j5_err_msg
+}
+
+// ---------- 内部工具 ----------
+func hex_val(b: i64) -> i64 {
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 65 && b <= 70 {
+        return b - 65 + 10
+    }
+    if b >= 97 && b <= 102 {
+        return b - 97 + 10
+    }
+    return -1
+}
+func u4_hex(s: string, from: i64, n: i64) -> i64 {
+    if from + 4 > n {
+        return -2
+    }
+    var cp: i64 = 0
+    var k: i64 = 0
+    while k < 4 {
+        var hv: i64 = hex_val(str_byte(s, from + k))
+        if hv < 0 {
+            return -1
+        }
+        cp = cp * 16 + hv
+        k = k + 1
+    }
+    return cp
+}
+// 码点 → 字符串（复用底座 str_from_code 语义；std/json 经 utf.from_code）
+func utf_from_code(cp: i64) -> string {
+    return str_from_code(cp)
+}
+}

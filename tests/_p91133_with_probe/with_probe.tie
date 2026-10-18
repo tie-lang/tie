@@ -1,0 +1,59 @@
+type tie<logic>
+// tests/_p91133_with_probe/with_probe.tie —— p.9.11.33 struct 的 with 验收
+// 由新编译器编译运行（期望输出 w:OK1 w:OK2 w:OK3 w:OK4，exit 0）。
+// 验收点：①值语义复制（原对象不变）②指定字段覆盖 ③未提及字段保持
+// ④链式 with ⑤f64 收窄（整数字面量赋 f64 字段）⑥引用字段共享。
+
+struct Pt {
+    var x: i64
+    var y: i64
+    var tag: string
+}
+
+struct W {
+    var a: i64
+    var r: f64
+    var s: string
+}
+
+func main() {
+    // ①②③ 值语义复制 + 覆盖 + 未提及字段保持
+    var p = Pt(1, 2, "orig")
+    var q = p with {x: 10}
+    if q.x == 10 && q.y == 2 && q.tag == "orig" && p.x == 1 && p.y == 2 {
+        println("w:OK1")
+    } else {
+        println("w:FAIL1")
+    }
+    // ④ 链式 with
+    var r = p with {x: 5} with {y: 6}
+    if r.x == 5 && r.y == 6 && r.tag == "orig" && p.x == 1 {
+        println("w:OK2")
+    } else {
+        println("w:FAIL2")
+    }
+    // ⑤ f64 字段整数字面量覆盖（S1.3 收窄）
+    var w = W(1, 2.5, "s")
+    var w2 = w with {r: 7}
+    if w2.r == 7.0 && w.a == 1 && w.r == 2.5 {
+        println("w:OK3")
+    } else {
+        println("w:FAIL3")
+    }
+    // ⑥ 表字段（引用）共享 + string 字段覆盖
+    var t = table_new_i64()
+    table_push(t, 42)
+    var b = B(t, "old")
+    var b2 = b with {name: "new"}
+    table_push(t, 43)
+    if len(b2.data) == 2 && b2.data[0] == 42 && b2.data[1] == 43 && b2.name == "new" && b.name == "old" {
+        println("w:OK4")
+    } else {
+        println("w:FAIL4")
+    }
+}
+
+struct B {
+    var data: table<i64>;
+    var name: string;
+}

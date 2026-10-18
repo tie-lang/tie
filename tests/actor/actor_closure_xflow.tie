@@ -1,0 +1,73 @@
+type tie<logic>
+// ============================================================================
+// actor_closure_xflow.tie —— 任务 A 隔离探针（2026-10-03）
+// 目标：一次性区分「跨执行流调用返回 0」的根因。
+// 已知：actor_msg_typed.tie 里 apply = f(x)+base，base 生效(100) 而 f(x)=0。
+// ⇒ 要么 (a) 闭包 env 无效，(b) i64 实参 x 没传对（f(0) 也可能得 0），(c) call_indirect 本身。
+// 分组：
+//   A  actor 内调「普通全局函数」      —— 纯跨流调用基线
+//   Cn actor 内调「消息传入的无捕获闭包」—— 排除 env
+//   Cc actor 内调「消息传入的捕获局部闭包」—— 捕获来自创建方栈帧（最可疑）
+//   Cg actor 内调「消息传入的捕获全局闭包」—— env 在堆还是静态槽
+//   E  actor 方法内自建闭包调用       —— 任务 B（可能编译期就失败）
+// ============================================================================
+
+var g_k: i64 = 5
+
+func g_triple(y: i64) -> i64 { return y * 3 }
+
+actor W {
+    var base: i64 = 0
+
+    pub func setup(b: i64) -> i64 {
+        base = b
+        return b
+    }
+
+    // A 基线：跨流调用普通全局函数
+    pub func t_global(x: i64) -> i64 {
+        return g_triple(x) + base
+    }
+
+    // Cn 消息传入的无捕获闭包
+    pub func t_fn_nocap(f: fn(i64) -> i64, x: i64) -> i64 {
+        return f(x) + base
+    }
+
+    // Cc 消息传入的捕获局部闭包（env 在 main 栈帧上）
+    pub func t_fn_cap_local(f: fn(i64) -> i64, x: i64) -> i64 {
+        return f(x) + base
+    }
+
+    // Cg 消息传入的捕获全局闭包
+    pub func t_fn_cap_glob(f: fn(i64) -> i64, x: i64) -> i64 {
+        return f(x) + base
+    }
+}
+
+func report(tag: string, got: i64, want: i64) {
+    if got == want {
+        println("PASS " + tag + "=" + to_string(got))
+    } else {
+        println("FAIL " + tag + "=" + to_string(got) + " want=" + to_string(want))
+    }
+}
+
+func main() {
+    var w = run W()
+    var b = w.setup(100)
+    report("setup", b, 100)
+
+    // A：普通全局函数，期望 3*7+100 = 121
+    report("A_global", w.t_global(7), 121)
+
+    // Cn：无捕获闭包 return y+1，期望 7+1+100 = 108
+    report("C_nocap", w.t_fn_nocap(func(y: i64) -> i64 { return y + 1 }, 7), 108)
+
+    // Cc：捕获局部 k=9，期望 7*9+100 = 163
+    var k: i64 = 9
+    report("C_cap_local", w.t_fn_cap_local(func(y: i64) -> i64 { return y * k }, 7), 163)
+
+    // Cg：捕获全局 g_k=5，期望 7*5+100 = 135
+    report("C_cap_glob", w.t_fn_cap_glob(func(y: i64) -> i64 { return y * g_k }, 7), 135)
+}

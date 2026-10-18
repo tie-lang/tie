@@ -1,0 +1,181 @@
+type tie<logic>
+// compiler/frontend/ast_test.tie —— tie.ast 库独立自检（p.9.21 G7 库资格②）
+// ============================================================
+// 无 driver 可跑：本文件即入口（tie<logic>），只 import 被测库，
+// 覆盖节点池的全部契约：
+//   - new_node：六列写入 + 返回节点 id（0 起连续）；
+//   - 字段访问器：tag/name/val/aux/line/col 读回与写入一致；
+//   - set_val：就地覆盖主整数值；
+//   - set_children / child_count / child_at：子节点段连续、
+//     顺序保持、支持 -1 哨兵槽位；两节点子段互不串扰；
+//   - is_stmt_list：StmtList 判定；
+//   - collect_stmt：从 StmtList（含嵌套块）展平收集顶层语句；
+//   - reset：池清空（count 归零）。
+// 全部通过输出「ast 自检通过」exit 0；任一失败打印明细 exit 1。
+//
+// # 语言边界应用（同 ir_test.tie）
+//   - import 文本内联后与本库顶层常量同作用域：**不定义本地常量**，
+//     tag 一律用库内 N_* 常量；
+//   - 前缀调用（ast.xxx）；断言失败累积用嵌套 if。
+//
+// 构造的树（对齐 tag 编号表语义）：
+//   StmtList(122)
+//     ├─ IntLit(0)  val=7
+//     ├─ Binary(9)  aux=运算符码  children=[IntLit, Var]
+//     └─ If(105)    children=[cond, then-StmtList, else-StmtList]
+// 运行（repo 根）：
+//   compiler\tiec.exe compiler\frontend\ast_test.tie -o <tmp>\asttest.exe
+//   <tmp>\asttest.exe        # -> 「ast 自检通过」exit 0
+
+import "./ast.tie"
+
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+func main() {
+    var ok: bool = true
+    ast.reset()
+    if !check(ast.count() == 0, "reset 后节点池为空") {
+        ok = false
+    }
+
+    // ---------- new_node：六列写入 ----------
+    var root = ast.new_node(N_STMTLIST, -1, 0, 0, 1, 1)
+    if !check(root == 0, "首节点 id 为 0") {
+        ok = false
+    }
+    if !check(ast.tag(root) == N_STMTLIST, "tag 列读回") {
+        ok = false
+    }
+    if !check(ast.line(root) == 1 && ast.col(root) == 1, "行/列读回") {
+        ok = false
+    }
+
+    var lit = ast.new_node(N_INT_LIT, -1, 7, 0, 2, 5)
+    if !check(ast.val(lit) == 7 && ast.line(lit) == 2 && ast.col(lit) == 5,
+              "字面量节点 val/line/col 读回") {
+        ok = false
+    }
+
+    // ---------- set_val：就地覆盖 ----------
+    ast.set_val(lit, 9)
+    if !check(ast.val(lit) == 9, "set_val 就地覆盖主整数值") {
+        ok = false
+    }
+
+    // ---------- 子节点段：连续、有序、支持 -1 槽位 ----------
+    var nameid = ast.new_node(N_VAR, 42, 0, 0, 3, 3)
+    var bin = ast.new_node(N_BINARY, -1, 0, 11, 3, 1)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, lit)
+    table_push(kids, nameid)
+    table_push(kids, -1)
+    ast.set_children(bin, kids)
+    if !check(ast.child_count(bin) == 3, "子节点个数读回") {
+        ok = false
+    }
+    if !check(ast.child_at(bin, 0) == lit && ast.child_at(bin, 1) == nameid,
+              "子节点顺序保持") {
+        ok = false
+    }
+    if !check(ast.child_at(bin, 2) == -1, "子节点支持 -1 哨兵槽位") {
+        ok = false
+    }
+    if !check(ast.name(nameid) == 42, "name 列（池 id）读回") {
+        ok = false
+    }
+
+    // ---------- 两节点子段互不串扰 ----------
+    var other = ast.new_node(N_CALL, -1, 0, 0, 4, 1)
+    var okids: table<i64> = table_new_i64()
+    table_push(okids, root)
+    ast.set_children(other, okids)
+    if !check(ast.child_count(other) == 1 && ast.child_at(other, 0) == root,
+              "第二节点子段独立") {
+        ok = false
+    }
+    if !check(ast.child_count(bin) == 3 && ast.child_at(bin, 1) == nameid,
+              "第一节点子段不受影响（段偏移 O(1)）") {
+        ok = false
+    }
+
+    // ---------- is_stmt_list + collect_stmt：嵌套块展平 ----------
+    var then_blk = ast.new_node(N_STMTLIST, -1, 0, 0, 5, 1)
+    var else_blk = ast.new_node(N_STMTLIST, -1, 0, 0, 7, 1)
+    var s1 = ast.new_node(N_INT_LIT, -1, 1, 0, 5, 3)
+    var s2 = ast.new_node(N_FLOAT_LIT, -1, 2, 0, 6, 3)
+    var tk: table<i64> = table_new_i64()
+    table_push(tk, s1)
+    table_push(tk, s2)
+    ast.set_children(then_blk, tk)
+    var s3 = ast.new_node(N_INT_LIT, -1, 3, 0, 7, 5)
+    var ek: table<i64> = table_new_i64()
+    table_push(ek, s3)
+    ast.set_children(else_blk, ek)
+
+    var cond = ast.new_node(N_INT_LIT, -1, 0, 0, 4, 5)
+    var ifn = ast.new_node(N_IF, -1, 0, 0, 4, 1)
+    var ik: table<i64> = table_new_i64()
+    table_push(ik, cond)
+    table_push(ik, then_blk)
+    table_push(ik, else_blk)
+    ast.set_children(ifn, ik)
+
+    var top: table<i64> = table_new_i64()
+    table_push(top, lit)
+    table_push(top, bin)
+    table_push(top, ifn)
+    ast.set_children(root, top)
+
+    if !check(ast.is_stmt_list(root) && ast.is_stmt_list(then_blk) && ast.is_stmt_list(else_blk),
+              "is_stmt_list 判定 StmtList") {
+        ok = false
+    }
+    if !check(!ast.is_stmt_list(ifn), "非 StmtList 不误判") {
+        ok = false
+    }
+
+    var out: table<i64> = table_new_i64()
+    ast.collect_stmt(out, root)
+    // 期望：字面量 / 二元 / if 三条顶层语句；嵌套块内语句**不**上抛
+    var found_lit: bool = false
+    var found_bin: bool = false
+    var found_if: bool = false
+    var no_nested: bool = true
+    var k2: i64 = 0
+    while k2 < len(out) {
+        var t = ast.tag(out[k2])
+        if t == N_INT_LIT && ast.val(out[k2]) == 9 {
+            found_lit = true
+        }
+        if t == N_BINARY {
+            found_bin = true
+        }
+        if t == N_IF {
+            found_if = true
+        }
+        if t == N_FLOAT_LIT {
+            no_nested = false
+        }
+        k2 = k2 + 1
+    }
+    if !check(len(out) == 3, "collect_stmt 收集 3 条顶层语句") {
+        ok = false
+    }
+    if !check(found_lit && found_bin && found_if, "三条顶层语句齐全") {
+        ok = false
+    }
+    if !check(no_nested, "嵌套块内语句不上抛") {
+        ok = false
+    }
+
+    // ---------- 汇总 ----------
+    if !ok {
+        exit(1)
+    }
+    println("ast 自检通过")
+}

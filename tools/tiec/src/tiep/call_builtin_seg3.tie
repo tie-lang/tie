@@ -1,0 +1,92 @@
+type tie<class>
+// compiler/interp/call_builtin_seg3.tie —— call_builtin 分派链分段 3（p.9.21 G2 单函数 ≤300 行）
+// ============================================================
+// 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
+// 与原函数同 namespace，跨文件裸名互调；p.9.17.2 Value 化后未命中改由
+// 前置名单（interp_call_p2 的 cb_is_seg3）判定，错误统一经 w_err 传播。
+namespace tiep {
+func call_builtin_seg3(name: string, args: table<Value>) -> Value {
+    if name == "arg_at" {
+        if len(args) != 1 || vval.type_of(args[0]) != W_INT {
+            w_err = "arg_at 需要一个整数下标参数"
+            return Value.Nil
+        }
+        var i = vval.int_val(args[0])
+        if script_args_active() {
+            if i < 0 || i >= len(script_args()) {
+                return vval.new_str("")
+            }
+            return vval.new_str(script_args()[i])
+        }
+        return vval.new_str(arg_string(i))
+    }
+    // 文件 SHA256（certutil 等价；内部 hex 提取，优先内部实现路径占位）
+    if name == "get_file_hash" {
+        if len(args) != 1 {
+            w_err = "get_file_hash 需要一个文件路径参数"
+            return Value.Nil
+        }
+        return vval.new_str(b_file_hash(vval.str_val(args[0])))
+    }
+    // 进程超时：解释器无 spawn+terminate 原语（libc system 同步阻塞），当前
+    // 退化为同步 exec_code（返回退出码）；OS 级 CreateProcessWait 超时语义待
+    // LLVM 后端内联原语接入后补强（诚实裁决，见批注）。
+    if name == "exec_code_timeout" {
+        if len(args) != 2 {
+            w_err = "exec_code_timeout 需要命令字符串与超时毫秒参数"
+            return Value.Nil
+        }
+        return vval.new_int(exec_code(vval.str_val(args[0])))
+    }
+    // 条件 exit(n)：置退出请求槽，eval_script 循环检测后停止；宿主透传退出码
+    if name == "exit" {
+        var exit_code: i64 = 0
+        if len(args) >= 1 {
+            exit_code = vval.int_val(args[0])
+        }
+        g_tsh_exit_req = true
+        g_tsh_exit_code = exit_code
+        return vval.new_void()
+    }
+    // ---- 批次④确定性内建 ----
+    // 确定删除单文件（转发底座 file_delete，内部确定删除；替代 exec del 的 flake）。
+    if name == "remove_file" {
+        if len(args) != 1 || vval.type_of(args[0]) != W_STR {
+            w_err = "remove_file 需要一个文件路径参数"
+            return Value.Nil
+        }
+        return vval.new_bool(file_delete(vval.str_val(args[0])))
+    }
+    // 字符串表按字节序（码点序）升序排序 → 新 Value::Table。
+    if name == "sort_strings" {
+        if len(args) != 1 || vval.type_of(args[0]) != W_TABLE {
+            w_err = "sort_strings 需要一个字符串表参数"
+            return Value.Nil
+        }
+        return b_sort_strings(args[0])
+    }
+    // findstr 风格正则命中：s 中匹配则 true。0-Rust：不再经语言级 regex_find
+    //（Rust 桥 tie_regex_find，驱动 driver 编译时置 g_used_interp）——改为纯 tie
+    // 内联 findstr 子集匹配器（b_findstr，str_char/str_len 等内联原语，零桥）。
+    // pattern 支持 findstr /r 常用子集（. * + ? ^ $ [类-范围] 与 "\\" 转义）。
+    if name == "regex_findstr" {
+        if len(args) != 2 || vval.type_of(args[0]) != W_STR || vval.type_of(args[1]) != W_STR {
+            w_err = "regex_findstr 需要两个字符串参数（s, pattern）"
+            return Value.Nil
+        }
+        return vval.new_bool(b_findstr(vval.str_val(args[0]), vval.str_val(args[1])))
+    }
+    // 短暂睡眠（libc Sleep 毫秒级，供超时/等待用）。
+    if name == "sleep_ms" {
+        if len(args) != 1 || vval.type_of(args[0]) != W_INT {
+            w_err = "sleep_ms 需要一个整数毫秒参数"
+            return Value.Nil
+        }
+        if vval.int_val(args[0]) > 0 {
+            unsafe { Sleep(vval.int_val(args[0])) }
+        }
+        return vval.new_void()
+    }
+    return Value.Nil  // 防御出口：名单前置分派（cb_is_seg3）保证不达
+}
+}

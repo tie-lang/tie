@@ -1,0 +1,38 @@
+type tie<class>
+// compiler/tinker/tinker.tie —— tinker 主文件（p.9.22.9-12）
+// ============================================================
+// tinker：tiec 内嵌的 tink 帧协议双向传输（tiec 天然成为 tink pipe 节点）。
+// 设计稿：docs/superpowers/specs/2026-09-25-structured-output-tinker-design.md §5。
+//
+// # 组成（p.9.21 模块纪律：主文件持全局 + import 树 + 分派薄壳）
+//   tinker_frame.tie  帧编解码 + CRC32 查表（零依赖叶）
+//   tinker_env.tie    信封 record 编解码（依赖 zdw）
+//   tinker_sink.tie   发送出口（stdout 帧流 / 帧文件；hub 预留）
+//   tinker_recv.tie   接收入口（stdin/帧文件；拒帧 + kind 分派）
+//
+// # CLI（driver/cli_args 解析）
+//   --tink（stdout 帧流；人读文本改走 stderr——driver.txt 单一出处）
+//   --tink-in（stdin 帧流接收，编译前先消费）· --tink-in-file <f>
+//   --tink-file <f>（帧流写文件）· --tink-save <dir>（收到载荷落盘）
+//   --tink --tink-in 双开 = 全双工管道节点。
+//
+// # 帧/信封
+//   帧 = [len u32 BE][payload][crc u32 BE]（与 std/tink 逐字节一致）
+//   信封 = kind(1 hello/2 hello-ack/3 stage/4 artifact/5 diag) + stage + name + payload
+//
+// # 失败语义
+//   拒帧（CRC/长度/信封非法）→ 报错退出非 0（不静默传递损坏数据）。
+
+// ==================== 全局（主文件持） ====================
+// 解码结果槽（env_decode 写入）。
+pub var tk_kind: i64 = -1;        // 信封 kind（-1 = 未解码）
+pub var tk_stage: i64 = 0;        // 信封 stage
+pub var tk_name: string = "";     // 信封 name
+pub var tk_pl: table<i64>;        // 信封 payload（内层记录/产物字节）
+// 出站缓冲：接收阶段（回执/透传）与发送阶段共用的 FIFO 帧缓冲，写出口一次写出。
+pub var tk_out: table<i64>;
+
+import "./tinker_frame.tie"
+import "./tinker_env.tie"
+import "./tinker_sink.tie"
+import "./tinker_recv.tie"

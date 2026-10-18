@@ -1,0 +1,136 @@
+type tie<class>
+// compiler/dbug/dbgem_coltd.tie —— 结构化输出·td 可读投影（p.9.22.2）
+// ============================================================
+// 同一列登记（dbgem_colzd）→ 可读表字面量（tie:data 合法：可被 config.parse_data
+// 解析回来做双形态等价校验）。布局：
+//   // tiec dbgem v1 stage=<名> unit=<路径> cols=<N>
+//   [
+//   "schema": 1,
+//   "stage": N,
+//   "unit": "…",
+//   "files": [ "…", … ],
+//   "strings": [ … ],
+//   "<列名>": [ 值, 值, … ],
+//   …
+//   ]
+// 值形态：i64 列 = 十进制；str 列 = 双引号字面量（转义集 \" \\ \n \r \t 与
+// config 解析器一致）。
+//
+// 注（与设计稿 §3 措辞的差异）：设计稿描述「每节点/符号/诊断一行」的行投影；
+// 本实现取**逐列段**投影——同一份列数据 1:1 呈现（直拷保真、双形态等价可
+// 机械校验、列内 diff 友好）。行重建为可选后续增强，不改变记录内容。
+
+namespace dbgem {
+
+// 追加带转义的引号字符串。
+// ★ 按**字节**遍历：len(s) = 字节数（str_len 是码点数——混用会截断多字节串）。
+func td_qstr(sb: i64, s: string) {
+    sb_append_byte(sb, 34)
+    var n = len(s)
+    var i: i64 = 0
+    while i < n {
+        var b = str_byte(s, i)
+        if b == 92 {
+            sb_append(sb, "\\\\")
+        } else if b == 34 {
+            sb_append(sb, "\\\"")
+        } else if b == 10 {
+            sb_append(sb, "\\n")
+        } else if b == 13 {
+            sb_append(sb, "\\r")
+        } else if b == 9 {
+            sb_append(sb, "\\t")
+        } else {
+            sb_append_byte(sb, b)
+        }
+        i = i + 1
+    }
+    sb_append_byte(sb, 34)
+}
+
+// 文件表段（0=主输入；k>=1=imports，序同 sstate.file_path_of）。
+func td_files(sb: i64) {
+    var n = len(g_file_base)
+    if n < 1 {
+        n = 1
+    }
+    sb_append(sb, "\"files\": [")
+    var k: i64 = 0
+    while k < n {
+        if k > 0 {
+            sb_append(sb, ", ")
+        }
+        if k == 0 {
+            td_qstr(sb, g_input)
+        } else {
+            td_qstr(sb, sstate.file_path_of(k))
+        }
+        k = k + 1
+    }
+    sb_append(sb, "],\n")
+}
+
+// 字符串池段（全量；id=下标）。
+func td_strings(sb: i64) {
+    sb_append(sb, "\"strings\": [")
+    var n = interner.len()
+    var i: i64 = 0
+    while i < n {
+        if i > 0 {
+            sb_append(sb, ", ")
+        }
+        td_qstr(sb, interner.name_str(i))
+        i = i + 1
+    }
+    sb_append(sb, "],\n")
+}
+
+// 列段（逐列一行块）。
+func td_cols(sb: i64) {
+    var c: i64 = 0
+    while c < len(dc_fno) {
+        sb_append(sb, "\"")
+        sb_append(sb, dc_label[c])
+        sb_append(sb, "\": [")
+        var off = dc_off[c]
+        var n = dc_len[c]
+        var i: i64 = 0
+        while i < n {
+            if i > 0 {
+                sb_append(sb, ", ")
+            }
+            if dc_kind[c] == 0 {
+                sb_append(sb, to_string(dc_i64[off + i]))
+            } else {
+                td_qstr(sb, dc_str[off + i])
+            }
+            i = i + 1
+        }
+        sb_append(sb, "],\n")
+        c = c + 1
+    }
+}
+
+// td 记录组装 + 落盘。
+pub func td_write(stage: i64, stage_name: string, path: string) -> bool {
+    var sb = string_builder()
+    sb_append(sb, "// tiec dbgem v1 stage=")
+    sb_append(sb, stage_name)
+    sb_append(sb, " unit=")
+    sb_append(sb, g_input)
+    sb_append(sb, " cols=")
+    sb_append(sb, to_string(len(dc_fno)))
+    sb_append(sb, "\n[\n")
+    sb_append(sb, "\"schema\": 1,\n\"stage\": ")
+    sb_append(sb, to_string(stage))
+    sb_append(sb, ",\n\"unit\": ")
+    td_qstr(sb, g_input)
+    sb_append(sb, ",\n")
+    td_files(sb)
+    td_strings(sb)
+    td_cols(sb)
+    sb_append(sb, "]\n")
+    return file_write(path, sb_build(sb))
+}
+
+}   // namespace dbgem

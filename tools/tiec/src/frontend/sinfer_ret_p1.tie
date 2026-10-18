@@ -1,0 +1,324 @@
+type tie<class>
+// compiler/frontend/sinfer_ret_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 sinfer_ret.tie。
+namespace sinfer {
+// ==================== S2.3 ? 后缀解包 ====================
+// `expr ?`：expr 必须是 Result/Option 类枚举（含 Ok/Err 或 Some/None 变体）。
+// 语义：
+//   - 解包类型 = Ok/Some 变体的 payload 类型（解包后表达式的类型）
+//   - 当前函数返回类型必须是「同一枚举实例」（Result/Option），
+//     否则 `?` 无法提前返回 Err/None（编译错误）
+// 返回解包类型；失败 -1（错误已置 sm_err_*）。
+func infer_try_unwrap(id: i64) -> i64 {
+    var operand = sstate.child(id, 0)
+    var ot = infer_expr(operand)
+    if ot < 0 {
+        return -1
+    }
+    if types.kind(ot) != K_ENUM {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'?' 解包的操作数必须是 Result/Option 枚举，实际是 " + types.type_name(ot)
+        return -1
+    }
+    var ei = types.low(ot)
+    var varoff = en_varoff[ei]
+    var nvar = en_nvar[ei]
+    // 找 Ok/Some 变体（payload 解包）与 Err/None 变体（提前返回标记）
+    var ok_i: i64 = -1
+    var err_i: i64 = -1
+    var k: i64 = 0
+    while k < nvar {
+        var vn = intern.lookup(en_vnames[varoff + k])
+        if vn == "Ok" || vn == "Some" {
+            ok_i = k
+        } else if vn == "Err" || vn == "None" {
+            err_i = k
+        }
+        k = k + 1
+    }
+    if ok_i < 0 || err_i < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'?' 解包要求枚举 '" + types.type_name(ot) + "' 具有 Ok/Some 与 Err/None 变体（Result/Option 形态）"
+        return -1
+    }
+    // 当前函数返回类型必须是同一枚举实例（Err/None 提前返回的落点）
+    // S2.2 闭包：闭包体内的 ? 解包以闭包返回类型（g_clo_ret_stack 栈顶）为基准
+    var ret_ty = sg_ret[g_curfn]
+    if g_clo_ret_top > 0 {
+        ret_ty = g_clo_ret_stack[g_clo_ret_top - 1]
+    }
+    if ret_ty < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'?' 解包只能用于返回 Result/Option 的函数内（当前函数无返回类型）"
+        return -1
+    }
+    if types.kind(ret_ty) != K_ENUM {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'?' 解包只能用于返回 Result/Option 的函数内，当前函数返回 " + types.type_name(ret_ty)
+        return -1
+    }
+    var rei = types.low(ret_ty)
+    if rei != ei {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'?' 解包错误类型不匹配：函数返回 " + types.type_name(ret_ty) + "，操作数是 " + types.type_name(ot)
+        return -1
+    }
+    // 解包类型 = Ok/Some 变体的 payload 类型（单字段）
+    var foff = en_vfldoff[varoff + ok_i]
+    if en_vnfld[varoff + ok_i] != 1 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "内部错误：'?' 解包的 Ok/Some 变体应恰有一个 payload 字段"
+        return -1
+    }
+    var unwrap = en_ftys[foff]
+    node_types[id] = unwrap
+    g_typed = g_typed + 1
+    return unwrap
+}
+
+// 变参元素类型（`...T` → T；非变参 -1）。签名存的是 table<T>。
+func sstate_fn_variadic_elem(sig: i64) -> i64 {
+    var n = sg_nparams[sig]
+    if n <= 0 {
+        return -1
+    }
+    if sp_vars[sg_off[sig] + n - 1] != 1 {
+        return -1
+    }
+    return types.table_elem(sp_tys[sg_off[sig] + n - 1])
+}
+
+// 函数调用推断
+// ---------- S1.3 字面量范围判定 ----------
+// 常量值 v 是否在类型 ty 的范围内（与 stype.types_match 的 C3 范围检查
+// 同一套边界；i64/u64 原生范围恒 true）。Binary 混合宽度上下文推断用。
+func lit_in_range(v: i64, ty: i64) -> bool {
+    if ty == TK_I8 && (v < -128 || v > 127) {
+        return false
+    }
+    if ty == TK_I16 && (v < -32768 || v > 32767) {
+        return false
+    }
+    if ty == TK_I32 && (v < -2147483648 || v > 2147483647) {
+        return false
+    }
+    if ty == TK_U8 && (v < 0 || v > 255) {
+        return false
+    }
+    if ty == TK_U16 && (v < 0 || v > 65535) {
+        return false
+    }
+    if ty == TK_U32 && (v < 0 || v > 4294967295) {
+        return false
+    }
+    return true
+}
+
+// p.8.2.2 命名实参重排 + p.9.11.23 默认值补齐 + p.9.11.25 方法支持。
+// 入参 `recv_skip`：0 = 普通函数；1 = 方法（children = [泛型槽, 接收者, 实参...]，
+// 形参下标 0 是接收者）——**接收者不参与命名重排与默认值补齐**（p.9.11.25 定案），
+// 故它被预填为已定槽，位置实参从下标 recv_skip 起排、命名匹配也跳过它。
+// 规则：位置实参在前、命名实参在后（乱序可）；命名实参可省略**有默认值**的形参
+//（值从声明处默认值表达式取，见下方补齐段）；变参函数不支持；未知/重复/冲突报错。
+func reorder_named_args(call_id: i64, args: ref table<i64>, full_name: string, sig: i64, recv_skip: i64) -> i64 {
+    var has_named: bool = false
+    var i0: i64 = 0
+    while i0 < len(args) {
+        if s_tags[args[i0]] == N_NAMED_ARG {
+            has_named = true
+        }
+        i0 = i0 + 1
+    }
+    if !has_named {
+        return 0
+    }
+    var nparams = sg_nparams[sig]
+    if sstate.fn_has_variadic(sig) == 1 {
+        sm_err_line = s_lines[call_id]
+        sm_err_col = s_cols[call_id]
+        sm_err_msg = "命名实参不支持变参函数 '" + full_name + "'"
+        return -1
+    }
+    var fnode = sstate.fn_def_node(full_name)
+    if fnode < 0 {
+        sm_err_line = s_lines[call_id]
+        sm_err_col = s_cols[call_id]
+        sm_err_msg = "内部错误：命名实参函数 '" + full_name + "' 无定义节点"
+        return -1
+    }
+    var pnames: table<i64> = table_new_i64()
+    var p: i64 = 0
+    while p < nparams {
+        var pnode = sstate.child(fnode, sstate.slot_off(fnode) + 1 + p)
+        table_push(pnames, s_names[pnode])
+        p = p + 1
+    }
+    var new_order: table<i64> = table_new_i64()
+    var filled: table<i64> = table_new_i64()
+    var k: i64 = 0
+    while k < nparams {
+        table_push(new_order, -1)
+        // 接收者槽（下标 < recv_skip）视为已定：不参与位置排序与默认值补齐。
+        if k < recv_skip {
+            table_push(filled, 1)
+        } else {
+            table_push(filled, 0)
+        }
+        k = k + 1
+    }
+    // 接收者预填（方法：形参下标 0 = 接收者，实参节点在 children[slot_off]）。
+    if recv_skip > 0 {
+        new_order[0] = sstate.child(call_id, sstate.slot_off(call_id))
+    }
+    var pos: i64 = recv_skip
+    var seen_named: bool = false
+    var i2: i64 = 0
+    while i2 < len(args) {
+        var a = args[i2]
+        if s_tags[a] == N_NAMED_ARG {
+            seen_named = true
+            var nm = s_names[a]
+            var pi: i64 = -1
+            var j: i64 = recv_skip
+            while j < nparams {
+                if pnames[j] == nm {
+                    pi = j
+                    break
+                }
+                j = j + 1
+            }
+            if pi < 0 {
+                sm_err_line = s_lines[a]
+                sm_err_col = s_cols[a]
+                if recv_skip > 0 && sstate.nchild(sstate.fn_def_node(full_name)) > 0 {
+                    // 方法：形参名表含接收者，若用户误用接收者名则明确提示
+                    var pn0 = sstate.child(sstate.fn_def_node(full_name), sstate.slot_off(sstate.fn_def_node(full_name)) + 1)
+                    if s_names[pn0] == nm {
+                        sm_err_msg = "命名实参 '" + intern.lookup(nm) + "' 是接收者形参，不能作为命名实参（接收者由调用对象给定）"
+                        return -1
+                    }
+                }
+                sm_err_msg = "命名实参 '" + intern.lookup(nm) + "' 不是函数 '" + full_name + "' 的形参"
+                return -1
+            }
+            if filled[pi] == 1 {
+                sm_err_line = s_lines[a]
+                sm_err_col = s_cols[a]
+                sm_err_msg = "命名实参 '" + intern.lookup(nm) + "' 重复"
+                return -1
+            }
+            if pi < pos {
+                sm_err_line = s_lines[a]
+                sm_err_col = s_cols[a]
+                sm_err_msg = "命名实参 '" + intern.lookup(nm) + "' 与位置实参冲突（位置实参已占用形参 " + to_string(pi + 1) + "）"
+                return -1
+            }
+            new_order[pi] = sstate.child(a, 0)
+            filled[pi] = 1
+        } else {
+            if seen_named {
+                sm_err_line = s_lines[a]
+                sm_err_col = s_cols[a]
+                sm_err_msg = "命名实参之后不能再出现位置实参"
+                return -1
+            }
+            if pos >= nparams {
+                sm_err_line = s_lines[call_id]
+                sm_err_col = s_cols[call_id]
+                sm_err_msg = "函数 '" + full_name + "' 实参过多（命名实参调用）"
+                return -1
+            }
+            new_order[pos] = a
+            filled[pos] = 1
+            pos = pos + 1
+        }
+        i2 = i2 + 1
+    }
+    // p.9.11.23 命名实参 × 默认值打通（定案一见 param-system-design §3）：未提供
+    // 的形参**若有默认值**，从声明处参数节点取其默认值表达式填入本槽；无默认值
+    // 才报「缺少形参」。于是可写 `f(x: 1, z: 3)`（y 自动补默认值），不再要求
+    // 命名实参调用全量提供。
+    //
+    // 两点依据：
+    //   * 默认值参数**连续居尾**（既有不变式，scollect 校验）⇒ 只要看该槽的
+    //     sp_defs 标志就足以判定可否省略，无需扫尾段；
+    //   * 填好后调用节点 children 即为**完整实参序列**，故 irgen 不会再走它的
+    //     「末尾顺序补齐」分支——那条路只能补尾部的洞，补不了命名的中间洞。
+    //
+    // 默认值节点来自声明处（会被多个调用点共享引用）：安全，因为默认值受
+    // const 白名单约束（字面量/常量算术/const 引用），求值无副作用、无作用域依赖。
+    var f2: i64 = recv_skip
+    while f2 < nparams {
+        if filled[f2] == 0 {
+            if sp_defs[sg_off[sig] + f2] == 0 {
+                sm_err_line = s_lines[call_id]
+                sm_err_col = s_cols[call_id]
+                sm_err_msg = "命名实参调用 '" + full_name + "' 缺少第 " + to_string(f2 + 1) + " 个形参 '" + intern.lookup(pnames[f2]) + "' 的值（该形参无默认值）"
+                return -1
+            }
+            var pnode2 = sstate.child(fnode, sstate.slot_off(fnode) + 1 + f2)
+            var defn2 = sstate.child(pnode2, 1)
+            if defn2 < 0 {
+                sm_err_line = s_lines[call_id]
+                sm_err_col = s_cols[call_id]
+                sm_err_msg = "内部错误：形参 '" + intern.lookup(pnames[f2]) + "' 标记有默认值但缺默认值表达式（函数 " + full_name + "）"
+                return -1
+            }
+            new_order[f2] = defn2
+            filled[f2] = 1
+        }
+        f2 = f2 + 1
+    }
+    // 改写调用节点 children 段。
+    // 段长必须容纳 recv_skip + (nparams - recv_skip) 个实参；用户少写时段长不足，
+    // 此时**就地写入会越界**——必须用 set_children 重建段（追加新段 + 更新
+    // coff/nchild）。头部（泛型槽 [+ 接收者]）原样保留，slot_off 语义不变。
+    var head = sstate.slot_off(call_id) + recv_skip
+    var need = head + (nparams - recv_skip)
+    if sstate.nchild(call_id) >= need {
+        // 段长已足够 → 就地改写，无额外分配
+        var off0 = s_coff[call_id] + head
+        var f4: i64 = recv_skip
+        while f4 < nparams {
+            s_children[off0 + (f4 - recv_skip)] = new_order[f4]
+            f4 = f4 + 1
+        }
+    } else {
+        // 段长不足 → 重建段
+        var kids: table<i64> = table_new_i64()
+        var h: i64 = 0
+        while h < head {
+            table_push(kids, sstate.child(call_id, h))
+            h = h + 1
+        }
+        var f5: i64 = recv_skip
+        while f5 < nparams {
+            table_push(kids, new_order[f5])
+            f5 = f5 + 1
+        }
+        sstate.set_children(call_id, kids)
+    }
+    // 同步实参表（args 不含接收者，故下标从 0 对应形参 recv_skip）
+    var q: i64 = recv_skip
+    var ai: i64 = 0
+    while q < nparams {
+        if ai < len(args) {
+            args[ai] = new_order[q]
+        } else {
+            table_push(args, new_order[q])
+        }
+        ai = ai + 1
+        q = q + 1
+    }
+    return 0
+}
+
+}

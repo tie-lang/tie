@@ -1,0 +1,487 @@
+type tie<class>
+// bytes.tie：标准库——字节表（动态 i64 表，元素 0..255）工具（命名空间 bytes），
+// 基于底座原语 byte_read / byte_write / byte_concat / bit_read / bit_write。
+// 接口（library-v2 §4.1）：表参数/返回全部标注元素类型 table<i64>。
+// 调用：import 后 bytes.read(path) / bytes.to_ascii(t)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 bytes_ 前缀（统一 func 写法，Harbor M2.1.6）。
+// 命名说明：bit_read / bit_write 与底座原语同名——语义分析中**内置原语优先于
+// 用户函数**解析（sinfer.infer_call 先查 builtin_call），故函数体内裸调 bit_read
+// 命中的是底座原语而非自身，不构成递归；外部用限定调用 bytes.bit_read 命中本函数。
+// 底座行为说明：
+//   - byte_read 失败（文件不存在等）由编译器输出运行时错误并退出（exit 1），
+//     本模块无法捕获，"失败空表"仅作文档约定（此接口由回溯后保留的原因见文件末注）；
+//   - byte_write 返回 i8（成功 1 / 失败 0），本模块转 bool；
+//   - bit_read 越界（pos<0 或超出表位数）返回 0；bit_write 越界返回 0（失败）。
+// 局限：tie 无「码点→任意字符」原语，to_ascii 只能查可打印 ASCII 表（32..126）
+// 还原字节，非可打印字节无法构造字符（跳过）；from_ascii 只接受 ASCII 码点
+// （0..127），遇非 ASCII 码点返回空表。
+//
+// == 关于 read 的返回类型（历史限制说明，已放开）==
+// 设计文档 library-v2 §4.1 原定 `read(path) -> Result<table<i64>, string>`（失败
+// 返回 Result.Err）。曾因 tiec 枚举 payload 白名单不支持 table 而退化为字节表
+// 哨兵；p.6.2.1 已放开 table 作 payload（见 tests/_p6_probe/enum_payload_lift.tie）。
+// 本函数保持返回类型化 table<i64>（真表语义）的既有签名（API 稳定，不破坏
+// 调用方），错误信号退化为 byte_read 的编译器报错退出 + 文档约定。
+namespace bytes {
+// 读取文件全部字节为 i64 表（每元素 0..255。失败由 byte_read 底座报错退出，
+// 见文件头底座行为说明与 read 返回类型注释）。
+pub func read(path: string) -> table<i64> {
+    return byte_read(path)
+}
+
+// 把字节表写入文件；成功返回 true，失败返回 false。
+// 底座 byte_write 返回 i8（1=成功、0=失败），此处转换为 bool。
+pub func write(path: string, t: table<i64>) -> bool {
+    return byte_write(path, t)
+}
+
+// 拼接两个字节表，返回新 i64 表（a 的元素在前，b 在后）；不修改入参。
+pub func concat(a: table<i64>, b: table<i64>) -> table<i64> {
+    return byte_concat(a, b)
+}
+
+// 读字节表第 pos 位（LSB 序：第 pos 位 = 第 pos/8 字节的第 pos%8 位），返回 0/1。
+// 越界（pos<0 或 pos/8 超出表长）返回 0（底座语义）。
+pub func bit_read(t: table<i64>, pos: i64) -> i64 {
+    return bit_read(t, pos)
+}
+
+// 写字节表第 pos 位为 bit（0/1，LSB 序），就地修改表；成功返回 true，越界
+// （pos<0 或超出表位数）返回 false 且不改动表。
+pub func bit_write(t: table<i64>, pos: i64, bit: i64) -> bool {
+    return bit_write(t, pos, bit)
+}
+
+// 字节表 → 字符串：每个字节按码点拼字符。可打印 ASCII（32..126）查表还原；
+// 非可打印字节（<32 或 >126）tie 无法构造字符，跳过（见文件头局限说明）；
+// 越界字节（<0 或 >255）忽略。ASCII 字节表可完整往返（to_ascii(from_ascii(s))==s）。
+pub func to_ascii(t: table<i64>) -> string {
+    // 32..126 全部 95 个可打印 ASCII 字符表（变量名 printable，非保留字）
+    var printable = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    var out: string = ""
+    var n: i64 = len(t)
+    var i: i64 = 0
+    while i < n {
+        var v: i64 = t[i]
+        // 越界字节（负值或 >255）忽略
+        if v >= 0 && v <= 255 {
+            // 可打印 ASCII 查表还原；非可打印（无法构造字符）自然跳过
+            if v >= 32 && v <= 126 {
+                out = out + str_char(printable, v - 32)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 字符串 → 字节表：每个 ASCII 码点（0..127）一字节；遇非 ASCII 码点（>127）
+// 返回空表（局限：tie 字符串内部为 UTF-8，非 ASCII 字符无法按字节拆解到表）。
+pub func from_ascii(s: string) -> table<i64> {
+    var out = table_new_i64()
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        // str_char 取单字符，char_code 取其码点（ASCII 下等于字节值）
+        var cp: i64 = char_code(str_char(s, i))
+        if cp > 127 {
+            // 非 ASCII 码点：返回空表（局限）
+            return table_new_i64()
+        }
+        table_push(out, cp)
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================================
+// 增强（p.9.1.1.15）：二进制数组操作 —— slice/subset/append/fill/反序、按值
+// 搜索/计数/替换、大小端 u16/u32/u64/f32/f64 读写、hex 字面量互转、base64
+// （字节表级，含原始二进制；与 std/encoding 的 ASCII base64 互补）。
+// 全部向后兼容：在既有 read/write/concat/bit_read/bit_write 上新增函数。
+// ============================================================================
+
+// 取字节表区间 [start, end) 的浅拷贝子表（不改原表）。越界按 saturating 截断。
+pub func slice(t: table<i64>, start: i64, end: i64) -> table<i64> {
+    var out = table_new_i64()
+    var n = len(t)
+    var lo = start
+    if lo < 0 {
+        lo = 0
+    }
+    var hi = end
+    if hi > n {
+        hi = n
+    }
+    var i: i64 = lo
+    while i < hi {
+        table_push(out, t[i])
+        i = i + 1
+    }
+    return out
+}
+
+// 拼接（与 concat 等价，语义别名，便于链式 append）。
+pub func append(a: table<i64>, b: table<i64>) -> table<i64> {
+    return byte_concat(a, b)
+}
+
+// 生成 n 个 value 值（0..255）的填充表。
+pub func fill(n: i64, value: i64) -> table<i64> {
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(out, value & 0xFF)
+        i = i + 1
+    }
+    return out
+}
+
+// 字节表反序，返回新表。
+pub func reverse(t: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var n = len(t)
+    var i: i64 = n - 1
+    while i >= 0 {
+        table_push(out, t[i])
+        i = i - 1
+    }
+    return out
+}
+
+// 查找字节值 value 首次出现的下标；无则返回 -1。
+pub func index_of(t: table<i64>, value: i64) -> i64 {
+    var n = len(t)
+    var i: i64 = 0
+    while i < n {
+        if t[i] == value {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 统计字节值 value 出现次数。
+pub func count_of(t: table<i64>, value: i64) -> i64 {
+    var n = len(t)
+    var c: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        if t[i] == value {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// 把字节值 from 全部替换为 to，返回新表。
+pub func replace_byte(t: table<i64>, from: i64, to: i64) -> table<i64> {
+    var out = table_new_i64()
+    var n = len(t)
+    var i: i64 = 0
+    while i < n {
+        if t[i] == from {
+            table_push(out, to & 0xFF)
+        } else {
+            table_push(out, t[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---------- 大小端多字节整数 编码（追加小端/大端字节段） ----------
+
+// u16 → 小端 2 字节。
+pub func to_u16_le(v: i64) -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, v & 0xFF)
+    table_push(t, (v >> 8) & 0xFF)
+    return t
+}
+pub func to_u16_be(v: i64) -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, (v >> 8) & 0xFF)
+    table_push(t, v & 0xFF)
+    return t
+}
+pub func to_u32_le(v: i64) -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, v & 0xFF)
+    table_push(t, (v >> 8) & 0xFF)
+    table_push(t, (v >> 16) & 0xFF)
+    table_push(t, (v >> 24) & 0xFF)
+    return t
+}
+pub func to_u32_be(v: i64) -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, (v >> 24) & 0xFF)
+    table_push(t, (v >> 16) & 0xFF)
+    table_push(t, (v >> 8) & 0xFF)
+    table_push(t, v & 0xFF)
+    return t
+}
+pub func to_u64_le(v: i64) -> table<i64> {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < 8 {
+        table_push(t, (v >> (i * 8)) & 0xFF)
+        i = i + 1
+    }
+    return t
+}
+pub func to_u64_be(v: i64) -> table<i64> {
+    var t = table_new_i64()
+    var i: i64 = 7
+    while i >= 0 {
+        table_push(t, (v >> (i * 8)) & 0xFF)
+        i = i - 1
+    }
+    return t
+}
+
+// ---------- 大小端多字节整数 解码（读第 off 字节起） ----------
+
+pub func from_u16_le(t: table<i64>, off: i64) -> i64 {
+    return (t[off] & 0xFF) | ((t[off + 1] & 0xFF) << 8)
+}
+pub func from_u16_be(t: table<i64>, off: i64) -> i64 {
+    return ((t[off] & 0xFF) << 8) | (t[off + 1] & 0xFF)
+}
+pub func from_u32_le(t: table<i64>, off: i64) -> i64 {
+    return (t[off] & 0xFF) | ((t[off + 1] & 0xFF) << 8) | ((t[off + 2] & 0xFF) << 16) | ((t[off + 3] & 0xFF) << 24)
+}
+pub func from_u32_be(t: table<i64>, off: i64) -> i64 {
+    return ((t[off] & 0xFF) << 24) | ((t[off + 1] & 0xFF) << 16) | ((t[off + 2] & 0xFF) << 8) | (t[off + 3] & 0xFF)
+}
+pub func from_u64_le(t: table<i64>, off: i64) -> i64 {
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        v = v | ((t[off + i] & 0xFF) << (i * 8))
+        i = i + 1
+    }
+    return v
+}
+pub func from_u64_be(t: table<i64>, off: i64) -> i64 {
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        v = (v << 8) | (t[off + i] & 0xFF)
+        i = i + 1
+    }
+    return v
+}
+
+// ---------- f32 / f64 读写（经 bitcast 原语） ----------
+
+// f64 → 8 字节（LE / BE 各自）。
+pub func to_f64_le(v: f64) -> table<i64> {
+    return to_u64_le(bitcast_f64_i64(v))
+}
+pub func to_f64_be(v: f64) -> table<i64> {
+    return to_u64_be(bitcast_f64_i64(v))
+}
+// 8 字节 → f64。
+pub func from_f64_le(t: table<i64>, off: i64) -> f64 {
+    return bitcast_i64_f64(from_u64_le(t, off))
+}
+pub func from_f64_be(t: table<i64>, off: i64) -> f64 {
+    return bitcast_i64_f64(from_u64_be(t, off))
+}
+
+// f64 → f32（近舍，普通数）→ 4 字节（LE/BE）。f32 为 IEEE-754 单精度，此处将
+// 高 29 位尾数截断为 23 位（向零舍入），支持 ±0/有限数/±Inf/NaN 位模式。
+pub func to_f32_le(v: f64) -> table<i64> {
+    var bits = bitcast_f64_i64(v)
+    var sign = (bits >> 63) & 1
+    var exp64 = (bits >> 52) & 0x7FF
+    var mant = bits & 0xFFFFFFFFFFFFF
+    var res32: i64 = 0
+    if exp64 == 2047 {   // Inf / NaN
+        var e32 = 255
+        if mant == 0 {
+            res32 = (sign << 31) | (e32 << 23)
+        } else {
+            res32 = (sign << 31) | (e32 << 23) | 0x3FFFFF
+        }
+    } else if exp64 == 0 {
+        res32 = (sign << 31)   // ±0 或次正规：按 0 处理
+    } else {
+        var e32 = exp64 - 1023 + 127
+        if e32 >= 255 {
+            res32 = (sign << 31) | (255 << 23)   // 上溢 → Inf
+        } else if e32 <= 0 {
+            res32 = (sign << 31)                 // 下溢 → 0
+        } else {
+            res32 = (sign << 31) | (e32 << 23) | ((mant >> 29) & 0x7FFFFF)
+        }
+    }
+    return to_u32_le(res32)
+}
+pub func to_f32_be(v: f64) -> table<i64> {
+    return to_u32_be(from_u32_le(to_f32_le(v), 0))
+}
+
+// 4 字节（LE/BE）→ f64（由 f32 位模式扩宽；普通数与 ±0/Inf/NaN 正确，次正规按 0）。
+pub func from_f32_le(t: table<i64>, off: i64) -> f64 {
+    return widen_f32(from_u32_le(t, off))
+}
+pub func from_f32_be(t: table<i64>, off: i64) -> f64 {
+    return widen_f32(from_u32_be(t, off))
+}
+
+// 把 f32 位模式扩宽为 f64 值（普通数/±0/±Inf/NaN；次正规返回 0.0）。
+func widen_f32(b: i64) -> f64 {
+    var sign = (b >> 31) & 1
+    var e32 = (b >> 23) & 0xFF
+    var m32 = b & 0x7FFFFF
+    if e32 == 0 {
+        if m32 == 0 && sign == 0 {
+            return bitcast_i64_f64(0)
+        }
+        if m32 == 0 && sign == 1 {
+            var nz: f64 = 0.0 * -1.0
+            return nz   // -0.0
+        }
+        return 0.0   // 次正规 → 0（简化）
+    }
+    if e32 == 255 {   // Inf / NaN
+        var e64 = 2047
+        var m64 = m32 << 29
+        if m32 == 0 {
+            m64 = 0
+        }
+        return bitcast_i64_f64((sign << 63) | (e64 << 52) | m64)
+    }
+    var e64 = e32 - 127 + 1023
+    return bitcast_i64_f64((sign << 63) | (e64 << 52) | (m32 << 29))
+}
+
+// ---------- hex / base64 ----------
+
+// 字节表 → 小写 hex 字符串（每字节 2 字符）。
+pub func to_hex(t: table<i64>) -> string {
+    var hexd = "0123456789abcdef"
+    var sb = string_builder()
+    var n = len(t)
+    var i: i64 = 0
+    while i < n {
+        var b = t[i] & 0xFF
+        sb_append(sb, str_char(hexd, (b >> 4) & 0xF))
+        sb_append(sb, str_char(hexd, b & 0xF))
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// hex 字符串 → 字节表（忽略空白；奇数字数在末尾补 0）。
+pub func from_hex(s: string) -> table<i64> {
+    var out = table_new_i64()
+    var nib: i64 = -1
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_byte(s, i)
+        var v: i64 = -1
+        if c >= 0x30 && c <= 0x39 {
+            v = c - 0x30
+        } else if c >= 0x61 && c <= 0x66 {
+            v = c - 0x61 + 10
+        } else if c >= 0x41 && c <= 0x46 {
+            v = c - 0x41 + 10
+        }
+        if v >= 0 {
+            if nib < 0 {
+                nib = v
+            } else {
+                table_push(out, nib * 16 + v)
+                nib = -1
+            }
+        }
+        i = i + 1
+    }
+    if nib >= 0 {
+        table_push(out, nib * 16)
+    }
+    return out
+}
+
+// 字节表 → base64（RFC 4648，带 '=' 填充）。
+pub func to_base64(t: table<i64>) -> string {
+    var b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    var sb = string_builder()
+    var n = len(t)
+    var i: i64 = 0
+    while i + 3 <= n {
+        var x = (t[i] << 16) | (t[i + 1] << 8) | t[i + 2]
+        sb_append(sb, str_char(b64, (x >> 18) & 0x3F))
+        sb_append(sb, str_char(b64, (x >> 12) & 0x3F))
+        sb_append(sb, str_char(b64, (x >> 6) & 0x3F))
+        sb_append(sb, str_char(b64, x & 0x3F))
+        i = i + 3
+    }
+    var rem = n - i
+    if rem == 1 {
+        var x = t[i] << 16
+        sb_append(sb, str_char(b64, (x >> 18) & 0x3F))
+        sb_append(sb, str_char(b64, (x >> 12) & 0x3F))
+        sb_append(sb, "==")
+    } else if rem == 2 {
+        var x = (t[i] << 16) | (t[i + 1] << 8)
+        sb_append(sb, str_char(b64, (x >> 18) & 0x3F))
+        sb_append(sb, str_char(b64, (x >> 12) & 0x3F))
+        sb_append(sb, str_char(b64, (x >> 6) & 0x3F))
+        sb_append(sb, "=")
+    }
+    return sb_build(sb)
+}
+
+// base64 → 字节表（'=' 填充可忽略；非法字符跳过）。
+pub func from_base64(s: string) -> table<i64> {
+    var out = table_new_i64()
+    var acc: i64 = 0
+    var cnt: i64 = 0
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_byte(s, i)
+        var v: i64 = -1
+        if c >= 0x41 && c <= 0x5A {
+            v = c - 0x41
+        } else if c >= 0x61 && c <= 0x7A {
+            v = c - 0x61 + 26
+        } else if c >= 0x30 && c <= 0x39 {
+            v = c - 0x30 + 52
+        } else if c == 0x2B {
+            v = 62
+        } else if c == 0x2F {
+            v = 63
+        } else if c == 0x3D {
+            break
+        }
+        if v >= 0 {
+            acc = (acc << 6) | v
+            cnt = cnt + 1
+            if cnt == 4 {
+                table_push(out, (acc >> 16) & 0xFF)
+                table_push(out, (acc >> 8) & 0xFF)
+                table_push(out, acc & 0xFF)
+                acc = 0
+                cnt = 0
+            }
+        }
+        i = i + 1
+    }
+    // 余下 2/3 字符
+    if cnt == 2 {
+        table_push(out, (acc >> 4) & 0xFF)
+    } else if cnt == 3 {
+        table_push(out, (acc >> 10) & 0xFF)
+        table_push(out, (acc >> 2) & 0xFF)
+    }
+    return out
+}
+}

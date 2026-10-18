@@ -1,0 +1,13 @@
+type tie<class, unsafe:share>
+// 探针库：spawn 引用全局可变容器 ⇒ 需要【上下文】+【share 凭据】两把锁（规范 §11.6）。
+// 函数包在 namespace 内（与 std 库一致），别名才能解析到它。
+var g_box: table<i64> = []
+namespace ufx {
+pub func kick(n: i64) -> i64 {
+    spawn(func() -> i64 {
+        g_box[0] = n
+        return 0
+    })
+    return 0
+}
+}

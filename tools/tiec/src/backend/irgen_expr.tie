@@ -1,0 +1,548 @@
+type tie<class>
+// compiler/backend/irgen_expr.tie —— 生成器 L3 表达式层 子模块
+// ============================================================
+// 从 irgen.tie 拆分而来：这是 irgen LLVM 风格分层重构的 S4（第四步）。
+// 本文件承载 L3 表达式层：表达式主调度器 tig_expr、内置原语名判定
+// is_builtin_name、巨型内置表达式生成器 builtin_expr（各 tag 表达式分发 /
+// 内置调用 → tie_* 桥 / libc / 内联生成）。它们被上层语句/表达式生成层
+// 裸名调用，是表达式求值的核心。L6 调用分派层（tig_runtime_call 等）
+// 不属于本轮，留在 irgen.tie 主文件。
+//
+// 拆分范式：【同 namespace 跨文件】（文本内联）。
+// 同 irgen_arith.tie（S3）/ irgen_builder.tie（S1）/ irgen_lit.tie（S2）。
+// irgen.tie 顶层 import 本文件后，本文件被文本内联进同一编译单元，声明与
+// irgen.tie 相同的 `namespace irgen`，同名 namespace 跨文件闭合并集：
+//   - 同 namespace 函数可互相裸名调用（主文件照常裸名调用 tig_expr 等）；
+//   - 可访问主文件顶层全局 var（g_cur_block/g_cur_func/node_types/s_tags 等）；
+//   - 本文件只含函数与注释，不含顶层全局 var 声明、不含 import——
+//     全局 var 与 import 树均留在 irgen.tie 主文件，避免重复定义。
+import "./tig_expr_seg1.tie"
+import "./tig_expr_seg2.tie"
+
+namespace irgen {
+// 表达式生成：返回结果值 id；-1 错误
+func tig_expr(id: i64) -> i64 {
+    var tag = s_tags[id]
+    var r: i64 = 0
+    r = tig_expr_seg1(id)
+    if r != -1 {
+        return r
+    }
+    r = tig_expr_seg2(id)
+    if r != -1 {
+        return r
+    }
+    // p.9.0-S.8：保留更具体的诊断。seg1/seg2 内部若已置 sm_err_msg（例如内置
+    // 调用识别成功但参数类型不符的语义错误），此处不覆盖为通用消息——否则
+    // 「as_i64 收到了数值参数」这类可行动的诊断会被冲成「未支持的表达式」。
+    // 与 tig_expr_seg1 里 is_builtin_name 分支的既有约定一致（该处同样只在
+    // sm_err_msg 为空时填默认消息）。
+    if str_len(sm_err_msg) == 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "irgen 未支持的表达式（tag=" + to_string(tag) + "，函数 " + g_cur_fn_name + "）"
+    }
+    return -1
+}
+
+// 块管道绑定槽的类型规范化：把**语义类型**映射为**IR 槽类型**，规则与
+// tig_stmt_b_100_VarDecl 的无标注推断分支一致（不可省——否则 `"x" -> { s -> … }`
+// 会生成 alloca <字符串类型> 而 store 值是 ptr，LLVM 校验报
+// `'%N' defined with type 'ptr' but expected 'i64'`）。
+// 关键映射：表/映射/字符串 → TK_STR（统一 ptr 槽，与 llvmgen store 的 to_ptr 配套）；
+// trit → i8 槽；bool → i1 槽；数字/不安全类型/聚合（元组·struct·enum·fn·port·数组）
+// → 保留语义类型；其余（宽类型 num/text/misc 等）→ i64。
+func pipe_slot_ty(it: i64) -> i64 {
+    if it < 0 {
+        return types.named(TK_I64)
+    }
+    if it == types.named(TK_STR) || types.is_table(it) || types.is_map(it) {
+        return types.named(TK_STR)
+    }
+    if it == types.named(TK_TRIT) {
+        return types.named(TK_TRIT)
+    }
+    if it == types.named(TK_ANY) {
+        return it
+    }
+    if types.is_bool_like(it) {
+        return types.named(TK_BOOL)
+    }
+    if types.is_float(it) || types.is_int(it) {
+        return it
+    }
+    if types.is_unsafe_ty(it) {
+        return it
+    }
+    var k = types.kind(it)
+    if k == K_TUPLE || k == K_STRUCT || k == K_ENUM || k == K_FN || k == K_PORT ||
+        k == K_ARRAY || k == K_ACTOR || k == K_GUARD || k == K_FUTURE {
+        return it
+    }
+    return types.named(TK_I64)
+}
+
+// p.9.13.3 幂 `**` 的 IR 生成（B_POW，二元节点 children=[base, exp]）。
+// 按操作数类型分派：
+//   * f64/f32 → libm `pow`（llvmgen 已无条件 declare `double @pow(double,double)`）；
+//   * int 族 → 前置快速幂 `lang::pow_i(base, exp)`（O(log n) 平方求幂，tie 库实现）。
+// 走 `tig_user_call_from(full, id, 0)` 按名调用：arg_start=0 使实参取节点的
+// children（即 base/exp 原序），无需另造 AST 节点，也不用手写 IR 循环。
+func tig_pow(id: i64) -> i64 {
+    var lhs = sstate.child(id, 0)
+    var rhs = sstate.child(id, 1)
+    if lhs < 0 || rhs < 0 {
+        return -1
+    }
+    var checked = s_vals[id] == B_CHECK_POW
+    var lt = node_types[lhs]
+    var rt = node_types[rhs]
+    var is_f = lt == types.named(TK_F64) || lt == types.named(TK_F32) ||
+        rt == types.named(TK_F64) || rt == types.named(TK_F32)
+    if is_f {
+        var lv = tig_expr(lhs)
+        if lv < 0 {
+            return -1
+        }
+        var rv = tig_expr(rhs)
+        if rv < 0 {
+            return -1
+        }
+        return tig_ext_call2("pow", lv, types.named(TK_F64), rv, types.named(TK_F64), types.named(TK_F64))
+    }
+    // p.9.13.3 `**?`（checked）：int 族走前置的逐步检查版（`*?` 每步验溢出，
+    // 故中间结果溢出也能捕获——先算完再验结果做不到这点）。
+    if checked {
+        return tig_user_call_from("lang::pow_i_checked", id, 0)
+    }
+    return tig_user_call_from("lang::pow_i", id, 0)
+}
+
+// p.9.11 `is` 类型判定（规范 §3.16）的 IR 生成（tag 207）。
+// 语义层已保证：左操作数类型 = any（装箱 {i64 tag, payload} 值）、类型节点的
+// node_types 已登记目标类型 id。生成＝any 值落 alloca → 读 tag@[0] → 与期望 tag
+//（单源 = stype.any_expected_tag，与 tig_box_any 装箱约定逐条对齐）icmp eq → bool。
+// `v is any` 恒真（左操作数求值后直接产 true 常量，保序不短路）。
+func tig_is_check(id: i64) -> i64 {
+    var lhs = sstate.child(id, 0)
+    var tnode = sstate.child(id, 1)
+    if lhs < 0 || tnode < 0 {
+        return -1
+    }
+    var lv = tig_expr(lhs)
+    if lv < 0 {
+        return -1
+    }
+    var BT = types.named(TK_BOOL)
+    var T64 = types.named(TK_I64)
+    var rt = node_types[tnode]
+    if rt < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'is' 类型节点未登记类型 id（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    if rt == types.named(TK_ANY) {
+        return tig_bool_lit(1)
+    }
+    var exp_tag = stype.any_expected_tag(rt)
+    if exp_tag < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'is' 暂不支持类型 " + types.type_name(rt) + "（该类型不能进 any 装箱）"
+        return -1
+    }
+    var any_ty = types.named(TK_ANY)
+    var slot = ir.new_inst(g_cur_block, 20, any_ty)  // alloca {i64,i64}
+    ir.add_operand(slot, any_ty, 2)
+    var sp = ir.get_value(slot)
+    var st = ir.new_inst(g_cur_block, 22, -1)  // store any 值
+    ir.add_operand(st, any_ty, 2)
+    ir.add_operand(st, lv, 0)
+    ir.add_operand(st, sp, 0)
+    var g0 = ir.new_inst(g_cur_block, 27, any_ty)  // agg_gep tag@[0]
+    ir.add_operand(g0, sp, 0)
+    ir.add_operand(g0, 0, 2)
+    var ld0 = ir.new_inst(g_cur_block, 21, T64)
+    ir.add_operand(ld0, ir.get_value(g0), 0)
+    var tag_v = ir.get_value(ld0)
+    var expv = tig_int_lit_ty(exp_tag, T64)
+    var cmp = ir.new_inst(g_cur_block, 12, BT)  // icmp eq
+    ir.add_operand(cmp, tag_v, 0)
+    ir.add_operand(cmp, expv, 0)
+    ir.add_operand(cmp, 0, 2)
+    return ir.get_value(cmp)
+}
+
+// p.9.13.4 块管道 `x -> { v -> expr }` 的 IR 生成（tag 162）。
+// 手法＝内联绑定：为绑定名开槽（alloca + store 数据值），把槽登记进当前作用域帧，
+// 在帧内求值体，再弹帧。不生成函数、不涉及调用——故无闭包捕获/环境副本问题。
+// 槽不登记进 g_tblcand_allocas：绑定值是**已存在的值**（数据表达式所拥有），
+// 登记会造成函数出口对同一表二次 release；其生命周期仍由数据值的原有归属管理
+//（与 for 循环变量槽同性质——绑定槽只是读取入口，不取得所有权）。
+func tig_block_pipe(id: i64) -> i64 {
+    var data = sstate.child(id, 0)
+    var body = sstate.child(id, 1)
+    if data < 0 || body < 0 {
+        return -1
+    }
+    var dv = tig_expr(data)
+    if dv < 0 {
+        return -1
+    }
+    var ty = pipe_slot_ty(node_types[data])
+    var alc = ir.new_inst(g_cur_block, 20, ty)  // alloca
+    ir.add_operand(alc, ty, 2)
+    var av = ir.get_value(alc)
+    var st = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st, ty, 2)
+    ir.add_operand(st, dv, 0)
+    ir.add_operand(st, av, 0)
+    scope_push()
+    scope_put(s_names[id], av, ty)
+    var bv = tig_expr(body)
+    scope_pop()
+    return bv
+}
+
+// 内置原语名判定（builtin_expr 支持集；与 sbuitin 语义层原语表对齐）。
+// 命中即内置——调用失败传播错误，不降级为用户函数路径。
+func is_builtin_name(nm: string) -> bool {
+    // ---------- S1.2 unsafe 指针/内存内置 ----------
+    if nm == "addr_of" || nm == "addr_of_field" || nm == "deref" || nm == "deref_write" ||
+        nm == "is_null" || nm == "ptr_add" || nm == "ptr_to_int" || nm == "int_to_ptr" ||
+        nm == "alloc" || nm == "free" || nm == "memcpy" || nm == "memset" ||
+        nm == "slice_of" || nm == "slice_len" || nm == "slice_index" ||
+        nm == "volatile_load" || nm == "volatile_store" {
+        return true
+    }
+    // ---------- S1.3 to_* / as_* 数值转换与解包族 ----------
+    if nm == "as_i8" || nm == "as_i16" || nm == "as_i32" || nm == "as_i64" ||
+        nm == "as_u8" || nm == "as_u16" || nm == "as_u32" || nm == "as_u64" ||
+        nm == "as_f32" || nm == "as_f64" ||
+        nm == "as_i128" || nm == "as_u128" ||
+        nm == "to_i8" || nm == "to_i16" || nm == "to_i32" || nm == "to_i64" ||
+        nm == "to_i128" || nm == "to_u8" || nm == "to_u16" || nm == "to_u32" ||
+        nm == "to_u64" || nm == "to_u128" || nm == "to_f32" || nm == "to_f64" {
+        return true
+    }
+    // ---------- S1.3 checked_* 溢出检测族 ----------
+    if nm == "checked_add" || nm == "checked_sub" || nm == "checked_mul" ||
+        nm == "checked_div" || nm == "checked_shl" || nm == "checked_shr" ||
+        nm == "checked_neg" {
+        return true
+    }
+    if nm == "exec_code" || nm == "time_now" || nm == "get_env" || nm == "exec_output" {
+        return true
+    }
+    if nm == "str_len" || nm == "char_code" || nm == "str_char" || nm == "str_from_code" {
+        return true
+    }
+    // ---------- S2.1 字符串 {ptr,len} 原语 ----------
+    // 二进制安全字节访问（str_byte）、UTF-8 码点解码（utf8_seq_len/utf8_char_at）、
+    // StringBuilder 句柄（string_builder/sb_append/sb_append_byte/sb_build）
+    if nm == "str_byte" || nm == "utf8_seq_len" || nm == "utf8_char_at" ||
+        nm == "string_builder" || nm == "sb_append" || nm == "sb_append_byte" ||
+        nm == "sb_build" || nm == "sb_reset" || nm == "str_sub_bytes" ||
+        nm == "sso_malloc_count" || nm == "catch_panic" || nm == "cb_ptr" {
+        return true
+    }
+    // ---------- 网络原语（P0：std/net）----------
+    if nm == "net_close" || nm == "net_tcp_accept" || nm == "net_tcp_connect" ||
+        nm == "net_tcp_listen" || nm == "net_tcp_recv" || nm == "net_tcp_send" ||
+        nm == "net_udp_bind" || nm == "net_udp_recv" || nm == "net_udp_send" ||
+        nm == "net_tcp_recv_bytes" || nm == "net_tcp_send_bytes" ||
+        nm == "net_udp_recv_bytes" || nm == "net_udp_send_bytes" {
+        return true
+    }
+    // ---------- 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）----------
+    if nm == "load_library" || nm == "get_proc" ||
+        nm == "dyn_call" || nm == "dyn_call_p" || nm == "cstr_to_string" {
+        return true
+    }
+    if nm == "to_string" || nm == "parse_int" || nm == "parse_float" || nm == "parse_trit" ||
+        nm == "to_trit" || nm == "trit_val" {
+        return true
+    }
+    if nm == "bitcast_f64_i64" || nm == "bitcast_i64_f64" {
+        return true
+    }
+    if nm == "len" {
+        return true
+    }
+    // P2b：any 拆箱转换（运行时 tag 检查；不匹配 → 运行时错误）
+    // P2d：as_table_* 拆箱为元素化表（tag = 精确表类型 id，须与装箱时一致）
+    if nm == "as_i64" || nm == "as_f64" || nm == "as_bool" || nm == "as_string" || nm == "as_char" ||
+        nm == "as_table_i64" || nm == "as_table_string" || nm == "as_table_bool" ||
+        nm == "as_table_f64" || nm == "as_table_char" || nm == "as_table_any" {
+        return true
+    }
+    // P2c：any 运行时辅助——any_tag(x) 读 {tag,payload} 的 tag 字段
+    if nm == "any_tag" {
+        return true
+    }
+    // r.1.6.15：share(x) 显式共享别名（值语义逃生舱）
+    if nm == "share" {
+        return true
+    }
+    // P2d-D3：map 高阶——map_keys(m)/map_values(m)/map_contains(m, key)
+    if nm == "map_keys" || nm == "map_values" || nm == "map_contains" {
+        return true
+    }
+    if nm == "table_new_i64" || nm == "table_new_f64" || nm == "table_new_string" || nm == "table_new_bool" {
+        return true
+    }
+    if nm == "table_push" || nm == "table_at" || nm == "table_pop" || nm == "table_trunc" ||
+        nm == "table_append" || nm == "table_append_raw" || nm == "table_reserve" || nm == "exit" {
+        return true
+    }
+    if nm == "arg_count" || nm == "arg_string" {
+        return true
+    }
+    if nm == "file_read" || nm == "file_write" || nm == "file_append" || nm == "file_exists" || nm == "file_delete" {
+        return true
+    }
+    // 完整 fs 元数据（UTF-8 桥）：大小 / 类型判定
+    if nm == "file_size" || nm == "file_is_dir" || nm == "file_is_file" {
+        return true
+    }
+    if nm == "print_err" || nm == "mkdir_all" || nm == "remove_dir_all" || nm == "regex_find_all" {
+        return true
+    }
+    if nm == "regex_match" || nm == "regex_find" || nm == "regex_replace" || nm == "regex_group" {
+        return true
+    }
+    if nm == "sqrt" || nm == "sin" || nm == "cos" || nm == "tan" ||
+        nm == "exp" || nm == "log" || nm == "floor" || nm == "ceil" || nm == "round" || nm == "pow" ||
+        nm == "tanh" || nm == "sinh" || nm == "cosh" || nm == "asin" || nm == "acos" ||
+        nm == "atan" || nm == "log2" || nm == "log10" || nm == "expm1" || nm == "log1p" ||
+        nm == "cbrt" || nm == "exp2" || nm == "trunc" ||
+        nm == "atan2" || nm == "copysign" || nm == "fmod" || nm == "remainder" || nm == "hypot" {
+        return true
+    }
+    if nm == "read_line" || nm == "cwd" || nm == "list_dir" || nm == "walk_dir" ||
+        nm == "byte_read" || nm == "byte_write" || nm == "byte_concat" ||
+        nm == "stdin_read" || nm == "stdout_write_bytes" || nm == "stdout_write_str" {
+        return true
+    }
+    if nm == "bit_read" || nm == "bit_write" {
+        return true
+    }
+    if nm == "path_basename" || nm == "path_dirname" || nm == "path_abs" ||
+        nm == "path_normalize" || nm == "path_join" {
+        return true
+    }
+    if nm == "http_get" || nm == "http_get_file" || nm == "untar_gz" || nm == "unzip" ||
+        nm == "copy_dir" || nm == "file_copy" || nm == "file_move" {
+        return true
+    }
+    if nm == "eval" || nm == "eval_call" || nm == "set_env" {
+        return true
+    }
+    if nm == "msg_set_lang" || nm == "msg_get_lang" || nm == "msg_register" ||
+        nm == "msg_t" || nm == "msg_t_lang" {
+        return true
+    }
+    if nm == "rand_range" {
+        return true
+    }
+    // ---------- trm-lite 轻量执行体原语（阶段1块2：spawn/yield/collect）----------
+    if nm == "spawn" || nm == "yield" || nm == "collect" || nm == "gosched" {
+        return true
+    }
+    // ---------- channel 原语（p.6.5.7：ch_open/ch_send/ch_recv/ch_close，静态链接 trm_lite.a）----------
+    if nm == "ch_open" || nm == "ch_send" || nm == "ch_send_block" || nm == "ch_recv" || nm == "ch_close" || nm == "ch_select" ||
+        nm == "ch_len" || nm == "ch_closed_flag" || nm == "ch_count" {
+        return true
+    }
+    // ---------- WaitGroup 原语（p.6.7.11：wg_new/wg_add/wg_done/wg_wait/wg_count）----------
+    if nm == "wg_new" || nm == "wg_add" || nm == "wg_done" || nm == "wg_wait" || nm == "wg_count" {
+        return true
+    }
+    return false
+}
+
+
+
+    // 背景：byte_read/byte_write/byte_concat/bit_read/bit_write 原以 tie_interp Rust
+    // 桥实现（tie_byte_*）。Rust 桥对**原生 32 字节表句柄**（s21 表布局
+    // {cap,len,data,esz}）的 ABI 约定不匹配，运行即 0xC0000005 崩溃（与 871d65f
+    // alloc 补头扫描同族）。此处改为 tie 内联 IR 全量重写，**零 Rust 依赖、跨
+    // Unix/Windows**（文件 IO 走 libc fopen/fread/fwrite/fseek/ftell/fclose，CRT
+    // 提供，无需任何系统头/链接库；路径 = tie 串数据指针 UTF-8 char*，Windows 下
+    // libc fopen 按 ANSI 代码页解释 → 中文路径受限，与旧 fopen 立场一致）。
+    // 表操作走原生句柄 + malloc/memcpy；位操作纯指令（shr/and/shl/or/xor）零依赖。
+
+
+
+
+
+
+
+
+
+
+
+
+    // ============ p.6.4.1 内联基础原语 + UTF-16 宽字符桥 ============
+    // 新基础设施：UTF-16 宽字符转换（Windows 系统调用面）。tie 字符串为 UTF-8
+    //（{8 字节长度头}{数据}{\0}）；SetEnvironmentVariableW / CommandLineToArgvW /
+    // GetCurrentDirectoryW 等需要 UTF-16LE（wchar_t*）。编译器后端不能 import
+    // std/utf.tie，故在 IR 层手排「码点解码 + 代理对编码」（本组辅助全部生成普通
+    // tie-IR 指令；零 Rust 桥、零 tie_interp.lib；UTF-8 逐字节序列判定复用
+    // s21_utf8_seq_len / s21_utf8_char_at，代理对编码按 Unicode 规范）。
+
+
+
+
+
+
+
+
+
+
+
+    // ==================== p.6.9.1 stdio 原语内联（stdin/stdout 字节 IO，零 Rust 桥） ====================
+    // 背景：LSP 服务端（JSON-RPC over stdio，p.6.9.2）与 tink 桥共用——与 byte_read/
+    // read_line 同范式：GetStdHandle + ReadFile/CRT _write，全 kernel32/CRT 符号
+    // （is_libc_sym 免 interp 链接），零 Rust 桥、零 g_used_interp。
+
+
+
+
+
+
+    // ==================== p.6.4.7 消息系统原语（纯 tie，运行期全局表） ====================
+    // 原 tie_msg_* Rust 桥（g_used_interp=true）改为编译器内联：状态 = 运行期程序
+    // 全局槽（惰性登记，仅含 msg_* 的程序才生成；对齐「编译器给用户程序建全局变量」）：
+    //   @__msg_lang  : string        当前语言（默认 ""，对齐原 Rust 桥初始态）
+    //   @__msg_keys  : table<string> 键平行表
+    //   @__msg_langs : table<string> 语言平行表
+    //   @__msg_texts : table<string> 文本平行表
+    // 语义：msg_register(key,lang,text) 线性扫 (key,lang) 命中覆盖 texts[i] 未命中
+    // 三表 append；msg_t(key) 按当前语言查未命中返 key；msg_t_lang(key,lang) 按指定
+    // 语言查未命中返空串 ""（对齐 Rust 桥原语义，ext/log 回退链 lookup 依赖）。
+    // msg_set_lang/msg_get_lang 读写 @__msg_lang。
+    // 模块级惰性登记标记 g_msg_reg_done 声明见 irgen.tie（文件顶层，每模块一次重置）。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ==================== r.1.6.2 Linux POSIX 文件系统分支 ====================
+    // file_* 内置（tig_read_file/tig_write_file/tig_mkdir_all/tig_list_dir 等）在
+    // Windows 内联 Win32 API（UTF-16 宽字符）；Linux 目标改生成 POSIX 符号调用，
+    // **UTF-8 直通**（tie string 即 UTF-8 字节，POSIX 路径天然接受；'\\' 在 POSIX
+    // 是普通字符）。以下辅助按 g_asm_target（driver set_target 注入，恒非空）在
+    // **编译期**分派——Windows 编译时恒走原 Win32 路径，生成 IR 逐字节不变。
+    // ABI 依赖（仅 Linux x86_64，glibc/musl 布局一致，CI 为 ubuntu-latest）：
+    //   struct stat   : st_mode@24 (u32)，st_size@48 (i64)，结构全尺寸 144B；
+    //   struct dirent : d_type@18 (u8)，d_name@19 (char[256]，NUL 结尾 UTF-8)。
+    // 符号位（open/read/write/...）已登记 is_libc_sym（irgen.tie）——非 interp 桥，
+    // Linux 目标不触发 tie_interp.lib 链接（link_exe 对 Linux 直接报错）。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ==================== p.6.4.9 HTTP 原语内联（Winsock + HTTP/1.1） ====================
+    // http_get / http_get_file 从 Rust 桥（tie_http_get/tie_http_get_file，g_used_interp
+    // 置位）改为编译器内联 IR：URL 解析 → gethostbyname/connect → GET 请求 →
+    // 响应头/体解析。零 Rust 桥（仅复用 p.6.4.5 net_* 内联）。
+    // 仅 http://（https 需 TLS，p.6.6.1 再做，本任务 https 返回空串/失败）。
+    // 协议：GET + Host + Connection: close → 读全部到 EOF（服务端因 Connection: close
+    // 会关闭连接）；解析头找 Content-Length 截取 body；无 Content-Length 读到 EOF。
+    // 局限：http_get 返回 tie string，body 含 ≥0x80 字节会破坏 UTF-8 语义（真正二进制
+    // 走 p.6.6.1 TLS 后的字节版）；连接/解析/非 2xx 均返回空串。
+    // 全部辅助生成内联 tie-IR（零新 opcode、零 tie_interp 桥调用）。
+
+
+
+
+
+
+
+
+
+
+    // ==================== p.6.4.9 通用 inflate 引擎（DEFLATE，纯 tie IR） ====================
+    // 编译器内联 DEFLATE inflate：RFC 1951（存储块/固定 Huffman/动态 Huffman + LZ77）。
+    // 供 untar_gz（gzip RFC 1952）与 unzip（raw DEFLATE）共用；也是后续 p.6.6 图像 PNG
+    //（zlib inflate）的可复用底座。零 Rust 桥、零系统依赖（纯算法）。
+    // 数据结构约定：
+    //   inflate 状态 st = 32B {src ptr@0, srclen@8, bitpos@16, status@24}（status!=0=失败）
+    //   Huffman 表 huff = {counts[16]@0, first[16]@128, offset[16]@256, symbol[n]@384}（i64 槽）
+    //   lengths = n 字节 i8 缓冲（码长数组）；输出走 StringBuilder（out_hv）。
+
+
+
+
+
+
+
+
+    // ==================== p.6.4.9 untar_gz / unzip 内联（gzip+tar / zip 容器解析） ====================
+    // untar_gz：gzip（RFC 1952）解压 → tar（ustar 512B 头）逐条目提取；
+    // unzip：EOCD + 中央目录 + 本地头解析，stored/deflate 条目提取。
+    // 两者共用 tig_inflate_raw（raw DEFLATE）。失败返回 false。路径 UTF-16 安全。
+
+
+
+
+
+
+
+
+
+
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+

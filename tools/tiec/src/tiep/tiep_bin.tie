@@ -1,0 +1,468 @@
+type tie<class>
+// compiler/interp/interp_bin.tie —— 自举 v2 解释器核心：二元运算求值
+// （从 interp.tie 拆出：eval_binary 及算术/比较/位运算辅助函数）
+// ============================================================
+// 范式：tie import 是文本内联——被 import 文件全部代码并入编译单元，一切
+// 符号全局可见。本文件与主文件 interp.tie 共享一个 `namespace tiep`（跨
+// 文件闭合并集，同 len 如 irgen/llvmgen 的 str/vtable/closure 先例），函数
+// 可互相裸名调用、访问主文件顶层全局 var（w_err/g_flow 等）与 vval 等。
+// 本文件不自建全局 var，不含 import。
+
+namespace tiep {
+
+// ==================== 二元运算 ====================
+
+// 二元运算求值（动态类型检查；对齐 Rust eval_binary 2621 行）。
+func eval_binary(op: i64, l: Value, r: Value) -> Value {
+    var lt = vval.type_of(l)
+    var rt = vval.type_of(r)
+    // 字符串 + 字符串 → 拼接（编译路径语义）
+    if op == B_ADD && lt == W_STR && rt == W_STR {
+        return vval.new_str(vval.str_val(l) + vval.str_val(r))
+    }
+    // 字符串比较：按 strcmp 语义（编译路径用 strcmp）
+    if op >= B_EQ && op <= B_GE && lt == W_STR && rt == W_STR {
+        return str_compare(op, vval.str_val(l), vval.str_val(r))
+    }
+    // 整数运算
+    if lt == W_INT && rt == W_INT {
+        return int_binary(op, vval.int_val(l), vval.int_val(r))
+    }
+    // 浮点运算
+    if lt == W_FLOAT && rt == W_FLOAT {
+        return float_binary(op, vval.float_val(l), vval.float_val(r))
+    }
+    // 布尔运算
+    if lt == W_BOOL && rt == W_BOOL {
+        return bool_binary(op, vval.int_val(l) != 0, vval.int_val(r) != 0)
+    }
+    // 平衡三进制 trit 运算（Kleene 三值逻辑）
+    if lt == W_TRIT && rt == W_TRIT {
+        return trit_binary(op, vval.int_val(l), vval.int_val(r))
+    }
+    // trit × i64 混合：提升为 i64 算术（与编译路径 sext 一致）
+    if lt == W_TRIT && rt == W_INT {
+        return trit_int(op, vval.int_val(l), vval.int_val(r), false)
+    }
+    if lt == W_INT && rt == W_TRIT {
+        return trit_int(op, vval.int_val(l), vval.int_val(r), true)
+    }
+    // p.9.13.3 `+` 容器拼接（interp 侧对齐 AOT 的 lang::tbl_cat 语义改写——
+    // 该改写在语义层，interp.eval 不经 sinfer ⇒ 这里原生实现）：
+    // 表 + 表 → 值语义新表（a 元素在前、b 在后）。map 的键值对在 interp 无
+    // 元素迭代通道（elem_at 仅 Tbl），map + map 暂维持「类型不匹配」。
+    if op == B_ADD && lt == W_TABLE && rt == W_TABLE {
+        var acc = vval.new_table()
+        var na = vval.elem_count(l)
+        var ia: i64 = 0
+        while ia < na {
+            acc = vval.table_push_val(acc, vval.elem_at(l, ia))
+            ia = ia + 1
+        }
+        var nb = vval.elem_count(r)
+        var ib: i64 = 0
+        while ib < nb {
+            acc = vval.table_push_val(acc, vval.elem_at(r, ib))
+            ib = ib + 1
+        }
+        return acc
+    }
+    // 类型不匹配
+    w_err = "类型不匹配: " + vval.type_name(l) + " " + op_symbol(op) + " " +
+        vval.type_name(r)
+    return Value.Nil
+}
+
+// 字符串比较（strcmp 码点序）。
+func str_compare(op: i64, a: string, b: string) -> Value {
+    if op == B_EQ {
+        return vval.new_bool(a == b)
+    }
+    if op == B_NOTEQ {
+        return vval.new_bool(a != b)
+    }
+    if op == B_LT {
+        return vval.new_bool(a < b)
+    }
+    if op == B_GT {
+        return vval.new_bool(a > b)
+    }
+    if op == B_LE {
+        return vval.new_bool(a <= b)
+    }
+    return vval.new_bool(a >= b)
+}
+
+// 整数二元运算（含除零/取模零检查与位运算/移位范围检查，文本对齐 Rust）。
+// p.9.0-S.7：`\`/`%%` 的 floor 语义（规范 §3.3）——先取截断结果，余数非零且与
+// 除数异号时调整一格。不用 `!=` 比较布尔，避免依赖布尔不等运算。
+func idiv_floor_i64(a: i64, b: i64) -> i64 {
+    var q = a / b
+    var r = a % b
+    if r != 0 {
+        if (r < 0 && b > 0) || (r > 0 && b < 0) {
+            return q - 1
+        }
+    }
+    return q
+}
+func floormod_i64(a: i64, b: i64) -> i64 {
+    var r = a % b
+    if r != 0 {
+        if (r < 0 && b > 0) || (r > 0 && b < 0) {
+            return r + b
+        }
+    }
+    return r
+}
+func int_binary(op: i64, a: i64, b: i64) -> Value {
+    if op == B_ADD {
+        return vval.new_int(a + b)
+    }
+    if op == B_SUB {
+        return vval.new_int(a - b)
+    }
+    if op == B_MUL {
+        return vval.new_int(a * b)
+    }
+    if op == B_DIV {
+        if b == 0 {
+            w_err = "除零错误"
+            return Value.Nil
+        }
+        return vval.new_int(a / b)
+    }
+    if op == B_MOD {
+        if b == 0 {
+            w_err = "除零错误（取模）"
+            return Value.Nil
+        }
+        return vval.new_int(a % b)
+    }
+    // p.9.0-S.7 整除 `\`（规范 §3.3：向下取整的商）
+    if op == B_IDIV {
+        if b == 0 {
+            w_err = "除零错误"
+            return Value.Nil
+        }
+        return vval.new_int(idiv_floor_i64(a, b))
+    }
+    // p.9.0-S.7 成对取余 `%%`（与 `\` 配对，余数符号跟随除数）
+    if op == B_FLOORMOD {
+        if b == 0 {
+            w_err = "除零错误（取模）"
+            return Value.Nil
+        }
+        return vval.new_int(floormod_i64(a, b))
+    }
+    if op == B_EQ {
+        return vval.new_bool(a == b)
+    }
+    if op == B_NOTEQ {
+        return vval.new_bool(a != b)
+    }
+    if op == B_LT {
+        return vval.new_bool(a < b)
+    }
+    if op == B_GT {
+        return vval.new_bool(a > b)
+    }
+    if op == B_LE {
+        return vval.new_bool(a <= b)
+    }
+    if op == B_GE {
+        return vval.new_bool(a >= b)
+    }
+    if op == B_AND || op == B_OR {
+        w_err = "整数不能做逻辑运算（需布尔）"
+        return Value.Nil
+    }
+    // M4 位运算/移位（仅整数；移位量必须在 0..64 范围）
+    if op == B_BITAND {
+        return vval.new_int(a & b)
+    }
+    if op == B_BITOR {
+        return vval.new_int(a | b)
+    }
+    if op == B_BITXOR {
+        return vval.new_int(a ^ b)
+    }
+    if op == B_SHL {
+        if b < 0 || b >= 64 {
+            w_err = "左移量必须在 0..64 范围内"
+            return Value.Nil
+        }
+        return vval.new_int(a << b)
+    }
+    if op == B_SHR {
+        if b < 0 || b >= 64 {
+            w_err = "右移量必须在 0..64 范围内"
+            return Value.Nil
+        }
+        return vval.new_int(a >> b)
+    }
+    w_err = "内部错误: 未知二元运算符 " + to_string(op)
+    return Value.Nil
+}
+
+// 浮点二元运算（Div/Mod 无除零检查——IEEE 754 inf/nan，对齐 Rust f64 路径）。
+func float_binary(op: i64, a: f64, b: f64) -> Value {
+    if op == B_ADD {
+        return vval.new_float(a + b)
+    }
+    if op == B_SUB {
+        return vval.new_float(a - b)
+    }
+    if op == B_MUL {
+        return vval.new_float(a * b)
+    }
+    if op == B_DIV {
+        return vval.new_float(a / b)
+    }
+    // p.9.0-S.7 整除 `\`（浮点）：floor(a / b)，与 AOT 的 fdiv+floor 同语义
+    if op == B_IDIV {
+        return vval.new_float(floor(a / b))
+    }
+    // p.9.0-S.7 成对取余 `%%`（浮点）：a - floor(a/b)*b（与 B_MOD 同式，语义独立）
+    if op == B_FLOORMOD {
+        var q9 = floor(a / b)
+        return vval.new_float(a - q9 * b)
+    }
+    if op == B_MOD {
+        // 语言 % 只支持整数：浮点取模用 a - floor(a/b)*b 近似（Rust 端 f64
+        // 直接取余；本实现针对正数一致，负数取模为语言层少见场景）
+        var q = floor(a / b)
+        return vval.new_float(a - q * b)
+    }
+    if op == B_EQ {
+        return vval.new_bool(a == b)
+    }
+    if op == B_NOTEQ {
+        return vval.new_bool(a != b)
+    }
+    if op == B_LT {
+        return vval.new_bool(a < b)
+    }
+    if op == B_GT {
+        return vval.new_bool(a > b)
+    }
+    if op == B_LE {
+        return vval.new_bool(a <= b)
+    }
+    if op == B_GE {
+        return vval.new_bool(a >= b)
+    }
+    if op == B_AND || op == B_OR {
+        w_err = "浮点数不能做逻辑运算（需布尔）"
+        return Value.Nil
+    }
+    w_err = "位运算/移位只支持整数"
+    return Value.Nil
+}
+
+// 布尔二元运算：逻辑与/或 + 相等比较（对齐 Rust 错误文本）。
+func bool_binary(op: i64, a: bool, b: bool) -> Value {
+    if op == B_AND {
+        return vval.new_bool(a && b)
+    }
+    if op == B_OR {
+        return vval.new_bool(a || b)
+    }
+    if op == B_EQ {
+        return vval.new_bool(a == b)
+    }
+    if op == B_NOTEQ {
+        return vval.new_bool(a != b)
+    }
+    if op >= B_BITAND && op <= B_SHR {
+        w_err = "位运算/移位只支持整数"
+        return Value.Nil
+    }
+    w_err = "布尔只能做逻辑运算与相等比较"
+    return Value.Nil
+}
+
+// trit 二元运算（Kleene 逻辑 + 饱和算术；对齐 Rust 2733 行）。
+func trit_binary(op: i64, a: i64, b: i64) -> Value {
+    if op == B_AND {
+        return vval.new_trit(min2(a, b))
+    }
+    if op == B_OR {
+        return vval.new_trit(max2(a, b))
+    }
+    if op == B_ADD {
+        return vval.new_trit(clamp_trit(a + b))
+    }
+    if op == B_SUB {
+        return vval.new_trit(clamp_trit(a - b))
+    }
+    if op == B_MUL {
+        return vval.new_trit(clamp_trit(a * b))
+    }
+    if op == B_EQ {
+        return vval.new_bool(a == b)
+    }
+    if op == B_NOTEQ {
+        return vval.new_bool(a != b)
+    }
+    if op == B_LT {
+        return vval.new_bool(a < b)
+    }
+    if op == B_GT {
+        return vval.new_bool(a > b)
+    }
+    if op == B_LE {
+        return vval.new_bool(a <= b)
+    }
+    if op == B_GE {
+        return vval.new_bool(a >= b)
+    }
+    if op == B_DIV || op == B_MOD {
+        w_err = "trit 不支持除/取模运算（三值无除法）"
+        return Value.Nil
+    }
+    w_err = "位运算/移位只支持整数"
+    return Value.Nil
+}
+
+// trit × i64 混合运算（提升为 i64 算术；rev = i64 在前）。
+// 交换律运算符（+ * == !=）对顺序无感；非交换（- < > <= >=）由 rev 调序。
+func trit_int(op: i64, a: i64, b: i64, rev: bool) -> Value {
+    var x = a
+    var y = b
+    if rev {
+        x = b
+        y = a
+    }
+    if op == B_ADD {
+        return vval.new_int(x + y)
+    }
+    if op == B_SUB {
+        if rev {
+            return vval.new_int(y - x)
+        }
+        return vval.new_int(x - y)
+    }
+    if op == B_MUL {
+        return vval.new_int(x * y)
+    }
+    if op == B_EQ {
+        return vval.new_bool(x == y)
+    }
+    if op == B_NOTEQ {
+        return vval.new_bool(x != y)
+    }
+    if op == B_LT {
+        if rev {
+            return vval.new_bool(y < x)
+        }
+        return vval.new_bool(x < y)
+    }
+    if op == B_GT {
+        if rev {
+            return vval.new_bool(y > x)
+        }
+        return vval.new_bool(x > y)
+    }
+    if op == B_LE {
+        if rev {
+            return vval.new_bool(y <= x)
+        }
+        return vval.new_bool(x <= y)
+    }
+    if op == B_GE {
+        if rev {
+            return vval.new_bool(y >= x)
+        }
+        return vval.new_bool(x >= y)
+    }
+    if rev {
+        w_err = "i64 与 trit 不支持该运算: " + op_symbol(op)
+    } else {
+        w_err = "trit 与 i64 不支持该运算: " + op_symbol(op)
+    }
+    return Value.Nil
+}
+
+// trit 饱和截断到 [-1, 1]。
+func clamp_trit(v: i64) -> i64 {
+    if v < -1 {
+        return -1
+    }
+    if v > 1 {
+        return 1
+    }
+    return v
+}
+
+func min2(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+func max2(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// 运算符符号（错误提示用；对齐 Rust op_display）。
+func op_symbol(op: i64) -> string {
+    if op == B_ADD {
+        return "+"
+    }
+    if op == B_SUB {
+        return "-"
+    }
+    if op == B_MUL {
+        return "*"
+    }
+    if op == B_DIV {
+        return "/"
+    }
+    if op == B_MOD {
+        return "%"
+    }
+    if op == B_EQ {
+        return "=="
+    }
+    if op == B_NOTEQ {
+        return "!="
+    }
+    if op == B_LT {
+        return "<"
+    }
+    if op == B_GT {
+        return ">"
+    }
+    if op == B_LE {
+        return "<="
+    }
+    if op == B_GE {
+        return ">="
+    }
+    if op == B_AND {
+        return "&&"
+    }
+    if op == B_OR {
+        return "||"
+    }
+    if op == B_BITAND {
+        return "&"
+    }
+    if op == B_BITOR {
+        return "|"
+    }
+    if op == B_BITXOR {
+        return "^"
+    }
+    if op == B_SHL {
+        return "<<"
+    }
+    return ">>"
+}
+
+}   // namespace tiep

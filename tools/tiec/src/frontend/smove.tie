@@ -1,0 +1,875 @@
+type tie<class>
+// compiler/frontend/smove.tie —— S1.5 移动语义独立检查 pass
+// ============================================================
+// 里程碑：S1.5 移动语义（docs/plans/ui-framework.md §4.2 + roadmap §S1.5）
+//
+// # 职责
+//   移动语义检查 = 变量 live/moved 状态跟踪（编译期）：
+//   - 堆类型（string/table/含堆字段聚合）赋值/按值传参/返回即转移所有权，
+//     源变量标记 moved；此后读取 = 编译错误 "use of moved value"
+//   - 栈类型（i64/f64/bool）拷贝语义，不跟踪
+//   - 显式复制用 clone/copy（sbuiltin/irgen 支持，见规划 §3.3）
+//
+// # 设计：独立 pass（与 sinfer/scheck 解耦）
+//   本模块不修改 sinfer/scheck（S1.2-1.4 并行会话在编辑），而是作为
+//   semantic 逐函数检查**之后**的独立遍历：读 sstate 全局表（AST 列式表 +
+//   lv_* 变量表 + sg_*/sp_* 签名表 + node_types 类型表），自行递归遍历
+//   函数体，维护 lv_moved 状态并报错。语义正确性依赖前置阶段已完成的
+//   类型推断（node_types）与变量登记（lv_*）。
+//
+// # 移动触发点（递归遍历识别）
+//   | 语句/表达式形态 | 动作 |
+//   | --- | --- |
+//   | `var b = a`（init 是直接变量，堆类型，非 const） | a → moved |
+//   | `b = a`（右侧直接变量，堆类型，非 const，a≠b） | a → moved；b 重新 live |
+//   | `f(a)`（实参直接变量，堆类型，形参非 ref，用户函数） | a → moved |
+//   | `return a`（返回直接变量，堆类型） | a → moved |
+//   | 复杂表达式内的变量读取（非直接移动位置） | 若 moved → 报错 |
+//   | 内置/原语调用实参（str_len/table_push 等语言底座） | 借用，不移动 |
+//
+// # 依赖
+//   sstate（AST 表 + lv_moved 工具 + 签名表）+ types（类型判定）。
+//   import 树位置：semantic import 本文件（import 去重保证 sstate/types
+//   不重复展开）。
+//
+// 调用：semantic.check_impl/check_ast 逐函数检查循环内
+// `scheck.check_fn_walk(fname)` 之后调用 `smove.check_fn_walk(fname)`。
+
+import "./sstate.tie"
+import "../middle/types.tie"
+import "./smove_stmt.tie"
+
+// 当前函数名（semantic 逐函数检查循环调用前由 check_fn_walk 设置；
+// 命名空间体内不允许 var，置于顶层——与 sstate 的 sm_* 状态同层）
+var smv_cur_fn_name: string = "";
+
+// 审计模式（TIE_MOVE_AUDIT=1）：移动违规**只报告不中止**，用于评估既有代码的
+// 迁移面（与 `--esc-audit` 同一定位：审计输出是发现漏洞的唯一手段）。
+// 默认 0 = 正常模式（违规即编译错误）。惰性读一次环境变量。
+var smv_audit: i64 = 0;
+var smv_audit_init: i64 = 0;
+
+// 堆类型检查开关（**默认开**，`TIE_MOVE_CHECK=0` 显式关闭）。2026-10-01 起：
+// string 已移出移动跟踪（不可变值，见 is_owned 注释），table/map 的违规经
+// 迁移清零（tiec 自举 85 → 0），故可以默认开启——这正是当年注释里
+// 「std/compiler 全量迁移完成后默认开启」承诺的兑现。
+// **凭据检查不受此开关影响**：guard<cap> 的 move-only 是规范 §11.6 的硬约束。
+var smv_heap_on: i64 = 1;
+
+namespace smove {
+
+// ==================== 所有权类型判定 ====================
+// 类型 id 是否为"所有权类型"（隐式移动语义作用域）：
+// table/map 直判；聚合（struct/tuple/enum）递归查字段——含一个可变字段即 owned。
+// i64/f64/bool/trit/char 等标量 = 栈类型（copy）。
+//
+// ★ `string` **不在**此列（2026-10-01 修正）。理由三点，缺一不可：
+//   1. 规范 §13.1 明文：「赋值与传参默认按值：新位置得到一份**独立的值**，
+//      原位置**继续有效**」——按值不产生移动；§13.2 才要求显式 `move` 记号。
+//      把"按值"当"移动"会让调用方在只读调用后再用变量即报错，而那不是错误。
+//   2. tie 的 string 是**不可变值**（`str_len`/`str_char`/`str_byte` 全只读，
+//      无任何原地修改内建；`string_builder` 是另一类型）⇒ 多个变量持同一份
+//      字节缓冲区**没有**别名写入风险 ⇒ 无需用移动语义来防。
+//   3. 实测代价：纳入后 tiec 自身报 85 处、tlib 同量级，而它们全是合法写法。
+// table/map 则相反：它们**可变且按浅拷贝共享**（实测 `var b = a; b[0] = 99`
+// 会让 `a[0]` 也变 99），别名写入是真实风险，故保留在跟踪范围内。
+//
+// `guard<cap>`（§11.6 凭据）也在内，但成因不同：它不是"含可变字段"，而是
+// **身份唯一**——规范原话「凭据可以转移，但不能复制，因此同一时刻只有一处
+// 持有它」。纳入后 `var b = a; var c = a` 会在第二处报「已移动」，
+// 杜绝权限被悄悄复制。
+func is_owned(t: i64) -> bool {
+    if t < 0 {
+        return false
+    }
+    if types.is_guard(t) {
+        return true
+    }
+    var k = types.kind(t)
+    if k == K_TABLE || k == K_MAP {
+        return true
+    }
+    if k == K_STRUCT {
+        // struct：递归字段——含任一堆字段即 owned
+        var si = types.low(t)
+        if si >= 0 && si < len(cls_fldoff) {
+            var off = cls_fldoff[si]
+            var cnt = cls_nfld[si]
+            var i: i64 = 0
+            while i < cnt {
+                if is_owned(fld_tys[off + i]) {
+                    return true
+                }
+                i = i + 1
+            }
+        }
+        return false
+    }
+    if k == K_TUPLE {
+        // tuple：递归字段
+        var ti = types.low(t)
+        if ti >= 0 && ti < len(tup_offs) {
+            var off = tup_offs[ti]
+            var cnt = tup_n[ti]
+            var i: i64 = 0
+            while i < cnt {
+                if is_owned(tup_tys[off + i]) {
+                    return true
+                }
+                i = i + 1
+            }
+        }
+        return false
+    }
+    if k == K_ENUM {
+        // enum：递归 payload 字段（含任一堆 payload 即 owned）
+        var ei = types.low(t)
+        if ei >= 0 && ei < len(en_varoff) {
+            var nvar = en_nvar[ei]
+            var v: i64 = 0
+            while v < nvar {
+                var voff = en_vfldoff[en_varoff[ei] + v]
+                var vnf = en_vnfld[en_varoff[ei] + v]
+                var f: i64 = 0
+                while f < vnf {
+                    if is_owned(en_ftys[voff + f]) {
+                        return true
+                    }
+                    f = f + 1
+                }
+                v = v + 1
+            }
+        }
+        return false
+    }
+    return false
+}
+
+// ==================== 调用名解析（smove 内建简版） ====================
+// 裸调用名 → 全名（对齐 sinfer.resolve_call_name 候选 1/2）：
+// 候选 1：裸名已有签名；候选 2：当前函数命名空间逐级外层补全。
+// 返回全名（找不到原样返回——上层按 fn_sig < 0 判内置借用）。
+func resolve_call(fnm: string) -> string {
+    if sstate.fn_sig(fnm) >= 0 {
+        return fnm
+    }
+    var full = smv_cur_fn_name
+    while str_len(full) > 0 {
+        var last = sstate.rfind_ns(full)
+        if last < 0 {
+            break
+        }
+        // 前缀 = full[0, last)（last 是 '::' 中第一个 ':' 的下标）
+        var prefix = str.slice(full, 0, last)
+        var cand = prefix + "::" + fnm
+        if sstate.fn_sig(cand) >= 0 {
+            return cand
+        }
+        full = prefix
+    }
+    return fnm
+}
+
+// ==================== 变量状态辅助 ====================
+// 表达式节点是否为"直接变量"且堆类型（可移动源）：
+// node_types[节点] 已由前置推断填充；再查 lv_vals 确认变量类型。
+//
+// ★ 全局变量**不是**移动源：全局是共享存储，读它不转移所有权，函数的
+// 「移动」也无从作用于全局。缺这道闸时 `g_role` 这类全局会被当成移动源，
+// 首次使用即被标记 moved，后续每次读取都报「已移动」——实测编译 driver.tie
+// 时 118 条报告**绝大多数**是此类误报（首个真违规 `src` 才是真问题）。
+// 这与 `esc_cand` 缺全局闸导致「全局表被误判为独占」是**同一个坑**：
+// 判据若只看「类型 / 初值新鲜度」，就区分不出「被多处方共享」这件事。
+// 这里用全局符号表 `gb_keys` 做独立判据（与 esc_is_global_name 的双判据冗余同思路）。
+// 变量是否为全局（全局**永不是**移动源：共享存储无所有权可转移）
+func is_global_var(nid: i64) -> bool {
+    if nid < 0 {
+        return false
+    }
+    return sstate.bs_find(gb_keys, nid) >= 0
+}
+
+func is_move_src(e: i64) -> bool {
+    if e < 0 {
+        return false
+    }
+    if s_tags[e] != S_N_VAR {
+        return false
+    }
+    var nid = interner.intern(sstate.name_str(e))
+    if is_global_var(nid) {
+        return false
+    }
+    // ★ immut 形参是**只读借用**，没有所有权可转移：把借用赋给局部变量
+    // （`var x = u`）只是复制引用，不消耗来源（对照 Rust：`&T` 是 Copy）。
+    // 缺这条判据时，`var x1 = u; var x3 = u` 会把形参 u 标记为「已移动」，
+    // 于是只读形参在函数体内只能用一次——实测 tlib 的 x25519::ladder 正是
+    // 这个形态（一个函数连带报 15 处）。
+    // im_* 集合由 scheck 逐函数登记（im_reset/im_insert），与 smove 的逐函数
+    // 检查同生命周期，故此处直接查询安全。
+    if sstate.im_is(nid) {
+        return false
+    }
+    var ty: i64 = -1
+    var lt = lv_find(nid)
+    if lt >= 0 {
+        ty = lt
+    }
+    if ty < 0 {
+        ty = node_types[e]
+    }
+    // 凭据：始终纳入移动跟踪（不受 TIE_MOVE_CHECK 影响）
+    if types.is_guard(ty) {
+        return true
+    }
+    // 堆类型：需 TIE_MOVE_CHECK 开启（全库迁移未完成）
+    if smv_heap_on == 0 {
+        return false
+    }
+    return is_owned(ty)
+}
+
+// ==================== 凭据判定（§11.6 身份唯一） ====================
+// 该表达式是否为**凭据**（guard<cap>）。凭据是身份而非值：规范 §11.6 明令
+// 「凭据可以转移，但不能复制，因此同一时刻只有一处持有它」。故凭据的
+// 赋值/传参一律消耗源，与 §13.1「赋值与传参默认按值」无关——那条讲的是值，
+// 而凭据没有「两份都有效」的语义。
+//
+// 与 is_owned 的区别：is_owned 对普通堆类型（table/map/含堆字段的聚合）也返回
+// true，但那些类型 2026-10-03 起**不再**按类型推断消耗源（见 is_owned 注释
+// 与 §13.1）；本谓词只认凭据，是搬移跟踪在赋值位的唯一保留项。
+func is_cred_only(e: i64) -> bool {
+    if e < 0 {
+        return false
+    }
+    var nid = var_nid(e)
+    if nid < 0 {
+        return false
+    }
+    var ty: i64 = -1
+    var lt = lv_find(nid)
+    if lt >= 0 {
+        ty = lt
+    }
+    if ty < 0 {
+        ty = node_types[e]
+    }
+    return types.is_guard(ty)
+}
+
+// 取变量名 id（-1 = 非变量）
+func var_nid(e: i64) -> i64 {
+    if e < 0 {
+        return -1
+    }
+    if s_tags[e] != S_N_VAR {
+        return -1
+    }
+    return interner.intern(sstate.name_str(e))
+}
+
+// 变量是否 const（不可移动——移动 = 修改 const，改深拷贝语义）
+func var_is_const(nid: i64) -> i64 {
+    var idx = sstate.bs_find(lv_keys, nid)
+    if idx < 0 {
+        return 0
+    }
+    return lv_const[idx]
+}
+
+// 局部变量类型查找（对齐 sinfer.lv_find——sstate 全局表直查，不依赖 sinfer）
+func lv_find(nid: i64) -> i64 {
+    var idx = sstate.bs_find(lv_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return lv_vals[idx]
+}
+
+// 已移动报错消息。凭据与堆类型共用同一条既有诊断（E00372）——前半句逐字复用，
+// 故命中 diagcode 目录里的稳定标号（`变量%已移动（…）不可再次使用（需要复制请用%）`
+// 在 cat/pfx 两张表里都是 E00372，prefix 规则按「消息以该键开头」命中，
+// 加后缀不影响标号）。凭据追加一句**例外说明**：通用建议「需要复制请用 clone」
+// 对凭据不成立，规范 §11.6 明令凭据只能转移不能复制。
+// （不做成独立消息是刻意的：诊断目录当前与源码不同步——重建会让全部码号重排，
+//   波及 tie-diag 等外部引用，须单独处理，见 memory。）
+func moved_msg(nid: i64, nm: string) -> string {
+    var lt = lv_find(nid)
+    if lt >= 0 && types.is_guard(lt) {
+        return "变量 '" + nm + "' 已移动（所有权已转移），不可再次使用（需要复制请用 clone）——凭据是例外：它只能转移，不能复制（§11.6：同一时刻只有一处持有它）"
+    }
+    return "变量 '" + nm + "' 已移动（所有权已转移），不可再次使用（需要复制请用 clone）"
+}
+
+// ==================== 移动动作唯一入口 ====================
+// 把"移动一个变量"收敛为一处：源已 moved ⇒ 报错；否则标记 moved。
+//
+// 为什么必须收敛：此前 6 个移动位置（var 声明 / 赋值 / 实参 / return /
+// 字段赋值 / 下标赋值）各自内联「mark moved」，**都只标记、不检查**，
+// 于是 `var b = a; var c = a` 编译通过——同一份所有权出现两个持有者。
+// 对堆类型这是内存安全漏洞（二次释放/别名写）；对 guard<cap> 更是规范
+// §11.6 明令禁止的「权限被悄悄扩散」。收敛后两处一起修好。
+//
+// 返回 0 成功 / -1 已报错（sm_err_* 已置）。e = 触发移动的源节点（报错定位用）。
+func move_var(nid: i64, e: i64) -> i64 {
+    if nid < 0 {
+        return 0
+    }
+    if sstate.lv_moved_is(nid) == 1 {
+        if smv_audit == 1 {
+            println("MVVIOL " + to_string(s_lines[e]) + ":" + to_string(s_cols[e]) +
+                " " + smv_cur_fn_name + " '" + sstate.name_str(e) + "'")
+            return 0
+        }
+        sm_err_line = s_lines[e]
+        sm_err_col = s_cols[e]
+        sm_err_msg = moved_msg(nid, sstate.name_str(e))
+        return -1
+    }
+    sstate.lv_moved_mark(nid)
+    // 审计模式下同时报告**首次标记点**：报错点大多是「读到已 moved」的连锁，
+    // 真正要改的是这里（谁消耗了它）。修法通常是给被调函数的只读形参加 `ref`。
+    if smv_audit == 1 {
+        println("MVMARK " + to_string(s_lines[e]) + ":" + to_string(s_cols[e]) +
+            " " + smv_cur_fn_name + " '" + sstate.name_str(e) + "'")
+    }
+    return 0
+}
+
+// 递归遍历表达式：变量出现在"读取位置"（非直接移动位置）→ 若 moved 报错。
+// 移动位置（赋值/声明/返回/实参的直接变量）由上层先行处理（mark），
+// 此处只检查**复杂表达式内部**的变量读取（如 `b = a + 1` 中 a 是读取）。
+// 返回 0 成功 / -1 错误（sm_err_* 已置）。
+func check_expr_read(e: i64) -> i64 {
+    if e < 0 {
+        return 0
+    }
+    var tag = s_tags[e]
+    // 变量读取：查 moved
+    if tag == S_N_VAR {
+        var nid = interner.intern(sstate.name_str(e))
+        if sstate.lv_moved_is(nid) == 1 {
+            if smv_audit == 1 {
+                println("MVVIOL " + to_string(s_lines[e]) + ":" + to_string(s_cols[e]) +
+                    " " + smv_cur_fn_name + " '" + sstate.name_str(e) + "'")
+                return 0
+            }
+            sm_err_line = s_lines[e]
+            sm_err_col = s_cols[e]
+            sm_err_msg = moved_msg(nid, sstate.name_str(e))
+            return -1
+        }
+        return 0
+    }
+    // 字面量：无变量
+    if tag == 0 || tag == 1 || tag == 2 || tag == 3 || tag == 4 || tag == 5 {
+        return 0
+    }
+    // Unary：操作数
+    if tag == S_N_UNARY {
+        return check_expr_read(sstate.child(e, 0))
+    }
+    // Binary：左右
+    if tag == S_N_BINARY {
+        var r1 = check_expr_read(sstate.child(e, 0))
+        if r1 < 0 {
+            return -1
+        }
+        return check_expr_read(sstate.child(e, 1))
+    }
+    // Ternary：条件/真/假
+    if tag == S_N_TERNARY {
+        var r2 = check_expr_read(sstate.child(e, 0))
+        if r2 < 0 {
+            return -1
+        }
+        var r3 = check_expr_read(sstate.child(e, 1))
+        if r3 < 0 {
+            return -1
+        }
+        return check_expr_read(sstate.child(e, 2))
+    }
+    // Range：两端（for 迭代范围）
+    if tag == S_N_RANGE {
+        var r4 = check_expr_read(sstate.child(e, 0))
+        if r4 < 0 {
+            return -1
+        }
+        return check_expr_read(sstate.child(e, 1))
+    }
+    // Index：基址 + 下标
+    if tag == S_N_INDEX {
+        var r5 = check_expr_read(sstate.child(e, 0))
+        if r5 < 0 {
+            return -1
+        }
+        return check_expr_read(sstate.child(e, 1))
+    }
+    // FieldAccess：基址
+    if tag == S_N_FIELD_ACCESS {
+        return check_expr_read(sstate.child(e, 0))
+    }
+    // TableLit：单元格值（cell = [TableId 或 -1, 值]）
+    if tag == S_N_TABLE_LIT {
+        var nc = sstate.nchild(e)
+        var i: i64 = 0
+        while i < nc {
+            var cell = sstate.child(e, i)
+            var v = sstate.child(cell, 1)
+            var r6 = check_expr_read(v)
+            if r6 < 0 {
+                return -1
+            }
+            i = i + 1
+        }
+        return 0
+    }
+    // TupleLit：字段值（field = [name 或 -1, 值]）
+    if tag == S_N_TUPLE_LIT {
+        var nc2 = sstate.nchild(e)
+        var i2: i64 = 0
+        while i2 < nc2 {
+            var f = sstate.child(e, i2)
+            var v2 = sstate.child(f, 1)
+            var r7 = check_expr_read(v2)
+            if r7 < 0 {
+                return -1
+            }
+            i2 = i2 + 1
+        }
+        return 0
+    }
+    // Call：实参检查（直接变量 = 移动位置，由 check_call_args 处理；
+    // 这里递归复杂实参内部）
+    if tag == S_N_CALL {
+        return check_call(e)
+    }
+    // MethodCall：接收者按引用（不移动）；实参同 Call
+    if tag == S_N_METHOD_CALL {
+        return check_method_call(e)
+    }
+    // p.9.11.3 try 错误聚合块：表达式位，块体为语句 → 按块遍历移动语义
+    if tag == S_N_TRY_BLOCK {
+        return check_block(sstate.child(e, 0))
+    }
+    // Path/其他：无变量读取
+    return 0
+}
+
+// 调用实参移动处理：用户函数按值传堆参数 → 直接变量实参 mark moved；
+// 复杂实参递归读取检查。内置函数（fn_sig < 0）借用。
+// 借用语义（实参递归读取检查，不 mark moved）：
+//   1) clone/copy（S1.5 显式复制内置）——复制不消耗源；
+//   2) 跨命名空间调用（full 含 ::，库/模块函数，如 str::find）——
+//      库函数约定只读参数，实参不被移动。这是 std/compiler 迁移的关键：
+//      库内部 `find(lower, c)` 按值传参**不**消耗调用方的 c，
+//      之后 `out = out + c` 才合法。
+// 裸名顶层函数（如用户代码 take_owned(s)）保持移动语义（full 不含 ::）。
+// p.9.11.26 `move x: T` 形参判定：读**声明处**该形参 Param 节点 val 的 bit2
+//（位域见 pstmt_top_p3 参数解析：bit0=ref · bit1=immut · bit2=move）。
+// 本函数供调用点判定「该实参的所有权被显式移交」，与既有的 is_move_src
+//（按值类型/属性推断移动源）互补：前者是**声明侧显式约定**，后者是隐式判定。
+func param_is_move(full: string, idx: i64) -> bool {
+    if idx < 0 || str_len(full) == 0 {
+        return false
+    }
+    var fnode = sstate.fn_def_node(full)
+    if fnode < 0 {
+        return false
+    }
+    var poff = sstate.slot_off(fnode) + 1 + idx
+    if poff >= sstate.nchild(fnode) {
+        return false
+    }
+    var pnode = sstate.child(fnode, poff)
+    if pnode < 0 {
+        return false
+    }
+    return (s_vals[pnode] / 4) % 2 == 1
+}
+
+// p.9.11.26 `immut x: T` 形参判定：读**声明处**该形参 Param 节点 val 的 bit1
+//（位域见 pstmt_top_p3 / scollect：bit0=ref · bit1=immut · bit2=move）。
+//
+// 为什么必须在这里单独查、而不是读 `sp_refs`：形参位域有三位
+//（ref / immut / move），但 `p_refs` 只登记了 bit0（`s_vals[p] & 1`），
+// immut 与 move 都被掩掉。于是只看 `sp_refs` 会把 `immut` 形参误当成
+//「无修饰 = 值传递」⇒ 实参被标记「已移动」——而 `immut` 的语义恰恰是
+//**只读借用，调用方继续用**（规范 §13.4 约定矩阵）。
+// 修 `sp_refs` 本身不可取：它还被 backend 四处消费（irgen_call_p1/p2、
+// irgen_p2、irgen_stmt_p3）决定**调用约定**（传值还是传指针），改动会波及
+// codegen。故与 `param_is_move` 走同一条「按函数名 + 形参下标反查声明节点」
+// 的路子，只加一个查询、零风险。
+// 注：函数体内的 immut 只读约束由 scheck 承担（它已读 bit1 登记 immut 集合），
+// 本函数只补**调用侧**的缺口。
+func param_is_immut(full: string, idx: i64) -> bool {
+    if idx < 0 || str_len(full) == 0 {
+        return false
+    }
+    var fnode = sstate.fn_def_node(full)
+    if fnode < 0 {
+        return false
+    }
+    var poff = sstate.slot_off(fnode) + 1 + idx
+    if poff >= sstate.nchild(fnode) {
+        return false
+    }
+    var pnode = sstate.child(fnode, poff)
+    if pnode < 0 {
+        return false
+    }
+    return (s_vals[pnode] / 2) % 2 == 1
+}
+
+func check_call(e: i64) -> i64 {
+    var fnm = sstate.name_str(e)
+    var full = resolve_call(fnm)
+    // clone/copy + 跨命名空间（库函数）借用特判：实参递归读取检查（不 mark moved）
+    if fnm == "clone" || fnm == "copy" || full == "clone" || full == "copy" || sstate.rfind_ns(full) >= 0 {
+        var base_c = sstate.slot_off(e)
+        var nc_c = sstate.nchild(e)
+        var i_c: i64 = 0
+        while i_c < nc_c - base_c {
+            var arg_c = sstate.child(e, base_c + i_c)
+            var r_c = check_expr_read(arg_c)
+            if r_c < 0 {
+                return -1
+            }
+            i_c = i_c + 1
+        }
+        return 0
+    }
+    var sig = sstate.fn_sig(full)
+    // 泛型槽偏移：Call children[0] = 类型实参槽（-1 或 N_TYPE_ARGS）
+    var base = sstate.slot_off(e)
+    var nc = sstate.nchild(e)
+    var i: i64 = 0
+    while i < nc - base {
+        var arg = sstate.child(e, base + i)
+        // 复杂实参：递归读取检查
+        var r = check_expr_read(arg)
+        if r < 0 {
+            return -1
+        }
+        // 用户函数 + 直接变量实参 + 形参声明为 `move x: T` → 移交。
+        //
+        // ★ 2026-10-03 修正：此前这里除显式 move 形参外，还用 `is_move_src(arg)`
+        //   做**类型推断**——凡堆类型（table/map/含堆字段的聚合）的变量按值传参
+        //   一律被标 moved。该推断与规范 §13.1 直接冲突，原文：「赋值与传参默认
+        //   按值：新位置得到一份独立的值，原位置继续有效」——这句话对 table 与
+        //   string 无差别；§13.2 才是移动，且要求**显式 `move` 记号**。
+        //   实测证据（TIE_MOVE_CHECK=0 绕过检查后实测运行期行为）：
+        //     func push_one(t: table<i64>) { table_push(t, 99) }
+        //     push_one(a)后 → len(a)=3、a[0]=1 仍可读写；var b=a; b[1]=55 → a[1]=55
+        //   即源**没有被失效**（共享借用，非所有权转移）。table 无refcount
+        //   析构，也不存在 move-check 要防的「二次释放」；要防的别名写入风险由
+        //   「共享可变」这一事实本身承担，与是否标记 moved 无关。
+        //   误报代价是真实的：它让「只读调用后再用变量」这种合法写法直接编译
+        //   失败——tiu 的 api/tests/probe_m1、probe_m2、engine/tests/probe_e1
+        //   三份已入库探针因此挂掉（迁移面问题，非探针缺陷）。
+        //
+        // ★ 凭据例外（§11.6）：凭据传参一律移交，否则 `f(g); g` 可绕过身份
+        //   唯一性——负例语料 tests/language/cred_dup_move_neg.tie 守赋值位，
+        //   传参位同理。故判据为「显式 move 形参 **或** 该实参是凭据」。
+        if sig >= 0 {
+            var nid = var_nid(arg)
+            if nid >= 0 {
+                var off = sg_off[sig]
+                // `sp_refs` 只带 bit0（ref）；`immut`（只读借用）另查声明节点。
+                if off + i < len(sp_refs) && sp_refs[off + i] == 0 && !param_is_immut(full, i) {
+                    if var_is_const(nid) == 0 && !is_global_var(nid) &&
+                        (param_is_move(full, i) || is_cred_only(arg)) {
+                        var mv = move_var(nid, arg)
+                        if mv < 0 {
+                            return -1
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 接收者路径拼接（smove 自写，参考 sinfer.recv_path_name；smove 只
+// import sstate+types，不能调 sinfer）——Var / FieldAccess / Path 统一
+// 递归拼接为 "a::b::c" 形式，用于命名空间方法调用的完整签名。
+func recv_path_name(recv: i64) -> string {
+    var tag = s_tags[recv]
+    if tag == S_N_VAR {
+        return sstate.name_str(recv)
+    }
+    if tag == S_N_FIELD_ACCESS {
+        // FieldAccess[name=字段名, children=[基址]]：基址路径 + :: + 字段名
+        var base = sstate.child(recv, 0)
+        var bp = recv_path_name(base)
+        var fnm = sstate.name_str(recv)
+        if bp == "" {
+            return fnm
+        }
+        return bp + "::" + fnm
+    }
+    if tag == S_N_PATH {
+        // Path(children=[Segment...])：顺序拼接
+        var out: string = ""
+        var nc = sstate.nchild(recv)
+        var i: i64 = 0
+        while i < nc {
+            if i > 0 {
+                out = out + "::"
+            }
+            out = out + sstate.name_str(sstate.child(recv, i))
+            i = i + 1
+        }
+        return out
+    }
+    // 兜底：children 顺序拼接
+    var out2: string = ""
+    var nc2 = sstate.nchild(recv)
+    var j: i64 = 0
+    while j < nc2 {
+        if j > 0 {
+            out2 = out2 + "::"
+        }
+        out2 = out2 + sstate.name_str(sstate.child(recv, j))
+        j = j + 1
+    }
+    return out2
+}
+
+// 方法调用实参处理：接收者（children[slot_off]）按引用不移动；
+// 实参从 slot_off+1 起（同 Call 规则）。
+// S1.5 接收者解析：命名空间点号调用（str.slice / str.trim）必须拼出
+// 完整签名（str::slice），否则 resolve_call 用裸名解析，命中同文件裸
+// 顶层函数（driver.tie 有裸 slice/trim）后 full 无 "::"，借用特判不生效
+// → 实参被误标 moved。与 sinfer.infer_method_call 对齐：
+//   接收者 S_N_VAR 且未绑定（无本地/全局变量）→ 命名空间前缀 rname::fnm
+//   接收者 S_N_PATH / S_N_FIELD_ACCESS          → 路径拼接 path::fnm
+//   接收者绑定（struct 实例方法）               → 维持原 resolve_call(fnm)
+func check_method_call(e: i64) -> i64 {
+    var fnm = sstate.name_str(e)
+    var recv = sstate.child(e, sstate.slot_off(e))
+    var full = resolve_call(fnm)
+    // 接收者命名空间解析（只影响 full，不改变绑定变量的 struct 方法行为）
+    if recv >= 0 {
+        var rtag = s_tags[recv]
+        if rtag == S_N_VAR {
+            var rname = sstate.name_str(recv)
+            var rnid = interner.intern(rname)
+            var rt = lv_find(rnid)
+            if rt < 0 {
+                var gidx = sstate.bs_find(gb_keys, rnid)
+                if gidx >= 0 {
+                    rt = gb_vals[gidx]
+                }
+            }
+            if rt < 0 {
+                // 未绑定变量 → 命名空间前缀（str.slice → str::slice）
+                full = rname + "::" + fnm
+            }
+        } else if rtag == S_N_PATH || rtag == S_N_FIELD_ACCESS {
+            // Path / 字段访问接收者 → 路径拼接（参考 sinfer.recv_path_name）
+            var rp = recv_path_name(recv)
+            if str_len(rp) > 0 {
+                full = rp + "::" + fnm
+            }
+        }
+    }
+    // clone/copy + 跨命名空间（库函数）借用特判：与 check_call 一致——
+    // 库内部 `set.find(s, x)` 点号调用实参不被移动（full 解析为 set::find 含 ::）。
+    // 接收者 + 全部实参递归读取检查（不 mark moved）。
+    if fnm == "clone" || fnm == "copy" || full == "clone" || full == "copy" || sstate.rfind_ns(full) >= 0 {
+        var recv_c = sstate.child(e, sstate.slot_off(e))
+        var r_c = check_expr_read(recv_c)
+        if r_c < 0 {
+            return -1
+        }
+        var base_c = sstate.slot_off(e) + 1
+        var nc_c = sstate.nchild(e)
+        var i_c: i64 = 0
+        while i_c < nc_c - base_c {
+            var arg_c = sstate.child(e, base_c + i_c)
+            var r2_c = check_expr_read(arg_c)
+            if r2_c < 0 {
+                return -1
+            }
+            i_c = i_c + 1
+        }
+        return 0
+    }
+    var sig = sstate.fn_sig(full)
+    // 三期 A 组 delegate（第1批同域）：guard 接收者被 move 消费（move 式派生）。
+    // 标记接收者变量已 move；同域/能力名校验在 sinfer。能力实参无运行时/无移动。
+    // 走统一入口：同一个凭据不能 delegate 两次（否则父凭据被两处消费 = 扩散）。
+    if fnm == "delegate" {
+        var recv_d = sstate.child(e, sstate.slot_off(e))
+        var dnid = var_nid(recv_d)
+        if dnid >= 0 && var_is_const(dnid) == 0 {
+            var mvd = move_var(dnid, recv_d)
+            if mvd < 0 {
+                return -1
+            }
+        }
+        return 0
+    }
+    // 接收者：按引用（不移动）——只做读取检查（方法内改动不属移动）
+    // （recv 已在函数开头解析，供命名空间判断与借用特判共用）
+    var r = check_expr_read(recv)
+    if r < 0 {
+        return -1
+    }
+    var base = sstate.slot_off(e) + 1
+    var nc = sstate.nchild(e)
+    var i: i64 = 0
+    while i < nc - base {
+        var arg = sstate.child(e, base + i)
+        var r2 = check_expr_read(arg)
+        if r2 < 0 {
+            return -1
+        }
+        if sig >= 0 {
+            var nid = var_nid(arg)
+            if nid >= 0 {
+                var off = sg_off[sig]
+                // 同 check_call 的2026-10-03 修正：普通堆类型传参不再按类型推断消耗源
+                // （与规范 §13.1「传参按值、原位置继续有效」对齐）；凭据仍移交（§11.6）。
+                // 方法形参下标 0 是接收者，故实参 i 对应形参 i+1。
+                if off + i < len(sp_refs) && sp_refs[off + i] == 0 && !param_is_immut(full, i + 1) {
+                    if var_is_const(nid) == 0 && !is_global_var(nid) &&
+                        (param_is_move(full, i + 1) || is_cred_only(arg)) {
+                        var mv = move_var(nid, arg)
+                        if mv < 0 {
+                            return -1
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ==================== 入口 ====================
+// 定位函数节点并检查（对齐 scheck.check_fn_walk：遍历 g_extra_tops 顶层
+// FnDef / 命名空间递归）。返回 0 已检查 / -1 错误（sm_err_* 已置）。
+pub func check_fn_walk(full: string) -> i64 {
+    // 审计模式 / 堆检查开关惰性初始化（只读一次环境变量）
+    if smv_audit_init == 0 {
+        smv_audit_init = 1
+        if str_len(get_env("TIE_MOVE_AUDIT")) > 0 {
+            smv_audit = 1
+        }
+        // 堆检查默认开；`TIE_MOVE_CHECK=0` 显式关闭（迁移已完成）
+        if get_env("TIE_MOVE_CHECK") == "0" {
+            smv_heap_on = 0
+        }
+    }
+    smv_cur_fn_name = str.clone(full)
+    // 快路径（性能重构）：fn_def_nodes 平行表定位（同 scheck.check_fn_walk；
+    // :: 段压 ns_stack 重建命名空间上下文——命名空间内私有函数解析依赖）
+    var fast_node = sstate.fn_def_node(full)
+    if fast_node >= 0 {
+        var segs = push_ns_of(full)
+        var r0 = check_fn(fast_node)
+        var pp: i64 = 0
+        while pp < segs {
+            ns_top = ns_top - 1
+            pp = pp + 1
+        }
+        return r0
+    }
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            if sstate.ns_full_name(sstate.name_str(s)) == full {
+                return check_fn(s)
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var j: i64 = 0
+            while j < nsegs {
+                var seg = sstate.child(s, j)
+                sstate.ns_push(s_names[seg])
+                j = j + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var r = check_fn_walk_in_ns(body, full)
+            j = 0
+            while j < nsegs {
+                ns_top = ns_top - 1
+                j = j + 1
+            }
+            if r == 0 {
+                return 0
+            }
+            if r < 0 {
+                return r
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 命名空间体内递归（含嵌套 namespace）。返回 0 找到 / -1 错误 / 1 未找到。
+func check_fn_walk_in_ns(blk: i64, full: string) -> i64 {
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(blk, i)
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            if sstate.ns_full_name(sstate.name_str(s)) == full {
+                return check_fn(s)
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var j: i64 = 0
+            while j < nsegs {
+                var seg = sstate.child(s, j)
+                sstate.ns_push(s_names[seg])
+                j = j + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var r = check_fn_walk_in_ns(body, full)
+            j = 0
+            while j < nsegs {
+                ns_top = ns_top - 1
+                j = j + 1
+            }
+            if r == 0 {
+                return 0
+            }
+            if r < 0 {
+                return r
+            }
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// 单函数移动检查：重置 moved 状态，遍历函数体。
+// 返回 0 成功 / -1 错误（sm_err_* 已置）。
+func check_fn(fn_node: i64) -> i64 {
+    sstate.lv_moved_reset()
+    var nparams = s_aux[fn_node]
+    // 无函数体声明（如 extern 声明，p.6.1.2）：body 子节点不存在
+    // （index == nchild），child() 无边界检查——越界读会把相邻/后续节点
+    // （import 多时常为其它文件顶层节点）或 arena 尾部未初始化内存
+    // 误当函数体扫到（假报错误或 0xC0000005）。声明无需检查体，直接返回
+    // （对齐 scheck.check_fn 的既有防护）。
+    if sstate.slot_off(fn_node) + 1 + nparams >= sstate.nchild(fn_node) {
+        return 0
+    }
+    // 函数体：children[slot_off + 1 + nparams]
+    var body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams)
+    return check_block(body)
+}
+
+}   // namespace smove

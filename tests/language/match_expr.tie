@@ -1,0 +1,92 @@
+type tie<logic>
+
+// ============================================================
+// p.9.10.1 match/switch 表达式验收：模式匹配从语句位扩展到表达式位。
+//
+// 覆盖场景：
+//   1. 整数 switch 表达式（`->` 分支 + `_` 通配）
+//   2. 字符串 subject switch 表达式
+//   3. 枚举 payload 解构（Option<T> Some(v)）作表达式值
+//   4. when 守卫 + `_` 通配
+//   5. `_` 通配作缺省臂
+//   6. switch 表达式用作实参
+//   7. 嵌套：内层 switch 表达式作为外层臂的值
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   zero / one / many / greet / 15 / -1 / pos-one / zero / other /
+//   [one] / inner-three
+// ============================================================
+import "/std/result.tie"
+import "/std/assert.tie"
+using assert;
+
+// 整数 switch 表达式（值/区间/`_` 通配）
+func describe(n: i64) -> string {
+    return switch n {
+        0 -> "zero",
+        1 -> "one",
+        2 -> "two",
+        _ -> "many"
+    }
+}
+
+// 枚举 payload 解构：Option<T> 的 Some(v) 绑定 payload 作表达式值
+func opt_bump(o: Option<i64>) -> i64 {
+    return switch o {
+        Some(v) -> v + 10,
+        None -> -1,
+        _ -> -99
+    }
+}
+
+// when 守卫 + `_` 通配
+func guarded(n: i64) -> string {
+    return switch n {
+        1 when n > 0 -> "pos-one",
+        0 -> "zero",
+        _ -> "other"
+    }
+}
+
+// switch 表达式用作实参
+func wrap(s: string) -> string {
+    return "[" + s + "]"
+}
+
+func main() {
+    // 1. 整数 switch 表达式
+    println(describe(0))   // zero
+    println(describe(1))   // one
+    println(describe(5))   // many
+    // 2. 字符串 subject
+    var s = "hi"
+    var sv = switch s {
+        "hi" -> "greet",
+        _ -> "other"
+    }
+    println(sv)   // greet
+    // 3. 枚举 payload 解构（Option<i64>）
+    var o1: Option<i64> = Option.Some(5)
+    println(opt_bump(o1))   // 15
+    var o2: Option<i64> = Option.None
+    println(opt_bump(o2))   // -1
+    // 4. when 守卫
+    println(guarded(1))   // pos-one
+    println(guarded(0))   // zero
+    println(guarded(9))   // other
+    // 5. switch 表达式用作实参
+    println(wrap(switch 1 {
+        1 -> "one",
+        _ -> "x"
+    }))   // [one]
+    // 6. 嵌套：内层 switch 表达式作为外层臂的值
+    var nested = switch 2 {
+        1 -> "one",
+        _ -> switch 3 {
+            3 -> "inner-three",
+            _ -> "inner-other"
+        }
+    }
+    println(nested)   // inner-three
+    println("p.9.10.1 match/switch 表达式全过")
+}

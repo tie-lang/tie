@@ -1,0 +1,687 @@
+type tie<class>
+// compiler/frontend/scheck_q3.tie —— 分片 3（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 scheck.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace scheck {
+// 变量声明检查（函数内）
+pub func check_var_decl(s: i64) -> i64 {
+    var nm = sstate.name_str(s)
+    var nid = intern.intern(nm)
+    var is_const = s_vals[s]
+    // r.1.6.7 凭据派生登记：`var sub = g.delegate(cap)` ⇒ 记下 (sub → g)，供
+    // `unsafe.revoke(g)` 沿派生关系传播失效（撤销父 ⇒ 子女一并失效）。
+    // 登记的是「名 → 名」的编译期关系，与类型/值无关，故在类型推断之前做。
+    var init_d = sstate.child(s, 1)
+    if init_d >= 0 && s_tags[init_d] == S_N_METHOD_CALL && sstate.name_str(init_d) == "delegate" {
+        var recv_d = sstate.child(init_d, sstate.slot_off(init_d))
+        if recv_d >= 0 && s_tags[recv_d] == S_N_VAR {
+            sstate.gr_add(nid, intern.intern(sstate.name_str(recv_d)))
+        }
+    }
+    // 重复声明对齐 Rust 版：不报错（scope.insert 覆盖语义）
+    var ty_node = sstate.child(s, 0)
+    var init = sstate.child(s, 1)
+    if ty_node >= 0 {
+        var ty = sgen.parse_generic_type_node(ty_node)
+        if ty < 0 {
+            return -1
+        }
+        // S2.4 port 对象变量：`var d: Drawable = button`（提升）或
+        // `var d2: Drawable = d`（port 拷贝）。提升 = 取 data 地址 + 打包
+        // vtable（借用语义归 unsafe，docs/plans/port-model.md §4.5）：
+        //   - 提升（struct → port）必须在 unsafe 上下文
+        //   - port → port 拷贝无新借用，安全代码允许
+        if types.kind(ty) == K_PORT {
+            if init < 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "port 对象变量 '" + nm + "' 必须初始化（如 unsafe { var " + nm + ": " + types.type_name(ty) + " = 具体实例 }）"
+                return -1
+            }
+            var it_p = sinfer.infer_expr(init)
+            if it_p < 0 {
+                return -1
+            }
+            if types.kind(it_p) == K_STRUCT {
+                // 提升：必须在 unsafe 上下文（借用语义归 unsafe）
+                if g_unsafe_depth == 0 {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "提升 '" + types.type_name(it_p) + "' 到 port '" + types.type_name(ty) + "' 必须在 unsafe 块或 unsafe 函数中（接口对象借用具体对象，指针操作归 unsafe）"
+                    return -1
+                }
+                // 2026-10-01 域标签：port 提升 = 取具体对象地址并借用 ⇒ 归 **mem** 域
+                // （归类文档 §6 唯一待补项，此处接线）。它不走内建清单，故域匹配
+                // 需在此单独判一次。
+                if (g_held_caps & 2) == 0 {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    var held_p = types.cap_set_name(g_held_caps)
+                    if str_len(held_p) == 0 {
+                        held_p = "none"
+                    }
+                    sm_err_msg = "提升到 port '" + types.type_name(ty) + "' 需要 mem 域凭据（当前作用域持：" + held_p +
+                        "）。持证方式：文件头 `type tie<角色, unsafe:mem>`、函数级 `#[unsafe.mem]`、或块级 `unsafe with(mem) { }` / `unsafe use g { }`"
+                    return -1
+                }
+                // 双锁通过 ⇒ 记 mem 域在作用域内被使用（W00030 判据）。
+                g_used_caps = g_used_caps | 2
+                var pi_l = types.low(ty)
+                if !stype.impl_has_ty(pi_l, it_p) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    if sstate.port_is_iface(pi_l) {
+                        // p.9.11.21 interface 提升不满足：定位第一个违规方法
+                        var vio2 = stype.iface_first_violation(pi_l, it_p)
+                        if vio2 >= 0 {
+                            var vname2 = sstate.port_method_name(pi_l, vio2)
+                            if stype.iface_vio_missing() {
+                                sm_err_msg = "类型 '" + types.type_name(it_p) + "' 未实现 interface '" + types.type_name(ty) + "'，不能提升（缺少方法 '" + vname2 + "'）"
+                            } else {
+                                sm_err_msg = "类型 '" + types.type_name(it_p) + "' 未实现 interface '" + types.type_name(ty) + "'，不能提升（方法 '" + vname2 + "' 签名不匹配）"
+                            }
+                        } else {
+                            sm_err_msg = "类型 '" + types.type_name(it_p) + "' 未实现 interface '" + types.type_name(ty) + "'，不能提升"
+                        }
+                    } else {
+                        sm_err_msg = "类型 '" + types.type_name(it_p) + "' 未实现 port '" + types.type_name(ty) + "'，不能提升（请先写 impl " + types.type_name(ty) + " for " + types.type_name(it_p) + "）"
+                    }
+                    return -1
+                }
+            } else if types.kind(it_p) == K_PORT {
+                // port → port 拷贝（指针拷贝，无新借用）
+                if it_p != ty {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "port 对象变量 '" + nm + "' 类型不匹配：标注 " + types.type_name(ty) + "，表达式推导为 " + types.type_name(it_p)
+                    return -1
+                }
+            } else {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "port 对象变量 '" + nm + "' 的初始化必须是实现了该 port 的具体类型实例（提升）或同 port 对象，实际是 " + types.type_name(it_p)
+                return -1
+            }
+            // W00008 / W00005：同名变量再次声明（作用域覆盖语义，后者遮蔽前者）
+            decl_warn(nid, s_lines[s], s_cols[s])
+            // 登记局部变量（port 对象 = ptr 槽）
+            sinfer.lv_insert(nid, ty, is_const, -1, 0)
+            // p.9.22.6 全量符号表：局部变量声明登记（kind 5）。
+            xref.reg_decl(nid, 5, ty, s)
+            return 0
+        }
+        // 安全边界重分类（§11.8，2026-10-01）：**类型本身不再是危险面** ——
+        // `ptr<T>` / `slice<T>` / `atomic<T>` 的声明在安全代码中合法。
+        //
+        // 判据（设计定稿）：「构造安全 ⟺ 不可能引发 UB」——持有/声明/比较/传递
+        // 一个指针值不会引发 UB，只有**解引用、指针算术、原始分配、取地址、
+        // 易失访存**才会。故危险面从「类型」下移到「操作」，由内置调用门禁
+        // （sinfer_ret_q2.tie 的 unsafe 内置清单）与「必须处于 unsafe 上下文」
+        // 共同承担；此处原先的 `types.is_unsafe_ty(ty) && g_unsafe_depth == 0`
+        // 整段拦截把「安全切片 vs 裸指针」两层混成一层，现改为只留操作级门禁。
+        //
+        // 注意：**不能**改 `types.is_unsafe_ty` 本身去实现本重分类 —— 该谓词在
+        // irgen 侧还承担「指针/切片/原子类型的槽型推断」（irgen_stmt_gen_p1.tie、
+        // irgen_expr.tie、irgen_closure.tie 三处），改它会让这些类型的变量生成
+        // 错误槽型。类型分类照旧，只撤掉前端这条按类型拒绝的门禁。
+        // S3.3：code 类型只能在宏函数体内使用（编译期值，运行期无表示）。
+        // 宏体不经过语义检查（interp 编译期执行），此检查拦截普通函数里的
+        // code 变量/参数（含展开残留的准引用）。
+        if ty == types.named(TK_CODE) {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "code 类型值只能在宏函数体内使用（宏 = 编译期 AST→AST 函数；准引用/插值/宏参数都是编译期构造）"
+            return -1
+        }
+        var it: i64 = -1
+        if init >= 0 {
+            it = sinfer.infer_expr(init)
+            if it < 0 {
+                // S2.3 目标类型引导：`var b: Result<i64, string> = Result.Err("bad")`
+                // 泛型 enum 构造类型参数推断不全时，用标注类型补全
+                var d_l = sm_err_line
+                var d_c = sm_err_col
+                var d_m = sm_err_msg
+                var hv = sinfer.try_enum_construct_hinted(init, ty)
+                if hv >= 0 {
+                    sm_err_line = 0
+                    sm_err_col = 0
+                    sm_err_msg = ""
+                    it = hv
+                } else {
+                    if sm_err_msg == d_m {
+                        sm_err_line = d_l
+                        sm_err_col = d_c
+                        sm_err_msg = d_m
+                    }
+                    return -1
+                }
+            }
+        }
+        // 空表/空 map 字面量目标引导：`var em: map = []` / `var t: table = []`。
+        // 空 [] 无元素，infer_expr 兜底 i64（无法区分 table/map），由标注类型
+        // 定型：node_types[init] = ty 供 irgen gen_table_lit 选择句柄
+        // （map → esz=16 / table → esz=8），it = ty 使下方类型匹配放行。
+        if it == types.named(TK_I64) && s_tags[init] == S_N_TABLE_LIT &&
+            sstate.nchild(init) == 0 && (types.is_table(ty) || types.is_map(ty)) {
+            node_types[init] = ty
+            it = ty
+        }
+        var telem: i64 = -1
+        var dyn: i64 = 0
+        if types.is_table(ty) {
+            if init >= 0 {
+                var itag = s_tags[init]
+                if itag == S_N_TABLE_LIT {
+                    telem = types.table_elem(it)
+                    if telem < 0 {
+                        telem = types.named(TK_I64)
+                    }
+                } else if itag == S_N_CALL {
+                    var fnm = sstate.name_str(init)
+                    if fnm == "table_new_i64" {
+                        telem = types.named(TK_I64)
+                    } else if fnm == "table_new_f64" {
+                        telem = types.named(TK_F64)
+                    } else if fnm == "table_new_string" {
+                        telem = types.named(TK_STR)
+                    } else if fnm == "table_new_bool" {
+                        telem = types.named(TK_BOOL)
+                    } else {
+                        // 用解析后全名查返回表元素
+                        var te2 = sinfer.table_ret_elem(sinfer.resolve_call_name(fnm))
+                        if te2 >= 0 {
+                            telem = te2
+                        }
+                    }
+                    dyn = 1
+                } else if itag == S_N_VAR {
+                    var iname = sstate.name_str(init)
+                    var inid = intern.intern(iname)
+                    var vte = sinfer.var_table_elem(inid)
+                    if vte >= 0 {
+                        telem = vte
+                    }
+                    if sinfer.var_dyn(inid) == 1 {
+                        dyn = 1
+                    }
+                    // p.6.9.15 警告 W0004：`var b = a` 拷贝动态表变量 → 引用共享
+                    if iname != nm && sinfer.var_dyn(inid) == 1 {
+                        sm_warn_add(s_lines[s], s_cols[s], "表变量拷贝共享底层数组（var b = a 后 b 的修改会反映到 a）")
+                    }
+                }
+            } else {
+                var te3 = types.table_elem(ty)
+                if te3 >= 0 {
+                    telem = te3
+                }
+                dyn = 1
+            }
+        }
+        if init >= 0 {
+            if !stype.types_match(ty, it, init) && !stype.types_compatible(ty, it) &&
+                !stype.types_narrow_int(ty, it, init) {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                if types.kind(ty) == K_ARRAY && s_tags[init] == S_N_TABLE_LIT {
+                    sm_err_msg = "变量 '" + nm + "' 类型不匹配：标注 " + types.type_name(ty) + "；数组字面量元素个数必须为 " + to_string(types.array_len(ty)) + "（实际 " + to_string(sstate.nchild(init)) + "），且元素类型必须与 " + types.type_name(types.array_elem(ty)) + " 一致"
+                } else {
+                    sm_err_msg = "变量 '" + nm + "' 类型不匹配：标注 " + types.type_name(ty) + "，表达式推导为 " + types.type_name(it)
+                }
+                return -1
+            }
+        }
+        // W00008 / W00005：同名变量再次声明（作用域覆盖语义，后者遮蔽前者）
+        decl_warn(nid, s_lines[s], s_cols[s])
+        sinfer.lv_insert(nid, ty, is_const, telem, dyn)
+        // p.9.22.6 全量符号表：局部变量声明登记（kind 5）。
+        xref.reg_decl(nid, 5, ty, s)
+        // S2.2 闭包：闭包体内声明的局部登记到当前闭包局部段（捕获遮蔽判定用）
+        if g_clo_depth > 0 && g_clo_cur >= 0 {
+            table_push(cl_locals, nid)
+        }
+        return 0
+    }
+    if init < 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "变量 '" + nm + "' 必须标注类型或初始化"
+        return -1
+    }
+    var it2 = sinfer.infer_expr(init)
+    if it2 < 0 {
+        return -1
+    }
+    var telem2: i64 = -1
+    var dyn2: i64 = 0
+    if types.is_table(it2) {
+        telem2 = types.table_elem(it2)
+        if telem2 < 0 {
+            // 调用/方法调用返回的裸表：查返回表元素类型
+            if s_tags[init] == S_N_CALL {
+                var fnm2 = sstate.name_str(init)
+                // table_new_*：元素类型由调用名决定（对齐 Rust dynamic_table_elem_ty
+                // 3844 行 table_new_elem_ty——Rust 侧 table_new_* 表达式类型是裸 table，
+                // 元素类型在 VarDecl 处按调用名解析登记）
+                var te4: i64 = -1
+                if fnm2 == "table_new_i64" {
+                    te4 = types.named(TK_I64)
+                } else if fnm2 == "table_new_f64" {
+                    te4 = types.named(TK_F64)
+                } else if fnm2 == "table_new_string" {
+                    te4 = types.named(TK_STR)
+                } else if fnm2 == "table_new_bool" {
+                    te4 = types.named(TK_BOOL)
+                }
+                if te4 >= 0 {
+                    telem2 = te4
+                } else {
+                    var te2 = sinfer.table_ret_elem(sinfer.resolve_call_name(fnm2))
+                    if te2 >= 0 {
+                        telem2 = te2
+                    } else {
+                        telem2 = types.named(TK_I64)
+                    }
+                }
+            } else if s_tags[init] == S_N_METHOD_CALL {
+                // 方法调用返回表：recv::mname 查返回表元素（如 str.split → str::split）
+                // MethodCall 接收者 = children[slot_off]（新布局 children[0]=泛型槽）
+                var recv = sstate.child(init, sstate.slot_off(init))
+                var rname = sstate.name_str(recv)
+                var mname = sstate.name_str(init)
+                var full2 = rname + "::" + mname
+                var te3 = sinfer.table_ret_elem(full2)
+                if te3 >= 0 {
+                    telem2 = te3
+                } else {
+                    telem2 = types.named(TK_I64)
+                }
+            } else {
+                telem2 = types.named(TK_I64)
+            }
+        }
+        if s_tags[init] != S_N_TABLE_LIT {
+            dyn2 = 1
+        }
+        // p.6.9.15 警告 W0004（无标注路径）：`var b = a` 拷贝动态表变量 → 引用共享
+        if s_tags[init] == S_N_VAR && types.is_table(it2) {
+            var iname2 = sstate.name_str(init)
+            var inid2 = intern.intern(iname2)
+            if iname2 != nm && sinfer.var_dyn(inid2) == 1 {
+                sm_warn_add(s_lines[s], s_cols[s], "表变量拷贝共享底层数组（var b = a 后 b 的修改会反映到 a）")
+            }
+        }
+    }
+    // W00008 / W00005（无标注路径）：同名变量再次声明（作用域覆盖语义）
+    decl_warn(nid, s_lines[s], s_cols[s])
+    sinfer.lv_insert(nid, it2, is_const, telem2, dyn2)
+    // p.9.22.6 全量符号表：局部变量声明登记（kind 5，无标注路径）。
+    xref.reg_decl(nid, 5, it2, s)
+    // S2.2 闭包：闭包体内声明的局部登记到当前闭包局部段（捕获遮蔽判定用）
+    if g_clo_depth > 0 && g_clo_cur >= 0 {
+        table_push(cl_locals, nid)
+    }
+    return 0
+}
+
+// 函数体检查
+pub func check_fn(fn_node: i64, full: string) -> i64 {
+    var sig = sstate.fn_sig(full)
+    if sig < 0 {
+        sm_err_line = s_lines[fn_node]
+        sm_err_col = s_cols[fn_node]
+        sm_err_msg = "内部错误：函数 '" + full + "' 无签名"
+        return -1
+    }
+    g_curfn = sig
+    sstate.im_reset()   // p.9.11.11 immut 收集重置（每函数）
+    sstate.vp_reset()   // r.1.6.10 按值形参收集重置（每函数，W00031 用）
+    sstate.uwt_reset()  // 规范 §13.1 不可观测写入目标集合重置（每函数）
+    lv_keys = table_new_i64()
+    lv_vals = table_new_i64()
+    lv_const = table_new_i64()
+    lv_telem = table_new_i64()
+    lv_dyn = table_new_i64()
+    lp_stack = table_new_i64()
+    lp_top = 0
+    // 三期 goto（§7.1.5）：每函数重置 goto 标签表与块追踪（R1 同函数 = 表隔离）
+    g_gt_keys = table_new_i64()
+    g_gt_chain = table_new_string()
+    g_gt_blkidx = table_new_i64()
+    g_gt_seq = table_new_i64()
+    g_gt_depths = table_new_i64()
+    g_gtg_keys = table_new_i64()
+    g_gtg_chain = table_new_string()
+    g_gtg_blkidx = table_new_i64()
+    g_gtg_seq = table_new_i64()
+    g_gtg_line = table_new_i64()
+    g_gtg_col = table_new_i64()
+    g_cur_chain = ""
+    g_cur_depth = 0
+    g_cur_blkidx = 0
+    g_cur_blknode = -1
+    g_gt_seq_cnt = 0
+    g_gt_blk_seq = 0
+    g_cf_depth = 0
+    g_block_names = table_new_i64()
+    // p.9.22.6：函数是新的 xref 作用域（owner = 函数定义节点）。形参/局部
+    // 声明的 use→decl 解析基础；出口处 pop（含无体提前返回）。
+    xref.push_scope(fn_node)
+    var nparams = sg_nparams[sig]
+    var off = sg_off[sig]
+    var i: i64 = 0
+    while i < nparams {
+        // 第 i 个参数节点：children[slot_off + 1 + i]（slot_off 双布局兼容）
+        var pnode = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + i)
+        var pname = sstate.name_str(pnode)
+        var pnid = intern.intern(pname)
+        var pty = sp_tys[off + i]
+        var prefs = sp_refs[off + i]
+        var telem: i64 = -1
+        var dyn: i64 = 0
+        if types.is_table(pty) {
+            telem = types.table_elem(pty)
+            if telem < 0 {
+                telem = types.named(TK_STR)
+            }
+            dyn = 1
+        }
+        sinfer.lv_insert(pnid, pty, 0, telem, dyn)
+        // p.9.22.6 全量符号表：形参声明登记（kind 6）。
+        xref.reg_decl(pnid, 6, pty, pnode)
+        // p.9.11.11 immut 只读形参：N_PARAM val bit1 = immut（parser 登记；by_ref
+        // 在 bit0 与既有 sp_refs 读取一致——此处读 bit1）。登记到 immut 集合。
+        if (s_vals[pnode] & 2) != 0 {
+            sstate.im_insert(pnid)
+        }
+        // r.1.6.10：按值形参登记（不论 immut），供 W00031 判定「写入副本」类无声失效。
+        // ★ 必须**排除 ref 形参**（2026-10-07 修正）：ref 的写入会传到调用方，不是副本。
+        //   此前无条件登记，而批量迁移把大量表/数组形参改成了 ref ⇒ 该集合实际包含
+        //   ref 形参 ⇒ `vp_is` 名不副实，W00031 第二形态在 ref 形参上误报
+        //   （实测 tlib `tensor.copy` 的 `dst`、`nn` 的 `yo` 都被误报）。
+        //   第一形态只作用于 struct 形参，而 ref 不支持 struct ⇒ 过滤对它是零影响。
+        if prefs == 0 {
+            sstate.vp_insert(pnid)
+        }
+        // 规范 §13.1「不可观测写入」：非 ref / 非 shared / 非 move 的**表**形参。
+        // 与 irgen r.1.6.14 入口 retain 条件同源（shared 跳过：纯借用就地改；
+        // move 跳过：所有权已移交被调方）；any 动态类型与 retain 同步排除。
+        var is_move_uw = (s_vals[pnode] / 4) % 2 == 1
+        var is_shared_uw = (s_vals[pnode] & 32) != 0
+        if prefs == 0 && !is_move_uw && !is_shared_uw && types.is_table(pty) && pty != types.named(TK_ANY) {
+            sstate.uwt_insert(pnid)
+        }
+        i = i + 1
+    }
+    // actor 消息方法体（内部全名 `actor$N::m`，见 scollect_port_q2 的登记）：
+    // 把该 actor 的**私有状态字段**绑进局部作用域。后端 irgen_rt_p3 用
+    // `scope_put(字段 → gep(rec, foff))` 绑到 record 槽；前端必须同样登记，
+    // 否则方法体访问字段报「未声明的变量」（2026-10-03 实测）。
+    // 非 actor 函数查表 miss → 不做任何事。
+    var afi = sstate.bs_find(afn_keys, intern.intern(full))
+    if afi >= 0 {
+        var aidx2 = afn_actor[afi]
+        var fbase2 = ac_fnoff[aidx2]
+        var fcnt2 = ac_fncnt[aidx2]
+        var ftyoff2 = ac_ftyoff[aidx2]
+        var fk2: i64 = 0
+        while fk2 < fcnt2 {
+            var fty2 = ac_ftys[ftyoff2 + fk2]
+            var ftelem2: i64 = -1
+            var fdyn2: i64 = 0
+            if types.is_table(fty2) {
+                ftelem2 = types.table_elem(fty2)
+                if ftelem2 < 0 {
+                    ftelem2 = types.named(TK_STR)
+                }
+                fdyn2 = 1
+            }
+            sinfer.lv_insert(ac_fnames[fbase2 + fk2], fty2, 0, ftelem2, fdyn2)
+            fk2 = fk2 + 1
+        }
+    }
+    // 函数体：children[slot_off + 1 + nparams]
+    var body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams)
+    // 无函数体声明（如 extern 声明）：body 子节点不存在（index == nchild），
+    // child() 越界读会把相邻/后续节点（import 多时常为其它文件顶层节点的 tag）
+    // 误当函数体成员扫到 → 假报「语句只能出现在文件顶层」。声明无需检查体，
+    // 直接返回（goto 表为空，check_goto_refs 亦为空操作，语义等价）。
+    if sstate.slot_off(fn_node) + 1 + nparams >= sstate.nchild(fn_node) {
+        xref.pop_scope()
+        return 0
+    }
+    // S1.2：unsafe 函数体内开启 unsafe 上下文（safe 代码进 unsafe fn 已被调用
+    // 检查拦截；unsafe fn 内部零标记触底）
+    var saved_depth = g_unsafe_depth
+    if sstate.sig_unsafe(sig) == 1 {
+        g_unsafe_depth = g_unsafe_depth + 1
+    }
+    // 2026-10-07：文件级 unsafe 上下文（`type tie<角色, unsafe>`，规范 §11.6）
+    // 与域凭据**对称** —— 按该函数所属模块判定，不再依赖全局量。
+    // 此前 driver 在解析前全局 +1 ⇒ ① 会扩散给被 import 的模块（父授权不继承，
+    // 与 caps 那条同类越权）② 检查阶段在解析之后，全局量已不代表函数所属模块。
+    if sstate.fn_uctx(fn_node) == 1 {
+        g_unsafe_depth = g_unsafe_depth + 1
+    }
+    // 2026-10-01：本函数的**持证域集** = 文件级授权 | 函数级属性位集。
+    // 这是「域匹配」的锁二来源之一（另两个是块级 unsafe.with / unsafe use）。
+    var saved_caps = g_held_caps
+    g_held_caps = sstate.fn_caps(fn_node)
+    // W00030：函数是**全新的凭据作用域**（凭据不跨函数继承），已用域从零记账。
+    g_used_caps = 0
+    // W00012（收窄版）：同一函数内同一整数字面量出现 >= 3 次才报——单次或两次
+    // 出现属正常写法，只有反复出现的无名常量才对应「局部修改易遗漏」。
+    // p.9.14.2：lit_scan 是全函数子树遍历，仅当警告 pass 启用才执行。
+    if semantic.sm_warn_enabled() {
+        var w12_vals: table<i64> = table_new_i64()
+        var w12_cnts: table<i64> = table_new_i64()
+        var w12_lns: table<i64> = table_new_i64()
+        var w12_cls: table<i64> = table_new_i64()
+        lit_scan(body, w12_vals, w12_cnts, w12_lns, w12_cls)
+        var w12_i: i64 = 0
+        while w12_i < len(w12_vals) {
+            if w12_cnts[w12_i] >= 3 {
+                sm_warn_add(w12_lns[w12_i], w12_cls[w12_i], "魔法数字（非 0/1 的字面量直接参与运算）")
+            }
+            w12_i = w12_i + 1
+        }
+    }
+    var r = check_block(body)
+    g_unsafe_depth = saved_depth
+    // W00030：函数持有的域在函数体内一次未用 ⇒ 凭据挂空。**逐函数判定只针对
+    // 函数级属性位**（`#[unsafe.域]`）——文件级授权是规范明文认可的粗粒度授权，
+    // 逐函数比对会退化成「授权文件里每个不碰该域的函数都告警」的噪声。
+    // 凭据**不跨函数继承**，函数是全新作用域：基准是属性位本身，而非外层的
+    // g_held_caps（闭包体不继承外层凭据，与 lock 去锁作用域同规则）。
+    cap_idle_check(sstate.fn_attr_caps(fn_node), body, s_lines[fn_node], s_cols[fn_node])
+    // 文件级授权按文件粒度另判：并入本模块累计用量。
+    cap_file_note(fn_node, body)
+    g_held_caps = saved_caps
+    if r < 0 {
+        xref.pop_scope()
+        return -1
+    }
+    // 规范 §13.1「不可观测写入」：按值表形参的直接写入只改本函数副本——常开
+    // 检查（不随 -w 告警门）。审计模式 TIE_UW_AUDIT=1 只列不拦（存量普查用）。
+    if uw_write_check(body, full) < 0 {
+        xref.pop_scope()
+        return -1
+    }
+    // p.9.14.2 独立警告 pass：W00011/15/5/19 四趟全函数子树遍历是自举性能病态
+    // 主因（每函数 3-4 趟 O(subtree) 递归；mod_walk 在嵌套 for 还会退化）。仅当
+    // 警告 pass 启用（-w）才执行；默认只报错时整段短路，零额外成本。
+    if semantic.sm_warn_enabled() {
+        // W00011 / W00015：遍历函数体子树收集「参数读取 / 可变绑定重赋值 /
+        // 可变声明」信息。闭包体作为函数体子树的一部分一并遍历，故闭包内读取 /
+        // 修改外层变量也会计入，避免对捕获变量误报「未使用 / 未修改」。
+        var dw_mvars: table<i64> = table_new_i64()
+        var dw_assigned: table<i64> = table_new_i64()
+        var dw_reads: table<i64> = table_new_i64()
+        var dw_decls: table<i64> = table_new_i64()
+        diag_walk(body, dw_mvars, dw_assigned, dw_reads, dw_decls)
+        // r.1.6.10 W00031：按值形参的表字段重绑定告警（无声失效）。
+        // 与上面同属警告 pass（-w），默认短路为零成本。三张表是**函数内**的
+        // 「局部变量 → 来源(按值形参, 字段)」映射，仅供自赋值措辞升级。
+        var w31_sk: table<i64> = table_new_i64()
+        var w31_sr: table<i64> = table_new_i64()
+        var w31_sf: table<i64> = table_new_i64()
+        w31_walk(body, w31_sk, w31_sr, w31_sf)
+        // r.1.6.10 W00031 第二形态：局部副本写入后再未被读取（写的是副本 ⇒ 静默丢失）。
+        // 与上面同属警告 pass（-w），默认短路为零成本。
+        w31_deadcopy_check(body)
+        // W00011：函数参数从未被读取（或写入）
+        var pi2: i64 = 0
+        while pi2 < nparams {
+            var pnode = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + pi2)
+            var pnid = intern.intern(sstate.name_str(pnode))
+            var used: bool = false
+            if sstate.seg_has(dw_reads, 0, len(dw_reads), pnid) == 1 {
+                used = true
+            }
+            if sstate.seg_has(dw_assigned, 0, len(dw_assigned), pnid) == 1 {
+                used = true
+            }
+            if !used {
+                sm_warn_add(s_lines[pnode], s_cols[pnode], "函数参数未使用（参数从未被读取）")
+            }
+            pi2 = pi2 + 1
+        }
+        // W00015：可变绑定（var）声明后从未被重赋值
+        var mi: i64 = 0
+        while mi < len(dw_mvars) {
+            var dv = dw_mvars[mi]
+            var dnid = intern.intern(sstate.name_str(dv))
+            if sstate.seg_has(dw_assigned, 0, len(dw_assigned), dnid) == 0 {
+                sm_warn_add(s_lines[dv], s_cols[dv], "可变绑定未修改（var 声明后从未赋值）")
+            }
+            mi = mi + 1
+        }
+        // W00005：局部变量（const / var）声明后从未被读取。
+        //  - 以 `_` 开头的名字不报（约定为有意不使用，含解构脱糖产生的 _tmpN/_cN）。
+        //  - 只扫函数体子树（body）：形参在 fn_node 子节点里，天然不在 body 内，
+        //    交给 W00011，不重复报。
+        //  - 与 W00015 分工：W00005 = 从未被读；W00015 = var 从未被写。两者可能同时命中
+        //    同一变量（声明后既不读也不写），此重叠可接受。
+        var w5i: i64 = 0
+        while w5i < len(dw_decls) {
+            var dv5 = dw_decls[w5i]
+            var dnm5 = sstate.name_str(dv5)
+            if len(dnm5) > 0 && !str.starts_with(dnm5, "_") {
+                var dnid5 = intern.intern(dnm5)
+                if sstate.seg_has(dw_reads, 0, len(dw_reads), dnid5) == 0 {
+                    sm_warn_add(s_lines[dv5], s_cols[dv5], "未使用变量（声明后从未被读取）")
+                }
+            }
+            w5i = w5i + 1
+        }
+        // W00019：表元素越界写（t[i] = v 且 i 为常量 >= 静态长度）。静态长度仅在
+        // 「var t = [字面量...] 且 t 在函数体内只被下标赋值使用」时可安全确定；长度
+        // 可能被 push/pop/传参/重赋值改变的场景一律不报（窄化，宁缺勿滥）。
+        w19_reset()
+        w19_collect(body)
+        w19_check(body)
+    }
+    // 三期 goto（§7.1.5）：函数体检查完后统一校验 goto（标签表已收集全——
+    // goto 可前向/后向任意位置，须全表收集后判定 R1/R2/R3）
+    var gr = check_goto_refs()
+    if gr < 0 {
+        xref.pop_scope()
+        return -1
+    }
+    xref.pop_scope()
+    return 0
+}
+
+// 带命名空间上下文的函数检查（顶层遍历 g_extra_tops，进入 namespace 时压段）
+pub func check_fn_walk(full: string) -> i64 {
+    // 快路径（性能重构）：fn_def_nodes 平行表 O(log n) 定位定义节点——
+    // 旧版每函数线性扫全部顶层 + 每候选拼 ns_full_name + strcmp，N 函数 ×
+    // M 顶层构成语义阶段最大平方（自举实测 sem 占 99.8%）。查表 miss 再走
+    // 旧扫描兜底（泛型展开等未登记路径）。
+    // 命名空间上下文：full 的 :: 段（除最后一段函数名）压 ns_stack——
+    // 命名空间内私有函数的裸调用解析依赖该栈（曾漏压导致「未定义的函数」）。
+    var fast_node = sstate.fn_def_node(full)
+    if fast_node >= 0 {
+        // 告警归属：本函数所在模块序号（0 = 主输入文件）——-Werror 只判主文件。
+        sm_set_cur_file(sstate.file_id_of_node(fast_node))
+        var segs = push_ns_of(full)
+        var r0 = check_fn(fast_node, full)
+        var pp: i64 = 0
+        while pp < segs {
+            ns_top = ns_top - 1
+            pp = pp + 1
+        }
+        if r0 < 0 {
+            return -1
+        }
+        return 1
+    }
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            if sstate.ns_full_name(sstate.name_str(s)) == full {
+                var r = check_fn(s, full)
+                if r < 0 {
+                    return -1
+                }
+                return 1
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var j: i64 = 0
+            while j < nsegs {
+                var seg = sstate.child(s, j)
+                sstate.ns_push(s_names[seg])
+                j = j + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var r = check_fn_walk_in_ns(body, full)
+            j = 0
+            while j < nsegs {
+                ns_top = ns_top - 1
+                j = j + 1
+            }
+            if r < 0 {
+                return -1
+            }
+            if r == 1 {
+                return 1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ==================== S2.2 闭包：延迟闭包体检查 ====================
+// 语义主流程末尾调用。FIFO 处理 g_clo_pending（登记顺序 = 检查顺序；
+// 嵌套闭包在外层闭包体检查期间登记，仍按 FIFO 排在外层之后）。
+// 每个闭包体用「登记时 lv 快照 + 闭包参数 + 闭包局部」重建独立作用域
+// 检查，结束后恢复外层作用域（函数检查残留的 lv 表）。
+// 注意：用**动态** len(g_clo_pending) 作循环边界——嵌套闭包是在检查外层
+// 闭包体时才被 infer_expr 登记到队尾，若固定 n 则嵌套闭包被漏检，其捕获集
+// 为空，内层闭包体对外层变量的引用在 irgen 阶段「变量未入作用域」。每个
+// N_FN_LIT 节点只被 infer 并登记一次，动态边界不会造成重复处理死循环。
+pub func check_pending_closures() -> i64 {
+    var i: i64 = 0
+    while i < len(g_clo_pending) {
+        var r = check_closure_body(i)
+        if r < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    // 捕获传播（任务21 嵌套闭包）：所有闭包体检查完后重算各闭包捕获集
+    if propagate_captures() < 0 {
+        return -1
+    }
+    // W00016：全部函数检查完后发射「全局可变表被多处修改」警告
+    w16_emit()
+    return 0
+}
+
+}

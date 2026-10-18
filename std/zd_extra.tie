@@ -1,0 +1,481 @@
+type tie<class>
+// tlib/std/zd_extra.tie —— zd 体积/读速优化扩展（namespace zd_extra，只读依赖 zd.tie；自 tiedb 提炼）
+// ============================================================================
+// 本模块只复用 zd.tie 基础原语（encode_string/decode_string/encode_i64/
+// decode_i64/write_f64_be/read_f64_be/encode_bool/decode_bool/write_varint/
+// read_varint/u8_at/concat/…），字节一律 table<i64>，错误哨兵 -1。
+//
+// 覆盖四类优化（设计文档 2026-08-31-zd-v2-design.md §5/§6/§4）：
+//
+//   [flags bit0] 字符串字典/引用：
+//     池段 = encode_string 串接（pool_build）；重复字符串只存一次——查池用
+//     pool_index（未找到 -1），命中复用序号；引用编码 = 0xC8 + varint 序号，
+//     只写序号不写串。
+//
+//   [flags bit1] 列式容器：
+//     字节格式：0xD6 | varint ncols | ncols×varint 类型码 | 每列
+//     (varint 元素数 + 各元素)。类型码 0=i64 1=f64 2=string 3=bool；
+//     f64 8 字节裸写、bool 1 字节、i64/string 用自描述紧凑编码——列内元素
+//     不重复类型标签（相对逐 record 去重 + 局部性）。cols 用宽表
+//     table<table> 承载异构列（i64/f64/string 表），bool 以 0/1 i64 承载。
+//
+//   [读速] 零拷贝引用读取：decode_string_ref_view 只解析字符串头，返回
+//     (payload 起点, payload 长度, 下一位置)，不拷贝字符串，大 blob 只读。
+//
+//   [读速] 偏移表跳读：encode_with_offsets 每 stride 个元素记录字节偏移
+//     （0xD5 | varint count | varint stride | varint ntab | ntab×varint 偏移 |
+//     items 区）；offset_at 用偏移表 O(1) 定位到最近边界，再快速跳过
+//     ≤stride-1 个元素，返回第 i 个元素的字节偏移。
+
+import "./zd.tie"
+
+namespace zd_extra {
+
+// ==================== 1. 字符串字典/引用（flags bit0） ====================
+
+// pool_build：字符串表 → 字符串池段字节（各元素为 encode_string 串接）。
+// 去重由调用方通过 pool_index 复用序号完成（重复字符串只存一次）。
+pub func pool_build(strings: table<string>) -> table<i64> {
+    var out = table_new_i64()
+    var n: i64 = len(strings)
+    var i: i64 = 0
+    while i < n {
+        out = zd.concat(out, zd.encode_string(strings[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// pool_index：查池内字符串序号，未找到返回 -1（线性扫 encode_string 段）。
+pub func pool_index(pool: table<i64>, s: string) -> i64 {
+    var idx: i64 = 0
+    var pos: i64 = 0
+    while pos < len(pool) {
+        var (v, np) = zd.decode_string(pool, pos)
+        if np < 0 {
+            return -1
+        }
+        if v == s {
+            return idx
+        }
+        idx = idx + 1
+        pos = np
+    }
+    return -1
+}
+
+// pool_get：池内序号 → 字符串。越界/坏池返回 ("", -1)。（私有辅助）
+func pool_get(pool: table<i64>, idx: i64) -> (string, i64) {
+    if idx < 0 {
+        return ("", -1)
+    }
+    var pos: i64 = 0
+    var i: i64 = 0
+    while i < idx {
+        var (dummy, np) = zd.decode_string(pool, pos)
+        if np < 0 {
+            return ("", -1)
+        }
+        pos = np
+        i = i + 1
+    }
+    var (s, np2) = zd.decode_string(pool, pos)
+    if np2 < 0 {
+        return ("", -1)
+    }
+    return (s, 1)
+}
+
+// encode_string_ref：字典引用编码 = 0xC8 + varint 序号（只写序号不写串）。
+pub func encode_string_ref(pool: table<i64>, idx: i64) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0xC8)
+    return zd.concat(out, zd.write_varint(idx))
+}
+
+// decode_string_ref：读 0xC8 + varint 序号，从池内取回字符串。
+pub func decode_string_ref(pool: table<i64>, bytes: table<i64>, pos: i64) -> (string, i64) {
+    if zd.u8_at(bytes, pos) != 0xC8 {
+        return ("", -1)
+    }
+    var (idx, p2) = zd.read_varint(bytes, pos + 1)
+    if p2 < 0 {
+        return ("", -1)
+    }
+    var (s, ok) = pool_get(pool, idx)
+    if ok < 0 {
+        return ("", -1)
+    }
+    return (s, p2)
+}
+
+// ==================== 1b. 池哈希索引（p.9.6.2 性能优化） ====================
+// 旧 pool_index 每次查询线性扫全池、逐条 decode_string（O(条目数 × 串长)）；
+// 实测 2000 条池命中 90µs/次（probe_zd_perf poolidx）。本组建**开放寻址哈希索引**
+// （FNV-1a 32 位 + 线性探测），查询均摊 O(1)：
+//   var (buckets, ords, starts) = pool_index_build(pool)
+//   pool_lookup(pool, buckets, ords, starts, s) -> 序号 / -1
+//   buckets[h] = 槽占用标记（1 = 占用），ords[h] = 池内序号，starts[h] = 条目起点。
+// 索引容量 2^k ≥ 2 × 条目数；一次 build 可复用多次 lookup（调用方缓存）。
+// 旧 pool_index 保留（小池/无索引场景），语义不变。
+
+// pidx_fnv32：FNV-1a 32 位（偏移基 2166136261、质数 16777619），逐字节，掩 32 位。
+func pidx_fnv32(t: table<i64>, start: i64, n: i64) -> i64 {
+    var h: i64 = 2166136261
+    var i: i64 = 0
+    while i < n {
+        h = ((h ^ (zd.u8_at(t, start + i) & 0xFF)) * 16777619) & 0xFFFFFFFF
+        i = i + 1
+    }
+    return h
+}
+
+// pool_index_build：扫描池段建哈希索引 → (buckets, ords, starts)。
+pub func pool_index_build(pool: table<i64>) -> (table<i64>, table<i64>, table<i64>) {
+    var starts = table_new_i64()
+    var pos: i64 = 0
+    var n: i64 = len(pool)
+    while pos < n {
+        var (payload, ln, next) = decode_string_ref_view(pool, pos)
+        if next < 0 {
+            break
+        }
+        table_push(starts, pos)
+        pos = next
+    }
+    var cnt: i64 = len(starts)
+    var cap: i64 = 16
+    while cap < cnt * 2 {
+        cap = cap * 2
+    }
+    var buckets = table_new_i64()
+    var ords = table_new_i64()
+    var k: i64 = 0
+    while k < cap {
+        table_push(buckets, 0)
+        table_push(ords, 0)
+        k = k + 1
+    }
+    var i: i64 = 0
+    while i < cnt {
+        var (ps, ln2, nx2) = decode_string_ref_view(pool, starts[i])
+        var h = pidx_fnv32(pool, ps, ln2) & (cap - 1)
+        while buckets[h] != 0 {
+            h = (h + 1) & (cap - 1)
+        }
+        buckets[h] = 1
+        ords[h] = i
+        i = i + 1
+    }
+    return (buckets, ords, starts)
+}
+
+// pidx_eq：池内 [start, start+n) 与查询 UTF-8 载荷逐字节相等。
+func pidx_eq(pool: table<i64>, start: i64, body: table<i64>, n: i64) -> bool {
+    var i: i64 = 0
+    while i < n {
+        if zd.u8_at(pool, start + i) != zd.u8_at(body, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// pool_lookup：哈希查出序号；未命中 -1；空索引 -1。
+pub func pool_lookup(pool: table<i64>, buckets: table<i64>, ords: table<i64>,
+                     starts: table<i64>, s: string) -> i64 {
+    var cap: i64 = len(buckets)
+    if cap == 0 {
+        return -1
+    }
+    var body = zd.utf8_encode(s)
+    var n: i64 = len(body)
+    var h = pidx_fnv32(body, 0, n) & (cap - 1)
+    var guard: i64 = 0
+    while guard <= cap {
+        if buckets[h] == 0 {
+            return -1
+        }
+        var st = starts[ords[h]]
+        var (ps, ln, nx) = decode_string_ref_view(pool, st)
+        if nx >= 0 && ln == n && pidx_eq(pool, ps, body, n) {
+            return ords[h]
+        }
+        h = (h + 1) & (cap - 1)
+        guard = guard + 1
+    }
+    return -1
+}
+
+// ==================== 2. 列式容器（flags bit1） ====================
+// 字节格式：0xD6 | varint ncols | ncols×varint 类型码 | 每列
+//   (varint 元素数 + 各元素)。类型码 0=i64 1=f64 2=string 3=bool。
+
+// encode_columnar：列 schema = 类型数组 + 各列值（cols 为宽表 table<table>，
+// 每列按类型传 i64/f64/string 表；bool 列传 0/1 的 table<i64>）。
+pub func encode_columnar(ncols: i64, col_tys: table<i64>, cols: table<table>) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0xD6)
+    out = zd.concat(out, zd.write_varint(ncols))
+    var i: i64 = 0
+    while i < ncols {
+        out = zd.concat(out, zd.write_varint(col_tys[i]))
+        i = i + 1
+    }
+    i = 0
+    while i < ncols {
+        var col = cols[i]
+        var n: i64 = len(col)
+        out = zd.concat(out, zd.write_varint(n))
+        var ty = col_tys[i]
+        var j: i64 = 0
+        if ty == 0 {
+            var ci: table<i64> = col
+            while j < n {
+                out = zd.concat(out, zd.encode_i64(ci[j]))
+                j = j + 1
+            }
+        } else if ty == 1 {
+            var cf: table<f64> = col
+            while j < n {
+                out = zd.concat(out, zd.write_f64_be(cf[j]))
+                j = j + 1
+            }
+        } else if ty == 2 {
+            var cs: table<string> = col
+            while j < n {
+                out = zd.concat(out, zd.encode_string(cs[j]))
+                j = j + 1
+            }
+        } else {
+            var cb: table<i64> = col
+            while j < n {
+                out = zd.concat(out, zd.encode_bool(cb[j] != 0))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// decode_columnar：读列式容器 → (col_tys, 各列宽表 cols, 下一位置)。
+// cols 每列重建为对应类型表（0/3→table<i64>、1→table<f64>、2→table<string>）；
+// bool 以 0/1 i64 承载，调用方按 col_tys 重新标注后读取。
+pub func decode_columnar(t: table<i64>, pos: i64) -> (table<i64>, table<table>, i64) {
+    var col_tys = table_new_i64()
+    var cols: table<table> = []
+    if zd.u8_at(t, pos) != 0xD6 {
+        return (col_tys, cols, -1)
+    }
+    var (ncols, p) = zd.read_varint(t, pos + 1)
+    if p < 0 {
+        return (col_tys, cols, -1)
+    }
+    var i: i64 = 0
+    while i < ncols {
+        var (ty, p2) = zd.read_varint(t, p)
+        if p2 < 0 {
+            return (col_tys, cols, -1)
+        }
+        table_push(col_tys, ty)
+        p = p2
+        i = i + 1
+    }
+    i = 0
+    while i < ncols {
+        var ty = col_tys[i]
+        var (n, p2) = zd.read_varint(t, p)
+        if p2 < 0 {
+            return (col_tys, cols, -1)
+        }
+        p = p2
+        var j: i64 = 0
+        if ty == 0 || ty == 3 {
+            var c = table_new_i64()
+            while j < n {
+                if ty == 0 {
+                    var (v, np) = zd.decode_i64(t, p)
+                    if np < 0 {
+                        return (col_tys, cols, -1)
+                    }
+                    table_push(c, v)
+                    p = np
+                } else {
+                    var (b, np) = zd.decode_bool(t, p)
+                    if np < 0 {
+                        return (col_tys, cols, -1)
+                    }
+                    table_push(c, b)
+                    p = np
+                }
+                j = j + 1
+            }
+            table_push(cols, c)
+        } else if ty == 1 {
+            var c = table_new_f64()
+            while j < n {
+                var (v, np) = zd.read_f64_be(t, p)
+                if np < 0 {
+                    return (col_tys, cols, -1)
+                }
+                table_push(c, v)
+                p = np
+                j = j + 1
+            }
+            table_push(cols, c)
+        } else {
+            var c = table_new_string()
+            while j < n {
+                var (v, np) = zd.decode_string(t, p)
+                if np < 0 {
+                    return (col_tys, cols, -1)
+                }
+                table_push(c, v)
+                p = np
+                j = j + 1
+            }
+            table_push(cols, c)
+        }
+        i = i + 1
+    }
+    return (col_tys, cols, p)
+}
+
+// ==================== 3. 零拷贝引用读取（大 blob 只读） ====================
+// decode_string_ref_view：只解析字符串头（fixstr/str8/str16/str32），返回
+//   (payload 起点 start, payload 长度 len, 下一位置 next)。不拷贝字符串；
+//   大 blob 直接对 bytes[start .. start+len) 只读操作。
+pub func decode_string_ref_view(bytes: table<i64>, pos: i64) -> (i64, i64, i64) {
+    var tag = zd.u8_at(bytes, pos)
+    if tag < 0 {
+        return (-1, -1, -1)
+    }
+    var n: i64 = -1
+    var start: i64 = -1
+    if tag >= 0xA0 && tag <= 0xBF {
+        n = tag & 0x1F
+        start = pos + 1
+    } else if tag == 0xD9 {
+        n = zd.u8_at(bytes, pos + 1)
+        if n < 0 {
+            return (-1, -1, -1)
+        }
+        start = pos + 2
+    } else if tag == 0xDA {
+        var (v, p2) = zd.read_u16_be(bytes, pos + 1)
+        if p2 < 0 {
+            return (-1, -1, -1)
+        }
+        n = v
+        start = p2
+    } else if tag == 0xDB {
+        var (v, p2) = zd.read_u32_be(bytes, pos + 1)
+        if p2 < 0 {
+            return (-1, -1, -1)
+        }
+        n = v
+        start = p2
+    } else {
+        return (-1, -1, -1)
+    }
+    if n < 0 {
+        return (-1, -1, -1)
+    }
+    if start + n > len(bytes) {
+        return (-1, -1, -1)
+    }
+    return (start, n, start + n)
+}
+
+// ==================== 4. 偏移表跳读（O(1) 定位 + 快速跳过） ====================
+// 字节格式：0xD5 | varint count | varint stride | varint ntab |
+//   ntab×varint 偏移（相对 items 区起点）| items 区（encode_i64 串接）。
+
+// encode_with_offsets：items 逐元素 encode_i64，每 stride 个元素在偏移表
+// 记录该元素相对 items 区起点的字节偏移。
+pub func encode_with_offsets(items: table<i64>, stride: i64) -> table<i64> {
+    var n: i64 = len(items)
+    var s: i64 = stride
+    if s < 1 {
+        s = 1
+    }
+    var ntab: i64 = 0
+    if n > 0 {
+        ntab = (n - 1) / s + 1
+    }
+    var head = table_new_i64()
+    table_push(head, 0xD5)
+    head = zd.concat(head, zd.write_varint(n))
+    head = zd.concat(head, zd.write_varint(s))
+    head = zd.concat(head, zd.write_varint(ntab))
+    var offsets = table_new_i64()
+    var body = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        if i % s == 0 {
+            table_push(offsets, len(body))
+        }
+        body = zd.concat(body, zd.encode_i64(items[i]))
+        i = i + 1
+    }
+    var k: i64 = 0
+    while k < ntab {
+        head = zd.concat(head, zd.write_varint(offsets[k]))
+        k = k + 1
+    }
+    return zd.concat(head, body)
+}
+
+// offset_at：返回 data 中第 i 个元素（encode_i64）的字节偏移。偏移表 O(1)
+// 定位最近边界 (i/stride)*stride，再快速跳过 ≤stride-1 个元素。越界返回 -1。
+pub func offset_at(data: table<i64>, table_pos: i64, i: i64) -> i64 {
+    if zd.u8_at(data, table_pos) != 0xD5 {
+        return -1
+    }
+    var (count, p) = zd.read_varint(data, table_pos + 1)
+    if p < 0 {
+        return -1
+    }
+    var (s, p2) = zd.read_varint(data, p)
+    if p2 < 0 {
+        return -1
+    }
+    var (ntab, p3) = zd.read_varint(data, p2)
+    if p3 < 0 {
+        return -1
+    }
+    if s < 1 {
+        s = 1
+    }
+    if i < 0 || i >= count {
+        return -1
+    }
+    var offs = table_new_i64()
+    var q: i64 = p3
+    var k: i64 = 0
+    while k < ntab {
+        var (v, np) = zd.read_varint(data, q)
+        if np < 0 {
+            return -1
+        }
+        table_push(offs, v)
+        q = np
+        k = k + 1
+    }
+    var item_area: i64 = q
+    var e: i64 = i / s
+    var pos: i64 = item_area + offs[e]
+    var j: i64 = e * s
+    while j < i {
+        var (dummy, np) = zd.decode_i64(data, pos)
+        if np < 0 {
+            return -1
+        }
+        pos = np
+        j = j + 1
+    }
+    return pos
+}
+}

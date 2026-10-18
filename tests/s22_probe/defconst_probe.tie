@@ -1,0 +1,47 @@
+type tie<tsc>
+
+// p.9.0-L.3 默认值 const 白名单探针：命名参数默认值 / actor 字段初值接受
+// const 引用与常量算术；struct 字段默认值保持逐构造求值语义。
+
+const K: i64 = 100
+const PRE: string = "id-"
+
+struct P {
+    var a: i64 = 10
+    var b: i64 = K
+    var c: i64 = 2 + 3
+}
+
+actor Counter {
+    var base: i64 = K * 2
+    var step: i64 = 1
+    pub func get() -> i64 { return base }
+}
+
+func mk(x: i64, y: i64 = K + 1) -> i64 { return x + y }
+func mkp(x: i64, p: string = PRE + "x") -> string { return p + to_string(x) }
+
+func main() -> i64 {
+    var ok: i64 = 0
+    var p = P()
+    if p.a == 10 && p.b == 100 && p.c == 5 { ok = ok + 1 } else { println("F1 " + to_string(p.a) + "," + to_string(p.b) + "," + to_string(p.c)) }
+    if mk(1) == 102 { ok = ok + 1 } else { println("F2 mk=" + to_string(mk(1))) }
+    if mkp(7) == "id-x7" { ok = ok + 1 } else { println("F3 mkp=" + mkp(7)) }
+    // 显式传参覆盖默认值（不回归）
+    if mk(1, 0) == 1 { ok = ok + 1 } else { println("F4 mk(1,0)=" + to_string(mk(1, 0))) }
+    // actor 字段 const 初值
+    var c = run Counter()
+    var g = c.get()
+    if g == 200 { ok = ok + 1 } else { println("F5 actor=" + to_string(g)) }
+    // struct 字段逐构造求值语义不回归：每次构造独立求值（此处用 const 算术验证通路）
+    var q = P()
+    if q.c == 5 { ok = ok + 1 } else { println("F6 q.c=" + to_string(q.c)) }
+
+    if ok == 6 {
+        println("VERDICT OK")
+        return 0
+    }
+    println("VERDICT FAIL ok=" + to_string(ok) + "/6")
+    exit(1)
+    return 0
+}

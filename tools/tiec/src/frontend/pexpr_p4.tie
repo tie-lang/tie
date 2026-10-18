@@ -1,0 +1,366 @@
+type tie<class>
+// compiler/frontend/pexpr_p4.tie —— 分片 4：箭头续扩（p.9.13.4）
+// ============================================================
+// 依据 docs/designs/tie-primitive-op-design.md §4：
+//   * 管道进容器/字段：`t -> [i]` → `t[i]`；`p -> .field` → `p.field`
+// 手法：**纯解析脱糖**，复用既有 N_INDEX / N_FIELD_ACCESS，无新 AST 节点、
+// 无语义层与 IR 改动——既有数据流箭头语义与 p.8.2.8 的 D1–D6 裁决原样保留。
+//
+// 与既有裁决的边界（务必保持）：
+//   D2) `a -> obj.f`（有基址 obj）仍为**字段赋值**；新形态是 `p -> .f`（箭头后
+//       紧跟 `.`，无基址）→ 读取。二者按「箭头后首个 token」区分，不冲突。
+//   D3) `arr[i] <- x` / `a -> arr[i]`（有基址）仍为 N_INDEX_ASSIGN；新形态是
+//       `t -> [i]`（箭头后紧跟 `[`）→ 读取。
+//   探测失败必须完整回退 token 流（save_pos/restore_pos），不留副作用。
+namespace pexpr {
+
+// 字段访问节点（base.field）。
+func p4_field(base: i64, fld: i64) -> i64 {
+    var fa = ast.new_node(N_FIELD_ACCESS, fld, -1, -1, ast.line(base), ast.col(base))
+    var fk: table<i64> = table_new_i64()
+    table_push(fk, base)
+    ast.set_children(fa, fk)
+    return fa
+}
+
+// 块管道形态（p.9.13.4）：箭头后是 `{ 绑定名 -> 体 }` 时构造 N_BLOCK_PIPE。
+// 形态判定＝三 token 前瞻：`{` + 标识符 + `->`。不匹配返回 -1（调用方回退常规解析）。
+// 注意与尾随闭包的区别：`x -> f() { … }` 的 `{ }` 已在后缀层被 f() 吃为末参
+//（p.8.2.8 裁决 D4），到达本层时 `{` 只可能是块管道开头。
+func pipe_block_form(lhs: i64) -> i64 {
+    if putil.peek_tag() != lex_lbrace {
+        return -1
+    }
+    if putil.peek_n(1) != lex_ident {
+        return -1
+    }
+    if putil.peek_n(2) != lex_arrow {
+        return -1
+    }
+    putil.advance()   // '{'
+    var bind = putil.expect_ident()
+    if bind < 0 {
+        return -1
+    }
+    putil.advance()   // '->'
+    var body = parse_expr()
+    if body < 0 {
+        return -1
+    }
+    if !putil.expect(lex_rbrace, "'}'") {
+        return -1
+    }
+    var n = ast.new_node(N_BLOCK_PIPE, bind, -1, -1, ast.line(lhs), ast.col(lhs))
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, lhs)
+    table_push(kids, body)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 管道读取式目标（p.9.13.4）：箭头后紧跟 `[` / `.` 时按读取脱糖。
+// 返回脱糖节点 id；形态不符返回 -1（调用方退回常规目标解析）。
+func pipe_read_form(base: i64) -> i64 {
+    var t = putil.peek_tag()
+    if t == lex_lbracket {
+        return p4_try_index_read(base)
+    }
+    if t == lex_dot && putil.peek_n(1) == lex_ident {
+        putil.advance()
+        var fld = interner.intern(putil.peek_lexeme())
+        putil.advance()
+        return p4_field(base, fld)
+    }
+    return -1
+}
+
+// `t -> [i]` 探测：下标表达式 + `]` 齐备才成立，否则整段回退。
+func p4_try_index_read(base: i64) -> i64 {
+    putil.save_pos()
+    putil.advance()
+    var idx = parse_expr()
+    if idx >= 0 && putil.eat(lex_rbracket) {
+        return mk_index(base, idx)
+    }
+    putil.restore_pos()
+    return -1
+}
+
+// 箭头一段：优先尝试读取式目标（p.9.13.4），否则常规目标 + 折叠。
+// 另有两种前缀形态（在常规目标之前判定，见下）：
+//   * 管道接运算符 `t -> + [x]` / `t -> in xs` → 脱糖为 `t + [x]` / `t in xs`
+//   * 条件管道 `x -> (cond ? f : g)`
+func arrow_step(op: i64, lhs: i64) -> i64 {
+    if op == B_ARROW_FWD {
+        var bt = pipe_block_form(lhs)
+        if bt >= 0 {
+            return bt
+        }
+        var pt = pipe_read_form(lhs)
+        if pt >= 0 {
+            return pt
+        }
+        var ot = pipe_operator_form(lhs)
+        if ot >= 0 {
+            return ot
+        }
+    }
+    var tgt = parse_ternary()
+    if tgt < 0 {
+        return -1
+    }
+    if ast.tag(tgt) == N_TERNARY {
+        return arrow_cond(op, lhs, tgt)
+    }
+    return arrow_fold(op, lhs, tgt)
+}
+
+// 管道接运算符（p.9.13.4 第 3 项）：箭头后直接跟二元运算符时，脱糖为以 lhs 作
+// 左操作数的二元表达式 —— `t -> + [x]` ≡ `t + [x]`，`t -> in xs` ≡ `t in xs`。
+// 覆盖全部二元运算符 token（算术/比较/逻辑/位/移位/`in`）；右操作数用
+// parse_ternary（不再进箭头层，避免链式歧义）。形态不符返回 -1（调用方回退）。
+func pipe_operator_form(lhs: i64) -> i64 {
+    var op = pipe_op_code(putil.peek_tag())
+    if op < 0 {
+        return -1
+    }
+    putil.advance()
+    var rhs = parse_ternary()
+    if rhs < 0 {
+        return -1
+    }
+    if op == PIPE_OP_IN {
+        // `t -> in xs`：复用 `in` 的脱糖（lang::seq_has(xs, t)）
+        return mk_in_call(lhs, rhs)
+    }
+    return mk_binary(op, lhs, rhs)
+}
+
+// 管道运算符专用码：`in` 用哨兵值（非 B_* 码，且须为正——负值与 `pipe_op_code`
+// 的「非运算符返回 -1」判定冲突）。B_* 码域为 0..20，故 1000 安全。
+const PIPE_OP_IN: i64 = 1000
+
+// token → 二元运算符码；非运算符返回 -1。
+func pipe_op_code(tag: i64) -> i64 {
+    if tag == lex_plus {
+        return B_ADD
+    }
+    if tag == lex_minus {
+        return B_SUB
+    }
+    if tag == lex_star {
+        return B_MUL
+    }
+    if tag == lex_slash {
+        return B_DIV
+    }
+    if tag == lex_percent {
+        return B_MOD
+    }
+    if tag == lex_eqeq {
+        return B_EQ
+    }
+    if tag == lex_noteq {
+        return B_NOTEQ
+    }
+    if tag == lex_lt {
+        return B_LT
+    }
+    if tag == lex_gt {
+        return B_GT
+    }
+    if tag == lex_le {
+        return B_LE
+    }
+    if tag == lex_ge {
+        return B_GE
+    }
+    if tag == lex_oror {
+        return B_OR
+    }
+    if tag == lex_andand {
+        return B_AND
+    }
+    if tag == lex_amp {
+        return B_BITAND
+    }
+    if tag == lex_pipe {
+        return B_BITOR
+    }
+    if tag == lex_caret {
+        return B_BITXOR
+    }
+    if tag == lex_shl {
+        return B_SHL
+    }
+    if tag == lex_shr {
+        return B_SHR
+    }
+    if tag == lex_in {
+        return PIPE_OP_IN
+    }
+    return -1
+}
+
+// 条件管道（p.9.13.4）：`x -> (cond ? f : g)` 脱糖为 `cond ? (x -> f) : (x -> g)`。
+// 两个分支各接箭头（调用分支走末参追加，裸 fn 分支保留箭头节点交语义层分派）。
+// 三元的 children 布局 = [cond, then, else]。
+func arrow_cond(op: i64, lhs: i64, tern: i64) -> i64 {
+    if ast.child_count(tern) < 3 {
+        return mk_binary(op, lhs, tern)
+    }
+    var c = ast.child_at(tern, 0)
+    var a = arrow_branch(op, lhs, ast.child_at(tern, 1))
+    var b = arrow_branch(op, lhs, ast.child_at(tern, 2))
+    var nt = ast.new_node(N_TERNARY, -1, -1, -1, ast.line(tern), ast.col(tern))
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, c)
+    table_push(kids, a)
+    table_push(kids, b)
+    ast.set_children(nt, kids)
+    return nt
+}
+
+// 条件分支接箭头：调用形态走末参追加，其它保留箭头节点（语义层按目标类型分派）。
+func arrow_branch(op: i64, lhs: i64, br: i64) -> i64 {
+    var t = ast.tag(br)
+    if t == N_CALL || t == N_METHOD_CALL || t == N_CALL_EXPR {
+        return arrow_fold(op, lhs, br)
+    }
+    return mk_binary(op, lhs, br)
+}
+
+// 箭头折叠（自 pexpr_p1 原样迁入，语义不变）：按目标形态脱糖——元组解构 /
+// 调用末参追加 / 下标赋值 / 字段赋值 / 保留箭头节点（交语义层按目标类型分派）。
+func arrow_fold(op: i64, lhs: i64, rhs: i64) -> i64 {
+    var data_n = lhs
+    var tgt_n = rhs
+    if op == B_ARROW_REV {
+        data_n = rhs
+        tgt_n = lhs
+    }
+    var ttag = ast.tag(tgt_n)
+    if ttag == N_TUPLE_LIT {
+        return arrow_destructure(data_n, tgt_n)
+    }
+    if ttag == N_CALL || ttag == N_METHOD_CALL || ttag == N_CALL_EXPR {
+        var kids: table<i64> = table_new_i64()
+        var kk: i64 = 0
+        while kk < ast.child_count(tgt_n) {
+            table_push(kids, ast.child_at(tgt_n, kk))
+            kk = kk + 1
+        }
+        table_push(kids, data_n)
+        ast.set_children(tgt_n, kids)
+        return tgt_n
+    }
+    if ttag == N_INDEX {
+        return p4_index_assign(tgt_n, data_n)
+    }
+    if ttag == N_FIELD_ACCESS {
+        return p4_field_assign(tgt_n, data_n)
+    }
+    return mk_binary(op, lhs, rhs)
+}
+
+// 反/正向解构（p.9.13.4 第 6 项）：`(a, b) <- t` 与 `t -> (a, b)` 等价，均脱糖为
+// 语句序列（N_STMTLIST，语义层按语句块检查、irgen 的 ExprStmt 分支按语句序列生成）：
+//     var _rd<行>_<列> = <数据表达式>
+//     var a = _rd<行>_<列>.Item1
+//     var b = _rd<行>_<列>.Item2
+// 手法照抄 for 循环的解构脱糖（pstmt_flow_p1.parse_for 的 dest_names 分支），
+// 故复用完全相同的 `.ItemK` 字段访问通道，无语义/IR 新增。
+// 临时名以**位置**而非计数器生成：位置在同一文件内天然唯一，避免为计数器另设全局
+//（本仓拆分约定要求全局 var 留在主文件 pexpr.tie）。
+// 约束：元组元素必须是裸标识符（`(a, 1) <- t` 无意义，报错）。
+func arrow_destructure(data: i64, tup: i64) -> i64 {
+    var line = ast.line(tup)
+    var col = ast.col(tup)
+    var n = ast.child_count(tup)
+    if n == 0 {
+        putil.set_err(line, col, "解构目标不能是空元组")
+        return -1
+    }
+    var tmp_id = interner.intern("_rd" + to_string(line) + "_" + to_string(col))
+    var stmts: table<i64> = table_new_i64()
+    // var _rd = <数据>
+    var td = ast.new_node(N_VAR_DECL, tmp_id, 0, -1, line, col)
+    var tk: table<i64> = table_new_i64()
+    table_push(tk, -1)
+    table_push(tk, data)
+    ast.set_children(td, tk)
+    table_push(stmts, td)
+    // 逐名绑定
+    var i: i64 = 0
+    while i < n {
+        var el = ast.child_at(tup, i)
+        // 元组字面量的 children 是 N_TUPLE_FIELD（21）包装节点，真实元素在
+        // 其 children[0]——必须解包，否则会误判为「元素不是标识符」（实测）。
+        if ast.tag(el) == N_TUPLE_FIELD {
+            el = ast.child_at(el, 0)
+        }
+        if ast.tag(el) != N_VAR {
+            putil.set_err(ast.line(el), ast.col(el), "解构元组的元素必须是标识符（形如 `(a, b) <- t`）")
+            return -1
+        }
+        var tv = ast.new_node(N_VAR, tmp_id, -1, -1, line, col)
+        var fa = ast.new_node(N_FIELD_ACCESS, interner.intern("Item" + to_string(i + 1)), -1, -1, line, col)
+        var fk: table<i64> = table_new_i64()
+        table_push(fk, tv)
+        ast.set_children(fa, fk)
+        var vd = ast.new_node(N_VAR_DECL, ast.name(el), 0, -1, ast.line(el), ast.col(el))
+        var vk: table<i64> = table_new_i64()
+        table_push(vk, -1)
+        table_push(vk, fa)
+        ast.set_children(vd, vk)
+        table_push(stmts, vd)
+        i = i + 1
+    }
+    var sl = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    ast.set_children(sl, stmts)
+    return sl
+}
+
+// 下标赋值脱糖：`arr[i] <- a` / `a -> arr[i]` → N_INDEX_ASSIGN。
+func p4_index_assign(tgt_n: i64, data_n: i64) -> i64 {
+    var ia = ast.new_node(N_INDEX_ASSIGN, -1, -1, -1, ast.line(tgt_n), ast.col(tgt_n))
+    var ik: table<i64> = table_new_i64()
+    table_push(ik, tgt_n)
+    table_push(ik, data_n)
+    ast.set_children(ia, ik)
+    return ia
+}
+
+// 字段赋值脱糖：`obj.f <- a` / `a -> obj.f` → N_FIELD_ASSIGN。
+func p4_field_assign(tgt_n: i64, data_n: i64) -> i64 {
+    var fa = ast.new_node(N_FIELD_ASSIGN, ast.name(tgt_n), -1, -1, ast.line(tgt_n), ast.col(tgt_n))
+    var fk: table<i64> = table_new_i64()
+    table_push(fk, ast.child_at(tgt_n, 0))
+    table_push(fk, data_n)
+    ast.set_children(fa, fk)
+    return fa
+}
+
+// p.9.11.6 表不可变更新 `with` 链（自 pexpr_p1 原样迁入，优先级低于箭头）：
+// `t with {k: v}` 左结合链式；右操作数用 parse_ternary（刻意不进箭头层）。
+func arrow_with_chain(lhs: i64) -> i64 {
+    var cur = lhs
+    while putil.peek_tag() == lex_with {
+        putil.advance()
+        var wline = ast.line(cur)
+        var wcol = ast.col(cur)
+        var upd = parse_ternary()
+        if upd < 0 {
+            return -1
+        }
+        var w = ast.new_node(N_WITH, -1, -1, -1, wline, wcol)
+        var wet: table<i64> = table_new_i64()
+        table_push(wet, cur)
+        table_push(wet, upd)
+        ast.set_children(w, wet)
+        cur = w
+    }
+    return cur
+}
+
+}

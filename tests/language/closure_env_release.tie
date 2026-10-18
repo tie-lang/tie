@@ -1,0 +1,42 @@
+type tie<logic>
+// closure_env_release.tie —— 闭包 env 释放回归（A 方案，2026-10-02）
+// ============================================================================
+// 背景：闭包捕获引用类型（表/映射）时，env 持有该表的句柄（+1 引用）。若闭包
+// 消亡时不归还，捕获的表永不回收。实测：循环 20 万次创建「捕获 200 元素表的
+// 闭包」并丢弃 ⇒ 峰值内存 326.6MB（≈ 20 万 × 1.6KB，全泄漏）。
+//
+// A 方案：env 首字段放**析构入口**（drop_<闭包>），闭包值消亡点由持有方调用，
+// 逐捕获字段 release 引用 + free(env)。不逃逸判定复用既有 esc 分析（逃逸者不
+// 释放：残余泄漏但安全）。见 tie-main/docs/designs/fn-capture-whitelist.md §6。
+//
+// 本探针跑 20 万轮；机制生效则内存应保持低位（实测 ~8.5MB），
+// 若不释放则约 320MB 量级（可由外部内存观测判定）。
+// 这里同时断言**语义正确**：每轮的捕获值必须读回正确（释放不得提前于使用）。
+
+func main() {
+    var n: i64 = 0
+    var acc: i64 = 0
+    while n < 200000 {
+        // 每轮新建一张 200 元素表并被闭包捕获
+        var t: table<i64> = []
+        var i: i64 = 0
+        while i < 200 {
+            table_push(t, i)
+            i = i + 1
+        }
+        var f = func() -> i64 { return len(t) }
+        var got = f()
+        if got != 200 {
+            println("FAIL 捕获值错：len=" + to_string(got))
+            return
+        }
+        acc = acc + got
+        n = n + 1
+    }
+    // 200000 × 200 = 40000000
+    if acc == 40000000 {
+        println("PASS closure-env-release acc=" + to_string(acc))
+    } else {
+        println("FAIL closure-env-release acc=" + to_string(acc) + " 期望 40000000")
+    }
+}

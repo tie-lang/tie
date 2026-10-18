@@ -1,0 +1,104 @@
+type tie<class>
+// compiler/tinker/tinker_sink.tie —— 发送出口（p.9.22.10）
+// ============================================================
+// 出口一：stdout 帧流（--tink；人读文本改走 stderr——driver.txt 单一出处）
+// 出口二：帧文件（--tink-file <f>；离线回放与在线管道同一格式）
+// hub 形态 B 预留（信封 kind/路由字段已带）；本阶段不实装网络 IPC。
+//
+// 帧内容（design §5）：--emit 各阶段记录（同一套 zd 记录换出口再发，不造新
+// 数据）→ stage 帧；产物文件字节 → artifact 帧；编译失败 → diag 帧（name
+// 携带渲染文本）。回执帧（hello-ack 等）由接收侧入 tk_reply，此处统一先发。
+
+namespace tinker {
+
+// 出站帧累积（单一缓冲，FIFO）：接收阶段的回执（hello-ack）与无落盘时的
+// 透传帧先入；发送阶段续写。**不在发送阶段清零**——清零会吞掉先入帧。
+pub func send_append(kind: i64, stage: i64, name: string, payload: table<i64>) {
+    var env = env_encode(kind, stage, name, payload)
+    var fr = frame_encode(env)
+    tk_out = byte_concat(tk_out, fr)
+}
+
+// 产物路径（与后端输出规则一致；rc != 0 或不可判 → 空串）。
+func product_path(rc: i64) -> string {
+    if rc != 0 {
+        return ""
+    }
+    var disp = driver.role_output(str.clone(g_role))
+    var out = g_output
+    if disp == "lib" {
+        if str_len(out) == 0 {
+            if g_shared {
+                if is_linux_target(driver.normalize_target(g_target)) {
+                    out = replace_ext(g_input, "so")
+                } else {
+                    out = replace_ext(g_input, "dll")
+                }
+            } else {
+                out = replace_ext(g_input, "a")
+            }
+        }
+        return out
+    }
+    if str_len(out) == 0 {
+        if is_linux_target(g_target) {
+            out = replace_ext(g_input, "")
+        } else {
+            out = replace_ext(g_input, "exe")
+        }
+    }
+    return out
+}
+
+// 发送阶段：回执帧 → stage 帧（--emit）→ diag 帧（失败）→ artifact 帧。
+// 写出：--tink → stdout；--tink-file → 文件（可同开）。
+pub func run_send(rc: i64) {
+    // ① 回执/透传：接收阶段已入 tk_out（FIFO 先于本阶段帧）——此处不复位、不搬运。
+    // ② stage 帧：--emit 各阶段（帧载荷恒为 zd 记录——design「不造新数据」）
+    var i: i64 = 0
+    while i < len(g_emit_specs) {
+        var st = dbgem.spec_stage(g_emit_specs[i])
+        var rec = dbgem.spec_record_bytes(st)
+        send_append(3, dbgem.stage_of(st), st, rec)
+        i = i + 1
+    }
+    // ③ diag 帧：失败（错误渲染文本）或成功但有警告（摘要）→ 帧载荷 = 结构化
+    // diag 记录（zd；与 --emit diag:zd 同一套数据换出口），name = 人读摘要。
+    var wc = semantic.warn_count()
+    if rc != 0 {
+        var msg = ""
+        if str_len(dg_err_msg) > 0 {
+            msg = diagcode.render_error(dg_err_line, dg_err_col, dg_err_msg)
+        } else if str_len(sm_err_msg) > 0 {
+            msg = diagcode.render_error(sm_err_line, sm_err_col, sm_err_msg)
+        } else {
+            msg = "编译失败（退出码 " + to_string(rc) + "）"
+        }
+        send_append(5, 4, msg, dbgem.spec_record_bytes("diag"))
+    } else if wc > 0 {
+        send_append(5, 4, "警告 " + to_string(wc) + " 条", dbgem.spec_record_bytes("diag"))
+    }
+    // ④ artifact 帧：产物文件字节（存在才发）
+    var pp = product_path(rc)
+    if str_len(pp) > 0 && file_exists(pp) {
+        var pb = byte_read(pp)
+        if len(pb) > 0 {
+            send_append(4, 0, file_name_of(str.clone(pp)), pb)
+        }
+    }
+    // ⑤ 写出
+    if g_tink {
+        if len(tk_out) > 0 {
+            stdout_write_bytes(tk_out)
+        }
+    }
+    if str_len(g_tink_file) > 0 {
+        if byte_write(g_tink_file, tk_out) {
+            dbg_txt("[tink] 帧流已写入 " + g_tink_file)
+        } else {
+            dbg_txt("[tink] 帧流写入失败: " + g_tink_file)
+        }
+    }
+}
+
+}   // namespace tinker

@@ -1,0 +1,166 @@
+type tie<logic>
+// ============================================================================
+// tests/json5_probe/json5_probe.tie：std/json5 JSON5 解析探针（p.9.1.1.6）。
+// JSON5 parser probe (p.9.1.1.6).
+//
+// 覆盖（Coverage）：
+//   - JSON5 综合文档（注释 // + /* */、尾逗号、单引号、无引号键、十六进制数字、
+//     + 号数字、多行字符串、续行）→ 解析成树并逐项断言；
+//   - 与 std/json 一致的结构（type_of / obj_get / arr_at / int_val / str_val）；
+//   - 注释与尾逗号容忍（标准 JSON 会拒绝的输入被正常接受）；
+//   - 十六进制 / 前导+号 / 前导与尾随小数点数字；
+//   - 单引号内嵌双引号、转义、\xHH、\v、\0、多行裸换行、续行折叠；
+//   - 坏输入报错（parse 返回 -1 且 err_msg 非空）：未闭合括号、坏数字、
+//     单引号未闭合、非法转义。
+// 数据平面：节点 id / string。夹具内联。
+// 编译运行：compiler\tiec.exe tests\json5_probe\json5_probe.tie
+// ============================================================================
+import "/std/json5.tie" as json5
+
+// ---- 断言工具 ----
+func chk_i64(name: string, got: i64, want: i64) {
+    if got == want {
+        println("PASS " + name)
+    } else {
+        println("FAIL " + name + " got=" + to_string(got) + " want=" + to_string(want))
+        exit(1)
+    }
+}
+func chk_str(name: string, got: string, want: string) {
+    if got == want {
+        println("PASS " + name)
+    } else {
+        println("FAIL " + name + " got=[" + got + "] want=[" + want + "]")
+        exit(1)
+    }
+}
+func chk_true(name: string, v: bool) {
+    if v {
+        println("PASS " + name)
+    } else {
+        println("FAIL " + name + " expected true")
+        exit(1)
+    }
+}
+func chk_f64(name: string, got: f64, want: f64) {
+    var d = got - want
+    if d < 0.0 {
+        d = -d
+    }
+    if d <= 0.000001 {
+        println("PASS " + name)
+    } else {
+        println("FAIL " + name + " got=" + to_string(got) + " want=" + to_string(want))
+        exit(1)
+    }
+}
+func chk_err(name: string, r: i64) {
+    if r == -1 && len(json5.err_msg()) > 0 {
+        println("PASS " + name)
+    } else {
+        println("FAIL " + name + " r=" + to_string(r) + " err=" + json5.err_msg())
+        exit(1)
+    }
+}
+
+// ---- 综合 JSON5 文档 ----
+func tst_composite() {
+    var r = json5.parse(rebuild_doc())
+    chk_i64("j5_root_obj", json5.type_of(r), 6)
+    chk_str("j5_name", json5.str_val(json5.obj_get(r, "name")), "Alice")
+    chk_i64("j5_age", json5.int_val(json5.obj_get(r, "age")), 30)
+    chk_i64("j5_hex", json5.int_val(json5.obj_get(r, "hex")), 255)
+    chk_i64("j5_neghex", json5.int_val(json5.obj_get(r, "neghex")), -16)
+    chk_i64("j5_plus", json5.int_val(json5.obj_get(r, "plus")), 42)
+    chk_f64("j5_ratio", json5.float_val(json5.obj_get(r, "ratio")), 1.5)
+    chk_f64("j5_dotf", json5.float_val(json5.obj_get(r, "dotf")), 0.5)
+    chk_f64("j5_trail", json5.float_val(json5.obj_get(r, "trail")), 5.0)
+    chk_i64("j5_quote_type", json5.type_of(json5.obj_get(r, "quote")), 4)
+    chk_str("j5_quote", json5.str_val(json5.obj_get(r, "quote")), "a \"b\" c")
+    var nest = json5.obj_get(r, "nested")
+    chk_i64("j5_nest_obj", json5.type_of(nest), 6)
+    chk_i64("j5_nest_inner", json5.int_val(json5.obj_get(nest, "inner")), 1)
+    var lst = json5.obj_get(nest, "list")
+    chk_i64("j5_nest_list_len", json5.arr_len(lst), 3)
+    chk_i64("j5_nest_list2", json5.int_val(json5.arr_at(lst, 2)), 3)
+    chk_str("j5_multi", json5.str_val(json5.obj_get(r, "multi")), "line one\nline two")
+    chk_str("j5_cont", json5.str_val(json5.obj_get(r, "cont")), "ab")
+}
+
+func rebuild_doc() -> string {
+    return "{\n" +
+        "  // 行注释\n" +
+        "  /* 块\n     注释 */\n" +
+        "  name: 'Alice',\n" +
+        "  age: 30,\n" +
+        "  hex: 0xFF,\n" +
+        "  neghex: -0x10,\n" +
+        "  plus: +42,\n" +
+        "  ratio: 1.5,\n" +
+        "  dotf: .5,\n" +
+        "  trail: 5.,\n" +
+        "  quote: \"a \\\"b\\\" c\",\n" +
+        "  nested: { inner: true, list: [1, 2, 3,], },\n" +
+        "  multi: 'line one\nline two',\n" +
+        "  cont: \"a\\\nb\",\n" +
+        "}\n"
+}
+
+// ---- 单引号与双引号、转义 ----
+func tst_strings() {
+    var doc = "{'k': 'it\\'s', d: \"tab\\there\", hx: '\\x41', vt: '\\v', nul: '\\0', un: '\\u0041'}"
+    var r = json5.parse(doc)
+    chk_i64("str_root", json5.type_of(r), 6)
+    chk_str("str_single_esc", json5.str_val(json5.obj_get(r, "k")), "it's")
+    chk_str("str_tab", json5.str_val(json5.obj_get(r, "d")), "tab\there")
+    chk_str("str_hexesc", json5.str_val(json5.obj_get(r, "hx")), "A")
+    chk_str("str_unicode", json5.str_val(json5.obj_get(r, "un")), "A")
+    // \v → 0x0B，\0 → 空白字符（不直接 to_string 断言可读，仅类型正确）
+    chk_i64("str_vt_type", json5.type_of(json5.obj_get(r, "vt")), 4)
+    chk_i64("str_nul_type", json5.type_of(json5.obj_get(r, "nul")), 4)
+    // 单引号字符串内含双引号 OK
+    var r2 = json5.parse("{a: 'say \"hi\" now'}")
+    chk_str("str_dq_in_sq", json5.str_val(json5.obj_get(r2, "a")), "say \"hi\" now")
+}
+
+// ---- 尾逗号 / 注释容忍（标准 JSON 拒收）----
+func tst_tolerance() {
+    // 尾逗号在对象与数组
+    var r = json5.parse("[1, 2, 3,]")
+    chk_i64("tol_arr_len", json5.arr_len(r), 3)
+    chk_i64("tol_arr3", json5.int_val(json5.arr_at(r, 2)), 3)
+    var r2 = json5.parse("{a: 1, b: 2,}")
+    chk_i64("tol_obj_b", json5.int_val(json5.obj_get(r2, "b")), 2)
+    // 大注释块跨元素
+    var r3 = json5.parse("{\n a: 1, /* c */ b: 2\n}")
+    chk_i64("tol_comment_b", json5.int_val(json5.obj_get(r3, "b")), 2)
+    // 对象用无引号键 true/false/null（保留字作为键）。注：tie 词法器对"字符串内
+    // `{关键字:`"字面量有解析限制（`{true:` 编译报错），故用运行时拼接规避——
+    // 运行时拼出的串仍是标准 JSON5 文档。
+    var r4 = json5.parse("{" + "true: 1, " + "false: 2, " + "null: 3" + "}")
+    chk_i64("tol_key_true", json5.int_val(json5.obj_get(r4, "true")), 1)
+    chk_i64("tol_key_null", json5.int_val(json5.obj_get(r4, "null")), 3)
+    // 数组尾逗号 + 后续内容
+    var r5 = json5.parse("{list: [1,\n], x: 9}")
+    chk_i64("tol_list_len", json5.arr_len(json5.obj_get(r5, "list")), 1)
+    chk_i64("tol_x", json5.int_val(json5.obj_get(r5, "x")), 9)
+}
+
+// ---- 坏输入报错 ----
+func tst_bad() {
+    chk_err("bad_unclosed_obj", json5.parse("{a: 1"))
+    chk_err("bad_unclosed_str", json5.parse("{a: 'x}"))
+    chk_err("bad_hex", json5.parse("{a: 0x}"))
+    chk_err("bad_num", json5.parse("{a: ++1}"))
+    chk_err("bad_escape", json5.parse("{a: '\\q'}"))
+    chk_err("bad_trailing", json5.parse("{a: 1} garbage"))
+}
+
+func main() {
+    tst_composite()
+    tst_strings()
+    tst_tolerance()
+    tst_bad()
+    println("json5 done")
+    exit(0)
+}

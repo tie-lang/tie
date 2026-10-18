@@ -1,0 +1,847 @@
+type tie<class>
+// compiler/backend/irgen_stmt_p3.tie —— 分片 3（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 irgen_stmt.tie。
+namespace irgen {
+// for-in 字符串码点迭代：`for c in s.chars()`（dev33 批次4 语法糖）。
+// 布局：循环变量 alloca（TK_STR，单字符）+ 字节位置计数器 alloca（i64）；
+// cond 块：字节位置 < str_len(s) 终结（s21_str_head_len O(1)）；body 块每次
+// 迭代 s21_utf8_char_at 解码码点 → s21_codepoint_to_str 得单字符字符串 → store
+// 到循环变量；step 块：位置 += s21_utf8_seq_len（字节步进）。continue → step，
+// break → exit。等价手写 while + utf8_seq_len/utf8_char_at 组合。
+func tig_for_chars(id: i64, iter: i64, body: i64) -> i64 {
+    // 接收者字符串值（s.chars() 的 s）
+    var recv = sstate.child(iter, sstate.slot_off(iter))
+    var s = tig_expr(recv)
+    if s < 0 {
+        return -1
+    }
+    // 记录当前块（tig_expr 可能切块），循环开始处用。
+    // 循环变量 alloca（TK_STR）+ 字节位置计数器 alloca（i64）
+    var item_a = ir.new_inst(g_cur_block, 20, types.named(TK_STR))  // alloca string
+    ir.add_operand(item_a, types.named(TK_STR), 2)
+    var item_ptr = ir.get_value(item_a)
+    var pos_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))  // alloca i64
+    ir.add_operand(pos_a, types.named(TK_I64), 2)
+    var pos_ptr = ir.get_value(pos_a)
+    var pos_zero = tig_int_lit_ty(0, types.named(TK_I64))
+    var st0 = ir.new_inst(g_cur_block, 22, -1)  // store 0 → pos
+    ir.add_operand(st0, types.named(TK_I64), 2)
+    ir.add_operand(st0, pos_zero, 0)
+    ir.add_operand(st0, pos_ptr, 0)
+    // 四块：cond / body / step / exit
+    var cond_blk = ir.new_block(g_cur_func, interner.intern("for.cond"))
+    var body_blk = ir.new_block(g_cur_func, interner.intern("for.body"))
+    var step_blk = ir.new_block(g_cur_func, interner.intern("for.step"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("for.exit"))
+    loop_push(s_aux[id], exit_blk, step_blk)
+    var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+    ir.add_operand(b0, cond_blk, 1)
+    // cond 块：pos < byte_len(s) → body，否则 exit
+    g_cur_block = cond_blk
+    var cur = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load pos
+    ir.add_operand(cur, pos_ptr, 0)
+    var cur_v = ir.get_value(cur)
+    var blen = s21_str_head_len(s)
+    var ol = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ult
+    ir.add_operand(ol, cur_v, 0)
+    ir.add_operand(ol, blen, 0)
+    ir.add_operand(ol, 6, 2)  // ult
+    var ol_v = ir.get_value(ol)
+    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb, ol_v, 0)
+    ir.add_operand(cb, body_blk, 1)
+    ir.add_operand(cb, exit_blk, 1)
+    // body 块：cp = utf8_char_at(s, pos) → 单字符 = str_from_code(cp) → store
+    g_cur_block = body_blk
+    // 重新 load pos（body 块内 SSA）
+    var cur2 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+    ir.add_operand(cur2, pos_ptr, 0)
+    var cur2_v = ir.get_value(cur2)
+    var cp = s21_utf8_char_at(s, cur2_v)
+    // 码点 → 单字符字符串（去 Rust 桥：s21_codepoint_to_str 内联，不链 tie_interp.lib）
+    var ch = s21_codepoint_to_str(cp)
+    var ist = ir.new_inst(g_cur_block, 22, -1)  // store 单字符 → 循环变量
+    ir.add_operand(ist, types.named(TK_STR), 2)
+    ir.add_operand(ist, ch, 0)
+    ir.add_operand(ist, item_ptr, 0)
+    scope_put(s_names[id], item_ptr, types.named(TK_STR))
+    var bb = tig_block_stmts(body)
+    if bb < 0 {
+        return -1
+    }
+    scope_pop()
+    if !block_terminated() {
+        var bb2 = ir.new_inst(g_cur_block, 30, -1)  // br step
+        ir.add_operand(bb2, step_blk, 1)
+    }
+    // step 块：pos += utf8_seq_len(s, pos) → store → br cond
+    g_cur_block = step_blk
+    var cur3 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+    ir.add_operand(cur3, pos_ptr, 0)
+    var cur3_v = ir.get_value(cur3)
+    var slen = s21_utf8_seq_len(s, cur3_v)
+    var np = s21_bin(0, cur3_v, slen)  // add
+    var st2 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st2, types.named(TK_I64), 2)
+    ir.add_operand(st2, np, 0)
+    ir.add_operand(st2, pos_ptr, 0)
+    var sb = ir.new_inst(g_cur_block, 30, -1)  // br cond
+    ir.add_operand(sb, cond_blk, 1)
+    // exit 块
+    g_cur_block = exit_blk
+    // p.9.11.4 defer：for 迭代退出（break/自然结束汇于 exit_blk）→ 运行本
+    // 循环体作用域 defer（g_lp_top 此刻 = 本循环体作用域，逆序）
+    if len(g_def_flags) > 0 {
+        var drr3 = tig_run_defers(g_lp_top)
+        if drr3 < 0 {
+            return -1
+        }
+    }
+    loop_pop()
+    return 0
+}
+
+// p.9.11.16 迭代器协议方法调用：`it.has_next()` / `it.next()`（接收者存槽）。
+// 复用 struct 方法签名约定（首参 self 自动 ref → 传槽地址；按值 → load）。
+// 返回 call 结果值。
+func tig_iter_call(full: string, recv_ptr: i64, rty: i64) -> i64 {
+    var sig = sstate.fn_sig(full)
+    if sig < 0 {
+        sm_err_msg = "迭代器方法 '" + full + "' 无签名（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var ret_ty = sg_ret[sig]
+    var off = sg_off[sig]
+    var first_ref = 0
+    if off >= 0 && off < len(sp_refs) {
+        first_ref = sp_refs[off]
+    }
+    var sym = interner.intern(full)
+    llvmgen.call_sym_reg(sym)
+    var rv: i64 = -1
+    if first_ref == 1 {
+        rv = recv_ptr  // 接收者槽地址
+    } else {
+        rv = ir.new_inst(g_cur_block, 21, rty)  // load 接收者值
+        ir.add_operand(rv, recv_ptr, 0)
+        rv = ir.get_value(rv)
+    }
+    var ty35: i64 = -1
+    if ret_ty != types.named(TK_VOID) {
+        ty35 = ret_ty
+    }
+    var inst = ir.new_inst(g_cur_block, 35, ty35)  // call
+    ir.add_operand(inst, sym, 0)
+    ir.add_operand(inst, ret_ty, 2)
+    if first_ref == 1 {
+        ir.add_operand(inst, types.named(TK_STR), 2)
+    } else {
+        ir.add_operand(inst, rty, 2)
+    }
+    ir.add_operand(inst, rv, 0)
+    if ret_ty == types.named(TK_VOID) {
+        return tig_int_lit(0)
+    }
+    return ir.get_value(inst)
+}
+
+// p.9.11.16 for-in 迭代器协议对象：`for x in it`（it 为 struct 实例，实现
+// has_next/next）。接收者求值一次落临时槽（有状态迭代器；表达式接收者只
+// 构造一次）；cond 块：it.has_next() → body；body 块：x = it.next() →
+// store 循环变量 → body 语句；continue → cond（重新 has_next），break → exit。
+// 元素类型 = next 返回类型（scheck 已登记循环变量；此处 LLVM 槽类型推导
+// 对齐 tig_for_table 的 elem_llvm_ty）。
+func tig_for_iter(id: i64, iter: i64, body: i64, it_ty: i64) -> i64 {
+    var si = types.low(it_ty)
+    var sname = sstate.struct_name_of(si)
+    var elem = sinfer.iter_proto_elem(it_ty)
+    if elem < 0 {
+        sm_err_msg = "迭代器协议探测失败（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var elem_llvm = elem
+    var suf = bridge_suffix(elem)
+    var fk = types.kind(elem)
+    if fk == K_STRUCT || fk == K_ENUM || fk == K_FN || fk == K_TUPLE || elem == types.named(TK_ANY) {
+        elem_llvm = elem
+    } else if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
+        elem_llvm = types.named(TK_STR)
+    } else if suf == "string" {
+        elem_llvm = types.named(TK_STR)
+    } else if suf == "bool" {
+        elem_llvm = types.named(TK_BOOL)
+    } else if suf == "f64" {
+        elem_llvm = types.named(TK_F64)
+    } else {
+        elem_llvm = types.named(TK_I64)
+    }
+    // 接收者求值一次 → 临时槽（struct 聚合值）
+    var it_a = ir.new_inst(g_cur_block, 20, it_ty)  // alloca struct
+    ir.add_operand(it_a, it_ty, 2)
+    var it_ptr = ir.get_value(it_a)
+    var itv = tig_expr(iter)
+    if itv < 0 {
+        return -1
+    }
+    var st0 = ir.new_inst(g_cur_block, 22, -1)  // store 接收者
+    ir.add_operand(st0, it_ty, 2)
+    ir.add_operand(st0, itv, 0)
+    ir.add_operand(st0, it_ptr, 0)
+    // 循环变量 alloca（元素 LLVM 类型）
+    var item_a = ir.new_inst(g_cur_block, 20, elem_llvm)
+    ir.add_operand(item_a, elem_llvm, 2)
+    var item_ptr = ir.get_value(item_a)
+    // 三块：cond / body / exit（next 在 body 内自推进，无 step 块）
+    var cond_blk = ir.new_block(g_cur_func, interner.intern("for.cond"))
+    var body_blk = ir.new_block(g_cur_func, interner.intern("for.body"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("for.exit"))
+    loop_push(s_aux[id], exit_blk, cond_blk)   // continue → cond（重查 has_next）
+    var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+    ir.add_operand(b0, cond_blk, 1)
+    // cond 块：has_next() → body，否则 exit
+    g_cur_block = cond_blk
+    var hn = tig_iter_call(sname + "::has_next", it_ptr, it_ty)
+    if hn < 0 {
+        return -1
+    }
+    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb, hn, 0)
+    ir.add_operand(cb, body_blk, 1)
+    ir.add_operand(cb, exit_blk, 1)
+    // body 块：x = next() → store → body 语句
+    g_cur_block = body_blk
+    var nx = tig_iter_call(sname + "::next", it_ptr, it_ty)
+    if nx < 0 {
+        return -1
+    }
+    var ist = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(ist, elem_llvm, 2)
+    ir.add_operand(ist, nx, 0)
+    ir.add_operand(ist, item_ptr, 0)
+    scope_put(s_names[id], item_ptr, elem_llvm)
+    var bb = tig_block_stmts(body)
+    if bb < 0 {
+        return -1
+    }
+    scope_pop()
+    if !block_terminated() {
+        var bb2 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+        ir.add_operand(bb2, cond_blk, 1)
+    }
+    // exit 块：defer 处理同表迭代（循环体作用域逆序）
+    g_cur_block = exit_blk
+    if len(g_def_flags) > 0 {
+        var drr4 = tig_run_defers(g_lp_top)
+        if drr4 < 0 {
+            return -1
+        }
+    }
+    loop_pop()
+    return 0
+}
+
+// for-over-流（拉取协议 `fn() -> Option<T>`，2026-10-13）：求值一次 → loop {
+//   m = it()；Some → 载荷还原入循环变量槽 + 语义体；None → 退出 }。
+// 骨架对齐 tig_for_iter；间接调用（opcode 70）发射对齐 tig_call_indirect。
+func tig_for_pull(id: i64, iter: i64, body: i64, elem_ty: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var fty = node_types[iter]
+    var fv = tig_expr(iter)
+    if fv < 0 {
+        return -1
+    }
+    var fa = ir.new_inst(g_cur_block, 20, fty)
+    ir.add_operand(fa, fty, 2)
+    var fap = ir.get_value(fa)
+    s21_store(fap, fv, fty)
+    var elem_llvm = elem_ty
+    var suf = bridge_suffix(elem_ty)
+    var ek = types.kind(elem_ty)
+    if ek == K_STRUCT || ek == K_ENUM || ek == K_FN || ek == K_TUPLE || elem_ty == types.named(TK_ANY) {
+        elem_llvm = elem_ty
+    } else if types.is_table(elem_ty) || types.is_map(elem_ty) || ek == K_PORT {
+        elem_llvm = types.named(TK_STR)
+    } else if suf == "bool" {
+        elem_llvm = types.named(TK_BOOL)
+    } else if suf == "f64" {
+        elem_llvm = types.named(TK_F64)
+    } else {
+        elem_llvm = types.named(TK_I64)
+    }
+    var va = ir.new_inst(g_cur_block, 20, elem_llvm)
+    ir.add_operand(va, elem_llvm, 2)
+    var vap = ir.get_value(va)
+    scope_put(interner.intern(sstate.name_str(id)), vap, elem_ty)
+    var opt_ty = types.fn_ret_ty(fty)
+    var cond_blk = ir.new_block(g_cur_func, interner.intern("fp.cond"))
+    var body_blk = ir.new_block(g_cur_func, interner.intern("fp.body"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("fp.exit"))
+    loop_push(s_aux[id], exit_blk, cond_blk)
+    var b0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b0, cond_blk, 1)
+    g_cur_block = cond_blk
+    var g0 = ir.new_inst(g_cur_block, 27, fty)
+    ir.add_operand(g0, fap, 0)
+    ir.add_operand(g0, 0, 2)
+    var ld0 = ir.new_inst(g_cur_block, 21, types.named(TK_STR))
+    ir.add_operand(ld0, ir.get_value(g0), 0)
+    var g1 = ir.new_inst(g_cur_block, 27, fty)
+    ir.add_operand(g1, fap, 0)
+    ir.add_operand(g1, 1, 2)
+    var ld1 = ir.new_inst(g_cur_block, 21, types.named(TK_STR))
+    ir.add_operand(ld1, ir.get_value(g1), 0)
+    var ty70: i64 = -1
+    if opt_ty != types.named(TK_VOID) {
+        ty70 = opt_ty
+    }
+    var call_i = ir.new_inst(g_cur_block, 70, ty70)
+    ir.add_operand(call_i, ir.get_value(ld1), 0)
+    ir.add_operand(call_i, opt_ty, 2)
+    ir.add_operand(call_i, ir.get_value(ld0), 0)
+    var mv = ir.get_value(call_i)
+    var mo = ir.new_inst(g_cur_block, 20, opt_ty)
+    ir.add_operand(mo, opt_ty, 2)
+    var mop = ir.get_value(mo)
+    s21_store(mop, mv, opt_ty)
+    var egp = ir.new_inst(g_cur_block, 27, opt_ty)
+    ir.add_operand(egp, mop, 0)
+    ir.add_operand(egp, 0, 2)
+    var eld = ir.new_inst(g_cur_block, 21, T64)
+    ir.add_operand(eld, ir.get_value(egp), 0)
+    var tagv = ir.get_value(eld)
+    var is_some = tig_icmp_c(tagv, tig_int_lit(0), 0)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, is_some, 0)
+    ir.add_operand(cb, body_blk, 1)
+    ir.add_operand(cb, exit_blk, 1)
+    g_cur_block = body_blk
+    var gj = ir.new_inst(g_cur_block, 27, opt_ty)
+    ir.add_operand(gj, mop, 0)
+    ir.add_operand(gj, 1, 2)
+    var gjp = ir.get_value(gj)
+    var ld = ir.new_inst(g_cur_block, 21, T64)
+    ir.add_operand(ld, gjp, 0)
+    var pv = ir.get_value(ld)
+    var bv: i64 = pv
+    if elem_ty == types.named(TK_STR) {
+        var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))
+        ir.add_operand(ip, pv, 0)
+        bv = ir.get_value(ip)
+    } else if elem_ty == types.named(TK_F64) {
+        var ldf = ir.new_inst(g_cur_block, 21, types.named(TK_F64))
+        ir.add_operand(ldf, gjp, 0)
+        bv = ir.get_value(ldf)
+    } else if types.is_table(elem_ty) || types.is_map(elem_ty) {
+        var ip2 = ir.new_inst(g_cur_block, 25, elem_ty)
+        ir.add_operand(ip2, pv, 0)
+        bv = ir.get_value(ip2)
+    } else if elem_ty != T64 && types.is_int(elem_ty) {
+        var cv = tig_coerce(bv, T64, elem_ty)
+        if cv < 0 {
+            return -1
+        }
+        bv = cv
+    }
+    s21_store(vap, bv, elem_llvm)
+    var bb = tig_block_stmts(body)
+    if bb < 0 {
+        return -1
+    }
+    if !block_terminated() {
+        var bb2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(bb2, cond_blk, 1)
+    }
+    g_cur_block = exit_blk
+    return 0
+}
+
+// for-in 表迭代：`for item in t`（t 为动态表变量/表达式）。
+// 布局（对齐 Rust gen_for_dyn_table）：计数器 alloca（0..len(t)，cond 块每次
+// 调 tie_table_len）+ 循环变量 alloca（元素类型 T）；body 每次迭代
+// tie_table_at 读取元素 → store 到循环变量；continue → step，break → exit。
+func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
+    // 表指针（load ptr 槽 / 全局表 load ptr, ptr @g）
+    var t = tig_expr(iter)
+    if t < 0 {
+        return -1
+    }
+    // 元素类型判定优先级：
+    //   1. iter 变量的作用域完整类型（table<T> → table_elem）
+    //   2. node_types[iter] 的表元素类型（语义推导）
+    //   3. sinfer.var_table_elem（语义层动态表登记）
+    //   4. body 中循环变量引用节点的语义类型（for f in entries 里 println(f) 推断）
+    //   5. 兜底 i64
+    var elem: i64 = types.named(TK_I64)
+    var matched: bool = false
+    if s_tags[iter] == 6 {
+        var bname = interner.intern(sstate.name_str(iter))
+        if scope_get(bname) >= 0 && types.is_table(g_lookup_ty) {
+            var le = types.table_elem(g_lookup_ty)
+            if le > 0 {
+                elem = le
+                matched = true
+            }
+        }
+        if !matched {
+            var bt2 = node_types[iter]
+            if types.is_table(bt2) {
+                var le2 = types.table_elem(bt2)
+                if le2 > 0 {
+                    elem = le2
+                    matched = true
+                }
+            }
+        }
+        if !matched {
+            var te = sinfer.var_table_elem(bname)
+            if te >= 0 {
+                elem = te
+                matched = true
+            }
+        }
+    } else {
+        var bt = node_types[iter]
+        if types.is_table(bt) {
+            var le2 = types.table_elem(bt)
+            if le2 > 0 {
+                elem = le2
+                matched = true
+            }
+        }
+    }
+    if !matched {
+        // body 中循环变量引用类型（`for f in entries { println(f) }` →
+        // f 的引用节点被语义层推断为 TK_STR）
+        var var_nm = interner.intern(sstate.name_str(id))
+        var bn = sstate.nchild(body)
+        var bi: i64 = 0
+        while bi < bn {
+            var st0 = sstate.child(body, bi)
+            var refs = find_var_refs(st0, var_nm)
+            var ri: i64 = 0
+            while ri < len(refs) {
+                var rt = node_types[refs[ri]]
+                if rt >= 0 && (rt == types.named(TK_STR) || types.is_int(rt) ||
+                    types.is_float(rt) || types.is_bool_like(rt)) {
+                    elem = rt
+                    matched = true
+                    break
+                }
+                ri = ri + 1
+            }
+            if matched {
+                break
+            }
+            bi = bi + 1
+        }
+    }
+    var suffix = bridge_suffix(elem)
+    var elem_llvm_ty = types.named(TK_I64)
+    // P2a 复合元素（struct/enum/fn）：循环变量类型 = 元素类型 id（多字元素）
+    var fk2 = types.kind(elem)
+    if fk2 == K_STRUCT || fk2 == K_ENUM || fk2 == K_FN || fk2 == K_TUPLE || elem == types.named(TK_ANY) {
+        elem_llvm_ty = elem
+    } else if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
+        suffix = "string"
+        elem_llvm_ty = elem
+    } else if suffix == "string" {
+        elem_llvm_ty = types.named(TK_STR)
+    } else if suffix == "bool" {
+        elem_llvm_ty = types.named(TK_BOOL)
+    } else if suffix == "f64" {
+        elem_llvm_ty = types.named(TK_F64)
+    }
+    // 计数器 alloca（i64）+ store 0
+    var idx_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))  // alloca
+    ir.add_operand(idx_a, types.named(TK_I64), 2)
+    var idx_ptr = ir.get_value(idx_a)
+    var i0 = tig_int_lit_ty(0, types.named(TK_I64))
+    var st0 = ir.new_inst(g_cur_block, 22, -1)  // store 0
+    ir.add_operand(st0, types.named(TK_I64), 2)
+    ir.add_operand(st0, i0, 0)
+    ir.add_operand(st0, idx_ptr, 0)
+    // 循环变量 alloca（元素类型）
+    var item_a = ir.new_inst(g_cur_block, 20, elem_llvm_ty)  // alloca
+    ir.add_operand(item_a, elem_llvm_ty, 2)
+    var item_ptr = ir.get_value(item_a)
+    // 四块：cond / body / step / exit
+    var cond_blk = ir.new_block(g_cur_func, interner.intern("for.cond"))
+    var body_blk = ir.new_block(g_cur_func, interner.intern("for.body"))
+    var step_blk = ir.new_block(g_cur_func, interner.intern("for.step"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("for.exit"))
+    loop_push(s_aux[id], exit_blk, step_blk)
+    var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+    ir.add_operand(b0, cond_blk, 1)
+    // cond 块：cur >= len(t) → exit
+    g_cur_block = cond_blk
+    var cur = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load
+    ir.add_operand(cur, idx_ptr, 0)
+    var cur_v = ir.get_value(cur)
+    var tlen = s21_table_len(t)
+    if tlen < 0 {
+        return -1
+    }
+    var done = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp sge
+    ir.add_operand(done, cur_v, 0)
+    ir.add_operand(done, tlen, 0)
+    ir.add_operand(done, 5, 2)  // sge
+    var done_v = ir.get_value(done)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, done_v, 0)
+    ir.add_operand(cb, exit_blk, 1)
+    ir.add_operand(cb, body_blk, 1)
+    // body 块：item = table_at(t, cur) → store → 循环体
+    g_cur_block = body_blk
+    var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+    ir.add_operand(ok_slot, types.named(TK_I8), 2)
+    // r.1.6.7 独占免锁：iter 是裸局部变量且静态证得独占 → 遍历读走免锁。
+    // （for 的 iter 是**只读**位置，esc_scan 的 FOR 分支按只读处理，故遍历本身
+    //  不会把候选置死；真正的泄漏点仍由循环子树里的其它语句决定。）
+    var iv = s21_table_at_ex(t, cur_v, ir.get_value(ok_slot), elem_llvm_ty, esc_take(iter, "for 遍历"))
+    if iv < 0 {
+        return -1
+    }
+    var ist = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(ist, elem_llvm_ty, 2)
+    ir.add_operand(ist, iv, 0)
+    ir.add_operand(ist, item_ptr, 0)
+    scope_put(s_names[id], item_ptr, elem_llvm_ty)
+    var bb = tig_block_stmts(body)
+    if bb < 0 {
+        return -1
+    }
+    scope_pop()
+    if !block_terminated() {
+        var bb2 = ir.new_inst(g_cur_block, 30, -1)  // br step
+        ir.add_operand(bb2, step_blk, 1)
+    }
+    // step 块：cur + 1 → store → br cond
+    g_cur_block = step_blk
+    var add1 = ir.new_inst(g_cur_block, 0, types.named(TK_I64))  // add
+    ir.add_operand(add1, cur_v, 0)
+    ir.add_operand(add1, 1, 2)
+    var add_v = ir.get_value(add1)
+    var st2 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st2, types.named(TK_I64), 2)
+    ir.add_operand(st2, add_v, 0)
+    ir.add_operand(st2, idx_ptr, 0)
+    var sb = ir.new_inst(g_cur_block, 30, -1)  // br cond
+    ir.add_operand(sb, cond_blk, 1)
+    // exit 块
+    g_cur_block = exit_blk
+    // p.9.11.4 defer：for 迭代退出（break/自然结束汇于 exit_blk）→ 运行本
+    // 循环体作用域 defer（g_lp_top 此刻 = 本循环体作用域，逆序）
+    if len(g_def_flags) > 0 {
+        var drr3 = tig_run_defers(g_lp_top)
+        if drr3 < 0 {
+            return -1
+        }
+    }
+    loop_pop()
+    return 0
+}
+
+// 语句树中查找变量引用节点（tag 6，名池 id == target）：返回节点 id 表。
+// tig_for_table 用它推断循环变量元素类型（body 里 println(f) → node_types[f]）
+func find_var_refs(st: i64, target: i64) -> table<i64> {
+    var out = table_new_i64()
+    collect_var_refs(st, target, out)
+    return out
+}
+
+// find_var_refs 的递归实现（深度优先遍历子节点）
+func collect_var_refs(st: i64, target: i64, ref out: table<i64>) {
+    if st < 0 {
+        return
+    }
+    if s_tags[st] == 6 && s_names[st] == target {
+        table_push(out, st)
+        return  // 变量节点是叶子
+    }
+    var n = sstate.nchild(st)
+    var i: i64 = 0
+    while i < n {
+        collect_var_refs(sstate.child(st, i), target, out)
+        i = i + 1
+    }
+}
+
+func sb_contains(t: table<i64>, v: i64) -> bool {
+    var i: i64 = 0
+    while i < len(t) {
+        if t[i] == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 定位 sb 状态索引（-1 未提升）
+func sb_find(nid: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_sb_keys) {
+        if g_sb_keys[i] == nid {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 取消提升登记（循环出口 build 回写后）。表重建去除目标条目。
+func sb_remove(nid: i64) {
+    var i = sb_find(nid)
+    if i < 0 {
+        return
+    }
+    var outk = table_new_i64()
+    var outh = table_new_i64()
+    var j: i64 = 0
+    while j < len(g_sb_keys) {
+        if j != i {
+            table_push(outk, g_sb_keys[j])
+            table_push(outh, g_sb_hv[j])
+        }
+        j = j + 1
+    }
+    g_sb_keys = outk
+    g_sb_hv = outh
+}
+
+// val 是否为 `out + ...` 自加形态：B_ADD(0) 左链，最左叶子 = Var(out)，
+// node_types[val] == TK_STR（字符串拼接）。
+func sb_is_self_add(val: i64, nid: i64) -> bool {
+    if val < 0 {
+        return false
+    }
+    if node_types[val] != types.named(TK_STR) {
+        return false
+    }
+    var cur = val
+    while s_tags[cur] == 9 && s_vals[cur] == 0 {  // N_BINARY + B_ADD
+        var lhs = sstate.child(cur, 0)
+        cur = lhs
+    }
+    return s_tags[cur] == 6 && s_names[cur] == nid
+}
+
+// 提取自加 RHS 的段节点（`out + a + b + c` → [a, b, c]，顺序正序；
+// 非自加形态返回空表）。
+func sb_split_segs(val: i64, nid: i64) -> table<i64> {
+    var rev = table_new_i64()
+    var cur = val
+    var depth: i64 = 0
+    while s_tags[cur] == 9 && s_vals[cur] == 0 && depth < 64 {
+        var lhs = sstate.child(cur, 0)
+        var rhs = sstate.child(cur, 1)
+        table_push(rev, rhs)
+        depth = depth + 1
+        cur = lhs
+    }
+    if s_tags[cur] != 6 || s_names[cur] != nid {
+        var empty = table_new_i64()
+        return empty
+    }
+    var segs = table_new_i64()
+    var i: i64 = len(rev) - 1
+    while i >= 0 {
+        table_push(segs, rev[i])
+        i = i - 1
+    }
+    return segs
+}
+
+// 递归收集语句树中的自加候选（合法叶 + 候选名 + 其它写标记 + goto 探测）
+func sb_collect(st: i64, ref legal: table<i64>, ref nids: table<i64>) {
+    if st < 0 {
+        return
+    }
+    if s_tags[st] == 144 {  // goto：逃出循环 → 全局禁提升（调用方查 goflag）
+        return
+    }
+    if s_tags[st] == 103 {  // N_ASSIGN
+        var nm = sstate.name_str(st)
+        if str_len(nm) > 0 {
+            var nid = interner.intern(nm)
+            var val = sstate.child(st, 0)
+            if sb_is_self_add(val, nid) {
+                var leaf = sb_left_leaf(val)
+                if leaf >= 0 {
+                    table_push(legal, leaf)
+                }
+                if !sb_contains(nids, nid) {
+                    table_push(nids, nid)
+                }
+            }
+        }
+        return  // Assign 的 val 子树不作为语句继续扫（引用检查由 find_var_refs 全量覆盖）
+    }
+    var n = sstate.nchild(st)
+    var i: i64 = 0
+    while i < n {
+        sb_collect(sstate.child(st, i), legal, nids)
+        i = i + 1
+    }
+}
+
+// 自加 RHS 左链最左叶子节点（= 该 out 的 Var 引用节点；-1 非自加形态）
+func sb_left_leaf(val: i64) -> i64 {
+    if val < 0 {
+        return -1
+    }
+    var cur = val
+    while s_tags[cur] == 9 && s_vals[cur] == 0 {
+        cur = sstate.child(cur, 0)
+    }
+    if s_tags[cur] == 6 {
+        return cur
+    }
+    return -1
+}
+
+// 扫描循环体：返回可安全提升的自加 string 变量名 id 表（空 = 不提升）。
+// 核对 1) 局部 string 未 pending；2) 无其它写；3) 无 goto；4) 引用纯净。
+func sb_scan(body: i64, cond: i64) -> table<i64> {
+    var jobs = table_new_i64()
+    var legal = table_new_i64()
+    sb_collect(body, legal, jobs)
+    var w_nid = table_new_i64()
+    var w_has = table_new_i64()
+    collect_other_writes(body, w_nid, w_has)
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < len(jobs) {
+        var nid = jobs[i]
+        var ok: bool = true
+        if scope_get(nid) < 0 {
+            ok = false
+        }
+        if ok && g_lookup_is_global != 0 {
+            ok = false
+        }
+        if ok && g_lookup_ty != types.named(TK_STR) {
+            ok = false
+        }
+        if ok && sb_find(nid) >= 0 {
+            ok = false
+        }
+        if ok && scan_goto(body) {
+            ok = false
+        }
+        var wi = linear_find(w_nid, nid)
+        if ok && wi >= 0 && w_has[wi] == 1 {
+            ok = false
+        }
+        // 引用纯净：全部引用（body + cond）∈ 合法自加叶
+        if ok {
+            var refs = find_var_refs(body, nid)
+            var rc = find_var_refs(cond, nid)
+            var rk: i64 = 0
+            while rk < len(rc) {
+                table_push(refs, rc[rk])
+                rk = rk + 1
+            }
+            var j: i64 = 0
+            while j < len(refs) {
+                if !sb_contains(legal, refs[j]) {
+                    ok = false
+                    break
+                }
+                j = j + 1
+            }
+        }
+        if ok {
+            table_push(out, nid)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 收集所有「out 作为赋值目标但非自加」的写（其它写 → 提升不安全）
+func collect_other_writes(st: i64, ref w_nid: table<i64>, ref w_has: table<i64>) {
+    if st < 0 {
+        return
+    }
+    if s_tags[st] == 144 {
+        return
+    }
+    if s_tags[st] == 103 {
+        var nm = sstate.name_str(st)
+        if str_len(nm) > 0 {
+            var nid = interner.intern(nm)
+            var val = sstate.child(st, 0)
+            // 自加不视为"其它写"：字符串 `t = t + x`（sb）与字节表
+            // `t = byte_concat(t, x)`（cbs）都属提升目标，非破坏性写
+            if !sb_is_self_add(val, nid) && !cbs_is_self_concat(val, nid) {
+                var wi = linear_find(w_nid, nid)
+                if wi < 0 {
+                    table_push(w_nid, nid)
+                    table_push(w_has, 1)
+                }
+            }
+        }
+        return
+    }
+    // 其它写目标：下标赋值 N_INDEX_ASSIGN / 字段赋值 N_FIELD_ASSIGN 也归为写
+    if s_tags[st] == 104 || s_tags[st] == 115 {  // N_INDEX_ASSIGN / N_FIELD_ASSIGN
+        var wbase = sstate.child(st, 0)
+        // ★ 显式守卫：`child()` 缺子节点时会给 **-1**，而 `s_tags[-1]`/`s_names[-1]`
+        //   会读到表头前的分配器元数据（`tbl_at` 的 `i < len` 对负数恒真 ⇒ 堆下读）。
+        //   实测 `--check-bounds` 在此处报 `OOB irgen::collect_other_writes
+        //   [s_tags] line 677 idx -1`，**一个编译过程触发 76 次**（每次编译都要走
+        //   全函数写目标收集）。原先靠越界读返回「某个值」——若该值恰为 6
+        //   （N_VAR），本分支会被**误判为真**并把垃圾 nid 当成写目标登记。
+        if wbase >= 0 && s_tags[wbase] == 6 {
+            var nid2 = s_names[wbase]
+            var wi2 = linear_find(w_nid, nid2)
+            if wi2 < 0 {
+                table_push(w_nid, nid2)
+                table_push(w_has, 1)
+            }
+        }
+        return
+    }
+    var n = sstate.nchild(st)
+    var i: i64 = 0
+    while i < n {
+        collect_other_writes(sstate.child(st, i), w_nid, w_has)
+        i = i + 1
+    }
+}
+
+// 线性查找（表值 → 下标；-1 无）
+func linear_find(t: table<i64>, v: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(t) {
+        if t[i] == v {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 探测语句树是否含 goto（144）——含则循环可能逃出 → 禁提升
+func scan_goto(st: i64) -> bool {
+    if st < 0 {
+        return false
+    }
+    if s_tags[st] == 144 {
+        return true
+    }
+    var n = sstate.nchild(st)
+    var i: i64 = 0
+    while i < n {
+        if scan_goto(sstate.child(st, i)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+}

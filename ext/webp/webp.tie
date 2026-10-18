@@ -1,0 +1,620 @@
+type tie<class>
+// ============================================================================
+// ext/webp/webp.tie —— WebP 编解码（命名空间 webp，纯 tie，VP8L 无损子集）p.9.1.1.2
+// WebP encode/decode (namespace webp, pure-tie, VP8L lossless subset).
+//
+// C 库在位判定（2026-09-13）：本机无 libwebp 的稳定可用 C 库（仅 TRAE 运行时深层
+// tesseract 附带 libwebp*.dll，无导入库/头文件，非系统/vcpkg/skia 构建产物，不可作
+// 为提交库的可复现依赖）。故本实现走**纯 tie 最小可用版本起步**：VP8L 无损编码子集
+// + 对应解码子集，数据平面 table<i64> 字节表。
+//
+// ---- 子集边界（subset boundary，如实注明）----
+// 支持 Support：
+//   - RIFF/WEBP 容器 + VP8L chunk 解析；
+//   - VP8L 头（signature 0x2f / 14+14 尺寸 / alpha 位 / version）；
+//   - 无变换（no transforms）、无色彩缓存（no color cache）的默认位流；
+//   - 字面量像素的 5 棵 Huffman 树（green[280]/red[256]/blue[256]/alpha[256]/dist[40]）
+//     canonical 编解码，字面量顺序 green→red→blue→alpha（按本实现约定）；
+//    编码端对任意字节值成立（green 取 9 位全覆盖）。
+//   - 编码仅发字面量（不作 LZ77/距离游程依赖）；解码遇长度/距离码（green≥256）时报错。
+// 不支持 Unsupported（明确拒绝或报错，绝不伪解码）：
+//   - 有损 VP8 帧；pred→transform / color / subtract-green / color-indexing 变换；
+//   - 色彩缓存（color cache）；多 Huffman 组（meta-huffman）；LZ77 长度-距离。
+// 说明：因本机无参考 libwebp 交叉验证，探针以 encode→decode 纯 tie 回环为验收依据
+//   （语义一致；跨 libwebp 工具的字节兼容为后续在库到位后的增量项）。
+//
+// 语言约束同 ext/png：位累加器 LSB-first（i64 无符号位污染仅接触 ≤0xFFFFFFFF 正值），
+// Huffman 用 canonical symbol[]+count[] 单遍解码；只接触 table<i64> 字节/位，不转 string。
+// ============================================================================
+
+struct WebPImage {
+    var ok: bool = false
+    var err: string = ""
+    var w: i64 = 0
+    var h: i64 = 0
+    var alpha_used: i64 = 0
+    var rgba: table<i64> = table_new_i64()   // R,G,B,A 逐像素平铺
+}
+
+namespace webp {
+
+// ---- 小端 u32 [off..off+3] ----
+func le32(b: table<i64>, off: i64) -> i64 {
+    return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)
+}
+
+// ============================================================================
+// 一、位读取器（LSB-first 累加器，同 ext/png 惯例）
+// ============================================================================
+func new_br() -> table<i64> {           // st=[0]bitbuf [1]bitcnt [2]pos
+    var t = table_new_i64()
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 0)
+    return t
+}
+
+func read_bits(ref st: table<i64>, raw: table<i64>, n: i64) -> i64 {
+    while st[1] < n {
+        if st[2] >= len(raw) {
+            return -1
+        }
+        st[0] = st[0] | (raw[st[2]] << st[1])
+        st[1] = st[1] + 8
+        st[2] = st[2] + 1
+    }
+    var mask: i64 = 1
+    var k: i64 = 0
+    while k < n {
+        mask = mask << 1
+        k = k + 1
+    }
+    mask = mask - 1
+    var res = st[0] & mask
+    st[0] = st[0] >> n
+    st[1] = st[1] - n
+    return res
+}
+
+// ============================================================================
+// 二、位写入器（LSB-first 打包）
+// ============================================================================
+func bw_init() -> table<i64> {          // wst=[0]未满字节位 [1]计数
+    var t = table_new_i64()
+    table_push(t, 0)
+    table_push(t, 0)
+    return t
+}
+
+func bw_put(ref out: table<i64>, ref wst: table<i64>, val: i64, n: i64) {
+    wst[0] = wst[0] | (val << wst[1])
+    wst[1] = wst[1] + n
+    while wst[1] >= 8 {
+        table_push(out, wst[0] & 0xFF)
+        wst[0] = wst[0] >> 8
+        wst[1] = wst[1] - 8
+    }
+}
+
+// 写 canonical 码（MSB-first 物理序，与 hdec 读取方向一致）。
+func bw_code(ref out: table<i64>, ref wst: table<i64>, cb: i64, length: i64) {
+    var i = length - 1
+    while i >= 0 {
+        bw_put(out, wst, (cb >> i) & 1, 1)
+        i = i - 1
+    }
+}
+
+func bw_flush(ref out: table<i64>, ref wst: table<i64>) {
+    if wst[1] > 0 {
+        table_push(out, wst[0] & 0xFF)
+        wst[1] = 0
+        wst[0] = 0
+    }
+}
+
+// ============================================================================
+// 三、canonical Huffman：建树 + 编码表 + 解码
+// ============================================================================
+// build_tables(length,n) -> (symbol[], count[], maxbits)；同 ext/png（puff 算法）。
+func build_tables(length: table<i64>, n: i64) -> (table<i64>, table<i64>, i64) {
+    var count = table_new_i64()
+    var i: i64 = 0
+    while i < 16 {
+        table_push(count, 0)
+        i = i + 1
+    }
+    var maxbits: i64 = 0
+    i = 0
+    while i < n {
+        var l = length[i]
+        if l > 0 {
+            count[l] = count[l] + 1
+            if l > maxbits {
+                maxbits = l
+            }
+        }
+        i = i + 1
+    }
+    if maxbits > 15 {
+        return (table_new_i64(), count, 0)
+    }
+    var symbol = table_new_i64()
+    var lx: i64 = 1
+    while lx <= maxbits {
+        i = 0
+        while i < n {
+            if length[i] == lx {
+                table_push(symbol, i)
+            }
+            i = i + 1
+        }
+        lx = lx + 1
+    }
+    return (symbol, count, maxbits)
+}
+
+// 解码一符号（puff 算法，同 ext/png.hdec）。越界/无效返回 -1。
+func hdec(ref st: table<i64>, raw: table<i64>, symbol: table<i64>,
+          count: table<i64>, maxbits: i64) -> i64 {
+    var cd: i64 = 0
+    var first: i64 = 0
+    var index: i64 = 0
+    var l: i64 = 1
+    while l <= maxbits {
+        var b = read_bits(st, raw, 1)
+        if b < 0 {
+            return -1
+        }
+        cd = cd | b
+        var cnt = count[l]
+        if cd - cnt < first {
+            return symbol[index + (cd - first)]
+        }
+        index = index + cnt
+        first = first + cnt
+        first = first << 1
+        cd = cd << 1
+        l = l + 1
+    }
+    return -1
+}
+
+// 编码表 build_codes(length,n) -> codes[](每符号 canonical 码)，与 hdec 一致。
+func build_codes(length: table<i64>, n: i64) -> table<i64> {
+    var bl = table_new_i64()
+    var i: i64 = 0
+    while i < 16 {
+        table_push(bl, 0)
+        i = i + 1
+    }
+    var maxbits: i64 = 0
+    i = 0
+    while i < n {
+        var l = length[i]
+        if l > 0 {
+            bl[l] = bl[l] + 1
+            if l > maxbits {
+                maxbits = l
+            }
+        }
+        i = i + 1
+    }
+    var next = table_new_i64()
+    i = 0
+    while i < 16 {
+        table_push(next, 0)
+        i = i + 1
+    }
+    var codev: i64 = 0
+    var bits: i64 = 1
+    while bits <= maxbits {
+        codev = (codev + bl[bits - 1]) << 1
+        next[bits] = codev
+        bits = bits + 1
+    }
+    var codes = table_new_i64()
+    i = 0
+    while i < n {
+        table_push(codes, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        var l = length[i]
+        if l > 0 {
+            codes[i] = next[l]
+            next[l] = next[l] + 1
+        }
+        i = i + 1
+    }
+    return codes
+}
+
+// 码长码分支树的固定码长（本实现子集）：只给符号 0/8/9 有意义长度，其余 0。
+// 当且仅当编码只用到 {0,8,9} 三个码长取值时有效（Kraft：1/2+1/4+1/4=1）。
+func clenc_lengths() -> table<i64> {
+    var c = table_new_i64()
+    var i: i64 = 0
+    while i < 19 {
+        table_push(c, 0)
+        i = i + 1
+    }
+    c[0] = 1    // 值 0
+    c[8] = 2    // 值 8
+    c[9] = 2    // 值 9
+    return c
+}
+
+// ============================================================================
+// 四、VP8L 头 + 解码
+// ============================================================================
+// 从 RIFF 容器定位并提取 VP8L chunk 载荷；找不到返回全 -1。
+func find_vp8l(bytes: table<i64>) -> (i64, i64, table<i64>) {
+    var nb = len(bytes)
+    var none = table_new_i64()
+    if nb < 20 {
+        return (-1, -1, none)
+    }
+    var pos: i64 = 12        // RIFF+size+WEBP 之后的首个 chunk
+    while pos + 8 <= nb {
+        var clen = le32(bytes, pos + 4)
+        if clen < 0 || pos + 8 + clen > nb {
+            return (-1, -1, none)
+        }
+        var isvp = bytes[pos] == 0x56 && bytes[pos + 1] == 0x50 &&
+                   bytes[pos + 2] == 0x38 && bytes[pos + 3] == 0x4C   // "VP8L"
+        if isvp {
+            var data = table_new_i64()
+            var k: i64 = 0
+            while k < clen {
+                table_push(data, bytes[pos + 8 + k])
+                k = k + 1
+            }
+            return (pos, clen, data)
+        }
+        pos = pos + 8 + clen
+        if (clen & 1) != 0 {
+            pos = pos + 1     // 跳过 pad 字节
+        }
+    }
+    return (-1, -1, none)
+}
+
+// 读 VP8L 头（40 位：sig8 + wm114 + hm114 + alpha1 + ver3）。
+// 返回 (w, h, alpha_used)；头非法时 w<0 且 err 非空。
+func parse_vp8lh(ref st: table<i64>, data: table<i64>) -> (i64, i64, i64, string) {
+    var sig = read_bits(st, data, 8)
+    if sig != 0x2F {
+        return (-1, -1, -1, "bad VP8L signature")
+    }
+    var wm1 = read_bits(st, data, 14)
+    var hm1 = read_bits(st, data, 14)
+    var alpha = read_bits(st, data, 1)
+    var ver = read_bits(st, data, 3)
+    if wm1 < 0 || hm1 < 0 || alpha < 0 || ver < 0 {
+        return (-1, -1, -1, "truncated vp8l header")
+    }
+    if ver != 0 {
+        return (-1, -1, -1, "unsupported vp8l version")
+    }
+    return (wm1 + 1, hm1 + 1, alpha, "")
+}
+
+// 读一棵 Huffman 树的码长（count 个，经码长码树），返回其 length[]。
+func read_codelens(ref st: table<i64>, raw: table<i64>, clsym: table<i64>,
+                   clcnt: table<i64>, clmb: i64, symbol_count: i64) -> table<i64> {
+    var length = table_new_i64()
+    var i: i64 = 0
+    while i < symbol_count {
+        var s = hdec(st, raw, clsym, clcnt, clmb)
+        if s < 0 {
+            return table_new_i64()   // 失败：空表（调用方判 len==0）
+        }
+        if s != 0 && s != 8 && s != 9 {
+            return table_new_i64()   // 子集外码长
+        }
+        table_push(length, s)
+        i = i + 1
+    }
+    return length
+}
+
+// 完整解码 VP8L 无损子集字节 → WebPImage。
+pub func decode_vp8l(data: table<i64>) -> WebPImage {
+    var img = WebPImage()
+    var st = new_br()
+    if len(data) < 5 {
+        img.err = "truncated vp8l"
+        return img
+    }
+    var hdr = parse_vp8lh(st, data)
+    if str_len(hdr.3) > 0 {
+        img.err = hdr.3
+        return img
+    }
+    var w = hdr.0
+    var h = hdr.1
+    var alpha_used = hdr.2
+    // 变换标志
+    var has_transform = read_bits(st, data, 1)
+    if has_transform != 0 {
+        img.err = "subset: transforms unsupported"
+        return img
+    }
+    // 色彩缓存标志
+    var use_cache = read_bits(st, data, 1)
+    if use_cache != 0 {
+        img.err = "subset: color cache unsupported"
+        return img
+    }
+    // 码长码树
+    var cl = clenc_lengths()
+    var ctr = build_tables(cl, 19)
+    var clsym = ctr.0
+    var clcnt = ctr.1
+    var clmb = ctr.2
+    if clmb <= 0 {
+        img.err = "bad codelen tree"
+        return img
+    }
+    // 5 棵树码长：green280/red256/blue256/alpha256/dist40
+    var glen = read_codelens(st, data, clsym, clcnt, clmb, 280)
+    var rlen = read_codelens(st, data, clsym, clcnt, clmb, 256)
+    var blen = read_codelens(st, data, clsym, clcnt, clmb, 256)
+    var alen = read_codelens(st, data, clsym, clcnt, clmb, 256)
+    var dlen = read_codelens(st, data, clsym, clcnt, clmb, 40)
+    if len(glen) != 280 || len(rlen) != 256 || len(blen) != 256 ||
+       len(alen) != 256 || len(dlen) != 40 {
+        img.err = "bad codelens stream"
+        return img
+    }
+    var gr = build_tables(glen, 280)
+    var rr = build_tables(rlen, 256)
+    var br = build_tables(blen, 256)
+    var ar = build_tables(alen, 256)
+    var gs = gr.0
+    var gc = gr.1
+    var gb = gr.2
+    var rs = rr.0
+    var rc = rr.1
+    var rb = rr.2
+    var bs = br.0
+    var bc = br.1
+    var bb = br.2
+    var ast = ar.0
+    var ac = ar.1
+    var ab2 = ar.2
+    if gb <= 0 || rb <= 0 || bb <= 0 || ab2 <= 0 {
+        img.err = "empty literal tree"
+        return img
+    }
+    // 像素解码：绿<256 → 字面量 RGBA
+    var rgba = table_new_i64()
+    var total = w * h
+    var p: i64 = 0
+    while p < total {
+        var g = hdec(st, data, gs, gc, gb)
+        if g < 0 {
+            img.err = "bitstream underrun (green)"
+            return img
+        }
+        if g >= 256 {
+            img.err = "subset: LZ77/length-distance unsupported"
+            return img
+        }
+        var r = hdec(st, data, rs, rc, rb)
+        var bn = hdec(st, data, bs, bc, bb)
+        var a = hdec(st, data, ast, ac, ab2)
+        if r < 0 || bn < 0 || a < 0 {
+            img.err = "bitstream underrun (channel)"
+            return img
+        }
+        table_push(rgba, r)
+        table_push(rgba, g)
+        table_push(rgba, bn)
+        table_push(rgba, a)
+        p = p + 1
+    }
+    img.ok = true
+    img.w = w
+    img.h = h
+    img.alpha_used = alpha_used
+    img.rgba = rgba
+    return img
+}
+
+// 对外 decode：完整 RIFF/WEBP → WebPImage。
+pub func decode(bytes: table<i64>) -> WebPImage {
+    var img = WebPImage()
+    var nb = len(bytes)
+    if nb < 20 {
+        img.err = "truncated file"
+        return img
+    }
+    if bytes[0] != 0x52 || bytes[1] != 0x49 || bytes[2] != 0x46 || bytes[3] != 0x46 {
+        img.err = "bad RIFF magic"
+        return img
+    }
+    if bytes[8] != 0x57 || bytes[9] != 0x45 || bytes[10] != 0x42 || bytes[11] != 0x50 {
+        img.err = "bad WEBP magic"
+        return img
+    }
+    var found = find_vp8l(bytes)
+    if found.0 < 0 {
+        img.err = "no VP8L chunk"
+        return img
+    }
+    return decode_vp8l(found.2)
+}
+
+// get_info：仅解析头（镜像 WebPGetInfo 语义：位深无需解码像素）。
+pub func get_info(bytes: table<i64>) -> WebPImage {
+    var img = WebPImage()
+    var found = find_vp8l(bytes)
+    if found.0 < 0 {
+        img.err = "no VP8L chunk"
+        return img
+    }
+    var st = new_br()
+    var hdr = parse_vp8lh(st, found.2)
+    if str_len(hdr.3) > 0 {
+        img.err = hdr.3
+        return img
+    }
+    img.ok = true
+    img.w = hdr.0
+    img.h = hdr.1
+    img.alpha_used = hdr.2
+    return img
+}
+
+// ============================================================================
+// 五、编码：RGBA → VP8L 无损子集 + RIFF/WEBP 容器
+// ============================================================================
+func push_u32le(ref buf: table<i64>, v: i64) {
+    table_push(buf, v & 0xFF)
+    table_push(buf, (v >> 8) & 0xFF)
+    table_push(buf, (v >> 16) & 0xFF)
+    table_push(buf, (v >> 24) & 0xFF)
+}
+
+func push_str(ref buf: table<i64>, s: string) {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        table_push(buf, str_byte(s, i))
+        i = i + 1
+    }
+}
+
+// 构造 5 棵树的码长（green/red/blue/alpha 全覆盖，dist 仅符号 0）。
+func tree_lengths() -> (table<i64>, table<i64>, table<i64>, table<i64>, table<i64>) {
+    var gl = table_new_i64()
+    var i: i64 = 0
+    while i < 280 {
+        table_push(gl, 9)          // 280 个绿符号全 9 位（2^9=512 覆盖）
+        i = i + 1
+    }
+    var rl = table_new_i64()
+    var bl = table_new_i64()
+    var al = table_new_i64()
+    i = 0
+    while i < 256 {
+        table_push(rl, 8)
+        table_push(bl, 8)
+        table_push(al, 8)
+        i = i + 1
+    }
+    var dl = table_new_i64()
+    i = 0
+    while i < 40 {
+        if i == 0 {
+            table_push(dl, 8)
+        } else {
+            table_push(dl, 0)
+        }
+        i = i + 1
+    }
+    return (gl, rl, bl, al, dl)
+}
+
+// 编码一棵树码长：逐一用码长码树书写（值 ∈{0,8,9}）。
+func enc_codelens(ref out: table<i64>, ref wst: table<i64>,
+                  codes: table<i64>, cl_lens: table<i64>, length: table<i64>) {
+    var i: i64 = 0
+    while i < len(length) {
+        var v = length[i]
+        bw_code(out, wst, codes[v], cl_lens[v])
+        i = i + 1
+    }
+}
+
+// RGBA8（逐像素 R,G,B,A）→ WebP 字节表。
+pub func encode(rgba: table<i64>, w: i64, h: i64) -> table<i64> {
+    var out = table_new_i64()
+    if w <= 0 || h <= 0 {
+        return out
+    }
+    // 1) 5 棵树
+    var tl = tree_lengths()
+    var gl = tl.0
+    var rl = tl.1
+    var bl = tl.2
+    var al = tl.3
+    var dl = tl.4
+    var gcodes = build_codes(gl, 280)
+    var rcodes = build_codes(rl, 256)
+    var bcodes = build_codes(bl, 256)
+    var acodes = build_codes(al, 256)
+    // 2) 码长码树（值 0/8/9）
+    var cl = clenc_lengths()
+    var clcodes = build_codes(cl, 19)
+    // 3) 位流
+    var wst = bw_init()
+    bw_put(out, wst, 0x2F, 8)                 // signature
+    bw_put(out, wst, w - 1, 14)
+    bw_put(out, wst, h - 1, 14)
+    // alpha 位
+    var has_alpha: i64 = 0
+    var i: i64 = 0
+    while i < len(rgba) - 3 {
+        if rgba[i + 3] != 255 {
+            has_alpha = 1
+        }
+        i = i + 4
+    }
+    bw_put(out, wst, has_alpha, 1)
+    bw_put(out, wst, 0, 3)                    // version
+    bw_put(out, wst, 0, 1)                    // no transforms
+    bw_put(out, wst, 0, 1)                    // no color cache
+    // 4) 写 5 棵树的码长
+    enc_codelens(out, wst, clcodes, cl, gl)
+    enc_codelens(out, wst, clcodes, cl, rl)
+    enc_codelens(out, wst, clcodes, cl, bl)
+    enc_codelens(out, wst, clcodes, cl, al)
+    enc_codelens(out, wst, clcodes, cl, dl)
+    // 5) 像素（字面量 green→red→blue→alpha）
+    var np = w * h
+    var p: i64 = 0
+    while p < np {
+        var r = rgba[p * 4 + 0]
+        var g = rgba[p * 4 + 1]
+        var b = rgba[p * 4 + 2]
+        var a = rgba[p * 4 + 3]
+        bw_code(out, wst, gcodes[g], 9)
+        bw_code(out, wst, rcodes[r], 8)
+        bw_code(out, wst, bcodes[b], 8)
+        bw_code(out, wst, acodes[a], 8)
+        p = p + 1
+    }
+    bw_flush(out, wst)
+    // 6) RIFF/WEBP 容器
+    var vp8 = table_new_i64()
+    var k: i64 = 0
+    while k < len(out) {
+        table_push(vp8, out[k])
+        k = k + 1
+    }
+    var final = table_new_i64()
+    push_str(final, "RIFF")
+    var total_size = len(vp8) + 8 + 8    // "WEBP"4 + chunk头8 + vp8
+    if (total_size & 1) != 0 {
+        total_size = total_size + 1      // RIFF 需要偶数字节
+    }
+    push_u32le(final, total_size)
+    push_str(final, "WEBP")
+    push_str(final, "VP8L")
+    push_u32le(final, len(vp8))
+    k = 0
+    while k < len(vp8) {
+        table_push(final, vp8[k])
+        k = k + 1
+    }
+    if (len(vp8) & 1) != 0 {
+        table_push(final, 0)             // pad
+    }
+    return final
+}
+
+}   // namespace webp

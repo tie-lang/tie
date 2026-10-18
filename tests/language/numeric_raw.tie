@@ -1,0 +1,54 @@
+type tie<logic>
+
+// p.9.11.19 数值字面量加强 + raw 字符串：
+//   - 数字分隔符 `1_000_000`（lex 数字内跳过 `_`，下一位须为数字/进制位；
+//     `_x` 标识符不受影响；`1_` 尾分隔自然拒绝）
+//   - `0b` 二进制（0x/0o 已支持，0b 补齐分隔）
+//   - raw 字符串 r"..."：免转义（`\n` 保持两字符）、无插值、`""` 双写 →
+//     字面 `"`（r"a""b" = a"b）；普通字符串不变
+func main() {
+    // 1. 数字分隔（十进制）
+    var a = 1_000_000
+    println(a)
+    var ok = a == 1000000
+    println(ok)
+    // 2. 0b 二进制
+    var b = 0b1010
+    println(b)
+    // 3. 0x 分隔（前缀后 _ 与数字间 _）
+    var c = 0x_1F
+    println(c)
+    var d = 0xCA_FE
+    println(d)
+    // 4. 0b 分隔
+    var e = 0b1010_1010
+    println(e)
+    // 5. 后缀 + 分隔
+    var f = 1_000i64
+    println(f)
+    // 6. 浮点分隔
+    var g = 1_000.5
+    println(g)
+    // 7. raw 字符串：\n 原样两字符（非换行）
+    var p = r"C:\path\n"
+    println(p)
+    // 8. raw 无插值（{name} 原样）
+    var q = r"{name}"
+    println(q)
+    // 9. raw 双写引号转义
+    var w = r"a""b"
+    println(w)
+    // 10. raw 空串
+    var z = r""
+    println("[" + z + "]")
+    // 11. 普通字符串不变（\n 转义生效）
+    var n = "a\nb"
+    println(n)
+    // 12. 标识符 _x 不受数字分隔影响
+    var _x = 5
+    println(_x)
+    // 13. 变量名 r 不受 raw 影响（r 后非 " 即普通标识符）
+    var r = 42
+    println(r)
+    println(r)
+}

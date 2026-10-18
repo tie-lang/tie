@@ -1,0 +1,811 @@
+type tie<class>
+// tlib/std/tzp.tie —— tzp 归档容器库 v1（容器核 + 文件级块体系 + 直存/deflate 变换档）
+// ============================================================================
+// tzp 是 tie 生态的统一归档格式（格式族设计稿：tie-main/docs/designs/tzp-format-family.md）。
+// 本文件实现**容器核**：封装层（头/校验/尾零）+ 布局层（文件级块 + 尾索引）+ 一期
+// 变换档（直存 / deflate）。熵层（rANS）与字典为一期后续档，字段均已留位。
+//
+// 字节布局（v1）：
+//   [头段 60B][数据段 data_len][索引段 idx_len][整体指纹 64][尾零 32]
+//
+//   头段 60B：
+//     0..7    magic "TIEZIPE"（7 ASCII）
+//     7       ver_d1  base-48 高位（v1 = 0）
+//     8       ver_d2  base-48 低位（v1 = 1）——版本 = d1*48 + d2（zd 样式）
+//     9       profile（0x01 = 归档）
+//     10      flags（低 7 位；一期 = 0，未知位拒绝）
+//     11      hash_id（0x01 = blake3）
+//     12..20  data_len   u64 BE（数据段字节数）
+//     20..28  file_count u64 BE（条目数）
+//     28..36  max_file   u64 BE（单文件明文上限，解压前校验）
+//     36..44  max_total  u64 BE（总长上限，解压前校验）
+//     44..60  头校验 = blake3_256(头[0..44)) 的前 16 个 hex 字符
+//
+//   索引段（紧随数据段）：file_count 条，每条：
+//     path_len u32 BE + path（UTF-8 字节）
+//     offset   u64 BE（数据段内偏移）· stored_len u64 BE · raw_len u64 BE
+//     method   u8（0 = 直存 / 8 = deflate）· fp 64 hex 字符（明文 blake3-256）
+//     条目按路径**字节序严格递增**（内容决定；写入顺序无关，重复拒绝）
+//
+//   整体指纹 64 字符：blake3_256(头段+数据段+索引段)
+//   尾零 32B：全零（越界安全 / mmap 便利，兼作校验点）
+//
+// 数据平面：二进制安全 string（tink 惯例——str_byte 访问 + sb_append_byte 构造；
+// 紧凑，无 table<i64> 的 8 倍内存放大）。与 bytes.read（表）的桥：to_blob/from_blob。
+// ⚠ 二进制纪律（实测）：字节流一律走 string_builder 通道（sb_append / sb_append_byte /
+// sb_build——对含 NUL 字节的串安全）；**`+` 拼接对含 NUL 的串按 C 语义截断**，禁止用于
+// 任意字节数据（本库曾因此在头检验拼接处静默截断——已修，见 make_head 注）。
+//
+// 接口：
+//   tzp_pack(names, blobs, method) -> string        （归档字节；输入乱序自动规范化）
+//   tzp_unpack(z) -> (bool, names, blobs)           （全链验证；输出=路径序）
+//   tzp_list(z)   -> (bool, names)                  （结构级验证）
+//   tzp_get(z, name) -> (bool, blob)                （结构级验证 + 该条 fp 校验）
+//   tzp_check(z)  -> i64                            （全链诊断码；0 = 通过）
+//   tzp_verify_deep(z) -> i64                       （逐条重算 fp；返回首个坏条 1-based，0 = 全过）
+//
+// 性能注记（一期）：整段哈希与切片走 substr_bin（逐字节 O(n)）。后续优化项：
+// ①运行时"二进制安全切片/分段哈希"原语（memcpy 级）；②zlib 的 string 版接口。
+// ============================================================================
+
+import "./blake3.tie" as blake3
+import "./zlib.tie" as zlib
+import "./rans.tie" as rans
+
+namespace tzp {
+
+// ============================================================================
+// 一、格式常量
+// ============================================================================
+
+pub func magic_str() -> string { return "TIEZIPE" }
+pub func ver_d1() -> i64 { return 0 }
+pub func ver_d2() -> i64 { return 1 }
+pub func profile_archive() -> i64 { return 1 }
+pub func hash_blake3() -> i64 { return 1 }
+pub func method_store() -> i64 { return 0 }
+pub func method_deflate() -> i64 { return 8 }
+pub func method_rans() -> i64 { return 16 }
+pub func header_len() -> i64 { return 60 }
+pub func fp_hex_len() -> i64 { return 64 }
+pub func head_chk_len() -> i64 { return 16 }
+pub func tail_pad_len() -> i64 { return 32 }
+pub func default_max_file() -> i64 { return 1073741824 }
+pub func default_max_total() -> i64 { return 8589934592 }
+func idx_entries_hard_cap() -> i64 { return 1048576 }
+
+// 诊断码（tzp_check 返回；0 = 通过）
+pub func d_ok() -> i64 { return 0 }
+pub func d_short() -> i64 { return -1 }        // 长度不足
+pub func d_magic() -> i64 { return -2 }
+pub func d_version() -> i64 { return -3 }
+pub func d_profile() -> i64 { return -4 }
+pub func d_flags() -> i64 { return -5 }
+pub func d_hash_id() -> i64 { return -6 }
+pub func d_head_chk() -> i64 { return -7 }
+pub func d_tail_pad() -> i64 { return -8 }
+pub func d_whole_fp() -> i64 { return -9 }
+pub func d_index_struct() -> i64 { return -10 }
+pub func d_index_order() -> i64 { return -11 }  // 乱序或重复
+pub func d_limit() -> i64 { return -12 }        // 超上限（解压前拦截）
+pub func d_deflate() -> i64 { return -13 }
+
+// ============================================================================
+// 二、二进制安全字节工具（string 平面）
+// ============================================================================
+
+// 读 pos 处字节（0..255）；越界返回 -1 哨兵。先显式界检查再访问。
+pub func u8_at(s: string, pos: i64) -> i64 {
+    if pos < 0 {
+        return -1
+    }
+    if pos >= len(s) {
+        return -1
+    }
+    return str_byte(s, pos) & 0xFF
+}
+
+func enc_u8(v: i64) -> string {
+    var sb = string_builder()
+
+    sb_append_byte(sb, v & 0xFF)
+    return sb_build(sb)
+}
+
+func enc_u32be(v: i64) -> string {
+    var sb = string_builder()
+
+    sb_append_byte(sb, (v >> 24) & 0xFF)
+    sb_append_byte(sb, (v >> 16) & 0xFF)
+    sb_append_byte(sb, (v >> 8) & 0xFF)
+    sb_append_byte(sb, v & 0xFF)
+    return sb_build(sb)
+}
+
+func enc_u64be(v: i64) -> string {
+    var sb = string_builder()
+
+    sb_append_byte(sb, (v >> 56) & 0xFF)
+    sb_append_byte(sb, (v >> 48) & 0xFF)
+    sb_append_byte(sb, (v >> 40) & 0xFF)
+    sb_append_byte(sb, (v >> 32) & 0xFF)
+    sb_append_byte(sb, (v >> 24) & 0xFF)
+    sb_append_byte(sb, (v >> 16) & 0xFF)
+    sb_append_byte(sb, (v >> 8) & 0xFF)
+    sb_append_byte(sb, v & 0xFF)
+    return sb_build(sb)
+}
+
+// 读 u32 BE；越界返回 -1。
+func read_u32be(s: string, pos: i64) -> i64 {
+    if pos < 0 {
+        return -1
+    }
+    if pos + 4 > len(s) {
+        return -1
+    }
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < 4 {
+        v = (v << 8) | (str_byte(s, pos + i) & 0xFF)
+        i = i + 1
+    }
+    return v
+}
+
+// 读 u64 BE；越界返回 -1。
+func read_u64be(s: string, pos: i64) -> i64 {
+    if pos < 0 {
+        return -1
+    }
+    if pos + 8 > len(s) {
+        return -1
+    }
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        v = (v << 8) | (str_byte(s, pos + i) & 0xFF)
+        i = i + 1
+    }
+    return v
+}
+
+// 二进制安全切片 [a, b)：逐字节经 str_byte + sb_append_byte。
+// 说明：string 的码点级切片（str_char 系）不接受任意字节，故此处为字节域实现。
+pub func substr_bin(s: string, a: i64, b: i64) -> string {
+    var lo: i64 = a
+    if lo < 0 {
+        lo = 0
+    }
+    var hi: i64 = b
+    if hi > len(s) {
+        hi = len(s)
+    }
+    var sb = string_builder()
+    var i: i64 = lo
+    while i < hi {
+        sb_append_byte(sb, str_byte(s, i) & 0xFF)
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// 字节表 → 二进制安全字符串（bytes.read 的输出转入本库）。
+pub func to_blob(t: table<i64>) -> string {
+    var sb = string_builder()
+    var i: i64 = 0
+    var n: i64 = len(t)
+    while i < n {
+        sb_append_byte(sb, t[i])
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// 二进制安全字符串 → 字节表（写出文件时转回 bytes.write 的输入）。
+pub func from_blob(s: string) -> table<i64> {
+    var out = table_new_i64()
+    var i: i64 = 0
+    var n: i64 = len(s)
+    while i < n {
+        table_push(out, str_byte(s, i) & 0xFF)
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================================
+// 三、路径与排序
+// ============================================================================
+
+// 路径合法性（最小集）：非空、不以 '/' 开头、不含 '\'、不含 NUL 字节。
+// 路径卫生（如 ".."）由调用方负责——本库不解析路径语义。
+func path_valid(p: string) -> bool {
+    var n: i64 = len(p)
+    if n == 0 {
+        return false
+    }
+    if u8_at(p, 0) == 47 {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        var b = u8_at(p, i)
+        if b == 92 {
+            return false
+        }
+        if b == 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 路径字节序比较：a < b → -1；a == b → 0；a > b → 1（无符号字节）。
+func cmp_path(a: string, b: string) -> i64 {
+    var na: i64 = len(a)
+    var nb: i64 = len(b)
+    var n: i64 = na
+    if nb < n {
+        n = nb
+    }
+    var i: i64 = 0
+    while i < n {
+        var x = u8_at(a, i)
+        var y = u8_at(b, i)
+        if x != y {
+            if x < y {
+                return 0 - 1
+            }
+            return 1
+        }
+        i = i + 1
+    }
+    if na == nb {
+        return 0
+    }
+    if na < nb {
+        return 0 - 1
+    }
+    return 1
+}
+
+// 归并两个相邻有序段 [lo, mid) 与 [mid, hi)（就地写回 idx）。
+func merge_run(ref idx: table<i64>, names: table<string>, lo: i64, mid: i64, hi: i64) {
+    var tmp = table_new_i64()
+    var a: i64 = lo
+    var b: i64 = mid
+    while a < mid || b < hi {
+        if a >= mid {
+            table_push(tmp, idx[b])
+            b = b + 1
+        } else if b >= hi {
+            table_push(tmp, idx[a])
+            a = a + 1
+        } else {
+            var ia = idx[a]
+            var ib = idx[b]
+            if cmp_path(names[ia], names[ib]) <= 0 {
+                table_push(tmp, ia)
+                a = a + 1
+            } else {
+                table_push(tmp, ib)
+                b = b + 1
+            }
+        }
+    }
+    var k: i64 = lo
+    var j: i64 = 0
+    while k < hi {
+        idx[k] = tmp[j]
+        k = k + 1
+        j = j + 1
+    }
+}
+
+// 自底向上归并排序（无递归）——按路径字节序返回索引序列。
+func build_idx(names: table<string>) -> table<i64> {
+    var n: i64 = len(names)
+    var idx = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(idx, i)
+        i = i + 1
+    }
+    var w: i64 = 1
+    while w < n {
+        var lo: i64 = 0
+        while lo < n {
+            var mid = lo + w
+            if mid > n {
+                mid = n
+            }
+            var hi = lo + 2 * w
+            if hi > n {
+                hi = n
+            }
+            if mid < hi {
+                merge_run(idx, names, lo, mid, hi)
+            }
+            lo = lo + 2 * w
+        }
+        w = w * 2
+    }
+    return idx
+}
+
+// 按路径序重排平行表（names/blobs 同步重排）。
+func sort_entries(names: table<string>, blobs: table<string>) -> (table<string>, table<string>) {
+    var idx = build_idx(names)
+    var on = table_new_string()
+    var ob = table_new_string()
+    for i in idx {
+        table_push(on, names[i])
+        table_push(ob, blobs[i])
+    }
+    return (on, ob)
+}
+
+// ============================================================================
+// 四、构建（pack）
+// ============================================================================
+
+// 头段（60B）：前 44B + 头校验 16 hex 字符。
+func make_head(data_len: i64, file_count: i64, max_file: i64, max_total: i64) -> string {
+    var sb = string_builder()
+    sb_append(sb, magic_str())
+    sb_append(sb, enc_u8(ver_d1()))
+    sb_append(sb, enc_u8(ver_d2()))
+    sb_append(sb, enc_u8(profile_archive()))
+    sb_append(sb, enc_u8(0))
+    sb_append(sb, enc_u8(hash_blake3()))
+    sb_append(sb, enc_u64be(data_len))
+    sb_append(sb, enc_u64be(file_count))
+    sb_append(sb, enc_u64be(max_file))
+    sb_append(sb, enc_u64be(max_total))
+    var head44 = sb_build(sb)
+    var chk = substr_bin(blake3.blake3_256(head44), 0, head_chk_len())
+    // 头部拼接经 sb 通道：`+` 对含 NUL 的串按 C 语义截断（二进制纪律——字节流一律
+    // 走 string_builder 通道，绝不用 `+`；见文件头注释"数据平面"）。
+    var sb2 = string_builder()
+    sb_append(sb2, head44)
+    sb_append(sb2, chk)
+    return sb_build(sb2)
+}
+
+// 打包（显式上限版）。输入乱序自动规范化（输出恒为路径序）；重复路径拒绝（返回空串）。
+pub func tzp_pack_ex(names: table<string>, blobs: table<string>, method: i64, max_file: i64, max_total: i64) -> string {
+    var n: i64 = len(names)
+    if n != len(blobs) {
+        return ""
+    }
+    if method != method_store() && method != method_deflate() && method != method_rans() {
+        return ""
+    }
+    // 逐条校验
+    var i: i64 = 0
+    while i < n {
+        if !path_valid(names[i]) {
+            return ""
+        }
+        if len(blobs[i]) > max_file {
+            return ""
+        }
+        i = i + 1
+    }
+    // 规范化排序
+    var sr = sort_entries(names, blobs)
+    var sn = sr.0
+    var sb2 = sr.1
+    // 严格递增检查（排序后相邻不等即无重复）
+    i = 0
+    while i + 1 < n {
+        if cmp_path(sn[i], sn[i + 1]) == 0 {
+            return ""
+        }
+        i = i + 1
+    }
+    // 逐条编码：收集 stored / fp / 长度
+    var storeds = table_new_string()
+    var fps = table_new_string()
+    var raws = table_new_i64()
+    var data_len: i64 = 0
+    i = 0
+    while i < n {
+        var raw = sb2[i]
+        var payload = raw
+        if method == method_deflate() {
+            if len(raw) > 0 {
+                var comp = zlib.deflate(from_blob(raw))
+                payload = to_blob(comp)
+            }
+        } else if method == method_rans() {
+            payload = rans.rans_compress(raw)
+        }
+        if data_len + len(payload) > max_total {
+            return ""
+        }
+        table_push(storeds, payload)
+        table_push(fps, blake3.blake3_256(raw))
+        table_push(raws, len(raw))
+        data_len = data_len + len(payload)
+        i = i + 1
+    }
+    // 数据段
+    var sbd = string_builder()
+    var offs = table_new_i64()
+    var acc: i64 = 0
+    i = 0
+    while i < n {
+        table_push(offs, acc)
+        sb_append(sbd, storeds[i])
+        acc = acc + len(storeds[i])
+        i = i + 1
+    }
+    var data = sb_build(sbd)
+    // 索引段
+    var sbi = string_builder()
+    i = 0
+    while i < n {
+        sb_append(sbi, enc_u32be(len(sn[i])))
+        sb_append(sbi, sn[i])
+        sb_append(sbi, enc_u64be(offs[i]))
+        sb_append(sbi, enc_u64be(len(storeds[i])))
+        sb_append(sbi, enc_u64be(raws[i]))
+        sb_append(sbi, enc_u8(method))
+        sb_append(sbi, fps[i])
+        i = i + 1
+    }
+    var index = sb_build(sbi)
+    // 头 + 数据 + 索引 → base → 整体指纹 → 尾零
+    var head = make_head(data_len, n, max_file, max_total)
+    var sbb = string_builder()
+    sb_append(sbb, head)
+    sb_append(sbb, data)
+    sb_append(sbb, index)
+    var base = sb_build(sbb)
+    var whole = blake3.blake3_256(base)
+    var sbf = string_builder()
+    sb_append(sbf, base)
+    sb_append(sbf, whole)
+    var pad: i64 = 0
+    while pad < tail_pad_len() {
+        sb_append_byte(sbf, 0)
+        pad = pad + 1
+    }
+    return sb_build(sbf)
+}
+
+// 打包（默认上限）。
+pub func tzp_pack(names: table<string>, blobs: table<string>, method: i64) -> string {
+    return tzp_pack_ex(names, blobs, method, default_max_file(), default_max_total())
+}
+
+// ============================================================================
+// 五、校验
+// ============================================================================
+
+// 头段校验：magic / 版本 / profile / flags / hash_id / 头校验。通过返回 0。
+func check_head(z: string) -> i64 {
+    if len(z) < header_len() + 96 {
+        return d_short()
+    }
+    // magic（7 字节 ASCII 比对）
+    var m = magic_str()
+    var i: i64 = 0
+    while i < 7 {
+        if u8_at(z, i) != u8_at(m, i) {
+            return d_magic()
+        }
+        i = i + 1
+    }
+    if u8_at(z, 7) != ver_d1() {
+        return d_version()
+    }
+    if u8_at(z, 8) != ver_d2() {
+        return d_version()
+    }
+    if u8_at(z, 9) != profile_archive() {
+        return d_profile()
+    }
+    if u8_at(z, 10) != 0 {
+        return d_flags()
+    }
+    if u8_at(z, 11) != hash_blake3() {
+        return d_hash_id()
+    }
+    var chk = substr_bin(blake3.blake3_256(substr_bin(z, 0, 44)), 0, head_chk_len())
+    i = 0
+    while i < head_chk_len() {
+        if u8_at(z, 44 + i) != u8_at(chk, i) {
+            return d_head_chk()
+        }
+        i = i + 1
+    }
+    return d_ok()
+}
+
+// 尾区校验：整体指纹匹配 + 尾零 32B 全零。通过返回 0。
+func check_tail(z: string) -> i64 {
+    var total: i64 = len(z)
+    var base_end = total - tail_pad_len() - fp_hex_len()
+    // 整体指纹
+    var whole = blake3.blake3_256(substr_bin(z, 0, base_end))
+    var i: i64 = 0
+    while i < fp_hex_len() {
+        if u8_at(z, base_end + i) != u8_at(whole, i) {
+            return d_whole_fp()
+        }
+        i = i + 1
+    }
+    // 尾零
+    i = total - tail_pad_len()
+    while i < total {
+        if u8_at(z, i) != 0 {
+            return d_tail_pad()
+        }
+        i = i + 1
+    }
+    return d_ok()
+}
+
+// 索引段结构校验（含上限与顺序）。通过返回 0；同时以参照输出解析结果。
+// 约定：返回 (code, count, idx_off, data_len)。
+func check_index(z: string) -> (i64, i64, i64, i64) {
+    var total: i64 = len(z)
+    var base_end = total - tail_pad_len() - fp_hex_len()
+    var data_len = read_u64be(z, 12)
+    var count = read_u64be(z, 20)
+    if data_len < 0 || count < 0 {
+        return (d_index_struct(), 0, 0, 0)
+    }
+    if count > idx_entries_hard_cap() {
+        return (d_limit(), 0, 0, 0)
+    }
+    var idx_off = header_len() + data_len
+    if idx_off > base_end {
+        return (d_index_struct(), 0, 0, 0)
+    }
+    var pos: i64 = idx_off
+    var prev = ""
+    var k: i64 = 0
+    while k < count {
+        var plen = read_u32be(z, pos)
+        if plen < 0 {
+            return (d_index_struct(), 0, 0, 0)
+        }
+        pos = pos + 4
+        if pos + plen > base_end {
+            return (d_index_struct(), 0, 0, 0)
+        }
+        var path = substr_bin(z, pos, pos + plen)
+        if !path_valid(path) {
+            return (d_index_struct(), 0, 0, 0)
+        }
+        pos = pos + plen
+        var off = read_u64be(z, pos)
+        var stlen = read_u64be(z, pos + 8)
+        var rlen = read_u64be(z, pos + 16)
+        var meth = u8_at(z, pos + 24)
+        if off < 0 || stlen < 0 || rlen < 0 {
+            return (d_index_struct(), 0, 0, 0)
+        }
+        if meth != method_store() && meth != method_deflate() && meth != method_rans() {
+            return (d_index_struct(), 0, 0, 0)
+        }
+        if off + stlen > data_len {
+            return (d_index_struct(), 0, 0, 0)
+        }
+        pos = pos + 25
+        if pos + fp_hex_len() > base_end {
+            return (d_index_struct(), 0, 0, 0)
+        }
+        pos = pos + fp_hex_len()
+        // 顺序（严格递增：有序且无重复）
+        if k > 0 {
+            if cmp_path(prev, path) >= 0 {
+                return (d_index_order(), 0, 0, 0)
+            }
+        }
+        prev = path
+        k = k + 1
+    }
+    if pos != base_end {
+        return (d_index_struct(), 0, 0, 0)
+    }
+    return (d_ok(), count, idx_off, data_len)
+}
+
+// 全链校验（tzp_check）：0 = 通过；负 = 诊断码。
+pub func tzp_check(z: string) -> i64 {
+    var hc = check_head(z)
+    if hc != d_ok() {
+        return hc
+    }
+    var ic = check_index(z)
+    if ic.0 != d_ok() {
+        return ic.0
+    }
+    var tc = check_tail(z)
+    if tc != d_ok() {
+        return tc
+    }
+    return d_ok()
+}
+
+// ============================================================================
+// 六、读取
+// ============================================================================
+
+// 提取第 k 条（0 起）的明文字节。返回 (ok, blob)。
+// 前置：调用方已完成相应级别的验证。off/stlen 为数据段内值。
+func extract_entry(z: string, off: i64, stlen: i64, rlen: i64, method: i64) -> (bool, string) {
+    var start = header_len() + off
+    var raw = substr_bin(z, start, start + stlen)
+    if method == method_store() {
+        return (true, raw)
+    }
+    if method == method_deflate() {
+        var rr = zlib.inflate(from_blob(raw))
+        if rr.0 == false {
+            return (false, "")
+        }
+        var out = to_blob(rr.1)
+        if len(out) != rlen {
+            return (false, "")
+        }
+        return (true, out)
+    }
+    if method == method_rans() {
+        var rd = rans.rans_decompress(raw)
+        if rd.0 == false {
+            return (false, "")
+        }
+        if len(rd.1) != rlen {
+            return (false, "")
+        }
+        return (true, rd.1)
+    }
+    return (false, "")
+}
+
+// 解包（全链验证；输出为路径序）。
+pub func tzp_unpack(z: string) -> (bool, table<string>, table<string>) {
+    var names = table_new_string()
+    var blobs = table_new_string()
+    var ck = tzp_check(z)
+    if ck != d_ok() {
+        return (false, names, blobs)
+    }
+    var total: i64 = len(z)
+    var base_end = total - tail_pad_len() - fp_hex_len()
+    var data_len = read_u64be(z, 12)
+    var count = read_u64be(z, 20)
+    var pos = header_len() + data_len
+    var k: i64 = 0
+    while k < count {
+        var plen = read_u32be(z, pos)
+        pos = pos + 4
+        var path = substr_bin(z, pos, pos + plen)
+        pos = pos + plen
+        var off = read_u64be(z, pos)
+        var stlen = read_u64be(z, pos + 8)
+        var rlen = read_u64be(z, pos + 16)
+        var meth = u8_at(z, pos + 24)
+        pos = pos + 25
+        pos = pos + fp_hex_len()
+        var ee = extract_entry(z, off, stlen, rlen, meth)
+        if ee.0 == false {
+            var e2n = table_new_string()
+            var e2b = table_new_string()
+            return (false, e2n, e2b)
+        }
+        table_push(names, path)
+        table_push(blobs, ee.1)
+        k = k + 1
+    }
+    return (true, names, blobs)
+}
+
+// 列出条目（结构级验证：头 + 索引；不做整体指纹，见 tzp_check 全链）。
+pub func tzp_list(z: string) -> (bool, table<string>) {
+    var names = table_new_string()
+    var hc = check_head(z)
+    if hc != d_ok() {
+        return (false, names)
+    }
+    var ic = check_index(z)
+    if ic.0 != d_ok() {
+        return (false, names)
+    }
+    var count = ic.1
+    var pos = ic.2
+    var k: i64 = 0
+    while k < count {
+        var plen = read_u32be(z, pos)
+        pos = pos + 4
+        table_push(names, substr_bin(z, pos, pos + plen))
+        pos = pos + plen + 25 + fp_hex_len()
+        k = k + 1
+    }
+    return (true, names)
+}
+
+// 取单条（结构级验证 + 该条 fp 校验，防局部篡改定位）。
+pub func tzp_get(z: string, name: string) -> (bool, string) {
+    var hc = check_head(z)
+    if hc != d_ok() {
+        return (false, "")
+    }
+    var ic = check_index(z)
+    if ic.0 != d_ok() {
+        return (false, "")
+    }
+    var count = ic.1
+    var pos = ic.2
+    var k: i64 = 0
+    while k < count {
+        var plen = read_u32be(z, pos)
+        pos = pos + 4
+        var path = substr_bin(z, pos, pos + plen)
+        pos = pos + plen
+        var off = read_u64be(z, pos)
+        var stlen = read_u64be(z, pos + 8)
+        var rlen = read_u64be(z, pos + 16)
+        var meth = u8_at(z, pos + 24)
+        pos = pos + 25
+        var fp = substr_bin(z, pos, pos + fp_hex_len())
+        pos = pos + fp_hex_len()
+        if cmp_path(path, name) == 0 {
+            var ee = extract_entry(z, off, stlen, rlen, meth)
+            if ee.0 == false {
+                return (false, "")
+            }
+            var got = blake3.blake3_256(ee.1)
+            if got != fp {
+                return (false, "")
+            }
+            return (true, ee.1)
+        }
+        k = k + 1
+    }
+    return (false, "")
+}
+
+// 深度校验：逐条重算明文 fp；返回首个坏条 1-based 序号（0 = 全过）。
+// 前置：已通过 tzp_check（结构可解析）。
+pub func tzp_verify_deep(z: string) -> i64 {
+    var ck = tzp_check(z)
+    if ck != d_ok() {
+        return 0 - 1
+    }
+    var total: i64 = len(z)
+    var data_len = read_u64be(z, 12)
+    var count = read_u64be(z, 20)
+    var pos = header_len() + data_len
+    var k: i64 = 0
+    while k < count {
+        var plen = read_u32be(z, pos)
+        pos = pos + 4 + plen
+        var off = read_u64be(z, pos)
+        var stlen = read_u64be(z, pos + 8)
+        var rlen = read_u64be(z, pos + 16)
+        var meth = u8_at(z, pos + 24)
+        pos = pos + 25
+        var fp = substr_bin(z, pos, pos + fp_hex_len())
+        pos = pos + fp_hex_len()
+        var ee = extract_entry(z, off, stlen, rlen, meth)
+        if ee.0 == false {
+            return k + 1
+        }
+        var got = blake3.blake3_256(ee.1)
+        if got != fp {
+            return k + 1
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+}

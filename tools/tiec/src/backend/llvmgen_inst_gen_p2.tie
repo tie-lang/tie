@@ -1,0 +1,486 @@
+type tie<class>
+// compiler/backend/llvmgen_inst_gen_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 llvmgen_inst_gen.tie。
+namespace llvmgen {
+pub func gen_inst_b_34_select(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // select：三目（操作数 [cond VALUE, then VALUE, else VALUE]；ins_ty = 值类型）
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = select i1 " + opnd_ref(inst_id, 0) + ", " + ty + " " + opnd_ref(inst_id, 1) + ", " + ty + " " + opnd_ref(inst_id, 2))
+        return
+}
+
+pub func gen_inst_b_6_and(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // and/or/xor/shl/shr（逻辑 i1 / 位运算 i64 按 ins_ty）
+        var opname = ""
+        if op == 6 {
+            opname = "and"
+        } else if op == 7 {
+            opname = "or"
+        } else if op == 8 {
+            opname = "xor"
+        } else if op == 10 {
+            opname = "shl"
+        } else if op == 11 {
+            // S1.3 B2 右移：有符号 → 算术右移（ashr）；无符号 → 逻辑右移
+            // （lshr）。u 类型位模式右移必须 lshr（ashr 会符号扩展错误）。
+            var ity11 = ir.ins_ty(inst_id)
+            if ity11 == TK_U8 || ity11 == TK_U16 || ity11 == TK_U32 || ity11 == TK_U64 {
+                opname = "lshr"
+            } else {
+                opname = "ashr"
+            }
+        }
+        // 移位计数 ≥ 位宽在 LLVM 是毒值（UB）：生成代码可能挂起/值损坏
+        // （2026-09-02 实测 `1 >> 88` 程序无输出）。语义定界为 JS 式掩码
+        // count & 63（与既有的 tie 侧 `shift < 64` 护栏行为兼容：≥64 一律 0/1..）。
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        if op == 10 || op == 11 {
+            // 移位数类型与结果类型一致（i64/大数 i128/u 类型），掩码常量随类型。
+            line("%sm" + to_string(inst_id) + " = and " + ty + " " + opnd_ref(inst_id, 1) + ", 63")
+            line(reg + " = " + opname + " " + ty + " " + opnd_ref(inst_id, 0) + ", %sm" + to_string(inst_id))
+        } else {
+            line(reg + " = " + opname + " " + ty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        }
+        return
+}
+
+pub func gen_inst_b_33_phi(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // phi：操作数 [值1, 块1, 值2, 块2, ...]（值可为 IMM 立即数）。
+        // 字符串 phi（ins_ty == TK_STR）：incoming 值须为 ptr——const_str 是
+        // i64 指针整数（ptrtoint）直引 @.str.N、str_cat 结果 inttoptr 转 ptr
+        //（曾生成 `phi ptr [%11, ...]` 而 %11 是 i64 → 类型不匹配）
+        var pty = llvm_ty(ir.ins_ty(inst_id))
+        var is_str_phi = ir.ins_ty(inst_id) == TK_STR
+        var args = ""
+        var k: i64 = 0
+        while k + 1 < cnt {
+            if k > 0 {
+                args = args + ", "
+            }
+            var vref = opnd_ref(inst_id, k)
+            if is_str_phi {
+                vref = to_ptr(ir.ins_opnd(inst_id, k))
+            }
+            args = args + "[" + vref + ", %bb" + to_string(ir.ins_opnd(inst_id, k + 1)) + "]"
+            k = k + 2
+        }
+        line(reg + " = phi " + pty + " " + args)
+        return
+}
+
+pub func gen_inst_b_35_call(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // call（阶段 A 用户函数）：操作数 [0]=符号池id, [1]=返回类型IMM,
+        // 然后每参数 [类型IMM, 值]。返回类型 = ins_ty（void 用 -1 → call void）。
+        var sid = ir.ins_opnd(inst_id, 0)
+        var sym = ns_replace(intern.lookup(sid))
+        if sym == "" {
+        }
+        var args = ""
+        var k: i64 = 2
+        while k + 1 < cnt {
+            if k > 2 {
+                args = args + ", "
+            }
+            var pty = llvm_ty(ir.ins_opnd(inst_id, k))
+            args = args + pty + " " + typed_ref(inst_id, k + 1)
+            k = k + 2
+        }
+        var tpre = ""
+        if tail_marked(inst_id) == 1 {
+            tpre = "tail "
+        }
+        if ir.ins_ty(inst_id) < 0 || ir.ins_ty(inst_id) == TK_VOID {
+            line(tpre + "call void @" + sym + "(" + args + ")")
+        } else {
+            line(reg + " = " + tpre + "call " + llvm_ty(ir.ins_ty(inst_id)) + " @" + sym + "(" + args + ")")
+        }
+        return
+}
+
+pub func gen_inst_b_70_call_indirect(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // call_indirect（S2.2 函数值调用）：操作数 [0]=entry 函数指针 VALUE,
+        // [1]=返回类型 id IMM, [2]=env VALUE, 然后每参数 [类型 id IMM, 值]。
+        // 统一入口签名 fn(ptr env, A...) -> R（无捕获闭包 env = null）。
+        // 发射 `call [Ty] %entry(ptr %env, args...)`——entry 是 ptr 值（聚合
+        // 字段 load），LLVM 允许以 ptr 值作为被调函数。
+        var entry_ref = opnd_ref(inst_id, 0)
+        var env_ref = opnd_ref(inst_id, 2)
+        var args2 = "ptr " + env_ref
+        var k2: i64 = 3
+        while k2 + 1 < cnt {
+            var pty2 = llvm_ty(ir.ins_opnd(inst_id, k2))
+            args2 = args2 + ", " + pty2 + " " + typed_ref(inst_id, k2 + 1)
+            k2 = k2 + 2
+        }
+        if ir.ins_ty(inst_id) < 0 || ir.ins_ty(inst_id) == TK_VOID {
+            line("call void " + entry_ref + "(" + args2 + ")")
+        } else {
+            line(reg + " = call " + llvm_ty(ir.ins_ty(inst_id)) + " " + entry_ref + "(" + args2 + ")")
+        }
+        return
+}
+
+pub func gen_inst_b_73_dyn_call(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // dyn_call（p.6.6.20 std/sqlite 动态加载）：操作数 [0]=entry 函数指针 VALUE,
+        // [1]=retmode IMM（0=i32 返回→截断+zext i64；1=完整 i64/指针返回）,
+        // 然后每参数 [类型 id IMM, 值]。发射 `call [Ty] %entry(args...)`——entry 是
+        // inttoptr 出的 ptr 值（GetProcAddress 地址），无 env（区别于 op70 的
+        // call_indirect 闭包调用）。所有实参按调用方声明的 tie 类型原样传递
+        //（字符串 TK_STR → ptr = const char*；整数 → i64），对齐 C ABI。
+        var entry_ref = opnd_ref(inst_id, 0)
+        var retmode = ir.ins_opnd(inst_id, 1)
+        var args3 = ""
+        var k3: i64 = 2
+        while k3 + 1 < cnt {
+            if k3 > 2 {
+                args3 = args3 + ", "
+            }
+            var pty3 = llvm_ty(ir.ins_opnd(inst_id, k3))
+            args3 = args3 + pty3 + " " + typed_ref(inst_id, k3 + 1)
+            k3 = k3 + 2
+        }
+        if retmode == 0 {
+            // i32 返回（sqlite3_* 返回 int）：call i32 %entry → zext i64
+            g_str_reg_cnt = g_str_reg_cnt + 1
+            var tmp = "%sc" + to_string(g_str_reg_cnt)
+            line(tmp + " = call i32 " + entry_ref + "(" + args3 + ")")
+            line(reg + " = zext i32 " + tmp + " to i64")
+        } else {
+            // 完整 64 位返回（指针/句柄）：call i64 %entry
+            line(reg + " = call i64 " + entry_ref + "(" + args3 + ")")
+        }
+        return
+}
+
+pub func gen_inst_b_56_str_cat(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // str_cat（字符串拼接）：操作数 [lhs, rhs] → malloc+memcpy 序列。
+        // S2.1：升级为 {ptr,len} 布局——malloc 8 头 + 数据 + \0：
+        //   buf[0..8)  = i64 总长（O(1) len 读取）；buf[8..] = UTF-8 数据；
+        //   数据末尾 \0（FFI 边界自动 NUL，旧 strlen/strcmp/printf 兼容）。
+        // 对齐 Rust tig_binary_str 的 Add：strlen+strlen → malloc(len1+len2+9)
+        // → 写头 → memcpy 两段 → 末尾 \0。
+        var lv = ir.ins_opnd(inst_id, 0)
+        var rv = ir.ins_opnd(inst_id, 1)
+        // 长度一律取 8 字节长度头（str_len_ref）：字面量→编译期立即数，
+        // 其余→load i64, gep(ptr, -8)。旧路径用 strlen 各扫全串两遍（437KB
+        // 拼接实测多付 ~30%），且对含 \0 的串按首个 \0 截断。
+        // 注意：arg 传裸引用（gen_call_i64 内部会加 argty 前缀），
+        // 曾误传 "ptr " + ref 导致 `strlen(ptr ptr @.str.N)` 重复前缀
+        var n1 = str_len_ref(lv)
+        var n2 = str_len_ref(rv)
+        // total = n1 + n2；size = total + 41（8 字节头 + 数据 + \0 + 32 字节
+        // 尾部填充）。32 字节保留区：CRT 向量化 strlen/strcmp/memcmp 按
+        // 16B/32B 宽读可能越 NUL 读到分配末尾之后——缓冲必须能容纳这类
+        // 良性越读（自举产物 tiec2b 曾因 1 字节余量撞未映射页 0xC0000005，
+        // 漏洞 B 根因）。填充只影响分配大小，{ptr,len} 语义不变。
+        var total = reg_add(n1, n2)
+        // SSO（dev33 批次3）：块分配走 @tie_sso_alloc——短串（≤31 字节）从
+        // 静态池 bump（零 malloc），长串回退 malloc（helper 内部 +41：8 头 +
+        // 1 \0 + 32 尾部填充，容纳向量化宽读，漏洞 B 修复）。返回块基址。
+        sso_enable()
+        var buf = gen_call_ptr("tie_sso_alloc", "i64", total)
+        // 写头部长度（S2.1 长度字段）
+        line("store i64 " + total + ", ptr " + buf)
+        // 数据起始 = buf + 8
+        var d0 = reg_gep(buf, "8")
+        // memcpy(d0, lv, n1) + memcpy(d0+n1, rv, n2)
+        line("call void @llvm.memcpy.p0.p0.i64(ptr " + d0 + ", ptr " + str_ptr_ref(lv) + ", i64 " + n1 + ", i1 false)")
+        var off = reg_gep(d0, n1)
+        line("call void @llvm.memcpy.p0.p0.i64(ptr " + off + ", ptr " + str_ptr_ref(rv) + ", i64 " + n2 + ", i1 false)")
+        // d0[total] = 0（边界自动 NUL）
+        var endp = reg_gep(d0, total)
+        line("store i8 0, ptr " + endp)
+        // 返回数据指针（ptrtoint i64 指针整数，{ptr,len} 的 ptr 位）
+        line(reg + " = ptrtoint ptr " + d0 + " to i64")
+        // p.9.12.7：companion 真 ptr 转换必须在**定义块**内生成（与上方 ptrtoint
+        // 同块）——字符串 phi（分支合流）的 incoming 引用它。旧路径在 phi 处
+        // （合并块）临时 inttoptr 会 ① 插在 phi 之前 → LLVM opt 报
+        // "PHI nodes not grouped at top of basic block"；② 引用分支块内定义的
+        // i64 值在合并块使用 → 多臂合流时该分支块不支配合并块 →
+        // "Instruction does not dominate all uses!"（p.9.12.7 崩源）。
+        // %spN 以结果值 id 定名（非纯数字后缀，renumber 不动；%sp 前缀独用，
+        // 不与 %sc/%ext 冲突）；opt 的 InstCombine 折叠 inttoptr(ptrtoint x) → x，
+        // 编译产物零性能开销。
+        line("%sp" + to_string(ir.get_value(inst_id)) + " = inttoptr i64 " + reg + " to ptr")
+        // p.6.7.5 生命周期确定性：链式临时释放——操作数若是前一 str_cat 的
+        // 结果值（op56 def）且全函数仅本次拼接一处使用（SSA 纯表达式临时，
+        // 无其它 load/store/传参引用），则结果就绪后按长度释放其堆缓冲。
+        // 计数含本指令自身（lv==rv 同一值两处消费 → uses>1 不释）与其它
+        // 后续引用（存入槽/传参 → uses>1 不释——防 use-after-free）。
+        str_temp_free_pass(inst_id, lv, n1)
+        str_temp_free_pass(inst_id, rv, n2)
+        return
+}
+
+pub func gen_inst_b_30_br(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // br label %block
+        line("br " + opnd_ref(inst_id, 0))
+        return
+}
+
+pub func gen_inst_b_31_cond_br(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // cond_br：操作数 [cond VALUE, then BLOCK, else BLOCK]
+        var cond = ir.ins_opnd(inst_id, 0)
+        var then_b = ir.ins_opnd(inst_id, 1)
+        var else_b = ir.ins_opnd(inst_id, 2)
+        // 条件为常量时内联 true/false（常量 def 行已不再出现在文本里，见 opnd_ref）
+        var cs = "i1 %" + to_string(cond)
+        var cdef = value_def(cond)
+        if cdef >= 0 {
+            if ir.ins_op(cdef) == 60 {
+                var ccty = ir.ins_ty(cdef)
+                if types.is_int(ccty) || ccty == types.named(TK_BOOL) {
+                    if ir.ins_opnd(cdef, 0) != 0 {
+                        cs = "i1 true"
+                    } else {
+                        cs = "i1 false"
+                    }
+                }
+            }
+        }
+        line("br " + cs + ", label %bb" + to_string(then_b) + ", label %bb" + to_string(else_b))
+        return
+}
+
+pub func gen_inst_b_32_ret(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // ret：无操作数 → ret void；有 → ret T %N（类型按指令 ins_ty——
+        // 显式 return 的表达式是 i64 常量/变量，硬编码 ret i32 会类型不匹配）
+        if cnt == 0 {
+            line("ret void")
+        } else {
+            var v0 = ir.ins_opnd(inst_id, 0)
+            var fret = llvm_ty(ir.func_ret(g_pfid))
+            if fret == "ptr" {
+                // 字符串返回：const_str/str_cat 值是 i64 指针整数，须转真 ptr
+                line("ret ptr " + to_ptr(v0))
+            } else if fret == "void" {
+                // main 特例（define i32 @main，irgen 补 ret i32 0）：
+                // 按值类型输出；其他 void 函数 → ret void
+                var fnm = intern.lookup(ir.func_name(g_pfid))
+                if fnm == "main" || (str_len(g_entry_name) > 0 && fnm == g_entry_name) {
+                    // 补 ret（irgen 尾部生成 ret i32 0）：operand 是 IMM(2) 字面量 0，
+                    // 不能查 value_def——值 id 0 恰好是第一条指令，会误判为 i64
+                    var def = -1
+                    if ir.ins_opnd_kind(inst_id, 0) == 0 {
+                        def = value_def(v0)
+                    }
+                    var rty2 = "i32"
+                    if def >= 0 {
+                        rty2 = llvm_ty(ir.ins_ty(def))
+                    }
+                    line("ret " + rty2 + " " + opnd_ref(inst_id, 0))
+                } else {
+                    line("ret void")
+                }
+            } else {
+                // 非 ptr：按值实际类型（bool 函数返回 icmp i1；i32 常量等）
+                var rty = fret
+                var pp = param_pos(v0)
+                if pp >= 0 {
+                    rty = llvm_ty(ir.func_param_ty(g_pfid, pp))
+                } else {
+                    var def = value_def(v0)
+                    if def >= 0 {
+                        if ir.ins_op(def) == 12 {
+                            // icmp 结果恒 i1（irgen 类型标记为 i64 简化）
+                            rty = "i1"
+                        } else {
+                            rty = llvm_ty(ir.ins_ty(def))
+                        }
+                    }
+                }
+                line("ret " + rty + " " + opnd_ref(inst_id, 0))
+            }
+        }
+        return
+}
+
+pub func gen_inst_b_41_call_vararg(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // call_vararg（printf）：操作数[0] = 格式串池 id；[1..] = 实参
+        var fid = ir.ins_opnd(inst_id, 0)
+        var slot = str_slot(fid)
+        // 实参类型提升：const_str → ptr 直传 @.str.N；i32 结果 → 先生成
+        // 独立 sext 指令（LLVM 不支持内联 sext 表达式实参）再传 i64；
+        // i64 → 直传。
+        var args = ""
+        var k: i64 = 1
+        while k < cnt {
+            if k > 1 {
+                args = args + ", "
+            }
+            var v = ir.ins_opnd(inst_id, k)
+            var def = value_def(v)
+            var rref = arg_ref(inst_id, k)
+            // i32 值实参：生成 sext 到独立寄存器（新寄存器号 g_sext_cnt 递增）
+            if def >= 0 {
+                if llvm_ty(ir.ins_ty(def)) == "i32" {
+                    g_sext_cnt = g_sext_cnt + 1
+                    var rn = "%ext" + to_string(g_sext_cnt)
+                    line(rn + " = sext i32 %" + to_string(v) + " to i64")
+                    rref = "i64 " + rn
+                } else if llvm_ty(ir.ins_ty(def)) == "i1" {
+                    // bool 值实参：zext i1 → i64（%lld 打印 0/1；sext 会得 -1）
+                    g_sext_cnt = g_sext_cnt + 1
+                    var rn2 = "%ext" + to_string(g_sext_cnt)
+                    line(rn2 + " = zext i1 %" + to_string(v) + " to i64")
+                    rref = "i64 " + rn2
+                }
+            }
+            args = args + rref
+            k = k + 1
+        }
+        // 实参列表前缀：非空时补 ", "
+        var call_args = ""
+        if args != "" {
+            call_args = ", " + args
+        }
+        line(reg + " = call i32 (ptr, ...) @printf(ptr " + str_data_ref(slot) + call_args + ")")
+        return
+}
+
+pub func gen_inst_b_36_extern_call(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // extern_call（阶段 A 新布局）：操作数 [0]=符号名池 id, [1]=返回类型IMM,
+        // 然后每参数 [类型IMM, 值]。返回类型 = ins_ty（void → call void）。
+        // S2.1：tie 桥返回字符串（ptr）= 无头堆串（桥内 malloc，无长度头）→
+        // 调用后**补头**（strlen + malloc + memcpy），统一为 {ptr,len} 布局
+        // （头部 8 字节 i64 长度 + 数据 + \0），保证 len(s) O(1) 与二进制安全。
+        // 判据：ins_ty == TK_STR 且符号 tie_ 前缀（libc 的 malloc/strlen 等
+        // 不以 tie_ 开头，绝不误补头）。补头后 reg 仍为数据指针（值 id 不变）。
+        var sid = ir.ins_opnd(inst_id, 0)
+        var sym = intern.lookup(sid)
+        var args = ""
+        var k: i64 = 2
+        while k + 1 < cnt {
+            if k > 2 {
+                args = args + ", "
+            }
+            var pty = llvm_ty(ir.ins_opnd(inst_id, k))
+            args = args + pty + " " + typed_ref(inst_id, k + 1)
+            k = k + 2
+        }
+        if ir.ins_ty(inst_id) < 0 || ir.ins_ty(inst_id) == TK_VOID {
+            line("call void @" + sym + "(" + args + ")")
+        } else if ir.ins_ty(inst_id) == TK_STR && !is_table_bridge(sym) {
+            // FFI 接收方向自动扫描（批次5 任务13/14）：extern 返回 string =
+            // C `char*`（NUL 结尾，无 {ptr,len} 头），调用后统一补头
+            // （strlen + malloc + memcpy + 尾 \0）。语义推广到**所有**符号——
+            // tie_ 桥与用户 extern（如 getenv）一致；表句柄桥经 is_table_bridge
+            // 黑名单排除（复用 ptr 槽，补头会错乱句柄）。
+            gen_ext_str_scan(reg, sym, args)
+        } else {
+            line(reg + " = call " + llvm_ty(ir.ins_ty(inst_id)) + " @" + sym + "(" + args + ")")
+        }
+        return
+}
+
+}

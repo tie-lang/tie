@@ -1,0 +1,149 @@
+type tie<tsh>
+// scripts/bootstrap-fp.tsh.tie —— 自举不动点校验（p.9.21：三阶，纯 tie/tshell）
+// ============================================================
+// 三阶不动点：tiec(入库) 编 driver → n1 → n2 → n3；SHA(n2)==SHA(n3) 即不动点
+// （certutil 求 SHA256，tie 侧取哈希行比对——fc /b 的返回码不可靠）。
+// 约 100 秒跑完三阶。
+//
+// 用法（repo 根）：
+//   tsh_main.exe -f scripts\bootstrap-fp.tsh.tie [输出目录] [fresh]
+// 输出目录默认 ..\_tiec_verify\fp（仓库外侧，避免污染工作树）；也可用环境
+// 变量 TIEC_FP_OUT 指定。**必须带输出目录 + fresh 双参数调用**（见 D4 注意）。
+// 输出：FIXED-POINT OK（exit 0）/ FIXED-POINT MISMATCH（exit 1）。
+//
+// ⚠ D4（p.9.21.7，tsh REPL v1 语义缺陷）：tsh 的脚本内变量赋值不稳定——
+//   同一轮运行中不同语句对同一变量可能看到不同值（实测：哨兵用默认目录、
+//   编译用参数目录、[4/4] 又用默认目录），`out = arg_at(0)` 在 1 参数布局下
+//   静默失效。**本脚本的全部使用点现调 resolve_out()，不经变量中转**；每次
+//   运行结束请对产物直接 certutil 复核哈希（脚本外操作台步骤）。
+//
+// 注意：编译语义/上限/诊断类改动必须「先落改动 → 自举升格 → 再改依赖它的
+// 源码」；缓存键不含编译器版本，一律 --no-cache。
+
+var tiec = ".\\compiler\\tiec.exe"
+var src = "compiler\\driver.tie"
+var flags = "-l2 -t0 --no-warn --no-cache"
+
+// 输出目录解析（每次需要处现调，不用变量中转——D4）。
+// 取值优先级：环境变量 TIEC_FP_OUT > 第 1 脚本参数 > 默认 ..\_tiec_verify\fp。
+func resolve_out(dflt: string) -> string {
+    var e = get_env("TIEC_FP_OUT")
+    if str_len(e) > 0 {
+        return e
+    }
+    if arg_count() >= 1 && !is_empty(arg_at(0)) {
+        return arg_at(0)
+    }
+    return dflt
+}
+
+func is_ws(ch: string) -> bool {
+    if ch == " " {
+        return true
+    }
+    if ch == "\t" {
+        return true
+    }
+    if ch == "\r" {
+        return true
+    }
+    if ch == "\n" {
+        return true
+    }
+    return false
+}
+
+// 去两端空白（deps-check 同款）
+func trim_ws(s: string) -> string {
+    var a: i64 = 0
+    var n = str_len(s)
+    while a < n && is_ws(str_char(s, a)) {
+        a = a + 1
+    }
+    var b = n
+    while b > a && is_ws(str_char(s, b - 1)) {
+        b = b - 1
+    }
+    return substr(s, a, b)
+}
+
+// certutil 过滤后的输出里找 64 字符的哈希行；找不到返回空串
+func hash_line(s: string) -> string {
+    var lines = split_lines(s)
+    var i: i64 = 0
+    while i < len(lines) {
+        var t = trim_ws(lines[i])
+        if str_len(t) == 64 {
+            return t
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ---------- 0. 输出目录（mkdir + 哨兵自检） ----------
+// p.9.17.2 修正：原 cmd if not exist/mkdir 组合对正斜杠路径报「命令语法不正确」
+//（tsh 参数路径恒被规范化为正斜杠）——改用底座 mkdir_all 原语（Windows API
+// 直接接受正斜杠），消除对 outdir 斜杠形式的敏感。
+mkdir_all(resolve_out("..\\_tiec_verify\\fp"))
+var sentinel = resolve_out("..\\_tiec_verify\\fp") + "\\_fp_sentinel.txt"
+file_write(sentinel, "fp")
+if !file_exists(sentinel) {
+    println("[fp] FATAL：输出目录哨兵写入失败（out 未生效或不可写）: " + resolve_out("..\\_tiec_verify\\fp"))
+    exit(2)
+}
+println("[fp] 输出目录 = " + resolve_out("..\\_tiec_verify\\fp"))
+
+// 断点续跑：三阶各约 35 秒，三阶连跑会顶到单命令 120 秒上限——**以 .done
+// 标记**判定该阶是否已完成（不能只看 exe 是否存在：被 120 秒 SIGTERM 切断
+// 的半截 exe 也会存在，实测导致 n3 由坏 n2 编出、比对恒 MISMATCH）。
+// 传 fresh 忽略标记强制全部重跑。
+var fresh: bool = false
+if arg_count() >= 2 && arg_at(1) == "fresh" {
+    fresh = true
+}
+
+// ---------- 1..3 三阶 ----------
+if fresh || !file_exists(resolve_out("..\\_tiec_verify\\fp") + "\\n1.done") {
+    var rc1 = exec_code("cmd /c " + tiec + " " + src + " " + flags + " -o " + resolve_out("..\\_tiec_verify\\fp") + "\\n1.exe >nul 2>&1")
+    if rc1 != 0 {
+        println("[1/4] 入库 tiec 编译失败 rc=" + to_string(rc1))
+        exit(1)
+    }
+    file_write(resolve_out("..\\_tiec_verify\\fp") + "\\n1.done", "ok")
+}
+println("[1/4] n1 完成")
+
+if fresh || !file_exists(resolve_out("..\\_tiec_verify\\fp") + "\\n2.done") {
+    var rc2 = exec_code("cmd /c " + resolve_out("..\\_tiec_verify\\fp") + "\\n1.exe " + src + " " + flags + " -o " + resolve_out("..\\_tiec_verify\\fp") + "\\n2.exe >nul 2>&1")
+    if rc2 != 0 {
+        println("[2/4] n1 自编失败 rc=" + to_string(rc2))
+        exit(1)
+    }
+    file_write(resolve_out("..\\_tiec_verify\\fp") + "\\n2.done", "ok")
+}
+println("[2/4] n2 完成")
+
+if fresh || !file_exists(resolve_out("..\\_tiec_verify\\fp") + "\\n3.done") {
+    var rc3 = exec_code("cmd /c " + resolve_out("..\\_tiec_verify\\fp") + "\\n2.exe " + src + " " + flags + " -o " + resolve_out("..\\_tiec_verify\\fp") + "\\n3.exe >nul 2>&1")
+    if rc3 != 0 {
+        println("[3/4] n2 自编失败 rc=" + to_string(rc3))
+        exit(1)
+    }
+    file_write(resolve_out("..\\_tiec_verify\\fp") + "\\n3.done", "ok")
+}
+println("[3/4] n3 完成")
+
+// ---------- 4. 哈希比对 n2 vs n3 ----------
+// 两个实测坑：①不要经 `cmd /c ... | find ... > 文件` 中转——管道加重定向在本
+// 环境产 0 字节文件，直接 exec_output 最稳；②不用 fc /b——exec_code 对 fc 的
+// 返回码不可靠（一致文件也报差异）。③resolve_out 必须内联进命令串——中转
+// 变量（fp_now）会踩 D4 赋值缺陷拿到空值。
+var d2 = hash_line(exec_output("certutil -hashfile " + resolve_out("..\\_tiec_verify\\fp") + "\\n2.exe SHA256"))
+var d3 = hash_line(exec_output("certutil -hashfile " + resolve_out("..\\_tiec_verify\\fp") + "\\n3.exe SHA256"))
+if d2 == d3 && str_len(d2) == 64 {
+    println("[4/4] FIXED-POINT OK（SHA256 = " + d2 + "）")
+    exit(0)
+}
+println("[4/4] FIXED-POINT MISMATCH（n2=[" + d2 + "] n3=[" + d3 + "]）")
+exit(1)

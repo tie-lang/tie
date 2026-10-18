@@ -1,0 +1,770 @@
+type tie<class>
+// compiler/backend/irgen_p1.tie —— irgen 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 irgen.tie。
+namespace irgen {
+// 是否程序入口：主文件的 main（可能在命名空间内，如 "app::main"）。
+// 入口全名由 frontend 的 reg_fn 按「file id 0 + 末段 main」登记。
+func is_entry_name(full_name: string) -> bool {
+    if full_name == "main" {
+        return true
+    }
+    if str_len(sstate.g_entry_name) > 0 && full_name == sstate.g_entry_name {
+        return true
+    }
+    return false
+}
+
+// 变量引用：load 指令（从 alloca 读取）。含全局变量（标量 load @g /
+// 表全局 load ptr, ptr @g——表指针本身）。
+func tig_var_ref(name_id: i64) -> i64 {
+    if scope_get_global(name_id) < 0 {
+        sm_err_msg = "变量 '" + intern.lookup(name_id) + "' 未入作用域（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    if g_lookup_is_global == 2 {
+        // 全局表：load ptr, ptr @g（槽中存表指针）
+        var inst = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load ptr
+        ir.add_operand(inst, g_lookup_alloca, 3)  // OK_GLOBAL 全局地址（池 id）
+        return ir.get_value(inst)
+    }
+    var ty = g_lookup_ty
+    var inst = ir.new_inst(g_cur_block, 21, ty)  // load
+    if g_lookup_is_global > 0 {
+        ir.add_operand(inst, g_lookup_alloca, 3)  // OK_GLOBAL 全局地址（@name）
+    } else {
+        // 局部槽（alloca %N）：必须 kind 0——kind 3 会让 llvmgen 按值 id
+        // 当 intern id 查名字，局部指令 id 与 intern id 数值重叠时误命中全局
+        // （如 alloca id=1 而 intern(1)="g" → 生成 load ptr @g 崩溃）
+        ir.add_operand(inst, g_lookup_alloca, 0)
+    }
+    return ir.get_value(inst)
+}
+
+// ---------- 函数签名辅助（sstate fn_keys/fn_vals/sg_*） ----------
+// 查函数签名 id（sstate.fn_sig）；未定义 -1
+func fn_sig_id(full: string) -> i64 {
+    return sstate.fn_sig(full)
+}
+
+// 签名 → 参数类型 id 表（扁平段 [0, nparams)）
+func fn_param_tys(sig: i64) -> table<i64> {
+    var off = sg_off[sig]
+    var n = sg_nparams[sig]
+    var out: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(out, sp_tys[off + i])
+        i = i + 1
+    }
+    return out
+}
+
+// 签名 → 返回类型 id
+func fn_ret_ty(sig: i64) -> i64 {
+    return sg_ret[sig]
+}
+
+// 签名 → 参数个数
+func fn_nparams(sig: i64) -> i64 {
+    return sg_nparams[sig]
+}
+
+// ---------- 裸调用名解析（irgen 版，对齐 sinfer.resolve_call_name） ----------
+// 在当前函数命名空间前缀链中补全裸名（如 sstate 内 child() → sstate::child）。
+// 返回全名（裸名已存在或内置 → 原样）。
+// 注意：**逐级外层**补全（log::error::no_file 内 lookup → log::error::lookup
+// 不存在时继续试 log::lookup）——曾只试最近一层，嵌套命名空间（log.error.no_file）
+// 内裸调用私有函数（log::lookup）解析失败报"无签名"
+func resolve_call_name(fnm: string) -> string {
+    if sstate.fn_sig(fnm) >= 0 {
+        return fnm
+    }
+    // 候选 2：当前函数命名空间前缀**逐级**外层补全
+    var full = g_cur_fn_name
+    while str_len(full) > 0 {
+        var last = sstate.rfind_ns(full)
+        if last < 0 {
+            break
+        }
+        var prefix = ig_slice(full, 0, last)
+        if prefix == "" {
+            break
+        }
+        var cand = prefix + "::" + fnm
+        if sstate.fn_sig(cand) >= 0 {
+            return cand
+        }
+        full = prefix  // 再往上一层
+    }
+    // 候选 3：using 前缀（driver 树无 using，防御）
+    var off: i64 = 0
+    var u: i64 = 0
+    while u < len(using_lens) {
+        var ln = using_lens[u]
+        var full2: string = ""
+        var i: i64 = 0
+        while i < ln {
+            if i > 0 {
+                full2 = full2 + "::"
+            }
+            full2 = full2 + intern.lookup(using_prefixes[off + i])
+            i = i + 1
+        }
+        var cand2 = full2 + "::" + fnm
+        if sstate.fn_sig(cand2) >= 0 {
+            return cand2
+        }
+        // 别名增名（2026-10-12，镜像 sinfer.resolve_call_name）：using 记录的
+        // 名称可能已被改名为别名——回退再试（两处实现必须同时对齐）
+        var rn5 = sstate.ns_rename_target(full2)
+        if str_len(rn5) > 0 {
+            var cand3 = rn5 + "::" + fnm
+            if sstate.fn_sig(cand3) >= 0 {
+                return cand3
+            }
+        }
+        off = off + ln
+        u = u + 1
+    }
+    return fnm
+}
+
+// 本地字符串切片 [start, end)（码点级）
+// 性能重写（O(n)）：字节定位 + StringBuilder 拷贝（旧逐字符拼接 O(n²)）
+func ig_slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = str_len(s)
+    if start < 0 {
+        start = 0
+    }
+    if end > n {
+        end = n
+    }
+    if start >= end {
+        return ""
+    }
+    var b: i64 = 0
+    var i: i64 = 0
+    var bstart: i64 = 0
+    while i < end {
+        if i == start {
+            bstart = b
+        }
+        b = b + utf8_seq_len(s, b)
+        i = i + 1
+    }
+    var sb = string_builder()
+    var k: i64 = bstart
+    while k < b {
+        sb_append_byte(sb, str_byte(s, k))
+        k = k + 1
+    }
+    return sb_build(sb)
+}
+
+// 查找字符串中第一个指定字符的下标（-1 = 无）。
+// 历史 bug：gen_call 曾调用未定义的裸 `find_char`（老式点号名兼容探测），
+// 导致所有 import 本模块的程序编译报"未定义的函数 'find_char'"。本辅助补齐。
+func ig_find_char(s: string, c: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 命名空间函数全名 → LLVM 符号（:: → $；对齐 llvmgen.ns_replace）
+func ig_ns_sym(full: string) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    var n = str_len(full)
+    while i < n {
+        if i + 1 < n && str_char(full, i) == ":" && str_char(full, i + 1) == ":" {
+            out = out + "$"
+            i = i + 2
+        } else {
+            out = out + str_char(full, i)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ==================== 阶段 A：扩展表达式/语句 ====================
+// 类型 → LLVM 桥后缀（表元素/实参类型分派；对齐 Rust table_elem_suffix）
+// string → string；bool → bool；其余（i64/f64/ptr 等）→ 按 llvm 类型
+func bridge_suffix(t: i64) -> string {
+    if t == types.named(TK_STR) {
+        return "string"
+    }
+    if t == types.named(TK_BOOL) {
+        return "bool"
+    }
+    if t == types.named(TK_F64) {
+        return "f64"
+    }
+    return "i64"
+}
+
+// 元素大小（tie_table_new 参数 / 槽字节步长）：复合元素精确尺寸（struct/enum/fn/
+// 元组），标量保持既有行为（bool=1，其余 8）。实现见 irgen_str.tie type_byte_size。
+func elem_size(t: i64) -> i64 {
+    return type_byte_size(t)
+}
+
+// Call/MethodCall 实参节点读取（2026-08-14 泛型槽偏移，权威约定见 ast.tie 头）：
+// children[0] 是泛型槽（-1 哨兵或 N_TYPE_ARGS），实参从 children[slot_off] 起。
+// k 为实参序号（0 起）。与语义层 sstate.slot_off 同源，保证偏移判定一致。
+func call_arg(id: i64, k: i64) -> i64 {
+    return sstate.child(id, sstate.slot_off(id) + k)
+}
+
+// 变参打包：多余实参节点 → 动态表（tie_table_new + 逐元素 push）。
+// 元素类型 = 变参元素类型 T（标量）。按值类型选桥（对齐 tig_table_lit）。
+func tig_variadic_table(nodes: table<i64>, elem: i64) -> i64 {
+    // 元素类型 = 变参元素类型 T（标量）。按值类型选桥（对齐 tig_table_lit）。
+    var size = elem_size(elem)
+    var size_v = tig_int_lit_ty(size, types.named(TK_I64))
+    var t = s21_table_new(size_v)
+    var i: i64 = 0
+    while i < len(nodes) {
+        // p.8.2.10 展开实参（N_SPREAD_ARG）：operand 是表，运行期把其全部元素
+        // 依序并入变参表（tig_variadic_append_spread 发射复制循环）。
+        if s_tags[nodes[i]] == N_SPREAD_ARG {
+            var sp_op = sstate.child(nodes[i], 0)
+            var src = tig_expr(sp_op)
+            if src < 0 {
+                return -1
+            }
+            if tig_variadic_append_spread(t, src, elem) < 0 {
+                return -1
+            }
+            i = i + 1
+            continue
+        }
+        var v = tig_expr(nodes[i])
+        if v < 0 {
+            return -1
+        }
+        var suffix = bridge_suffix(elem)
+        var pty = types.named(TK_I64)
+        var vt = node_types[nodes[i]]
+        if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR)) {
+            suffix = "string"
+            pty = types.named(TK_STR)
+        } else if vt >= 0 && (vt == types.named(TK_F64) || vt == types.named(TK_F32)) {
+            suffix = "f64"
+            pty = types.named(TK_F64)
+        } else if suffix == "string" {
+            pty = types.named(TK_STR)
+        } else if suffix == "bool" {
+            pty = types.named(TK_BOOL)
+        }
+        s21_table_push(t, pty, v)
+        i = i + 1
+    }
+    return t
+}
+
+// p.8.2.10 展开实参：把源表 src 的全部元素运行期依序并入变参表 t（复制循环）。
+// 发射 4 块（cond/body/step/exit）线性小循环，逐元素 s21_table_at + s21_table_push。
+// 内部循环不做 loop_push/loop_pop（非用户循环——外层用户循环的 break/continue
+// 仍应导向用户循环标签，不受本复制循环干扰）。
+func tig_variadic_append_spread(t: i64, src: i64, elem: i64) -> i64 {
+    var elem_llvm_ty = types.named(TK_I64)
+    var suffix = bridge_suffix(elem)
+    var fk2 = types.kind(elem)
+    if fk2 == K_STRUCT || fk2 == K_ENUM || fk2 == K_FN || fk2 == K_TUPLE || elem == types.named(TK_ANY) {
+        elem_llvm_ty = elem
+    } else if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
+        suffix = "string"
+        elem_llvm_ty = elem
+    } else if suffix == "string" {
+        elem_llvm_ty = types.named(TK_STR)
+    } else if suffix == "bool" {
+        elem_llvm_ty = types.named(TK_BOOL)
+    } else if suffix == "f64" {
+        elem_llvm_ty = types.named(TK_F64)
+    }
+    // idx alloca + store 0
+    var idx_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))
+    ir.add_operand(idx_a, types.named(TK_I64), 2)
+    var idx_ptr = ir.get_value(idx_a)
+    var i0 = tig_int_lit_ty(0, types.named(TK_I64))
+    var st0 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st0, types.named(TK_I64), 2)
+    ir.add_operand(st0, i0, 0)
+    ir.add_operand(st0, idx_ptr, 0)
+    var cond_blk = ir.new_block(g_cur_func, interner.intern("spread.cond"))
+    var body_blk = ir.new_block(g_cur_func, interner.intern("spread.body"))
+    var step_blk = ir.new_block(g_cur_func, interner.intern("spread.step"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("spread.exit"))
+    var b0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b0, cond_blk, 1)
+    // cond: idx >= len(src) → exit
+    g_cur_block = cond_blk
+    var cur = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+    ir.add_operand(cur, idx_ptr, 0)
+    var cur_v = ir.get_value(cur)
+    var tlen = s21_table_len(src)
+    if tlen < 0 {
+        return -1
+    }
+    var done = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(done, cur_v, 0)
+    ir.add_operand(done, tlen, 0)
+    ir.add_operand(done, 5, 2)   // sge
+    var done_v = ir.get_value(done)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, done_v, 0)
+    ir.add_operand(cb, exit_blk, 1)
+    ir.add_operand(cb, body_blk, 1)
+    // body: item = src[idx]; push into t
+    g_cur_block = body_blk
+    var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))
+    ir.add_operand(ok_slot, types.named(TK_I8), 2)
+    var iv = s21_table_at(src, cur_v, ir.get_value(ok_slot), elem_llvm_ty)
+    if iv < 0 {
+        return -1
+    }
+    s21_table_push(t, elem_llvm_ty, iv)
+    var bb2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bb2, step_blk, 1)
+    // step: idx+1 → store → br cond
+    g_cur_block = step_blk
+    var add1 = ir.new_inst(g_cur_block, 0, types.named(TK_I64))
+    ir.add_operand(add1, cur_v, 0)
+    ir.add_operand(add1, 1, 2)
+    var add_v = ir.get_value(add1)
+    var st2 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st2, types.named(TK_I64), 2)
+    ir.add_operand(st2, add_v, 0)
+    ir.add_operand(st2, idx_ptr, 0)
+    var sb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(sb, cond_blk, 1)
+    g_cur_block = exit_blk
+    return 0
+}
+
+// 原子内存序标识符 → IMM（Relaxed=0 Acquire=1 Release=2 AcqRel=3 SeqCst=4）
+func atomic_order_imm(node: i64) -> i64 {
+    var nm = sstate.name_str(node)
+    if nm == "Acquire" {
+        return 1
+    }
+    if nm == "Release" {
+        return 2
+    }
+    if nm == "AcqRel" {
+        return 3
+    }
+    if nm == "SeqCst" {
+        return 4
+    }
+    return 0  // Relaxed / 其他（语义层已校验）
+}
+
+// 聚合类型 → 字段索引（元组：命名匹配 + ItemN/数字；struct：命名匹配）
+func agg_field_index(ty: i64, fname: string) -> i64 {
+    var k = types.kind(ty)
+    if k == K_TUPLE {
+        var idx = ty - BASE_TUPLE
+        var off = tup_offs[idx]
+        var n = tup_n[idx]
+        var i: i64 = 0
+        while i < n {
+            var fnid = tup_names[off + i]
+            if fnid >= 0 && intern.lookup(fnid) == fname {
+                return i
+            }
+            i = i + 1
+        }
+        // 匿名元组：ItemN（解构展开，N 从 1 起）或纯数字下标（.0/.1）
+        return num_field_index(fname)
+    }
+    if k == K_STRUCT {
+        var idx2 = ty - BASE_STRUCT
+        var off2 = cls_fldoff[idx2]
+        var n2 = cls_nfld[idx2]
+        var i2: i64 = 0
+        while i2 < n2 {
+            var fnid2 = fld_names[off2 + i2]
+            if fnid2 >= 0 && intern.lookup(fnid2) == fname {
+                return i2
+            }
+            i2 = i2 + 1
+        }
+    }
+    return -1
+}
+
+// 聚合类型 → 字段类型 id
+func agg_field_ty(ty: i64, idx: i64) -> i64 {
+    var k = types.kind(ty)
+    if k == K_TUPLE {
+        var t = ty - BASE_TUPLE
+        return tup_tys[tup_offs[t] + idx]
+    }
+    if k == K_STRUCT {
+        var s = ty - BASE_STRUCT
+        return fld_tys[cls_fldoff[s] + idx]
+    }
+    return types.named(TK_I64)
+}
+
+// 数字/ItemN 字段名解析：".0"/".1" → 字段下标；".Item1"/".Item2" → N-1。
+// 非法数字串返回 -1（parse_int 对非法输入报错，须先自行解析）。
+func num_field_index(fname: string) -> i64 {
+    var n = str_len(fname)
+    var start = 0
+    if n >= 5 && ig_slice(fname, 0, 4) == "Item" {
+        start = 4
+    }
+    var val: i64 = 0
+    var i: i64 = start
+    while i < n {
+        var cc = char_code(str_char(fname, i))
+        if cc < 48 || cc > 57 {
+            return -1  // 非数字字段名（未命中）
+        }
+        val = val * 10 + (cc - 48)
+        i = i + 1
+    }
+    if start == 4 {
+        return val - 1  // ItemN → N-1（1-based）
+    }
+    return val  // 纯数字 → 字段下标
+}
+
+// 2026-10-12：Winsock 符号单一来源（net_* 内建与用户 extern 直调共用判据）：
+// is_libc_sym 据此判「非 interp 桥」；tig_ext_call_typed 据此置 g_used_wsock
+// 触发 -lws2_32 链接。select/ioctlsocket/WSACleanup 为用户事件循环直调符号
+// （内建阻塞模型不经它们），登记以支持自建事件面。
+func is_wsock_sym(sym: string) -> bool {
+    if sym == "socket" || sym == "bind" || sym == "connect" || sym == "listen" ||
+        sym == "accept" || sym == "send" || sym == "recv" || sym == "sendto" ||
+        sym == "recvfrom" || sym == "closesocket" || sym == "htons" ||
+        sym == "inet_addr" || sym == "gethostbyname" || sym == "WSAStartup" ||
+        sym == "select" || sym == "ioctlsocket" || sym == "WSACleanup" ||
+        sym == "WSAGetLastError" || sym == "WSASetLastError" ||
+        sym == "getsockopt" || sym == "setsockopt" ||
+        sym == "getsockname" || sym == "getpeername" {
+        return true
+    }
+    return false
+}
+
+// 符号是否为 libc（llvmgen 无条件 declare 的符号；不触发 tie_interp 链接）
+func is_libc_sym(sym: string) -> bool {
+    if sym == "printf" || sym == "strlen" || sym == "strcmp" {
+        return true
+    }
+    if sym == "malloc" || sym == "free" || sym == "fopen" || sym == "fwrite" ||
+        sym == "fread" || sym == "fseek" || sym == "ftell" || sym == "fclose" || sym == "fflush" {
+        return true
+    }
+    // S2.1：libc memcpy（StringBuilder 数据拷贝；无需 tie_interp 链接）
+    if sym == "memcpy" {
+        return true
+    }
+    // 批次 7：libc memmove（map 有序数组插入平移；重叠安全，无需 tie_interp 链接）
+    if sym == "memmove" {
+        return true
+    }
+    if sym == "exit" || sym == "remove" {
+        return true
+    }
+    // r.1.6.6：libc/CRT 常用符号——abs（整数绝对值）/atexit（退出注册）/
+    // _setjmp/longjmp（闭包/分发栈回退，glibc 提供 _setjmp）。未登记会把纯
+    // libc 程序误判为 interp 桥，Linux 目标链接直接拒绝。
+    if sym == "abs" || sym == "atexit" || sym == "_setjmp" || sym == "longjmp" {
+        return true
+    }
+    // r.1.6.6：libc clock（tiec 内部计时点，Windows CRT/POSIX 均提供）——
+    // 未登记会把纯 libc 程序误判为 interp 桥，Linux 目标链接直接拒绝。
+    if sym == "clock" {
+        return true
+    }
+    // libm 数学函数（llvmgen 无条件 declare；f64 → f64）
+    if sym == "sqrt" || sym == "sin" || sym == "cos" || sym == "tan" ||
+        sym == "exp" || sym == "log" || sym == "floor" || sym == "ceil" ||
+        sym == "round" || sym == "pow" {
+        return true
+    }
+    // L1 1.2 新增数学内建：双曲/反三角/超越/舍入符号——未登记会误判为
+    // tie-interp 桥 → 假阳性 need_interp → 找不到 tie_interp.lib 链接失败。
+    if sym == "tanh" || sym == "sinh" || sym == "cosh" ||
+        sym == "asin" || sym == "acos" || sym == "atan" || sym == "atan2" ||
+        sym == "log2" || sym == "log10" || sym == "expm1" || sym == "log1p" ||
+        sym == "cbrt" || sym == "exp2" || sym == "trunc" ||
+        sym == "copysign" || sym == "fmod" || sym == "remainder" || sym == "hypot" {
+        return true
+    }
+    // p.6.4.4：libc _gcvt（to_string(f64)：非变参 CRT，写 %g 格式数字到缓冲。Windows
+    // clang 手写 IR 的 FP 变参（snprintf）会错位，故用非变参 _gcvt）
+    if sym == "_gcvt" {
+        return true
+    }
+    // runtime.a 退役：exec_code/get_env/time_now 内联到 libc 直调（不置 g_used_interp）
+    if sym == "system" || sym == "getenv" || sym == "time" {
+        return true
+    }
+    // p.6.4.1 内联基础原语：rand（rand_range）/ _write（print_err → stderr）
+    // 均为 CRT 符号（非 interp 桥）。
+    if sym == "rand" || sym == "_write" {
+        return true
+    }
+    // p.6.4.1 UTF-16 宽字符桥：Windows 系统调用面（kernel32/shell32，非 interp 桥）
+    // r.1.6.6：GetTickCount（kernel32 毫秒时钟，tiec 内部计时点）补登记——未登记
+    // 会把纯 libc 程序误判为 interp 桥；Linux 由 linux_compat.c shim 解析。
+    if sym == "GetCommandLineW" || sym == "CommandLineToArgvW" || sym == "LocalFree" ||
+        // 2026-10-16：补 GetEnvironmentVariableW —— tiej execrun.env_get（Windows
+        // 实时环境块直读；tie get_env 内置读 CRT 快照，进程内新写不可见）。
+        sym == "SetEnvironmentVariableW" || sym == "GetEnvironmentVariableW" ||
+        sym == "GetCurrentDirectoryW" ||
+        sym == "GetTickCount" {
+        return true
+    }
+    // p.6.6.20 std/sqlite 动态加载：kernel32 LoadLibraryW/GetProcAddress
+    //（winsqlite3.dll 无 .lib 可链，须动态加载；符号经 CRT 隐式链 kernel32）
+    if sym == "LoadLibraryW" || sym == "GetProcAddress" {
+        return true
+    }
+    // 一期并发 A4 执行层：kernel32 线程 + 同步原语（系统库默认自动链入，非 interp 桥）
+    // Sleep：kernel32 毫秒休眠（interp sleep_ms 内建底层，批次⑤）。Windows 目标下
+    // 未登记会被 tig_ext_call_typed 误判为 interp 桥 → 置 g_used_interp → driver
+    // 编译链（interp 内嵌）假阳性 need_interp。于此处无条件登记（kernel32 恒可链）。
+    if sym == "Sleep" {
+        return true
+    }
+    if sym == "CreateThread" || sym == "WaitForSingleObject" || sym == "CloseHandle" ||
+        sym == "GetCurrentThreadId" ||
+        sym == "InitializeCriticalSection" || sym == "DeleteCriticalSection" ||
+        sym == "EnterCriticalSection" || sym == "LeaveCriticalSection" ||
+        sym == "InitializeConditionVariable" || sym == "WakeConditionVariable" ||
+        sym == "SleepConditionVariableCS" {
+        return true
+    }
+    // p.6.4.2/p.6.4.3 文件系统原语内联：kernel32/shell32 *W API（UTF-16 安全路径）
+    // + CRT memset（SHFILEOPSTRUCTW 零化）。全为系统库符号，非 interp 桥。
+    if sym == "memset" || sym == "CreateFileW" || sym == "ReadFile" ||
+        sym == "WriteFile" || sym == "FlushFileBuffers" || sym == "GetFileSizeEx" ||
+        sym == "CreateDirectoryW" || sym == "GetFileAttributesW" ||
+        sym == "DeleteFileW" || sym == "FindFirstFileW" || sym == "FindNextFileW" ||
+        sym == "FindClose" || sym == "CopyFileW" || sym == "MoveFileW" ||
+        sym == "SHFileOperationW" ||
+        // 控制台编码契约（irgen_console.tie）：GetConsoleMode/WriteConsoleW/
+        // ReadConsoleW 同为 kernel32 符号（非 interp 桥）——未登记会误判桥。
+        // 2026-10-16：补 SetConsoleMode/ReadConsoleInputW/GetConsoleScreenBufferInfo
+        // ——终端原语（tiej term.tie：逐键读取/VT 开启/尺寸；设计稿 §4.3）。
+        sym == "GetConsoleMode" || sym == "WriteConsoleW" || sym == "ReadConsoleW" ||
+        sym == "SetConsoleMode" || sym == "ReadConsoleInputW" ||
+        sym == "GetConsoleScreenBufferInfo" {
+        return true
+    }
+    // p.6.4.6 exec_output 进程管道内联：kernel32 进程/管道/句柄 API（非 interp 桥）。
+    // CreatePipe/CreateProcessW/ReadFile 捕获子进程 stdout；SetHandleInformation 置
+    // 可继承位；WaitForSingleObject/CloseHandle/GetExitCodeProcess 收尾。kernel32 经
+    // CRT 隐式链接，无需额外 .lib。GetStdHandle(负句柄常量) 供 STARTUPINFOW.hStdInput。
+    if sym == "CreatePipe" || sym == "CreateProcessW" || sym == "SetHandleInformation" ||
+        sym == "GetExitCodeProcess" || sym == "GetStdHandle" {
+        return true
+    }
+    // p.6.4.5 网络原语内联：Winsock2 符号（ws2_32，非 interp 桥）。仅 Windows
+    // 目标下程序实际引用（net_* 调内联 IR 会 emit 这些符号），Linux 交叉目标
+    // 若用 net_* 自然缺 ws2_32——与本文件其余 Win32 系统库符号处理一致。
+    // 2026-10-12：清单收敛至 is_wsock_sym 单一来源（新增 select/ioctlsocket/
+    // WSACleanup——用户事件循环 extern 直调；tig_ext_call_typed 同判据置位）。
+    if is_wsock_sym(sym) {
+        return true
+    }
+    // r.1.6.2：Linux POSIX 文件系统符号（file_* 内置 Linux 分支，UTF-8 直通）。
+    // 全为 libc 符号（非 interp 桥）——Linux 目标链 tie_interp.lib 会直接报错，
+    // 凡引用 POSIX 文件符号必须置 is_libc，否则 link_exe 判 need_interp 失败。
+    if sym == "open" || sym == "read" || sym == "write" || sym == "close" ||
+        sym == "access" || sym == "unlink" || sym == "mkdir" || sym == "rmdir" ||
+        sym == "opendir" || sym == "readdir" || sym == "closedir" ||
+        sym == "stat" || sym == "rename" {
+        return true
+    }
+    // r.1.6.3：Linux POSIX process/cwd/env 符号（exec_output/cwd/set_env 内置
+    // Linux 分支，UTF-8 直通；全为 libc 符号，非 interp 桥——同 r.1.6.2 注释）。
+    // pipe/fork/dup2/execl/waitpid 供 exec_output 管道捕获；getcwd/setenv 供
+    // cwd/set_env；strlen 已登记（arg_string/exec_output 取参长）。
+    // 2026-10-15：补 chdir/execv/pipe2/_exit —— tiej 执行域引擎（execrun.tie，
+    // POSIX 分支）直启/管道/接线用（无 shell 借用：fork+chdir+dup2+execv）。
+    // 2026-10-16：补 isatty/tcgetattr/tcsetattr —— tiej 终端原语（term.tie，
+    // POSIX raw 模式；设计稿 §4.3）。
+    if sym == "getcwd" || sym == "setenv" || sym == "pipe" || sym == "fork" ||
+        sym == "dup2" || sym == "execl" || sym == "waitpid" ||
+        sym == "chdir" || sym == "execv" || sym == "pipe2" || sym == "_exit" ||
+        sym == "isatty" || sym == "tcgetattr" || sym == "tcsetattr" {
+        return true
+    }
+    // r.1.6.4：Linux POSIX socket 符号（net_* 内置 Linux 分支直调 libc socket 族，
+    // UTF-8/字节 IO 直通；全为 libc 符号，非 interp 桥——同 r.1.6.2 注释）。
+    // socket/connect/bind/listen/accept/send/recv/sendto/recvfrom 同 libc 名；
+    // gethostbyname/inet_addr 已在上方 Winsock 组登记（POSIX 亦存在）。
+    if sym == "socket" || sym == "connect" || sym == "bind" || sym == "listen" ||
+        sym == "accept" || sym == "send" || sym == "recv" ||
+        sym == "sendto" || sym == "recvfrom" {
+        return true
+    }
+    // 2026-10-12：Linux 事件面符号（epoll/非阻塞；libc，非 interp 桥）。
+    // 用户自建事件循环直调（select 在上方 Winsock 组已含，POSIX 亦在 libc）。
+    if sym == "epoll_create" || sym == "epoll_create1" || sym == "epoll_ctl" ||
+        sym == "epoll_wait" || sym == "fcntl" || sym == "poll" {
+        return true
+    }
+    // r.1.6.16：Linux 目标私有豁免——由 trm_lite_linux.a 的 compat shim 成员解析
+    // （BCryptGenRandom = getrandom(2) shim，r.1.6.8；tie_regex_* 五原语 = POSIX
+    // regcomp 桥，r.1.6.11）。仅在 Linux 目标登记：Windows 下二者保持原 interp
+    // 桥路径（tie_interp.lib / bcrypt.dll 解析），避免破坏既有链接行为。
+    // 注意 tig_is_linux() 取 g_asm_target（driver 注入，恒非空）。
+    if tig_is_linux() {
+        if sym == "BCryptGenRandom" ||
+            sym == "tie_regex_match" || sym == "tie_regex_find" ||
+            sym == "tie_regex_find_all" || sym == "tie_regex_group" ||
+            sym == "tie_regex_replace" {
+            return true
+        }
+        // r.1.6.18：trm-lite Win32 同步原语对等（tl_linux_shim.o 成员提供 pthread
+        // 实现：Sleep→nanosleep、WakeAllConditionVariable→pthread_cond_broadcast）——
+        // std_net_bytes 等复杂形态程序的 channel 广播/时限路径，Linux 由 .a 解析。
+        if sym == "Sleep" || sym == "WakeAllConditionVariable" {
+            return true
+        }
+    }
+    return false
+}
+
+// 符号扩展：src 类型值 → dst 类型（sext opcode 19）。trit/窄整数提升用。
+func tig_sext(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
+    var sext = ir.new_inst(g_cur_block, 19, dst_ty)
+    ir.add_operand(sext, src_ty, 2)  // 源类型 IMM
+    ir.add_operand(sext, v, 0)
+    return ir.get_value(sext)
+}
+
+// 整数 → f64 提升（sitofp opcode 28）：数学函数整数实参（sqrt(4)）转浮点。
+// 已是 f64/f32 直传；窄整数/无符号按有符号 sitofp（tie 整数有符号语义）。
+func tig_to_f64(v: i64, vt: i64) -> i64 {
+    if types.is_int(vt) {
+        var s = ir.new_inst(g_cur_block, 28, types.named(TK_F64))  // sitofp
+        ir.add_operand(s, vt, 2)  // 源类型 IMM
+        ir.add_operand(s, v, 0)
+        return ir.get_value(s)
+    }
+    return v  // 已 f64/f32（或未知 → 直传）
+}
+
+// i8 返回桥 → bool（i1）：call i8 → icmp ne i8 %r, 0（对齐 Rust i8→i1 转换）
+func tig_bool_bridge1(sym: string, v: i64, vty: i64) -> i64 {
+    var r = tig_ext_call1(sym, v, vty, types.named(TK_I8))
+    if r < 0 {
+        return -1
+    }
+    var inst = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne
+    ir.add_operand(inst, r, 0)
+    ir.add_operand(inst, 0, 2)
+    ir.add_operand(inst, 1, 2)  // ne
+    return ir.get_value(inst)
+}
+
+// 双字符串参数 i8 返回桥 → bool（file_copy/file_move/untar_gz/unzip/copy_dir 等）
+func tig_bool_bridge2(sym: string, v1: i64, v2: i64) -> i64 {
+    var r = tig_ext_call2(sym, v1, types.named(TK_STR), v2, types.named(TK_STR), types.named(TK_I8))
+    if r < 0 {
+        return -1
+    }
+    var inst = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne
+    ir.add_operand(inst, r, 0)
+    ir.add_operand(inst, 0, 2)
+    ir.add_operand(inst, 1, 2)  // ne
+    return ir.get_value(inst)
+}
+
+// file_write/file_append：UTF-8 安全桥（tie_file_write / tie_file_append，
+// Rust std::fs 覆盖写 / OpenOptions 追加写）。曾用 libc fopen("wb"/"ab") +
+// fwrite——中文路径按 ANSI 代码页误读必失败。返回 bool（成功与否）。
+func tig_file_write(p: i64, c: i64, append: bool) -> i64 {
+    if append {
+        return tig_bool_bridge2("tie_file_append", p, c)
+    }
+    return tig_bool_bridge2("tie_file_write", p, c)
+}
+
+// file_exists：UTF-8 安全桥（tie_file_exists，Rust std::fs File::open 探测）。
+// 曾用 libc fopen(path, "rb")——Windows ANSI 代码页误读 UTF-8 中文路径，
+// 中文目录/文件名的存在性检查必失败（tiec 编译中文路径源文件报"读取源码失败"）。
+// 桥返回 i8 → icmp ne 0 → bool（对齐 Rust i8→i1 转换）。
+func tig_file_exists(p: i64) -> i64 {
+    return tig_bool_bridge1("tie_file_exists", p, types.named(TK_STR))
+}
+
+// 收集模块全部 extern 函数名（顶层 extern 声明节点），懒初始化
+func collect_extern_fns() {
+    g_extern_ids = table_new_i64()
+    var n2 = len(g_extra_tops)
+    var i3: i64 = 0
+    while i3 < n2 {
+        var s3 = g_extra_tops[i3]
+        if s_tags[s3] == 117 {
+            table_push(g_extern_ids, interner.intern(sstate.name_str(s3)))
+        }
+        i3 = i3 + 1
+    }
+    g_extern_ready = 1
+}
+
+// 判定 interned id 是否为用户 extern（稀疏表线性 id 比对，O(externs) ≈ O(1)）。
+// 入参为「已 interned」的函数全名 id（tig_user_call 的 sym），避免逐调用 re-intern。
+func is_extern_fn_id(fid: i64) -> bool {
+    if g_extern_ready == 0 {
+        collect_extern_fns()
+    }
+    var gi2: i64 = 0
+    while gi2 < len(g_extern_ids) {
+        if g_extern_ids[gi2] == fid {
+            return true
+        }
+        gi2 = gi2 + 1
+    }
+    return false
+}
+
+// 动态库边界类型检查（任务 36 + S10 扩展）：标量 + string + slice<T> + repr(C) pod
+// struct 可跨动态库边界；void 仅作返回类型。
+//   - slice<T>：{ptr,len} 两 i64，C ABI 良定义（如 {uintptr_t, size_t}）；
+//   - repr(C) pod struct：仅标量/固定长数组/嵌套 pod，布局明确可序列化；
+// 表/map/enum/元组/函数值/port 的堆布局跨语言不可见 → 违例返回错误消息（空串 = 允许）。
+func dynlib_ty_ok(t: i64) -> string {
+    if t == types.named(TK_VOID) {
+        return ""
+    }
+    if t == types.named(TK_STR) {
+        return ""
+    }
+    if types.is_int(t) || types.is_float(t) {
+        return ""
+    }
+    if t == types.named(TK_BOOL) || t == types.named(TK_TRIT) || t == types.named(TK_CHAR) {
+        return ""
+    }
+    // S10 扩展链面：slice<T> = {ptr,len}（指针+长度两个 i64，跨边界布局确定）
+    if types.kind(t) == K_SLICE {
+        return ""
+    }
+    // S10 扩展链面：repr(C) pod struct（固定 C 内存布局，字段仅标量）
+    if is_repr_c_pod(t) {
+        return ""
+    }
+    return "类型 '" + types.type_name(t) + "' 不能跨动态库边界（仅标量/string/slice/repr(C) pod struct 可跨库）"
+}
+
+}

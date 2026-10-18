@@ -1,0 +1,899 @@
+type tie<class>
+// ============================================================================
+// ext/qrdec/qrdec.tie —— QR 码解码（命名空间 qrdec，纯 tie）p.9.1.1.13
+// QR Code decoder. 依赖 ext/qr 生成端（复用其 GF(256) RS / 掩码 / 格式信息知识
+// 反转）。data 平面：模块矩阵（0/1，table<i64> 行优先）→ 文本；或二值图像字节
+// → 文本。
+//
+// 支持范围（Scope / documented boundaries）：
+//   - 版本 1（21×21）与 2（25×25），全部纠错等级（L/M/Q/H），单块数据码字
+//     （v1/v2 各 ECL 均单块，无交织）——与生成端 ext/qr 完全对称。
+//   - 输入：decode(matrix,size) 干净的 0/1 模块矩阵（无旋转/透视）；或者
+//     decode_image(img,w,h,scale) 二值图像（1=暗，含 4 模块 quiet zone，整倍
+//     scale，正交摆放）。定位方式：依 quiet zone + 整倍 scale 重建网格，再经
+//     模块级 finder 图案校验确保对齐。
+//   未支持（明确边界，不硬撑）：版本 ≥3、多块交织、旋转/透视/畸变图像。
+//
+// 接口：
+//   decode(matrix, size) -> string    模块矩阵 → 解码文本；失败返回 "" 且
+//                                     err_msg() 可查。
+//   decode_image(img, w, h, scale) -> string  二值图像 → 解码文本。
+//   correct(cw, ecc_n) -> table<i64>  完整码字流（data||ecc）→ RS 纠错后的
+//                                     完整码字流（BM+Chien+Forney；探针对拍用）。
+//   err_msg() -> string               最近一次解码失败说明。
+//
+// 实现要点：
+//   - 格式信息：读第一份 15 位（draw_format 的列 8 排布），与 BCH(15,5) 全部
+//     32 候选（多项式 0x537，XOR 0x5412）按汉明距取最近者→ ECL+掩码号。
+//   - 掩码：8 种 XOR 与生成端逐位一致；读数据时对非功能模块 XOR mask 复原。
+//   - 数据位流：严格复现生成端 place_data 的之字形扫描顺序。
+//   - RS 纠错：Berlekamp-Massey 求位置多项式 + Chien 搜索 + Forney 求幅值；
+//     GF(256) 本原多项式 0x11D、原元 2，生成根 α^0..α^(ecc-1)。
+// ============================================================================
+
+// ---- 模块级全局（命名空间外；同 ext/qr 布局） ----
+var de_exp: table<i64>;   // GF(256) exp 表
+var de_log: table<i64>;   // GF(256) log 表
+var de_gf_ok: i64 = 0;    // GF 表是否已构建
+var de_err: string = "";  // 最近一次错误消息
+
+namespace qrdec {
+
+// ---- GF(256) 算术（本原多项式 0x11D，本原元 2） ----
+func gf_ensure() {
+    if de_gf_ok == 1 {
+        return
+    }
+    de_exp = table_new_i64()
+    de_log = table_new_i64()
+    var i: i64 = 0
+    while i < 512 {
+        table_push(de_exp, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < 256 {
+        table_push(de_log, 0)
+        i = i + 1
+    }
+    var x: i64 = 1
+    i = 0
+    while i < 255 {
+        de_exp[i] = x
+        de_log[x] = i
+        x = x * 2
+        if x >= 256 {
+            x = x ^ 0x11D
+        }
+        i = i + 1
+    }
+    i = 255
+    while i < 512 {
+        de_exp[i] = de_exp[i - 255]
+        i = i + 1
+    }
+    de_gf_ok = 1
+}
+
+func gf_mul(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 {
+        return 0
+    }
+    return de_exp[(de_log[a] + de_log[b]) % 255]
+}
+
+// 非零元逆元。
+func gf_inv(a: i64) -> i64 {
+    return de_exp[(255 - de_log[a]) % 255]
+}
+
+// 多项式求值 Σp[i]*x^i。
+func poly_eval(p: table<i64>, x: i64) -> i64 {
+    var acc: i64 = 0
+    var i: i64 = len(p) - 1
+    while i >= 0 {
+        acc = gf_mul(acc, x)
+        if p[i] != 0 {
+            acc = acc ^ p[i]
+        }
+        i = i - 1
+    }
+    return acc
+}
+
+// 码字流 → 伴随式 S[i] = R(α^i), i=0..t-1。全零返回 0。
+func syndromes(r: table<i64>, n: i64, t: i64, ref out: table<i64>) -> i64 {
+    var allzero: i64 = 1
+    var i: i64 = 0
+    while i < t {
+        var s: i64 = 0
+        var j: i64 = 0
+        while j < n {
+            var e = (i * (n - 1 - j)) % 255
+            if e < 0 {
+                e = e + 255
+            }
+            if r[j] != 0 {
+                s = s ^ gf_mul(r[j], de_exp[e])
+            }
+            j = j + 1
+        }
+        out[i] = s
+        if s != 0 {
+            allzero = 0
+        }
+        i = i + 1
+    }
+    return allzero
+}
+
+// Berlekamp-Massey：伴随式 s[]（长度 t）→ 错误位置多项式 Λ[]。
+// 返回 0 成功 / 1 失败（不可纠：deg > t/2）。cat 为输出容器（长度 t+2，全 0）。
+func berlekamp(s: table<i64>, t: i64, ref cat: table<i64>) -> i64 {
+    var cap = t + 2
+    var C = table_new_i64()
+    var B = table_new_i64()
+    var T = table_new_i64()
+    var i: i64 = 0
+    while i < cap {
+        table_push(C, 0)
+        table_push(B, 0)
+        table_push(T, 0)
+        i = i + 1
+    }
+    C[0] = 1
+    B[0] = 1
+    var L: i64 = 0
+    var mm: i64 = 1
+    var bval: i64 = 1
+    var n: i64 = 0
+    while n < t {
+        var d = s[n]
+        var i2: i64 = 1
+        while i2 <= L {
+            if C[i2] != 0 && s[n - i2] != 0 {
+                d = d ^ gf_mul(C[i2], s[n - i2])
+            }
+            i2 = i2 + 1
+        }
+        if d == 0 {
+            mm = mm + 1
+        } else {
+            var coef = gf_mul(d, gf_inv(bval))
+            // T = copy(C)
+            var k: i64 = 0
+            while k < cap {
+                T[k] = C[k]
+                k = k + 1
+            }
+            // C[x] ^= coef * x^mm * B[x]
+            var i3: i64 = 0
+            while i3 < cap - mm {
+                if B[i3] != 0 {
+                    C[i3 + mm] = C[i3 + mm] ^ gf_mul(coef, B[i3])
+                }
+                i3 = i3 + 1
+            }
+            if 2 * L <= n {
+                L = n + 1 - L
+                var k2: i64 = 0
+                while k2 < cap {
+                    B[k2] = T[k2]
+                    k2 = k2 + 1
+                }
+                bval = d
+                mm = 1
+            } else {
+                mm = mm + 1
+            }
+        }
+        n = n + 1
+    }
+    if L > t / 2 {
+        return 1
+    }
+    // 输出 Λ[]（degree ≤ L），归一化使 Λ[0]=1
+    var k0: i64 = 0
+    while k0 <= L {
+        cat[k0] = C[k0]
+        k0 = k0 + 1
+    }
+    if cat[0] != 0 {
+        var inv0 = gf_inv(cat[0])
+        var k3: i64 = 0
+        while k3 <= L {
+            if cat[k3] != 0 {
+                cat[k3] = gf_mul(cat[k3], inv0)
+            }
+            k3 = k3 + 1
+        }
+    }
+    cat[L + 1] = 0   // 结束符清零（标记 degree = L）
+    return 0
+}
+
+// 错误估值多项式 Ω = S(x)*Λ(x) mod x^t。输出长度 t。
+func omega_poly(s: table<i64>, lam: table<i64>, t: i64, ref out: table<i64>) {
+    var k: i64 = 0
+    while k < t {
+        var acc: i64 = 0
+        var i: i64 = 0
+        while i <= k {
+            if s[i] != 0 && lam[k - i] != 0 {
+                acc = acc ^ gf_mul(s[i], lam[k - i])
+            }
+            i = i + 1
+        }
+        out[k] = acc
+        k = k + 1
+    }
+}
+
+// 对完整码字 r（n=cw 长度）做 Chien+Forney 纠错。返回 1 成功 / 0 失败。
+func chien_forney(ref r: table<i64>, n: i64, lam: table<i64>, omg: table<i64>, t: i64) -> i64 {
+    var deg: i64 = 0
+    var i: i64 = 0
+    while i < t + 2 {
+        if lam[i] != 0 {
+            deg = i
+        }
+        i = i + 1
+    }
+    var fixed: i64 = 0
+    var k: i64 = 0
+    while k < 255 {
+        var xroot = de_exp[k]         // β^{-1}（Λ 的根，指数 k=255-deg）
+        var evl = poly_eval(lam, xroot)
+        if evl == 0 {
+            var degree = (255 - k) % 255   // 错误所在次数 = 字段元 β 的指数
+            var byteidx = n - 1 - degree
+            if byteidx < 0 || byteidx >= n {
+                return 0
+            }
+            var beta = de_exp[degree]      // β = 错误字段元
+            var arg = k                    // β^{-1} = exp[arg]
+            // Ω(β^{-1})
+            var omv: i64 = 0
+            var j: i64 = 0
+            while j < t {
+                if omg[j] != 0 {
+                    omv = omv ^ gf_mul(omg[j], de_exp[(arg * j) % 255])
+                }
+                j = j + 1
+            }
+            // Λ'(β^{-1})（奇次 i 项 λ_i*β^{-(i-1)}）
+            var dv: i64 = 0
+            var ii: i64 = 1
+            while ii <= deg {
+                if (ii % 2) == 1 && lam[ii] != 0 {
+                    dv = dv ^ gf_mul(lam[ii], de_exp[(arg * (ii - 1)) % 255])
+                }
+                ii = ii + 1
+            }
+            if dv == 0 {
+                return 0
+            }
+            // e = β * Ω(β^{-1}) / Λ'(β^{-1})（特征 2，负号即恒等）
+            var mag = gf_mul(beta, gf_mul(omv, gf_inv(dv)))
+            r[byteidx] = r[byteidx] ^ mag
+            fixed = fixed + 1
+        }
+        k = k + 1
+    }
+    if fixed != deg {
+        return 0
+    }
+    return 1
+}
+
+// 表浅拷贝。
+func copy_tbl(src: table<i64>) -> table<i64> {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < len(src) {
+        table_push(t, src[i])
+        i = i + 1
+    }
+    return t
+}
+
+// ---- 容表（task 序 ecl：0=L 1=M 2=Q 3=H，同 ext/qr） ----
+func cap_data(v: i64, ecl: i64) -> i64 {
+    if v == 1 {
+        if ecl == 0 {
+            return 19
+        }
+        if ecl == 1 {
+            return 16
+        }
+        if ecl == 2 {
+            return 13
+        }
+        return 9
+    }
+    if ecl == 0 {
+        return 34
+    }
+    if ecl == 1 {
+        return 28
+    }
+    if ecl == 2 {
+        return 22
+    }
+    return 16
+}
+
+func cap_ecc(v: i64, ecl: i64) -> i64 {
+    if v == 1 {
+        if ecl == 0 {
+            return 7
+        }
+        if ecl == 1 {
+            return 10
+        }
+        if ecl == 2 {
+            return 13
+        }
+        return 17
+    }
+    if ecl == 0 {
+        return 10
+    }
+    if ecl == 1 {
+        return 16
+    }
+    if ecl == 2 {
+        return 22
+    }
+    return 28
+}
+
+// 掩码函数：mid∈0..7，(r,c) 是否翻转（与生成端逐位一致）。
+func mask_on(mid: i64, r: i64, c: i64) -> bool {
+    if mid == 0 {
+        return (r + c) % 2 == 0
+    }
+    if mid == 1 {
+        return r % 2 == 0
+    }
+    if mid == 2 {
+        return c % 3 == 0
+    }
+    if mid == 3 {
+        return (r + c) % 3 == 0
+    }
+    if mid == 4 {
+        return ((r / 2) + (c / 3)) % 2 == 0
+    }
+    if mid == 5 {
+        return (r * c) % 2 + (r * c) % 3 == 0
+    }
+    if mid == 6 {
+        return ((r * c) % 2 + (r * c) % 3) % 2 == 0
+    }
+    return ((r + c) % 2 + (r * c) % 3) % 2 == 0
+}
+
+// 功能模块表构建（复现生成端 setup_function_patterns）。
+func build_fm(size: i64, version: i64, ref fm: table<i64>) {
+    var i: i64 = 0
+    while i < size * size {
+        fm[i] = 0
+        i = i + 1
+    }
+    // 三个 finder + separator（每 8×8）
+    var cab: i64 = 0
+    while cab < 3 {
+        var c0: i64 = 0
+        if cab == 1 {
+            c0 = size - 7
+        }
+        var r0: i64 = 0
+        if cab == 2 {
+            r0 = size - 7
+        }
+        var dr: i64 = -1
+        while dr < 8 {
+            var dc: i64 = -1
+            while dc < 8 {
+                var rr = r0 + dr
+                var cc = c0 + dc
+                if rr >= 0 && rr < size && cc >= 0 && cc < size {
+                    fm[rr * size + cc] = 1
+                }
+                dc = dc + 1
+            }
+            dr = dr + 1
+        }
+        cab = cab + 1
+    }
+    // alignment（v2 中心 (18,18)，跳过与 finder 重叠）
+    if version >= 2 {
+        var pos = table_new_i64()
+        table_push(pos, 6)
+        table_push(pos, 18)
+        var pi: i64 = 0
+        while pi < 2 {
+            var pj: i64 = 0
+            while pj < 2 {
+                var rr = pos[pi]
+                var cc = pos[pj]
+                var skip = false
+                if rr <= 8 && cc <= 8 {
+                    skip = true
+                }
+                if rr <= 8 && cc >= size - 9 {
+                    skip = true
+                }
+                if rr >= size - 9 && cc <= 8 {
+                    skip = true
+                }
+                if skip == false {
+                    var dr2: i64 = -2
+                    while dr2 <= 2 {
+                        var dc2: i64 = -2
+                        while dc2 <= 2 {
+                            var mr = rr + dr2
+                            var mc = cc + dc2
+                            if mr >= 0 && mr < size && mc >= 0 && mc < size {
+                                fm[mr * size + mc] = 1
+                            }
+                            dc2 = dc2 + 1
+                        }
+                        dr2 = dr2 + 1
+                    }
+                }
+                pj = pj + 1
+            }
+            pi = pi + 1
+        }
+    }
+    // timing 行 6 / 列 6：仅内部段 8..size-9（外段在 finder/separator 已标）
+    var k: i64 = 8
+    while k < size - 8 {
+        fm[k * size + 6] = 1
+        fm[6 * size + k] = 1
+        k = k + 1
+    }
+    // format 区（col 8 / row 8 的具体格）+ 暗模块（精确复现生成端）
+    var r: i64 = 0
+    while r < 6 {
+        fm[r * size + 8] = 1
+        r = r + 1
+    }
+    fm[7 * size + 8] = 1
+    fm[8 * size + 8] = 1
+    r = size - 7
+    while r < size {
+        fm[r * size + 8] = 1
+        r = r + 1
+    }
+    var c: i64 = 0
+    while c < 6 {
+        fm[8 * size + c] = 1
+        c = c + 1
+    }
+    fm[8 * size + 7] = 1
+    fm[8 * size + 8] = 1
+    c = size - 8
+    while c < size {
+        fm[8 * size + c] = 1
+        c = c + 1
+    }
+    fm[(size - 8) * size + 8] = 1   // 暗模块
+}
+
+// BCH(15,5) 格式信息（多项式 0x537，XOR 0x5412）——与生成端一致，用于候选匹配。
+func format_bits(data5: i64) -> i64 {
+    var d = data5 << 10
+    var bits = d
+    var bl: i64 = 0
+    var tmp = d
+    while tmp != 0 {
+        bl = bl + 1
+        tmp = tmp >> 1
+    }
+    while bl >= 11 {
+        var sh = bl - 11
+        d = d ^ (0x537 << sh)
+        tmp = d
+        bl = 0
+        while tmp != 0 {
+            bl = bl + 1
+            tmp = tmp >> 1
+        }
+    }
+    return ((data5 << 10) | d) ^ 0x5412
+}
+
+// 读格式信息第一份（draw_format 的列 8 排布）15 位 → 最近候选 data5（ecl2|mask3）。
+func read_format(matrix: table<i64>, size: i64, ref ecl: table<i64>, ref mask: table<i64>) -> i64 {
+    // 复制 draw_format 的 copy A 放置位
+    var fi: i64 = 0
+    var b_i: i64 = 0
+    while b_i < 15 {
+        var r: i64 = 0
+        var c: i64 = 8
+        if b_i < 6 {
+            r = b_i
+        } else if b_i < 8 {
+            r = b_i + 1
+        } else {
+            r = size - 15 + b_i
+        }
+        var bit = matrix[r * size + c]
+        if bit == 1 {
+            fi = fi | (1 << b_i)
+        }
+        b_i = b_i + 1
+    }
+    // 与 32 候选比汉明距
+    var best: i64 = -1
+    var bestd: i64 = 100
+    var cand: i64 = 0
+    while cand < 32 {
+        var bc = format_bits(cand)
+        var dist: i64 = 0
+        var i: i64 = 0
+        while i < 15 {
+            if ((bc >> i) & 1) != ((fi >> i) & 1) {
+                dist = dist + 1
+            }
+            i = i + 1
+        }
+        if dist < bestd {
+            bestd = dist
+            best = cand
+        }
+        cand = cand + 1
+    }
+    if bestd > 3 {
+        return 1
+    }
+    ecl[0] = best >> 3
+    mask[0] = best & 7
+    return 0
+}
+
+// spec ECL 位 → task 序（01=L,00=M,11=Q,10=H → 0,1,2,3）。
+func spec_to_task(spec: i64) -> i64 {
+    if spec == 0 {
+        return 1
+    }
+    if spec == 1 {
+        return 0
+    }
+    if spec == 2 {
+        return 3
+    }
+    return 2
+}
+
+// 之字形扫描读数据位（复现 place_data 顺序），对非功能模块 XOR 掩码。
+func read_bits_zigzag(matrix: table<i64>, fm: table<i64>, size: i64, mid: i64, total: i64) -> table<i64> {
+    var bits = table_new_i64()
+    var bit_index: i64 = 0
+    var inc: i64 = -1
+    var row = size - 1
+    var col = size - 1
+    while col >= 1 {
+        var cc = col
+        if cc <= 6 {
+            cc = cc - 1
+        }
+        var done = false
+        while done == false {
+            var off: i64 = 0
+            while off < 2 {
+                var c = cc - off
+                if fm[row * size + c] == 0 {
+                    var raw = matrix[row * size + c]
+                    var v = raw
+                    if mask_on(mid, row, c) {
+                        v = 1 - v
+                    }
+                    table_push(bits, v)
+                    bit_index = bit_index + 1
+                }
+                off = off + 1
+            }
+            row = row + inc
+            if row < 0 || row >= size {
+                row = row - inc
+                inc = -inc
+                done = true
+            }
+        }
+        col = col - 2
+    }
+    return bits
+}
+
+// 数据码字文本解析（数字/字母数字/字节模式）。
+func parse_payload(data: table<i64>) -> string {
+    var sb = string_builder()
+    var bitpos: i64 = 0
+    var nb = len(data) * 8
+    // 读 mode（4 位）
+    var mode: i64 = 0
+    var i: i64 = 0
+    while i < 4 {
+        var byteidx = bitpos / 8
+        var bitidx = 7 - (bitpos % 8)
+        mode = (mode << 1) | ((data[byteidx] >> bitidx) & 1)
+        bitpos = bitpos + 1
+        i = i + 1
+    }
+    if mode == 1 {
+        // numeric：count 10 位
+        var cnt: i64 = 0
+        i = 0
+        while i < 10 {
+            var byteidx = bitpos / 8
+            var bitidx = 7 - (bitpos % 8)
+            cnt = (cnt << 1) | ((data[byteidx] >> bitidx) & 1)
+            bitpos = bitpos + 1
+            i = i + 1
+        }
+        var done: i64 = 0
+        while done < cnt {
+            var remaining = cnt - done
+            if remaining >= 3 {
+                var v: i64 = 0
+                i = 0
+                while i < 10 {
+                    var byteidx = bitpos / 8
+                    var bitidx = 7 - (bitpos % 8)
+                    v = (v << 1) | ((data[byteidx] >> bitidx) & 1)
+                    bitpos = bitpos + 1
+                    i = i + 1
+                }
+                sb_append_byte(sb, 0x30 + (v / 100) % 10)
+                sb_append_byte(sb, 0x30 + (v / 10) % 10)
+                sb_append_byte(sb, 0x30 + v % 10)
+                done = done + 3
+            } else if remaining == 2 {
+                var v: i64 = 0
+                i = 0
+                while i < 7 {
+                    var byteidx = bitpos / 8
+                    var bitidx = 7 - (bitpos % 8)
+                    v = (v << 1) | ((data[byteidx] >> bitidx) & 1)
+                    bitpos = bitpos + 1
+                    i = i + 1
+                }
+                sb_append_byte(sb, 0x30 + v / 10)
+                sb_append_byte(sb, 0x30 + v % 10)
+                done = done + 2
+            } else {
+                var v: i64 = 0
+                i = 0
+                while i < 4 {
+                    var byteidx = bitpos / 8
+                    var bitidx = 7 - (bitpos % 8)
+                    v = (v << 1) | ((data[byteidx] >> bitidx) & 1)
+                    bitpos = bitpos + 1
+                    i = i + 1
+                }
+                sb_append_byte(sb, 0x30 + v)
+                done = done + 1
+            }
+        }
+    } else if mode == 2 {
+        var cnt: i64 = 0
+        i = 0
+        while i < 9 {
+            var byteidx = bitpos / 8
+            var bitidx = 7 - (bitpos % 8)
+            cnt = (cnt << 1) | ((data[byteidx] >> bitidx) & 1)
+            bitpos = bitpos + 1
+            i = i + 1
+        }
+        var alpha = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+        var done: i64 = 0
+        while done < cnt {
+            var remaining = cnt - done
+            if remaining >= 2 {
+                var v: i64 = 0
+                i = 0
+                while i < 11 {
+                    var byteidx = bitpos / 8
+                    var bitidx = 7 - (bitpos % 8)
+                    v = (v << 1) | ((data[byteidx] >> bitidx) & 1)
+                    bitpos = bitpos + 1
+                    i = i + 1
+                }
+                var a0 = (v / 45) % 45
+                var a1 = v % 45
+                sb_append_byte(sb, char_code(str_char(alpha, a0)))
+                sb_append_byte(sb, char_code(str_char(alpha, a1)))
+                done = done + 2
+            } else {
+                var v: i64 = 0
+                i = 0
+                while i < 6 {
+                    var byteidx = bitpos / 8
+                    var bitidx = 7 - (bitpos % 8)
+                    v = (v << 1) | ((data[byteidx] >> bitidx) & 1)
+                    bitpos = bitpos + 1
+                    i = i + 1
+                }
+                sb_append_byte(sb, char_code(str_char(alpha, v % 45)))
+                done = done + 1
+            }
+        }
+    } else if mode == 4 {
+        var cnt: i64 = 0
+        i = 0
+        while i < 8 {
+            var byteidx = bitpos / 8
+            var bitidx = 7 - (bitpos % 8)
+            cnt = (cnt << 1) | ((data[byteidx] >> bitidx) & 1)
+            bitpos = bitpos + 1
+            i = i + 1
+        }
+        var done: i64 = 0
+        while done < cnt {
+            var v: i64 = 0
+            i = 0
+            while i < 8 {
+                var bi = bitpos / 8
+                var bt = 7 - (bitpos % 8)
+                v = (v << 1) | ((data[bi] >> bt) & 1)
+                bitpos = bitpos + 1
+                i = i + 1
+            }
+            sb_append_byte(sb, v)
+            done = done + 1
+        }
+    } else {
+        // 终止/其他模式 → 有意置位财政错误信号
+        return ""
+    }
+    return sb_build(sb)
+}
+
+// 完整码字流 RS 纠错（探针用；data||ecc → 纠错后完整码字流，失败空表）。
+pub func correct(cw: table<i64>, ecc_n: i64) -> table<i64> {
+    gf_ensure()
+    var n = len(cw)
+    if n == 0 || ecc_n <= 0 || ecc_n > n {
+        return table_new_i64()
+    }
+    var t = ecc_n
+    var s = table_new_i64()
+    var i: i64 = 0
+    while i < t {
+        table_push(s, 0)
+        i = i + 1
+    }
+    var az = syndromes(cw, n, t, s)
+    if az == 1 {
+        return copy_tbl(cw)
+    }
+    var cat = table_new_i64()
+    i = 0
+    while i < t + 2 {
+        table_push(cat, 0)
+        i = i + 1
+    }
+    if berlekamp(s, t, cat) != 0 {
+        return table_new_i64()
+    }
+    var omg = table_new_i64()
+    i = 0
+    while i < t {
+        table_push(omg, 0)
+        i = i + 1
+    }
+    omega_poly(s, cat, t, omg)
+    var r2 = copy_tbl(cw)
+    if chien_forney(r2, n, cat, omg, t) == 0 {
+        return table_new_i64()
+    }
+    return r2
+}
+
+// 模块矩阵 → 解码文本。
+pub func decode(matrix: table<i64>, size: i64) -> string {
+    de_err = ""
+    gf_ensure()
+    if len(matrix) < size * size {
+        de_err = "matrix too small"
+        return ""
+    }
+    if size != 21 && size != 25 {
+        de_err = "unsupported version (only v1/v2)"
+        return ""
+    }
+    var version = (size - 17) / 4
+    var ecl = table_new_i64()
+    table_push(ecl, 0)
+    var mask = table_new_i64()
+    table_push(mask, 0)
+    if read_format(matrix, size, ecl, mask) != 0 {
+        de_err = "format info unreadable"
+        return ""
+    }
+    var task_ecl = spec_to_task(ecl[0])
+    var fm = table_new_i64()
+    var i: i64 = 0
+    while i < size * size {
+        table_push(fm, 0)
+        i = i + 1
+    }
+    build_fm(size, version, fm)
+    var dc = cap_data(version, task_ecl)
+    var en = cap_ecc(version, task_ecl)
+    var total = dc + en
+    var bits = read_bits_zigzag(matrix, fm, size, mask[0], total)
+    // bits → 码字流
+    var cw = table_new_i64()
+    var ci: i64 = 0
+    while ci < total {
+        var b: i64 = 0
+        var bi: i64 = 0
+        while bi < 8 {
+            b = (b << 1) | bits[ci * 8 + bi]
+            bi = bi + 1
+        }
+        table_push(cw, b)
+        ci = ci + 1
+    }
+    var corr = correct(cw, en)
+    if len(corr) == 0 {
+        de_err = "RS uncorrectable"
+        return ""
+    }
+    // 取数据码字（前 dc）
+    var data = table_new_i64()
+    var di: i64 = 0
+    while di < dc {
+        table_push(data, corr[di])
+        di = di + 1
+    }
+    return parse_payload(data)
+}
+
+// 二值图像（1=暗；含 4 模块 quiet zone；整倍 scale；正交）→ 解码文本。
+pub func decode_image(img: table<i64>, w: i64, h: i64, scale: i64) -> string {
+    de_err = ""
+    if scale <= 0 || w <= 0 || h <= 0 {
+        de_err = "bad dims"
+        return ""
+    }
+    var qz: i64 = 4
+    var size = (w / scale) - 2 * qz
+    if size != 21 && size != 25 {
+        de_err = "unrecognized size from image"
+        return ""
+    }
+    var matrix = table_new_i64()
+    var r: i64 = 0
+    while r < size {
+        var c: i64 = 0
+        while c < size {
+            var py = (qz + r) * scale + scale / 2
+            var px = (qz + c) * scale + scale / 2
+            var v: i64 = 0
+            if py * w + px < len(img) {
+                v = img[py * w + px]
+            }
+            table_push(matrix, v)
+            c = c + 1
+        }
+        r = r + 1
+    }
+    // finder 对齐校验：左上 finder 中心 (3,3) 应为暗
+    if matrix[3 * size + 3] != 1 {
+        de_err = "finder misaligned"
+        return ""
+    }
+    return decode(matrix, size)
+}
+
+pub func err_msg() -> string {
+    return de_err
+}
+
+}   // namespace qrdec

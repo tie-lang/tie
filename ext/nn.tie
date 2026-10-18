@@ -1,0 +1,722 @@
+type tie<class>
+// std/nn.tie —— L3 神经网络层库 nn（命名空间 nn；纯 tie，std 层）
+// ============================================================
+// 用途：微型扩散模型训练（DDPM 训练 UNet 的 CPU 训练/推理）的核心层库。
+// 手写梯度（每层 forward + backward 成对），性能优先，f32 存储 + f64 内积。
+//
+// 【设计说明 ABI】与 linalg/tensor 一致：struct 无法 ref 形参（ref 仅限
+// table / array<T,N>），故本库所有神经层的数据/梯度一律走「定长容量池」——
+// 函数的 me/out/in/w 等一律为 `ref array<f32,1024>` 零拷贝指针通道（4KB），
+// 形状信息用显式 (i64,...) 维度参数传递，返回 void。调用方持有容量池数组
+// （如 `var d: array<f32,1024> = array_init(0.0)`），不要直接 `t.data` 作
+// ref 实参再同函数按值传 t（工具链会生成崩溃代码）。
+//
+// 【精度】所有逐元素/卷积内积一律 f32→f64→f32（f64 累加再 as_f32 回写），
+// 规避 f32 算术误生成 fadd/fmul double 触发 opt 崩溃，同时保证内积稳定。
+//
+// 【参数组织】可训练参数（权重/偏置/γ/β）统一放 struct LayerW（或独立数组）；
+// struct 不可 ref，训练时把 w/b 数组以 ref array 通道传给各函数。
+//
+// 【梯度公式】linear：gx=Wᵀ·dy；dW=dy⊗x；db=dy。conv：标准互相关梯度。
+// conv2d_t：上采样转置卷积。groupnorm：gx=invstd·(gx̂-S/m-T·x̂/m)。
+// attention：softmax 行梯度 ds=p·(dL-Σp·dL) 再反解 dQ/dK/dV。
+// EN: L3 nn layers (linear/conv/convT/groupnorm/layernorm/attention) with paired
+// forward+backward hand-written grads. f32 store + f64 accumulate via ref-array
+// channel ABI (single-point pool).
+
+import "/ext/tensor.tie";
+import "/std/linalg.tie";
+import "/ext/tmath.tie";
+
+using tensor;
+using linalg;
+using tmath;
+
+// LayerW 可训练参数容器（权重+偏置，展平）。注意：struct 必须定义在命名空间
+// 外的顶层（与 tensor/trng/buffer 一致的 ABI，见文件头）；不可 ref 形参，故
+// 训练时把 w/b 数组以 ref array<f32,1024> 通道传给各层函数。
+// v2：容量档位值参数（与库函数同约定 `<CAP: i64 = 1024>`；实例化按档取用）。
+// EN: trainable layer weights+bias container (top-level struct; by-value).
+struct LayerW<CAP: i64 = 1024> {
+    var w: array<f32, CAP>;
+    var b: array<f32, CAP>;
+    var wCnt: i64 = 0;
+    var bCnt: i64 = 0;
+}
+
+namespace nn {
+
+// ======================= Linear（全连接层） =======================
+
+// 全连接前向：y[j] = Σ_i x[i]*W[j][i] + b[j]，j∈[0,no)。W 行主序 [no][ni]。
+// EN: linear forward y[no]=x[ni]·W[no][ni]+b[no]; row-major W.
+pub func linear_forward<CAP: i64 = 1024>(yo: ref array<f32, CAP>, xi: ref array<f32, CAP>, ni: i64,
+                        wi: ref array<f32, CAP>, wcnt: i64, bi: ref array<f32, CAP>, bcnt: i64, no: i64) {
+    var j: i64 = 0
+    while j < no {
+        var acc: f64 = 0.0
+        if bcnt > 0 && j < bcnt {
+            acc = to_f64(bi[j])
+        }
+        var i: i64 = 0
+        while i < ni {
+            var widx = j * ni + i
+            if wcnt > 0 && widx < wcnt {
+                acc = acc + to_f64(xi[i]) * to_f64(wi[widx])
+            }
+            i = i + 1
+        }
+        yo[j] = to_f32(acc)
+        j = j + 1
+    }
+}
+
+// 全连接反向：dgy 上层梯度[no]，回写 gx[i]=Σ_j dgy[j]*W[j][i]、
+//   dW[j][i]=dgy[j]*x[i]、db[j]=dgy[j]。xv 为前向输入激活（dW=dy⊗x 必须）。
+// EN: linear backward: input/weight/bias grads (needs fwd input xv for dW).
+pub func linear_backward<CAP: i64 = 1024>(gxo: ref array<f32, CAP>, gyi: ref array<f32, CAP>, xv: ref array<f32, CAP>,
+                         ni: i64, wi: ref array<f32, CAP>, wcnt: i64, no: i64,
+                         gwo: ref array<f32, CAP>, gbo: ref array<f32, CAP>) {
+    var i: i64 = 0
+    while i < ni {
+        var acc: f64 = 0.0
+        var j: i64 = 0
+        while j < no {
+            var widx = j * ni + i
+            if wcnt > 0 && widx < wcnt {
+                acc = acc + to_f64(gyi[j]) * to_f64(wi[widx])
+            }
+            j = j + 1
+        }
+        gxo[i] = to_f32(acc)
+        i = i + 1
+    }
+    var j2: i64 = 0
+    while j2 < no {
+        var i2: i64 = 0
+        while i2 < ni {
+            var widx = j2 * ni + i2
+            if wcnt > 0 && widx < wcnt {
+                gwo[widx] = to_f32(to_f64(gyi[j2]) * to_f64(xv[i2]))
+            }
+            i2 = i2 + 1
+        }
+        if wcnt > 0 {
+            gbo[j2] = gyi[j2]
+        }
+        j2 = j2 + 1
+    }
+}
+
+// ======================= Conv2D（标准卷积） =======================
+
+// 2D 卷积前向（stride/pad，0 填充）。输入 x(Cin,Hin,Win)，核 wf(Cout,Cin,K,K)，
+// bias wb(Cout)；输出 yo(Cout,Hout,Wout)，Hout=(Hin+2p-K)/stride+1。
+// 核下标 co*(cin*K*K)+ci*(K*K)+kh*K+kw。EN: 2D conv forward, zero-padding.
+pub func conv2d_forward<CAP: i64 = 1024>(yo: ref array<f32, CAP>, xi: ref array<f32, CAP>, cin: i64, hin: i64, win: i64,
+                        wf: ref array<f32, CAP>, cout: i64, kk: i64, stride: i64, pad: i64,
+                        wb: ref array<f32, CAP>) {
+    var hout = (hin + 2 * pad - kk) / stride + 1
+    var wout = (win + 2 * pad - kk) / stride + 1
+    var co: i64 = 0
+    while co < cout {
+        var ho: i64 = 0
+        while ho < hout {
+            var wo: i64 = 0
+            while wo < wout {
+                var acc: f64 = to_f64(wb[co])
+                var ci: i64 = 0
+                while ci < cin {
+                    var kh: i64 = 0
+                    while kh < kk {
+                        var hi = ho * stride - pad + kh
+                        if hi >= 0 && hi < hin {
+                            var kw: i64 = 0
+                            while kw < kk {
+                                var wi2 = wo * stride - pad + kw
+                                if wi2 >= 0 && wi2 < win {
+                                    var wi = co * (cin * kk * kk) + ci * (kk * kk) + kh * kk + kw
+                                    var xidx = ci * (hin * win) + hi * win + wi2
+                                    acc = acc + to_f64(xi[xidx]) * to_f64(wf[wi])
+                                }
+                                kw = kw + 1
+                            }
+                        }
+                        kh = kh + 1
+                    }
+                    ci = ci + 1
+                }
+                yo[co * (hout * wout) + ho * wout + wo] = to_f32(acc)
+                wo = wo + 1
+            }
+            ho = ho + 1
+        }
+        co = co + 1
+    }
+}
+
+// 2D 卷积反向：回写输入梯度 gxi、核梯度 gwo、偏置梯度 gbo（dgy 为上流梯度）。
+// EN: 2D conv backward: gxi/gwo/gbo grads.
+pub func conv2d_backward<CAP: i64 = 1024>(gxi: ref array<f32, CAP>, gwo: ref array<f32, CAP>, gbo: ref array<f32, CAP>,
+                         gyi: ref array<f32, CAP>, xi: ref array<f32, CAP>, cin: i64, hin: i64, win: i64,
+                         wf: ref array<f32, CAP>, cout: i64, kk: i64, stride: i64, pad: i64) {
+    var hout = (hin + 2 * pad - kk) / stride + 1
+    var wout = (win + 2 * pad - kk) / stride + 1
+    var t: i64 = 0
+    while t < hin * win {
+        gxi[t] = 0.0
+        t = t + 1
+    }
+    var c: i64 = 0
+    while c < cout {
+        gbo[c] = 0.0
+        var tc: i64 = 0
+        while tc < cin * kk * kk {
+            gwo[c * (cin * kk * kk) + tc] = 0.0
+            tc = tc + 1
+        }
+        c = c + 1
+    }
+    var co: i64 = 0
+    while co < cout {
+        var ho: i64 = 0
+        while ho < hout {
+            var wo: i64 = 0
+            while wo < wout {
+                var gyv: f64 = to_f64(gyi[co * (hout * wout) + ho * wout + wo])
+                gbo[co] = to_f32(to_f64(gbo[co]) + gyv)
+                var ci: i64 = 0
+                while ci < cin {
+                    var kh: i64 = 0
+                    while kh < kk {
+                        var hi = ho * stride - pad + kh
+                        if hi >= 0 && hi < hin {
+                            var kw: i64 = 0
+                            while kw < kk {
+                                var wi2 = wo * stride - pad + kw
+                                if wi2 >= 0 && wi2 < win {
+                                    var widx = co * (cin * kk * kk) + ci * (kk * kk) + kh * kk + kw
+                                    var xidx = ci * (hin * win) + hi * win + wi2
+                                    gxi[xidx] = to_f32(to_f64(gxi[xidx]) + gyv * to_f64(wf[widx]))
+                                    gwo[widx] = to_f32(to_f64(gwo[widx]) + gyv * to_f64(xi[xidx]))
+                                }
+                                kw = kw + 1
+                            }
+                        }
+                        kh = kh + 1
+                    }
+                    ci = ci + 1
+                }
+                wo = wo + 1
+            }
+            ho = ho + 1
+        }
+        co = co + 1
+    }
+}
+
+// ======================= Conv2D Transposed（转置卷积，UNet 上采样） =======================
+
+// 转置卷积前向（上采样）：输出 Hout=(Hin-1)*stride - 2*pad + K。
+// yo[co,ho,wo] = Σ_ci kh kw x[ci,hi,wi]*w[co,ci,kh,kw]，hi=(ho+pad-kh)/stride
+// （需整除且在界内）。EN: transposed conv forward (upsample).
+pub func conv2d_t_forward<CAP: i64 = 1024>(yo: ref array<f32, CAP>, xi: ref array<f32, CAP>, cin: i64, hin: i64, win: i64,
+                          wf: ref array<f32, CAP>, cout: i64, kk: i64, stride: i64, pad: i64,
+                          wb: ref array<f32, CAP>) {
+    var hout = (hin - 1) * stride - 2 * pad + kk
+    var wout = (win - 1) * stride - 2 * pad + kk
+    var co: i64 = 0
+    while co < cout {
+        var ho: i64 = 0
+        while ho < hout {
+            var wo: i64 = 0
+            while wo < wout {
+                var acc: f64 = to_f64(wb[co])
+                var ci: i64 = 0
+                while ci < cin {
+                    var kh: i64 = 0
+                    while kh < kk {
+                        var th: i64 = ho + pad - kh
+                        if th >= 0 && th % stride == 0 && th / stride < hin {
+                            var hi = th / stride
+                            var kw: i64 = 0
+                            while kw < kk {
+                                var tw: i64 = wo + pad - kw
+                                if tw >= 0 && tw % stride == 0 && tw / stride < win {
+                                    var wi2 = tw / stride
+                                    var widx = co * (cin * kk * kk) + ci * (kk * kk) + kh * kk + kw
+                                    var xidx = ci * (hin * win) + hi * win + wi2
+                                    acc = acc + to_f64(xi[xidx]) * to_f64(wf[widx])
+                                }
+                                kw = kw + 1
+                            }
+                        }
+                        kh = kh + 1
+                    }
+                    ci = ci + 1
+                }
+                yo[co * (hout * wout) + ho * wout + wo] = to_f32(acc)
+                wo = wo + 1
+            }
+            ho = ho + 1
+        }
+        co = co + 1
+    }
+}
+
+// 转置卷积反向：回写 gxi/gwo/gbo（dgy 形状同 yo）。EN: transposed conv backward.
+pub func conv2d_t_backward<CAP: i64 = 1024>(gxi: ref array<f32, CAP>, gwo: ref array<f32, CAP>, gbo: ref array<f32, CAP>,
+                           gyi: ref array<f32, CAP>, xi: ref array<f32, CAP>, cin: i64, hin: i64, win: i64,
+                           wf: ref array<f32, CAP>, cout: i64, kk: i64, stride: i64, pad: i64) {
+    var hout = (hin - 1) * stride - 2 * pad + kk
+    var wout = (win - 1) * stride - 2 * pad + kk
+    var t: i64 = 0
+    while t < hin * win {
+        gxi[t] = 0.0
+        t = t + 1
+    }
+    var c: i64 = 0
+    while c < cout {
+        gbo[c] = 0.0
+        var tc: i64 = 0
+        while tc < cin * kk * kk {
+            gwo[c * (cin * kk * kk) + tc] = 0.0
+            tc = tc + 1
+        }
+        c = c + 1
+    }
+    var co: i64 = 0
+    while co < cout {
+        var ho: i64 = 0
+        while ho < hout {
+            var wo: i64 = 0
+            while wo < wout {
+                var gyv: f64 = to_f64(gyi[co * (hout * wout) + ho * wout + wo])
+                gbo[co] = to_f32(to_f64(gbo[co]) + gyv)
+                var ci: i64 = 0
+                while ci < cin {
+                    var kh: i64 = 0
+                    while kh < kk {
+                        var th: i64 = ho + pad - kh
+                        if th >= 0 && th % stride == 0 && th / stride < hin {
+                            var hi = th / stride
+                            var kw: i64 = 0
+                            while kw < kk {
+                                var tw: i64 = wo + pad - kw
+                                if tw >= 0 && tw % stride == 0 && tw / stride < win {
+                                    var wi2 = tw / stride
+                                    var widx = co * (cin * kk * kk) + ci * (kk * kk) + kh * kk + kw
+                                    var xidx = ci * (hin * win) + hi * win + wi2
+                                    gxi[xidx] = to_f32(to_f64(gxi[xidx]) + gyv * to_f64(wf[widx]))
+                                    gwo[widx] = to_f32(to_f64(gwo[widx]) + gyv * to_f64(xi[xidx]))
+                                }
+                                kw = kw + 1
+                            }
+                        }
+                        kh = kh + 1
+                    }
+                    ci = ci + 1
+                }
+                wo = wo + 1
+            }
+            ho = ho + 1
+        }
+        co = co + 1
+    }
+}
+
+// ======================= GroupNorm（分组归一化，可学习 γ/β） =======================
+
+// 前向：输入 (n, c, hw)；分 g 组，每组 cpg=c/g 个通道。逐样本逐组归一（组内
+// m=cpg*hw 元素）：x̂=(x-mean)·invstd；y=γ[ch]·x̂+β[ch]；invstd=1/√(var+eps)。
+// EN: GroupNorm forward: per-sample per-group normalize, learnable γ(c) β(c).
+pub func groupnorm_forward<CAP: i64 = 1024>(yo: ref array<f32, CAP>, xi: ref array<f32, CAP>, n: i64, c: i64, hw: i64, g: i64,
+                           gama: ref array<f32, CAP>, beta: ref array<f32, CAP>, eps: f64) {
+    var cpg = c / g
+    var m = cpg * hw
+    var s: i64 = 0
+    while s < n {
+        var gi: i64 = 0
+        while gi < g {
+            var area = (s * c + gi * cpg) * hw
+            var mean: f64 = 0.0
+            var t2: i64 = 0
+            while t2 < m {
+                mean = mean + to_f64(xi[area + t2])
+                t2 = t2 + 1
+            }
+            mean = mean / to_f64(m)
+            var varv: f64 = 0.0
+            var t3: i64 = 0
+            while t3 < m {
+                var d2 = to_f64(xi[area + t3]) - mean
+                varv = varv + d2 * d2
+                t3 = t3 + 1
+            }
+            varv = varv / to_f64(m)
+            var inv = 1.0 / sqrt(varv + eps)
+            var ch: i64 = 0
+            while ch < cpg {
+                var hw2: i64 = 0
+                while hw2 < hw {
+                    var idx = (s * c + gi * cpg + ch) * hw + hw2
+                    var xh = (to_f64(xi[idx]) - mean) * inv
+                    yo[idx] = to_f32(xh * to_f64(gama[gi * cpg + ch]) + to_f64(beta[gi * cpg + ch]))
+                    hw2 = hw2 + 1
+                }
+                ch = ch + 1
+            }
+            gi = gi + 1
+        }
+        s = s + 1
+    }
+}
+
+// 反向：回写 gxi、ggama、gbeta（dgy 形状同 yo）。
+//   组内（S=Σgx̂，T=Σgx̂·x̂，gx̂=gy·γ）：
+//      gx = invstd·(gx̂ - S/m - T·x̂/m)；ggama[ch]+=gy·x̂；gbeta[ch]+=gy。
+// EN: GroupNorm backward (input/gamma/beta grads; m=cpg*hw).
+pub func groupnorm_backward<CAP: i64 = 1024>(gxi: ref array<f32, CAP>, ggama: ref array<f32, CAP>, gbeta: ref array<f32, CAP>,
+                            gyi: ref array<f32, CAP>, xi: ref array<f32, CAP>, n: i64, c: i64, hw: i64, g: i64,
+                            gama: ref array<f32, CAP>, eps: f64) {
+    var cpg = c / g
+    var m = cpg * hw
+    var zr: i64 = 0
+    while zr < c {
+        ggama[zr] = 0.0
+        gbeta[zr] = 0.0
+        zr = zr + 1
+    }
+    var s: i64 = 0
+    while s < n {
+        var gi: i64 = 0
+        while gi < g {
+            var gch0 = gi * cpg
+            var area = (s * c + gch0) * hw
+            var mean: f64 = 0.0
+            var t2: i64 = 0
+            while t2 < m {
+                mean = mean + to_f64(xi[area + t2])
+                t2 = t2 + 1
+            }
+            mean = mean / to_f64(m)
+            var varv: f64 = 0.0
+            var t3: i64 = 0
+            while t3 < m {
+                var d2 = to_f64(xi[area + t3]) - mean
+                varv = varv + d2 * d2
+                t3 = t3 + 1
+            }
+            varv = varv / to_f64(m)
+            var inv = 1.0 / sqrt(varv + eps)
+            var S: f64 = 0.0
+            var T: f64 = 0.0
+            var xtmp: array<f64, CAP> = array_init(0.0)
+            var gtmp: array<f64, CAP> = array_init(0.0)
+            var ct: i64 = 0
+            while ct < m {
+                var xv = to_f64(xi[area + ct])
+                var xh = (xv - mean) * inv
+                var ch = gi * cpg + (ct / hw)
+                var hw2 = ct % hw
+                var gyv = to_f64(gyi[(s * c + ch) * hw + hw2])
+                var gxh: f64 = gyv * to_f64(gama[ch])
+                xtmp[ct] = xh
+                gtmp[ct] = gxh
+                S = S + gxh
+                T = T + gxh * xh
+                ggama[ch] = to_f32(to_f64(ggama[ch]) + gyv * xh)
+                gbeta[ch] = to_f32(to_f64(gbeta[ch]) + gyv)
+                ct = ct + 1
+            }
+            var inv_m: f64 = 1.0 / to_f64(m)
+            var ct2: i64 = 0
+            while ct2 < m {
+                gxi[area + ct2] = to_f32(inv * (gtmp[ct2] - S * inv_m - T * xtmp[ct2] * inv_m))
+                ct2 = ct2 + 1
+            }
+            gi = gi + 1
+        }
+        s = s + 1
+    }
+}
+
+// ======================= LayerNorm（备用；按最后一维 f 归一） =======================
+
+// 前向：输入 (n, f)，逐行在 f 元素归一，γ/β 长 f。EN: LayerNorm over feature dim.
+pub func layernorm_forward<CAP: i64 = 1024>(yo: ref array<f32, CAP>, xi: ref array<f32, CAP>, n: i64, f: i64,
+                           gama: ref array<f32, CAP>, beta: ref array<f32, CAP>, eps: f64) {
+    var s: i64 = 0
+    while s < n {
+        var mean: f64 = 0.0
+        var t2: i64 = 0
+        while t2 < f {
+            mean = mean + to_f64(xi[s * f + t2])
+            t2 = t2 + 1
+        }
+        mean = mean / to_f64(f)
+        var varv: f64 = 0.0
+        var t3: i64 = 0
+        while t3 < f {
+            var d2 = to_f64(xi[s * f + t3]) - mean
+            varv = varv + d2 * d2
+            t3 = t3 + 1
+        }
+        varv = varv / to_f64(f)
+        var inv = 1.0 / sqrt(varv + eps)
+        var j: i64 = 0
+        while j < f {
+            var xh = (to_f64(xi[s * f + j]) - mean) * inv
+            yo[s * f + j] = to_f32(xh * to_f64(gama[j]) + to_f64(beta[j]))
+            j = j + 1
+        }
+        s = s + 1
+    }
+}
+
+// 反向：输入梯度 gxi（同公式 gx=invstd·(gx̂-S/m-T·x̂/m)），并重扫累加 γ/β 梯度。
+// EN: LayerNorm backward (input grad; gamma/beta grads re-scanned).
+pub func layernorm_backward<CAP: i64 = 1024>(gxi: ref array<f32, CAP>, ggama: ref array<f32, CAP>, gbeta: ref array<f32, CAP>,
+                            gyi: ref array<f32, CAP>, xi: ref array<f32, CAP>, n: i64, f: i64,
+                            gama: ref array<f32, CAP>, eps: f64) {
+    var c: i64 = 0
+    while c < f {
+        ggama[c] = 0.0
+        gbeta[c] = 0.0
+        c = c + 1
+    }
+    var s: i64 = 0
+    while s < n {
+        var mean: f64 = 0.0
+        var t2: i64 = 0
+        while t2 < f {
+            mean = mean + to_f64(xi[s * f + t2])
+            t2 = t2 + 1
+        }
+        mean = mean / to_f64(f)
+        var varv: f64 = 0.0
+        var t3: i64 = 0
+        while t3 < f {
+            var d2 = to_f64(xi[s * f + t3]) - mean
+            varv = varv + d2 * d2
+            t3 = t3 + 1
+        }
+        varv = varv / to_f64(f)
+        var inv = 1.0 / sqrt(varv + eps)
+        var xh: array<f64, CAP> = array_init(0.0)
+        var gxhat: array<f64, CAP> = array_init(0.0)
+        var S: f64 = 0.0
+        var T: f64 = 0.0
+        var j: i64 = 0
+        while j < f {
+            var xv = (to_f64(xi[s * f + j]) - mean) * inv
+            var gx = to_f64(gyi[s * f + j]) * to_f64(gama[j])
+            xh[j] = xv
+            gxhat[j] = gx
+            S = S + gx
+            T = T + gx * xv
+            ggama[j] = to_f32(to_f64(ggama[j]) + to_f64(gyi[s * f + j]) * xv)
+            gbeta[j] = to_f32(to_f64(gbeta[j]) + to_f64(gyi[s * f + j]))
+            j = j + 1
+        }
+        var invf: f64 = 1.0 / to_f64(f)
+        var j2: i64 = 0
+        while j2 < f {
+            gxi[s * f + j2] = to_f32(inv * (gxhat[j2] - S * invf - T * xh[j2] * invf))
+            j2 = j2 + 1
+        }
+        s = s + 1
+    }
+}
+
+// ======================= Attention（单头） =======================
+
+// 前向：scores = Q·Kᵀ/√d，按行 softmax，输出 = softmax·V。Q/K/V 均 (n,d)。
+// yo[j,dj] = Σ_l P[j,l]*V[l,dj]。EN: single-head attention forward (n,d).
+pub func attention_forward<CAP: i64 = 1024>(yo: ref array<f32, CAP>, q: ref array<f32, CAP>, k: ref array<f32, CAP>,
+                           v: ref array<f32, CAP>, n: i64, d: i64) {
+    var ivd = 1.0 / sqrt(to_f64(d))
+    var sco: array<f64, CAP> = array_init(0.0)
+    var psum: array<f64, CAP> = array_init(0.0)
+    var i: i64 = 0
+    while i < n {
+        var mx: f64 = -100000000000000.0
+        var l: i64 = 0
+        while l < n {
+            var s: f64 = 0.0
+            var r: i64 = 0
+            while r < d {
+                s = s + to_f64(q[i * d + r]) * to_f64(k[l * d + r])
+                r = r + 1
+            }
+            s = s * ivd
+            sco[i * n + l] = s
+            if s > mx {
+                mx = s
+            }
+            l = l + 1
+        }
+        var z: f64 = 0.0
+        var l2: i64 = 0
+        while l2 < n {
+            var e2 = exp(sco[i * n + l2] - mx)
+            psum[i * n + l2] = e2
+            z = z + e2
+            l2 = l2 + 1
+        }
+        var l3: i64 = 0
+        while l3 < n {
+            psum[i * n + l3] = psum[i * n + l3] / z
+            l3 = l3 + 1
+        }
+        i = i + 1
+    }
+    var j: i64 = 0
+    while j < n {
+        var dj: i64 = 0
+        while dj < d {
+            var acc: f64 = 0.0
+            var li: i64 = 0
+            while li < n {
+                acc = acc + psum[j * n + li] * to_f64(v[li * d + dj])
+                li = li + 1
+            }
+            yo[j * d + dj] = to_f32(acc)
+            dj = dj + 1
+        }
+        j = j + 1
+    }
+}
+
+// 反向：回写 gq/gk/gv（dgy 形状同 yo）。softmax 行梯度 ds=p·(dL-Σp·dL)。
+// EN: single-head attention backward (gq/gk/gv grads).
+pub func attention_backward<CAP: i64 = 1024>(gq: ref array<f32, CAP>, gk: ref array<f32, CAP>, gv: ref array<f32, CAP>,
+                            gyi: ref array<f32, CAP>, q: ref array<f32, CAP>, k: ref array<f32, CAP>,
+                            v: ref array<f32, CAP>, n: i64, d: i64) {
+    var ivd = 1.0 / sqrt(to_f64(d))
+    var sco: array<f64, CAP> = array_init(0.0)
+    var psum: array<f64, CAP> = array_init(0.0)
+    var i: i64 = 0
+    while i < n {
+        var mx: f64 = -100000000000000.0
+        var l: i64 = 0
+        while l < n {
+            var s: f64 = 0.0
+            var r: i64 = 0
+            while r < d {
+                s = s + to_f64(q[i * d + r]) * to_f64(k[l * d + r])
+                r = r + 1
+            }
+            s = s * ivd
+            sco[i * n + l] = s
+            if s > mx {
+                mx = s
+            }
+            l = l + 1
+        }
+        var z: f64 = 0.0
+        var l2: i64 = 0
+        while l2 < n {
+            var e2 = exp(sco[i * n + l2] - mx)
+            psum[i * n + l2] = e2
+            z = z + e2
+            l2 = l2 + 1
+        }
+        var l3: i64 = 0
+        while l3 < n {
+            psum[i * n + l3] = psum[i * n + l3] / z
+            l3 = l3 + 1
+        }
+        i = i + 1
+    }
+    var zz: i64 = 0
+    while zz < n * d {
+        gq[zz] = 0.0
+        gk[zz] = 0.0
+        gv[zz] = 0.0
+        zz = zz + 1
+    }
+    // gv[l,dj] = Σ_i P[i,l]*gy[i,dj]
+    var dj: i64 = 0
+    while dj < d {
+        var li: i64 = 0
+        while li < n {
+            var acc: f64 = 0.0
+            var r: i64 = 0
+            while r < n {
+                acc = acc + psum[r * n + li] * to_f64(gyi[r * d + dj])
+                r = r + 1
+            }
+            gv[li * d + dj] = to_f32(acc)
+            li = li + 1
+        }
+        dj = dj + 1
+    }
+    // 逐行反解 ds 再反传 dQ；dK 独立重扫
+    var i2: i64 = 0
+    while i2 < n {
+        var dL: array<f64, CAP> = array_init(0.0)
+        var li: i64 = 0
+        while li < n {
+            var acc: f64 = 0.0
+            var j2: i64 = 0
+            while j2 < d {
+                acc = acc + to_f64(gyi[i2 * d + j2]) * to_f64(v[li * d + j2])
+                j2 = j2 + 1
+            }
+            dL[li] = acc
+            li = li + 1
+        }
+        var dot: f64 = 0.0
+        var l4: i64 = 0
+        while l4 < n {
+            dot = dot + psum[i2 * n + l4] * dL[l4]
+            l4 = l4 + 1
+        }
+        var r: i64 = 0
+        while r < d {
+            var aq: f64 = 0.0
+            var l6: i64 = 0
+            while l6 < n {
+                var ds: f64 = psum[i2 * n + l6] * (dL[l6] - dot)
+                aq = aq + ds * to_f64(k[l6 * d + r])
+                l6 = l6 + 1
+            }
+            gq[i2 * d + r] = to_f32(aq * ivd)
+            r = r + 1
+        }
+        i2 = i2 + 1
+    }
+    // dK[lk,dj] = Σ_i ds[i,lk]*q[i,dj]*ivd
+    var lk: i64 = 0
+    while lk < n {
+        var dj2: i64 = 0
+        while dj2 < d {
+            var ak: f64 = 0.0
+            var rr: i64 = 0
+            while rr < n {
+                var dL2: array<f64, CAP> = array_init(0.0)
+                var j3: i64 = 0
+                while j3 < d {
+                    dL2[j3] = to_f64(gyi[rr * d + j3]) * to_f64(v[lk * d + j3])
+                    j3 = j3 + 1
+                }
+                // 重算 row rr 的 dot 与 ds[rr,lk]
+                var dot2: f64 = 0.0
+                var l7: i64 = 0
+                while l7 < n {
+                    dot2 = dot2 + psum[rr * n + l7] * dL2[l7]
+                    l7 = l7 + 1
+                }
+                var dsv: f64 = psum[rr * n + lk] * (dL2[lk] - dot2)
+                ak = ak + dsv * to_f64(q[rr * d + dj2])
+                rr = rr + 1
+            }
+            gk[lk * d + dj2] = to_f32(ak * ivd)
+            dj2 = dj2 + 1
+        }
+        lk = lk + 1
+    }
+}
+
+}   // namespace nn

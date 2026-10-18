@@ -1,0 +1,33 @@
+type tie<logic>
+// ============================================================
+// p.9.11.11 immut 只读形参负例：写 immut 形参 = 编译错误（error[E...]）。
+//   1. 直接重写 `t = value`
+//   2. 自增/自减 `t++`
+//   3. 字段写 `p.x = value`
+//   4. 下标写 `arr[i] = value`
+// 任一命中即编译失败（回归把 * _neg*.tie 应拒编译视为 PASS）。
+// ============================================================
+struct Point {
+    var x: i64 = 0
+    var y: i64 = 0
+}
+
+func bad_write(immut t: i64) -> i64 {
+    t = t + 5        // 1. 不能给 immut 形参赋值
+    return t
+}
+func bad_inc(immut n: i64) -> i64 {
+    n++              // 2. 不能对 immut 形参自增/自减
+    return n
+}
+func bad_field(immut p: Point) -> i64 {
+    p.x = 99         // 3. 不能修改 immut 形参的字段
+    return p.x
+}
+func bad_index(immut arr: table<i64>) -> i64 {
+    arr[0] = 7       // 4. 不能修改 immut 形参的下标元素
+    return arr[0]
+}
+func main() {
+    println("unreachable")
+}

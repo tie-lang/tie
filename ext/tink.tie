@@ -1,0 +1,2821 @@
+type tie<class>
+// ext/tink.tie —— tink 协议（v3 线格式；命名空间 tink）
+// ============================================================
+// 线格式（全大端 BE；设计依据：tink v3 设计文档 §3 线格式 / §4 注册表）：
+//   帧 = [magic u8[2] = 0x74 0x6B][ver u8 = 3][type u8][flags u16]
+//        [stream_id u32][seq u32][len u16]
+//        [扩展区]?            （flags.EXT：ext_len u16 + TLV 序列）
+//        [载荷：len 字节]      （flags.OFFSET 时载荷前 4B 为 offset，计入 len）
+//        [尾部]?              （PROTECTED = 16B AEAD tag / CRC = 4B CRC32C / 裸 = 无）
+//   头部 16B 明文（路由/多路复用需要）；CRC32C 覆盖「头 + 扩展 + 载荷」；
+//   PROTECTED 时「头 + 扩展」作为 AAD（密码层，本骨架只做结构位）。
+//
+// 扩展区：ext_len u16 BE + ext_len 字节的 TLV 序列（ext_len = TLV 序列字节数，
+//   不含自身 2B；0 = 空扩展区）。扩展区自述长度 ⇒ 任意帧 O(1) 跳过；
+//   序列须恰好被 TLV 消耗（越界/残余 = 帧非法，于扩展区解析点检出）。
+// TLV 条目 = key u16 BE + value_len u16 BE + value；未知 key 必须跳过。
+//
+// 尾部三态（PROTECTED 与 CRC 互斥，同置 = 帧非法）：16B tag / 4B CRC / 裸（0B，
+//   仅受信本地显式开启，默认不允许——裸策略由上层模式决定，本层放行但可辨识）。
+//
+// == 实现三原则 ==
+//  ① 性能极强：frame_skip / frame_view 单遍扫描、O(1) 跳过（不解析扩展区、
+//     不校验 CRC）；CRC32C 查表；组装走 bytes.concat（byte_concat 编译器内联
+//     批量拷贝）；无逐字节拼接、无 O(n²)。
+//  ② 内存尽量低：frame_view 返回「缓冲内偏移」视图，热路径零拷贝零物化；
+//     需要载荷实体时显式 frame_take 物化一次；frame_skip 不分配任何表。
+//  ③ 安全：非法输入一律早拒（魔力/版本/保留位/尾部互斥/长度越界），哨兵返回
+//     不 panic；所有访问先显式界检查（不依赖运行期越界检查）；CRC 校验为统一
+//     出口（iok）；保护帧本层不宣称已验证（iok = -1，待密码层）。
+//
+// 错误约定：
+//   frame_view / frame_skip：1 = 成功；0 = 缓冲不足（流绑定 = 等更多字节；
+//     数据报绑定 = 整报已到，视为损坏丢弃）；-1 = 帧非法（早拒绝）。
+//   frame_encode：非法输入返回空表（合法帧 ≥ 16 字节，空表 ≠ 帧）。
+//   ext_find：(status, voff, vlen)：1 找到 / 0 无此 key / -1 区结构坏。
+//   ext_u8/u32/u64：-1 = 缺失/值短/结构坏。
+//
+// 说明：未知 type 由读方「跳过 + 计数」，编解码层不视为非法；type_defined /
+//   type_writable 供写方纪律与探针使用；0xF0–0xFF 为私有/实验（不进规范，可用）。
+//   写方不得使用 0x7x–0xEx 预留块与各预留槽；已定义槽永不复用/改名。
+// 探针：std/tink_*_probe.tie（12 个，覆盖帧骨架→中继全协议；对应设计文档 §11 探针集）。
+
+import "../std/bytes.tie" as bytes
+import "../std/x25519.tie" as x25519
+import "../std/ed25519.tie" as ed25519
+import "../std/hkdf.tie" as hkdf
+import "../std/hmac.tie" as hmac
+import "../std/chacha20.tie" as chacha20
+import "../std/blake3.tie" as blake3
+import "../std/sha256.tie" as sha
+import "../std/tsha2.tie" as tsha2
+
+// CRC32C 查表（Castagnoli，反射多项式 0x82F63B78；懒构建一次，见 crc32c_ensure）
+var crc32c_tab: table<i64>;
+
+namespace tink {
+
+// ==================== 常量：魔数与版本 ====================
+
+pub func magic_1() -> i64 { return 0x74 }
+pub func magic_2() -> i64 { return 0x6B }
+pub func frame_version() -> i64 { return 3 }
+pub func header_len() -> i64 { return 16 }
+pub func tail_crc_len() -> i64 { return 4 }
+pub func tail_tag_len() -> i64 { return 16 }
+
+// ==================== 帧类型注册表（§4，40 个已定义槽） ====================
+
+// 传输核心·数据面 0x0x
+pub func ft_padding() -> i64 { return 0x00 }
+pub func ft_ping() -> i64 { return 0x01 }
+pub func ft_pong() -> i64 { return 0x02 }
+pub func ft_ack() -> i64 { return 0x03 }
+pub func ft_message() -> i64 { return 0x04 }
+pub func ft_stream_data() -> i64 { return 0x05 }
+pub func ft_datagram() -> i64 { return 0x06 }
+pub func ft_batch() -> i64 { return 0x07 }
+pub func ft_reset_stream() -> i64 { return 0x08 }
+pub func ft_stop_sending() -> i64 { return 0x09 }
+// 传输核心·流控与状态面 0x1x
+pub func ft_max_data() -> i64 { return 0x10 }
+pub func ft_max_stream_data() -> i64 { return 0x11 }
+pub func ft_data_blocked() -> i64 { return 0x12 }
+pub func ft_stream_blocked() -> i64 { return 0x13 }
+// 会话与安全 0x2x
+pub func ft_hello() -> i64 { return 0x20 }
+pub func ft_hello_ack() -> i64 { return 0x21 }
+pub func ft_finish() -> i64 { return 0x22 }
+pub func ft_ticket() -> i64 { return 0x23 }
+pub func ft_resume() -> i64 { return 0x24 }
+pub func ft_key_update() -> i64 { return 0x25 }
+pub func ft_goaway() -> i64 { return 0x26 }
+pub func ft_close() -> i64 { return 0x27 }
+// 总线 0x3x
+pub func ft_register() -> i64 { return 0x30 }
+pub func ft_lookup() -> i64 { return 0x31 }
+pub func ft_lookup_reply() -> i64 { return 0x32 }
+pub func ft_unregister() -> i64 { return 0x33 }
+pub func ft_subscribe() -> i64 { return 0x34 }
+pub func ft_unsubscribe() -> i64 { return 0x35 }
+pub func ft_publish() -> i64 { return 0x36 }
+pub func ft_multicast() -> i64 { return 0x37 }
+// RPC 0x4x
+pub func ft_request() -> i64 { return 0x40 }
+pub func ft_response() -> i64 { return 0x41 }
+pub func ft_cancel() -> i64 { return 0x42 }
+pub func ft_push() -> i64 { return 0x43 }
+// 内容 0x5x
+pub func ft_get() -> i64 { return 0x50 }
+pub func ft_have() -> i64 { return 0x51 }
+pub func ft_put() -> i64 { return 0x52 }
+pub func ft_chunk_proof() -> i64 { return 0x53 }
+pub func ft_verify() -> i64 { return 0x54 }
+// 中继 0x6x
+pub func ft_forward() -> i64 { return 0x60 }
+
+// ==================== flags（§3.2） ====================
+
+pub func fl_ext() -> i64 { return 1 }
+pub func fl_protected() -> i64 { return 2 }
+pub func fl_crc() -> i64 { return 4 }
+pub func fl_fin() -> i64 { return 8 }
+pub func fl_offset() -> i64 { return 16 }
+pub func fl_urgent() -> i64 { return 32 }
+// bit6..15 必须为 0；置位 = 帧非法（早拒绝）
+pub func fl_reserved_mask() -> i64 { return 0xFFC0 }
+
+// ==================== TLV key 注册表（§3.3） ====================
+
+pub func tlv_conn_id() -> i64 { return 1 }
+pub func tlv_priority() -> i64 { return 2 }
+pub func tlv_deadline() -> i64 { return 3 }
+pub func tlv_req_id() -> i64 { return 4 }
+pub func tlv_trace() -> i64 { return 5 }
+pub func tlv_topic() -> i64 { return 6 }
+pub func tlv_content_id() -> i64 { return 7 }
+pub func tlv_compress() -> i64 { return 8 }
+pub func tlv_cc_hint() -> i64 { return 9 }
+
+// ==================== 错误码分区（§4.7；码值表随规范发布） ====================
+
+pub func err_ok() -> i64 { return 0x0000 }
+pub func err_class_transport() -> i64 { return 0x0100 }
+pub func err_class_session() -> i64 { return 0x0200 }
+pub func err_class_security() -> i64 { return 0x0300 }
+pub func err_class_bus() -> i64 { return 0x0400 }
+pub func err_class_content() -> i64 { return 0x0500 }
+pub func err_class_relay() -> i64 { return 0x0600 }
+// 0x0104：重传耗尽 → RESET_STREAM（§5.3 已具名；其余码值随规范注册表发布）
+pub func err_timeout() -> i64 { return 0x0104 }
+
+// ==================== 类型注册表助手 ====================
+
+// 已定义槽判定：0x7x–0xEx 整块预留、各预留槽、0xFx 私有均非「已定义」
+pub func type_defined(t: i64) -> bool {
+    if t < 0 || t > 255 { return false }
+    var blk = (t >> 4) & 0x0F
+    var sl = t & 0x0F
+    if blk == 0 { return sl <= 9 }
+    if blk == 1 { return sl <= 3 }
+    if blk == 2 { return sl <= 7 }
+    if blk == 3 { return sl <= 7 }
+    if blk == 4 { return sl <= 3 }
+    if blk == 5 { return sl <= 4 }
+    if blk == 6 { return sl == 0 }
+    return false
+}
+
+// 写方可用判定：已定义槽，或 0xF0–0xFF 私有/实验；预留槽/预留块 v3 写方禁用
+pub func type_writable(t: i64) -> bool {
+    if type_defined(t) { return true }
+    if t >= 0xF0 && t <= 0xFF { return true }
+    return false
+}
+
+pub func type_block(t: i64) -> i64 { return (t >> 4) & 0x0F }
+pub func type_slot(t: i64) -> i64 { return t & 0x0F }
+
+// 类型名（诊断/探针用；未定义 → "UNKNOWN"）
+pub func type_name(t: i64) -> string {
+    if t == 0x00 { return "PADDING" }
+    if t == 0x01 { return "PING" }
+    if t == 0x02 { return "PONG" }
+    if t == 0x03 { return "ACK" }
+    if t == 0x04 { return "MESSAGE" }
+    if t == 0x05 { return "STREAM_DATA" }
+    if t == 0x06 { return "DATAGRAM" }
+    if t == 0x07 { return "BATCH" }
+    if t == 0x08 { return "RESET_STREAM" }
+    if t == 0x09 { return "STOP_SENDING" }
+    if t == 0x10 { return "MAX_DATA" }
+    if t == 0x11 { return "MAX_STREAM_DATA" }
+    if t == 0x12 { return "DATA_BLOCKED" }
+    if t == 0x13 { return "STREAM_BLOCKED" }
+    if t == 0x20 { return "HELLO" }
+    if t == 0x21 { return "HELLO_ACK" }
+    if t == 0x22 { return "FINISH" }
+    if t == 0x23 { return "TICKET" }
+    if t == 0x24 { return "RESUME" }
+    if t == 0x25 { return "KEY_UPDATE" }
+    if t == 0x26 { return "GOAWAY" }
+    if t == 0x27 { return "CLOSE" }
+    if t == 0x30 { return "REGISTER" }
+    if t == 0x31 { return "LOOKUP" }
+    if t == 0x32 { return "LOOKUP_REPLY" }
+    if t == 0x33 { return "UNREGISTER" }
+    if t == 0x34 { return "SUBSCRIBE" }
+    if t == 0x35 { return "UNSUBSCRIBE" }
+    if t == 0x36 { return "PUBLISH" }
+    if t == 0x37 { return "MULTICAST" }
+    if t == 0x40 { return "REQUEST" }
+    if t == 0x41 { return "RESPONSE" }
+    if t == 0x42 { return "CANCEL" }
+    if t == 0x43 { return "PUSH" }
+    if t == 0x50 { return "GET" }
+    if t == 0x51 { return "HAVE" }
+    if t == 0x52 { return "PUT" }
+    if t == 0x53 { return "CHUNK_PROOF" }
+    if t == 0x54 { return "VERIFY" }
+    if t == 0x60 { return "FORWARD" }
+    return "UNKNOWN"
+}
+
+// ==================== CRC32C（Castagnoli） ====================
+// 懒构建 256 项查表（位递推一次成型）；建后每字节 = 1 查表 + 3 位运算。
+// 反射式递推：c 每步 < 2^32 恒正，`>>` 即逻辑右移（论证与 rdu/crc.tie 同）。
+// 行尾 0x82F63B78 = Castagnoli 反射多项式；KAT 见探针（"123456789" 与 RFC 3720）。
+
+func crc32c_ensure() {
+    if len(crc32c_tab) > 0 {
+        return
+    }
+    var i: i64 = 0
+    while i < 256 {
+        var c: i64 = i
+        var k: i64 = 0
+        while k < 8 {
+            if (c & 1) != 0 {
+                c = (c >> 1) ^ 0x82F63B78
+            } else {
+                c = c >> 1
+            }
+            k = k + 1
+        }
+        table_push(crc32c_tab, c)
+        i = i + 1
+    }
+}
+
+// 区间 [start, end) 的 CRC32C（init 0xFFFFFFFF，xorout 0xFFFFFFFF）。
+// 越界按饱和截断（防御；正常调用由上层先行界检查）。
+pub func crc32c_range(b: table<i64>, start: i64, end: i64) -> i64 {
+    crc32c_ensure()
+    var lo = start
+    if lo < 0 { lo = 0 }
+    var hi = end
+    if hi > len(b) { hi = len(b) }
+    var c: i64 = 0xFFFFFFFF
+    var i: i64 = lo
+    while i < hi {
+        c = crc32c_tab[(c ^ b[i]) & 0xFF] ^ (c >> 8)
+        i = i + 1
+    }
+    return c ^ 0xFFFFFFFF
+}
+
+// ==================== 头部编解码 ====================
+
+// 16B 头部序列化（不做合法性校验；供 frame_encode 与探针构造用）。
+pub func header_encode(ftype: i64, flags: i64, stream_id: i64, seq: i64, plen: i64) -> table<i64> {
+    var h = table_new_i64()
+    table_push(h, 0x74)
+    table_push(h, 0x6B)
+    table_push(h, 3)
+    table_push(h, ftype & 0xFF)
+    table_push(h, (flags >> 8) & 0xFF)
+    table_push(h, flags & 0xFF)
+    table_push(h, (stream_id >> 24) & 0xFF)
+    table_push(h, (stream_id >> 16) & 0xFF)
+    table_push(h, (stream_id >> 8) & 0xFF)
+    table_push(h, stream_id & 0xFF)
+    table_push(h, (seq >> 24) & 0xFF)
+    table_push(h, (seq >> 16) & 0xFF)
+    table_push(h, (seq >> 8) & 0xFF)
+    table_push(h, seq & 0xFF)
+    table_push(h, (plen >> 8) & 0xFF)
+    table_push(h, plen & 0xFF)
+    return h
+}
+
+// ==================== 扩展区（TLV） ====================
+
+// 单条 TLV：key u16 BE + value_len u16 BE + value。
+pub func ext_tlv(key: i64, value: table<i64>) -> table<i64> {
+    var h = table_new_i64()
+    table_push(h, (key >> 8) & 0xFF)
+    table_push(h, key & 0xFF)
+    var vl = len(value)
+    table_push(h, (vl >> 8) & 0xFF)
+    table_push(h, vl & 0xFF)
+    return bytes.concat(h, value)
+}
+
+pub func ext_tlv_u8(key: i64, v: i64) -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, v & 0xFF)
+    return ext_tlv(key, t)
+}
+
+pub func ext_tlv_u32(key: i64, v: i64) -> table<i64> {
+    return ext_tlv(key, bytes.to_u32_be(v))
+}
+
+pub func ext_tlv_u64(key: i64, v: i64) -> table<i64> {
+    return ext_tlv(key, bytes.to_u64_be(v))
+}
+
+// 在扩展区（缓冲区间 [off, off+n)）中查 key → (status, voff, vlen)：
+//   1 = 找到（voff 指向 value 首字节，vlen = value 字节数）且全区结构完好
+//   0 = 无此 key 且全区结构完好
+//   -1 = 区结构坏（TLV 越界 / 残余字节 / 区间越过缓冲）——坏区不产出任何结果
+// 行走覆盖全区：记录首个匹配后继续走完，残余/越界一律 -1——即
+// 「序列须恰好消耗 ext_len」纪律在每个扩展区解析点强制（未知 key 自然跳过）。
+pub func ext_find(b: table<i64>, off: i64, n: i64, key: i64) -> (i64, i64, i64) {
+    if off < 0 || n < 0 { return (-1, 0, 0) }
+    if off + n > len(b) { return (-1, 0, 0) }
+    var p = off
+    var end = off + n
+    var fnd: i64 = 0
+    var vo: i64 = 0
+    var vl0: i64 = 0
+    while p + 4 <= end {
+        var k = bytes.from_u16_be(b, p)
+        var vl = bytes.from_u16_be(b, p + 2)
+        if p + 4 + vl > end { return (-1, 0, 0) }
+        if k == key && fnd == 0 {
+            fnd = 1
+            vo = p + 4
+            vl0 = vl
+        }
+        p = p + 4 + vl
+    }
+    if p != end { return (-1, 0, 0) }  // 残余（非完整 TLV）→ 结构坏
+    if fnd == 1 { return (1, vo, vl0) }
+    return (0, 0, 0)
+}
+
+// 扩展区结构校验：1 = 完好消耗（空区也算完好）/ -1 = 坏。
+// key = -1 永不匹配（u16 域外哨兵），故复用 ext_find 的行走判据，不另立一套。
+pub func ext_check(b: table<i64>, off: i64, n: i64) -> i64 {
+    var (st, x1, x2) = ext_find(b, off, n, -1)
+    if st == 0 { return 1 }
+    return -1
+}
+
+// 类型化取值：缺失/值短/结构坏一律 -1。
+pub func ext_u8(b: table<i64>, off: i64, n: i64, key: i64) -> i64 {
+    var (st, vo, vl) = ext_find(b, off, n, key)
+    if st != 1 || vl < 1 { return -1 }
+    return b[vo] & 0xFF
+}
+
+pub func ext_u32(b: table<i64>, off: i64, n: i64, key: i64) -> i64 {
+    var (st, vo, vl) = ext_find(b, off, n, key)
+    if st != 1 || vl < 4 { return -1 }
+    return bytes.from_u32_be(b, vo)
+}
+
+pub func ext_u64(b: table<i64>, off: i64, n: i64, key: i64) -> i64 {
+    var (st, vo, vl) = ext_find(b, off, n, key)
+    if st != 1 || vl < 8 { return -1 }
+    return bytes.from_u64_be(b, vo)
+}
+
+// ==================== 帧视图（零拷贝） ====================
+// 从缓冲 pos 处读取一帧，返回字段与「缓冲内偏移」视图（不拷贝载荷/扩展区/尾部）。
+// 返回：(ok, ftype, flags, stream_id, seq, body_off, body_len, ext_off, ext_len, iok, next_pos)
+//   ok：1 成功 / 0 缓冲不足 / -1 帧非法（魔力/版本/保留位/尾部互斥/结构越界）
+//   body_off / body_len：载荷区视图（OFFSET 位时其前 4B 为 offset，计入 len）
+//   ext_off / ext_len：扩展区 TLV 序列视图（无扩展区 = -1/-1；空扩展区 = 偏移/0）
+//   iok：1 CRC32C 通过 / 0 CRC 失败 / -1 本层无结论（裸帧，或保护帧待密码层）
+//   next_pos：下一帧起点；失败时 -1。
+pub func frame_view(b: table<i64>, pos: i64) -> (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) {
+    var nb = len(b)
+    if pos < 0 {
+        return (-1, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1)
+    }
+    if pos + 16 > nb {
+        return (0, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1)
+    }
+    if (b[pos] & 0xFF) != 0x74 || (b[pos + 1] & 0xFF) != 0x6B {
+        return (-1, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1)  // 魔力
+    }
+    if (b[pos + 2] & 0xFF) != 3 {
+        return (-1, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1)  // 版本不支持
+    }
+    var fl = bytes.from_u16_be(b, pos + 4)
+    if (fl & 0xFFC0) != 0 {
+        return (-1, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1)  // 保留位置位
+    }
+    var prot: bool = (fl & 2) != 0
+    var crc: bool = (fl & 4) != 0
+    if prot && crc {
+        return (-1, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1)  // 尾部互斥
+    }
+    var ftype = b[pos + 3] & 0xFF
+    var sid = bytes.from_u32_be(b, pos + 6)
+    var sq = bytes.from_u32_be(b, pos + 10)
+    var plen = bytes.from_u16_be(b, pos + 14)
+    var off = pos + 16
+    var elen: i64 = -1
+    var eoff: i64 = -1
+    if (fl & 1) != 0 {
+        if off + 2 > nb {
+            return (0, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1)
+        }
+        elen = bytes.from_u16_be(b, off)
+        eoff = off + 2
+        off = off + 2 + elen
+        if off > nb {
+            return (0, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1)
+        }
+    }
+    var boff = off
+    off = off + plen
+    if off > nb {
+        return (0, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1)
+    }
+    var tlen: i64 = 0
+    if prot {
+        tlen = 16
+    } else if crc {
+        tlen = 4
+    }
+    if off + tlen > nb {
+        return (0, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1)
+    }
+    var iok: i64 = -1
+    if crc {
+        var want = bytes.from_u32_be(b, off)
+        var got = crc32c_range(b, pos, off)  // 覆盖「头 + 扩展 + 载荷」
+        if want == got {
+            iok = 1
+        } else {
+            iok = 0
+        }
+    }
+    return (1, ftype, fl, sid, sq, boff, plen, eoff, elen, iok, off + tlen)
+}
+
+// ==================== 帧跳过（零拷贝，O(1)） ====================
+// 返回 next（>0）/ 0 缓冲不足 / -1 帧非法。不校验 CRC、不解析扩展区。
+// 结构判据与 frame_view 完全一致——两处必须同步（探针对同一输入成对断言）。
+pub func frame_skip(b: table<i64>, pos: i64) -> i64 {
+    var nb = len(b)
+    if pos < 0 { return -1 }
+    if pos + 16 > nb { return 0 }
+    if (b[pos] & 0xFF) != 0x74 || (b[pos + 1] & 0xFF) != 0x6B { return -1 }
+    if (b[pos + 2] & 0xFF) != 3 { return -1 }
+    var fl = bytes.from_u16_be(b, pos + 4)
+    if (fl & 0xFFC0) != 0 { return -1 }
+    if (fl & 2) != 0 && (fl & 4) != 0 { return -1 }
+    var plen = bytes.from_u16_be(b, pos + 14)
+    var off = pos + 16
+    if (fl & 1) != 0 {
+        if off + 2 > nb { return 0 }
+        var elen = bytes.from_u16_be(b, off)
+        off = off + 2 + elen
+        if off > nb { return 0 }
+    }
+    off = off + plen
+    if off > nb { return 0 }
+    var tlen: i64 = 0
+    if (fl & 2) != 0 {
+        tlen = 16
+    } else if (fl & 4) != 0 {
+        tlen = 4
+    }
+    if off + tlen > nb { return 0 }
+    return off + tlen
+}
+
+// ==================== 帧组装 ====================
+// 合法输入 → 完整帧字节；非法输入 → 空表。
+//   ext：TLV 序列字节（EXT 位置位时写入，可为空；EXT 位未置位时必须为空）
+//   PROTECTED 编码未接线（密码层里程碑）——本层拒绝，防止「声称保护而未加密」。
+//   CRC 位置位时自动计算覆盖「头 + 扩展 + 载荷」的 CRC32C 并置尾。
+pub func frame_encode(ftype: i64, flags: i64, stream_id: i64, seq: i64, payload: table<i64>, ext: table<i64>) -> table<i64> {
+    var empty = table_new_i64()
+    if (flags & 0xFFC0) != 0 { return empty }        // 保留位
+    if (flags & 2) != 0 { return empty }             // PROTECTED 未接线（含与 CRC 同置）
+    var has_ext: bool = (flags & 1) != 0
+    if !has_ext && len(ext) > 0 { return empty }     // EXT 位与扩展区不一致
+    if !type_writable(ftype) { return empty }        // 预留槽/预留块禁写
+    var plen = len(payload)
+    if plen > 65535 { return empty }
+    var elen = len(ext)
+    if elen > 65535 { return empty }
+    var a = header_encode(ftype, flags, stream_id, seq, plen)
+    if has_ext {
+        var pre = table_new_i64()
+        table_push(pre, (elen >> 8) & 0xFF)
+        table_push(pre, elen & 0xFF)
+        a = bytes.concat(a, bytes.concat(pre, ext))
+    }
+    a = bytes.concat(a, payload)
+    if (flags & 4) != 0 {
+        var c = crc32c_range(a, 0, len(a))
+        var cb = table_new_i64()
+        table_push(cb, (c >> 24) & 0xFF)
+        table_push(cb, (c >> 16) & 0xFF)
+        table_push(cb, (c >> 8) & 0xFF)
+        table_push(cb, c & 0xFF)
+        return bytes.concat(a, cb)
+    }
+    return a
+}
+
+// ==================== 物化与载荷前缀 ====================
+
+// 视图段物化（显式拷贝一次；热路径应直接消费偏移，避免物化）。
+pub func frame_take(b: table<i64>, off: i64, n: i64) -> table<i64> {
+    return bytes.slice(b, off, off + n)
+}
+
+// OFFSET 位（§3.2）载荷前缀：4B BE offset。组装载荷 = 本前缀 ⊕ 数据。
+pub func offset_prefix(off: i64) -> table<i64> {
+    return bytes.to_u32_be(off)
+}
+
+// ==================== 消息与流（§5.2） ====================
+// MESSAGE：一条离散消息 = 单帧（≤65535B）或「多帧 + OFFSET 位」分片（首片 OFFSET=0、
+//   末片置 FIN）；接收端按 OFFSET 重组——容忍乱序，重复帧（内容逐字节一致）去重，
+//   重叠冲突 / 空洞 / 缺末片 FIN → 拒收。
+// STREAM_DATA：字节流块；OFFSET 用于断点续传/并行发送定位，重组取「从 0 起连续前缀」
+//   （遇空洞即归还已有前缀，供增量消费）。
+// DATAGRAM：不可靠消息（不重传不排序）；单帧即完整载荷，本层不做重组。
+// 保护位 prot 由调用方给定：0 = 裸（仅显式场景）或 fl_crc()（明文模式）；
+//   PROTECTED 帧在密码层密封后装配，本层解析时拒收（不可读）。
+
+// ---------- PING / PONG（body = nonce u64 BE） ----------
+
+pub func ping_body(nonce: i64) -> table<i64> { return bytes.to_u64_be(nonce) }
+pub func pong_body(nonce: i64) -> table<i64> { return bytes.to_u64_be(nonce) }
+
+pub func ping_frame(stream_id: i64, seq: i64, nonce: i64, prot: i64) -> table<i64> {
+    return frame_encode(ft_ping(), prot, stream_id, seq, ping_body(nonce), table_new_i64())
+}
+
+pub func pong_frame(stream_id: i64, seq: i64, nonce: i64, prot: i64) -> table<i64> {
+    return frame_encode(ft_pong(), prot, stream_id, seq, pong_body(nonce), table_new_i64())
+}
+
+// 读 PING/PONG body 的 nonce（<8 字节 → -1）
+pub func nonce_of(b: table<i64>, off: i64, n: i64) -> i64 {
+    if off < 0 || n < 8 || off + 8 > len(b) { return -1 }
+    return bytes.from_u64_be(b, off)
+}
+
+// ---------- RESET_STREAM / STOP_SENDING（body = code u32 BE） ----------
+
+pub func reset_frame(stream_id: i64, seq: i64, ec: i64, prot: i64) -> table<i64> {
+    return frame_encode(ft_reset_stream(), prot, stream_id, seq, bytes.to_u32_be(ec), table_new_i64())
+}
+
+pub func stop_frame(stream_id: i64, seq: i64, ec: i64, prot: i64) -> table<i64> {
+    return frame_encode(ft_stop_sending(), prot, stream_id, seq, bytes.to_u32_be(ec), table_new_i64())
+}
+
+// 读 RESET/STOP body 的 code（<4 字节 → -1）
+pub func code_of(b: table<i64>, off: i64, n: i64) -> i64 {
+    if off < 0 || n < 4 || off + 4 > len(b) { return -1 }
+    return bytes.from_u32_be(b, off)
+}
+
+// ---------- 分片收集与合并（MESSAGE / STREAM_DATA 共用核心） ----------
+
+// 收集缓冲区中的分片帧 → (ok, offs, voffs, vlens, fins)：
+//   offs   分片载荷绝对偏移（OFFSET 未置位按 0 处理——即整条消息位于位置 0）
+//   voffs/vlens 载荷视图（缓冲内偏移/字节数，已扣除 OFFSET 前缀）
+//   fins   FIN 位（0/1）
+// 校验：逐帧结构合法、类型 == want_ty、CRC（若有）必须通过、PROTECTED 拒收。
+func frag_collect(b: table<i64>, want_ty: i64) -> (i64, table<i64>, table<i64>, table<i64>, table<i64>) {
+    var offs = table_new_i64()
+    var voffs = table_new_i64()
+    var vlens = table_new_i64()
+    var fins = table_new_i64()
+    var pos: i64 = 0
+    while pos < len(b) {
+        var (ok, ty, fl, sd, sq, bo, bl, eo, el, iok, nx) = frame_view(b, pos)
+        if ok != 1 { return (0, offs, voffs, vlens, fins) }
+        if ty != want_ty { return (0, offs, voffs, vlens, fins) }
+        if (fl & 2) != 0 { return (0, offs, voffs, vlens, fins) }
+        if (fl & 4) != 0 && iok != 1 { return (0, offs, voffs, vlens, fins) }
+        var fo: i64 = 0
+        var vo = bo
+        var vl = bl
+        if (fl & 16) != 0 {
+            if bl < 4 { return (0, offs, voffs, vlens, fins) }
+            fo = bytes.from_u32_be(b, bo)
+            vo = bo + 4
+            vl = bl - 4
+        }
+        table_push(offs, fo)
+        table_push(voffs, vo)
+        table_push(vlens, vl)
+        var fmark: i64 = 0
+        if (fl & 8) != 0 { fmark = 1 }
+        table_push(fins, fmark)
+        pos = nx
+    }
+    return (1, offs, voffs, vlens, fins)
+}
+
+// 分片索引按偏移升序（选择排序；输出 idx 表）
+func frag_order(offs: table<i64>) -> table<i64> {
+    var n = len(offs)
+    var idx = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(idx, i)
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        var mi = i
+        var j: i64 = i + 1
+        while j < n {
+            if offs[idx[j]] < offs[idx[mi]] { mi = j }
+            j = j + 1
+        }
+        if mi != i {
+            var tv = idx[i]
+            idx[i] = idx[mi]
+            idx[mi] = tv
+        }
+        i = i + 1
+    }
+    return idx
+}
+
+// 严格合并（MESSAGE）：覆盖 [0, 终点) 无缝、首片从 0 起、末端片置 FIN；
+// 重复（完全包含且内容逐字节一致）去重；部分重叠 / 内容冲突 / 空洞 → 失败。
+func frag_merge_strict(b: table<i64>, offs: table<i64>, voffs: table<i64>, vlens: table<i64>, fins: table<i64>) -> (i64, table<i64>) {
+    var empty = table_new_i64()
+    var n = len(offs)
+    if n == 0 { return (0, empty) }
+    var idx = frag_order(offs)
+    var out = table_new_i64()
+    var cursor: i64 = 0
+    var last_fin: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        var k = idx[i]
+        var fo = offs[k]
+        var vl = vlens[k]
+        var vo = voffs[k]
+        if fo > cursor { return (0, empty) }
+        if fo < cursor {
+            if fo + vl > cursor { return (0, empty) }
+            var q: i64 = 0
+            var same: bool = true
+            while q < vl {
+                if (b[vo + q] & 0xFF) != (out[fo + q] & 0xFF) { same = false }
+                q = q + 1
+            }
+            if !same { return (0, empty) }
+        } else {
+            var q2: i64 = 0
+            while q2 < vl {
+                table_push(out, b[vo + q2] & 0xFF)
+                q2 = q2 + 1
+            }
+            cursor = cursor + vl
+            last_fin = fins[k]
+        }
+        i = i + 1
+    }
+    if last_fin != 1 { return (0, empty) }
+    return (1, out)
+}
+
+// 前缀合并（STREAM）：从 0 起取连续前缀，遇空洞即归还已有前缀（ok=1）；
+// 部分重叠 / 内容冲突 → 失败；无分片 → 空前缀（ok=1）。
+func frag_merge_prefix(b: table<i64>, offs: table<i64>, voffs: table<i64>, vlens: table<i64>, fins: table<i64>) -> (i64, table<i64>) {
+    var empty = table_new_i64()
+    var n = len(offs)
+    if n == 0 { return (1, empty) }
+    var idx = frag_order(offs)
+    var out = table_new_i64()
+    var cursor: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var k = idx[i]
+        var fo = offs[k]
+        var vl = vlens[k]
+        var vo = voffs[k]
+        if fo > cursor { return (1, out) }
+        if fo < cursor {
+            if fo + vl > cursor { return (0, empty) }
+            var q: i64 = 0
+            var same: bool = true
+            while q < vl {
+                if (b[vo + q] & 0xFF) != (out[fo + q] & 0xFF) { same = false }
+                q = q + 1
+            }
+            if !same { return (0, empty) }
+        } else {
+            var q2: i64 = 0
+            while q2 < vl {
+                table_push(out, b[vo + q2] & 0xFF)
+                q2 = q2 + 1
+            }
+            cursor = cursor + vl
+        }
+        i = i + 1
+    }
+    return (1, out)
+}
+
+// ---------- MESSAGE ----------
+
+// 单帧消息（≤65535B；未分片；置 FIN）
+pub func msg_frame(payload: table<i64>, stream_id: i64, seq: i64, prot: i64) -> table<i64> {
+    return frame_encode(ft_message(), prot | fl_fin(), stream_id, seq, payload, table_new_i64())
+}
+
+// 分片：payload → 逐帧字节拼接（片帧 i 的 seq = start_seq + i；首片 OFFSET=0，末片 FIN）
+// 每片数据上限 max_chunk ≤ 65531（= 65535 − 4B offset 前缀；前缀计入 len）
+pub func msg_split(payload: table<i64>, stream_id: i64, start_seq: i64, max_chunk: i64, prot: i64) -> table<i64> {
+    var out = table_new_i64()
+    var total = len(payload)
+    var c = max_chunk
+    if c <= 0 { c = 65531 }
+    if c > 65531 { c = 65531 }
+    var nf = total / c
+    if nf * c < total { nf = nf + 1 }
+    if nf == 0 { nf = 1 }
+    var i: i64 = 0
+    while i < nf {
+        var cs = i * c
+        var ce = cs + c
+        if ce > total { ce = total }
+        var part = bytes.slice(payload, cs, ce)
+        var body = bytes.concat(bytes.to_u32_be(cs), part)
+        var fl: i64 = fl_offset() | prot
+        if i == nf - 1 { fl = fl | fl_fin() }
+        var fr = frame_encode(ft_message(), fl, stream_id, start_seq + i, body, table_new_i64())
+        out = bytes.concat(out, fr)
+        i = i + 1
+    }
+    return out
+}
+
+// 重组（严格）：→ (ok, payload)
+pub func msg_join(b: table<i64>) -> (i64, table<i64>) {
+    var empty = table_new_i64()
+    var (okc, offs, voffs, vlens, fins) = frag_collect(b, ft_message())
+    if okc != 1 || len(offs) == 0 { return (0, empty) }
+    return frag_merge_strict(b, offs, voffs, vlens, fins)
+}
+
+// ---------- STREAM_DATA ----------
+
+// 字节流块：data 位于流内偏移 off；fin_flag 置 FIN（半关闭）
+pub func stream_chunk(data: table<i64>, stream_id: i64, seq: i64, off: i64, fin_flag: bool, prot: i64) -> table<i64> {
+    var body = bytes.concat(bytes.to_u32_be(off), data)
+    var fl: i64 = fl_offset() | prot
+    if fin_flag { fl = fl | fl_fin() }
+    return frame_encode(ft_stream_data(), fl, stream_id, seq, body, table_new_i64())
+}
+
+// 重组（前缀）：→ (ok, 从 0 起的连续前缀)
+pub func stream_join(b: table<i64>) -> (i64, table<i64>) {
+    var empty = table_new_i64()
+    var (okc, offs, voffs, vlens, fins) = frag_collect(b, ft_stream_data())
+    if okc != 1 { return (0, empty) }
+    return frag_merge_prefix(b, offs, voffs, vlens, fins)
+}
+
+// ---------- DATAGRAM ----------
+
+// 不可靠消息单帧（不重传不排序；丢包即丢）
+pub func datagram_frame(payload: table<i64>, stream_id: i64, seq: i64, prot: i64) -> table<i64> {
+    return frame_encode(ft_datagram(), prot, stream_id, seq, payload, table_new_i64())
+}
+
+// ==================== 可靠传输（§5.3） ====================
+// 每流独立：seq u32 单调 +1；接收端重排 + 范围 ACK（largest/delay/count + gap/range 对）；
+// 发送端重发缓冲 + RTO 指数退避（初值 333ms、每次 ×2、上限 8s；均可调）；
+// 「重传 = 原帧重发（幂等）」；连续 5 次重传仍超时 → RESET_STREAM(code = 0x0104 TIMEOUT)。
+// ACK 策略：每 2 帧或 25ms 至少一 ACK（自适应）。
+// 状态 = 可写穿表（ref 参数）：
+//   rx 状态 [next_expect, pending_since_ack, last_ack_ms]；接收集 got 由调用方持有
+//     （append-only，乱序持有，不压缩；含 [next_expect, ∞) 内已收 seq）
+//   tx 状态 [base, next, rto0, cap]；重发缓冲 sbuf；段表 segs 步长 5：
+//     [seq, boff, blen, lastms, rets]；blen == -1 → 已释放（已确认）；
+//     lastms == -1 → 从未发送
+// 语义纪律：所有可靠性状态是每流的；连接控制流（stream 0）用同一机制（控制消息不丢）。
+
+// ---------- 范围 ACK 编解码 ----------
+// body：largest u32 + delay u16 + count u8 + (gap u16, range u16) × count
+// 覆盖语义（钉死为 KAT）：第 0 对 gap 恒 0；run_0 覆盖 [largest − range_0 + 1, largest]；
+// 其后 run_i 的最高位 = run_{i−1} 最低位 − 1 − gap_i。
+
+// 建 ACK body：gaps/ranges 等长（1..255 对），gaps[0] 须为 0；入参不合法 → 空表
+pub func ack_build(largest: i64, delay: i64, gaps: table<i64>, ranges: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var cnt = len(ranges)
+    if cnt < 1 || cnt > 255 || len(gaps) != cnt { return out }
+    table_push(out, (largest >> 24) & 0xFF)
+    table_push(out, (largest >> 16) & 0xFF)
+    table_push(out, (largest >> 8) & 0xFF)
+    table_push(out, largest & 0xFF)
+    table_push(out, (delay >> 8) & 0xFF)
+    table_push(out, delay & 0xFF)
+    table_push(out, cnt & 0xFF)
+    var i: i64 = 0
+    while i < cnt {
+        var g = gaps[i]
+        var r = ranges[i]
+        table_push(out, (g >> 8) & 0xFF)
+        table_push(out, g & 0xFF)
+        table_push(out, (r >> 8) & 0xFF)
+        table_push(out, r & 0xFF)
+        i = i + 1
+    }
+    return out
+}
+
+// 解 ACK body → (ok, largest, delay, gaps, ranges)；长度须恰为 7 + count×4
+pub func ack_parse(b: table<i64>, off: i64, n: i64) -> (i64, i64, i64, table<i64>, table<i64>) {
+    var gaps = table_new_i64()
+    var ranges = table_new_i64()
+    if off < 0 || n < 7 || off + n > len(b) { return (0, 0, 0, gaps, ranges) }
+    var cnt = b[off + 6] & 0xFF
+    if n != 7 + cnt * 4 { return (0, 0, 0, gaps, ranges) }
+    var largest = bytes.from_u32_be(b, off)
+    var delay = bytes.from_u16_be(b, off + 4)
+    var i: i64 = 0
+    while i < cnt {
+        var p = off + 7 + i * 4
+        table_push(gaps, bytes.from_u16_be(b, p))
+        table_push(ranges, bytes.from_u16_be(b, p + 2))
+        i = i + 1
+    }
+    return (1, largest, delay, gaps, ranges)
+}
+
+// seq 是否被该 ACK 覆盖（1/0；结构坏/无范围 → 保守 0）
+pub func ack_covers(largest: i64, gaps: table<i64>, ranges: table<i64>, seq: i64) -> i64 {
+    if largest < 0 { return 0 }
+    var n = len(ranges)
+    if n < 1 { return 0 }
+    var hi = largest
+    var i: i64 = 0
+    while i < n {
+        var rl = ranges[i]
+        if rl <= 0 { return 0 }
+        var lo = hi - rl + 1
+        if seq >= lo && seq <= hi { return 1 }
+        if i + 1 < n {
+            var g = gaps[i + 1]
+            if g < 0 { return 0 }
+            hi = lo - 1 - g
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 由接收集（任意序、容忍重复）反推范围 → (largest, gaps, ranges)；空集 → (-1, 空, 空)
+pub func ack_ranges_from(seqs: table<i64>) -> (i64, table<i64>, table<i64>) {
+    var gaps = table_new_i64()
+    var ranges = table_new_i64()
+    var n = len(seqs)
+    if n == 0 { return (-1, gaps, ranges) }
+    var idx = frag_order(seqs)
+    var largest = seqs[idx[n - 1]]
+    table_push(gaps, 0)
+    var hi = largest
+    var lo = largest
+    var i = n - 2
+    while i >= 0 {
+        var v = seqs[idx[i]]
+        if v >= lo {
+            i = i - 1
+        } else if v == lo - 1 {
+            lo = v
+            i = i - 1
+        } else {
+            table_push(ranges, hi - lo + 1)
+            table_push(gaps, lo - v - 1)
+            hi = v
+            lo = v
+            i = i - 1
+        }
+    }
+    table_push(ranges, hi - lo + 1)
+    return (largest, gaps, ranges)
+}
+
+// ACK 帧（body 装入 ft_ack）
+pub func ack_frame(stream_id: i64, seq: i64, largest: i64, delay: i64, gaps: table<i64>, ranges: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_ack(), prot, stream_id, seq, ack_build(largest, delay, gaps, ranges), table_new_i64())
+}
+
+// ---------- 接收端（重排 + ACK 策略） ----------
+
+// 新接收状态：[next_expect, pending_since_ack, last_ack_ms]
+pub func rx_new() -> table<i64> {
+    var st = table_new_i64()
+    table_push(st, 0)
+    table_push(st, 0)
+    table_push(st, 0)
+    return st
+}
+
+// 收一帧 seq → 1 = 接受（首次）/ 0 = 重复或过旧（丢弃；计数由调用方）
+pub func rx_push(ref st: table<i64>, ref got: table<i64>, seq: i64) -> i64 {
+    if seq < st[0] { return 0 }
+    if seq == st[0] {
+        st[0] = st[0] + 1
+        st[1] = st[1] + 1
+        var advanced: bool = true
+        while advanced {
+            advanced = false
+            var i: i64 = 0
+            while i < len(got) {
+                if got[i] == st[0] {
+                    st[0] = st[0] + 1
+                    advanced = true
+                }
+                i = i + 1
+            }
+        }
+        return 1
+    }
+    var i2: i64 = 0
+    while i2 < len(got) {
+        if got[i2] == seq { return 0 }
+        i2 = i2 + 1
+    }
+    table_push(got, seq)
+    st[1] = st[1] + 1
+    return 1
+}
+
+// ACK 是否到期：每 2 帧，或 1 帧后 25ms（自适应）
+pub func rx_ack_due(st: table<i64>, now_ms: i64) -> i64 {
+    if st[1] >= 2 { return 1 }
+    if st[1] >= 1 && now_ms - st[2] >= 25 { return 1 }
+    return 0
+}
+
+// 构建 ACK body（清 pending、更新 last_ack_ms）；无可确认 → 空表
+// 参考实现：合并集 = [0, next) ∪ got（O(收到集)；量产可增量维护范围表）
+pub func rx_ack_build(ref st: table<i64>, got: table<i64>, delay: i64, now_ms: i64) -> table<i64> {
+    var all = table_new_i64()
+    var k: i64 = 0
+    while k < st[0] {
+        table_push(all, k)
+        k = k + 1
+    }
+    var i: i64 = 0
+    while i < len(got) {
+        table_push(all, got[i])
+        i = i + 1
+    }
+    var (largest, gaps, ranges) = ack_ranges_from(all)
+    st[1] = 0
+    st[2] = now_ms
+    if largest < 0 { return table_new_i64() }
+    return ack_build(largest, delay, gaps, ranges)
+}
+
+// ---------- 发送端（重发缓冲 + RTO） ----------
+
+// 新发送状态：[base, next, rto0, cap]
+pub func tx_new(rto0: i64, cap: i64) -> table<i64> {
+    var st = table_new_i64()
+    table_push(st, 0)
+    table_push(st, 0)
+    table_push(st, rto0)
+    table_push(st, cap)
+    return st
+}
+
+pub func tx_next_seq(st: table<i64>) -> i64 { return st[1] }
+
+// 入队一帧（seq 自动分配；帧字节追加进 sbuf；lastms = -1 未发送）
+pub func tx_push(ref st: table<i64>, ref sbuf: table<i64>, ref segs: table<i64>, frame: table<i64>) {
+    var sq = st[1]
+    var bo = len(sbuf)
+    var bl = len(frame)
+    var i: i64 = 0
+    while i < bl {
+        table_push(sbuf, frame[i] & 0xFF)
+        i = i + 1
+    }
+    table_push(segs, sq)
+    table_push(segs, bo)
+    table_push(segs, bl)
+    table_push(segs, -1)
+    table_push(segs, 0)
+    st[1] = st[1] + 1
+}
+
+// 取出需发送（首发或到期重传）的帧（拼接）→ (frames, exhausted)
+// exhausted = 1：存在段连续 5 次重传仍超时（调用方应发 RESET_STREAM(0x0104) 终止该流）
+// 副作用：标记发送时刻 / 递增重传计数；已释放段（blen = -1）跳过
+pub func tx_collect_due(ref st: table<i64>, ref segs: table<i64>, sbuf: table<i64>, now_ms: i64) -> (table<i64>, i64) {
+    var out = table_new_i64()
+    var exhausted: i64 = 0
+    var nseg = len(segs) / 5
+    var k: i64 = 0
+    while k < nseg {
+        var p = k * 5
+        var blen = segs[p + 2]
+        if blen >= 0 {
+            var due: i64 = 0
+            var rets = segs[p + 4]
+            if segs[p + 3] < 0 {
+                due = 1
+            } else {
+                var eff = st[2] << rets
+                if eff > st[3] { eff = st[3] }
+                if now_ms - segs[p + 3] >= eff { due = 1 }
+            }
+            if due == 1 {
+                if segs[p + 3] >= 0 && rets >= 5 {
+                    exhausted = 1
+                } else {
+                    if segs[p + 3] >= 0 { segs[p + 4] = rets + 1 }
+                    segs[p + 3] = now_ms
+                    var bo = segs[p + 1]
+                    var i: i64 = 0
+                    while i < blen {
+                        table_push(out, sbuf[bo + i] & 0xFF)
+                        i = i + 1
+                    }
+                }
+            }
+        }
+        k = k + 1
+    }
+    return (out, exhausted)
+}
+
+// 收 ACK：释放已确认段（blen = -1）→ 返回释放计数；推进 base 至最小未释放 seq
+pub func tx_on_ack(ref st: table<i64>, ref segs: table<i64>, largest: i64, gaps: table<i64>, ranges: table<i64>) -> i64 {
+    var freed: i64 = 0
+    var nseg = len(segs) / 5
+    var k: i64 = 0
+    while k < nseg {
+        var p = k * 5
+        if segs[p + 2] >= 0 {
+            if ack_covers(largest, gaps, ranges, segs[p]) == 1 {
+                segs[p + 2] = -1
+                freed = freed + 1
+            }
+        }
+        k = k + 1
+    }
+    var b = st[0]
+    var advanced: bool = true
+    while advanced {
+        advanced = false
+        k = 0
+        while k < nseg {
+            var p2 = k * 5
+            if segs[p2] == b && segs[p2 + 2] == -1 {
+                b = b + 1
+                advanced = true
+            }
+            k = k + 1
+        }
+    }
+    st[0] = b
+    return freed
+}
+
+// 尚有在途段数（未释放段计数）
+pub func tx_inflight(segs: table<i64>) -> i64 {
+    var nseg = len(segs) / 5
+    var c: i64 = 0
+    var k: i64 = 0
+    while k < nseg {
+        if segs[k * 5 + 2] >= 0 { c = c + 1 }
+        k = k + 1
+    }
+    return c
+}
+
+// 全部确认？（base == next）
+pub func tx_done(st: table<i64>) -> i64 {
+    if st[0] == st[1] { return 1 }
+    return 0
+}
+
+// ==================== 聚合与批量（§5.8） ====================
+// BATCH（0x07）：纯传输容器 —— count u16 + (len u16 + 内层帧) × count。
+// 内层帧 = 完整 16B 头 + [扩展区] + [载荷]，**无尾部**：内层帧的 PROTECTED/CRC 位
+// 必须为 0（封套唯一落点——批 = 单一认证单元，要么全好要么全拒）。
+// 拆包后与逐帧到达完全等价：批边界永不进入语义层（seq/流控/可靠性单位 = 内层帧）。
+// 明文模式：BATCH 帧自身可带 CRC32C（覆盖整个批体，机制见 frame_encode）。
+// 密封批（PROTECTED BATCH）：单 16B tag 摊薄认证开销（密码层负责密封；本节强制结构纪律）。
+
+// 打批：内层帧（拼接字节，逐帧无尾）→ BATCH body；非法输入 → 空表
+// 校验：逐帧结构合法；PROTECTED/CRC 位必须为 0；单帧总长 ≤ 65535；帧数 1..65535
+pub func batch_pack(frames: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var offs = table_new_i64()
+    var lens = table_new_i64()
+    var pos: i64 = 0
+    while pos < len(frames) {
+        var (ok, ty, fl, sd, sq, bo, bl, eo, el, iok, nx) = frame_view(frames, pos)
+        if ok != 1 { return out }
+        if (fl & 2) != 0 || (fl & 4) != 0 { return out }
+        var tot = nx - pos
+        if tot > 65535 { return out }
+        table_push(offs, pos)
+        table_push(lens, tot)
+        pos = nx
+    }
+    var cnt = len(offs)
+    if cnt < 1 || cnt > 65535 { return out }
+    table_push(out, (cnt >> 8) & 0xFF)
+    table_push(out, cnt & 0xFF)
+    var i: i64 = 0
+    while i < cnt {
+        var l = lens[i]
+        table_push(out, (l >> 8) & 0xFF)
+        table_push(out, l & 0xFF)
+        var s = offs[i]
+        var j: i64 = 0
+        while j < l {
+            table_push(out, frames[s + j] & 0xFF)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 拆批：BATCH body（缓冲区间 [off, off+n)）→ (ok, offs, lens)
+//   offs/lens：内层帧视图（同一缓冲内偏移/长度，零拷贝）
+// 校验：结构（count/len 恰好消耗 n、无残余）；每个内层帧经完整帧解析
+//   （含魔力/版本/保留位）；内层帧 PROTECTED/CRC 位必须为 0。
+pub func batch_unpack(b: table<i64>, off: i64, n: i64) -> (i64, table<i64>, table<i64>) {
+    var offs = table_new_i64()
+    var lens = table_new_i64()
+    if off < 0 || n < 2 || off + n > len(b) { return (0, offs, lens) }
+    var cnt = bytes.from_u16_be(b, off)
+    var p = off + 2
+    var end = off + n
+    var i: i64 = 0
+    while i < cnt {
+        if p + 2 > end { return (0, offs, lens) }
+        var l = bytes.from_u16_be(b, p)
+        p = p + 2
+        if p + l > end { return (0, offs, lens) }
+        var (ok, ty, fl, sd, sq, bo, bl, eo, el, iok, nx) = frame_view(b, p)
+        if ok != 1 || nx != p + l { return (0, offs, lens) }
+        if (fl & 2) != 0 || (fl & 4) != 0 { return (0, offs, lens) }
+        table_push(offs, p)
+        table_push(lens, l)
+        p = p + l
+        i = i + 1
+    }
+    if p != end { return (0, offs, lens) }
+    return (1, offs, lens)
+}
+
+// 批帧：BATCH body 装入 ft_batch（明文模式 prot 传 fl_crc() 或 0；
+//   PROTECTED 密封由密码层在密封后装配——本层拒绝，防「声称加密而未加密」）
+pub func batch_frame(stream_id: i64, seq: i64, frames: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_batch(), prot, stream_id, seq, batch_pack(frames), table_new_i64())
+}
+
+// ==================== 流控与调度（§5.4/§5.5） ====================
+// 双层额度：连接级 MAX_DATA / DATA_BLOCKED；流级 MAX_STREAM_DATA / STREAM_BLOCKED。
+// 额度 = 信用字节数（u64 域，以 i64 位型承载）；发送方未确认在途 ≤ 额度；
+// 接收方消费后补发 MAX_* 追加额度；DATAGRAM 不计流控（无重传队列；速率由 CC 约束）。
+// 初始建议：1 MiB/流、8 MiB/连接（调用方参数化）。
+// 调度：优先级 0..7 + URGENT；控制流（stream 0）视同 URGENT。
+//   参考调度：URGENT/控制优先（优先级降序），其余（优先级降序）；
+//   每流本轮服务数 = min(待发, 优先级+1) ⇒ 非空流每轮 ≥1 次（饿不死）。
+
+// ---------- 流控帧编解码 ----------
+
+// MAX_DATA（连接控制流，credit u64）
+pub func max_data_frame(seq: i64, credit: i64, prot: i64) -> table<i64> {
+    return frame_encode(ft_max_data(), prot, 0, seq, bytes.to_u64_be(credit), table_new_i64())
+}
+
+// MAX_STREAM_DATA（body = 目标流 u32 + credit u64）
+pub func max_stream_data_frame(seq: i64, target: i64, credit: i64, prot: i64) -> table<i64> {
+    var body = bytes.concat(bytes.to_u32_be(target), bytes.to_u64_be(credit))
+    return frame_encode(ft_max_stream_data(), prot, 0, seq, body, table_new_i64())
+}
+
+// DATA_BLOCKED（credit u64）
+pub func data_blocked_frame(seq: i64, credit: i64, prot: i64) -> table<i64> {
+    return frame_encode(ft_data_blocked(), prot, 0, seq, bytes.to_u64_be(credit), table_new_i64())
+}
+
+// STREAM_BLOCKED（body = 目标流 u32 + credit u64）
+pub func stream_blocked_frame(seq: i64, target: i64, credit: i64, prot: i64) -> table<i64> {
+    var body = bytes.concat(bytes.to_u32_be(target), bytes.to_u64_be(credit))
+    return frame_encode(ft_stream_blocked(), prot, 0, seq, body, table_new_i64())
+}
+
+// credit u64 读取（≥8 字节；否则 -1）
+pub func credit_of(b: table<i64>, off: i64, n: i64) -> i64 {
+    if off < 0 || n < 8 || off + 8 > len(b) { return -1 }
+    return bytes.from_u64_be(b, off)
+}
+
+// (目标流 u32 + credit u64) 读取 → (ok, stream, credit)
+pub func stream_credit_of(b: table<i64>, off: i64, n: i64) -> (i64, i64, i64) {
+    if off < 0 || n < 12 || off + 12 > len(b) { return (0, 0, 0) }
+    return (1, bytes.from_u32_be(b, off), bytes.from_u64_be(b, off + 4))
+}
+
+// ---------- 双层流控引擎 ----------
+
+// 连接级状态：[limit, used]
+pub func fc_conn_new(limit: i64) -> table<i64> {
+    var st = table_new_i64()
+    table_push(st, limit)
+    table_push(st, 0)
+    return st
+}
+
+// 流级表（调用方持有）：步长 3：[sid, limit, used]
+pub func fc_stream_add(ref streams: table<i64>, sid: i64, limit: i64) {
+    table_push(streams, sid)
+    table_push(streams, limit)
+    table_push(streams, 0)
+}
+
+func fc_find(streams: table<i64>, sid: i64) -> i64 {
+    var n = len(streams) / 3
+    var i: i64 = 0
+    while i < n {
+        if streams[i * 3] == sid { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// 可发 n 字节？（1/0；连接与流任一不足 / 未知流 → 0）
+pub func fc_can(conn: table<i64>, streams: table<i64>, sid: i64, n: i64) -> i64 {
+    var k = fc_find(streams, sid)
+    if k < 0 { return 0 }
+    if conn[1] + n > conn[0] { return 0 }
+    if streams[k * 3 + 2] + n > streams[k * 3 + 1] { return 0 }
+    return 1
+}
+
+// 提交发送 n 字节（记账；调用方先 fc_can）
+pub func fc_use(ref conn: table<i64>, ref streams: table<i64>, sid: i64, n: i64) {
+    var k = fc_find(streams, sid)
+    conn[1] = conn[1] + n
+    if k >= 0 { streams[k * 3 + 2] = streams[k * 3 + 2] + n }
+}
+
+// 追加额度（MAX_DATA / MAX_STREAM_DATA 的应用点）
+pub func fc_grant_conn(ref conn: table<i64>, credit: i64) {
+    conn[0] = conn[0] + credit
+}
+
+pub func fc_grant_stream(ref streams: table<i64>, sid: i64, credit: i64) {
+    var k = fc_find(streams, sid)
+    if k >= 0 { streams[k * 3 + 1] = streams[k * 3 + 1] + credit }
+}
+
+pub func fc_used_conn(conn: table<i64>) -> i64 { return conn[1] }
+
+pub func fc_used_stream(streams: table<i64>, sid: i64) -> i64 {
+    var k = fc_find(streams, sid)
+    if k < 0 { return -1 }
+    return streams[k * 3 + 2]
+}
+
+// ---------- 优先级调度 ----------
+
+// 本轮调度序（sid 可重复 = 服务多次）：见文件头调度说明。
+pub func sched_round(sids: table<i64>, prios: table<i64>, urgents: table<i64>, pendings: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var n = len(sids)
+    var used = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(used, 0)
+        i = i + 1
+    }
+    var pass: i64 = 0
+    while pass < 2 {
+        var progressed: bool = true
+        while progressed {
+            progressed = false
+            var best: i64 = -1
+            i = 0
+            while i < n {
+                var is_urg: bool = urgents[i] != 0 || sids[i] == 0
+                var in_pass: bool = false
+                if pass == 0 {
+                    in_pass = is_urg
+                } else {
+                    in_pass = !is_urg
+                }
+                if used[i] == 0 && in_pass {
+                    if best < 0 || prios[i] > prios[best] { best = i }
+                }
+                i = i + 1
+            }
+            if best >= 0 {
+                used[best] = 1
+                progressed = true
+                var quota = prios[best] + 1
+                var cnt = pendings[best]
+                if cnt > quota { cnt = quota }
+                var j: i64 = 0
+                while j < cnt {
+                    table_push(out, sids[best])
+                    j = j + 1
+                }
+            }
+        }
+        pass = pass + 1
+    }
+    return out
+}
+
+// ==================== 握手（§6.2） ====================
+// TLS 1.3 式 1-RTT 双向认证（0-RTT 见 §6.5）。消息体（全大端）：
+//   HELLO     : ver u8 + ver_min u8 + rand 32 + eph_pub 32(x25519) + id_pub 32(ed25519)
+//               + suites u16 位图 + features u64 + ticket?（0-RTT 恢复票，余量任意长）
+//   HELLO_ACK : ver u8 + rand 32 + eph_pub 32 + id_pub 32 + suite u16 + features u64
+//               + sig 64（服务端 ed25519，对 transcript）
+//   FINISH    : sig 64（客户端 ed25519，对 transcript）
+// transcript（签名绑定全部协商参数，防降级/防中间人；口径钉死为 KAT）：
+//   server_t = HELLO体 ‖ HELLO_ACK前段（ver/rand/eph/id/suite/features，不含 sig 自身）
+//   client_t = HELLO体 ‖ HELLO_ACK体（含 sig）
+// 密钥表（TLS 1.3 式；HKDF = HMAC-SHA256；info 标签经 hex 编码）：
+//   PRK = HKDF-Extract(salt=0, X25519 共享)；
+//   "tink v3 c hs traffic" / "tink v3 s hs traffic" / "tink v3 c ap traffic"
+//   / "tink v3 s ap traffic" / "tink v3 exp master"（各 32B；方向分离 c2s/s2c）。
+// 套件 id：0 = CHACHA20_POLY1305_SHA256（默认）；1 = AES_128_GCM_SHA256；2..3 PQ 预留。
+// features 位（§6.6 哈希能力）：bit0 TSHA2 / bit1 BLAKE3 / bit2 SHA-256。
+
+// 标签 → info hex（HKDF/hmac/ed25519 的消息域均为 hex 串）
+func label_hex(s: string) -> string {
+    return bytes.to_hex(bytes.from_ascii(s))
+}
+
+pub func suite_chacha20_poly1305_sha256() -> i64 { return 0 }
+pub func suite_aes_128_gcm_sha256() -> i64 { return 1 }
+pub func feat_hash_tsha2() -> i64 { return 1 }
+pub func feat_hash_blake3() -> i64 { return 2 }
+pub func feat_hash_sha256() -> i64 { return 4 }
+
+// 套件协商：双方位图交集的最小 id（id 序 = 优先级）；无交集 → -1
+pub func hs_choose_suite(c_suites: i64, s_suites: i64) -> i64 {
+    var both = c_suites & s_suites
+    var i: i64 = 0
+    while i < 16 {
+        if ((both >> i) & 1) != 0 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// 哈希能力协商：共同能力中的最高优先序（BLAKE3 > TSHA2 > SHA-256）；无 → 0
+// 返回位值：2 = BLAKE3 / 1 = TSHA2 / 4 = SHA-256
+pub func hs_choose_hash(c_feat: i64, s_feat: i64) -> i64 {
+    var both = c_feat & s_feat
+    if (both & 2) != 0 { return 2 }
+    if (both & 1) != 0 { return 1 }
+    if (both & 4) != 0 { return 4 }
+    return 0
+}
+
+// hex 串 → 32 字节表（不足补零；公钥/随机数）
+pub func hx32(h: string) -> table<i64> {
+    var t = bytes.from_hex(h)
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < 32 {
+        if i < len(t) { table_push(out, t[i] & 0xFF) } else { table_push(out, 0) }
+        i = i + 1
+    }
+    return out
+}
+
+// 内部：32B 定长段追加
+func push32(ref out: table<i64>, seg: table<i64>) {
+    var i: i64 = 0
+    while i < 32 {
+        if i < len(seg) { table_push(out, seg[i] & 0xFF) } else { table_push(out, 0) }
+        i = i + 1
+    }
+}
+
+// 内部：u64 追加
+func push64(ref out: table<i64>, v: i64) {
+    var i: i64 = 7
+    while i >= 0 {
+        table_push(out, (v >> (i * 8)) & 0xFF)
+        i = i - 1
+    }
+}
+
+// ---------- 消息体构造 ----------
+
+// HELLO 体：前 108B 定长 + ticket 余量
+pub func hello_body(ver: i64, ver_min: i64, rand: table<i64>, eph_pub: table<i64>, id_pub: table<i64>, suites: i64, features: i64, ticket: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, ver & 0xFF)
+    table_push(out, ver_min & 0xFF)
+    push32(out, rand)
+    push32(out, eph_pub)
+    push32(out, id_pub)
+    table_push(out, (suites >> 8) & 0xFF)
+    table_push(out, suites & 0xFF)
+    push64(out, features)
+    return bytes.concat(out, ticket)
+}
+
+// HELLO_ACK 前段（不含 sig）
+pub func hello_ack_prefix(ver: i64, rand: table<i64>, eph_pub: table<i64>, id_pub: table<i64>, suite: i64, features: i64) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, ver & 0xFF)
+    push32(out, rand)
+    push32(out, eph_pub)
+    push32(out, id_pub)
+    table_push(out, (suite >> 8) & 0xFF)
+    table_push(out, suite & 0xFF)
+    push64(out, features)
+    return out
+}
+
+// HELLO_ACK 完整体 = 前段 ‖ sig
+pub func hello_ack_body(prefix: table<i64>, sig: table<i64>) -> table<i64> {
+    return bytes.concat(prefix, sig)
+}
+
+// ---------- 扫描（解析对端消息体） ----------
+// HELLO → (ok, info)；info 步长 9：[ver, vmin, suites, features, rand_off, eph_off, id_off, ticket_off, ticket_len]
+pub func hs_hello_scan(b: table<i64>, off: i64, n: i64) -> (i64, table<i64>) {
+    var info = table_new_i64()
+    if off < 0 || n < 108 || off + n > len(b) { return (0, info) }
+    table_push(info, b[off] & 0xFF)
+    table_push(info, b[off + 1] & 0xFF)
+    table_push(info, bytes.from_u16_be(b, off + 98))
+    table_push(info, bytes.from_u64_be(b, off + 100))
+    table_push(info, off + 2)
+    table_push(info, off + 34)
+    table_push(info, off + 66)
+    table_push(info, off + 108)
+    table_push(info, n - 108)
+    return (1, info)
+}
+
+// HELLO_ACK → (ok, info)；info 步长 7：[ver, suite, features, rand_off, eph_off, id_off, sig_off]；须 n ≥ 171
+pub func hs_ack_scan(b: table<i64>, off: i64, n: i64) -> (i64, table<i64>) {
+    var info = table_new_i64()
+    if off < 0 || n < 171 || off + n > len(b) { return (0, info) }
+    table_push(info, b[off] & 0xFF)
+    table_push(info, bytes.from_u16_be(b, off + 98))
+    table_push(info, bytes.from_u64_be(b, off + 100))
+    table_push(info, off + 1)
+    table_push(info, off + 33)
+    table_push(info, off + 65)
+    table_push(info, off + 107)
+    return (1, info)
+}
+
+// ---------- 签名与 transcript ----------
+
+// 服务端 transcript = HELLO体 ‖ ACK 前段
+pub func hs_transcript_server(hello: table<i64>, ack_prefix: table<i64>) -> table<i64> {
+    return bytes.concat(hello, ack_prefix)
+}
+
+// 客户端 transcript = HELLO体 ‖ ACK 体（含 sig）
+pub func hs_transcript_client(hello: table<i64>, ack_full: table<i64>) -> table<i64> {
+    return bytes.concat(hello, ack_full)
+}
+
+// X25519 密钥对 / 共享（转出封装，探测与上层免 import 细节）
+pub func hs_eph_keygen(seed_hex: string) -> string { return x25519.keygen(seed_hex) }
+pub func hs_shared(eph_sk_hex: string, peer_eph_pk_hex: string) -> string { return x25519.dh(eph_sk_hex, peer_eph_pk_hex) }
+pub func hs_id_keygen(seed_hex: string) -> string { return ed25519.keygen(seed_hex) }
+
+// 对 transcript 签名（私钥种子 hex）→ sig hex
+pub func hs_sign(id_seed_hex: string, transcript: table<i64>) -> string {
+    var pubk = ed25519.keygen(id_seed_hex)
+    return ed25519.sign(bytes.to_hex(transcript), pubk, id_seed_hex)
+}
+
+// 验证 transcript 的 sig（公钥 hex）→ 1/0
+pub func hs_verify(id_pub_hex: string, transcript: table<i64>, sig_hex: string) -> i64 {
+    return ed25519.verify(id_pub_hex, bytes.to_hex(transcript), sig_hex)
+}
+
+// ---------- 密钥表 ----------
+
+// X25519 共享（hex）→ 五个 32B 秘密（hex）：(c_hs, s_hs, c_ap, s_ap, 导出 master)
+pub func hs_keys(shared_hex: string) -> (string, string, string, string, string) {
+    var prk = hkdf.extract("", shared_hex)
+    return (hkdf.expand(prk, label_hex("tink v3 c hs traffic"), 32),
+            hkdf.expand(prk, label_hex("tink v3 s hs traffic"), 32),
+            hkdf.expand(prk, label_hex("tink v3 c ap traffic"), 32),
+            hkdf.expand(prk, label_hex("tink v3 s ap traffic"), 32),
+            hkdf.expand(prk, label_hex("tink v3 exp master"), 32))
+}
+
+// ==================== 密封、重钥与抗重放（§6.3/§6.4/§6.5） ====================
+// 帧密封：nonce(12B) = 方向字 1B + 纪元 1B + 计数器 10B BE（发帧计数，单调不回绕）；
+// AAD = 头 16B + 扩展区（含 ext_len 前缀＝帧首至载荷前）；载荷 = 明文分块加密
+// （ChaCha20 计数器自 1 起）；tag 16B 置尾（ChaCha20-Poly1305）。
+// AEAD 密钥 = HKDF-Expand(应用秘密, "tink v3 key", 32)。
+// 重钥：新秘密 = HKDF-Expand(旧秘密, "tink v3 ku", 32)；phase 位翻转（§6.4）。
+// 抗重放：会话内滑窗 ±1024（32×u32 位图），重复/过旧 = 丢弃 + 计数（不报错）。
+
+pub func dir_ctos() -> i64 { return 0 }
+pub func dir_stoc() -> i64 { return 1 }
+pub func rp_window() -> i64 { return 1024 }
+
+// 帧 AEAD 密钥派生（应用秘密 → ChaCha20 密钥 hex）
+pub func hs_aead_key(secret_hex: string) -> string {
+    return hkdf.expand(secret_hex, label_hex("tink v3 key"), 32)
+}
+
+// 12B nonce：方向 1 + 纪元 1 + 计数器 10B BE
+func seal_nonce(dir: i64, epoch: i64, ctr: i64) -> table<i64> {
+    var n = table_new_i64()
+    table_push(n, dir & 0xFF)
+    table_push(n, epoch & 0xFF)
+    var i: i64 = 9
+    while i >= 0 {
+        table_push(n, (ctr >> (i * 8)) & 0xFF)
+        i = i - 1
+    }
+    return n
+}
+
+// 密封一帧（PROTECTED 由本函数置位；调用方 flags 不得预置 PROTECTED/CRC）
+pub func frame_seal(ftype: i64, flags: i64, stream_id: i64, seq: i64, payload: table<i64>, ext: table<i64>, key_hex: string, dir: i64, epoch: i64, ctr: i64) -> table<i64> {
+    var empty0 = table_new_i64()
+    if (flags & 2) != 0 || (flags & 4) != 0 { return empty0 }
+    var has_ext: bool = (flags & 1) != 0
+    if !has_ext && len(ext) > 0 { return empty0 }
+    if !type_writable(ftype) { return empty0 }
+    var plen = len(payload)
+    if plen > 65535 { return empty0 }
+    var elen = len(ext)
+    if elen > 65535 { return empty0 }
+    var fl: i64 = flags | 2
+    var a = header_encode(ftype, fl, stream_id, seq, plen)
+    if has_ext {
+        var pre = table_new_i64()
+        table_push(pre, (elen >> 8) & 0xFF)
+        table_push(pre, elen & 0xFF)
+        a = bytes.concat(a, bytes.concat(pre, ext))
+    }
+    var nh = bytes.to_hex(seal_nonce(dir, epoch, ctr))
+    var ct = chacha20.xor_stream(key_hex, nh, 1, payload)
+    var th = chacha20.aead_mac(key_hex, nh, a, ct)
+    return bytes.concat(bytes.concat(a, ct), bytes.from_hex(th))
+}
+
+// 开启并解密：→ (ok, 明文, next)；1 成功 / -1 结构坏或非保护帧 / 0 认证失败
+pub func frame_open(b: table<i64>, pos: i64, key_hex: string, dir: i64, epoch: i64, ctr: i64) -> (i64, table<i64>, i64) {
+    var empty0 = table_new_i64()
+    var (ok, ty, fl, sd, sq, bo, bl, eo, el, iok, nx) = frame_view(b, pos)
+    if ok != 1 || (fl & 2) == 0 { return (-1, empty0, -1) }
+    var aad = bytes.slice(b, pos, bo)
+    var ct = bytes.slice(b, bo, bo + bl)
+    var tag = bytes.slice(b, nx - 16, nx)
+    var nh = bytes.to_hex(seal_nonce(dir, epoch, ctr))
+    var th = chacha20.aead_mac(key_hex, nh, aad, ct)
+    if !chacha20.ct_eq(bytes.from_hex(th), tag) { return (0, empty0, nx) }
+    var pt = chacha20.xor_stream(key_hex, nh, 1, ct)
+    return (1, pt, nx)
+}
+
+// 重钥：新秘密（§6.4）
+pub func ku_next(old_secret_hex: string) -> string {
+    return hkdf.expand(old_secret_hex, label_hex("tink v3 ku"), 32)
+}
+
+// KEY_UPDATE 帧（body = phase u8）
+pub func key_update_frame(stream_id: i64, seq: i64, phase: i64, prot: i64) -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, phase & 0xFF)
+    return frame_encode(ft_key_update(), prot, stream_id, seq, t, table_new_i64())
+}
+
+// ---------- 抗重放滑窗（§6.5） ----------
+
+// 新滑窗：st = [largest(-1 空), 32×u32 位图]（位 i ↔ delta = largest − seq）
+pub func rp_new() -> table<i64> {
+    var st = table_new_i64()
+    table_push(st, -1)
+    var i: i64 = 0
+    while i < 32 {
+        table_push(st, 0)
+        i = i + 1
+    }
+    return st
+}
+
+func rp_clear(ref st: table<i64>) {
+    var i: i64 = 0
+    while i < 32 {
+        st[1 + i] = 0
+        i = i + 1
+    }
+}
+
+func rp_mark(ref st: table<i64>, i: i64) {
+    var w = i / 32
+    var b = i % 32
+    st[1 + w] = st[1 + w] | (1 << b)
+}
+
+// 检查并记录 seq：1 = 新（接受）/ 0 = 重放或过旧（丢弃）
+pub func rp_check(ref st: table<i64>, seq: i64) -> i64 {
+    if seq < 0 { return 0 }
+    var largest = st[0]
+    if largest < 0 {
+        st[0] = seq
+        rp_clear(st)
+        rp_mark(st, 0)
+        return 1
+    }
+    if seq > largest {
+        var k = seq - largest
+        if k >= 1024 {
+            rp_clear(st)
+        } else {
+            var ws = k / 32
+            var bs = k % 32
+            var w: i64 = 31
+            while w >= 0 {
+                var src = w - ws
+                var lo: i64 = 0
+                if src >= 0 { lo = st[1 + src] & 0xFFFFFFFF }
+                var hi: i64 = 0
+                if bs > 0 && src - 1 >= 0 { hi = st[1 + src - 1] & 0xFFFFFFFF }
+                var v: i64 = lo
+                if bs > 0 { v = ((lo << bs) | (hi >> (32 - bs))) & 0xFFFFFFFF }
+                st[1 + w] = v
+                w = w - 1
+            }
+        }
+        st[0] = seq
+        rp_mark(st, 0)
+        return 1
+    }
+    var delta = largest - seq
+    if delta >= 1024 { return 0 }
+    var w2 = delta / 32
+    var b3 = delta % 32
+    if ((st[1 + w2] >> b3) & 1) != 0 { return 0 }
+    rp_mark(st, delta)
+    return 1
+}
+
+// ==================== 0-RTT 恢复（§5.6/§6.5） ====================
+// TICKET（0x23）：服务器签发的**不透明**恢复票（客户端原样回传）；含会话状态摘要（32B）、
+//   有效期（≤ 7 天）、单次性位。RESUME（0x24）：nstreams u16 ‖ (sid u32 + next_seq u32)×n ‖ ticket
+//   （各流 next_seq 摘要 = 断点续传）。
+// 防重放：兑换后记录 ticket id 至有效期结束；单次性位 = 永久烧毁（过期亦拒）。
+// 恢复期密钥：res_secret → "tink v3 res c/s ap traffic"（方向分离）。
+// early data：仅幂等请求（REQUEST flags bit0；RPC 层接线见 M10）。
+// 票据真实性：参考格式以服务器 ticket 密钥附加 16B HMAC（先验后兑；不加密——机密不放票据）。
+
+pub func tkt_max_ttl_ms() -> i64 { return 7 * 24 * 3600 * 1000 }
+pub func eo_idempotent_bit() -> i64 { return 1 }
+
+pub func eo_allowed(flags: i64) -> i64 {
+    if (flags & 1) != 0 { return 1 }
+    return 0
+}
+
+// 票据参考格式（113B）：[id 16][issued u64][expiry u64][one_shot u8][digest 32][secret 32][mac 16]
+// mac = HMAC-SHA256(ticket_key, 前 97B) 前 16B；ttl 超过 7 天 → 空表（拒绝）
+pub func tkt_build(ticket_key_hex: string, id: table<i64>, issued_ms: i64, ttl_ms: i64, one_shot: i64, digest: table<i64>, res_secret: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    if ttl_ms < 0 || ttl_ms > tkt_max_ttl_ms() { return out }
+    var i: i64 = 0
+    while i < 16 {
+        if i < len(id) { table_push(out, id[i] & 0xFF) } else { table_push(out, 0) }
+        i = i + 1
+    }
+    push64(out, issued_ms)
+    push64(out, issued_ms + ttl_ms)
+    table_push(out, one_shot & 1)
+    i = 0
+    while i < 32 {
+        if i < len(digest) { table_push(out, digest[i] & 0xFF) } else { table_push(out, 0) }
+        i = i + 1
+    }
+    i = 0
+    while i < 32 {
+        if i < len(res_secret) { table_push(out, res_secret[i] & 0xFF) } else { table_push(out, 0) }
+        i = i + 1
+    }
+    var mh = hmac.hmac_sha256(ticket_key_hex, bytes.to_hex(out))
+    var mb = bytes.from_hex(mh)
+    i = 0
+    while i < 16 {
+        table_push(out, mb[i])
+        i = i + 1
+    }
+    return out
+}
+
+// 扫描 → (ok, issued, expiry, one_shot, id_off, digest_off, secret_off)；n 必须 = 113
+pub func tkt_scan(b: table<i64>, off: i64, n: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
+    if off < 0 || n != 113 || off + n > len(b) { return (0, 0, 0, 0, 0, 0, 0) }
+    return (1, bytes.from_u64_be(b, off + 16), bytes.from_u64_be(b, off + 24), b[off + 32] & 0xFF, off, off + 33, off + 65)
+}
+
+// 验票（HMAC 前 16B 常数时间比较）→ 1/0
+pub func tkt_verify(ticket_key_hex: string, b: table<i64>, off: i64, n: i64) -> i64 {
+    if off < 0 || n != 113 || off + n > len(b) { return 0 }
+    var mh = hmac.hmac_sha256(ticket_key_hex, bytes.to_hex(bytes.slice(b, off, off + 97)))
+    var mb = bytes.from_hex(mh)
+    var ok: i64 = 1
+    var i: i64 = 0
+    while i < 16 {
+        if (mb[i] & 0xFF) != (b[off + 97 + i] & 0xFF) { ok = 0 }
+        i = i + 1
+    }
+    return ok
+}
+
+// 兑换登记表：st = [count, 记录 × 步长 18：[expiry, burned, id 16B]]
+pub func tkt_store_new() -> table<i64> {
+    var st = table_new_i64()
+    table_push(st, 0)
+    return st
+}
+
+func tkt_store_find(st: table<i64>, b: table<i64>, id_off: i64) -> i64 {
+    var cnt = st[0]
+    var i: i64 = 0
+    while i < cnt {
+        var base = 1 + i * 18
+        var same: bool = true
+        var j: i64 = 0
+        while j < 16 {
+            if (st[base + 2 + j] & 0xFF) != (b[id_off + j] & 0xFF) { same = false }
+            j = j + 1
+        }
+        if same { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// 兑换：→ (status, secret_off)：1 接受（secret_off 指向 32B res_secret）/ 0 无效或过期 / -1 重放
+pub func tkt_redeem(ref store: table<i64>, ticket_key_hex: string, b: table<i64>, off: i64, n: i64, now_ms: i64) -> (i64, i64) {
+    if tkt_verify(ticket_key_hex, b, off, n) != 1 { return (0, 0 - 1) }
+    var expiry = bytes.from_u64_be(b, off + 24)
+    var one_shot = b[off + 32] & 0xFF
+    var rec = tkt_store_find(store, b, off)
+    if rec >= 0 {
+        var base = 1 + rec * 18
+        if store[base + 1] == 1 { return (0 - 1, 0 - 1) }
+        if now_ms <= store[base] { return (0 - 1, 0 - 1) }
+    }
+    if now_ms > expiry { return (0, 0 - 1) }
+    if rec < 0 {
+        store[0] = store[0] + 1
+        table_push(store, expiry)
+        table_push(store, one_shot)
+        var i: i64 = 0
+        while i < 16 {
+            table_push(store, b[off + i] & 0xFF)
+            i = i + 1
+        }
+    } else {
+        var base2 = 1 + rec * 18
+        store[base2] = expiry
+        store[base2 + 1] = one_shot
+    }
+    return (1, off + 65)
+}
+
+// 恢复期密钥（方向分离）
+pub func res_keys(res_secret_hex: string) -> (string, string) {
+    return (hkdf.expand(res_secret_hex, label_hex("tink v3 res c ap traffic"), 32),
+            hkdf.expand(res_secret_hex, label_hex("tink v3 res s ap traffic"), 32))
+}
+
+// RESUME body = nstreams u16 ‖ (sid u32 + next_seq u32)×n ‖ ticket
+pub func resume_body(ticket: table<i64>, sids: table<i64>, seqs: table<i64>) -> table<i64> {
+    var n = len(sids)
+    if n != len(seqs) || n > 65535 { return table_new_i64() }
+    var out = table_new_i64()
+    table_push(out, (n >> 8) & 0xFF)
+    table_push(out, n & 0xFF)
+    var i: i64 = 0
+    while i < n {
+        out = bytes.concat(out, bytes.concat(bytes.to_u32_be(sids[i]), bytes.to_u32_be(seqs[i])))
+        i = i + 1
+    }
+    return bytes.concat(out, ticket)
+}
+
+// 扫描 → (ok, ticket_off, ticket_len, sids, seqs)
+pub func resume_scan(b: table<i64>, off: i64, n: i64) -> (i64, i64, i64, table<i64>, table<i64>) {
+    var sids = table_new_i64()
+    var seqs = table_new_i64()
+    if off < 0 || n < 2 || off + n > len(b) { return (0, 0, 0, sids, seqs) }
+    var cnt = bytes.from_u16_be(b, off)
+    var need = 2 + cnt * 8
+    if n < need { return (0, 0, 0, sids, seqs) }
+    var i: i64 = 0
+    while i < cnt {
+        table_push(sids, bytes.from_u32_be(b, off + 2 + i * 8))
+        table_push(seqs, bytes.from_u32_be(b, off + 2 + i * 8 + 4))
+        i = i + 1
+    }
+    return (1, off + need, n - need, sids, seqs)
+}
+
+// TICKET 帧（body = 票据字节）
+pub func ticket_frame(stream_id: i64, seq: i64, ticket: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_ticket(), prot, stream_id, seq, ticket, table_new_i64())
+}
+
+// RESUME 帧
+pub func resume_frame(stream_id: i64, seq: i64, body: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_resume(), prot, stream_id, seq, body, table_new_i64())
+}
+
+// ==================== 总线语义（§7/§4.4） ====================
+// REGISTER / LOOKUP / LOOKUP_REPLY / UNREGISTER / SUBSCRIBE / UNSUBSCRIBE / PUBLISH /
+// MULTICAST 编解码 + hub 最小实现（名字路由 / 通配订阅 / 扇出）。
+// hub 只做路由（不解析载荷）。名称/主题/过滤器 ≤ 255B（u8 长度前缀）；
+// peer_id = algo u8 + len u8 + digest（§6.6 同构）；通配 '*' 匹配任意串（含空）。
+// 条目：REGISTER=name‖caps u64；LOOKUP/SUBSCRIBE 等=name；PUBLISH/MULTICAST=name‖载荷；
+// LOOKUP_REPLY=count u16‖(pid‖alen u8+addr)×count。
+
+// --- 名称与名称体（LOOKUP/SUBSCRIBE/UNREGISTER 通用） ---
+
+pub func name_body(name: string) -> table<i64> {
+    var nb = bytes.from_ascii(name)
+    var out = table_new_i64()
+    var n = len(nb)
+    if n > 255 { return out }
+    table_push(out, n)
+    var i: i64 = 0
+    while i < n {
+        table_push(out, nb[i] & 0xFF)
+        i = i + 1
+    }
+    return out
+}
+
+func u8str_scan(b: table<i64>, off: i64, n: i64) -> (i64, string) {
+    if off < 0 || n < 1 || off + n > len(b) { return (0, "") }
+    var nl = b[off] & 0xFF
+    if n < 1 + nl { return (0, "") }
+    return (1, bytes.to_ascii(bytes.slice(b, off + 1, off + 1 + nl)))
+}
+
+pub func lookup_scan(b: table<i64>, off: i64, n: i64) -> (i64, string) {
+    return u8str_scan(b, off, n)
+}
+
+pub func sub_scan(b: table<i64>, off: i64, n: i64) -> (i64, string) {
+    return u8str_scan(b, off, n)
+}
+
+// --- REGISTER ---
+
+pub func reg_body(name: string, cap: i64) -> table<i64> {
+    var nb = name_body(name)
+    if len(nb) == 0 { return nb }
+    return bytes.concat(nb, bytes.to_u64_be(cap))
+}
+
+pub func reg_scan(b: table<i64>, off: i64, n: i64) -> (i64, string, i64) {
+    if off < 0 || n < 9 || off + n > len(b) { return (0, "", 0) }
+    var nl = b[off] & 0xFF
+    if n < 1 + nl + 8 { return (0, "", 0) }
+    return (1, bytes.to_ascii(bytes.slice(b, off + 1, off + 1 + nl)), bytes.from_u64_be(b, off + 1 + nl))
+}
+
+pub func register_frame(stream_id: i64, seq: i64, name: string, cap: i64, prot: i64) -> table<i64> {
+    return frame_encode(ft_register(), prot, stream_id, seq, reg_body(name, cap), table_new_i64())
+}
+
+pub func lookup_frame(stream_id: i64, seq: i64, name: string, prot: i64) -> table<i64> {
+    return frame_encode(ft_lookup(), prot, stream_id, seq, name_body(name), table_new_i64())
+}
+
+pub func sub_frame(stream_id: i64, seq: i64, pattern: string, prot: i64) -> table<i64> {
+    return frame_encode(ft_subscribe(), prot, stream_id, seq, name_body(pattern), table_new_i64())
+}
+
+pub func unsub_frame(stream_id: i64, seq: i64, pattern: string, prot: i64) -> table<i64> {
+    return frame_encode(ft_unsubscribe(), prot, stream_id, seq, name_body(pattern), table_new_i64())
+}
+
+// --- peer_id 与 LOOKUP_REPLY ---
+
+pub func pid_make(algo: i64, digest: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var dl = len(digest)
+    if dl > 255 { return out }
+    table_push(out, algo & 0xFF)
+    table_push(out, dl)
+    var i: i64 = 0
+    while i < dl {
+        table_push(out, digest[i] & 0xFF)
+        i = i + 1
+    }
+    return out
+}
+
+// pids：各 pid 的拼接字节；addrs 等长（条目 = pid ‖ alen u8 + addr）
+pub func reply_body(pids: table<i64>, addrs: table<string>) -> table<i64> {
+    var cnt = len(addrs)
+    if cnt > 65535 { return table_new_i64() }
+    var out = table_new_i64()
+    table_push(out, (cnt >> 8) & 0xFF)
+    table_push(out, cnt & 0xFF)
+    var p: i64 = 0
+    var i: i64 = 0
+    while i < cnt {
+        if p + 2 > len(pids) { return table_new_i64() }
+        var plen = 2 + (pids[p + 1] & 0xFF)
+        var q: i64 = 0
+        while q < plen {
+            table_push(out, pids[p + q] & 0xFF)
+            q = q + 1
+        }
+        p = p + plen
+        var ab = bytes.from_ascii(addrs[i])
+        var al = len(ab)
+        if al > 255 { return table_new_i64() }
+        table_push(out, al)
+        q = 0
+        while q < al {
+            table_push(out, ab[q] & 0xFF)
+            q = q + 1
+        }
+        i = i + 1
+    }
+    if p != len(pids) { return table_new_i64() }
+    return out
+}
+
+pub func reply_count(b: table<i64>, off: i64, n: i64) -> (i64, i64) {
+    if off < 0 || n < 2 || off + n > len(b) { return (0, 0) }
+    return (1, bytes.from_u16_be(b, off))
+}
+
+// 条目 i（从 0 起）→ (ok, algo, d_off, d_len, a_off, a_len)
+pub func reply_entry(b: table<i64>, off: i64, n: i64, i: i64) -> (i64, i64, i64, i64, i64, i64) {
+    if off < 0 || n < 2 || off + n > len(b) { return (0, 0, 0, 0, 0, 0) }
+    var cnt = bytes.from_u16_be(b, off)
+    if i < 0 || i >= cnt { return (0, 0, 0, 0, 0, 0) }
+    var p = off + 2
+    var end = off + n
+    var k: i64 = 0
+    while k < cnt {
+        if p + 2 > end { return (0, 0, 0, 0, 0, 0) }
+        var algo = b[p] & 0xFF
+        var d_len = b[p + 1] & 0xFF
+        var d_off = p + 2
+        p = p + 2 + d_len
+        if p + 1 > end { return (0, 0, 0, 0, 0, 0) }
+        var al = b[p] & 0xFF
+        var a_off = p + 1
+        p = p + 1 + al
+        if p > end { return (0, 0, 0, 0, 0, 0) }
+        if k == i { return (1, algo, d_off, d_len, a_off, al) }
+        k = k + 1
+    }
+    return (0, 0, 0, 0, 0, 0)
+}
+
+pub func reply_frame(stream_id: i64, seq: i64, pids: table<i64>, addrs: table<string>, prot: i64) -> table<i64> {
+    return frame_encode(ft_lookup_reply(), prot, stream_id, seq, reply_body(pids, addrs), table_new_i64())
+}
+
+// --- PUBLISH / MULTICAST ---
+
+pub func publish_body(topic: string, payload: table<i64>) -> table<i64> {
+    var nb = name_body(topic)
+    if len(nb) == 0 { return nb }
+    return bytes.concat(nb, payload)
+}
+
+pub func publish_frame(stream_id: i64, seq: i64, topic: string, payload: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_publish(), prot, stream_id, seq, publish_body(topic, payload), table_new_i64())
+}
+
+pub func multicast_frame(stream_id: i64, seq: i64, topic: string, payload: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_multicast(), prot, stream_id, seq, publish_body(topic, payload), table_new_i64())
+}
+
+// → (ok, topic, payload_off, payload_len)
+pub func publish_scan(b: table<i64>, off: i64, n: i64) -> (i64, string, i64, i64) {
+    if off < 0 || n < 1 || off + n > len(b) { return (0, "", 0, 0) }
+    var nl = b[off] & 0xFF
+    if n < 1 + nl { return (0, "", 0, 0) }
+    return (1, bytes.to_ascii(bytes.slice(b, off + 1, off + 1 + nl)), off + 1 + nl, n - 1 - nl)
+}
+
+// --- hub 最小实现（名字路由 / 通配订阅 / 扇出；删除 = 墓碑，peer/pattern 置 ""） ---
+
+pub func hub_register(ref names: table<string>, ref peers: table<string>, ref caps: table<i64>, name: string, peer: string, cap: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(names) {
+        if names[i] == name {
+            peers[i] = peer
+            caps[i] = cap
+            return 0
+        }
+        i = i + 1
+    }
+    table_push(names, name)
+    table_push(peers, peer)
+    table_push(caps, cap)
+    return 1
+}
+
+pub func hub_unregister(ref names: table<string>, ref peers: table<string>, ref caps: table<i64>, name: string) -> i64 {
+    var hit: i64 = 0
+    var i: i64 = 0
+    while i < len(names) {
+        if names[i] == name && peers[i] != "" {
+            peers[i] = ""
+            caps[i] = 0
+            hit = 1
+        }
+        i = i + 1
+    }
+    return hit
+}
+
+// → (ok, peer, caps)
+pub func hub_lookup(names: table<string>, peers: table<string>, caps: table<i64>, name: string) -> (i64, string, i64) {
+    var i: i64 = 0
+    while i < len(names) {
+        if names[i] == name && peers[i] != "" {
+            return (1, peers[i], caps[i])
+        }
+        i = i + 1
+    }
+    return (0, "", 0)
+}
+
+pub func hub_subscribe(ref patterns: table<string>, ref sp: table<string>, pattern: string, peer: string) -> i64 {
+    table_push(patterns, pattern)
+    table_push(sp, peer)
+    return 1
+}
+
+pub func hub_unsubscribe(ref patterns: table<string>, ref sp: table<string>, pattern: string, peer: string) -> i64 {
+    var hit: i64 = 0
+    var i: i64 = 0
+    while i < len(patterns) {
+        if patterns[i] == pattern && sp[i] == peer {
+            patterns[i] = ""
+            sp[i] = ""
+            hit = 1
+        }
+        i = i + 1
+    }
+    return hit
+}
+
+// 通配匹配：'*' 任意串（含空）；其余字面（经典回溯，无早退）
+pub func topic_match(pattern: string, topic: string) -> i64 {
+    var m = str_len(pattern)
+    var n = str_len(topic)
+    var pi: i64 = 0
+    var ti: i64 = 0
+    var star: i64 = -1
+    var mark: i64 = 0
+    while ti < n {
+        var adv: bool = false
+        if pi < m {
+            if str_char(pattern, pi) == str_char(topic, ti) {
+                pi = pi + 1
+                ti = ti + 1
+                adv = true
+            } else if str_char(pattern, pi) == "*" {
+                star = pi
+                mark = ti
+                pi = pi + 1
+                adv = true
+            }
+        }
+        if !adv {
+            if star >= 0 {
+                pi = star + 1
+                mark = mark + 1
+                ti = mark
+            } else {
+                return 0
+            }
+        }
+    }
+    while pi < m {
+        if str_char(pattern, pi) != "*" { return 0 }
+        pi = pi + 1
+    }
+    return 1
+}
+
+// 扇出：匹配订阅者（去重，保留首次出现序）
+pub func hub_fanout(patterns: table<string>, sp: table<string>, topic: string) -> table<string> {
+    var out: table<string> = []
+    var i: i64 = 0
+    while i < len(patterns) {
+        if sp[i] != "" && topic_match(patterns[i], topic) == 1 {
+            var dup: bool = false
+            var j: i64 = 0
+            while j < len(out) {
+                if out[j] == sp[i] { dup = true }
+                j = j + 1
+            }
+            if !dup { table_push(out, sp[i]) }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ==================== RPC（§4.5/§7）与错误码注册表（§4.7 全量） ====================
+// REQUEST（0x40）：req_id u64 + flags u8 + service(u8 长) + method(u8 长) + payload
+//   flags bit0 = idempotent（early data 许可，§6.5；判读用 eo_allowed）。
+// RESPONSE（0x41）：req_id u64 + status u32 + payload（status = 错误码注册表）。
+// CANCEL（0x42）：req_id u64（幂等；已取消 req_id 的 RESPONSE 到达即丢弃）。
+// PUSH（0x43）：req_id u64 + payload（双向流式 RPC 服务端推送；同 REQ_ID 关联）。
+// hub 只做路由（不解析 payload）；deadline/cancel 在 hub 侧透传（不代答）。
+
+// ---- 错误码注册表（§4.7 全量；码值随规范发布） ----
+// 0x01xx 传输 / 0x02xx 会话 / 0x03xx 安全 / 0x04xx 总线 / 0x05xx 内容 / 0x06xx 中继；
+// 0x07xx–0x0Fxx 预留；0x10xx+ 应用自定义。
+
+pub func err_frame_malformed() -> i64 { return 0x0101 }
+pub func err_stream_state() -> i64 { return 0x0102 }
+pub func err_flow_control() -> i64 { return 0x0103 }
+pub func err_deadline_exceeded() -> i64 { return 0x0105 }
+pub func err_version_unsupported() -> i64 { return 0x0201 }
+pub func err_suite_unsupported() -> i64 { return 0x0202 }
+pub func err_protocol_violation() -> i64 { return 0x0203 }
+pub func err_stream_limit() -> i64 { return 0x0204 }
+pub func err_session_closing() -> i64 { return 0x0205 }
+pub func err_handshake_failed() -> i64 { return 0x0301 }
+pub func err_auth_failed() -> i64 { return 0x0302 }
+pub func err_aead_tag_failed() -> i64 { return 0x0303 }
+pub func err_replay() -> i64 { return 0x0304 }
+pub func err_key_update() -> i64 { return 0x0305 }
+pub func err_ticket_invalid() -> i64 { return 0x0306 }
+pub func err_no_route() -> i64 { return 0x0401 }
+pub func err_topic_invalid() -> i64 { return 0x0402 }
+pub func err_sub_limit() -> i64 { return 0x0403 }
+pub func err_not_held() -> i64 { return 0x0501 }
+pub func err_verify_failed() -> i64 { return 0x0502 }
+pub func err_range_invalid() -> i64 { return 0x0503 }
+pub func err_algo_unsupported() -> i64 { return 0x0504 }
+pub func err_target_unreachable() -> i64 { return 0x0601 }
+pub func err_forward_refused() -> i64 { return 0x0602 }
+
+pub func err_class_of(ec: i64) -> i64 {
+    if ec == 0 { return 0 }
+    return ec & 0xFF00
+}
+
+pub func err_name(ec: i64) -> string {
+    if ec == 0x0000 { return "OK" }
+    if ec == 0x0101 { return "FRAME_MALFORMED" }
+    if ec == 0x0102 { return "STREAM_STATE" }
+    if ec == 0x0103 { return "FLOW_CONTROL_ERROR" }
+    if ec == 0x0104 { return "TIMEOUT" }
+    if ec == 0x0105 { return "DEADLINE_EXCEEDED" }
+    if ec == 0x0201 { return "VERSION_UNSUPPORTED" }
+    if ec == 0x0202 { return "SUITE_UNSUPPORTED" }
+    if ec == 0x0203 { return "PROTOCOL_VIOLATION" }
+    if ec == 0x0204 { return "STREAM_LIMIT" }
+    if ec == 0x0205 { return "SESSION_CLOSING" }
+    if ec == 0x0301 { return "HANDSHAKE_FAILED" }
+    if ec == 0x0302 { return "AUTH_FAILED" }
+    if ec == 0x0303 { return "AEAD_TAG_FAILED" }
+    if ec == 0x0304 { return "REPLAY" }
+    if ec == 0x0305 { return "KEY_UPDATE_ERROR" }
+    if ec == 0x0306 { return "TICKET_INVALID" }
+    if ec == 0x0401 { return "NO_ROUTE" }
+    if ec == 0x0402 { return "TOPIC_INVALID" }
+    if ec == 0x0403 { return "SUBSCRIPTION_LIMIT" }
+    if ec == 0x0501 { return "NOT_HELD" }
+    if ec == 0x0502 { return "VERIFY_FAILED" }
+    if ec == 0x0503 { return "RANGE_INVALID" }
+    if ec == 0x0504 { return "ALGO_UNSUPPORTED" }
+    if ec == 0x0601 { return "TARGET_UNREACHABLE" }
+    if ec == 0x0602 { return "FORWARD_REFUSED" }
+    return "UNKNOWN"
+}
+
+// ---- RPC 编解码 ----
+
+pub func req_body(req_id: i64, flags: i64, service: string, method: string, payload: table<i64>) -> table<i64> {
+    var sb = name_body(service)
+    var mb = name_body(method)
+    if len(sb) == 0 || len(mb) == 0 { return table_new_i64() }
+    var fb = table_new_i64()
+    table_push(fb, flags & 0xFF)
+    var out = bytes.concat(bytes.to_u64_be(req_id), fb)
+    out = bytes.concat(out, bytes.concat(sb, mb))
+    return bytes.concat(out, payload)
+}
+
+// → (ok, req_id, flags, service, method, p_off, p_len)
+pub func req_scan(b: table<i64>, off: i64, n: i64) -> (i64, i64, i64, string, string, i64, i64) {
+    if off < 0 || n < 10 || off + n > len(b) { return (0, 0, 0, "", "", 0, 0) }
+    var req_id = bytes.from_u64_be(b, off)
+    var flags = b[off + 8] & 0xFF
+    var p = off + 9
+    var end = off + n
+    var sl = b[p] & 0xFF
+    if p + 1 + sl > end { return (0, 0, 0, "", "", 0, 0) }
+    var svc = bytes.to_ascii(bytes.slice(b, p + 1, p + 1 + sl))
+    p = p + 1 + sl
+    if p + 1 > end { return (0, 0, 0, "", "", 0, 0) }
+    var ml = b[p] & 0xFF
+    if p + 1 + ml > end { return (0, 0, 0, "", "", 0, 0) }
+    var mth = bytes.to_ascii(bytes.slice(b, p + 1, p + 1 + ml))
+    p = p + 1 + ml
+    return (1, req_id, flags, svc, mth, p, end - p)
+}
+
+pub func request_frame(stream_id: i64, seq: i64, req_id: i64, flags: i64, service: string, method: string, payload: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_request(), prot, stream_id, seq, req_body(req_id, flags, service, method, payload), table_new_i64())
+}
+
+pub func resp_body(req_id: i64, status: i64, payload: table<i64>) -> table<i64> {
+    return bytes.concat(bytes.concat(bytes.to_u64_be(req_id), bytes.to_u32_be(status)), payload)
+}
+
+// → (ok, req_id, status, p_off, p_len)
+pub func resp_scan(b: table<i64>, off: i64, n: i64) -> (i64, i64, i64, i64, i64) {
+    if off < 0 || n < 12 || off + n > len(b) { return (0, 0, 0, 0, 0) }
+    return (1, bytes.from_u64_be(b, off), bytes.from_u32_be(b, off + 8), off + 12, n - 12)
+}
+
+pub func response_frame(stream_id: i64, seq: i64, req_id: i64, status: i64, payload: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_response(), prot, stream_id, seq, resp_body(req_id, status, payload), table_new_i64())
+}
+
+pub func cancel_body(req_id: i64) -> table<i64> {
+    return bytes.to_u64_be(req_id)
+}
+
+pub func cancel_scan(b: table<i64>, off: i64, n: i64) -> (i64, i64) {
+    if off < 0 || n < 8 || off + n > len(b) { return (0, 0) }
+    return (1, bytes.from_u64_be(b, off))
+}
+
+pub func cancel_frame(stream_id: i64, seq: i64, req_id: i64, prot: i64) -> table<i64> {
+    return frame_encode(ft_cancel(), prot, stream_id, seq, cancel_body(req_id), table_new_i64())
+}
+
+pub func push_body(req_id: i64, payload: table<i64>) -> table<i64> {
+    return bytes.concat(bytes.to_u64_be(req_id), payload)
+}
+
+// → (ok, req_id, p_off, p_len)
+pub func push_scan(b: table<i64>, off: i64, n: i64) -> (i64, i64, i64, i64) {
+    if off < 0 || n < 8 || off + n > len(b) { return (0, 0, 0, 0) }
+    return (1, bytes.from_u64_be(b, off), off + 8, n - 8)
+}
+
+pub func push_frame(stream_id: i64, seq: i64, req_id: i64, payload: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_push(), prot, stream_id, seq, push_body(req_id, payload), table_new_i64())
+}
+
+// ---- 请求登记（deadline/cancel 时序） ----
+// st = [count, 记录 × 步长 3：[req_id, deadline_ms, state]]；state：0 待答 / 1 已取消 / 2 完成
+
+pub func rpc_new() -> table<i64> {
+    var st = table_new_i64()
+    table_push(st, 0)
+    return st
+}
+
+func rpc_find(st: table<i64>, req_id: i64) -> i64 {
+    var c = st[0]
+    var i: i64 = 0
+    while i < c {
+        if st[1 + i * 3] == req_id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// → 1 已登记 / 0 重复（保持原状）
+pub func rpc_track(ref st: table<i64>, req_id: i64, deadline_ms: i64) -> i64 {
+    if rpc_find(st, req_id) >= 0 { return 0 }
+    st[0] = st[0] + 1
+    table_push(st, req_id)
+    table_push(st, deadline_ms)
+    table_push(st, 0)
+    return 1
+}
+
+pub func rpc_state(st: table<i64>, req_id: i64) -> i64 {
+    var k = rpc_find(st, req_id)
+    if k < 0 { return -1 }
+    return st[1 + k * 3 + 2]
+}
+
+// 取消：幂等（重复取消不再变更）→ 1 本次标记 / 0 未标记（未知或非待答）
+pub func rpc_cancel(ref st: table<i64>, req_id: i64) -> i64 {
+    var k = rpc_find(st, req_id)
+    if k < 0 { return 0 }
+    if st[1 + k * 3 + 2] != 0 { return 0 }
+    st[1 + k * 3 + 2] = 1
+    return 1
+}
+
+// 应答到达：1 交付 / 0 丢弃（已取消或已完成）/ -1 未知
+pub func rpc_accept_response(ref st: table<i64>, req_id: i64) -> i64 {
+    var k = rpc_find(st, req_id)
+    if k < 0 { return -1 }
+    if st[1 + k * 3 + 2] == 0 {
+        st[1 + k * 3 + 2] = 2
+        return 1
+    }
+    return 0
+}
+
+// 超期扫描：标记完成并返回超期待答 req_id 列表（deadline 0 = 无期限，跳过）
+pub func rpc_expire(ref st: table<i64>, now_ms: i64) -> table<i64> {
+    var out = table_new_i64()
+    var c = st[0]
+    var i: i64 = 0
+    while i < c {
+        var base = 1 + i * 3
+        if st[base + 2] == 0 {
+            var dl = st[base + 1]
+            if dl > 0 && now_ms > dl {
+                st[base + 2] = 2
+                table_push(out, st[base])
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ==================== 内容与验证流（§8） ====================
+// content_id = algo u8 + len u8 + digest（与 peer_id 同构）。
+// algo 1 = BLAKE3-256（首选）：原生树验证流（1024B 叶 = chunk CV；根 = blake3_256，与官方一致）；
+// algo 2 = TSHA2F-48（备选）：分块链 c₀ = H(块₀)；cᵢ = H(串字节(cᵢ₋₁) ‖ 块ᵢ)（逐块摘要 + 链式
+//   定位；根 = 末链值，base48 串 ASCII 作摘要字节；前缀可续算 ⇒ 断点续传一致）；
+// algo 3 = SHA-256（兜底）：自建 Merkle（1024B 叶、官方栈形；父 = sha256(raw(l) ‖ raw(r)))。
+// 树族验证流 = 叶路径（siblings + 方向位），逐块拉取即验；CHUNK_PROOF 帧承载。
+// GET/HAVE/PUT 帧 + GET(range) 增量 ⇒ 断点续传（已验块集合）。
+
+pub func cas_chunk() -> i64 { return 1024 }
+
+pub func cid_make(algo: i64, digest: table<i64>) -> table<i64> { return pid_make(algo, digest) }
+
+// → (ok, algo, d_off, d_len, total)
+pub func cid_scan(b: table<i64>, off: i64) -> (i64, i64, i64, i64, i64) {
+    if off < 0 || off + 2 > len(b) { return (0, 0, 0, 0, 0) }
+    var algo = b[off] & 0xFF
+    var dl = b[off + 1] & 0xFF
+    if off + 2 + dl > len(b) { return (0, 0, 0, 0, 0) }
+    return (1, algo, off + 2, dl, 2 + dl)
+}
+
+// 二进制安全切片（字节域）
+func bsub(s: string, a: i64, b: i64) -> string {
+    var sb = string_builder()
+    var i: i64 = a
+    while i < b && i < len(s) {
+        sb_append_byte(sb, str_byte(s, i) & 0xFF)
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// 族哈希（字符串进、字符串出）
+pub func fam_hash(algo: i64, msg: string) -> string {
+    if algo == 1 { return blake3.blake3_256(msg) }
+    if algo == 2 { return tsha2.tsha2f(msg, 48) }
+    if algo == 3 { return sha.sha256(msg) }
+    return ""
+}
+
+// 叶值（树族；algo 2 无叶概念）
+func cas_leaf(algo: i64, msg: string, off: i64, clen: i64, counter: i64) -> string {
+    if algo == 1 { return blake3.cas_leaf_hex(msg, off, clen, counter) }
+    if algo == 3 { return sha.sha256(bsub(msg, off, off + clen)) }
+    return ""
+}
+
+// 父值（树族；root = 顶层合并）
+func cas_parent(algo: i64, l: string, r: string, root: bool) -> string {
+    if algo == 1 { return blake3.cas_parent_hex(l, r, root) }
+    if algo == 3 {
+        var sb = string_builder()
+        var lb = bytes.from_hex(l)
+        var rb = bytes.from_hex(r)
+        var i: i64 = 0
+        while i < len(lb) {
+            sb_append_byte(sb, lb[i] & 0xFF)
+            i = i + 1
+        }
+        i = 0
+        while i < len(rb) {
+            sb_append_byte(sb, rb[i] & 0xFF)
+            i = i + 1
+        }
+        return sha.sha256(sb_build(sb))
+    }
+    return ""
+}
+
+// 叶列表（1024B 切块；空内容 → 单叶占位 = fam_hash）
+pub func cas_leaves(algo: i64, msg: string) -> table<string> {
+    var out: table<string> = []
+    var n = len(msg)
+    if n == 0 {
+        table_push(out, fam_hash(algo, msg))
+        return out
+    }
+    var pos: i64 = 0
+    var ci: i64 = 0
+    while pos < n {
+        var clen: i64 = 1024
+        if pos + clen > n { clen = n - pos }
+        table_push(out, cas_leaf(algo, msg, pos, clen, ci))
+        pos = pos + clen
+        ci = ci + 1
+    }
+    return out
+}
+
+// 栈形归并（与 blake3 官方 finalize 对齐：末叶不入栈；末次合并 = 根）
+func cas_merge(algo: i64, leaves: table<string>) -> string {
+    var m = len(leaves)
+    var stack: table<string> = []
+    var slen: i64 = 0
+    var total: i64 = 0
+    var i: i64 = 0
+    while i < m - 1 {
+        var cv = leaves[i]
+        total = total + 1
+        var t = total
+        while t % 2 == 0 {
+            var l = stack[slen - 1]
+            cv = cas_parent(algo, l, cv, false)
+            slen = slen - 1
+            t = t / 2
+        }
+        if slen < len(stack) {
+            stack[slen] = cv
+        } else {
+            table_push(stack, cv)
+        }
+        slen = slen + 1
+        i = i + 1
+    }
+    var acc = leaves[m - 1]
+    var si = slen
+    while si > 0 {
+        var l2 = stack[si - 1]
+        var fl: bool = (si == 1)
+        acc = cas_parent(algo, l2, acc, fl)
+        si = si - 1
+    }
+    return acc
+}
+
+// 树根：≤1024 → fam_hash；否则栈形归并
+pub func cas_root(algo: i64, msg: string) -> string {
+    if len(msg) <= 1024 { return fam_hash(algo, msg) }
+    return cas_merge(algo, cas_leaves(algo, msg))
+}
+
+// 小于 n 的最大 2 的幂
+func p2lt(n: i64) -> i64 {
+    var p: i64 = 1
+    while p * 2 < n {
+        p = p * 2
+    }
+    return p
+}
+
+// 子树值（叶区间 [a, b)，递归分裂形状与栈形一致）
+func cas_subtree(algo: i64, leaves: table<string>, a: i64, b: i64) -> string {
+    var size = b - a
+    if size == 1 { return leaves[a] }
+    var k = p2lt(size)
+    var l = cas_subtree(algo, leaves, a, a + k)
+    var r = cas_subtree(algo, leaves, a + k, b)
+    return cas_parent(algo, l, r, false)
+}
+
+// 证明：叶 i 的路径 → (ok, siblings, rights, root)
+//   rights[k] = 1 表示第 k 层该节点为右子（兄弟在左）
+pub func cas_proof(algo: i64, msg: string, i: i64) -> (i64, table<string>, table<i64>, string) {
+    var sibs: table<string> = []
+    var rights: table<i64> = []
+    if len(msg) <= 1024 {
+        if i != 0 { return (0, sibs, rights, "") }
+        return (1, sibs, rights, fam_hash(algo, msg))
+    }
+    var leaves = cas_leaves(algo, msg)
+    var m = len(leaves)
+    if i < 0 || i >= m { return (0, sibs, rights, "") }
+    var root = cas_merge(algo, leaves)
+    var lo: i64 = 0
+    var size = m
+    while size > 1 {
+        var k = p2lt(size)
+        if i - lo < k {
+            table_push(sibs, cas_subtree(algo, leaves, lo + k, lo + size))
+            table_push(rights, 0)
+            size = k
+        } else {
+            table_push(sibs, cas_subtree(algo, leaves, lo, lo + k))
+            table_push(rights, 1)
+            lo = lo + k
+            size = size - k
+        }
+    }
+    // 路径反转：自底向上（叶侧在前；末元素 = 顶层合并，校验时加 ROOT）
+    var rs: table<string> = []
+    var rw: table<i64> = []
+    var q = len(sibs) - 1
+    while q >= 0 {
+        table_push(rs, sibs[q])
+        table_push(rw, rights[q])
+        q = q - 1
+    }
+    return (1, rs, rw, root)
+}
+
+// 校验：块字节 + 路径 → 1/0（单叶：直接 fam_hash 比对）
+pub func cas_verify_chunk(algo: i64, chunk_msg: string, i: i64, sibs: table<string>, rights: table<i64>, root: string) -> i64 {
+    if len(sibs) == 0 {
+        if fam_hash(algo, chunk_msg) == root { return 1 }
+        return 0
+    }
+    var node = cas_leaf(algo, chunk_msg, 0, len(chunk_msg), i)
+    var lvl = len(sibs)
+    var k: i64 = 0
+    while k < lvl {
+        var fl: bool = (k == lvl - 1)
+        if rights[k] != 0 {
+            node = cas_parent(algo, sibs[k], node, fl)
+        } else {
+            node = cas_parent(algo, node, sibs[k], fl)
+        }
+        k = k + 1
+    }
+    if node == root { return 1 }
+    return 0
+}
+
+// ---- 链族（algo 2） ----
+
+// 链推进一步：c' = H(串字节(c) ‖ 块)
+pub func chain_step(algo: i64, carry: string, block_msg: string) -> string {
+    var sb = string_builder()
+    var i: i64 = 0
+    while i < str_len(carry) {
+        sb_append_byte(sb, char_code(str_char(carry, i)) & 0xFF)
+        i = i + 1
+    }
+    i = 0
+    while i < len(block_msg) {
+        sb_append_byte(sb, str_byte(block_msg, i) & 0xFF)
+        i = i + 1
+    }
+    return fam_hash(algo, sb_build(sb))
+}
+
+// 全量链根
+pub func chain_root(algo: i64, msg: string) -> string {
+    var n = len(msg)
+    if n == 0 { return fam_hash(algo, "") }
+    var pos: i64 = 0
+    var st: string = ""
+    var first: bool = true
+    while pos < n {
+        var clen: i64 = 1024
+        if pos + clen > n { clen = n - pos }
+        var blk = bsub(msg, pos, pos + clen)
+        if first {
+            st = fam_hash(algo, blk)
+            first = false
+        } else {
+            st = chain_step(algo, st, blk)
+        }
+        pos = pos + clen
+    }
+    return st
+}
+
+// 链前缀（断点续传）：处理 [0, lim) 内完整块 → (链态, 已处理字节数)；不足一块 → ("", 0)
+pub func chain_prefix(algo: i64, msg: string, lim: i64) -> (string, i64) {
+    var n = len(msg)
+    if lim > n { lim = n }
+    var cnt: i64 = lim / 1024
+    if lim == n && n > 0 && n <= 1024 { cnt = 1 }
+    if cnt == 0 { return ("", 0) }
+    var st: string = ""
+    var pos: i64 = 0
+    var b: i64 = 0
+    while b < cnt {
+        var clen: i64 = 1024
+        if pos + clen > n { clen = n - pos }
+        var blk = bsub(msg, pos, pos + clen)
+        if b == 0 {
+            st = fam_hash(algo, blk)
+        } else {
+            st = chain_step(algo, st, blk)
+        }
+        pos = pos + clen
+        b = b + 1
+    }
+    return (st, pos)
+}
+
+// ---- CAS 操作 ----
+
+// content_id：alg 1/3 = 树根字节（32B）；alg 2 = 链根 base48 串 ASCII 字节
+pub func cas_cid(algo: i64, msg: string) -> table<i64> {
+    var root: string = ""
+    if algo == 2 {
+        root = chain_root(2, msg)
+    } else {
+        root = cas_root(algo, msg)
+    }
+    if str_len(root) == 0 { return table_new_i64() }
+    var dig = table_new_i64()
+    if algo == 2 {
+        dig = bytes.from_ascii(root)
+    } else {
+        dig = bytes.from_hex(root)
+    }
+    return cid_make(algo, dig)
+}
+
+// 校验 msg 是否匹配 cid → 1/0
+pub func cas_verify_cid(algo: i64, msg: string, cid: table<i64>, off: i64) -> i64 {
+    var (ok, a, do, dl, tot) = cid_scan(cid, off)
+    if ok != 1 || a != algo { return 0 }
+    var mine = cas_cid(algo, msg)
+    var (m0, m1, m2, m3, m4) = cid_scan(mine, 0)
+    if m0 != 1 || m3 != dl { return 0 }
+    var i: i64 = 0
+    var same: i64 = 1
+    while i < dl {
+        if (cid[do + i] & 0xFF) != (mine[m2 + i] & 0xFF) { same = 0 }
+        i = i + 1
+    }
+    return same
+}
+
+// GET(range)：blob 字节表区间（饱和）
+pub func cas_get(blob: table<i64>, off: i64, len: i64) -> table<i64> {
+    return bytes.slice(blob, off, off + len)
+}
+
+pub func cas_chunk_count(n: i64) -> i64 {
+    if n <= 0 { return 1 }
+    var c = n / 1024
+    if c * 1024 < n { c = c + 1 }
+    return c
+}
+
+// 第 i 块切片（1024B 粒度，饱和）
+pub func cas_chunk_slice(blob: table<i64>, i: i64) -> table<i64> {
+    var a = i * 1024
+    return bytes.slice(blob, a, a + 1024)
+}
+
+// ---- GET / HAVE / PUT / CHUNK_PROOF 帧 ----
+
+// GET body = cid ‖ u32 off ‖ u32 len；→ (ok, cid_off, cid_total, roff, rlen)
+pub func get_body(cid: table<i64>, off: i64, len: i64) -> table<i64> {
+    return bytes.concat(bytes.concat(cid, bytes.to_u32_be(off)), bytes.to_u32_be(len))
+}
+
+pub func get_scan(b: table<i64>, off: i64, n: i64) -> (i64, i64, i64, i64, i64) {
+    var (ok0, algo, do, dl, tot) = cid_scan(b, off)
+    if ok0 != 1 || n < tot + 8 { return (0, 0, 0, 0, 0) }
+    return (1, off, tot, bytes.from_u32_be(b, off + tot), bytes.from_u32_be(b, off + tot + 4))
+}
+
+pub func get_frame(stream_id: i64, seq: i64, cid: table<i64>, off: i64, len: i64, prot: i64) -> table<i64> {
+    return frame_encode(ft_get(), prot, stream_id, seq, get_body(cid, off, len), table_new_i64())
+}
+
+pub func have_frame(stream_id: i64, seq: i64, cid: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_have(), prot, stream_id, seq, cid, table_new_i64())
+}
+
+pub func put_frame(stream_id: i64, seq: i64, cid: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_put(), prot, stream_id, seq, cid, table_new_i64())
+}
+
+// CHUNK_PROOF body = i u32 ‖ count u16 ‖ rights u16（位 k = 第 k 层为右子）‖ sibling 32B × count
+pub func chunk_proof_body(i: i64, sibs: table<string>, rights: table<i64>) -> table<i64> {
+    var cnt = len(sibs)
+    var out = bytes.to_u32_be(i)
+    var hd = table_new_i64()
+    table_push(hd, (cnt >> 8) & 0xFF)
+    table_push(hd, cnt & 0xFF)
+    var rb: i64 = 0
+    var k: i64 = 0
+    while k < cnt {
+        if rights[k] != 0 { rb = rb | (1 << k) }
+        k = k + 1
+    }
+    table_push(hd, (rb >> 8) & 0xFF)
+    table_push(hd, rb & 0xFF)
+    out = bytes.concat(out, hd)
+    k = 0
+    while k < cnt {
+        out = bytes.concat(out, bytes.from_hex(sibs[k]))
+        k = k + 1
+    }
+    return out
+}
+
+// → (ok, i, count, rights 位图, sibs)
+pub func chunk_proof_scan(b: table<i64>, off: i64, n: i64) -> (i64, i64, i64, i64, table<string>) {
+    var sibs: table<string> = []
+    if off < 0 || n < 8 || off + n > len(b) { return (0, 0, 0, 0, sibs) }
+    var idx = bytes.from_u32_be(b, off)
+    var cnt = bytes.from_u16_be(b, off + 4)
+    var rb = bytes.from_u16_be(b, off + 6)
+    if n < 8 + cnt * 32 { return (0, 0, 0, 0, sibs) }
+    var k: i64 = 0
+    while k < cnt {
+        table_push(sibs, bytes.to_hex(bytes.slice(b, off + 8 + k * 32, off + 8 + k * 32 + 32)))
+        k = k + 1
+    }
+    return (1, idx, cnt, rb, sibs)
+}
+
+// rights 位图 → 表
+pub func proof_rights(rb: i64, cnt: i64) -> table<i64> {
+    var out = table_new_i64()
+    var k: i64 = 0
+    while k < cnt {
+        if ((rb >> k) & 1) != 0 {
+            table_push(out, 1)
+        } else {
+            table_push(out, 0)
+        }
+        k = k + 1
+    }
+    return out
+}
+
+pub func chunk_proof_frame(stream_id: i64, seq: i64, body: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_chunk_proof(), prot, stream_id, seq, body, table_new_i64())
+}
+
+// ==================== 中继与迁移（§4.6/§5.6） ====================
+// FORWARD（0x60）：target peer_id ‖ 内层帧。relay **不解密载荷**（不解析内层、只读 target）；
+// 拒绝 → 0x06xx（TARGET_UNREACHABLE / FORWARD_REFUSED）。
+// 迁移：连接以 CONN_ID（TLV 1）标识；新路径同 CONN_ID 帧**经认证后**即接管（数据报绑定）；
+// 流绑定下迁移 = 重连 + RESUME（见 M8）。
+
+// target ‖ inner
+pub func forward_body(target: table<i64>, inner: table<i64>) -> table<i64> {
+    return bytes.concat(target, inner)
+}
+
+// → (ok, t_off, t_len, inner_off, inner_len)（t_* = 目标 peer_id 区间）
+pub func forward_scan(b: table<i64>, off: i64, n: i64) -> (i64, i64, i64, i64, i64) {
+    var (ok0, algo, do, dl, tot) = cid_scan(b, off)
+    if ok0 != 1 || n <= tot { return (0, 0, 0, 0, 0) }
+    return (1, off, tot, off + tot, n - tot)
+}
+
+pub func forward_frame(stream_id: i64, seq: i64, target: table<i64>, inner: table<i64>, prot: i64) -> table<i64> {
+    return frame_encode(ft_forward(), prot, stream_id, seq, forward_body(target, inner), table_new_i64())
+}
+
+// CONN_ID 迁移状态：[conn_id, epoch]
+pub func mig_new(conn_id: i64) -> table<i64> {
+    var st = table_new_i64()
+    table_push(st, conn_id)
+    table_push(st, 0)
+    return st
+}
+
+// 接管判定：1 = 接受（epoch+1）/ 0 = 拒绝（ID 不符或未认证）
+pub func mig_takeover(ref st: table<i64>, frame_conn_id: i64, authenticated: i64) -> i64 {
+    if st[0] != frame_conn_id { return 0 }
+    if authenticated != 1 { return 0 }
+    st[1] = st[1] + 1
+    return 1
+}
+
+}   // namespace tink

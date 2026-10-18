@@ -1,0 +1,853 @@
+type tie<class>
+// compiler/driver/pipeline.tie —— driver 编译管线（kpass 序列 / 后端驱动）子模块
+// ============================================================
+// 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
+// 拆分范式：同编译单元跨文件（文本内联）——本文件只含函数与注释，
+// 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
+// 风格 ns：函数在 `namespace driver` 内，一律 pub（driver 库 API 面）；
+// 主文件顶层 main() 以 driver.<名>() 调用。
+namespace driver {
+// 并发缺席：**可执行产物**（role_output == "exe"）、非动态库、且整个编译单元
+//（含 import 展开）不含 spawn。任一不满足 → false（保守：宁可少优化，绝不漏锁）。
+// 边界与依据：
+//   · 库产物（.a/.dll/.so）一律不算缺席——静态库会被多线程宿主链入，动态库更
+//     直接被任意线程调用（trm-lite 自身就是以 class 角色构建的 .a，其线程池
+//     调度器在 worker 线程里操作表，必须保留锁）；
+//   · spawn 是 tie 语言唯一的执行流创建路径（g_spawn_nodes 逐点登记，含任务集
+//     运行期组装的强制登记）；
+//   · 越过语言直接用 unsafe extern CreateThread / 运行时线程池（pp_open）创建
+//     线程者，属 unsafe 越界——与语言既有内存模型一致，由书写者负责。
+pub func no_concurrency() -> bool {
+    if g_shared {
+        return false
+    }
+    if role_output(str.clone(g_role)) != "exe" {
+        return false
+    }
+    if len(g_spawn_nodes) > 0 {
+        return false
+    }
+    return true
+}
+
+// 段 1 前端：词法 + 语法 + 语义（含 import）。失败返回 1（frontend 内部已
+// 打印诊断，wrapper 不重复打印）。
+pub func kpass_front() -> i64 {
+    if frontend(k_g_src, k_g_base_dir) < 0 {
+        return 1
+    }
+    return 0
+}
+
+// 段 2 中端：AST → tie-IR（tig_ast 复用 frontend 产物）。含 asm! 目标注入。
+pub func kpass_irgen() -> i64 {
+    var asm_target = normalize_target(g_target)
+    if asm_target == "trm" {
+        // p.7.3.3 路线 B：trm 字节码目标不带 CPU 三元组——IR 生成用本机默认
+        // （字节码产物与平台无关）
+        asm_target = ""
+    }
+    if str_len(asm_target) == 0 && g_cfg_root >= 0 {
+        var cfg_target = config.get_str(g_cfg_root, "target")
+        if str_len(cfg_target) > 0 {
+            asm_target = normalize_target(cfg_target)
+        }
+    }
+    if str_len(asm_target) == 0 {
+        asm_target = "x86_64-pc-windows-msvc"  // 本机默认（Windows x64 开发机）
+    }
+    irgen.set_target(asm_target)
+    // p.9.21 G3：装配职责上移到 driver——irgen 不再 import llvmgen；
+    // Linux main 入口 argc/argv 签名判据在此同步注入。
+    llvmgen.set_linux(is_linux_target(asm_target))
+    unsafe {
+        var t2 = clock()
+    }
+    // p.9.21.9 片段组装消费：全部模块片段命中 → 跳过 irgen+passes（片段已含
+    // pass 结果），按 g_extra_tops 装配序重放片段 IR。装配失败降级全量路径
+    //（响亮打印，不静默）。
+    if cache_enabled() {
+        var ap = modcache_assembly_paths()
+        if len(ap) > 0 {
+            var order = asm_build_order()
+            if len(order) > 0 {
+            var arc = tieir.asm_from_slices(ap, order)
+            if arc == 0 {
+                // p.9.21.9 收口：irgen 副作用恢复（登记族 + 链接判据）。
+                // 装配路径跳过 irgen → 全局/vtable 登记、链接置位须按片段 IR
+                // 引用等价恢复；任一项无法归类 → 回滚登记并降级全量（诚实）。
+        if get_env("TIEC_INC") == "1" {
+            var tk: i64 = 0
+            unsafe { tk = GetTickCount() }
+            file_append("phase.log", "pipe asm-ok t=" + to_string(tk) + "\n")
+        }
+                var rcv = asm_side_recover()
+                if rcv == 0 {
+                    // llvmgen 置位副作用恢复（irgen 生成引用时置位；装配按片段
+                    // 引用等价恢复——白名单对齐 llvmgen_inst_p1）
+                    if tieir.asm_flag_sso() {
+                        llvmgen.sso_enable()
+                    }
+                    if tieir.asm_flag_wsock() {
+                        llvmgen.wsock_enable()
+                    }
+                    if tieir.asm_flag_catch() {
+                        llvmgen.catch_enable()
+                    }
+                    if tieir.asm_flag_sc() {
+                        // p.9.17.1：str_char 缓存段（emit 侧隐含 SSO 段）
+                        llvmgen.sc_enable()
+                    }
+                    // p.9.15.1 装配路径补烘焙：全量路径在 irgen 后由 bake_build_stamp
+                    // 把「本次源码集指纹」覆写进 g_tiec_build_stamp 初值；装配路径
+                    // 跳过 irgen，该初值经 asm_reg_globals 重放为**源码初值**（空串）
+                    // ⇒ 命中路径 .ll 的 @.str 池缺「指纹串」条目、全局定义退化空串
+                    //（实测 3.2 万行纯编号重排、0 功能差异；池编号按文本升序、只由
+                    // 串集合决定 ⇒ 集合恢复即全文件字节一致）。片段全命中的前提 =
+                    // 同一源码集 ⇒ 此处重算值恒等于全量路径产物；非 tiec 自身编译
+                    //（has_global=false）惰性短路、零成本。
+                    bake_build_stamp()
+                    var inc9 = get_env("TIEC_INC")
+                    if inc9 == "1" {
+                        dbg_txt("MODASM " + to_string(len(ap)) + "/" + to_string(len(ap)) + " assembled")
+                    }
+                    g_t_irgen = 0
+                    return 0
+                }
+                llvmgen.reset_global_regs()
+                // 链接判据一并复位（恢复期可能已置位；全量路径由 irgen 自行置位）
+                g_used_trmlite = false
+                g_used_interp = false
+                g_used_wsock = false
+                dbg_txt("MODASM fallback（副作用恢复失败降级全量）: " + asm_recover_err)
+            } else {
+                dbg_txt("MODASM fallback（装配失败降级全量）: " + tieir.err_msg())
+            }
+            }
+        }
+    }
+    var rc = irgen.tig_ast()
+    unsafe {
+        var t2e = clock()
+    }
+    g_t_irgen = t2e - t2
+    if rc < 0 {
+        var msg = sm_err_msg
+        if str_len(msg) == 0 {
+            msg = "irgen 最小集之外的语句（尚未支持）"
+        }
+        dbg_txt("IR 生成失败: " + msg)
+        return 1
+    }
+    // p.9.15.1：烘进「本次源码集指纹」当**编译器自身身份**（仅编译 tiec 自身时
+    // 该全局才存在 ⇒ 用户程序零成本）。须在 irgen 之后（全局已登记）与 emit 之前。
+    bake_build_stamp()
+    // p.9.20.2 中端 pass 管道（t 轴）：irgen 之后、llvmgen 之前。
+    // 失败 = pass 内部错误（诊断由 pass 侧输出），终止编译。
+    var mrc = passes.run(effective_tie_opt())
+    if mrc != 0 {
+        dbg_txt(diagcode.render_error(-1, -1, "中端 pass 失败（t" + to_string(effective_tie_opt()) + "）"))
+        return 1
+    }
+    // p.9.21.6-2 模块级 tieir 片段缓存：归属注入 + 逐模块命中/写入。
+    // p.9.21.8 池过滤落地后**默认开**（片段池 = 引用过滤 + 保序压缩，
+    // 写放大消除）；片段写入失败只损失该模块片段，编译不受影响
+    //（单元级缓存与产物链路零改动）。
+    if cache_enabled() {
+        var af = mod_attribution_fill()
+        if af == 0 {
+            var mc = mod_cache_update()
+            if mc < 0 {
+                return -1
+            }
+        }
+    }
+    return 0
+}
+
+// p.9.21.9 收口：装配路径的 irgen 副作用恢复（登记族 + 链接判据）。
+// 装配路径跳过 irgen，故 irgen 生成期的全部「登记/置位」副作用须按**片段 IR
+// 引用**等价恢复（IR 是唯一事实）：
+//   ① 全局 var（顶层 VarDecl + 命名空间 const）与 vtable → AST 重放登记；
+//   ② 惰性登记族（msg_* 槽 / rand_range 槽 / Linux 入口捕获）→ 全局引用判定；
+//   ③ p.6.10.4 循环哨兵 @tl_loopf_<fn>_<n>（i64 零值）→ 前缀识别 + 显式归零；
+//   ④ 链接判据 g_used_wsock/trmlite/interp → 旗标与 extern 符号前缀判定。
+// 任一项无法归类 → 返回 -1（asm_recover_err 记因），driver 回滚登记并降级
+// 全量路径（不静默产出缺全局定义的单元）。
+func asm_side_recover() -> i64 {
+    asm_recover_err = ""
+    file_append("phase.log", "recover enter\n")
+    if irgen.asm_reg_globals() < 0 {
+        asm_recover_err = "全局 var 登记重放失败: " + sm_err_msg
+        return -1
+    }
+    file_append("phase.log", "recover regglobals ok\n")
+    var i: i64 = 0
+    while i < tieir.asm_gref_count() {
+        var nm = asm_bare(interner.name_str(tieir.asm_gref_id(i)))
+        if nm == "__tig_argc" || nm == "__tig_argv" {
+            llvmgen.linux_args_enable()
+        } else if nm == "__msg_lang" || nm == "__msg_keys" ||
+                  nm == "__msg_langs" || nm == "__msg_texts" {
+            irgen.asm_reg_msg()
+        } else if nm == "__rng_state" {
+            irgen.asm_reg_rng()
+        } else if str_len(nm) > 9 && asm_has_pre(nm, "tl_loopf_") {
+            // 循环/分支内表变量自遮蔽哨兵：名字含函数名与序号（不可穷举白名单）
+            if !llvmgen.has_global(nm) {
+                llvmgen.global_scalar_reg(nm, types.named(TK_I64))
+                llvmgen.global_scalar_init(nm, 0)
+            }
+        }
+        i = i + 1
+    }
+    // 登记完备校验：引用的全局必须已登记，或属 llvmgen 旗标段（无条件发射）
+    i = 0
+    while i < tieir.asm_gref_count() {
+        var gb = asm_bare(interner.name_str(tieir.asm_gref_id(i)))
+        if !llvmgen.has_global(gb) && !asm_flag_global(gb) {
+            asm_recover_err = "装配副作用未覆盖的全局引用: " + gb
+            return -1
+        }
+        i = i + 1
+    }
+    file_append("phase.log", "recover grefs ok\n")
+    // 链接判据恢复（irgen 生成期置位；装配按片段引用等价恢复）
+    var k: i64 = 0
+    while k < tieir.asm_ext_count() {
+        var sym = interner.name_str(tieir.asm_ext_id(k))
+        if str_len(sym) > 3 && asm_has_pre(sym, "tl_") {
+            g_used_trmlite = true
+        } else if irgen.asm_is_libc(sym) {
+            // libc/CRT 符号：无需额外库（is_libc_sym 与 irgen 同表）
+        } else {
+            // 其余（用户 extern / 平台符号 kernel32 / tie_* 桥）：链接判据无法从
+            // IR 忠实判定——实测 extern_s10_ptr 等含 tie_* 外部符号但全量路径不
+            // 链 tie_interp（该符号由模块内 define/CRT 解析），按前缀猜会误链 →
+            // 一律降级全量（判据交给 irgen 自己置位）。
+            asm_recover_err = "装配副作用未覆盖的 extern 符号: " + sym
+            return -1
+        }
+        k = k + 1
+    }
+    file_append("phase.log", "recover exts ok\n")
+    if tieir.asm_flag_wsock() {
+        g_used_wsock = true
+    }
+    return 0
+}
+
+// 前缀判定（str 无 starts_with 内置；逐码点比对）
+func asm_has_pre(s: string, pre: string) -> bool {
+    var n = str_len(pre)
+    if str_len(s) < n {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) != str_char(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// llvmgen 旗标段无条件发射的全局（不进 g_global_* 登记表，装配校验须豁免）：
+// SSO 池（sso 置位）/ 可捕获 panic（catch 置位）/ Winsock 初始化旗标（wsock
+// 置位）/ vtable 常量（vtable_reg 登记，名以 vt. 开头）。
+// 入参为裸名（去 '@'）——与 tieir_asm 的白名单同源。
+func asm_flag_global(nm: string) -> bool {
+    if nm == "s21_sso_pool" || nm == "s21_sso_off" || nm == "s21_sso_malloc_cnt" {
+        return true
+    }
+    if nm == "tie_panic_jb" || nm == "tie_panic_active" {
+        return true
+    }
+    if nm == "g_wsock_init" {
+        return true
+    }
+    if str_len(nm) > 3 && asm_has_pre(nm, "vt.") {
+        return true
+    }
+    return false
+}
+
+// 全局名归一化（IR 里带/不带 '@' 两种写法并存 → 一律按裸名比对）
+func asm_bare(s: string) -> string {
+    if str_len(s) > 1 && str_char(s, 0) == "@" {
+        return slice(s, 1, str_len(s))
+    }
+    return s
+}
+
+// p.9.21.9：装配序 = g_extra_tops 序的函数全名列表（driver 复刻 tig_fn_def/
+// tig_ns 取名规则：顶层/方法 bare 即全名；命名空间 prefix::bare；泛型模板
+// 声明不产 IR，跳过）。供 tieir.asm_from_slices 匹配片段函数。
+pub func asm_build_order() -> table<string> {
+    var out: table<string> = table_new_string()
+    if get_env("TIEC_ASMDBG") == "3" {
+        var di: i64 = 0
+        var nm_dollar: i64 = 0
+        var tag_other: i64 = 0
+        while di < len(g_extra_tops) {
+            var s3 = g_extra_tops[di]
+            var tg = s_tags[s3]
+            var nm3 = sstate.name_str(s3)
+            var is_d = str_sub_bytes(nm3, 0, str_len(nm3))
+            var has_dollar = false
+            var ci: i64 = 0
+            while ci < str_len(nm3) {
+                if str_byte(nm3, ci) == 36 { has_dollar = true }
+                ci = ci + 1
+            }
+            if has_dollar {
+                dbg_txt("ASMDBG gext_dollar[" + to_string(di) + "] tag=" + to_string(tg) + " name=" + nm3)
+                nm_dollar = nm_dollar + 1
+            }
+            if tg != 100 && tg != 101 && tg != 112 {
+                tag_other = tag_other + 1
+                if tag_other <= 10 {
+                    dbg_txt("ASMDBG gext_othertag[" + to_string(di) + "] tag=" + to_string(tg) + " name=" + nm3)
+                }
+            }
+            di = di + 1
+        }
+        dbg_txt("ASMDBG gext_total=" + to_string(len(g_extra_tops)) + " dollar=" + to_string(nm_dollar) + " othertag=" + to_string(tag_other))
+    }
+    // p.9.21.9 收口：原「含顶层 VarDecl → 空 order 降级」护栏已摘除——
+    // 全局 var 登记族（含命名空间 const）与 vtable 登记由 irgen.asm_reg_globals
+    // 在装配路径重放，链接判据与惰性登记族由 asm_side_recover 恢复。
+    var i: i64 = 0
+    while i < len(g_extra_tops) {
+        var s = g_extra_tops[i]
+        if s_tags[s] == 101 {
+            asm_order_one_fn(s, "", out)
+        } else if s_tags[s] == 112 {
+            asm_order_ns(s, "", out)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+func asm_order_one_fn(fn_node: i64, prefix: string, ref out: table<string>) {
+    // p.9.21.11：移除「TYPE_PARAMS 首槽 → 模板跳过」——泛型**展开节点**
+    //（sgen_inst 的 clone_subst 产物）同样保留 TYPE_PARAMS 首槽但名字已
+    // mangled 且**必须进装配序**（展开函数经 fn_sig 归属到来源模块片段，
+    // 装配序缺名 → 覆盖校验失败降级全量；driver 实测 assert::assert_eq$i64）。
+    // 模板项进序后匹配不到任何记录，build_seq 按「未找到 = 不产 IR 的项」
+    // 自然跳过——原跳过逻辑对模板是冗余、对展开是致命。
+    var bare = sstate.name_str(fn_node)
+    var full_name: string = str.clone(bare)
+    if prefix != "" {
+        full_name = prefix + "::" + bare
+    }
+    table_push(out, full_name)
+}
+
+func asm_order_ns(ns_node: i64, prefix: string, ref out: table<string>) {
+    var nseg = s_aux[ns_node]
+    var full_pre: string = prefix
+    var k: i64 = 0
+    while k < nseg {
+        var seg = sstate.child(ns_node, k)
+        if full_pre != "" {
+            full_pre = full_pre + "::"
+        }
+        full_pre = full_pre + sstate.name_str(seg)
+        k = k + 1
+    }
+    var body = sstate.child(ns_node, nseg)
+    var nb = sstate.nchild(body)
+    var i: i64 = 0
+    while i < nb {
+        var st = sstate.child(body, i)
+        var tag = s_tags[st]
+        if tag == 101 {
+            asm_order_one_fn(st, full_pre, out)
+        } else if tag == 112 {
+            asm_order_ns(st, full_pre, out)
+        }
+        i = i + 1
+    }
+}
+
+// 段 3 中端旁路：--tieir-out 序列化（无 g_tieir_out 直接返回 0 通过）。
+pub func kpass_tieir() -> i64 {
+    if str_len(g_tieir_out) > 0 {
+        // p.9.20 §6.3：tieir 单元头携带 t 档与 pass 管道版本（可复现性自证）
+        ir_meta.set_tie_opt(effective_tie_opt())
+        ir_meta.set_pass_ver(passes.pipeline_ver())
+        // p.9.22.8：段 8 语义符号表——采集开启时构建列组并注入尾部；
+        // 未开启时显式清空（进程内多编译防残留）。
+        if xref.enabled() == 1 {
+            dbgem.build_sym()
+            tieir.set_sec8(dbgem.sym8_section())
+        } else {
+            tieir.set_sec8(table_new_i64())
+        }
+        if !tieir.write(g_tieir_out) {
+            dbg_txt("tieir 序列化失败: " + tieir.err_msg())
+            return 1
+        }
+        dbg_txt("已生成 tieir: " + g_tieir_out)
+    }
+    return 0
+}
+
+// 段 3b（p.7.3.3 路线 B）：trm 字节码目标——写出 .tir 分发单元并终止
+// （不 llvm emit/link；可插拔后端，默认不启用）。输出路径优先级：
+// --tieir-out > -o > 输入同名 .tir。
+pub func kpass_trmemit() -> i64 {
+    var out = g_tieir_out
+    if str_len(out) == 0 {
+        out = g_output
+    }
+    if str_len(out) == 0 {
+        out = replace_ext(g_input, "tir")
+    }
+    // p.9.20 §6.3：trm 分发单元同样携带 t 档 / pass 管道版本
+    ir_meta.set_tie_opt(effective_tie_opt())
+    ir_meta.set_pass_ver(passes.pipeline_ver())
+    // p.9.22.8：段 8 语义符号表（同 kpass_tieir）
+    if xref.enabled() == 1 {
+        dbgem.build_sym()
+        tieir.set_sec8(dbgem.sym8_section())
+    } else {
+        tieir.set_sec8(table_new_i64())
+    }
+    if !tieir.write(out) {
+        dbg_txt(diagcode.render_error(-1, -1, "trm 目标后端失败: " + tieir.err_msg()))
+        return 1
+    }
+    dbg_txt("trm 目标产物: " + out + "（tieir 字节码，供 trm 引擎加载执行）")
+    return 0
+}
+
+// 段 4 后端：tie-IR → .ll 文本 + 写盘。g_emit_ir 时打印阶段计时并返回 0
+//（成功停，link 段由驱动侧 max_steps 截断跳过）。
+pub func kpass_emit() -> i64 {
+    unsafe {
+        var t3 = clock()
+    }
+    llvmgen.set_entry(sstate.g_entry_name)
+    var ll_text = llvmgen.emit()
+    unsafe {
+        var t3e = clock()
+    }
+    g_t_emit = t3e - t3
+    // r.1.4.4：未支持指令硬错误——不再静默降级为占位注释继续链接
+    if str_len(llvmgen.err_msg()) > 0 {
+        dbg_txt(diagcode.render_error(-1, -1, "代码生成失败: " + llvmgen.err_msg()))
+        return 1
+    }
+    // IR 文件路径（p.9.15.4：统一由 driver.ir_path 给；--emit-ir 落用户路径，
+    // 否则落**进程私有**临时名——见 ir_priv_prefix 注释）
+    var ir_path = ir_path()
+    unsafe {
+        var t4 = clock()
+    }
+    if !file_write(ir_path, ll_text) {
+        dbg_txt("文件操作失败: 写 IR 文件 " + ir_path)
+        return 1
+    }
+    unsafe {
+        var t4e = clock()
+    }
+    g_t_write = t4e - t4
+    if g_emit_ir {
+        // 阶段计时报告（TIEC_TIME=1）：parse/sem/irgen/emit/write 五段
+        if get_env("TIEC_TIME") == "1" {
+            dbg_txt("[time] parse=" + to_string(g_t_parse) + "ms sem=" + to_string(g_t_sem) +
+                "ms irgen=" + to_string(g_t_irgen) + "ms emit=" + to_string(g_t_emit) +
+                "ms write=" + to_string(g_t_write) + "ms")
+        }
+        dbg_txt("已生成 LLVM IR: " + ir_path)
+        return 0
+    }
+    return 0
+}
+
+// ==================== p.9.20 双轴优化档解析（含内存上限降档） ====================
+// 生效 LLVM/clang 轴优化档（l 轴）优先级：CLI -l/--llvm-opt 显式 > config
+// （含 profile 激活）> 默认 2。内存上限（--mem-limit / config tiec.mem_limit）
+// >0 表示节省内存意图，此时 l3 自动降为 l2（打印诊断警告）。0 = 不限，行为不变。
+pub func effective_llvm_opt() -> i64 {
+    var level = g_llvm_opt
+    if !g_llvm_set {
+        level = 2
+        if g_cfg_root >= 0 {
+            // ★ 必须用 path_get 判"键是否存在"：config.get_int 对缺失键返回 0，
+            //   直接当值用会把默认档污染成 l0（实测：默认档退化成 opt -O0 + clang -O0）。
+            var cnode = config.path_get(g_cfg_root, "llvm_opt")
+            if cnode >= 0 {
+                var cfg_opt = config.int_val(cnode)
+                if cfg_opt >= 0 && cfg_opt <= 3 {
+                    level = cfg_opt
+                }
+            }
+        }
+    }
+    // 注：-l3 已移除（实测更慢且越界），故不再有「内存上限下 l3 降档」分支。
+    return level
+}
+
+// -l 预设 → 机器码档（clang -O）：0/1 → -O0（IR 已由 opt 优化），2 → -O1，3 → -O2。
+// 三处 clang 调用此前都不传 -O（机器码实为 -O0）；-l2/-l3 的新语义是「不跑 opt，
+// 直接让 clang 优化」，实测与"opt 后再 clang -O2"等价且省一遍优化（见评估报告）。
+pub func effective_clang_opt() -> i64 {
+    var level = effective_llvm_opt()
+    if level <= 1 {
+        return 0
+    }
+    return level - 1
+}
+
+// 是否**跑** opt 阶段，以及档位：-1 = 跳过（clang 直接吃原始 IR）。
+// 预设：-l0 → opt -O0；-l1 → **opt -O2**（IR 全优化 + clang -O0 的经典组合）；
+//       -l2/-l3 → 跳过 opt（交给 clang -O1/-O2）。
+// 优先级：--opt=<n> 强制 > -l 预设。
+pub func effective_ir_opt() -> i64 {
+    if g_opt_force >= 0 {
+        return g_opt_force
+    }
+    var level = effective_llvm_opt()
+    if level == 0 {
+        return 0
+    }
+    if level == 1 {
+        return 2
+    }
+    return -1
+}
+
+// 生效 tiec 中端轴优化档（t 轴）优先级：CLI -t/--tie-opt 显式 > config
+// （含 profile 激活）> 默认 2。
+// t 轴不受 --mem-limit 影响（pass 管道非内存大头）。
+pub func effective_tie_opt() -> i64 {
+    var level = g_tie_opt
+    if !g_tie_set && g_cfg_root >= 0 {
+        var tnode = config.path_get(g_cfg_root, "tiec_opt")
+        if tnode >= 0 {
+            var cfg_t = config.int_val(tnode)
+            if cfg_t >= 0 && cfg_t <= 3 {
+                level = cfg_t
+            }
+        }
+    }
+    return level
+}
+
+// 段 5 后端：opt → 链接/归档（lib→compile_library/compile_shared，其余→
+// compile_logic 三路 link 分支）。
+pub func kpass_link() -> i64 {
+    var ir_path = ir_path()
+    var opt_path = opt_path()
+    // IR 优化阶段：-l2/-l3 预设**跳过**（clang 自己会做全套 -O1/-O2 优化，
+    // 实测与"opt 后再 clang -O2"产物等价且少一遍优化、构建快 28s）；
+    // -l0/-l1 与 `--opt=<n>` 仍跑 opt。
+    var level = effective_ir_opt()
+    if level >= 0 {
+        var orc = tc.opt(ir_path, opt_path, level)
+        if orc != 0 {
+            dbg_txt(diagcode.render_error(-1, -1, "中间优化失败: " + tc_err_msg))
+            return 1
+        }
+    } else {
+        // 跳过 opt：clang 直接读原始 IR（--keep-ir 时不产出 .opt.ll）
+        opt_path = ir_path
+    }
+    // S3.1：target 优先级 CLI --target > 配置 target > 空（本机）
+    var target = normalize_target(g_target)
+    if str_len(target) == 0 && g_cfg_root >= 0 {
+        target = normalize_target(config.get_str(g_cfg_root, "target"))
+    }
+    var disp2 = role_output(str.clone(g_role))
+    if disp2 == "lib" {
+        // M5 动态库模式（--shared / 输出 .dll/.so）：走共享库链接（非静态库 .a）
+        if g_shared {
+            return compile_shared(ir_path, opt_path, target)
+        }
+        return compile_library(ir_path, opt_path, target)
+    }
+    // lib 之外（check/pass 已提前 return）：exe / 空 = 可执行管线
+    return compile_logic(ir_path, opt_path, target)
+}
+
+// driver 次引导：登记 5 个真实 pass + 1 条真实 pipeline（幂等，返回真实
+// pipeline 注册项 id）。真实 pass 的 impl_name = "kpass_*"。
+pub func keel_driver_boot() -> i64 {
+    var fd: table<i64> = table_new_i64()
+    var pf = keelreg.register("tiec::pass_front_real", "pass", "kpass_front", fd)
+    var idd: table<i64> = table_new_i64()
+    table_push(idd, pf)
+    var pi = keelreg.register("tiec::pass_irgen_real", "pass", "kpass_irgen", idd)
+    var itd: table<i64> = table_new_i64()
+    table_push(itd, pi)
+    var pt = keelreg.register("tiec::pass_tieir_real", "pass", "kpass_tieir", itd)
+    var etd: table<i64> = table_new_i64()
+    table_push(etd, pt)
+    var pe = keelreg.register("tiec::pass_emit_real", "pass", "kpass_emit", etd)
+    var ltd: table<i64> = table_new_i64()
+    table_push(ltd, pe)
+    var pl = keelreg.register("tiec::pass_link_real", "pass", "kpass_link", ltd)
+    // p.7.3.3 路线 B：trm 字节码目标可插拔后端（pass_trmemit + pipeline_trm；
+    // 默认不启用——pipeline_real 全程不动，默认编译链路逐字节不变）
+    var ptd: table<i64> = table_new_i64()
+    table_push(ptd, pi)
+    var ptm = keelreg.register("tiec::pass_trmemit_real", "pass", "kpass_trmemit", ptd)
+    var trmd: table<i64> = table_new_i64()
+    table_push(trmd, pf)
+    table_push(trmd, pi)
+    table_push(trmd, ptm)
+    g_trm_pipeline = keelreg.register("tiec::pipeline_trm", "pipeline", "", trmd)
+    var pdd: table<i64> = table_new_i64()
+    table_push(pdd, pf)
+    table_push(pdd, pi)
+    table_push(pdd, pt)
+    table_push(pdd, pe)
+    table_push(pdd, pl)
+    return keelreg.register("tiec::pipeline_real", "pipeline", "", pdd)
+}
+
+// C1 分派（impl_name "kpass_*" → 整数选择子 → driver 真实 pass）。
+pub func keel_dispatch(nm: string) -> i64 {
+    var sel: i64 = -1
+    if nm == "kpass_front" {
+        sel = 0
+    } else if nm == "kpass_irgen" {
+        sel = 1
+    } else if nm == "kpass_tieir" {
+        sel = 2
+    } else if nm == "kpass_emit" {
+        sel = 3
+    } else if nm == "kpass_link" {
+        sel = 4
+    } else if nm == "kpass_trmemit" {
+        sel = 5
+    }
+    switch sel {
+        case 0:
+            return kpass_front()
+        case 1:
+            return kpass_irgen()
+        case 2:
+            return kpass_tieir()
+        case 3:
+            return kpass_emit()
+        case 4:
+            return kpass_link()
+        case 5:
+            return kpass_trmemit()
+        default:
+            return -1
+    }
+}
+
+// 驱动注册表管线：读 pipeline:real 的「有序 pass 引用列表」，逐个按
+// impl_name 分派执行；任一非 0 立即中止返回（等价 executor.run_pipeline）。
+// max_steps 截断前缀（--emit-ir 场景断在 emit 后，跳过 opt/link）。
+// p.9.15.1：kpass_front（语义含 import 展开）完成后，sstate.g_imported 已含
+// 全部依赖路径——在此处做依赖感知缓存判定：命中则跳过后续 pass 直接返回成功
+//（产物已由缓存复制到目标路径，见 cache_try_hit_dep）。
+pub func keel_run_pipeline(pid: i64, max_steps: i64) -> i64 {
+    var n = keelreg.deps_count(pid)
+    if max_steps > 0 && max_steps < n {
+        n = max_steps
+    }
+    var i: i64 = 0
+    while i < n {
+        var ref_id = keelreg.deps_at(pid, i)
+        var iname = keelreg.impl_name_of(ref_id)
+        if iname == "" {
+            return -1
+        }
+        // p.9.15.1 依赖感知缓存：front 完成后判定（命中 → 后续 pass 跳过）。
+        // 仅对「真实管线」生效；trm 路线 B（独立分派）与 --emit-ir 前的
+        // 提前返回路径不受影响（g_trm_mode 单独拦截于 compile_program）。
+        if iname == "kpass_front" {
+            var tf0 = 0
+            unsafe { tf0 = GetTickCount() }
+            var frc = keel_dispatch(iname)
+            var tf1 = 0
+            unsafe { tf1 = GetTickCount() }
+            var incf = get_env("TIEC_INC")
+            if incf == "1" {
+                dbg_txt("PHASE " + iname + " " + to_string(tf1 - tf0) + "ms")
+            }
+            if frc != 0 {
+                return frc
+            }
+            // 并发缺席判据注入（irgen.set_noconc）：前端已展开全部 import，此刻
+            // g_spawn_nodes 是**整个编译单元**的事实。必须在缓存判定之前注入——
+            // 缓存键织入 Q 标记（cache_drv），否则「有 spawn」的产物会命中
+            // 「无 spawn」时生成的免锁片段。
+            irgen.set_noconc(no_concurrency())
+            if cache_enabled() {
+                var hit = cache_try_hit_dep()
+                if hit == 1 {
+                    return 0  // 命中：产物已复制，整条管线到此为止
+                }
+                if hit < 0 {
+                    return -1
+                }
+            }
+        } else {
+            var t0p = 0
+            unsafe { t0p = GetTickCount() }
+            var rc = keel_dispatch(iname)
+            var t1p = 0
+            unsafe { t1p = GetTickCount() }
+            var incp = get_env("TIEC_INC")
+            if incp == "1" {
+                dbg_txt("PHASE " + iname + " " + to_string(t1p - t0p) + "ms")
+                file_append("phase.log", "PHASE " + iname + " end " + to_string(t1p) + "\n")
+            }
+            if rc != 0 {
+                return rc
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+pub func compile_program(src: string) -> i64 {
+    // base_dir：输入路径的目录（import 展开需要）；\\ 归一化为 /
+    k_g_base_dir = dir_of(str.clone(g_input))
+    k_g_src = src
+    // p.9.22：结构化输出初始化（列登记 + 错误槽；全局初值不生效）。
+    dbgem.boot()
+    // p.9.22：符号表采集门（单一出处）——需要 symtab 数据的输出路径才开启：
+    // --emit symtab* / --tieir-out（段 8）/ trm 目标 / library|class 伴生 .sym.zd。
+    // 默认关闭 ⇒ 普通编译零开销（xref 登记函数首行短路）。
+    if dbgem.sym_wanted() == 1 {
+        xref.set_enabled(1)
+    }
+    // p.9.22.1：--emit-only——只跑前端（内含 --emit 落盘），不进中端/后端。
+    if g_emit_only {
+        return kpass_front()
+    }
+    // Keel 骨架引导：boot（内建默认注册项）→ driver 次引导（真实注册项）。
+    // 幂等：重复调用不重复登记（register 重名返回原 id）。
+    keelboot.boot()
+    var real_pid = keel_driver_boot()
+    // --emit-ir：只跑 front→irgen→tieir→emit 前缀（emit 内成功停），跳过
+    // opt/link；否则全 5 段。
+    var steps: i64 = 5
+    if g_emit_ir {
+        steps = 4
+    }
+    // p.7.3.3 路线 B：trm 字节码目标（不缓存，产物 .tir 独立分派）
+    if g_trm_mode {
+        return keel_run_pipeline(g_trm_pipeline, 3)
+    }
+    // p.9.15.1 编译缓存：依赖感知命中在 keel_run_pipeline 内 kpass_front 之后
+    // 判定（cache_try_hit_dep，见 keel_run_pipeline）；此处的早期判定仅保留
+    // --emit-ir / 无管线路径兜底（依赖集未知时走旧单文件键，仅复制产物）。
+    var rc = keel_run_pipeline(real_pid, steps)
+    if rc != 0 {
+        return rc
+    }
+    // -Werror：末段（链接/优化档）产生的 driver 侧告警同样当错误。此处产物可能
+    // 已落盘（告警发生在最后一段内部），故只保证**退出码非 0** 供 CI 与纪律判定。
+    if warn_gate() != 0 {
+        return 1
+    }
+    // p.9.15.1：管线成功后写依赖感知缓存（聚合键 + .dep 清单 + 产物指纹）。
+    if cache_enabled() {
+        var wrc = cache_store_dep()
+        if wrc < 0 {
+            return -1
+        }
+    }
+    return 0
+}
+
+// logic：clang 链接可执行文件；清理中间文件（除非 --keep-ir）。
+// 程序用了 tie-interp 库桥（file_*/regex_*/exec_output 等，irgen 置 g_used_interp）
+// → 链接 tie_interp.lib（Rust 桥）。exec_code/get_env/time_now 已内联到 libc，
+// std/runtime.a 退役——纯程序（无桥）不链接任何运行时库，零依赖。
+pub func compile_logic(ir_path: string, opt_path: string, target: string) -> i64 {
+    var exe_path = g_output
+    if str_len(exe_path) == 0 {
+        // r.1.6.1：Linux 可执行文件无扩展名（ELF）；Windows 默认 .exe
+        if is_linux_target(g_target) {
+            exe_path = replace_ext(g_input, "")
+        } else {
+            exe_path = replace_ext(g_input, "exe")
+        }
+    }
+    // need_interp = g_used_interp：有 Rust 桥才链 tie_interp.lib
+    // p.9.15.4：链接到**私有中转名**再发布到 exe_path —— ① 防并发互锁同一输出
+    //（LNK1104）② 用户路径永不出现**半写的 exe**。无私有前缀则退回直接链。
+    var link_out = exe_path
+    var pre_l = ir_prefix()
+    if pre_l != "" {
+        link_out = pre_l + ".exe.tmp"
+    }
+    var bres = tc.link_exe(opt_path, link_out, target, g_used_interp, g_used_trmlite, g_used_wsock)
+    if bres != 0 {
+        dbg_txt(diagcode.render_error(-1, -1, "后端失败: " + tc_err_msg))
+        return 1
+    }
+    if link_out != exe_path {
+        if !publish_artifact(link_out, exe_path) {
+            dbg_txt(diagcode.render_error(-1, -1, "产物发布失败: " + exe_path))
+            return 1
+        }
+    }
+    cleanup_ir()
+    dbg_txt("编译成功: " + exe_path)
+    return 0
+}
+
+// library：clang -c 目标文件 + llvm-ar 打包静态库；清理中间文件。
+pub func compile_library(ir_path: string, opt_path: string, target: string) -> i64 {
+    var lib_path = g_output
+    if str_len(lib_path) == 0 {
+        lib_path = replace_ext(g_input, "a")
+    }
+    var obj_path = replace_ext(g_input, "o")
+    var crc = tc.compile_object(opt_path, obj_path, target)
+    if crc != 0 {
+        dbg_txt(diagcode.render_error(-1, -1, "后端失败: " + tc_err_msg))
+        return 1
+    }
+    var arc = tc.archive(obj_path, lib_path)
+    if arc != 0 {
+        dbg_txt(diagcode.render_error(-1, -1, "后端失败: " + tc_err_msg))
+        return 1
+    }
+    cleanup_ir()
+    file_delete(obj_path)
+    dbg_txt("库编译成功: " + lib_path)
+    return 0
+}
+
+// 动态库：clang -shared 链接（Windows .dll / Linux .so，dllexport 导出面由
+// irgen 标记）；清理中间文件（除非 --keep-ir）。
+pub func compile_shared(ir_path: string, opt_path: string, target: string) -> i64 {
+    var dll_path = g_output
+    if str_len(dll_path) == 0 {
+        // 默认扩展名：linux 目标 → .so；其余（win/mac）→ .dll
+        if is_linux_target(target) {
+            dll_path = replace_ext(g_input, "so")
+        } else {
+            dll_path = replace_ext(g_input, "dll")
+        }
+    }
+    var src = tc.link_shared(opt_path, dll_path, target, g_used_interp, g_used_trmlite, g_used_wsock)
+    if src != 0 {
+        dbg_txt(diagcode.render_error(-1, -1, "后端失败: " + tc_err_msg))
+        return 1
+    }
+    cleanup_ir()
+    dbg_txt("动态库编译成功: " + dll_path)
+    return 0
+}
+
+
+
+}

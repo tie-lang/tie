@@ -1,0 +1,103 @@
+type tie<logic>
+// compiler/lib/interner_test.tie —— tie.interner 库独立自检（p.9.21 G7 库资格②）
+// ============================================================
+// 无 driver 可跑：本文件即入口（tie<logic>），只 import 被测库，
+// 覆盖 interner.tie 注释头「配套的验收要点」一节列出的全部契约：
+//   - 幂等：intern(s) 重复登记返回同一 id；
+//   - 反查：lookup(intern(s)) == s；
+//   - 哨兵：name_str(-1) == ""；is_valid(-1) == false；越界 id 非法；
+//   - 预登记：init() 后 "main" 等高频名在池内且 id 稳定；
+//   - 区间：len() 单调不减，合法 id 恒在 [0, len())。
+// 全部通过输出「interner 自检通过」exit 0；任一失败打印明细 exit 1。
+//
+// # 语言边界应用（同 ir_test.tie 文件头）
+//   - import 文本内联后顶层与本库全局定义同作用域：本文件不定义
+//     本地常量（interner.tie 也无常量，无撞名风险）；
+//   - 前缀调用（interner.xxx），不用 using；
+//   - 断言失败累积用嵌套 if（&& 非短路，不依赖求值序）。
+//
+// 运行（repo 根）：
+//   compiler\tiec.exe compiler\lib\interner_test.tie -o <tmp>\interntest.exe
+//   <tmp>\interntest.exe     # -> 「interner 自检通过」exit 0
+
+import "./interner.tie"
+
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+func main() {
+    var ok: bool = true
+
+    // ---------- 预登记 ----------
+    interner.init()
+    var before = interner.len()
+    if !check(before >= 8, "init() 预登记 8 个高频名") {
+        ok = false
+    }
+
+    // ---------- 幂等 + 反查 ----------
+    var a = interner.intern("自检字符串甲")
+    var a2 = interner.intern("自检字符串甲")
+    if !check(a == a2, "重复登记返回同一 id") {
+        ok = false
+    }
+    if !check(interner.lookup(a) == "自检字符串甲", "lookup 还原文本") {
+        ok = false
+    }
+    if !check(interner.name_str(a) == "自检字符串甲", "name_str 还原文本") {
+        ok = false
+    }
+
+    // 第二个串：id 不同且单调
+    var b = interner.intern("自检字符串乙")
+    if !check(b != a, "不同文本不同 id") {
+        ok = false
+    }
+    if !check(b > a, "id 随登记单调递增") {
+        ok = false
+    }
+
+    // ---------- 哨兵 ----------
+    if !check(interner.name_str(-1) == "", "name_str(-1) 返回空串哨兵") {
+        ok = false
+    }
+    if !check(!interner.is_valid(-1), "is_valid(-1) 为假") {
+        ok = false
+    }
+    if !check(!interner.is_valid(interner.len() + 1000000), "越界 id 非法") {
+        ok = false
+    }
+    if !check(interner.is_valid(a), "已登记 id 合法") {
+        ok = false
+    }
+    if !check(interner.lookup(a + 1000000) == "", "未登记 id 反查返回空串") {
+        ok = false
+    }
+
+    // ---------- 区间不变量 ----------
+    if !check(interner.len() == before + 2, "池条目数只增不减且与登记数一致") {
+        ok = false
+    }
+    var n = interner.len()
+    var inrange: bool = true
+    var i: i64 = 0
+    while i < n {
+        if !interner.is_valid(i) {
+            inrange = false
+        }
+        i = i + 1
+    }
+    if !check(inrange, "合法 id 区间 [0, len()) 无空洞") {
+        ok = false
+    }
+
+    // ---------- 汇总 ----------
+    if !ok {
+        exit(1)
+    }
+    println("interner 自检通过")
+}

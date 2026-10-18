@@ -1,0 +1,29 @@
+type tie<logic>
+
+// ============================================================
+// p.9.11.21 负例2：interface 方法签名不匹配（返回类型）→ 约束不满足报错
+// error[E#####]：类型 'Bad' 未实现 interface 'Drawable'（方法 'area' 签名不匹配）
+// ============================================================
+
+interface Drawable {
+    pub func area(self) -> i64
+}
+
+struct Bad {
+    var x: i64 = 0
+}
+namespace Bad {
+    // 返回类型 string，与 interface 要求 i64 不匹配
+    pub func area(self: Bad) -> string {
+        return "x"
+    }
+}
+
+func area_of<T: Drawable>(x: T) -> i64 {
+    return x.area()
+}
+
+func main() {
+    var b = Bad()
+    println(area_of(b))
+}

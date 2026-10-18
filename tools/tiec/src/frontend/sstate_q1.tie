@@ -1,0 +1,1488 @@
+type tie<class>
+// compiler/frontend/sstate_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sstate.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+// 可见性梯度档位（p.9.21.4 II1，L1 选项菜单）：
+//   0 = A1a 全开放（一切符号跨 ns 可见；脚本/无 ns 项目显式降档用）
+//   1 = A1b ns 级私有（默认 = 历史行为：同 ns 或子 ns 可见，跨 ns 需 pub）
+//   2 = A1c 包级（同**顶层包**= 首个 ns 段内互见，含兄弟/父子 ns；跨包需 pub）
+//   3 = A1d 全私有+显式导出（仅精确同 ns 可见，子 ns 不豁免；发行库用）
+// 顶层函数（全名无 ::）在所有档位豁免——脚本友好约束（无 ns 场景零迁移）。
+// driver 经 set_visibility 注入（--visibility=；默认 1 = A1b = 历史行为，
+// 不传旗标的编译逐字节不变）。全局 var 必须在顶层（tie 约束，不可进 ns）。
+var g_vis_level: i64 = 1;
+
+namespace sstate {
+// ==================== 工具：协议解析 ====================
+// 读取协议行字段（空格分隔，返回第 k 个字段字符串；k 从 0）
+pub func pf(line: string, k: i64) -> string {
+    var start: i64 = 0
+    var cur: i64 = 0
+    var n = str_len(line)
+    var i: i64 = 0
+    var seg: i64 = 0
+    while i <= n {
+        var at_end: bool = false
+        if i == n {
+            at_end = true
+        } else {
+            if str_char(line, i) == " " {
+                at_end = true
+            }
+        }
+        if at_end {
+            if seg == k {
+                return str.slice(line, start, i)
+            }
+            seg = seg + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 十进制字符串 → i64（协议字段解析用；支持负号）
+pub func parse_dec(s: string) -> i64 {
+    var n = str_len(s)
+    var v: i64 = 0
+    var neg: bool = false
+    var i: i64 = 0
+    if n > 0 {
+        if str_char(s, 0) == "-" {
+            neg = true
+            i = 1
+        }
+    }
+    while i < n {
+        var cc = char_code(str_char(s, i))
+        if cc >= 48 {
+            if cc <= 57 {
+                v = v * 10 + (cc - 48)
+            }
+        }
+        i = i + 1
+    }
+    if neg {
+        v = 0 - v
+    }
+    return v
+}
+
+// ==================== 工具：协议行单次扫描解析 ====================
+// 整行字段一次字符扫描直接累积为 i64，返回字段值表。字段下标对应协议行：
+//   0=id 1=tag 2=name 3=val 4=aux 5=line 6=col 7=nchild 8..=子节点 id
+// 逐字节等价于原 pf(line,k) + parse_dec 组合：字段以单个空格分隔、全部为
+// 十进制整数（允许负号）。语义对齐 parse_dec——负号仅在字段首字符判定、
+// 字段内非数字字符跳过、空字段累积为 0。
+// 性能动机：原 load_ast/append_ast 每行调用 pf 8+ 次（每次 pf 内部
+// str.slice 生成一个字段子串）再各自 parse_dec 独立扫描，大文件（3000+
+// 节点）反序列化是性能热点；本函数整行单遍扫描、零中间字段子串分配
+// （每行仅一次 str.slice 生成行串本身），把每行的 8+ 次字符串分配降为 0。
+func parse_row(line: string) -> table<i64> {
+    var out: table<i64> = table_new_i64() // 字段值累积表（按出现顺序 push）
+    var n = str_len(line)                 // 行长度（协议行行尾仅 \n，无 \r）
+    var v: i64 = 0                        // 当前字段的十进制累积值
+    var neg: bool = false                 // 当前字段为负数（仅字段首字符判定）
+    var in_field: bool = false            // 已进入字段（防御行内连续空格）
+    var i: i64 = 0
+    while i < n {
+        var ch = str_char(line, i)
+        if ch == " " {
+            // 空格 = 字段分隔符：把已累积的当前字段落盘，并重置字段状态
+            if in_field {
+                if neg {
+                    v = 0 - v
+                }
+                table_push(out, v)
+                v = 0
+                neg = false
+                in_field = false
+            }
+        } else {
+            if !in_field {
+                // 字段首字符：仅此位置判定负号（对齐 parse_dec 的开头负号语义）
+                in_field = true
+                if ch == "-" {
+                    neg = true
+                } else {
+                    var cc = char_code(ch)
+                    if cc >= 48 {
+                        if cc <= 57 {
+                            v = v * 10 + (cc - 48)
+                        }
+                    }
+                }
+            } else {
+                // 字段中间字符：跳过非数字，只累积十进制位（对齐 parse_dec）
+                var cc = char_code(ch)
+                if cc >= 48 {
+                    if cc <= 57 {
+                        v = v * 10 + (cc - 48)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    // 行尾没有空格：把最后一个字段落盘（整行为空时 out 保持空表）
+    if in_field {
+        if neg {
+            v = 0 - v
+        }
+        table_push(out, v)
+    }
+    return out
+}
+
+// 加载 AST 协议文本（首行 N: + 每行 id tag name val aux line col nchild c1...）
+// 重建 9 列全局表。返回 0 成功 / -1 失败。
+pub func load_ast(ast_text: string) -> i64 {
+    // 首行 N:
+    var first_end: i64 = 0
+    var n = str_len(ast_text)
+    var i: i64 = 0
+    while i < n {
+        if str_char(ast_text, i) == "\n" {
+            first_end = i
+            break
+        }
+        i = i + 1
+    }
+    if first_end == 0 {
+        return -1
+    }
+    var head = str.slice(ast_text, 0, first_end)
+    var cnt = parse_dec(str.slice(head, 0, str_len(head) - 1))
+    s_n = cnt
+    // 预分配 9 列（push -1 占位，避免后续超界）
+    s_tags = table_new_i64()
+    s_names = table_new_i64()
+    s_vals = table_new_i64()
+    s_aux = table_new_i64()
+    s_coff = table_new_i64()
+    s_nchild = table_new_i64()
+    s_children = table_new_i64()
+    s_lines = table_new_i64()
+    s_cols = table_new_i64()
+    node_types = table_new_i64()
+    g_cmp_getter = table_new_i64()
+    g_cmp_setter = table_new_i64()
+    var k: i64 = 0
+    while k < cnt {
+        table_push(s_tags, 0)
+        table_push(s_names, 0)
+        table_push(s_vals, 0)
+        table_push(s_aux, 0)
+        table_push(s_coff, 0)
+        table_push(s_nchild, 0)
+        table_push(s_lines, 0)
+        table_push(s_cols, 0)
+        table_push(node_types, -1)
+        table_push(g_cmp_getter, -1)
+        table_push(g_cmp_setter, -1)
+        k = k + 1
+    }
+    // 逐行解析节点（parse_row 整行单次扫描直接累积 i64，零字段子串分配）
+    var pos: i64 = first_end + 1
+    var node_id: i64 = 0
+    while pos < n && node_id < cnt {
+        var line_end: i64 = pos
+        while line_end < n {
+            if str_char(ast_text, line_end) == "\n" {
+                break
+            }
+            line_end = line_end + 1
+        }
+        // 整行字段一次扫描：f[0]=id f[1]=tag f[2]=name f[3]=val
+        // f[4]=aux f[5]=line f[6]=col f[7]=nchild f[8..]=子节点 id
+        var f: table<i64> = parse_row(str.slice(ast_text, pos, line_end))
+        s_tags[node_id] = f[1]
+        s_names[node_id] = f[2]
+        s_vals[node_id] = f[3]
+        s_aux[node_id] = f[4]
+        s_nchild[node_id] = f[7]
+        s_lines[node_id] = f[5]
+        s_cols[node_id] = f[6]
+        node_id = node_id + 1
+        pos = line_end + 1
+    }
+    // 计算子节点偏移并填充 s_children
+    var off: i64 = 0
+    var j: i64 = 0
+    while j < cnt {
+        s_coff[j] = off
+        off = off + s_nchild[j]
+        j = j + 1
+    }
+    // 二次扫描：填充 s_children
+    s_children = table_new_i64()
+    var z: i64 = 0
+    while z < off {
+        table_push(s_children, 0)
+        z = z + 1
+    }
+    pos = first_end + 1
+    node_id = 0
+    while pos < n && node_id < cnt {
+        var line_end: i64 = pos
+        while line_end < n {
+            if str_char(ast_text, line_end) == "\n" {
+                break
+            }
+            line_end = line_end + 1
+        }
+        // 子节点字段从下标 8 起连续排列，直接按 f[8 + c] 取用
+        var f: table<i64> = parse_row(str.slice(ast_text, pos, line_end))
+        var nc = s_nchild[node_id]
+        var base = s_coff[node_id]
+        var c: i64 = 0
+        while c < nc {
+            s_children[base + c] = f[8 + c]
+            c = c + 1
+        }
+        node_id = node_id + 1
+        pos = line_end + 1
+    }
+    return 0
+}
+
+// ==================== import 展开：追加合并 AST ====================
+// 把 import 文件的 AST 协议文本节点追加到当前 s_* 表末尾。
+// 新节点 id 自动 = 原 id + base（当前节点总数）；子节点 id 同步偏移。
+// 返回新节点段起点 base（>=0 成功；-1 失败）——调用方可用
+// base + 新文件节点数 - 1 定位该文件的顶层 StmtList root。
+pub func append_ast(ast_text: string) -> i64 {
+    // 首行 N:
+    var first_end: i64 = 0
+    var n = str_len(ast_text)
+    var i: i64 = 0
+    while i < n {
+        if str_char(ast_text, i) == "\n" {
+            first_end = i
+            break
+        }
+        i = i + 1
+    }
+    if first_end == 0 {
+        return -1
+    }
+    var head = str.slice(ast_text, 0, first_end)
+    var cnt = parse_dec(str.slice(head, 0, str_len(head) - 1))
+    var base = len(s_tags)
+    // 逐行解析节点并追加（子节点先暂存，第二次扫描填偏移）
+    var pos: i64 = first_end + 1
+    var node_id: i64 = 0
+    var new_offs: table<i64> = table_new_i64()
+    while pos < n && node_id < cnt {
+        var line_end: i64 = pos
+        while line_end < n {
+            if str_char(ast_text, line_end) == "\n" {
+                break
+            }
+            line_end = line_end + 1
+        }
+        // 整行字段一次扫描：f[0]=id f[1]=tag f[2]=name f[3]=val
+        // f[4]=aux f[5]=line f[6]=col f[7]=nchild f[8..]=子节点 id
+        var f: table<i64> = parse_row(str.slice(ast_text, pos, line_end))
+        table_push(s_tags, f[1])
+        table_push(s_names, f[2])
+        table_push(s_vals, f[3])
+        table_push(s_aux, f[4])
+        table_push(s_coff, 0)
+        table_push(s_nchild, f[7])
+        table_push(s_lines, f[5])
+        table_push(s_cols, f[6])
+        table_push(node_types, -1)
+        table_push(g_cmp_getter, -1)
+        table_push(g_cmp_setter, -1)
+        table_push(new_offs, 0)
+        node_id = node_id + 1
+        pos = line_end + 1
+    }
+    // 计算新节点子段偏移（相对 s_children 当前末尾）
+    var off = len(s_children)
+    var j: i64 = 0
+    while j < cnt {
+        new_offs[j] = off
+        off = off + s_nchild[base + j]
+        j = j + 1
+    }
+    // 二次扫描：填充子节点（id 偏移 +base，-1 哨兵保持）
+    pos = first_end + 1
+    node_id = 0
+    while pos < n && node_id < cnt {
+        var line_end: i64 = pos
+        while line_end < n {
+            if str_char(ast_text, line_end) == "\n" {
+                break
+            }
+            line_end = line_end + 1
+        }
+        // 子节点字段从下标 8 起连续排列，直接按 f[8 + c] 取用。
+        // N_CASE_BIND 特判（对齐 append_ast_mem / sgen.clone_inner）：
+        // children[1..] 是绑定变量名池 id（裸 intern id，非节点 id）——
+        // 不做 +base 平移，否则被导入/协议合并后 case 载荷绑定查找落空
+        //（E00488，findings §18.2）。
+        var f: table<i64> = parse_row(str.slice(ast_text, pos, line_end))
+        s_coff[base + node_id] = new_offs[node_id]
+        var is_cb = f[1] == N_CASE_BIND
+        var nc = s_nchild[base + node_id]
+        var c: i64 = 0
+        while c < nc {
+            var cid = f[8 + c]
+            if cid >= 0 && !(is_cb && c >= 1) {
+                cid = cid + base
+            }
+            table_push(s_children, cid)
+            c = c + 1
+        }
+        node_id = node_id + 1
+        pos = line_end + 1
+    }
+    s_n = len(s_tags)
+    return base
+}
+
+// ==================== 节点访问辅助 ====================
+pub func nchild(id: i64) -> i64 {
+    return s_nchild[id]
+}
+
+pub func child(id: i64, k: i64) -> i64 {
+    return s_children[s_coff[id] + k]
+}
+
+// p.9.11.22 捕获面白名单辅助：名字 `nm` 是否为**当前正在检查的函数**（g_curfn）
+// 的 `ref` 形参（sig 由调用方传入——用闭包登记时记下的 cl_owner_sig，
+// 因为捕获分析是后置批量做的，全局 g_curfn 那时已不代表该闭包的外层函数）。
+// 依据：形参名只存于声明节点（sg_* 表只有类型/修饰），故经 sg_defnode[g_curfn]
+// 反查声明节点，再逐形参比对名字并读 sp_refs 的 by_ref 标志。
+// 注：闭包体检查期间 g_curfn 仍为**外层函数**签名（闭包体不重设——见
+// scheck_p2 的闭包返回类型走独立栈），故此处判定的正是「外层函数形参」。
+pub func is_ref_param_of(sig: i64, nm: string) -> i64 {
+    if sig < 0 || sig >= len(sg_defnode) {
+        return 0
+    }
+    var fnode = sg_defnode[sig]
+    if fnode < 0 {
+        return 0
+    }
+    var nid = intern.intern(nm)
+    var n = sg_nparams[sig]
+    var off = sg_off[sig]
+    var idx: i64 = 0
+    while idx < n {
+        var poff = slot_off(fnode) + 1 + idx
+        if poff >= nchild(fnode) {
+            return 0
+        }
+        var pnode = child(fnode, poff)
+        if pnode >= 0 && s_names[pnode] == nid {
+            if off + idx < len(sp_refs) && sp_refs[off + idx] == 1 {
+                return 1
+            }
+            return 0
+        }
+        idx = idx + 1
+    }
+    return 0
+}
+
+// 语义期**新建节点**（p.9.11.34 赋值位短闭包引入的通用能力）。
+//
+// 为何需要：语义层此前只能**就地改写**已有节点（如把 BINARY 的 tag 换成 CALL），
+// 无法新增节点——语义表 s_* 是「解析后 AST 的列式镜像」，解析期之外没有把新节点
+// 登记进镜像的路径。凡「语义期才知道要不要展开、且展开需要更多子节点」的消糖
+//（如赋值位 `f = t -> expr` 需从 2 子节点的箭头节点变成 4 子节点的闭包），都必须
+// 有本能力。
+//
+// 实现：向 8 张并行表各追加一项（下标对齐 = 新节点 id），s_coff 先置 0 再由
+// set_children 重设；s_n 递增。**调用方须保证**新节点在语义期已加载完 AST 之后
+// 才创建（否则下标与解析期不一致——实际上 s_* 只在 load_ast 时增长，故安全）。
+pub func new_node_sem(tag: i64, name: i64, val: i64, aux: i64, line: i64, col: i64) -> i64 {
+    table_push(s_tags, tag)
+    table_push(s_names, name)
+    table_push(s_vals, val)
+    table_push(s_aux, aux)
+    table_push(s_coff, 0)
+    table_push(s_nchild, 0)
+    table_push(s_lines, line)
+    table_push(s_cols, col)
+    s_n = s_n + 1
+    return s_n - 1
+}
+
+// 重设节点的 children 段（p.9.11.23 新增）。
+//
+// 为何需要：children 用**扁平段**表示（s_coff 段起点 + s_nchild 段长度），节点创建
+// 时段长即固定。若某处改写需要**更多**子节点（或长度变化），直接 `s_children[coff+k] = x`
+// 会**写到段外**、破坏相邻节点的子节点段——实测症状是极难定位的错值（命名实参
+// 跳默认值时，重排后的槽内容打印全对，但运行时结果无意义）。
+//
+// 手法：把新段**追加**到 s_children 尾部，更新 coff/nchild 指向它；旧段成为垃圾
+//（不回收——编译器一次性构建，且仅对确实需要改长度的调用点发生，量小）。
+// 注意：**调用方须保证新段的首元素语义与旧段一致**（如调用节点的 children[0] 仍需
+// 是泛型槽 -1），因为 sstate.slot_off 依赖首元素判定偏移。
+pub func set_children(node: i64, kids: table<i64>) {
+    var off = len(s_children)
+    var i: i64 = 0
+    while i < len(kids) {
+        table_push(s_children, kids[i])
+        i = i + 1
+    }
+    s_coff[node] = off
+    s_nchild[node] = len(kids)
+}
+
+pub func name_str(id: i64) -> string {
+    var nid = s_names[id]
+    if nid < 0 {
+        return ""
+    }
+    return intern.lookup(nid)
+}
+
+// ==================== immut 只读形参集合（p.9.11.11） ====================
+// 每函数（scheck.check_fn）重置——清空集合；check_fn 参数循环对 immut 形参
+// 逐一 im_insert 登记其变量名池 id。赋值/自增自减/字段&下标写经 im_is 拒绝。
+pub func im_reset() {
+    g_im_keys = table_new_i64()
+    g_im_vals = table_new_i64()
+}
+
+pub func im_insert(nid: i64) {
+    var i: i64 = 0
+    while i < len(g_im_keys) {
+        if g_im_keys[i] == nid {
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_im_keys, nid)
+    table_push(g_im_vals, 1)
+}
+
+pub func im_is(nid: i64) -> bool {
+    var i: i64 = 0
+    while i < len(g_im_keys) {
+        if g_im_keys[i] == nid {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 名字池 id → 字符串（im_root 返回的是名字池 id，非节点 id；name_str 只接受节点 id）
+pub func im_name(nid: i64) -> string {
+    if nid < 0 {
+        return ""
+    }
+    return intern.lookup(nid)
+}
+
+// ==================== 全部按值形参集合（r.1.6.10，W00031 用） ====================
+// 与 immut 集合同构但用途不同：immut 用于**禁写**（主检查路径拒绝），本集合用于
+// 「按值形参的字段改不到调用方」**告警**（警告 pass）。每函数 check_fn 重置；
+// 参数循环对所有形参（不论 immut）逐一 vp_insert。
+//
+// 为什么单列而不复用 im_*：immut 形参在主检查路径已被拒绝（写它直接报错），
+// 走到告警 pass 的只有**非 immut** 的普通按值形参——正是本告警的目标。
+pub func vp_reset() {
+    g_vp_keys = table_new_i64()
+}
+
+pub func vp_insert(nid: i64) {
+    var i: i64 = 0
+    while i < len(g_vp_keys) {
+        if g_vp_keys[i] == nid {
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_vp_keys, nid)
+}
+
+// nid 是否为当前函数的按值形参（名字池 id）
+pub func vp_is(nid: i64) -> bool {
+    if nid < 0 {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(g_vp_keys) {
+        if g_vp_keys[i] == nid {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ============ 不可观测写入目标集合（规范 §13.1）============
+// 登记对象：非 ref / 非 shared / 非 move 的**表**形参——它们的直接写入只改
+// 本函数副本（irgen 入口 retain ⇒ rc≥2 ⇒ 写时复制分离），调用方永不观察。
+// 与 irgen r.1.6.14 retain 条件同源；move 形参被调方已取得所有权，其写入是
+// 对自己值的正常使用，不登记。
+pub func uwt_reset() {
+    g_uwt_keys = table_new_i64()
+}
+
+pub func uwt_insert(nid: i64) {
+    var i: i64 = 0
+    while i < len(g_uwt_keys) {
+        if g_uwt_keys[i] == nid {
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_uwt_keys, nid)
+}
+
+// nid 是否为当前函数的「按值表形参」（不可观测写入的目标）
+pub func uwt_is(nid: i64) -> bool {
+    if nid < 0 {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(g_uwt_keys) {
+        if g_uwt_keys[i] == nid {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 取赋值目标链的根变量名池 id：从 base 沿 child(0) 上行，遇 S_N_VAR 返回其名；
+// 非纯变量/字段/索引链（S_N_UNARY/方法返回值等）返回 -1（不判定 immut）。
+pub func im_root(base: i64) -> i64 {
+    if base < 0 {
+        return -1
+    }
+    var cur = base
+    var guard: i64 = 0
+    while guard < 64 {
+        var t = s_tags[cur]
+        if t == S_N_VAR {
+            return s_names[cur]
+        }
+        if t == S_N_FIELD_ACCESS || t == S_N_INDEX || t == S_N_TUPLE_FIELD {
+            if s_nchild[cur] > 0 {
+                cur = s_children[s_coff[cur]]
+            } else {
+                return -1
+            }
+        } else {
+            return -1
+        }
+        guard = guard + 1
+    }
+    return -1
+}
+
+// 泛型槽偏移判定（2026-08-14 泛型语法布局，权威约定见 ast.tie 头部注释）：
+// 返回 1 表示 children 头部有「泛型槽/类型实参槽」——children[0] == -1 哨兵
+// （非泛型但槽仍占位）或 children[0] 是 N_TYPE_PARAMS / N_TYPE_ARGS 节点。
+// 消费方读取「返回类型 / 第 i 个参数 / 第 i 个字段 / 第 i 个实参 / 接收者」
+// 等位置时必须 +1 偏移。适用节点：FnDef / Struct（N_TYPE_PARAMS 槽）、
+// Call / MethodCall / StructType（N_TYPE_ARGS 槽）——T1 起这些节点恒有槽，
+// 故对它们恒返回 1。无子节点（nchild==0）或首子节点非槽 → 0。
+pub func slot_off(node: i64) -> i64 {
+    if s_nchild[node] <= 0 {
+        return 0
+    }
+    var c0 = s_children[s_coff[node]]
+    if c0 < 0 {
+        return 1  // -1 哨兵：泛型槽存在但为空
+    }
+    var t0 = s_tags[c0]
+    if t0 == S_N_TYPE_PARAMS || t0 == S_N_TYPE_ARGS {
+        return 1
+    }
+    return 0
+}
+
+// ==================== r.1.6.7 凭据层级与撤销（unsafe.revoke） ====================
+// 凭据是纯编译期概念（guard<cap> 无运行时表示），故撤销也完全是语义层的事：
+// 登记派生关系 + 标记失效集合 + 使用点诊断。
+// 撤销是**流敏感**的（语句按序检查，撤销点之后的才失效）且**单调**的（不回生）。
+
+// 登记派生关系：`var sub = g.delegate(cap)` ⇒ (sub → g)。
+pub func gr_add(child: i64, parent: i64) {
+    table_push(gr_rel, child)
+    table_push(gr_rel, parent)
+}
+
+// 该凭据是否已失效（自身被撤销，或**传递**祖先被撤销）。
+pub func gr_is_dead(nid: i64) -> bool {
+    var i: i64 = 0
+    while i < len(gr_dead) {
+        if gr_dead[i] == nid {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 标记单个凭据失效；返回 1 = 本次新标记，0 = 本想已失效。
+func gr_kill_one(nid: i64) -> i64 {
+    if gr_is_dead(nid) {
+        return 0
+    }
+    table_push(gr_dead, nid)
+    return 1
+}
+
+// 撤销凭据：自身与其**传递**派生出的凭据一并失效。
+// 只对「本次新标记」的节点继续向下传播 ⇒ 即使派生关系成环也不会死循环。
+pub func gr_revoke(nid: i64) {
+    if gr_kill_one(nid) == 0 {
+        return
+    }
+    var i: i64 = 0
+    while i + 1 < len(gr_rel) {
+        if gr_rel[i + 1] == nid {
+            gr_revoke(gr_rel[i])
+        }
+        i = i + 2
+    }
+}
+
+// 函数边界重置。挂在 lv_moved_reset 内（见该函数）——凭据状态与 moved 状态
+// 同属函数级语义状态，生命周期完全一致，故共用同一个重置点，不另开调用链。
+pub func gr_reset() {
+    gr_rel = []
+    gr_dead = []
+}
+
+// ==================== 能力域位集：函数级 / 文件级（2026-10-01 泛化） ====================
+// 域位：0=share 1=mem 2=ext 3=lock 4=raw（与 types.guard_cap_index 同序）。
+// 锁位单列常量，供 irgen 的「持 lock ⇒ 去锁」判定直接用。
+const CAP_LOCK_BIT: i64 = 8;   // 1 << 3
+
+// parser 侧登记（记**本模块局部 id**，待装载后由 cap_apply_file 提交）。
+pub func imp_cap_put(local_id: i64, bits: i64) {
+    if bits == 0 {
+        return
+    }
+    table_push(s_imp_cap_nodes, local_id)
+    table_push(s_imp_cap_vals, bits)
+}
+
+// 装载完成后按文件基址提交域信息（主文件 from_nid = 0；import 模块 = g_file_base[k]）。
+// 做两件事：
+//   ① 把本模块**每个** FnDef 登记为「持该文件的文件级授权域」；
+//   ② 把 parser 侧记下的函数级属性（局部 id）平移 from_nid 后登记。
+// 之所以放在装载**之后**而不是 parser 里：只有装载完成才知道本模块的基址，
+// 而 parser 无法预知（import 的基址由 append 决定）。
+pub func cap_apply_file(from_nid: i64) {
+    // ① 文件级授权 → 本模块所有函数
+    var fc = s_file_caps
+    var uc = s_file_uctx
+    var i: i64 = from_nid
+    if from_nid >= 0 {
+        while i < len(s_tags) {
+            if s_tags[i] == 101 {   // S_N_FN_DEF
+                if fc != 0 {
+                    fn_cap_put(i, fc)
+                }
+                // 2026-10-07：文件级 unsafe 上下文同样落到**本模块**的每个函数上。
+                // 范围由此天然精确 —— 不继承父模块、也不扩散给子模块（规范 §11.6）。
+                if uc != 0 {
+                    fn_uctx_put(i, 1)
+                }
+            }
+            i = i + 1
+        }
+    }
+    // ② 函数级属性（parser 侧局部 id → 全局 id）
+    var j: i64 = 0
+    while j < len(s_imp_cap_nodes) {
+        fn_cap_put(from_nid + s_imp_cap_nodes[j], s_imp_cap_vals[j])
+        fn_attr_put(from_nid + s_imp_cap_nodes[j], s_imp_cap_vals[j])
+        j = j + 1
+    }
+    s_imp_cap_nodes = []
+    s_imp_cap_vals = []
+    // ③ W00030：记本模块的文件级授权位集（按模块序号），供文件粒度挂空判定。
+    //    模块序号 = file_id_of_node(base)。表按需增长（模块装载顺序 = 序号顺序）。
+    var fi = file_id_of_node(from_nid)
+    while len(g_file_idle_auth) <= fi {
+        table_push(g_file_idle_auth, 0)
+        table_push(g_file_idle_used, 0)
+    }
+    g_file_idle_auth[fi] = g_file_idle_auth[fi] | fc
+}
+
+// 函数级**属性**位集（`#[unsafe.域]`）单独登记 —— 与 fn_caps 的合并表分开，
+// 供 W00030 逐函数挂空判定用（文件级授权按文件粒度另判，见 cap_apply_file ③）。
+pub func fn_attr_put(nid: i64, bits: i64) {
+    if bits == 0 {
+        return
+    }
+    var i: i64 = 0
+    while i < len(s_fn_attr_nodes) {
+        if s_fn_attr_nodes[i] == nid {
+            s_fn_attr_vals[i] = s_fn_attr_vals[i] | bits
+            return
+        }
+        i = i + 1
+    }
+    table_push(s_fn_attr_nodes, nid)
+    table_push(s_fn_attr_vals, bits)
+}
+
+pub func fn_attr_caps(nid: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(s_fn_attr_nodes) {
+        if s_fn_attr_nodes[i] == nid {
+            return s_fn_attr_vals[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 登记函数的域位集（叠加：同一函数可因文件级 + 属性同时持多域）。
+pub func fn_cap_put(nid: i64, bits: i64) {
+    if bits == 0 {
+        return
+    }
+    var i: i64 = 0
+    while i < len(s_fn_cap_nodes) {
+        if s_fn_cap_nodes[i] == nid {
+            s_fn_cap_vals[i] = s_fn_cap_vals[i] | bits
+            return
+        }
+        i = i + 1
+    }
+    table_push(s_fn_cap_nodes, nid)
+    table_push(s_fn_cap_vals, bits)
+}
+
+// 查询：该函数持哪些域（位集；未登记 = 0）。
+pub func fn_caps(nid: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(s_fn_cap_nodes) {
+        if s_fn_cap_nodes[i] == nid {
+            return s_fn_cap_vals[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 该函数是否持 lock 域（irgen 去锁判定用）。
+pub func lock_fn_is(nid: i64) -> bool {
+    return (fn_caps(nid) & CAP_LOCK_BIT) != 0
+}
+
+// 每次解析前重置（跨编译单元不串用）。
+pub func fn_cap_reset() {
+    s_fn_cap_nodes = []
+    s_fn_cap_vals = []
+    s_file_caps = 0
+    s_fn_uctx_nodes = []
+    s_fn_uctx_vals = []
+    s_file_uctx = 0
+}
+
+// 本文件是否声明裸 `unsafe`（文件级不安全上下文，规范 §11.6）。
+pub func set_file_uctx(v: i64) {
+    s_file_uctx = v
+}
+
+pub func file_uctx() -> i64 {
+    return s_file_uctx
+}
+
+// 函数是否处于「文件级 unsafe 上下文」（由 cap_apply_file 按模块登记）。
+pub func fn_uctx_put(nid: i64, v: i64) {
+    if v == 0 {
+        return
+    }
+    var i: i64 = 0
+    while i < len(s_fn_uctx_nodes) {
+        if s_fn_uctx_nodes[i] == nid {
+            s_fn_uctx_vals[i] = 1
+            return
+        }
+        i = i + 1
+    }
+    table_push(s_fn_uctx_nodes, nid)
+    table_push(s_fn_uctx_vals, 1)
+}
+
+pub func fn_uctx(nid: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(s_fn_uctx_nodes) {
+        if s_fn_uctx_nodes[i] == nid {
+            return s_fn_uctx_vals[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 从**源码头部**取「是否声明裸 `unsafe`」（与 scan_file_caps 平行：同样只看
+// 前 20 行、遇首个非空非声明行即停）。供 import 逐模块设置上下文用。
+pub func scan_file_unsafe(src: string) -> i64 {
+    var n = str_len(src)
+    var pos: i64 = 0
+    var line_no: i64 = 1
+    var out: i64 = 0
+    var done: bool = false
+    while pos < n && line_no <= 20 && !done {
+        var ln_e = pos
+        while ln_e < n && str_char(src, ln_e) != "\n" {
+            ln_e = ln_e + 1
+        }
+        var ln = trim(str.slice(src, pos, ln_e))
+        if str_len(ln) > 0 {
+            if has_prefix(str.clone(ln), "type tie") {
+                var lt = find_char(str.clone(ln), "<")
+                var gt = find_char(str.clone(ln), ">")
+                if lt >= 0 && gt > lt {
+                    var inner = slice(str.clone(ln), lt + 1, gt)
+                    var parts = split_char(inner, ",")
+                    var i: i64 = 0
+                    while i < len(parts) {
+                        // 只认**恰好** `unsafe` 的项；`unsafe:域` 是另一回事（域凭据，
+                        // 由 scan_file_caps 负责），两者可同时出现。
+                        if trim(parts[i]) == "unsafe" {
+                            out = 1
+                        }
+                        i = i + 1
+                    }
+                }
+                done = true
+            } else {
+                done = true
+            }
+        }
+        pos = ln_e + 1
+        line_no = line_no + 1
+    }
+    return out
+}
+
+// 设置「本文件获授权的域位集」（driver 调 parse_ast 前按头部角色声明调用）。
+// 设置当前**正在解析的那个文件**的域位集。
+// 只赋值、不清空函数表 —— 因为 import 展开会**逐模块**切换它（切到被导入文件的
+// 授权、扫完还原），清空会把主文件已登记的函数级属性抹掉。
+// 函数表的清空由 fn_cap_reset 在**编译单元起点**显式做。
+pub func set_file_caps(v: i64) {
+    s_file_caps = v
+}
+
+// 从**源码头部**取 `unsafe:<域>` 授权位集（供 import 逐模块授权用）。
+// 为什么不复用 driver 的角色注册表：frontend 不能反向依赖 driver（driver 已
+// import frontend，再反向就成环）。故此处只做**一件事**——认出头部
+// `type tie<角色, unsafe:X, ...>` 里的 `unsafe:X` 段并折算成位集；其余角色语义
+// （基础角色、参数、修饰白名单）仍由 driver 的角色机负责，两边职责不重叠。
+// 扫描口径与 driver.scan_header 一致：只看前 20 行，遇第一个非空非声明行即停。
+pub func scan_file_caps(src: string) -> i64 {
+    var n = str_len(src)
+    var pos: i64 = 0
+    var line_no: i64 = 1
+    var out: i64 = 0
+    var done: bool = false
+    while pos < n && line_no <= 20 && !done {
+        var ln_e = pos
+        while ln_e < n && str_char(src, ln_e) != "\n" {
+            ln_e = ln_e + 1
+        }
+        var ln = trim(str.slice(src, pos, ln_e))
+        if str_len(ln) > 0 {
+            if has_prefix(str.clone(ln), "type tie") {
+                // 取尖括号内的角色列表
+                var lt = find_char(str.clone(ln), "<")
+                var gt = find_char(str.clone(ln), ">")
+                if lt >= 0 && gt > lt {
+                    var inner = slice(str.clone(ln), lt + 1, gt)
+                    var parts = split_char(inner, ",")
+                    var i: i64 = 0
+                    while i < len(parts) {
+                        var it = trim(parts[i])
+                        if has_prefix(str.clone(it), "unsafe:") && str_len(it) > 7 {
+                            out = out | types.cap_bit_of(slice(str.clone(it), 7, str_len(it)))
+                        }
+                        i = i + 1
+                    }
+                }
+                done = true
+            } else {
+                done = true   // 头部区结束（首个非空非声明行）
+            }
+        }
+        pos = ln_e + 1
+        line_no = line_no + 1
+    }
+    return out
+}
+
+// 编译单元起点调用：清空函数级域表与文件级位集，避免同一进程连续编译多个文件时
+// 旧节点 id 残留（节点池 id 在新 AST 里会重用 ⇒ 会串到新文件的函数上）。
+pub func compile_unit_reset() {
+    s_fn_cap_nodes = []
+    s_fn_cap_vals = []
+    s_file_caps = 0
+    s_fn_uctx_nodes = []
+    s_fn_uctx_vals = []
+    s_file_uctx = 0
+    // ===== 单元级累加器（2026-10-18，常驻编译服务）=====
+    // **位置纪律**：这些表必须在本函数（真正的一次性单元边界，parser 之前）清，
+    // 不能放 reset_sem_state —— 后者在 parser 之后被 check_ast/check_impl 调用，
+    // 清掉 s_imp_cap_* / 注解 / doc 注释这些「parser → 语义」的交接表会把它们
+    // 抹掉（实测 cred_idle_probe 的 #[unsafe.ext] 丢失 ⇒ 假 E00719）。
+    // 一次性 CLI 每进程只编一个单元，清不清都看不出差别；长驻复用不清则跨单元串状态：
+    // 上一单元的 spawn 点/actor 登记/警告行号挂到本单元的节点 id 上（假 E00903、
+    // `irgen 未支持的表达式 tag=…`）。
+    // 对齐纪律：今后新增「单元级累加」表，挂到这里。
+    // ===== 常驻复用（--serve-compile 的 op=2 请求）：**单元级累加器**补齐 =====
+    // 背景：check_impl 入口就会调本函数，但下列表此前**没人清**——一次性 CLI
+    // 每进程只分析一个单元，永远看不出来；常驻服务里它们跨单元存活，症状是
+    // 「上一个单元的 spawn 点/actor 登记/警告行号 挂到本单元的 AST 节点 id 上」：
+    // 实测 149 个语言用例连编时出现假 E00903（行号指向本文件第 9 行）与
+    // `irgen 未支持的表达式（tag=…）`（旧节点的 tag 撞进本单元节点空间）。
+    // 对齐纪律：今后新增「单元级累加」的全局表，必须同时挂到这里。
+    cl_grefs = table_new_i64()
+    g_spawn_nodes = table_new_i64()
+    g_spawn_args = table_new_i64()
+    g_spawn_caps = table_new_i64()
+    g_spawn_unsafe = table_new_i64()
+    g_spawn_force = table_new_i64()
+    // actor 表（ac_*：方法/字段段式登记，索引与 types.BASE_ACTOR 行号对应）
+    ac_keys = table_new_i64()
+    ac_vals = table_new_i64()
+    ac_mnames = table_new_i64()
+    ac_fnames = table_new_i64()
+    ac_mpar = table_new_i64()
+    ac_mptys = table_new_i64()
+    ac_mret = table_new_i64()
+    ac_mrets = table_new_i64()
+    ac_fdefs = table_new_i64()
+    ac_ftys = table_new_i64()
+    ac_masync = table_new_i64()
+    ac_mreent = table_new_i64()
+    ac_mn = table_new_i64()
+    ac_fncnt = table_new_i64()
+    ac_foffs = table_new_i64()
+    ac_ftyoff = table_new_i64()
+    ac_fvoff = table_new_i64()
+    ac_moff = table_new_i64()
+    ac_mnpars = table_new_i64()
+    ac_paroff = table_new_i64()
+    ac_fnoff = table_new_i64()
+    // struct 形状/表示类、泛型登记、move 分析、属性与凭据登记
+    struct_tys = table_new_i64()
+    st_reprc = table_new_i64()
+    gtyp_kinds = table_new_i64()
+    gtyp_kindoff = table_new_i64()
+    gval_kkeys = table_new_i64()
+    gval_kvals = table_new_i64()
+    lv_moved = table_new_i64()
+    g_uwt_keys = table_new_i64()
+    g_vp_keys = table_new_i64()
+    gen_marks = table_new_i64()
+    gr_dead = table_new_i64()
+    gr_rel = table_new_i64()
+    s_fn_attr_nodes = table_new_i64()
+    s_fn_attr_vals = table_new_i64()
+    s_fn_cap_nodes = table_new_i64()
+    s_fn_cap_vals = table_new_i64()
+    s_fn_uctx_nodes = table_new_i64()
+    s_fn_uctx_vals = table_new_i64()
+    s_imp_cap_nodes = table_new_i64()
+    s_imp_cap_vals = table_new_i64()
+    g_im_keys = table_new_i64()
+    g_im_vals = table_new_i64()
+    // 警告 pass 的行号/位置累加（w16 未修改绑定、w19 越界常量下标）
+    // goto 标签/块表（scheck 侧登记）
+    g_cmp_getter = table_new_i64()
+    g_cmp_setter = table_new_i64()
+    // 注解 / doc 注释登记
+    // 文件级登记（import 展开 / idle 凭据 / 命名空间改名）
+    g_file_idle_auth = table_new_i64()
+    g_file_idle_used = table_new_i64()
+    g_file_stem = table_new_string()
+    g_ns_rename_old = table_new_string()
+    g_ns_rename_new = table_new_string()
+    g_extra_tops = table_new_i64()
+    g_imported = table_new_string()
+    g_file_roots = table_new_i64()
+    g_imp_alias_names = table_new_string()
+    g_imp_alias_paths = table_new_string()
+    tre_bi_vals = table_new_i64()
+    fld_defs = table_new_i64()
+}
+
+// 本文件获授权的域位集。
+pub func file_caps() -> i64 {
+    return s_file_caps
+}
+
+// ==================== 可寻址与可见性辅助 ====================
+// P8 可寻址判定（对齐 Rust is_addressable_expr）：只有变量或字段访问链可寻址。
+pub func is_addressable(id: i64) -> bool {
+    var tag = s_tags[id]
+    if tag == 6 {
+        return true
+    }
+    if tag == 15 {
+        return is_addressable(child(id, 0))
+    }
+    return false
+}
+
+// 字符串前缀判定（s 是否以 pre 开头）
+pub func has_prefix_str(s: string, pre: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(pre)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 查找最后一个 "::" 的位置（命名空间分隔；返回 ':' 下标，-1 = 无）
+// ---------- 别名改名映射（2026-10-12「增名不除名」缺陷修复） ----------
+// 别名把被导入库的顶层命名空间改名（内联模型 M2.1.7）；同单元的其他消费方
+// （如 datetime 内部裸引 time.now()）会因此断链。此处登记 旧名→新名，
+// 解析未命中时回退把旧名替换为新名再试——旧名与别名同时可解析。
+pub func ns_rename_reset() {
+    g_ns_rename_old = table_new_string()
+    g_ns_rename_new = table_new_string()
+}
+
+pub func ns_rename_add(old_nm: string, new_nm: string) {
+    if str_len(old_nm) == 0 || str_len(new_nm) == 0 || old_nm == new_nm {
+        return
+    }
+    table_push(g_ns_rename_old, old_nm)
+    table_push(g_ns_rename_new, new_nm)
+}
+
+// 旧名 → 新名（无映射返回 ""）
+pub func ns_rename_target(nm: string) -> string {
+    var i: i64 = 0
+    while i < len(g_ns_rename_old) {
+        if g_ns_rename_old[i] == nm {
+            return g_ns_rename_new[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 导入路径 → 文件名词干（末段去 ".tie"；无后缀返回原末段）。顶层限定用。
+pub func stem_of_path(path: string) -> string {
+    var n = len(path)
+    var a: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var c = str_byte(path, i)
+        if c == 47 || c == 92 {
+            a = i + 1
+        }
+        i = i + 1
+    }
+    var e = n
+    if n - a > 4 && str_byte(path, n - 4) == 46 && str_byte(path, n - 3) == 116 &&
+        str_byte(path, n - 2) == 105 && str_byte(path, n - 1) == 101 {
+        e = n - 4
+    }
+    var sb = string_builder()
+    var j = a
+    while j < e {
+        sb_append_byte(sb, str_byte(path, j))
+        j = j + 1
+    }
+    return sb_build(sb)
+}
+
+pub func rfind_ns(s: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    var last: i64 = -1
+    while i + 1 < n {
+        if str_char(s, i) == ":" {
+            if str_char(s, i + 1) == ":" {
+                last = i
+            }
+        }
+        i = i + 1
+    }
+    return last
+}
+
+// 可见性梯度档位（p.9.21.4 II1，L1 选项菜单）：
+pub func set_visibility(level: i64) {
+    if level >= 0 && level <= 3 {
+        g_vis_level = level
+    }
+}
+
+// 首个 ns 段（A1c 包级判定用）；无段返回原串
+func first_ns_seg(s: string) -> string {
+    var p = find_ns_sep(s)
+    if p < 0 {
+        return s
+    }
+    return str.slice(s, 0, p)
+}
+
+func find_ns_sep(s: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i + 1 < n {
+        if str.slice(s, i, i + 2) == "::" {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 私有函数可见性校验（对齐 Rust check_visibility，M2.1.7）：
+// 返回 0 = 可见 / -1 = 私有拦截（sm_err_* 已置）。
+// 梯度（L1 选项菜单，档位见 g_vis_level 注释）：
+//   显式 pub 恒放行；顶层函数恒放行；其后按档位收缩可见范围——
+//   A1a 全开放 / A1b 同 ns+子 ns / A1c 同顶层包 / A1d 仅精确同 ns。
+pub func check_visibility(full_name: string, sig: i64, call_node: i64) -> i64 {
+    // S1.2：sg_pub 复用为标志位（bit0=pub, bit1=unsafe）
+    if (sg_pub[sig] & 1) == 1 {
+        return 0
+    }
+    if g_vis_level == 0 {
+        return 0
+    }
+    var last = rfind_ns(full_name)
+    if last < 0 {
+        // 单态化/改名产物（`$` 混合名）豁免：其声明节点由编译器生成，文件
+        // 归属为生成点而非模板源文件——源级调用在模板处已按可见性把关。
+        var has_ds: i64 = 0
+        var dsi: i64 = 0
+        var dsn = str_len(full_name)
+        while dsi < dsn {
+            if str_char(full_name, dsi) == "$" {
+                has_ds = 1
+                dsi = dsn
+            } else {
+                dsi = dsi + 1
+            }
+        }
+        if has_ds == 1 {
+            return 0
+        }
+        // 顶层函数（2026-10-12 收紧，规范 §9.3 的承诺落地）：同一文件内照旧；
+        // **跨文件调用须 pub**，否则默认私有不可见。extern 声明豁免（跨文件
+        // 链接本就依靠它）；无法定位声明者（内建等）豁免。
+        // 审计模式 TIE_VIS_AUDIT=1 只列不拦（存量普查用）。
+        var dfn = fn_def_node(full_name)
+        if dfn < 0 || s_tags[dfn] == S_N_EXTERN {
+            return 0
+        }
+        var fdecl = file_id_of_node(dfn)
+        var fcall = file_id_of_node(call_node)
+        if fdecl < 0 || fcall < 0 || fdecl == fcall {
+            return 0
+        }
+        if get_env("TIE_VIS_AUDIT") == "1" {
+            println("vis-audit: " + full_name + "（声明文件 " + to_string(fdecl) + " → 调用文件 " + to_string(fcall) + "）")
+            return 0
+        }
+        sm_err_line = s_lines[call_node]
+        sm_err_col = s_cols[call_node]
+        sm_err_msg = "函数 '" + full_name + "' 是文件级私有函数（默认私有，`pub func` 显式导出），不可跨文件调用"
+        return -1
+    }
+    var prefix = str.slice(full_name, 0, last)
+    var cur = cur_ns_prefix()
+    if cur == prefix {
+        return 0
+    }
+    if has_prefix_str(cur, prefix + "::") {
+        if g_vis_level <= 2 {
+            return 0
+        }
+        // A1d：子 ns 不豁免，落到拦截
+    } else if g_vis_level == 2 {
+        // A1c 包级：同顶层包（首个 ns 段相同）即互见
+        if first_ns_seg(cur) == first_ns_seg(prefix) {
+            return 0
+        }
+    }
+    sm_err_line = s_lines[call_node]
+    sm_err_col = s_cols[call_node]
+    sm_err_msg = "函数 '" + full_name + "' 是命名空间 '" + prefix + "' 的私有函数（默认私有，`pub func` 显式导出），不可在命名空间之外调用"
+    return -1
+}
+
+// ns 常量可见性（A2b：常量可见性跟随 L1 梯度，p.9.21.5 II2）：
+// 返回 0 = 可见 / -1 = 拦截（sm_err_* 已置）。pub 位读 gb_const 槽 bit1
+// （collect_global_var 编码）；顶层常量（全名无 ::）豁免；档位语义与
+// check_visibility 完全一致（A1a 全开放 / A1b 同 ns+子 ns / A1c 同顶层包 /
+// A1d 仅精确同 ns）。
+pub func check_const_visibility_nid(nid: i64, node: i64) -> i64 {
+    var idx = bs_find(gb_keys, nid)
+    if idx < 0 {
+        return 0
+    }
+    if (gb_const[idx] & 2) == 2 {
+        return 0
+    }
+    if g_vis_level == 0 {
+        return 0
+    }
+    var full_name = intern.lookup(nid)
+    var last = rfind_ns(full_name)
+    if last < 0 {
+        // 顶层全局/常量（2026-10-13 收紧，与函数同制度）：同一文件内照旧；
+        // 跨文件引用须 pub。声明文件 = gb_module（行下标 → 来源文件 id）。
+        // 审计模式 TIE_VIS_AUDIT=1 只列不拦（存量普查用）。
+        var df = gb_module(idx)
+        var cf = file_id_of_node(node)
+        if df < 0 || cf < 0 || df == cf {
+            return 0
+        }
+        if get_env("TIE_VIS_AUDIT") == "1" {
+            println("vis-audit-global: " + full_name)
+            return 0
+        }
+        sm_err_line = s_lines[node]
+        sm_err_col = s_cols[node]
+        sm_err_msg = "全局 '" + full_name + "' 是文件级私有（默认私有，pub 前缀显式导出），不可跨文件引用"
+        return -1
+    }
+    var prefix = str.slice(full_name, 0, last)
+    var cur = cur_ns_prefix()
+    if cur == prefix {
+        return 0
+    }
+    if has_prefix_str(cur, prefix + "::") {
+        if g_vis_level <= 2 {
+            return 0
+        }
+        // A1d：子 ns 不豁免，落到拦截
+    } else if g_vis_level == 2 {
+        if first_ns_seg(cur) == first_ns_seg(prefix) {
+            return 0
+        }
+    }
+    sm_err_line = s_lines[node]
+    sm_err_col = s_cols[node]
+    sm_err_msg = "常量 '" + full_name + "' 是命名空间 '" + prefix + "' 的私有常量（默认私有，`pub const` 显式导出），不可在命名空间之外引用"
+    return -1
+}
+
+// 当前函数命名空间前缀（可见性校验用）
+pub func cur_ns_prefix() -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < ns_top {
+        if i > 0 {
+            out = out + "::"
+        }
+        out = out + intern.lookup(ns_stack[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ==================== 符号表（并行排序表 + 二分）====================
+// 二分查找升序 keys，返回下标或 -1
+pub func bs_find(keys: table<i64>, k: i64) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        var kv = keys[mid]
+        if kv == k {
+            return mid
+        }
+        if kv < k {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// ==================== S2.2 闭包：扁平段内线性查找 ====================
+// 闭包语义状态表的参数名段/局部名段/捕获名段都是「声明/登记顺序」扁平段
+// （非升序，不能用 bs_find）。段内成员判定用线性扫（段通常很小：闭包参数
+// 数、局部数、捕获数都有限）。off = 段起始下标，n = 段长度，k = 目标名 id。
+// 返回 1 = 在段内，0 = 不在。
+pub func seg_has(seg: table<i64>, off: i64, n: i64, k: i64) -> i64 {
+    var i: i64 = 0
+    while i < n {
+        if seg[off + i] == k {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 重置 moved 状态（每函数开始时调用）
+pub func lv_moved_reset() {
+    lv_moved = table_new_i64()
+    // r.1.6.7：凭据层级/撤销状态与 moved 状态同属函数级语义状态，生命周期一致，
+    // 故共用本重置点（所有既有 moved 重置调用处自动覆盖，无需另开调用链）。
+    gr_reset()
+}
+
+// 标记变量为 moved（有序插入；重复标记幂等）
+pub func lv_moved_mark(nid: i64) {
+    if bs_find(lv_moved, nid) >= 0 {
+        return
+    }
+    var n = len(lv_moved)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if lv_moved[mid] < nid {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    table_push(lv_moved, 0)
+    var i: i64 = n
+    while i > pos {
+        lv_moved[i] = lv_moved[i - 1]
+        i = i - 1
+    }
+    lv_moved[pos] = nid
+}
+
+// 变量是否已移动（1=moved / 0=live）
+pub func lv_moved_is(nid: i64) -> i64 {
+    if bs_find(lv_moved, nid) >= 0 {
+        return 1
+    }
+    return 0
+}
+
+// 清除单个变量的 moved 标记（重新赋值后变量恢复 live）。
+// tie 表无法物理截断，直接重建表（每函数 moved 量极小，成本可忽略）。
+pub func lv_moved_unmark(nid: i64) {
+    var idx = bs_find(lv_moved, nid)
+    if idx < 0 {
+        return
+    }
+    var rebuild = table_new_i64()
+    var n = len(lv_moved)
+    var j: i64 = 0
+    while j < n {
+        if lv_moved[j] != nid {
+            table_push(rebuild, lv_moved[j])
+        }
+        j = j + 1
+    }
+    lv_moved = rebuild
+}
+
+// 快照当前 moved 状态（深拷贝独立表）。分支检查用：保存分支入口状态，
+// 分支结束用 lv_moved_restore 恢复——分支内 return/赋值触发的移动标记
+// **不泄漏到分支外**（分支互斥路径，如 `if m == 0 { return s }` 后 s 仍 live）。
+// std/compiler 迁移关键：无分支敏感时此类合法模式被误报 use-of-moved。
+pub func lv_moved_snap() -> table<i64> {
+    var snap = table_new_i64()
+    var n = len(lv_moved)
+    var i: i64 = 0
+    while i < n {
+        table_push(snap, lv_moved[i])
+        i = i + 1
+    }
+    return snap
+}
+
+// 恢复 moved 状态（深拷贝重建独立表，避免与快照共享底层数组）。
+pub func lv_moved_restore(snap: table<i64>) {
+    var rebuild = table_new_i64()
+    var n = len(snap)
+    var j: i64 = 0
+    while j < n {
+        table_push(rebuild, snap[j])
+        j = j + 1
+    }
+    lv_moved = rebuild
+}
+
+// 有序插入 keys（返回插入位置），vals 并行同步插入
+pub func sorted_insert(ref keys: table<i64>, ref vals: table<i64>, k: i64, v: i64) -> i64 {
+    var n = len(keys)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if keys[mid] < k {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    table_push(keys, 0)
+    table_push(vals, 0)
+    var i: i64 = n
+    while i > pos {
+        keys[i] = keys[i - 1]
+        vals[i] = vals[i - 1]
+        i = i - 1
+    }
+    keys[pos] = k
+    vals[pos] = v
+    return pos
+}
+
+// 函数表三列有序插入（keys/vals/nodes 并行同步移位；reg_fn 专用）。
+// 返回插入位置。
+pub func sorted_insert_fn(ref keys: table<i64>, ref vals: table<i64>, ref nodes: table<i64>, k: i64, v: i64, nd: i64) -> i64 {
+    var n = len(keys)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if keys[mid] < k {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    table_push(keys, 0)
+    table_push(vals, 0)
+    table_push(nodes, 0)
+    var i: i64 = n
+    while i > pos {
+        keys[i] = keys[i - 1]
+        vals[i] = vals[i - 1]
+        nodes[i] = nodes[i - 1]
+        i = i - 1
+    }
+    keys[pos] = k
+    vals[pos] = v
+    nodes[pos] = nd
+    return pos
+}
+
+}

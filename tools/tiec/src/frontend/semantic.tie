@@ -1,0 +1,112 @@
+type tie<class>
+// compiler/frontend/semantic.tie —— 自举 v2 T2.6：完整语义分析器（主入口）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）。由 T1.3 原型
+// compiler/proto/semantic.tie 升版（corpus pass + 负例断言），行为基准
+// Rust crates/tie-frontend/src/semantic.rs（错误消息逐字对齐）。
+// # 模块拆分（2026-08-11）：原 3802 行单文件按「无环 import 树」拆为 8 模块——
+//   sstate.tie（全局状态+AST 9 列+工具）/ stype.tie（类型辅助，复用 types）/
+//   sbuiltin.tie（内置函数签名）/ sinfer.tie（表达式推断+调用解析）/
+//   scollect.tie（顶层收集）/ scheck.tie（语句/函数检查）/ 本文件（主入口）。
+//   类型系统复用 middle/types.tie + middle/data.tie（T2.1 交付）。
+// # 相比原型改进：
+//   - import 展开（原型跳过，本版实现：读文件 + 递归检查 + 重复导入去重）；
+//   - 类型系统走 types.tie（ty_* 自编码与 proto 同构）。
+// # 协议：check(ast_text) -> "OK:<typed_count>" 或 "ERR:<line> <col> <msg>"。
+// # T2.6 验收：corpus 101 文件 pass + 负例 golden 逐字对齐 Rust。
+// import 树：本文件同时 import parser 树（展开 import 用）与 scheck 链
+// （语义检查）；两树文件无重叠（parser 树 = pst/ast/lexer/putil/pexpr/...，
+// semantic 树 = sstate/stype/sbuiltin/sinfer/scollect/scheck），无环无重复。
+// S3.3：mexpand（宏展开 pass）import interp 树（interp → session/value +
+// parser 树 + sstate）——与上述两树按「解析后路径」去重，无环。
+import "./parser.tie"
+import "./scheck.tie"
+import "./sgen.tie"
+import "./smove.tie"
+import "./mexpand.tie"
+import "./semantic_gen.tie"
+
+// ==================== import 展开状态 ====================
+// 当前文件目录（相对 import 解析基准）
+pub var g_cur_dir: string = "";
+// p.9.13.7-B 内置库零副本：/std /ext /rdu /sys 别名解析到内置库根。
+// 取值序：--lib-root CLI > TIE_LIB_ROOT 环境变量 > 默认 ~/.tiec-lib/tlib。
+pub var g_lib_root: string = "";
+
+// p.9.11.13 扩展（2026-10-12）：#cfg 求值环境——被导入文件的预处理与主文件
+// 共用同一 target/profile（driver 归一化后经 semantic.set_cfg_env 单点注入；
+// 空 = 主机 / 无 profile，与主文件路径默认语义一致）。
+pub var g_cfg_env_target: string = "";
+pub var g_cfg_env_profile: string = "";
+
+// 泛型预扫描展开状态（T3b）：g_extra_tops 已扫描位置游标（新展开的函数
+// 追加到 g_extra_tops 末尾，主循环从该位置续扫）
+pub var g_scan_extra_last: i64 = 0;
+
+// 子阶段计时（性能诊断，TIEC_TIME=1 时输出）：sem 内部分布定位。
+// 声明须在文件顶层（命名空间体内只允许函数）。符号 = kernel32 GetTickCount
+//（毫秒精度；driver 已声明 CRT clock，extern 不允许跨文件重复定义）。
+unsafe extern fn GetTickCount() -> i64;
+pub var sm_t_copy: i64 = 0
+pub var sm_t_mexp: i64 = 0
+pub var sm_t_imp: i64 = 0
+pub var sm_t_coll: i64 = 0
+pub var sm_t_impl: i64 = 0
+pub var sm_t_gen: i64 = 0
+pub var sm_t_flds: i64 = 0
+pub var sm_t_fns: i64 = 0
+// import 展开三级细分计时（TIEC_TIME=1）：strip=头部剥离 / lex=run_lex /
+// build=fill_pending+parse_program / append=append_ast_mem——imports 总量
+// 24.8s（driver 闭包）病源定位用。
+pub var sm_t_imp_strip: i64 = 0
+pub var sm_t_imp_lex: i64 = 0
+pub var sm_t_imp_build: i64 = 0
+pub var sm_t_imp_append: i64 = 0
+pub var sm_t_imp_fill: i64 = 0
+// p.9.14.2 性能优化：import 去重索引（intern id，有序二分）——imported_has 原为
+// 对 g_imported(table<string>) 的线性查找，driver 数百文件时 O(n²) 累积成 import
+// 展开病态；改用 intern.intern(id) + sstate.bs_find 二分，import 展开近线性。
+pub var g_imp_idkeys: table<i64> = []
+pub var g_imp_idvals: table<i64> = []
+
+// ---------- 警告通道（p.6.9.15 诊断标号体系） ----------
+// 语义检查期间的警告平行收集（错误仍走 sm_err_* 单条；警告可多条）：
+// 检查结束并入 OK 协议返回（sm_ok_protocol），driver 打印 warning[W#####]。
+// 每函数检查前不重置（一个文件编译内跨函数累积），check_impl/check_ast
+// 入口统一清零（sm_warn_reset）。
+pub var sm_warn_lines: table<i64>;   // 警告行（平行表）
+pub var sm_warn_cols: table<i64>;
+pub var sm_warn_msgs: table<string>; // 警告核心消息（与 diagcode 警告目录逐字一致）
+pub var sm_warn_files: table<i64>;   // 警告所属模块序号（0 = 主输入文件，见 g_file_base 约定）
+// 「当前正在检查的模块序号」：由 scheck.check_fn_walk 按函数定义节点设置，
+// sm_warn_add 据此打归属。**0 = 主输入文件**（g_file_base[0] = 0 的约定）。
+// 目的是让 -Werror 只判「你编的这个文件」，不被 std/prelude 自身的告警拖垮
+//（与 cap_idle_flush「只判主输入文件」同一裁决）。
+pub var sm_cur_file: i64 = 0;
+// p.9.14.2 独立警告 pass：总开关（默认 false = 只报错，警告检查不付任何成本）。
+// driver 用 -w 开启、--no-warn 保持关闭；仅 true 时语义侧警告收集/渲染进行。
+pub var sm_warn_active: bool = false;
+
+
+namespace semantic {
+
+
+// 递归展开单个 import 节点：读文件 → parse → append_ast 合并，
+// 其顶层语句（非 import）进 g_extra_tops，其 import 递归展开。
+// ---------- p.9.11.31 选择性导入：依赖闭包 ----------
+// 引用收集标签：N_VAR(6) 变量/裸调用名、N_CALL(7) 调用名、N_METHOD_CALL(18)、
+// N_STRUCT_TYPE(202) 类型引用（用户类型名标注）。过收集无害（多保留）。
+
+
+// ---------- p.9.14.1 结构化警告事件访问器 ----------
+// 语义侧收集表保持（sm_warn_add 收集端不变）；以下 pub 访问器供 driver 直读
+// （跨命名空间经 semantic.xxx 转调），替代旧的 ";W:l c msg" 文本协议往返。
+// 渲染仅发生在输出端一次（diagcode.render_warning）。
+
+
+}
+
+import "./semantic_p1.tie"
+
+import "./semantic_q1.tie"
+import "./semantic_q2.tie"

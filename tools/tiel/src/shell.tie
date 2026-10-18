@@ -1,0 +1,60 @@
+type tie<logic>
+// shell.tie —— tiel 命令行外壳（tiel 可执行入口）
+// ============================================================
+// 构建：tiec shell.tie -o tiel.exe
+// 用法：
+//   tiel <script.tie…>   校验脚本（前端：词法/语法/错误码）；多文件逐个校验
+//   tiel -v              版本信息
+// 输出：错误行为 CLI 形态 `error[E#####] @行:列: 消息。`；通过时打印统计。
+// 退出码：0 全部通过 / 1 存在校验失败 / 2 用法错误。
+import "./tiel.tie"
+import "./emcodes.tie"
+import "./emit.tie"
+import "./lex.tie"
+import "./parse.tie"
+import "./render.tie"
+using tiel
+namespace tiel;
+
+func sh_version() {
+    println("tiel 0.1.0 —— tie 轻量解释器（前端：词法/语法/错误码）")
+    println("用法: tiel <script.tie…>    校验脚本")
+    println("      tiel -v               版本")
+}
+
+func main() -> i64 {
+    var n = arg_count()
+    if n < 1 {
+        sh_version()
+        return 2
+    }
+    var first = arg_string(0)
+    if first == "-v" || first == "--version" {
+        sh_version()
+        return 0
+    }
+    var fails: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var p = arg_string(i)
+        var src = file_read(p)
+        if str_len(src) == 0 {
+            println("tiel: 读取失败: " + p)
+            fails = fails + 1
+        } else {
+            var err = tiel_check(src)
+            if str_len(err) > 0 {
+                println(err)
+                fails = fails + 1
+            } else {
+                println("校验通过: " + p)
+                println("  结构账: " + em_stats())
+            }
+        }
+        i = i + 1
+    }
+    if fails > 0 {
+        return 1
+    }
+    return 0
+}

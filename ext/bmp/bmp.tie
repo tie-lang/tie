@@ -1,0 +1,345 @@
+type tie<class>
+// ============================================================================
+// ext/bmp/bmp.tie —— BMP 位图编解码（命名空间 bmp，纯 tie）p.9.1.1.14
+// BMP decoder/encoder. 无损位图：读 BITMAPFILEHEADER(14B)/BITMAPINFOHEADER(40B)、
+// palette（1/4/8 bpp）与 24/32 bpp、行对齐 4 字节、从上到下扫描（负高）与
+// 从下到上（正高，按显示序翻转为自上而下）。
+//
+// 数据平面：像素以 flat table<i64> 表示，每像素 3 字节 RGB（r,g,b），row-major
+// 自上而下。palette 为 flat RGB 表（每项 3 字节）。解码无论源 bpp 均展开为 RGB；
+// 编码 24bpp。
+//
+// 接口：
+//   decode(bytes) -> Bmp    解析 → struct{ ok, w, h, bpp, pixels, palette,
+//                                     compression, err }（见下方 struct 注释）。
+//   encode(w, h, rgb) -> table<i64>  RGB(3×w×h) → 24bpp BMP 字节表（负高=自上而下）。
+//   err_msg() -> string      最近一次解码失败的说明。
+//
+// 支持：
+//   - bpp：1/4/8（调色板）与 24/32（无调色板）。
+//   - 行对齐：每行字节数按 4 字节对齐（24bpp 与 palette 1/4/8 均含补位）。
+//   - 高度符号：负高（BITMAPINFOHEADER 顶到底）直接按存储序；正高（底到顶）
+//     解码时按显示序翻转成自上而下。
+//   - 扫描方向统一输出为自上而下 row-major。
+//   不支持的（marked，不硬撑）：compression != BI_RGB(0)，即 RLE8/RLE4 不解压，
+//     置 compression 字段并让 ok=false（optional，按任务标注）。
+//
+// 实现要点：
+//   - 所有多字节小端读取手工位运算（不允许依赖硬件字节序）。
+//   - 调色板展开：像素值作索引取 palette → RGB。
+//   - 行字节数 row_bytes = floor((bpp*w + 31)/32)*4（4 字节对齐，标准公式）。
+// ============================================================================
+
+// 解码结果。ok=1 成功/0 失败；err 失败说明。pixels 为 RGB flat（3×w×h，
+// row-major 自上而下）；palette 为 RGB flat（bpp<=8 时）或空表。
+struct Bmp {
+    var ok: i64 = 0
+    var w: i64 = 0
+    var h: i64 = 0
+    var bpp: i64 = 0
+    var compression: i64 = 0
+    var pixels: table<i64> = table_new_i64()
+    var palette: table<i64> = table_new_i64()
+    var err: string = ""
+}
+
+namespace bmp {
+
+// ---- 小端读取辅助 ----
+
+// u16 LE（从 b[ofs..ofs+1]）。
+func rd_u16(b: table<i64>, ofs: i64) -> i64 {
+    return b[ofs] | (b[ofs + 1] << 8)
+}
+
+// u32 LE（从 b[ofs..ofs+3]）。
+func rd_u32(b: table<i64>, ofs: i64) -> i64 {
+    return (b[ofs] | (b[ofs + 1] << 8) | (b[ofs + 2] << 16) | (b[ofs + 3] << 24))
+}
+
+// i32 LE，符号扩展（u32 位型 → 若最高位 set 则减 2^32；使负高可判）。
+func rd_i32(b: table<i64>, ofs: i64) -> i64 {
+    var u = (b[ofs] | (b[ofs + 1] << 8) | (b[ofs + 2] << 16) | (b[ofs + 3] << 24))
+    if (u & 0x80000000) != 0 {
+        return u - 0x100000000
+    }
+    return u
+}
+
+// ---- 数据平面 ----
+
+// 每行字节数（4 字节对齐）：floor((bpp*w + 31)/32)*4。
+func row_bytes(bpp: i64, w: i64) -> i64 {
+    var bits = bpp * w
+    var words = (bits + 31) / 32
+    return words * 4
+}
+
+// 计算某个像素（col，row）在扫描行内的位偏移跨度所覆盖的字节/位操作不再通用；
+// bone 1bpp 每个字节装 8 个像素（MSB first）。
+
+// 调色板读取：紧随 40 字节头后，palette_size 项，每项 4 字节（B,G,R,reserved）。
+// 返回 flat RGB 表。
+func read_palette(b: table<i64>, ofs: i64, count: i64) -> table<i64> {
+    var pal = table_new_i64()
+    var i: i64 = 0
+    while i < count {
+        // 项布局 B[0] G[1] R[2] reserved[3]
+        table_push(pal, b[ofs + i * 4 + 2])   // R
+        table_push(pal, b[ofs + i * 4 + 1])   // G
+        table_push(pal, b[ofs + i * 4 + 0])   // B
+        i = i + 1
+    }
+    return pal
+}
+
+// 从索引像素值展开为 RGB。palette 为 flat RGB。
+func index_rgb(pal: table<i64>, idx: i64) -> i64 {
+    // 越界索引回绕到 0 号色（约定）
+    var i = idx * 3
+    var n = len(pal)
+    if i < 0 || i + 2 >= n {
+        return 0
+    }
+    return i
+}
+
+// 从 bmp 字节（from 起 pixel data）解码给定 bpp 的像素，依赖 palette。
+func decode_pixels(b: table<i64>, from: i64, w: i64, h: i64, bpp: i64, pal: table<i64>) -> table<i64> {
+    var px = table_new_i64()
+    var rb = row_bytes(bpp, w)
+    var row: i64 = 0          // 扫描行（存储序）
+    while row < h {
+        var line = from + row * rb
+        var col: i64 = 0
+        while col < w {
+            var base = line + (col * bpp) / 8
+            if bpp == 1 {
+                var bit = col & 7
+                var bytev = b[base]
+                var bitv = (bytev >> (7 - bit)) & 1
+                var pi = index_rgb(pal, bitv)
+                table_push(px, pal[pi])
+                table_push(px, pal[pi + 1])
+                table_push(px, pal[pi + 2])
+            } else if bpp == 4 {
+                var nib = col & 1
+                var bytev = b[base]
+                var hi = (bytev >> 4) & 0xF
+                var lo = bytev & 0xF
+                var v = lo
+                if nib == 0 {
+                    v = hi
+                }
+                var pi = index_rgb(pal, v)
+                table_push(px, pal[pi])
+                table_push(px, pal[pi + 1])
+                table_push(px, pal[pi + 2])
+            } else if bpp == 8 {
+                var pi = index_rgb(pal, b[base])
+                table_push(px, pal[pi])
+                table_push(px, pal[pi + 1])
+                table_push(px, pal[pi + 2])
+            } else if bpp == 24 {
+                table_push(px, b[base + 2])   // R
+                table_push(px, b[base + 1])   // G
+                table_push(px, b[base + 0])   // B
+            } else {   // bpp == 32
+                table_push(px, b[base + 2])
+                table_push(px, b[base + 1])
+                table_push(px, b[base + 0])
+            }
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return px
+}
+
+// 按高度符号统一为自上而下 row-major。storage 为按「显示序 h_half」存储的像素。
+// 负高：存储已自上而下 → 直接回。正高：底到顶 → 按 h 行翻转。
+func reorder(storage: table<i64>, w: i64, h: i64, topdown: i64) -> table<i64> {
+    if topdown == 1 {
+        return storage
+    }
+    var out = table_new_i64()
+    var row: i64 = 0
+    while row < h {
+        var src = (h - 1 - row) * w * 3
+        table_push(out, storage[src])
+        table_push(out, storage[src + 1])
+        table_push(out, storage[src + 2])
+        var col: i64 = 1
+        while col < w {
+            var off = src + col * 3
+            table_push(out, storage[off])
+            table_push(out, storage[off + 1])
+            table_push(out, storage[off + 2])
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return out
+}
+
+// 解码 BMP 字节 → Bmp。失败时 ok=false + err。
+pub func decode(b: table<i64>) -> Bmp {
+    var r: Bmp = Bmp()
+    var n = len(b)
+    if n < 54 {
+        r.err = "too short"
+        return r
+    }
+    // BITMAPFILEHEADER
+    if b[0] != 0x42 || b[1] != 0x4D {
+        r.err = "not BM"
+        return r
+    }
+    var pixel_ofs = rd_u32(b, 10)
+    // BITMAPINFOHEADER
+    var hdrsize = rd_u32(b, 14)
+    if hdrsize < 40 {
+        r.err = "unsupported DIB header"
+        return r
+    }
+    var w = rd_i32(b, 18)
+    var hi = rd_i32(b, 22)
+    var bppv = rd_u16(b, 28)
+    var comp = rd_u32(b, 30)
+    if w <= 0 {
+        w = -w
+    }
+    var h = hi
+    var topdown: i64 = 0
+    if h < 0 {
+        topdown = 1
+        h = -h
+    }
+    if w == 0 || h == 0 {
+        r.err = "zero dim"
+        return r
+    }
+    if bppv != 1 && bppv != 4 && bppv != 8 && bppv != 24 && bppv != 32 {
+        r.err = "unsupported bpp " + to_string(bppv)
+        return r
+    }
+    if comp != 0 {
+        // RLE8/RLE4 未实现（optional marked）
+        r.err = "compression != BI_RGB (RLE not supported)"
+        r.compression = comp
+        return r
+    }
+    r.compression = 0
+    r.w = w
+    r.h = h
+    r.bpp = bppv
+    // 调色板：bpp<=8 时在 40 字节头之后
+    var pal_ofs = 14 + hdrsize
+    var pal_count: i64 = 0
+    if bppv <= 8 {
+        var used = rd_u32(b, 46)
+        if used == 0 {
+            pal_count = 1 << bppv
+        } else {
+            pal_count = used
+        }
+        r.palette = read_palette(b, pal_ofs, pal_count)
+    } else {
+        r.palette = table_new_i64()
+    }
+    // 像素
+    var storage = decode_pixels(b, pixel_ofs, w, h, bppv, r.palette)
+    r.pixels = reorder(storage, w, h, topdown)
+    if len(r.pixels) != w * h * 3 {
+        r.err = "pixel count mismatch"
+        r.ok = 0
+        return r
+    }
+    r.ok = 1
+    return r
+}
+
+// RGB(3×w×h, row-major 自上而下) → 24bpp BMP 字节（负高=DIB top-down）。
+pub func encode(w: i64, h: i64, rgb: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var rb = row_bytes(24, w)
+    var pxbytes = rb * h
+    var filelen = 54 + pxbytes
+    // BITMAPFILEHEADER
+    table_push(out, 0x42)          // 'B'
+    table_push(out, 0x4D)          // 'M'
+    // file size u32
+    table_push(out, filelen & 0xFF)
+    table_push(out, (filelen >> 8) & 0xFF)
+    table_push(out, (filelen >> 16) & 0xFF)
+    table_push(out, (filelen >> 24) & 0xFF)
+    // reserved two u16 zero
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0)
+    // pixel offset u32 = 54
+    table_push(out, 54)
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0)
+    // BITMAPINFOHEADER (40)
+    table_push(out, 40)
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0)
+    // width u32
+    table_push(out, w & 0xFF)
+    table_push(out, (w >> 8) & 0xFF)
+    table_push(out, (w >> 16) & 0xFF)
+    table_push(out, (w >> 24) & 0xFF)
+    // height u32 (negative → top-down)
+    var hn = -h
+    table_push(out, hn & 0xFF)
+    table_push(out, (hn >> 8) & 0xFF)
+    table_push(out, (hn >> 16) & 0xFF)
+    table_push(out, (hn >> 24) & 0xFF)
+    // planes u16 = 1
+    table_push(out, 1)
+    table_push(out, 0)
+    // bpp u16 = 24
+    table_push(out, 24)
+    table_push(out, 0)
+    // compression u32 = 0
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0)
+    // imageSize u32 = pxbytes
+    table_push(out, pxbytes & 0xFF)
+    table_push(out, (pxbytes >> 8) & 0xFF)
+    table_push(out, (pxbytes >> 16) & 0xFF)
+    table_push(out, (pxbytes >> 24) & 0xFF)
+    // xppm/yp Pm u32 zero ×2
+    table_push(out, 0); table_push(out, 0); table_push(out, 0); table_push(out, 0)
+    table_push(out, 0); table_push(out, 0); table_push(out, 0); table_push(out, 0)
+    // colorsUsed/Important u32 zero
+    table_push(out, 0); table_push(out, 0); table_push(out, 0); table_push(out, 0)
+    table_push(out, 0); table_push(out, 0); table_push(out, 0); table_push(out, 0)
+    // 像素（RGB，行 4 字节补位）
+    var row: i64 = 0
+    while row < h {
+        var col: i64 = 0
+        while col < w {
+            var base = (row * w + col) * 3
+            table_push(out, rgb[base + 2])   // B
+            table_push(out, rgb[base + 1])   // G
+            table_push(out, rgb[base + 0])   // R
+            col = col + 1
+        }
+        var pad: i64 = 0
+        while pad < rb - w * 3 {
+            table_push(out, 0)
+            pad = pad + 1
+        }
+        row = row + 1
+    }
+    return out
+}
+
+}   // namespace bmp

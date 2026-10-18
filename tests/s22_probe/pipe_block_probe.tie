@@ -1,0 +1,59 @@
+type tie<tsc>
+
+// p.9.13.4 / p.9.0-L.2 数据流管道收尾探针：块管道 / 条件管道 / 接运算符 /
+// 读取式 / 箭头解构 / 反向赋值。断言自包含（VERDICT OK / F<n>）。
+
+func add1(v: i64) -> i64 { return v + 1 }
+func neg(v: i64) -> i64 { return 0 - v }
+
+func main() -> i64 {
+    var ok: i64 = 0
+    // 1. 块管道：数据绑定到局部名 v 后求值体
+    var r1 = 21 -> { v -> v * 2 }
+    if r1 == 42 { ok = ok + 1 } else { println("F1 r1=" + to_string(r1)) }
+    // 2. 块管道链式
+    var r2 = 5 -> { a -> a + 1 } -> { b -> b * 10 }
+    if r2 == 60 { ok = ok + 1 } else { println("F2 r2=" + to_string(r2)) }
+    // 3. 条件管道（三元形态）：两分支各接调用
+    var flag = true
+    var r3 = 7 -> (flag ? add1 : neg)
+    if r3 == 8 { ok = ok + 1 } else { println("F3 r3=" + to_string(r3)) }
+    // 4. 条件管道：条件翻转走另一分支
+    var r4 = 7 -> (!flag ? add1 : neg)
+    if r4 == -7 { ok = ok + 1 } else { println("F4 r4=" + to_string(r4)) }
+    // 5. 接运算符：t -> + [x] ≡ t + [x]（表达式：产生新表，原表不变——值语义）
+    var t: table<i64> = [1, 2]
+    var t2 = t -> + [9]
+    if len(t2) == 3 && t2[2] == 9 && len(t) == 2 { ok = ok + 1 } else { println("F5 len2=" + to_string(len(t2)) + " len=" + to_string(len(t))) }
+    // 6. 读取式：p -> .field 与 t -> [i]
+    var p = Point2()
+    p.x = 33
+    var r6 = p -> .x
+    if r6 == 33 { ok = ok + 1 } else { println("F6 r6=" + to_string(r6)) }
+    var r6b = t -> [0]
+    if r6b == 1 { ok = ok + 1 } else { println("F6b r6b=" + to_string(r6b)) }
+    // 7. 箭头解构：pair -> (a, b)（语句位声明 a、b）
+    var pair = (11, 22)
+    pair -> (a, b)
+    if a == 11 && b == 22 { ok = ok + 1 } else { println("F7 a=" + to_string(a)) }
+    // 8. 反向赋值解构：(c, d) <- pair
+    (c, d) <- pair
+    if c == 11 && d == 22 { ok = ok + 1 } else { println("F8 c=" + to_string(c)) }
+    // 9. `in` 接运算符：5 -> in xs ≡ 5 in xs
+    var xs: table<i64> = [3, 5, 7]
+    var r9 = 5 -> in xs
+    if r9 { ok = ok + 1 } else { println("F9 r9=false") }
+
+    if ok == 10 {
+        println("VERDICT OK")
+        return 0
+    }
+    println("VERDICT FAIL ok=" + to_string(ok) + "/10")
+    exit(1)
+    return 0
+}
+
+struct Point2 {
+    var x: i64 = 0
+    var y: i64 = 0
+}

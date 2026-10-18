@@ -1,0 +1,99 @@
+type tie<class>
+// compiler/frontend/stype_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 stype.tie。
+namespace stype {
+// p.9.11.21 interface 结构性实现判定（struct）：接口全部方法在该 struct 的
+// 命名空间方法（<struct>::<m>，M2.1.8 首参自动 ref）中签名兼容（方法名 +
+// 参数个数 + 去 self 参数类型 + 返回类型）。全匹配 → 合成 impl 记录返回
+// true；任一缺失/不匹配返回 false（violation 细节经 iface_first_violation
+// 供调用方构造诊断，见 sgen_inst / scheck）。
+func iface_struct_has_ty(pi: i64, si: i64) -> bool {
+    var sname = sstate.struct_name_of(si)
+    var n = pm_n[pi]
+    var mnames: table<i64> = table_new_i64()
+    var mi: i64 = 0
+    while mi < n {
+        var mname = sstate.port_method_name(pi, mi)
+        var full = sname + "::" + mname
+        if !iface_method_matches(pi, mi, full) {
+            return false
+        }
+        table_push(mnames, intern.intern(full))
+        mi = mi + 1
+    }
+    // 全部签名兼容：合成 impl 记录（vtable 生成 / 提升 / 约束校验复用）
+    if sstate.reg_impl(pi, si, mnames) < 0 {
+        return false
+    }
+    return true
+}
+
+// p.9.11.21 interface 结构性实现判定（enum）：仅签名兼容检查，不合成
+// impl 记录（enum 提升为接口对象后置，与 port 现状一致）。
+func iface_enum_has_ty(pi: i64, ei: i64) -> bool {
+    var ename = sstate.enum_name_of(ei)
+    var n = pm_n[pi]
+    var mi: i64 = 0
+    while mi < n {
+        var mname = sstate.port_method_name(pi, mi)
+        var full = ename + "::" + mname
+        if !iface_method_matches(pi, mi, full) {
+            return false
+        }
+        mi = mi + 1
+    }
+    return true
+}
+
+// interface 方法签名与命名空间函数签名匹配（fn_sig 全名查找，去 self 槽）
+func iface_method_matches(pi: i64, mi: i64, full: string) -> bool {
+    var sig = sstate.fn_sig(full)
+    if sig < 0 {
+        return false
+    }
+    var pnp = sstate.port_method_nparams(pi, mi)  // 含 self
+    if sg_nparams[sig] != pnp {
+        return false
+    }
+    var j: i64 = 1
+    while j < pnp {
+        var want = sstate.port_method_param(pi, mi, j)
+        var got = sp_tys[sg_off[sig] + j]
+        if want != got {
+            return false
+        }
+        j = j + 1
+    }
+    if sg_ret[sig] != sstate.port_method_ret(pi, mi) {
+        return false
+    }
+    return true
+}
+
+// 常量值是否在类型范围内（C3 边界；与 sinfer.lit_in_range 同套逻辑，
+// stype 侧独立副本避免循环依赖）
+func lit_in_range_stype(v: i64, ty: i64) -> bool {
+    if ty == TK_I8 && (v < -128 || v > 127) {
+        return false
+    }
+    if ty == TK_I16 && (v < -32768 || v > 32767) {
+        return false
+    }
+    if ty == TK_I32 && (v < -2147483648 || v > 2147483647) {
+        return false
+    }
+    if ty == TK_U8 && (v < 0 || v > 255) {
+        return false
+    }
+    if ty == TK_U16 && (v < 0 || v > 65535) {
+        return false
+    }
+    if ty == TK_U32 && (v < 0 || v > 4294967295) {
+        return false
+    }
+    return true
+}
+
+}

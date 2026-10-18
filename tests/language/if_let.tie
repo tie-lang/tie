@@ -1,0 +1,87 @@
+type tie<logic>
+
+// ============================================================
+// p.9.10.2 if-let 解构条件验收：`if let <pattern> = <expr> { }`（可选 else）。
+// 纯糖，脱糖为现有 switch 语句；expr 为 Option/Result（或可解构值）。
+//
+// 覆盖场景：
+//   1. Option.Some 成功绑定 payload
+//   2. Option.None → else 分支
+//   3. 无 else（仅 then 块）
+//   4. Result.Ok 成功绑定
+//   5. Result.Err → else 分支
+//   6. 多变量解构（枚举多 payload 字段）
+//   7. 嵌套 if-let（Option<Option<T>>）
+//   8. `else if let` 链
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   42 / none2 / many42 / 7 / err2 / 3 / ab / 9 / chain-2
+// ============================================================
+import "/std/result.tie"
+
+enum Point2 {
+    Pt(i64, string)
+}
+
+func main() {
+    // 1. Option.Some 绑定
+    var o1: Option<i64> = Option.Some(42)
+    if let Some(x) = o1 {
+        println(x)   // 42
+    } else {
+        println("none")
+    }
+    // 2. Option.None → else
+    var o2: Option<i64> = Option.None
+    if let Some(y) = o2 {
+        println("some")
+    } else {
+        println("none2")   // none2
+    }
+    // 3. 无 else（仅 then 块即可）
+    if let Some(a) = o1 {
+        println("many" + to_string(a))   // many42
+    }
+    // 4. Result.Ok 绑定
+    var r1: Result<i64, string> = Result.Ok(7)
+    if let Ok(v) = r1 {
+        println(v)   // 7
+    } else {
+        println("err")
+    }
+    // 5. Result.Err → else
+    var r2: Result<i64, string> = Result.Err("bad")
+    if let Ok(v) = r2 {
+        println("ok")
+    } else {
+        println("err2")   // err2
+    }
+    // 6. 多变量解构
+    var p = Point2.Pt(3, "ab")
+    if let Pt(m, s2) = p {
+        println(m)   // 3
+        println(s2)  // ab
+    } else {
+        println("pt-else")
+    }
+    // 7. 嵌套 if-let（then 块内再 if-let 解构另一值）
+    var n1: Option<i64> = Option.Some(2)
+    var n2: Option<i64> = Option.Some(3)
+    if let Some(p) = n1 {
+        if let Some(q) = n2 {
+            println(p + q)   // 5
+        } else {
+            println("n2-none")
+        }
+    }
+    // 8. else-if 链
+    var chk: Option<i64> = Option.None
+    if let Some(b) = chk {
+        println("chain-1")
+    } else if let Some(c2) = o1 {
+        println("chain-2")   // o1 是 Some(42) → 命中
+    } else {
+        println("chain-3")
+    }
+    println("p.9.10.2 if-let 解构条件全过")
+}

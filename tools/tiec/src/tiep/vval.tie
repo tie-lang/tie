@@ -1,0 +1,709 @@
+type tie<class>
+// compiler/interp/vval.tie —— p.9.17.2 第一步：拆箱值模型（Value enum，双形态共存）
+// ============================================================
+// 里程碑：docs/designs/interp-performance.md §4.2.1（值表示选型 = 案 A enum 标签联合）。
+// 本文件是**新增**的平行实现：既有 `ivalue`（value.tie，id + 平行表盒装）完全不动，
+// 本模块以 tie 原生 ADT 表达值，供第一步做 parity 门禁与语言前提验证；第二步
+// （热路径切换）再把调用点从 `ivalue.*` 迁到 `vval.*`。
+//
+// # 为什么是 enum 而不是 NaN-boxing（设计 §4.2.1 二）
+//   tie 原生 ADT 在 LLVM 层是静态结构体 {i64 tag, i64×K 槽}，零堆分配；实测：
+//   构造+解构一轮 332ns vs 盒装 621ns（1.87×），且 enum 与 i64 传递耗时在噪声内
+//   相等（传递无惩罚）——NaN-boxing 赖以胜出的「省字节」在此换不来可测收益，
+//   却要手工位运算 + f64 NaN 空间论证，故否决。
+//
+// # 表示（标量内联 + 复合值留槽）
+//   Nil                     无值
+//   Int(i64)                整数
+//   Flt(f64)                浮点（原生 f64 载荷，无需手工 bitcast）
+//   Bool(i64) 0/1           布尔
+//   Trit(i64) -1/0/1        平衡三进制
+//   Chr(i64)                字符码点
+//   Rng(i64, i64, i64)       范围起点/终点/闭区间标志（**内联**）
+//   Str(i64)                文本槽（w_svals 下标）
+//   Tbl(i64)                表描述符槽（w_koff/w_kcnt 下标；元素在 w_kids）
+//   Map(i64)                键值表描述符槽（键在 w_mkeys，值在 w_mvals）
+//   Code(i64)               宏/准引用文本槽（w_svals 下标）
+//   Rng 三个 i64 载荷 ⇒ 每值按 enum 最大变体布局内联。
+//
+// # 与 ivalue 的关系
+//   标量不再入池（消灭每值 7 次 table_push 与后续表寻址）；复合值仍走「描述符槽 +
+//   扁平元素表」，扁平表的元素类型由 i64（节点 id）改为 **Value（值直存）**——
+//   省掉一层 id 间接。表/映射的**值语义仍靠 (koff, kcnt) 区间快照手工实现**（tie
+//   原生表是引用语义、push 原地改，不能直接拿来当不可变快照）。
+//
+// # 命名与常量纪律
+//   顶层常量加 W_ 前缀（`ivalue` 的 T_* 与本模块 import 内联后同作用域，重名即
+//   重复定义报错——parity 探针会同时引入两者）；全局表加 w_ 前缀。
+//
+// # 调用约定
+//   import 后 vval.new_int(...) / vval.type_of(...)。
+
+import "/std/utf.tie"
+import "../lib/interner.tie"
+
+// ==================== 类型码常量（与 ivalue 的 T_* 逐值一致：对外契约） ====================
+pub const W_INT: i64 = 0;
+pub const W_FLOAT: i64 = 1;
+pub const W_BOOL: i64 = 2;
+pub const W_TRIT: i64 = 3;
+pub const W_CHAR: i64 = 4;
+pub const W_STR: i64 = 5;
+pub const W_RANGE: i64 = 6;
+pub const W_TABLE: i64 = 7;
+pub const W_MAP: i64 = 8;
+pub const W_VOID: i64 = 9;
+pub const W_CODE: i64 = 10;
+
+// ==================== 值类型（拆箱核心） ====================
+enum Value {
+    Nil
+    Int(i64)
+    Flt(f64)
+    Bool(i64)
+    Trit(i64)
+    Chr(i64)
+    Rng(i64, i64, i64)
+    Str(i64)
+    Tbl(i64)
+    Map(i64)
+    Code(i64)
+}
+
+// ==================== 复合值存储（标量不入池） ====================
+// 描述符槽：表与键值表共用（与 ivalue 同布局，便于第二步对齐）。
+var w_koff: table<i64>;        // 段起点（w_kids / w_mkeys+w_mvals 偏移）
+var w_kcnt: table<i64>;        // 段元素个数
+var w_kids: table<Value>;      // 表元素扁平表（**值直存**）
+var w_mkeys: table<i64>;       // 键值表键（interner id，升序段）
+var w_mvals: table<Value>;     // 键值表值扁平表
+var w_svals: table<string>;    // 文本槽（Str / Code）
+
+// 键值表写入的键槽（沿用 ivalue 的 g_ms_key 范式：混合实参嵌套调用会错位，
+// 故键走全局槽、值走参数）。w_ms_key 由调用方在 map_set 前设置。
+pub var w_ms_key: i64 = 0;
+
+// 错误槽。**刻意不叫 g_err**：`ivalue`（value.tie）已有同名顶层变量，而本模块与它
+// 需在同一二进制内共存（parity 门禁同时引入两者），import 内联后同作用域重名即
+// 重复定义报错。第二步（统一值模型）时两者合一。
+pub var w_err: string = "";
+
+namespace vval {
+
+// ==================== 会话重置 ====================
+
+pub func reset() {
+    w_koff = table_new_i64()
+    w_kcnt = table_new_i64()
+    w_kids = {}
+    w_mkeys = table_new_i64()
+    w_mvals = {}
+    w_svals = table_new_string()
+    w_err = ""
+}
+
+// ==================== 描述符槽 ====================
+
+// 新描述符槽（koff=段起点，kcnt=0），返回槽下标。
+func new_slot() -> i64 {
+    table_push(w_koff, 0)
+    table_push(w_kcnt, 0)
+    return len(w_koff) - 1
+}
+
+// 新文本槽，返回槽下标。
+func new_text(s: string) -> i64 {
+    table_push(w_svals, s)
+    return len(w_svals) - 1
+}
+
+// ==================== 构造 ====================
+
+pub func new_int(v: i64) -> Value {
+    return Value.Int(v)
+}
+
+pub func new_float(v: f64) -> Value {
+    return Value.Flt(v)
+}
+
+pub func new_bool(b: bool) -> Value {
+    if b {
+        return Value.Bool(1)
+    }
+    return Value.Bool(0)
+}
+
+pub func new_trit(v: i64) -> Value {
+    return Value.Trit(v)
+}
+
+pub func new_char(cp: i64) -> Value {
+    return Value.Chr(cp)
+}
+
+pub func new_str(s: string) -> Value {
+    return Value.Str(new_text(s))
+}
+
+pub func new_range(s: i64, e: i64, inclusive: i64) -> Value {
+    return Value.Rng(s, e, inclusive)
+}
+
+// 空表值（后续 push 产生新描述符槽；语义对齐 ivalue.new_table）。
+pub func new_table() -> Value {
+    var n = new_slot()
+    w_koff[n] = len(w_kids)
+    w_kcnt[n] = 0
+    return Value.Tbl(n)
+}
+
+// 空键值表值。
+pub func new_map() -> Value {
+    var n = new_slot()
+    w_koff[n] = len(w_mkeys)
+    w_kcnt[n] = 0
+    return Value.Map(n)
+}
+
+pub func new_void() -> Value {
+    return Value.Nil
+}
+
+pub func new_code(proto: string) -> Value {
+    return Value.Code(new_text(proto))
+}
+
+// ==================== 访问 ====================
+
+// 类型码（W_* 常量；与 ivalue.type_of 逐值一致）。
+pub func type_of(v: Value) -> i64 {
+    // 只用标签判别，故 case 不绑定载荷（绑定而未用会被判「未声明的变量」）
+    switch v {
+        case Value.Int:
+            return W_INT
+        case Value.Flt:
+            return W_FLOAT
+        case Value.Bool:
+            return W_BOOL
+        case Value.Trit:
+            return W_TRIT
+        case Value.Chr:
+            return W_CHAR
+        case Value.Str:
+            return W_STR
+        case Value.Rng:
+            return W_RANGE
+        case Value.Tbl:
+            return W_TABLE
+        case Value.Map:
+            return W_MAP
+        case Value.Code:
+            return W_CODE
+        default:
+            return W_VOID
+    }
+}
+
+// 类型名（错误提示用；文本与 ivalue.type_name 逐一对应）。
+pub func type_name(v: Value) -> string {
+    var t = type_of(v)
+    if t == W_INT {
+        return "整数"
+    }
+    if t == W_FLOAT {
+        return "浮点数"
+    }
+    if t == W_BOOL {
+        return "布尔"
+    }
+    if t == W_TRIT {
+        return "trit"
+    }
+    if t == W_CHAR {
+        return "字符"
+    }
+    if t == W_STR {
+        return "字符串"
+    }
+    if t == W_RANGE {
+        return "范围"
+    }
+    if t == W_TABLE {
+        return "表"
+    }
+    if t == W_MAP {
+        return "键值表"
+    }
+    if t == W_CODE {
+        return "code"
+    }
+    return "void"
+}
+
+// 整数载荷（非整数值为 0——与 ivalue.int_val 的 id 语义不同：vval 是值，
+// 故非整数返回 0 而非越界读表）。
+pub func int_val(v: Value) -> i64 {
+    switch v {
+        case Value.Int(x):
+            return x
+        case Value.Bool(x):
+            return x
+        case Value.Trit(x):
+            return x
+        case Value.Chr(x):
+            return x
+        default:
+            return 0
+    }
+}
+
+pub func float_val(v: Value) -> f64 {
+    switch v {
+        case Value.Flt(x):
+            return x
+        default:
+            return 0.0
+    }
+}
+
+// 字符串值文本（Str / Code 槽取文本；其余空串）。
+pub func str_val(v: Value) -> string {
+    switch v {
+        case Value.Str(x):
+            return w_svals[x]
+        case Value.Code(x):
+            return w_svals[x]
+        default:
+            return ""
+    }
+}
+
+// code 值文本（非 code 值返回空串）。
+pub func code_str(v: Value) -> string {
+    switch v {
+        case Value.Code(x):
+            return w_svals[x]
+        default:
+            return ""
+    }
+}
+
+// Range 起点、终点与闭区间标志。
+pub func range_start(v: Value) -> i64 {
+    switch v {
+        case Value.Rng(a, b, c):
+            return a
+        default:
+            return 0
+    }
+}
+pub func range_end(v: Value) -> i64 {
+    switch v {
+        case Value.Rng(a, b, c):
+            return b
+        default:
+            return 0
+    }
+}
+pub func range_inclusive(v: Value) -> i64 {
+    switch v {
+        case Value.Rng(a, b, c):
+            return c
+        default:
+            return 0
+    }
+}
+
+// 真值判断（只接受布尔；失败置 w_err 返回 false，调用方判 w_err）。
+pub func is_truthy(v: Value) -> bool {
+    switch v {
+        case Value.Bool(x):
+            return x != 0
+        default:
+            w_err = "条件必须是布尔，实际是 " + type_name(v)
+            return false
+    }
+}
+
+// ==================== 表 / 键值表 ====================
+
+// 元素个数。
+pub func elem_count(v: Value) -> i64 {
+    switch v {
+        case Value.Tbl(k):
+            return w_kcnt[k]
+        case Value.Map(k):
+            return w_kcnt[k]
+        default:
+            return 0
+    }
+}
+
+// 第 i 个元素（表）：越界返回 Nil（对齐 ivalue.elem_at 的 -1 哨兵语义——
+// 调用方在越界前已自检，此处只作防御）。
+pub func elem_at(v: Value, i: i64) -> Value {
+    switch v {
+        case Value.Tbl(k):
+            if i < 0 {
+                return Value.Nil
+            }
+            if i >= w_kcnt[k] {
+                return Value.Nil
+            }
+            return w_kids[w_koff[k] + i]
+        default:
+            return Value.Nil
+    }
+}
+
+// 表尾追加：返回**新表值**（旧值视图冻结——值语义）。
+// 尾复用（与 ivalue 同范式，§16）：源段末尾正好落在 w_kids 末尾时共享起点只追加；
+// 段创建时都在 [0, len(w_kids)) 内且连续，追加只影响 ≥ len(w_kids) 的位置，
+// 任何既有段的视图都在其左，故旧值视图天然冻结。
+pub func table_push_val(tv: Value, elem: Value) -> Value {
+    switch tv {
+        case Value.Tbl(tid):
+            var off = w_koff[tid]
+            var cnt = w_kcnt[tid]
+            var n = new_slot()
+            if off + cnt == len(w_kids) {
+                w_koff[n] = off
+                table_push(w_kids, elem)
+                w_kcnt[n] = cnt + 1
+                return Value.Tbl(n)
+            }
+            w_koff[n] = len(w_kids)
+            var i: i64 = 0
+            while i < cnt {
+                table_push(w_kids, w_kids[off + i])
+                i = i + 1
+            }
+            table_push(w_kids, elem)
+            w_kcnt[n] = cnt + 1
+            return Value.Tbl(n)
+        default:
+            return tv
+    }
+}
+
+// 表第 i 个元素替换为新值：返回新表值（越界由调用方校验）。
+pub func table_set_at(tv: Value, i: i64, elem: Value) -> Value {
+    switch tv {
+        case Value.Tbl(tid):
+            var n = new_slot()
+            var off = w_koff[tid]
+            var cnt = w_kcnt[tid]
+            w_koff[n] = len(w_kids)
+            var k: i64 = 0
+            while k < cnt {
+                if k == i {
+                    table_push(w_kids, elem)
+                } else {
+                    table_push(w_kids, w_kids[off + k])
+                }
+                k = k + 1
+            }
+            w_kcnt[n] = cnt
+            return Value.Tbl(n)
+        default:
+            return tv
+    }
+}
+
+// 段内键查找（按 interner id 升序段）：命中返回段内下标，未命中 -1。
+func map_find(mid: i64, key_id: i64) -> i64 {
+    var off = w_koff[mid]
+    var cnt = w_kcnt[mid]
+    var i: i64 = 0
+    while i < cnt {
+        if w_mkeys[off + i] == key_id {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 按键读取：命中返回值；未命中置 w_err 返回 Nil（文本对齐 ivalue.map_get）。
+pub func map_get(mv: Value, key_id: i64) -> Value {
+    switch mv {
+        case Value.Map(mid):
+            var i = map_find(mid, key_id)
+            if i < 0 {
+                w_err = "运行时错误: map_get 键不存在：'" + interner.lookup(key_id) + "'"
+                return Value.Nil
+            }
+            return w_mvals[w_koff[mid] + i]
+        default:
+            return Value.Nil
+    }
+}
+
+// 按键读取（复合赋值用）：未命中返回 Int(0)（不报错）。
+pub func map_get_opt(mv: Value, key_id: i64) -> Value {
+    switch mv {
+        case Value.Map(mid):
+            var i = map_find(mid, key_id)
+            if i < 0 {
+                return Value.Int(0)
+            }
+            return w_mvals[w_koff[mid] + i]
+        default:
+            return Value.Int(0)
+    }
+}
+
+// 段内元素文本比较（键升序维护用）。
+func text_less(j: i64) -> bool {
+    return interner.lookup(w_mkeys[j]) < interner.lookup(w_mkeys[j - 1])
+}
+
+// 写键值：返回新 map 值（键已存在 → 覆盖值；否则按文本字典序升序插入）。
+// 键取自 w_ms_key 槽（沿用 ivalue 的参数错位规避范式）；n 为调用方新建的空 map。
+pub func map_set(n: Value, mv: Value, val: Value) -> Value {
+    switch n {
+        case Value.Map(nid):
+            var key_id = w_ms_key
+            var mid: i64 = -1
+            switch mv {
+                case Value.Map(m):
+                    mid = m
+                default:
+                    mid = -1
+            }
+            var cnt: i64 = 0
+            if mid >= 0 {
+                cnt = w_kcnt[mid]
+            }
+            // 旧段 → 局部表（读全局表立即 push 会写入错乱值，故经局部表过渡）
+            var tk: table<i64> = table_new_i64()
+            var tv: table<Value> = {}
+            var off: i64 = 0
+            if mid >= 0 {
+                off = w_koff[mid]
+            }
+            var i: i64 = 0
+            while i < cnt {
+                table_push(tk, w_mkeys[off + i])
+                table_push(tv, w_mvals[off + i])
+                i = i + 1
+            }
+            w_koff[nid] = len(w_mkeys)
+            w_kcnt[nid] = cnt
+            i = 0
+            var replaced = false
+            while i < cnt {
+                if !replaced && tk[i] == key_id {
+                    table_push(w_mkeys, tk[i])
+                    table_push(w_mvals, val)
+                    replaced = true
+                } else {
+                    table_push(w_mkeys, tk[i])
+                    table_push(w_mvals, tv[i])
+                }
+                i = i + 1
+            }
+            if !replaced {
+                table_push(w_mkeys, key_id)
+                table_push(w_mvals, val)
+                var j = len(w_mkeys) - 1
+                var moving: bool = true
+                while moving {
+                    if j <= w_koff[nid] {
+                        moving = false
+                    } else if text_less(j) {
+                        var tmpk: i64 = w_mkeys[j]
+                        w_mkeys[j] = w_mkeys[j - 1]
+                        w_mkeys[j - 1] = tmpk
+                        var tmpv: Value = w_mvals[j]
+                        w_mvals[j] = w_mvals[j - 1]
+                        w_mvals[j - 1] = tmpv
+                        j = j - 1
+                    } else {
+                        moving = false
+                    }
+                }
+                w_kcnt[nid] = cnt + 1
+            }
+            return Value.Map(nid)
+        default:
+            return n
+    }
+}
+
+// ==================== 字符串化 ====================
+
+// 打印格式（与 ivalue.to_print_string 逐字节一致）。
+pub func to_print_string(v: Value) -> string {
+    switch v {
+        case Value.Int(x):
+            return to_string(x)
+        case Value.Flt(x):
+            return to_string(x)
+        case Value.Bool(x):
+            if x != 0 {
+                return "1"
+            }
+            return "0"
+        case Value.Trit(x):
+            return to_string(x)
+        case Value.Chr(x):
+            return utf_char_of(x)
+        case Value.Str(x):
+            return w_svals[x]
+        case Value.Rng(a, b, c):
+            if c != 0 {
+                return to_string(a) + "..=" + to_string(b)
+            }
+            return to_string(a) + ".." + to_string(b)
+        case Value.Tbl(k):
+            return table_print(k)
+        case Value.Map(k):
+            return map_print(k)
+        case Value.Code(x):
+            return "<code: " + w_svals[x] + ">"
+        default:
+            return ""
+    }
+}
+
+// REPL 结果格式（bool → true/false）。
+pub func to_repl_string(v: Value) -> string {
+    switch v {
+        case Value.Bool(x):
+            if x != 0 {
+                return "true"
+            }
+            return "false"
+        default:
+            return to_print_string(v)
+    }
+}
+
+// 表 → "[a, b]"。
+func table_print(k: i64) -> string {
+    var off = w_koff[k]
+    var cnt = w_kcnt[k]
+    var out: string = "["
+    var i: i64 = 0
+    while i < cnt {
+        out = out + to_print_string(w_kids[off + i])
+        if i + 1 < cnt {
+            out = out + ", "
+        }
+        i = i + 1
+    }
+    return out + "]"
+}
+
+// 键值表 → "{k: v, k2: v2}"（键升序——构造期已保证）。
+func map_print(k: i64) -> string {
+    var off = w_koff[k]
+    var cnt = w_kcnt[k]
+    var out: string = "{"
+    var i: i64 = 0
+    while i < cnt {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + interner.lookup(w_mkeys[off + i])
+        out = out + ": "
+        out = out + to_print_string(w_mvals[off + i])
+        i = i + 1
+    }
+    return out + "}"
+}
+
+// ==================== 字面量反转义（与 ivalue 同名同语义） ====================
+
+pub func unescape_str(raw: string) -> string {
+    var n = str_len(raw)
+    var is_raw: bool = false
+    if n >= 3 && str_char(raw, 0) == "r" && str_char(raw, 1) == "\"" &&
+        str_char(raw, n - 1) == "\"" {
+        raw = slice(raw, 2, n - 1)
+        is_raw = true
+    }
+    if !is_raw {
+        if n >= 2 {
+            if str_char(raw, 0) == "\"" {
+                if str_char(raw, n - 1) == "\"" {
+                    raw = slice(raw, 1, n - 1)
+                }
+            }
+        }
+    }
+    var out: string = ""
+    var m = str_len(raw)
+    var i: i64 = 0
+    while i < m {
+        var c = str_char(raw, i)
+        if !is_raw && c == "\\" && i + 1 < m {
+            var e = str_char(raw, i + 1)
+            if e == "n" {
+                out = out + "\n"
+                i = i + 2
+            } else if e == "t" {
+                out = out + "\t"
+                i = i + 2
+            } else if e == "r" {
+                out = out + "\r"
+                i = i + 2
+            } else if e == "\\" {
+                out = out + "\\"
+                i = i + 2
+            } else if e == "\"" {
+                out = out + "\""
+                i = i + 2
+            } else if e == "'" {
+                out = out + "'"
+                i = i + 2
+            } else if e == "0" {
+                var zsb = string_builder()
+                sb_append_byte(zsb, 0)
+                out = out + sb_build(zsb)
+                i = i + 2
+            } else {
+                out = out + c
+                i = i + 1
+            }
+        } else {
+            out = out + c
+            i = i + 1
+        }
+    }
+    return out
+}
+
+pub func unescape_char(raw: string) -> i64 {
+    var s = unescape_str(raw)
+    var n = str_len(s)
+    if n == 0 {
+        return -1
+    }
+    return char_code(str_char(s, 0))
+}
+
+// ==================== 工具 ====================
+
+func utf_char_of(cp: i64) -> string {
+    if cp >= 32 {
+        if cp <= 126 {
+            return utf.to_char(cp)
+        }
+    }
+    return "?"
+}
+
+func slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+}   // namespace vval

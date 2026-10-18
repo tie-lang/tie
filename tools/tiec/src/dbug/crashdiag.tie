@@ -1,0 +1,183 @@
+type tie<logic>
+// compiler/dbug/crashdiag.tie —— p.9.2.1 崩溃诊断：运行期 panic 的
+// backtrace（解释器调用栈符号化）+ 崩溃日志文件。
+// ============================================================
+// 交付形态：独立工具（tiec 编译成 crashdiag.exe），驱动 compiler/interp
+// 解释器执行用户程序（先注册全部函数，再经零参入口 __tie_crash_entry__
+// 调 main()），并在 w_err 首次置位（panic）时：
+//   1) 把崩溃点解释器调用栈符号化（函数名 + 函数体首行，自外向内）；
+//   2) 拼装崩溃报告写日志文件（默认 <程序>.crash.log，-o 可覆盖）；
+//   3) 打印报告到控制台，退出码非 0。
+//
+// 约定（务实定界）：
+//   - 被测程序为**模块式**（只定义函数），入口为无参 `func main()`；
+//   - backtrace 符号化来源 = 解释器调用栈（interp_dbug 在 call_fn 进入/退出
+//     时维护的帧栈，配合 w_err 置位时的快照）——解释器语境下“符号化”即
+//     帧指针 → 函数名 + 行号映射（非 native 地址，见 docs/p.9.2.1.md）；
+//   - 编译器自身崩溃（tiec 本体段错误）走另一路径（旗帜日志/断言），本文
+//    档说明为后续火焰图/重症诊断范畴，不在本子项范围。
+//
+// 用法:
+//   crashdiag [-o <日志路径>] <program.tie>
+//
+// 退出码: 0 = 正常运行结束 / 1 = 运行期 panic（已写崩溃日志）/
+//         2 = 参数或程序加载/注册错误。
+
+import "../tiep/tiep.tie"
+
+var g_fail_early: string = "";
+
+// ---------- 源码预处理工具（去文件角色头 `type tie<...>`） ----------
+
+func cdx_has_prefix(s: string, p: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(p)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(p, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func cdx_isspace(c: string) -> bool {
+    var cd = char_code(c)
+    return cd == 32 || cd == 9 || cd == 10 || cd == 13
+}
+
+func cdx_trim(s: string) -> string {
+    var n = str_len(s)
+    var a: i64 = 0
+    while a < n && cdx_isspace(str_char(s, a)) {
+        a = a + 1
+    }
+    var b: i64 = n
+    while b > a && cdx_isspace(str_char(s, b - 1)) {
+        b = b - 1
+    }
+    var out: string = ""
+    var i: i64 = a
+    while i < b {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+// 逐行剔除以 "type tie" 开头的行（文件角色头，interp 解析器不识别）。
+func cdx_strip_hdr(src: string) -> string {
+    var out: string = ""
+    var line: string = ""
+    var i: i64 = 0
+    var n = str_len(src)
+    while i < n {
+        var c = str_char(src, i)
+        if char_code(c) == 10 {
+            var t = cdx_trim(line)
+            if !(cdx_has_prefix(t, "type tie")) {
+                out = out + line + "\n"
+            }
+            line = ""
+        } else {
+            line = line + c
+        }
+        i = i + 1
+    }
+    var tl = cdx_trim(line)
+    if tl != "" && !cdx_has_prefix(tl, "type tie") {
+        out = out + line
+    }
+    return out
+}
+
+// 注册被测程序函数 + 注入零参入口，返回错误文本（""=成功）。
+func load_program(src: string) -> string {
+    var clean = cdx_strip_hdr(src)
+    // 1. 注册源程序全部顶层函数
+    var r1 = tiep.eval(clean)
+    if w_err != "" {
+        return "程序注册失败: " + w_err
+    }
+    // 2. 注入单参入口，内部调 main()（main 需 0 参；eval_call 协议要求恰好 1 参）
+    var r2 = tiep.eval("func __tie_crash_entry__(arg: string) -> i64 { main() ; return 0 }")
+    if w_err != "" {
+        return "注入入口失败（被测程序需无参 main()）: " + w_err
+    }
+    return ""
+}
+
+// 崩溃报告文本。
+func build_report(prog: string, msg: string) -> string {
+    var s: string = ""
+    s = s + "=== tie 崩溃诊断 (p.9.2.1) ===\n"
+    s = s + "时间戳: " + to_string(time_now()) + "\n"
+    s = s + "程序: " + prog + "\n"
+    s = s + "错误: " + msg + "\n"
+    s = s + "调用栈 (backtrace, 自外向内):\n"
+    var d = tiep.dbg_err_depth()
+    if d == 0 {
+        s = s + "  (无候选栈帧)\n"
+    }
+    var i: i64 = 0
+    while i < d {
+        s = s + "  #" + to_string(i) + " " + tiep.dbg_err_name(i) +
+            " (行:" + to_string(tiep.dbg_err_line(i)) + ")\n"
+        i = i + 1
+    }
+    s = s + "符号化说明: 帧为解释器函数 + 函数体首行（源码 -g 行映射见 docs/p.9.2.1.md）\n"
+    return s
+}
+
+func main() -> i64 {
+    // 参数解析
+    var logpath: string = ""
+    var prog: string = ""
+    var i: i64 = 0
+    while i < arg_count() {
+        var a = arg_string(i)
+        if a == "-o" {
+            i = i + 1
+            if i < arg_count() {
+                logpath = arg_string(i)
+            }
+        } else if prog == "" {
+            prog = a
+        }
+        i = i + 1
+    }
+    if prog == "" {
+        println("用法: crashdiag [-o <日志>] <program.tie>")
+        return 2
+    }
+    if !file_exists(prog) {
+        println("崩溃诊断失败: 程序文件不存在: " + prog)
+        return 2
+    }
+    if logpath == "" {
+        logpath = prog + ".crash.log"
+    }
+    var src = file_read(prog)
+    tiep.reset()
+    tiep.dbg_start(false)
+    var err = load_program(src)
+    if err != "" {
+        println("崩溃诊断失败: " + err)
+        return 2
+    }
+    var res = tiep.eval_call("__tie_crash_entry__", "")
+    var _ignored = res
+    if w_err != "" {
+        // run-time panic 路径
+        var report = build_report(prog, w_err)
+        file_write(logpath, report)
+        print(report)
+        println("崩溃日志已写入: " + logpath)
+        return 1
+    }
+    return 0
+}

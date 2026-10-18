@@ -1,0 +1,15 @@
+type tie<logic>
+// tests/_p9126_rowpool_probe/rowpool_neg_probe.tie —— p.9.12.6 行池负例探针。
+// 负下标写拒绝：rows[-1] = r 运行时诊断「表下标越界（负索引）」并 exit(1)。
+// 期望 run rc=1 且输出含诊断消息（companion 负例，随 rowpool_probe.tie 验收）。
+struct N {
+    var v: i64 = 0
+}
+
+func main() -> i64 {
+    var t: table<N> = []
+    t[1] = N(1)
+    t[-2] = N(2)
+    println("UNREACHED")
+    return 0
+}

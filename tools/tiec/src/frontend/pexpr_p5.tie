@@ -1,0 +1,86 @@
+type tie<class>
+// compiler/frontend/pexpr_p5.tie —— 分片 5：运算符批（p.9.13.3）
+// ============================================================
+// 依据 docs/designs/tie-primitive-op-design.md §3。
+//
+// 本分片承载 `in` 中缀运算符（p.9.13.3）。
+// 解析期只产出中间形态 `N_BINARY(B_IN, elem, cont)`；**类型分派在语义层**——
+// 容器类型解析期不可知，语义期已知（node_types）。语义层把该节点**重写**为
+// 对应的库调用，故 irgen 见不到 B_IN：
+//   右 string → `lang::str_has(hay, needle)`（子串，O(n·m) 朴素匹配）
+//   右 table  → `lang::seq_has(t, v)`（元素，泛型单态化覆盖全部元素类型）
+//   右 map    → `lang::map_has(m, k)`（键，O(1)——底层走内置 map_contains）
+//
+// 优先级（设计：介于比较与逻辑之间；实测后定在 **比 `==` 更紧**）：
+//   `x in xs == false` → `(x in xs) == false`（自然写法，故 `in` 比 `==` 紧）
+//   `x in xs && flag`  → `(x in xs) && flag`（&& 远松于 in，天然成立）
+//   `a == b in xs`     → `a == (b in xs)`（确定性，不歧义）
+// 由 `parse_equality` 的内侧调用接通（`parse_equality → parse_in_expr →
+// parse_comparison`）。
+//
+// 与 `for x in xs` 的关系：for 的绑定名由 `putil.expect_ident()` 直读（非表达式
+// 解析），`in` 由 for 语句自己消费，故表达式层的 `in` **不会**干扰 for 循环
+// （实测：全量回归无变化）。
+//
+// 边界：容器须为 string / table / map 三者之一，其它类型在语义层报错。
+// `not in` 暂无——tie 无 `not` 关键字（逻辑非是 `!`），新增属破坏性改动；
+// 当前可写 `!(x in xs)`。
+namespace pexpr {
+
+// 构造 `in` 的**中间形态**节点：N_BINARY(B_IN)，children = [泛型槽, 容器, 键/元素]。
+// 刻意做成**与调用节点同形**（含首泛型槽、children 数 3）：语义层据此只需把
+// tag 换成 S_N_CALL、写入目标函数名即可（children 长度不变，符合既有「就地改写
+// 调用节点 children 段」的范式），随后交由**正常调用通道**处理——这很关键，
+// 因为 `seq_has<T>` / `map_has<V>` 是**泛型**函数，没有具体 `fn_sig`，
+// 用 `tig_user_call_from` 直接发射会因 sig=-1 失败（实测）。
+// 容器在前、键/元素在后 = 三个目标库函数的统一签名。
+func mk_in_call(elem: i64, cont: i64) -> i64 {
+    var n = ast.new_node(N_BINARY, -1, B_IN, -1, ast.line(elem), ast.col(elem))
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, -1)      // 泛型槽（改写为调用后沿用）
+    table_push(kids, cont)
+    table_push(kids, elem)
+    ast.set_children(n, kids)
+    return n
+}
+
+// `in` 中缀层（左结合）：`elem in container` → 中间形态（语义层再定目标函数）。
+// 同时支持 `not in`（p.9.13.3）：识别为**一词法组合**——当前 token 是标识符
+// `not` 且紧随 `in` 时，等价于 `!(elem in container)`。
+// 实现取解析层前瞻（不改词法表、**不把 `not` 升为全局保留字**），故既满足设计
+// 「`not in` 为一词法组合」的意图，又不破坏把 `not` 用作普通标识符的既有代码。
+func parse_in_expr() -> i64 {
+    var lhs = parse_is()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var negate: bool = false
+        if putil.peek_tag() == lex_ident && putil.peek_n(1) == lex_in {
+            // `not in` 组合：仅当标识符文本恰为 "not" 且下一 token 是 `in`
+            if putil.peek_lexeme() == "not" {
+                negate = true
+                putil.advance()   // 'not'
+            } else {
+                d = true
+            }
+        } else if putil.peek_tag() != lex_in {
+            d = true
+        }
+        if !d {
+            putil.advance()   // 'in'
+            var rhs = parse_is()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_in_call(lhs, rhs)
+            if negate {
+                lhs = mk_unary(U_NOT, lhs, ast.line(lhs), ast.col(lhs))
+            }
+        }
+    }
+    return lhs
+}
+
+}

@@ -1,0 +1,90 @@
+type tie<class>
+// compiler/backend/builtin_expr_seg3.tie —— builtin_expr 分派链分段 3（p.9.21 G2 单函数 ≤300 行）
+// ============================================================
+// 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
+// 与原函数同 namespace，跨文件裸名互调；段尾 return <sentinel> = 本段未命中。
+namespace irgen {
+    func builtin_expr_seg3(nm: string, id: i64) -> i64 {
+        // stdout_write_bytes(字节表) / stdout_write_str(串) → 写入字节数（tig_stdout_write_*）
+        if nm == "stdout_write_bytes" || nm == "stdout_write_str" {
+            var so1 = tig_expr(call_arg(id, 0))
+            if so1 < 0 {
+                return -1
+            }
+            if nm == "stdout_write_bytes" {
+                g_builtin_res = tig_stdout_write_bytes(so1)
+            } else {
+                g_builtin_res = tig_stdout_write_str(so1)
+            }
+            return 0
+        }
+        // bit_read：字节表 + 位置 → i64（tig_bit_read 原生实现，越界 0）
+        if nm == "bit_read" { return bi_bit_read(nm, id) }
+        // bit_write：字节表 + 位置 + 位 → bool（tig_bit_write 原生实现，越界 false）
+        if nm == "bit_write" { return bi_bit_write(nm, id) }
+        // byte_concat：字节表 + 字节表 → 字节表（tig_byte_concat 原生实现）
+        if nm == "byte_concat" { return bi_byte_concat(nm, id) }
+        // set_env：内联 SetEnvironmentVariableW（UTF-16 桥）；msg_set_lang：单参 void
+        if nm == "set_env" { return bi_set_env(nm, id) }
+        // ---------- p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表） ----------
+        // 不再走 tie_msg_* Rust 桥（g_used_interp=false）。状态 = 运行期程序全局槽
+        // @__msg_lang / @__msg_keys / @__msg_langs / @__msg_texts（惰性登记 + 惰性建表，
+        // 见 tig_msg_reg_globals / tig_msg_ensure）。
+        // ---------- p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表） ----------
+        if nm == "msg_set_lang" { return bi_msg_set_lang(nm, id) }
+        if nm == "msg_get_lang" { return bi_msg_get_lang(nm, id) }
+        if nm == "msg_register" { return bi_msg_register(nm, id) }
+        if nm == "msg_t" { return bi_msg_t(nm, id) }
+        if nm == "msg_t_lang" { return bi_msg_t_lang(nm, id) }
+        // rand_range：i64 半开区间 [min,max)；内联 libc rand()（非密码学安全）
+        if nm == "rand_range" { return bi_rand_range(nm, id) }
+        // table_at：表 + 下标 → 元素（与 t[i] 同语义；元素类型 fallback 判定）
+        if nm == "table_at" { return bi_table_at(nm, id) }
+        if nm == "table_pop" { return bi_table_pop(nm, id) }
+        if nm == "table_trunc" { return bi_table_trunc(nm, id) }
+        if nm == "table_append" { return bi_table_append(nm, id) }
+        if nm == "table_append_raw" { return bi_table_append_raw(nm, id) }
+        if nm == "table_reserve" { return bi_table_reserve(nm, id) }
+        // ---------- trm-lite 轻量执行体原语（阶段1块2：spawn/yield/collect） ----------
+        if nm == "spawn" { return bi_spawn(nm, id) }
+        if nm == "yield" { return bi_yield(nm, id) }
+        if nm == "gosched" { return bi_gosched(nm, id) }
+        if nm == "collect" { return bi_collect(nm, id) }
+        // ---------- channel 原语（p.6.5.7：mailbox 承载，静态链接 trm_lite.a）----------
+        // ch_open() → i64 新通道句柄；入队前初始化各平行数组/环形缓冲（trm_lite.a 内部完成）。
+        // ---------- channel 原语（p.6.5.7：mailbox 承载，静态链接 trm_lite.a） ----------
+        if nm == "ch_open" { return bi_ch_open(nm, id) }
+        if nm == "ch_len" { return bi_ch_len(nm, id) }
+        if nm == "ch_closed_flag" { return bi_ch_closed_flag(nm, id) }
+        if nm == "ch_count" { return bi_ch_count(nm, id) }
+        // ch_send(ch, v) → i64（0=入队成功 1=失败：通道关闭或队列满）。
+        if nm == "ch_send" { return bi_ch_send(nm, id) }
+        // ch_send_block(ch, v) → i64（p.9.5.x T3 背压：队满阻塞等待空位；0=已入队
+        // 1=通道关闭）。trm_lite_chan$ch_send_block 条件变量等待，Go 阻塞 send。
+        if nm == "ch_send_block" { return bi_ch_send_block(nm, id) }
+        // ch_recv(ch) → i64（消息值；0=空未关；-1=已关闭且空）。
+        if nm == "ch_recv" { return bi_ch_recv(nm, id) }
+        // ch_close(ch) → void：置关闭位（幂等）；唤醒等待者。trm_lite_chan$ch_close。
+        if nm == "ch_close" { return bi_ch_close(nm, id) }
+        // ---------- p.6.7.12 ch_select：多路收发（平行数组承载） ----------
+        // ch_select(handles: table<i64>, actions: table<i64>, values: table<i64>)
+        //   → i64（命中分支下标 0 起 / -1 无可执行分支）。actions[i]=1 recv / -1 send。
+        // 三个表实参经 t21_ptri 转 i64 句柄传入（运行时自行按容器布局读元素）。
+        // ---------- p.6.7.12 ch_select：多路收发（平行数组承载） ----------
+        if nm == "ch_select" { return bi_ch_select(nm, id) }
+        // ---------- WaitGroup 原语（p.6.7.11：Go sync.WaitGroup 语义，trm_lite_wg$*） ----------
+        // wg_new() → i64 新组句柄。
+        // ---------- WaitGroup 原语（p.6.7.11：Go sync.WaitGroup 语义，trm_lite_wg$*） ----------
+        if nm == "wg_new" { return bi_wg_new(nm, id) }
+        // wg_add(h, n) → void。
+        if nm == "wg_add" { return bi_wg_add(nm, id) }
+        // wg_done(h) → void。
+        if nm == "wg_done" { return bi_wg_done(nm, id) }
+        // wg_wait(h) → void。
+        if nm == "wg_wait" { return bi_wg_wait(nm, id) }
+        // wg_count(h) → i64（r.1.5.2）：剩余未 done 计数（观察量，wg_wait 轮询用；
+        // trm-lite wg 实现：计数归零钳 0，返回值即 g_wg_cnt[h-1]）。
+        if nm == "wg_count" { return bi_wg_count(nm, id) }
+        return -1  // 本段未命中
+    }
+}

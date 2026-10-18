@@ -1,0 +1,330 @@
+type tie<class>
+// compiler/middle/tieir_asm.tie —— p.9.21.9 片段装配器：入口 + 片段解析
+// ============================================================
+// v3（p.9.21.11）：u32 LE + UTF-8 + p1 偏置（i64 逃逸）+ [kind, payload]
+// 操作数序；symtab/export/片段头转存重放。装配重放侧（build_seq/replay）
+// 拆至 tieir_asm_replay.tie（同 namespace 跨文件，铁律 11 拆解批次）。
+// compiler/middle/tieir_asm.tie —— p.9.21.9 片段组装消费（装配器，与 write_mod_slice 对偶）
+// ============================================================
+// 全模块片段缓存命中时，跳过 irgen+passes（片段 = pass 后 IR，键含 t 档），
+// 按装配序把各模块 .tir 片段重放为完整单元 IR（ir/ir_meta 全局状态）。
+//
+// # 装配序（driver 注入 asm_from_slices 的 order 参数）
+//   order = [主片段头部合成（actor thunk/dispatch，保序）] + [g_extra_tops 序
+//   的函数全名（driver 复刻 tig_fn_def/tig_ns 取名）] + [主片段尾部合成]。
+//   g_extra_tops 是源码级交错序（import 就地展开），片段拼接序不成立
+//   （findings §8.4）。合成识别：主片段（模块 0）中不匹配 order 的函数，
+//   首个匹配之前的为头部合成、其余为尾部合成（合成由 irgen 前置/后置生成，
+//   在主片段函数序中位于两端）。
+//
+// # 重放与字节一致（findings §8.2/§8.3）
+//   - ir 构造调用（new_func/new_block/new_inst/add_operand）按原创建序重放 →
+//     值空间/块 id/指令 id/params_off/ops_off/block start-end 自然复现；
+//   - 操作数映射：kind 0 值 → 片段内偏移（v - vbase）< 参数数 ? 全局参数值
+//     （ir.param_val）: 全局结果值（重放时按偏移登记）；池载荷操作数①
+//     （const_str(62)/const_f(51)/call(35)/extern_call(36)/call_vararg(41)）
+//     与 kind 3（全局名）→ 片段池 id → 全局池 id（str_pool 幂等 intern）；
+//     kind 1 块 → 片段块 lid → 全局块 id；kind 2 原样；
+//   - exported 重放（ir.func_export_set）；span 按全局指令位写回（行序 =
+//     片段指令序）；符号/导出段在真实产物中恒空（编译器零调用点）→ 段 4/6
+//     自动一致；池段允许排列差异（分段口径，findings §8.2）；
+//   - 解析防御：段 4/6 行数非 0、span 行数与指令数不符 → 拒绝（driver 降级
+//     全量路径，响亮打印）。
+//
+// # 语言边界（同 tieir_slice）
+//   - namespace tieir（import tieir_ser 文本内联合并 → rd_i64/rd_str/
+//     rd_sec_head/set_err/str_pool/SEC_*/TIEIR_VERSION 私有可见）；
+//   - 片段字节表只读；转存走本文件全局扁平表（per-片段基址索引）。
+//
+// 自检：探针工程装配 vs 全量 --tieir-out 分段 SHA 对比（操作台验收）。
+
+import "./tieir_ser.tie"
+import "./tieir_fmt_v3.tie"
+import "./tieir_asm_parse.tie"
+import "./tieir_asm_replay.tie"
+
+
+// ---------- 元数据转存（v3：片段头/sym/exp 不再拒收，重放回 ir_meta） ----------
+pub var asm_m_pkg: table<i64>;       // 片段 → 包名池 id（set_pkg_name）
+pub var asm_m_ver: table<i64>;       // 片段 → 版本串池 id（set_pkg_version）
+pub var asm_m_irver: table<i64>;     // 片段 → ir 版本
+pub var asm_m_topt: table<i64>;      // 片段 → t 档
+pub var asm_m_pver: table<i64>;      // 片段 → pass 版本
+pub var asm_m_cver: table<i64>;      // 片段 → 编译器版本串池 id
+pub var asm_m_dep_base: table<i64>;  // 片段 → 依赖对基址（len = n+1）
+pub var asm_m_dep: table<i64>;       // 扁平依赖对 [name_pid, ver_pid, ...]
+pub var asm_sym_base: table<i64>;    // 片段 → sym 行基址（len = n+1）
+pub var asm_sym: table<i64>;         // 扁平 sym 行 [name_pid, sig_pid, kind, vis, line, col]
+pub var asm_exp_base: table<i64>;    // 片段 → exp 行基址（len = n+1）
+pub var asm_exp: table<i64>;         // 扁平 exp 行 [name_pid, sig_pid, line, col]
+
+// ---------- 转存表（per-片段基址索引；tie 无二维表，扁平 + 基址） ----------
+pub var asm_f_base: table<i64>;      // 片段 → 函数记录基址（len = n+1）
+pub var asm_f_gname: table<i64>;     // 函数记录 → 全局池 id
+pub var asm_f_ret: table<i64>;
+pub var asm_f_pcnt: table<i64>;
+pub var asm_f_ex: table<i64>;
+pub var asm_f_vbase: table<i64>;     // 片段值基址（解析回填）
+pub var asm_f_pty_base: table<i64>;  // 函数 → 参数类型扁平基址
+pub var asm_f_pty: table<i64>;
+pub var asm_f_blk_base: table<i64>;  // 函数 → 块段基址（下标进 asm_fb_idx，见下）
+pub var asm_f_blk_cnt: table<i64>;
+// p.9.21.9 收口：块/指令的**按函数分组**索引（原实现假设「块表内同函数的块
+// 连续」——闭包/嵌套生成会让同一函数的块在块表里交错，导致指令区间串到别的
+// 函数、值偏移整体错位。改为显式分组：asm_fb_idx = 每函数的块记录下标段（
+// 块表相对序保序），asm_bi_base/cnt = 每块记录的指令区间）。
+pub var asm_fb_idx: table<i64>;      // 扁平：函数段 → 块记录下标（块表序）
+pub var asm_bi_base: table<i64>;     // 块记录 → 指令记录基址
+pub var asm_bi_cnt: table<i64>;      // 块记录 → 指令数
+pub var asm_i_blk: table<i64>;       // 指令记录 → 全局块记录下标（重放单趟挂块用）
+pub var asm_f_used: table<i64>;      // 装配序命中标记（0/1）
+pub var asm_b_base: table<i64>;      // 片段 → 块记录基址
+pub var asm_b_fid: table<i64>;       // 块记录 → 全局函数记录下标
+pub var asm_b_gname: table<i64>;     // 块记录 → 全局池 id
+pub var asm_b_gid: table<i64>;       // 块记录 → 重放后全局块 id
+pub var asm_i_base: table<i64>;      // 片段 → 指令记录基址
+pub var asm_i_op: table<i64>;
+pub var asm_i_ty: table<i64>;
+pub var asm_i_val: table<i64>;       // 片段结果值（-1 = 无）
+pub var asm_i_cnt: table<i64>;
+pub var asm_i_obase: table<i64>;     // 指令 → 操作数基址
+pub var asm_o_v: table<i64>;         // 操作数载荷（值 = 片段值；池类 = 全局池 id；块 = 片段块 lid；立即数原样）
+pub var asm_o_k: table<i64>;         // 操作数 kind（原样）
+pub var asm_o_pool: table<i64>;      // 1 = 池载荷（载荷已是全局池 id）
+pub var asm_pr_base: table<i64>;     // 片段 → 池 remap 基址
+pub var asm_pr: table<i64>;          // 片段池 id → 全局池 id
+pub var asm_frag_fn: table<i64>;     // 片段 → 函数数
+// p.9.21.9 收口：值映射表（片段值 id → 重放后的全局 ir 值 id；-1 = 未登记）。
+// 替代原「per-fn 结果表 + 偏移」算法——后者隐含「同函数的值域连续」假设，而
+// 闭包/嵌套生成会让两个函数的值在原始值空间**交错**（父函数体生成途中生成
+// 闭包函数 → 闭包的值插在父函数值中间），偏移算法必然错位（实测 driver 树
+// str::trim_start 报「值操作数引用未登记结果」）。显式按值 id 建表则与交错
+// 无关：片段值 id 是唯一键，登记即查。
+pub var asm_vmap: table<i64>;
+// p.9.21.10：每片段值空间的全局基址——各片段值 id 独立从 0 压缩，vmap 是
+// 全局键空间，必须加片段基址才唯一（否则跨片段键碰撞 → 装配错值）。
+pub var asm_frag_vbase: table<i64>;
+pub var asm_frag_vtotal: i64 = 0;    // 此前各片段值空间大小的全局累计
+// p.9.21.9 收口：指令 gid 回执表（下标 = 指令记录；重放两趟法的中间态）。
+// 两趟法动因：真实 IR 存在**前向值引用**（phi/合并类指令 op33、load op21 等
+// 的操作数指向创建序更靠后的值——irgen 先建指令、后补操作数，离线核查 driver
+// 片段共 910 处）。单趟「建指令即加操作数」必然撞未登记值 → 装配失败降级。
+// 两趟：①建函数/块/指令（值登记进 asm_vmap）→ ②按指令序补操作数（此时值
+// 全部就绪）。操作数表顺序与单趟一致（仍按指令序、指令内操作数序）。
+pub var asm_i_gid: table<i64>;
+pub var asm_seq: table<i64>;         // 装配序 → 函数记录下标
+pub var asm_flag_sso: bool = false;   // 片段引用 s21_sso_* 全局（llvmgen.sso_enable 恢复用）
+pub var asm_flag_wsock: bool = false; // 片段引用 @g_wsock_init
+pub var asm_flag_catch: bool = false; // 片段引用 tie_panic_jb/active
+pub var asm_flag_sc: bool = false;    // 片段 call @tie_sc_off（str_char 缓存 helper）
+// p.9.21.9 收口：装配路径的 irgen 副作用恢复素材——
+//   asm_grefs = 片段引用的全局名（kind 3 操作数池 id，去重）→ driver 据此
+//     恢复全局登记族（linux_args/msg/rng/循环哨兵）与做「登记完备」校验；
+//   asm_exts  = 片段 extern_call(36) 的符号名池 id（去重）→ driver 据此恢复
+//     链接判据（g_used_trmlite/g_used_interp）。二者均为池 id（全局域）。
+var asm_grefs: table<i64>;
+var asm_exts: table<i64>;
+
+namespace tieir {
+
+// 全局名归一化（去 '@' 前缀）：IR 里全局名带/不带前缀两种写法并存，
+// 白名单比对（置位恢复/登记完备校验）一律按裸名。
+// p.9.21.11：单字符循环拼接 O(n²) → str_sub_bytes 单次拷贝（池载荷操作数
+// 热路径，每池引用一次；'@' 后必为 ASCII 标识符，码点数 = 字节数）。
+func asm_bare_name(s: string) -> string {
+    if str_len(s) > 1 && str_byte(s, 0) == 64 {   // '@'
+        return str_sub_bytes(s, 1, str_len(s))
+    }
+    return s
+}
+
+// 池 id 去重入表（is_ref = true → 全局名引用表 asm_grefs；false → extern
+// 符号表 asm_exts）。装配路径的 irgen 副作用恢复只关心「出现与否」，不关心序。
+func asm_push_dedup(gpid: i64, is_ref: bool) {
+    // ★ 必须直接写目标全局表（2026-10-07 修）：此前用 `var t = asm_exts` 取一份
+    //   再 push —— 值语义下那是**副本**，push 触发写前分离只改副本、函数返回即丢，
+    //   于是 asm_grefs / asm_exts **永远为空**（去重入表整体失效）。汇编恢复路径
+    //   （driver 据 asm_gref_count/asm_ext_count 判定 `tl_*` 符号与 extern 名）据此
+    //   误判，恒走「副作用恢复失败降级全量」。
+    //   由 W00031 第二形态（写入副本后未使用）在自编译时抓到。
+    var i: i64 = 0
+    if is_ref {
+        while i < len(asm_grefs) {
+            if asm_grefs[i] == gpid {
+                return
+            }
+            i = i + 1
+        }
+        table_push(asm_grefs, gpid)
+        return
+    }
+    while i < len(asm_exts) {
+        if asm_exts[i] == gpid {
+            return
+        }
+        i = i + 1
+    }
+    table_push(asm_exts, gpid)
+}
+
+// 指令记录 → 所属片段号（两趟法第二趟按指令序补操作数时用）
+func asm_inst_frag(gi: i64) -> i64 {
+    var m: i64 = 0
+    while m + 1 < len(asm_i_base) {
+        if gi >= asm_i_base[m] && gi < asm_i_base[m + 1] {
+            return m
+        }
+        m = m + 1
+    }
+    return 0
+}
+
+// 值映射表写入（按需增长，未登记槽 = -1）
+pub func asm_vmap_set(idx: i64, v: i64) {
+    while len(asm_vmap) <= idx {
+        table_push(asm_vmap, -1)
+    }
+    asm_vmap[idx] = v
+}
+
+// 记录下标 → 所属片段号（基址表线性定位；片段数十级，代价可忽略）。
+pub func asm_rec_frag(r: i64) -> i64 {
+    var m: i64 = 0
+    while m + 1 < len(asm_f_base) {
+        if r >= asm_f_base[m] && r < asm_f_base[m + 1] {
+            return m
+        }
+        m = m + 1
+    }
+    return 0
+}
+
+// ---------- 解析：片段 m 的字节表 → 转存（v3 格式，见 tieir_fmt_v3 头注） ----------
+pub func asm_flag_sso() -> bool { return asm_flag_sso }
+pub func asm_flag_wsock() -> bool { return asm_flag_wsock }
+pub func asm_flag_catch() -> bool { return asm_flag_catch }
+pub func asm_flag_sc() -> bool { return asm_flag_sc }
+// p.9.21.9 收口：装配路径副作用恢复素材（池 id，driver 侧 interner.name_str 取文本）
+pub func asm_gref_count() -> i64 { return len(asm_grefs) }
+pub func asm_gref_id(i: i64) -> i64 { return asm_grefs[i] }
+pub func asm_ext_count() -> i64 { return len(asm_exts) }
+pub func asm_ext_id(i: i64) -> i64 { return asm_exts[i] }
+
+pub func asm_from_slices(paths: table<string>, order: table<string>) -> i64 {
+    var n = len(paths)
+    if n == 0 {
+        set_err("asm: 空片段表")
+        return -1
+    }
+    // 复位转存表
+    asm_f_base = table_new_i64()
+    asm_f_gname = table_new_i64()
+    asm_f_ret = table_new_i64()
+    asm_f_pcnt = table_new_i64()
+    asm_f_ex = table_new_i64()
+    asm_f_vbase = table_new_i64()
+    asm_f_pty_base = table_new_i64()
+    asm_f_pty = table_new_i64()
+    asm_f_blk_base = table_new_i64()
+    asm_f_blk_cnt = table_new_i64()
+    asm_fb_idx = table_new_i64()
+    asm_bi_base = table_new_i64()
+    asm_bi_cnt = table_new_i64()
+    asm_i_blk = table_new_i64()
+    asm_f_used = table_new_i64()
+    asm_b_base = table_new_i64()
+    asm_b_fid = table_new_i64()
+    asm_b_gname = table_new_i64()
+    asm_b_gid = table_new_i64()
+    asm_i_base = table_new_i64()
+    asm_i_op = table_new_i64()
+    asm_i_ty = table_new_i64()
+    asm_i_val = table_new_i64()
+    asm_i_cnt = table_new_i64()
+    asm_i_obase = table_new_i64()
+    asm_o_v = table_new_i64()
+    asm_o_k = table_new_i64()
+    asm_o_pool = table_new_i64()
+    asm_pr_base = table_new_i64()
+    asm_pr = table_new_i64()
+    asm_frag_fn = table_new_i64()
+    asm_vmap = table_new_i64()
+    asm_frag_vbase = table_new_i64()
+    asm_frag_vtotal = 0
+    asm_i_gid = table_new_i64()
+    asm_seq = table_new_i64()
+    asm_grefs = table_new_i64()
+    asm_exts = table_new_i64()
+    asm_m_pkg = table_new_i64()
+    asm_m_ver = table_new_i64()
+    asm_m_irver = table_new_i64()
+    asm_m_topt = table_new_i64()
+    asm_m_pver = table_new_i64()
+    asm_m_cver = table_new_i64()
+    asm_m_dep_base = table_new_i64()
+    asm_m_dep = table_new_i64()
+    asm_sym_base = table_new_i64()
+    asm_sym = table_new_i64()
+    asm_exp_base = table_new_i64()
+    asm_exp = table_new_i64()
+    asm_flag_sso = false
+    asm_flag_wsock = false
+    asm_flag_catch = false
+    asm_flag_sc = false
+    var m: i64 = 0
+    var dbg_t0: i64 = 0
+    unsafe { dbg_t0 = GetTickCount() }
+    var dbg_bytes: i64 = 0
+    while m < n {
+        var t = bytes.read(paths[m])
+        if len(t) == 0 {
+            set_err("asm: 片段读取失败: " + paths[m])
+            return -1
+        }
+        dbg_bytes = dbg_bytes + len(t)
+        if asm_parse_slice(t, m) != 0 {
+            return -1
+        }
+        m = m + 1
+    }
+    // 元数据转存表尾哨兵（replay 的 [mm, mm+1) 区间扫描需要）
+    asm_m_dep_base[n] = len(asm_m_dep)
+    asm_sym_base[n] = len(asm_sym)
+    asm_exp_base[n] = len(asm_exp)
+    var dbg_t1: i64 = 0
+    unsafe { dbg_t1 = GetTickCount() }
+    var dbg_t2: i64 = 0
+    unsafe { dbg_t2 = GetTickCount() }
+    // 尾哨兵（per-片段基址表统一长度 n+1）
+    asm_f_base[n] = len(asm_f_gname)
+    // 注意：asm_f_pty_base 是**函数记录**索引（push 式），此处绝不能写 [n]
+    //（n = 片段数）——曾越界改写第 n 号函数记录的类型基址，其参数类型全变
+    // 零值（driver 实测 putil::slice_str 签名 (ptr,i64,i64) → (i8,i8,i8)）。
+    // 该哨兵无消费者（重放只按函数记录读），直接移除。
+    if asm_build_seq(order) != 0 {
+        return -1
+    }
+    if asm_replay() != 0 {
+        return -1
+    }
+    var dbg_t3: i64 = 0
+    unsafe { dbg_t3 = GetTickCount() }
+    if get_env("TIEC_ASMDBG") == "1" {
+        println("ASMDIAG parse=" + to_string(dbg_t1 - dbg_t0) + "ms bytes=" + to_string(dbg_bytes) +
+            " seq+replay=" + to_string(dbg_t3 - dbg_t2) + "ms")
+    }
+    // 全覆盖：重放函数数 == 全部片段函数数
+    var total: i64 = 0
+    m = 0
+    while m < n {
+        total = total + asm_frag_fn[m]
+        m = m + 1
+    }
+    if ir.func_count() != total {
+        set_err("asm: 重放函数数不符（" + to_string(ir.func_count()) + "/" + to_string(total) + "）")
+        return -1
+    }
+    return 0
+}
+
+}   // namespace tieir

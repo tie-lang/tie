@@ -1,0 +1,66 @@
+type tie<class>
+// compiler/backend/irgen_stmt.tie —— 生成器 L4 语句/控制流层 子模块
+// ============================================================
+// 从 irgen.tie 拆分而来：这是 irgen LLVM 风格分层重构的 S5（第五步）。
+// 本文件承载 L4 语句/控制流层：语句主调度器 tig_stmt、switch（tig_switch）、
+// for 遍历（tig_for_chars/tig_for_table）、索引读写（tig_index_read/
+// tig_index_assign）、打印（tig_println）、块语句（tig_block_stmts）、
+// 变量引用收集（find_var_refs/collect_var_refs）等。
+//
+// 拆分范式：【同 namespace 跨文件】（文本内联）。
+// 同 irgen_arith.tie（S3）/ irgen_expr.tie（S4）。irgen.tie 顶层 import 本文件
+// 后，本文件被文本内联进同一编译单元，声明与 irgen.tie 相同的 `namespace irgen`，
+// 同名 namespace 跨文件闭合并集：
+//   - 同 namespace 函数可互相裸名调用（主文件照常裸名调用 tig_stmt 等）；
+//   - 可访问主文件顶层全局 var（g_cur_block/g_cur_func/node_types/s_tags 等）；
+//   - 本文件只含函数与注释，不含顶层全局 var 声明、不含 import——
+//     全局 var 与 import 树均留在 irgen.tie 主文件，避免重复定义。
+namespace irgen {
+
+
+// ==================== 循环内字符串自加 StringBuilder 提升（p.6.1.4） ====================
+// 识别 `out = out + seg...`（string 局部变量自加拼接）→ 循环内自动改为
+// StringBuilder 追加（s21_sb_*），循环出口 sb_build 回写 out。根治 str_cat
+// O(n²) 无名分配带来的内存无界增长（每次 + 新分配、旧中间串永不释放）。
+// 提升前提（逐项静态核对，任何不满足即退回原 str_cat 路径）：
+//   1) out 是函数内局部 string 变量（非全局）
+//   2) 循环体（含条件）内 out 的全部引用仅是自加 RHS 的最左叶子——
+//      无其它读、无取址/传参、无非自加赋值（其它写）
+//   3) 循环体内无 goto 逃出（break/continue 均汇入 exit/cond 块，安全）
+// 语义与原逐段拼接完全等价：最终 out = 全部段的顺序拼接。
+
+
+// ==================== 字节表自加 StringBuilder 提升（cbs，p.6.1.4） ====================
+// 识别 `t = byte_concat(t, seg...)`（局部字节表变量自加累积）→ 循环内改为
+// 私有累积表 acc 就地追加，循环出口写回 t。根治 byte_concat O(n²) 无名分配
+//（每迭代新建整表 + 旧表永不释放，dpcodec/jcc-pack encode 内存无界增长根因）。
+// 安全前提（与字符串 sb 提升同构，逐项核对）：
+//   1) t 是函数内局部 table<i64> 变量（非全局）
+//   2) 循环体（含条件）内 t 的全部引用仅是自加 RHS 第一实参（Var(t)）——
+//      无其它读、无取址/传参、无非自加赋值（其它写）
+//   3) 循环体内无 goto 逃出
+// 装配：循环前 acc = 拷贝(t)（唯一引用，旧表只读不写 → 无别名污染）；
+// 体内自加 → acc 就地追加（tl_tbl$tbl_ensure 扩容免旧块 + memcpy）；
+// 循环出口（break 经 exit 块覆盖）store acc 到 t 槽。语义与原逐段拼接完全等价。
+
+
+// ==================== p.9.11.4 defer 资源释放 ====================
+// defer 在 irgen 侧以「编译期注册表 + 出口发射」实现：
+//   - 每函数维护 g_def_bodies/g_def_flags/g_def_scopes 三表（函数开始置空）。
+//   - 每遇 `defer { body }`：注册 body StmtList 节点 + 分配 bool 标志 alloca
+//     （置 false），记录注册所在循环作用域标记（g_cur_loop_sc 计数）。
+//   - 退出执行点（函数正常收尾 / return / `?` Err 传播 / 循环自然结束+break）
+//     按需发射「LIFO 执行链」：逆序遍历满足作用域条件的 defer，用运行时标志
+//     守卫（条件注册立即生效），执行其 body 后清标志，汇合到 continuation。
+//   - panic 不可恢复（进程退出）不执行 defer（裁决注明）；continue 不退出循环
+//     体作用域故不触发（与 Go 语义一致）。
+// 全局表 g_def_bodies/g_def_flags/g_def_scopes/g_def_cnt/g_def_sc/sc_cnt/g_block_lvl/
+// g_in_fn_body 声明于 irgen.tie 主文件（本子文件只允许 func）。
+
+
+}
+
+import "./irgen_stmt_p1.tie"
+import "./irgen_stmt_p2.tie"
+import "./irgen_stmt_p3.tie"
+import "./irgen_stmt_p4.tie"

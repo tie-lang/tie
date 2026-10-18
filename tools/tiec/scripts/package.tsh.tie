@@ -1,0 +1,246 @@
+type tie<tsh>
+// scripts/package.tsh.tie —— tie 正式发行版打包脚本（Windows，0-Rust）tsh-role 移植 package.ps1
+// ============================================================================
+// 职责：自举验证（tiec 编译 driver.tie→tiec2.exe）→ 可选 repl 自举 → 组装发行目录
+//   dist/tie-{版本}/（bin/docs/examples/内置库 std ext rdu sys/skills/editor/compiler）
+//   → 生成 zip（Windows 自带 tar，0 外部依赖）。产物 dist/tie-{版本}-win-x64.zip。
+// 用法（仓库根目录）：<tsh> -f scripts/package.tsh.tie [ReleaseVersion] [LlvmDir] [--skip-repl] [--skip-llvm]
+//   例：<tsh> -f scripts/package.tsh.tie Harbor-2026.1-preview.2
+//       <tsh> -f scripts/package.tsh.tie 2026.2 D:\LLVM --skip-repl
+// 移植说明：
+//   - 内置库 std/ext/rdu/sys 从库根（--lib-root / TIE_LIB_ROOT / 默认 ~/.tiec-lib/tlib）取值。
+//   - 文件复制经 cmd `copy /y`/`xcopy`（tsh 无 file_copy/copy_dir 内建）；递归过滤复制经
+//     walk_dir（返回全路径）+ replace 前缀得到相对路径。
+//   - zip 用 Windows 自带 tar（`tar -a -c -f <zip> -C <root> <distname>`），等价 Compress-Archive。
+//   - 自举/编译失败以 exec_code 退出码判定（实测可靠）。参数经函数 return 解析（避免 interp
+//     的 if-内重赋值缺陷）。
+
+func bstr(b: bool) -> string { if b { return "T" } return "F" }
+func fex(p: string) -> bool {
+    var r = exec_output("cmd /c if exist " + p + " (echo _FE_YES) else (echo _FE_NO) 2>&1")
+    return contains(r, "_FE_YES")
+}
+func dirname(p: string) -> string {
+    return replace_all(p, "\\" + path_basename(p), "")
+}
+func pick_lic(a: string, b: string) -> string {
+    if fex(a) { return a }
+    return b
+}
+// 复制单文件（目标父目录 mkdir_all 后 cmd copy）
+func copy_file(src: string, dst: string) -> i64 {
+    var _m = mkdir_all(dirname(dst))
+    return exec_code("cmd /c copy /Y \"" + src + "\" \"" + dst + "\" >nul 2>&1")
+}
+
+// 参数解析（函数 return 避免 if-内重赋值缺陷）
+func get_version() -> string {
+    if arg_count() >= 1 && !is_empty(arg_at(0)) && !has_prefix(arg_at(0), "--") { return arg_at(0) }
+    return "2026.1"
+}
+func get_llvm() -> string {
+    if arg_count() >= 2 && !is_empty(arg_at(1)) && !has_prefix(arg_at(1), "--") { return arg_at(1) }
+    return "D:\\LLVM"
+}
+func arg_has(tag: string) -> bool {
+    var n = arg_count()
+    var ii: i64 = 0
+    while ii < n {
+        if arg_at(ii) == tag { return true }
+        ii = ii + 1
+    }
+    return false
+}
+
+var release = get_version()
+var llvm = get_llvm()
+var skipRepl = arg_has("--skip-repl")
+var skipLlvm = arg_has("--skip-llvm")
+
+var root = cwd()
+var distName = "tie-" + release
+var zipName = "tie-" + release + "-win-x64.zip"
+var distDir = root + "\\dist\\" + distName
+var tiecExe = root + "\\compiler\\tiec.exe"
+var rc: i64 = 0
+
+println("[package] 发行版号: " + release)
+println("[package] 仓库根目录: " + root)
+
+// ---- 第 1 步：自举验证 ----
+println("")
+println("[1/4] 自举验证: tiec 编译 driver.tie → tiec2.exe...")
+var tiec2 = root + "\\compiler\\tiec2.exe"
+var _a = exec_code("cmd /c del /Q \"" + tiec2 + "\" >nul 2>&1")
+rc = exec_code("cmd /c " + tiecExe + " compiler\\driver.tie -o " + tiec2 + " >nul 2>&1")
+if rc != 0 {
+    println("[1/4] 自举编译失败（退出码 " + to_string(rc) + "）")
+    exit(1)
+}
+println("[1/4] 自举验证完成")
+
+// ---- 第 2 步：repl.exe 自举（可选）----
+println("")
+println("[2/4] repl.exe 自举...")
+var replExe = root + "\\repl\\repl.exe"
+if skipRepl {
+    println("[2/4] 已跳过 repl 自举（--skip-repl）")
+} else {
+    rc = exec_code("cmd /c " + tiecExe + " repl\\repl.tie >nul 2>&1")
+    if rc != 0 {
+        println("[2/4] repl.exe 编译失败（退出码 " + to_string(rc) + "）")
+        exit(1)
+    }
+    if !fex(replExe) {
+        println("[2/4] repl.exe 未生成: " + replExe)
+        exit(1)
+    }
+    println("[2/4] repl.exe 自举完成")
+}
+
+// ---- 第 3 步：组装发行目录 ----
+println("")
+println("[3/4] 组装发行目录 " + distDir + " ...")
+var _rd = exec_code("cmd /c rd /s /q \"" + distDir + "\" >nul 2>&1")
+var _mk = mkdir_all(distDir + "\\bin")
+
+// bin/：tiec/tiec2 编译器 + repl 外壳 + pkg 包管理器
+if fex(replExe) { var _r1 = copy_file(replExe, distDir + "\\bin\\repl.exe"); println("  bin/repl.exe") }
+var pkgExe = root + "\\pkg\\pkg.exe"
+if fex(pkgExe) { var _r2 = copy_file(pkgExe, distDir + "\\bin\\pkg.exe"); println("  bin/pkg.exe") }
+if fex(tiecExe) { var _r3 = copy_file(tiecExe, distDir + "\\bin\\tiec.exe"); println("  bin/tiec.exe") }
+
+// ---- [3.5] LLVM 精简工具链（可选）----
+println("")
+println("[3.5] LLVM 精简工具链...")
+if skipLlvm {
+    println("[3.5] 已跳过 LLVM 工具链打包（--skip-llvm）")
+} else {
+    if !fex(llvm + "\\bin\\clang.exe") {
+        println("  LLVM 工具链打包跳过（未找到 " + llvm + "\\bin\\clang.exe）")
+    } else {
+        var lvmBin = distDir + "\\bin\\llvm\\bin"
+        var lvmLib = distDir + "\\bin\\llvm\\lib"
+        var _b1 = mkdir_all(lvmBin)
+        var _b2 = mkdir_all(lvmLib)
+        var ltools = ["clang.exe", "opt.exe", "llvm-ar.exe", "lld-link.exe"]
+        for t in ltools {
+            if fex(llvm + "\\bin\\" + t) {
+                var _c1 = copy_file(llvm + "\\bin\\" + t, lvmBin + "\\" + t)
+                println("  bin/llvm/bin/" + t)
+            } else {
+                if t == "clang.exe" {
+                    println("  clang.exe 缺失，LLVM 工具链失败")
+                    exit(1)
+                }
+                println("  警告: 缺失 " + t + "（跳过）")
+            }
+        }
+        // 头文件资源目录：整体复制 lib/clang（含 <ver>/include 各版本），匹配 clang 资源查找
+        var _x = exec_code("cmd /c xcopy /E /I /Y \"" + llvm + "\\lib\\clang\" \"" + lvmLib + "\\clang\" >nul 2>&1")
+        println("  bin/llvm/lib/clang/include")
+        // 许可文件：优先 LLVM 自带，缺失回退仓库内置
+        var lic = pick_lic(llvm + "\\LICENSE.txt", root + "\\third_party\\llvm\\LICENSE.TXT")
+        if fex(lic) { var _l1 = copy_file(lic, distDir + "\\bin\\llvm\\LICENSE.txt"); println("  bin/llvm/LICENSE.txt") }
+        else { println("  警告: 缺失 LLVM 许可文件（跳过）") }
+    }
+}
+
+// 包根发行文档 + 许可证
+var docs = ["README.md", "NEW.md", "CHANGELOG.md", "LICENSE"]
+for doc in docs {
+    if fex(root + "\\" + doc) {
+        var _d1 = copy_file(root + "\\" + doc, distDir + "\\" + doc)
+    }
+}
+// docs/ 全目录
+var _dx = exec_code("cmd /c xcopy /E /I /Y \"" + root + "\\docs\" \"" + distDir + "\\docs\" >nul 2>&1")
+println("  docs/")
+// examples/：只复制 .tie 源码
+var _mx = mkdir_all(distDir + "\\examples")
+var exs = list_dir(root + "\\examples")
+for en in exs {
+    if has_suffix(en, ".tie") {
+        var _e1 = copy_file(root + "\\examples\\" + en, distDir + "\\examples\\" + en)
+    }
+}
+println("  examples/")
+
+// std/ext/rdu/sys：内置库从库根取值（--lib-root / TIE_LIB_ROOT / 默认 ~/.tiec-lib/tlib）
+var libRoot = get_env("TIE_LIB_ROOT")
+if is_empty(libRoot) { libRoot = get_env("USERPROFILE") + "\\.tiec-lib\\tlib" }
+var libs = ["std", "ext", "rdu", "sys"]
+for lib in libs {
+    var libSrc = libRoot + "\\" + lib
+    if fex(libSrc) {
+        var _lt = mkdir_all(distDir + "\\" + lib)
+        var lw = walk_dir(libSrc)
+        for lp in lw {
+            if has_suffix(lp, ".tie") {
+                var rel = replace_all(lp, libSrc, "")
+                var _c2 = copy_file(lp, distDir + "\\" + lib + rel)
+            }
+        }
+        println("  " + lib + "/")
+    } else {
+        println("  " + lib + "/ 跳过（库根缺失: " + libRoot + "，先运行 scripts/fetch-lib.tsh.tie）")
+    }
+}
+
+// skills/tie-dev/：全量复制
+var skSrc = root + "\\skills"
+if fex(skSrc) {
+    var skw = walk_dir(skSrc)
+    for sp in skw {
+        var srel = replace_all(sp, skSrc, "")
+        var _c3 = copy_file(sp, distDir + "\\skills" + srel)
+    }
+    println("  skills/")
+}
+
+// editor/vscode-tie/：排除 node_modules/ 与 out/
+var edSrc = root + "\\editor\\vscode-tie"
+if fex(edSrc) {
+    var edw = walk_dir(edSrc)
+    for ep in edw {
+        if contains(ep, "node_modules") || has_suffix(ep, "\\out") { continue }
+        if contains(ep, "\\out\\") { continue }
+        var erel = replace_all(ep, edSrc, "")
+        var _c4 = copy_file(ep, distDir + "\\editor\\vscode-tie" + erel)
+    }
+    println("  editor/vscode-tie/")
+}
+
+// compiler/：递归复制 .tie 源码 + README.tie，剔除 .exe 编译产物
+var coSrc = root + "\\compiler"
+if fex(coSrc) {
+    var cow = walk_dir(coSrc)
+    for cp in cow {
+        var cbase = path_basename(cp)
+        if has_suffix(cp, ".tie") || cbase == "README.tie" {
+            if has_suffix(cp, ".exe") { continue }
+            var crel = replace_all(cp, coSrc, "")
+            var _c5 = copy_file(cp, distDir + "\\compiler" + crel)
+        }
+    }
+    println("  compiler/")
+}
+
+println("[3/4] 发行目录组装完成")
+
+// ---- 第 4 步：打包 zip ----
+println("")
+println("[4/4] 打包 zip...")
+var zipPath = root + "\\dist\\" + zipName
+var _rz = exec_code("cmd /c del /Q \"" + zipPath + "\" >nul 2>&1")
+rc = exec_code("cmd /c tar -a -c -f \"" + zipPath + "\" -C \"" + root + "\\dist\" " + distName + " >nul 2>&1")
+if !fex(zipPath) {
+    println("zip 打包失败: " + zipPath)
+    exit(1)
+}
+
+println("")
+println("打包完成")
+println("  zip: " + zipPath)
+println("  目录: " + distDir)
+exit(0)

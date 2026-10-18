@@ -1,0 +1,597 @@
+type tie<class>
+// compiler/driver/serve.tie —— tink 常驻服务（两种**角色**，同一套帧/信封）
+// ============================================================
+// 两个入口，各自独占一个进程（角色由命令行模式决定，不由请求决定）：
+//   --tink-serve      role=1 分析：只跑前端，回结构化记录（tsp/LSP 用，毫秒级、无副作用）
+//   --serve-compile   role=2 编译：跑完整单元（含后端与链接），落盘（构建驱动用，秒级）
+// 为什么分进程而不共用一个循环：编译会 spawn clang/link，且编译器内部 panic 走
+//   tig_panic_tail → exit(1)。同进程会把这些故障与延迟直接传染给编辑器语言服务。
+//
+// # 帧与信封（协议层，不随角色变）
+//   帧 = [16B 头 magic/ver/type/flags/stream_id/seq/len][载荷][CRC32C 4B BE]
+//   信封 = zd 字段流：f1=kind f2=stage f3=name f4=payload
+//   kind：1 hello · 2 hello-ack · 3 stage · 4 artifact · 5 diag · 6 request · 7 done
+//        · 8 shutdown。**方法不用 kind 表达**——kind=6 是唯一的请求种类，方法在载荷 f1=op。
+//   未知 kind / 未知 op / 载荷非法 → 回 diag（kind=5，f3 携带文本），不静默忽略、不退出。
+//
+// # request（kind=6）载荷：f1=op
+//   op=1 analyze：f2=src（源码文本）f3=base_dir f4=vpath f5=stages 位掩码
+//                 （1=tokens 2=ast 4=symtab 8=diag）
+//   op=2 compile：f2=vpath（输入路径）f3=out f4=target f5=l f6=t
+//                 f7=flags 位掩码（1=no_cache 2=no_warn 4=emit_ir 8=keep_ir）
+//                 负数（l/t）= 未指定，保持默认档。
+//   编译请求只给**路径**不给源码：import 解析、文件名-头部一致性、依赖缓存都建立在
+//   真实路径上；要编未落盘的内容先写文件（编辑器路径走 op=1）。
+//
+// # done（kind=7）载荷：f1=op f2=rc（0 成功/1 失败）f3=vpath（回显）f4=captured
+//   analysis 的 stage 帧仍按 kind=3 + stage 1/2/3/4；失败必发 diag 帧。
+//   captured 仅编译请求有值：该单元的全部人读文本（dbg_txt 在捕获模式下写入）。
+//
+// # hello-ack（kind=2）载荷：f1=role（1 分析 / 2 编译）f2=ops 位掩码
+//   客户端据此确认对面是哪种角色，避免「发错服务、无应答」。
+//
+// # 复位纪律
+//   每请求前 driver.unit_reset()（前端 AST/语义表 + 后端单元级累加器与置位旗标）；
+//   编译请求另做选项复位（sv_opts_reset），否则上一请求的 -l/--shared 漏进本单元。
+//   分析请求：警告通道常开（LSP 需要）、伴生 .sym.zd 恒关（零落盘）。
+// 日志一律 stderr；stdout 仅帧流。
+
+namespace driver {
+
+// ---------- stdin 流式读取（tink v3 帧：16B 定长头 + 载荷 + CRC32C(4B)；分片重组） ----------
+
+// 读恰好 n 字节；EOF 提前结束返回短表。
+func sv_read_n(n: i64) -> table<i64> {
+    var out = table_new_i64()
+    while len(out) < n {
+        var chunk = stdin_read(n - len(out))
+        if len(chunk) == 0 {
+            break
+        }
+        out = byte_concat(out, chunk)
+    }
+    return out
+}
+
+// 读一原始帧（头 16B + 载荷 + CRC 校验）→ (ok, flags, payload)。
+// ok：1 成功 / 0 干净 EOF（帧起点无字节）/ -1 拒帧（头或 CRC 非法）。
+func sv_read_raw() -> (i64, i64, table<i64>) {
+    var empty = table_new_i64()
+    var h = sv_read_n(16)
+    if len(h) == 0 {
+        return (0, 0, empty)
+    }
+    if len(h) < 16 {
+        return (-1, 0, empty)
+    }
+    // 头校验（与 tinker_frame.head_at 同规则：magic/ver=3/type=0x04 MESSAGE；
+    // 保留位与 EXT/PROTECTED 必须为 0）。
+    if (h[0] & 0xFF) != 0x74 || (h[1] & 0xFF) != 0x6B || (h[2] & 0xFF) != 3 || (h[3] & 0xFF) != 0x04 {
+        return (-1, 0, empty)
+    }
+    var fl = ((h[4] & 0xFF) << 8) | (h[5] & 0xFF)
+    if (fl & 0xFFC0) != 0 || (fl & 1) != 0 || (fl & 2) != 0 {
+        return (-1, 0, empty)
+    }
+    var ln = ((h[14] & 0xFF) << 8) | (h[15] & 0xFF)
+    var tlen: i64 = 0
+    if (fl & 4) != 0 {
+        tlen = 4
+    }
+    var rest = sv_read_n(ln + tlen)
+    if len(rest) != ln + tlen {
+        return (-1, 0, empty)
+    }
+    if tlen == 4 {
+        var want = ((rest[ln] & 0xFF) << 24) | ((rest[ln + 1] & 0xFF) << 16) | ((rest[ln + 2] & 0xFF) << 8) | (rest[ln + 3] & 0xFF)
+        var buf = byte_concat(h, rest)
+        if want != tinker.crc32c_range(buf, 0, 16 + ln) {
+            return (-1, 0, empty)
+        }
+    }
+    var pl = table_new_i64()
+    var i: i64 = 0
+    while i < ln {
+        table_push(pl, rest[i])
+        i = i + 1
+    }
+    return (1, fl, pl)
+}
+
+// 读一逻辑帧（含分片自动重组；按偏移严格拼接）→ (ok, payload)。
+func sv_read_frame() -> (i64, table<i64>) {
+    var empty = table_new_i64()
+    var r = sv_read_raw()
+    if r.0 != 1 {
+        return (r.0, empty)
+    }
+    var fl0 = r.1
+    var pl0 = r.2
+    if (fl0 & 16) == 0 {
+        return (1, pl0)
+    }
+    if len(pl0) < 4 {
+        return (-1, empty)
+    }
+    var off0 = ((pl0[0] & 0xFF) << 24) | ((pl0[1] & 0xFF) << 16) | ((pl0[2] & 0xFF) << 8) | (pl0[3] & 0xFF)
+    if off0 != 0 {
+        return (-1, empty)
+    }
+    var out = table_new_i64()
+    var j: i64 = 4
+    while j < len(pl0) {
+        table_push(out, pl0[j])
+        j = j + 1
+    }
+    var fin: i64 = 0
+    if (fl0 & 8) != 0 {
+        fin = 1
+    }
+    while fin == 0 {
+        var r2 = sv_read_raw()
+        if r2.0 != 1 {
+            return (-1, empty)
+        }
+        var fl2 = r2.1
+        var pl2 = r2.2
+        if (fl2 & 16) == 0 || len(pl2) < 4 {
+            return (-1, empty)
+        }
+        var off2 = ((pl2[0] & 0xFF) << 24) | ((pl2[1] & 0xFF) << 16) | ((pl2[2] & 0xFF) << 8) | (pl2[3] & 0xFF)
+        if off2 != len(out) {
+            return (-1, empty)
+        }
+        var j2: i64 = 4
+        while j2 < len(pl2) {
+            table_push(out, pl2[j2])
+            j2 = j2 + 1
+        }
+        if (fl2 & 8) != 0 {
+            fin = 1
+        }
+    }
+    return (1, out)
+}
+
+// ---------- 请求字段解析 ----------
+
+// 区间 [start, end) 的字符串值（fixstr/str8/str16/str32 头 + UTF-8 正文）→ 字符串。
+// StringBuilder 组装（大源码下避免 O(n²) 拼接）。
+func sv_str_at(p: table<i64>, start: i64, end: i64) -> string {
+    if start >= end {
+        return ""
+    }
+    var h0 = p[start]
+    var hw: i64 = 1
+    if h0 == 0xD9 {
+        hw = 2
+    } else if h0 == 0xDA {
+        hw = 3
+    } else if h0 == 0xDB {
+        hw = 5
+    }
+    var sb = string_builder()
+    var bi = start + hw
+    while bi < end {
+        var b0 = p[bi]
+        var cp: i64 = b0
+        var adv: i64 = 1
+        if b0 >= 0xF0 {
+            if bi + 3 >= end {
+                break
+            }
+            cp = ((b0 & 0x07) << 18) | ((p[bi + 1] & 0x3F) << 12) | ((p[bi + 2] & 0x3F) << 6) | (p[bi + 3] & 0x3F)
+            adv = 4
+        } else if b0 >= 0xE0 {
+            if bi + 2 >= end {
+                break
+            }
+            cp = ((b0 & 0x0F) << 12) | ((p[bi + 1] & 0x3F) << 6) | (p[bi + 2] & 0x3F)
+            adv = 3
+        } else if b0 >= 0xC0 {
+            if bi + 1 >= end {
+                break
+            }
+            cp = ((b0 & 0x1F) << 6) | (p[bi + 1] & 0x3F)
+            adv = 2
+        }
+        sb_append(sb, str_from_code(cp))
+        bi = bi + adv
+    }
+    return sb_build(sb)
+}
+
+// 请求总入口的公共头：只读 f1=op。返回 (ok, op)；ok=0 表示载荷非法。
+// 每个角色只接受自己的 op（见 sv_dispatch），不在这里猜。
+func sv_parse_op(p: table<i64>) -> (i64, i64) {
+    var nb = len(p)
+    var pos: i64 = 0
+    while pos < nb {
+        var tr = tinker.rd_varint(p, pos)
+        if tr.1 < 0 {
+            return (0, 0)
+        }
+        var lr = tinker.rd_varint(p, tr.1)
+        if lr.1 < 0 || lr.0 < 0 || lr.1 + lr.0 > nb {
+            return (0, 0)
+        }
+        if (tr.0 >> 3) == 1 {
+            var vr = tinker.rd_varint(p, lr.1)
+            if vr.1 < 0 {
+                return (0, 0)
+            }
+            return (1, vr.0)
+        }
+        pos = lr.1 + lr.0
+    }
+    return (0, 0)   // 缺 op：拒绝（不猜默认值——猜错会静默跑错语义）
+}
+
+// op=1 analyze 载荷 → (ok, src, base, vpath, stages)
+func sv_parse_analyze(p: table<i64>) -> (i64, string, string, string, i64) {
+    var src: string = ""
+    var base: string = ""
+    var vpath: string = ""
+    var stages: i64 = 15
+    var seen_src: i64 = 0
+    var nb = len(p)
+    var pos: i64 = 0
+    while pos < nb {
+        var tr = tinker.rd_varint(p, pos)
+        if tr.1 < 0 {
+            return (0, "", "", "", 0)
+        }
+        var lr = tinker.rd_varint(p, tr.1)
+        if lr.1 < 0 || lr.0 < 0 || lr.1 + lr.0 > nb {
+            return (0, "", "", "", 0)
+        }
+        var fno = tr.0 >> 3
+        var vs = lr.1
+        var ve = lr.1 + lr.0
+        if fno == 2 {
+            src = sv_str_at(p, vs, ve)
+            seen_src = 1
+        } else if fno == 3 {
+            base = sv_str_at(p, vs, ve)
+        } else if fno == 4 {
+            vpath = sv_str_at(p, vs, ve)
+        } else if fno == 5 {
+            var gr = tinker.rd_varint(p, vs)
+            if gr.1 >= 0 {
+                stages = gr.0
+            }
+        }
+        pos = ve
+    }
+    if seen_src == 0 {
+        return (0, "", "", "", 0)
+    }
+    return (1, src, base, vpath, stages)
+}
+
+// done 帧载荷：f1=op f2=ok/rc f3=vpath（回显）f4=captured（可空）。
+// 单一构造点：分析/编译两种角色共用同一 schema，客户端不必按角色写两套解析。
+func sv_done_payload(op: i64, rc: i64, vpath: string, captured: string) -> table<i64> {
+    var out = table_new_i64()
+    out = byte_concat(out, zdw.concat(zdw.varint(1 * 8 + 2), zdw.varint(len(zdw.enc_i64(op)))))
+    out = byte_concat(out, zdw.enc_i64(op))
+    out = byte_concat(out, zdw.concat(zdw.varint(2 * 8 + 2), zdw.varint(len(zdw.enc_i64(rc)))))
+    out = byte_concat(out, zdw.enc_i64(rc))
+    var vs = zdw.enc_string(vpath)
+    out = byte_concat(out, zdw.concat(zdw.varint(3 * 8 + 2), zdw.varint(len(vs))))
+    out = byte_concat(out, vs)
+    var cs = zdw.enc_string(captured)
+    out = byte_concat(out, zdw.concat(zdw.varint(4 * 8 + 2), zdw.varint(len(cs))))
+    out = byte_concat(out, cs)
+    return out
+}
+
+// 冲刷出站缓冲到 stdout（帧流唯一写出点）。
+func sv_flush() {
+    if len(tk_out) > 0 {
+        stdout_write_bytes(tk_out)
+    }
+    tk_out = table_new_i64()
+}
+
+// diag 帧（kind=5）：文本走 name（协议既有约定），不回 done——客户端据「无 done」判定失败。
+func sv_diag(msg: string) {
+    tinker.send_append(5, 0, msg, table_new_i64())
+    sv_flush()
+}
+
+// ---------- 编译请求（op=2） ----------
+
+// 选项复位：全部回到「命令行未给旗标」的默认态（与 cli_args 的初值一致）。
+// 逐请求必做——服务进程的全局是**跨请求存活**的，上一请求的 -l3/--shared/--no-warn
+// 漏进本单元不会有任何报错，只会让产物形态静默漂移。
+func sv_opts_reset() {
+    g_output = ""
+    g_llvm_opt = 2
+    g_llvm_set = false
+    g_tie_opt = 2
+    g_tie_set = false
+    g_opt_force = -1
+    g_build_mode = 0
+    g_target = ""
+    g_mem_limit = 0
+    g_jobs = 0
+    g_no_cache = false
+    g_no_warn = false
+    g_warn_error = false
+    g_warn_seen = 0
+    g_warn_failed = false
+    g_front_warn = false
+    g_emit_ir = false
+    g_keep_ir = false
+    g_cli_fast_math = false
+    g_cli_check_bounds = false
+    g_cli_esc_audit = false
+    g_cli_visibility = 1
+    g_prep_only = false
+    g_compress_data = false
+    g_shared = false
+    g_backend_cli = ""
+    g_role = ""
+    // 编译请求按**命令行默认**（library/class 照常写伴生 .sym.zd）；
+    // 分析请求的「零落盘」由分析分支单独置 true。
+    g_no_sym = false
+}
+
+// op=2 compile 载荷 → (ok, vpath, out, target, l, t, flags)。l/t < 0 = 未指定。
+func sv_parse_compile(p: table<i64>) -> (i64, string, string, string, i64, i64, i64) {
+    var vpath: string = ""
+    var out: string = ""
+    var target: string = ""
+    var lv: i64 = 0 - 1
+    var tv: i64 = 0 - 1
+    var flags: i64 = 0
+    var nb = len(p)
+    var pos: i64 = 0
+    while pos < nb {
+        var tr = tinker.rd_varint(p, pos)
+        if tr.1 < 0 {
+            return (0, "", "", "", 0 - 1, 0 - 1, 0)
+        }
+        var lr = tinker.rd_varint(p, tr.1)
+        if lr.1 < 0 || lr.0 < 0 || lr.1 + lr.0 > nb {
+            return (0, "", "", "", 0 - 1, 0 - 1, 0)
+        }
+        var fno = tr.0 >> 3
+        var vs = lr.1
+        var ve = lr.1 + lr.0
+        if fno == 2 {
+            vpath = sv_str_at(p, vs, ve)
+        } else if fno == 3 {
+            out = sv_str_at(p, vs, ve)
+        } else if fno == 4 {
+            target = sv_str_at(p, vs, ve)
+        } else if fno == 5 || fno == 6 || fno == 7 {
+            var gr = tinker.rd_varint(p, vs)
+            if gr.1 >= 0 {
+                if fno == 5 {
+                    lv = gr.0
+                } else if fno == 6 {
+                    tv = gr.0
+                } else {
+                    flags = gr.0
+                }
+            }
+        }
+        pos = ve
+    }
+    if str_len(vpath) == 0 {
+        return (0, "", "", "", 0 - 1, 0 - 1, 0)
+    }
+    return (1, vpath, out, target, lv, tv, flags)
+}
+
+// 执行一个编译请求：复位 → 落参 → run_unit → 回 done 帧。返回 0 正常 / -1 载荷非法。
+func sv_compile(p: table<i64>) -> i64 {
+    var c = sv_parse_compile(p)
+    if c.0 == 0 {
+        return 0 - 1
+    }
+    var vpath = c.1
+    var out = c.2
+    var target = c.3
+    var lv = c.4
+    var tv = c.5
+    var flags = c.6
+    sv_opts_reset()
+    g_input = vpath
+    g_output = out
+    g_target = target
+    if lv >= 0 {
+        g_llvm_opt = lv
+        g_llvm_set = true
+    }
+    if tv >= 0 {
+        g_tie_opt = tv
+        g_tie_set = true
+    }
+    if (flags & 1) != 0 {
+        g_no_cache = true
+    }
+    if (flags & 2) != 0 {
+        g_no_warn = true
+    }
+    if (flags & 4) != 0 {
+        g_emit_ir = true
+    }
+    if (flags & 8) != 0 {
+        g_keep_ir = true
+    }
+    // 人读文本按请求捕获（客户端按请求配对；不依赖共享 stderr 的时序）
+    g_svc_cap = ""
+    g_svc_cap_on = true
+    var rc = run_unit()
+    g_svc_cap_on = false
+    var cap = g_svc_cap
+    g_svc_cap = ""
+    tinker.send_append(7, 0, "done", sv_done_payload(2, rc, vpath, cap))
+    sv_flush()
+    return 0
+}
+
+// ---------- 分析请求（op=1） ----------
+
+// 执行一个分析请求：前端前置 → 按掩码发 stage 帧 → done。返回 0 正常 / -1 载荷非法。
+func sv_analyze(p: table<i64>) -> i64 {
+    var a = sv_parse_analyze(p)
+    if a.0 == 0 {
+        return 0 - 1
+    }
+    var src = a.1
+    var base = a.2
+    var vpath = a.3
+    var stages = a.4
+    // 分析请求的专属口径：警告通道开（LSP 要警告）、零落盘（不写 .sym.zd）。
+    // dbgem.boot() 在这里补（复位已把它清掉；编译角色则由 compile_program 在
+    // role_registry_boot 之后调，顺序与 CLI 一致）。
+    dbgem.boot()
+    g_front_warn = true
+    g_no_sym = true
+    g_input = vpath
+    // 角色注册表 boot（幂等；主编译流程在 driver.tie 调，服务模式须在这里补）。
+    // 首次以请求的 base 定型（单工作区假设；多项目切换在 v1 不保证重扫）。
+    role_registry_boot(base)
+    var rc: i64 = 0 - 1
+    // 前端前置序列（与主编译流程同源）：#cfg 预处理 → 头部扫描 → 剥头行 →
+    // 语言前置注入。服务模式无 CLI/配置：target 取本机默认、profile 取空
+    // （等价「未配置」——与正常流程在无配置时的行为一致）。
+    var cfg_target = normalize_target("")
+    var cfg_profile = ""
+    semantic.set_cfg_env(cfg_target, cfg_profile)
+    var pruned = cfgpre.preprocess(src, cfg_target, cfg_profile)
+    if has_prefix(str.clone(pruned), "ERR:") {
+        dbgem.set_err_proto(pruned)
+        rc = 0 - 1
+    } else if scan_header(str.clone(pruned)) < 0 {
+        var m = "文件类型声明错误"
+        if str_len(g_role_err) > 0 {
+            m = "文件类型声明错误: " + g_role_err
+        }
+        dbgem.set_err_proto(m)
+        rc = 0 - 1
+    } else {
+        var clean = strip_type_header(pruned)
+        clean = prelude_inject(clean, g_role, pruned)
+        rc = frontend(clean, base)
+    }
+    // 发帧：成功按掩码；失败必发 diag（含 211 渲染文本）
+    if rc == 0 {
+        if (stages & 1) != 0 {
+            tinker.send_append(3, 1, "tokens", dbgem.spec_record_bytes("tokens"))
+        }
+        if (stages & 2) != 0 {
+            tinker.send_append(3, 2, "ast", dbgem.spec_record_bytes("ast"))
+        }
+        if (stages & 4) != 0 {
+            tinker.send_append(3, 3, "symtab", dbgem.spec_record_bytes("symtab"))
+        }
+        if (stages & 8) != 0 {
+            tinker.send_append(3, 4, "diag", dbgem.spec_record_bytes("diag"))
+        }
+    } else {
+        tinker.send_append(3, 4, "diag", dbgem.spec_record_bytes("diag"))
+    }
+    var okv: i64 = 0
+    if rc == 0 {
+        okv = 1
+    }
+    tinker.send_append(7, 0, "done", sv_done_payload(1, okv, vpath, ""))
+    sv_flush()
+    return 0
+}
+
+// ---------- 服务主循环（角色参数化） ----------
+
+// 角色：1=分析（只认 op=1）2=编译（只认 op=2）。返回 0 干净退出 / 1 拒帧。
+func sv_loop(role: i64) -> i64 {
+    dbgem.boot()
+    if role == 1 {
+        g_front_warn = true   // 警告通道常开（LSP 需要；frontend 内转交 semantic）
+        g_no_sym = true       // 不写伴生 .sym.zd（服务零落盘）
+    } else {
+        g_serve_compile = true
+    }
+    dbg_txt("[serve] ready role=" + to_string(role))
+    while true {
+        var fr = sv_read_frame()
+        if fr.0 == 0 {
+            dbg_txt("[serve] stdin EOF，退出")
+            return 0
+        }
+        if fr.0 < 0 {
+            print_err("[serve] 拒帧（头/CRC/分片非法）\n")
+            return 1
+        }
+        if tinker.env_decode(fr.1) < 0 {
+            print_err("[serve] 拒帧（信封解码失败）\n")
+            return 1
+        }
+        if tk_kind == 8 {
+            dbg_txt("[serve] 停机帧，退出")
+            return 0
+        }
+        if tk_kind == 1 {
+            // hello-ack：f1=role f2=ops 位掩码（客户端据此确认对面角色）
+            var pl = table_new_i64()
+            pl = byte_concat(pl, zdw.concat(zdw.varint(1 * 8 + 2), zdw.varint(len(zdw.enc_i64(role)))))
+            pl = byte_concat(pl, zdw.enc_i64(role))
+            pl = byte_concat(pl, zdw.concat(zdw.varint(2 * 8 + 2), zdw.varint(len(zdw.enc_i64(3)))))
+            pl = byte_concat(pl, zdw.enc_i64(3))   // ops = 1|2
+            tinker.send_append(2, 0, "hello-ack", pl)
+            sv_flush()
+            continue
+        }
+        if tk_kind != 6 {
+            // 未知 kind：明确拒绝（此前是 continue —— 客户端会无应答挂死）
+            print_err("[serve] 未知 kind=" + to_string(tk_kind) + "，已回 diag\n")
+            sv_diag("未知 kind=" + to_string(tk_kind) + "；本服务只接受 kind=6（request）")
+            continue
+        }
+        var o = sv_parse_op(tk_pl)
+        if o.0 == 0 {
+            print_err("[serve] 请求缺 op，已回 diag\n")
+            sv_diag("请求载荷非法：缺 f1=op")
+            continue
+        }
+        var op = o.1
+        if op != role {
+            print_err("[serve] 角色不匹配：role=" + to_string(role) + " 收到 op=" + to_string(op) + "\n")
+            if role == 1 {
+                sv_diag("本进程是分析角色（--tink-serve），只接 op=1；编译请用 --serve-compile")
+            } else {
+                sv_diag("本进程是编译角色（--serve-compile），只接 op=2；分析请用 --tink-serve")
+            }
+            continue
+        }
+        if role == 1 {
+            unit_reset()
+            if sv_analyze(tk_pl) < 0 {
+                sv_diag("analyze 载荷非法（需 f2=src）")
+            }
+            continue
+        }
+        unit_reset()
+        if sv_compile(tk_pl) < 0 {
+            sv_diag("compile 载荷非法（需 f2=vpath）")
+        }
+        continue
+    }
+    return 0
+}
+
+// 分析服务入口（--tink-serve）。
+pub func run_serve() -> i64 {
+    return sv_loop(1)
+}
+
+// 编译服务入口（--serve-compile）。
+pub func run_compile_serve() -> i64 {
+    return sv_loop(2)
+}
+
+}   // namespace driver

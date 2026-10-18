@@ -1,0 +1,64 @@
+type tie<logic>
+
+// ============================================================
+// p.8.1.1 const fn 编译期求值验收（编译期常量折叠更强能力，静态元编程基础）
+// `const fn` 声明：既是普通运行期函数（后端照常发射），也可在编译期常量
+// 上下文（全局标量初始化）被直接求值折叠——编译期算常量 / 预计算结果。
+//
+// 覆盖场景：
+//   1. 递归 const fn（阶乘）：const N = fact(5) 编译期折叠 → 120
+//   2. 循环 + 局部变量/赋值 const fn（斐波那契）：const F10 = fib(10) → 55
+//   3. 字符串拼接 const fn：const G = greeting("tie") → "Hello, tie!"
+//   4. const fn 运行期调用正常（与普通函数同语义）
+//   5. 算术 + const fn 调用混合折叠：const P = fact(3) * 8 → 48
+//   6. 编译期比较 + 三元折叠：const Q = (fib(5) < 10 ? 64 : 128) → 64
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   120 / 55 / Hello, tie! / 720 / 6765 / 48 / 64
+// ============================================================
+
+// 递归 const fn：阶乘
+const fn fact(n: i64) -> i64 {
+    if n <= 1 {
+        return 1
+    }
+    return n * fact(n - 1)
+}
+
+// 循环 const fn：斐波那契（局部变量 + 赋值 + while）
+const fn fib(n: i64) -> i64 {
+    var a: i64 = 0
+    var b: i64 = 1
+    var i: i64 = 0
+    while i < n {
+        var t = a + b
+        a = b
+        b = t
+        i = i + 1
+    }
+    return a
+}
+
+// 字符串拼接 const fn
+const fn greeting(name: string) -> string {
+    return "Hello, " + name + "!"
+}
+
+// 编译期常量：全局初始化调用 const fn → 编译期求值折叠落位（静态元编程）
+const N: i64 = fact(5)
+const F10: i64 = fib(10)
+const G: string = greeting("tie")
+const P: i64 = fact(3) * 8                  // 6 * 8 = 48
+const Q: i64 = (fib(5) < 10 ? 64 : 128)     // fib(5)=5 < 10 → 64
+
+func main() {
+    // 全局常量已被编译期折叠
+    println(N)    // 120
+    println(F10)  // 55
+    println(G)    // Hello, tie!
+    // const fn 运行期调用正常
+    println(fact(6))  // 720
+    println(fib(20))  // 6765
+    println(P)    // 48
+    println(Q)    // 64
+}

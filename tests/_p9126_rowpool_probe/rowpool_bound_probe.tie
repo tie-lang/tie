@@ -1,0 +1,39 @@
+type tie<logic>
+// tests/_p9126_rowpool_probe/rowpool_bound_probe.tie —— p.9.12.6 行池边界诊断探针。
+// 本文件**必须编译失败**（companion；在源码级验收，随 rowpool_probe.tie 走）。
+// 覆盖的行池违背边界用法逐一应报出对应清晰诊断（v1 边界，见 tie-rowpool-design.md）：
+//   1) table<R> 作函数返回值 →「行池 table<R> 不能作函数返回值」；
+//   2) table<R> 作函数形参/ref 形参 →「不能作函数形参/ref 形参」；
+//   3) table<R> 作全局变量 →「全局变量 v1 暂不支持」；
+//   4) table_push 作用于行池 →「table_push 不支持作用于行池」；
+//   5) 负下标写 → 运行时「表下标越界（负索引）」exit(1)（见 rowpool_neg_probe.tie）。
+// 期望：tiec 对该文件报编译/IR 生成错误且含上述「行池」关键字，不产出 .exe。
+struct R {
+    var x: i64 = 0
+    var y: f64 = 0.0
+}
+
+// 1) 返回值
+func bad_ret() -> table<R> {
+    var t: table<R> = []
+    return t
+}
+
+// 2) 形参 / ref 形参
+func bad_param(p: table<R>) -> i64 {
+    return 0
+}
+
+// 3) 全局行池
+var g_rows: table<R> = []
+
+// 4) table_push 作用于行池
+func bad_push() -> i64 {
+    var t: table<R> = []
+    table_push(t, R())
+    return 0
+}
+
+func main() -> i64 {
+    return 0
+}

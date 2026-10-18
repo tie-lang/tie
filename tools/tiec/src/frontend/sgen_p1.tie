@@ -1,0 +1,591 @@
+type tie<class>
+// compiler/frontend/sgen_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 sgen.tie。
+namespace sgen {
+// 类型实参 → mangling 片段：types.type_name 规范化（替换 < > , 为 _）。
+// struct 实例化名含 $（如 Box$i64），保留 $（可读且不与 `::` 冲突）。
+func type_seg(t: i64) -> string {
+    var s = types.type_name(t)
+    var out: string = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var ch = str_char(s, i)
+        if ch == "<" || ch == ">" || ch == "," {
+            out = out + "_"
+        } else {
+            out = out + ch
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 类型实参后缀：`$T1$T2...`（空表返回 ""）
+func mangle_suffix(args: table<i64>) -> string {
+    var out: string = ""
+    var k: i64 = 0
+    while k < len(args) {
+        if args[k] < 0 {
+            // v2 值参数编码：-1 - 值 → 实例化符号标记 $n<val>（与类型实参
+            // 符号空间分离，避免负类型 id 越界查表；同档位同符号幂等去重）
+            out = out + "$n" + to_string(-1 - args[k])
+        } else {
+            out = out + "$" + type_seg(args[k])
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// 字符串切片（本模块本地辅助；对齐 irgen.ig_slice）
+func ig_slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+// 追加节点到 sstate 表尾（9 列 + node_types 同步 push）
+func push_node(tag: i64, name: i64, val: i64, aux: i64, line: i64, col: i64) -> i64 {
+    table_push(s_tags, tag)
+    table_push(s_names, name)
+    table_push(s_vals, val)
+    table_push(s_aux, aux)
+    table_push(s_coff, 0)
+    table_push(s_nchild, 0)
+    table_push(s_lines, line)
+    table_push(s_cols, col)
+    table_push(node_types, -1)
+    return len(s_tags) - 1
+}
+
+// 批量设置子节点（写入 sstate 表；段偏移 + 扁平子段）
+func set_children_ast(node: i64, kids: table<i64>) {
+    s_coff[node] = len(s_children)
+    var k: i64 = 0
+    while k < len(kids) {
+        table_push(s_children, kids[k])
+        k = k + 1
+    }
+    s_nchild[node] = len(kids)
+}
+
+// 类型参数名 id 查找（tp_names 线性查，返回下标；-1 无）
+func find_tp(tp_names: table<i64>, nm: string) -> i64 {
+    var nid = intern.intern(nm)
+    var k: i64 = 0
+    while k < len(tp_names) {
+        if tp_names[k] == nid {
+            return k
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// 克隆并替换（内部递归）。v2：kinds 并行表标记每槽类型/值参数；N_VAR 引用
+// 值参数名（容量参数，如 `array<f32, CAP>` 的长度）时整体替换为 N_INT_LIT
+// 具体值（-1-编码还原）——实例化后类型检查不再需要值环境。
+func clone_inner(node: i64, tp_names: table<i64>, kinds: table<i64>, args: table<i64>) -> i64 {
+    var tag = s_tags[node]
+    // N_CASE_BIND（case 解构绑定，p.8.1.2 泛型函数）：children[1] 是**变量名池 id**
+    //（非 AST 节点——parser 直接把 intern id 塞进 children），不能递归克隆（会把
+    // 池 id 当节点 id 越界读 s_tags）；children[0] 变体引用照常递归。
+    if tag == N_CASE_BIND {
+        var c0 = clone_inner(sstate.child(node, 0), tp_names, kinds, args)
+        if c0 < 0 {
+            return -1
+        }
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, c0)
+        table_push(kids, sstate.child(node, 1))  // 变量名池 id 原样
+        var nb = push_node(tag, s_names[node], s_vals[node], s_aux[node], s_lines[node], s_cols[node])
+        set_children_ast(nb, kids)
+        return nb
+    }
+    // v2 值参数引用：N_VAR 命中模板值参数名（容量参数，如 `array<f32, CAP>`
+    // 的长度位置）→ 整体替换为 N_INT_LIT 具体值（编码 -1-v 还原）。值参数
+    // 无类型实参语义，此处不产类型节点。
+    if tag == N_VAR {
+        var nmv = sstate.name_str(node)
+        var tpi = find_tp(tp_names, nmv)
+        if tpi >= 0 && tpi < len(kinds) && kinds[tpi] == 1 {
+            if tpi >= len(args) {
+                sm_err_line = s_lines[node]
+                sm_err_col = s_cols[node]
+                sm_err_msg = "泛型模板值参数 '" + nmv + "' 缺少实参"
+                return -1
+            }
+            var enc = args[tpi]
+            if enc >= 0 {
+                sm_err_line = s_lines[node]
+                sm_err_col = s_cols[node]
+                sm_err_msg = "泛型值参数槽需要整型常量实参（如 conv<1280>）"
+                return -1
+            }
+            var val = -1 - enc
+            if val <= 0 {
+                sm_err_line = s_lines[node]
+                sm_err_col = s_cols[node]
+                sm_err_msg = "值参数必须为正整数，实际是 " + to_string(val)
+                return -1
+            }
+            return push_node(N_INT_LIT, -1, val, -1, s_lines[node], s_cols[node])
+        }
+        // 非模板参数 N_VAR：保持原样复制（可能是全局 const 名，待类型解析求值）
+    }
+    // 类型参数引用 → 实参类型节点
+    if tag == S_N_STRUCT_TYPE {
+        var nm = sstate.name_str(node)
+        var tpi = find_tp(tp_names, nm)
+        if tpi >= 0 {
+            if tpi >= len(args) {
+                sm_err_line = s_lines[node]
+                sm_err_col = s_cols[node]
+                sm_err_msg = "泛型模板类型参数 '" + nm + "' 缺少实参"
+                return -1
+            }
+            return type_node_from_id(args[tpi])
+        }
+        // 模板 struct 引用（带 N_TYPE_ARGS）：先复制 children，再实例化替换
+        var kids: table<i64> = table_new_i64()
+        var nc = sstate.nchild(node)
+        var k: i64 = 0
+        while k < nc {
+            // -1 哨兵子节点（如 N_TYPE_ARGS 槽空）保持 -1，不递归
+            var cid = sstate.child(node, k)
+            if cid >= 0 {
+                var c = clone_inner(cid, tp_names, kinds, args)
+                if c < 0 {
+                    return -1
+                }
+                table_push(kids, c)
+            } else {
+                table_push(kids, -1)
+            }
+            k = k + 1
+        }
+        var new = push_node(tag, s_names[node], s_vals[node], s_aux[node], s_lines[node], s_cols[node])
+        set_children_ast(new, kids)
+        if nc > 0 && s_tags[kids[0]] == S_N_TYPE_ARGS {
+            var nm2 = sstate.name_str(node)
+            var gidx = sstate.gt_find(nm2)
+            if gidx >= 0 && gty_is_struct[gidx] == 1 {
+                // 已替换实参（无 TypeVar 残留）→ 解析 → 实例化 → 整个节点替换
+                var args2 = parse_type_args_ast(kids[0])
+                if len(args2) == 0 {
+                    return -1  // 解析失败（sm_err_* 已置）
+                }
+                var si = instantiate_struct(gidx, args2)
+                if si < 0 {
+                    return -1
+                }
+                return type_node_from_id(types.struct_of(si))
+            }
+            if gidx >= 0 && gty_is_struct[gidx] == 2 {
+                // p.8.1.2 泛型 enum 模板形参（`r: Result<T,E>` 克隆后实参已具体化）：
+                // 与 struct 模板同款——当场实例化并替换整个节点。此前漏处理导致
+                // instantiate_fn 走 stype.parse_type_node 报「类型 'Result' 未定义」
+                // （stype 只查 st_keys/en_keys 具体实例，不认模板名 + N_TYPE_ARGS）。
+                var args2 = parse_type_args_ast(kids[0])
+                if len(args2) == 0 {
+                    return -1
+                }
+                var ei = instantiate_enum(gidx, args2)
+                if ei < 0 {
+                    return -1
+                }
+                return type_node_from_id(types.enum_of(ei))
+            }
+        }
+        return new
+    }
+    // FnDef / Struct：泛型槽 → -1（不复制 N_TYPE_PARAMS 子树）
+    if tag == S_N_FN_DEF || tag == S_N_STRUCT {
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, -1)
+        var nc = sstate.nchild(node)
+        var k: i64 = 1
+        while k < nc {
+            var c = clone_inner(sstate.child(node, k), tp_names, kinds, args)
+            if c < 0 {
+                return -1
+            }
+            table_push(kids, c)
+            k = k + 1
+        }
+        var new = push_node(tag, s_names[node], s_vals[node], s_aux[node], s_lines[node], s_cols[node])
+        set_children_ast(new, kids)
+        return new
+    }
+    // 普通节点：递归复制 children（-1 哨兵保持）
+    var kids: table<i64> = table_new_i64()
+    var nc = sstate.nchild(node)
+    var k: i64 = 0
+    while k < nc {
+        var cid = sstate.child(node, k)
+        if cid >= 0 {
+            var c = clone_inner(cid, tp_names, kinds, args)
+            if c < 0 {
+                return -1
+            }
+            table_push(kids, c)
+        } else {
+            table_push(kids, -1)
+        }
+        k = k + 1
+    }
+    var new = push_node(tag, s_names[node], s_vals[node], s_aux[node], s_lines[node], s_cols[node])
+    set_children_ast(new, kids)
+    return new
+}
+
+// ==================== 返回表元素类型登记（实例化函数用）====================
+// 简化版返回表扫描：函数体第一层 Return 的表表达式元素类型（对齐
+// scollect.scan_blk/scan_return_elem 的语义子集）。tre_keys 幂等登记。
+func register_table_ret(mangled: string, fn_node: i64) {
+    var nparams = s_aux[fn_node]
+    var body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams)
+    var e = scan_ret_elem(body)
+    if e >= 0 {
+        var nid = intern.intern(mangled)
+        if sstate.bs_find(tre_keys, nid) < 0 {
+            sstate.sorted_insert(tre_keys, tre_vals, nid, e)
+        }
+    }
+}
+
+// 语句块 → 返回表元素类型（-1 无法确定）
+func scan_ret_elem(blk: i64) -> i64 {
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(blk, i)
+        var tag = s_tags[s]
+        if tag == S_N_RETURN {
+            var v = sstate.child(s, 0)
+            if v >= 0 {
+                var e = scan_return_elem(v)
+                if e >= 0 {
+                    return e
+                }
+            }
+        }
+        // 递归子块（if/while/for/switch）
+        var r: i64 = -1
+        if tag == S_N_IF {
+            r = scan_ret_elem(sstate.child(s, 1))
+            if r >= 0 {
+                return r
+            }
+            var el = sstate.child(s, 2)
+            if el >= 0 {
+                r = scan_ret_elem(el)
+                if r >= 0 {
+                    return r
+                }
+            }
+        } else if tag == S_N_WHILE {
+            r = scan_ret_elem(sstate.child(s, 1))
+            if r >= 0 {
+                return r
+            }
+        } else if tag == S_N_FOR {
+            r = scan_ret_elem(sstate.child(s, 1))
+            if r >= 0 {
+                return r
+            }
+        } else if tag == S_N_SWITCH {
+            var ncases = s_aux[s]
+            var k: i64 = 0
+            while k < ncases {
+                var c = sstate.child(s, 1 + k)
+                r = scan_ret_elem(sstate.child(c, 2))
+                if r >= 0 {
+                    return r
+                }
+                k = k + 1
+            }
+            var dflt = sstate.child(s, 1 + ncases)
+            if dflt >= 0 {
+                r = scan_ret_elem(dflt)
+                if r >= 0 {
+                    return r
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 表达式 → 表元素类型（表字面量 / 变量 / 调用返回表）
+func scan_return_elem(e: i64) -> i64 {
+    var tag = s_tags[e]
+    if tag == S_N_TABLE_LIT {
+        var nc = sstate.nchild(e)
+        if nc == 0 {
+            return types.named(TK_I64)
+        }
+        return scan_return_elem(sstate.child(sstate.child(e, 0), 1))
+    }
+    if tag == S_N_VAR {
+        // 查本函数体内同名 var 声明（简化：不递归；返回 -1 由调用方兜底）
+        return -1
+    }
+    if tag == S_N_CALL {
+        var nm = sstate.name_str(e)
+        if nm == "table_new_i64" {
+            return types.named(TK_I64)
+        }
+        if nm == "table_new_f64" {
+            return types.named(TK_F64)
+        }
+        if nm == "table_new_string" {
+            return types.named(TK_STR)
+        }
+        if nm == "table_new_bool" {
+            return types.named(TK_BOOL)
+        }
+        // 已登记返回表函数
+        var full = resolve_name_gen(nm)
+        return sinfer_tre(full)
+    }
+    return -1
+}
+
+// 返回表元素查询（裸名经命名空间补全后查 tre_keys/tre_bi_keys）
+func sinfer_tre(full: string) -> i64 {
+    var nid = intern.intern(full)
+    var idx = sstate.bs_find(tre_keys, nid)
+    if idx >= 0 {
+        return tre_vals[idx]
+    }
+    var bi = sstate.bs_find(tre_bi_keys, nid)
+    if bi >= 0 {
+        return tre_bi_vals[bi]
+    }
+    return -1
+}
+
+// 裸名解析（fn_sig / gt_find 双通道；对齐 sinfer.resolve_call_name 的泛型扩展）
+func resolve_name_gen(name: string) -> string {
+    var nid = intern.intern(name)
+    if sstate.fn_sig(name) >= 0 {
+        return name
+    }
+    if sstate.gt_find(name) >= 0 {
+        return name
+    }
+    if ns_top > 0 {
+        var depth: i64 = ns_top
+        while depth >= 0 {
+            var full: string = ""
+            var i: i64 = 0
+            while i < depth {
+                if i > 0 {
+                    full = full + "::"
+                }
+                full = full + intern.lookup(ns_stack[i])
+                i = i + 1
+            }
+            var cand: string = ""
+            if full != "" {
+                cand = full + "::" + name
+            } else {
+                cand = name
+            }
+            if sstate.fn_sig(cand) >= 0 || sstate.gt_find(cand) >= 0 {
+                return cand
+            }
+            depth = depth - 1
+        }
+    }
+    // using 前缀
+    var off: i64 = 0
+    var u: i64 = 0
+    while u < len(using_lens) {
+        var ln = using_lens[u]
+        var full: string = ""
+        var i: i64 = 0
+        while i < ln {
+            if i > 0 {
+                full = full + "::"
+            }
+            full = full + intern.lookup(using_prefixes[off + i])
+            i = i + 1
+        }
+        var cand = full + "::" + name
+        if sstate.fn_sig(cand) >= 0 || sstate.gt_find(cand) >= 0 {
+            return cand
+        }
+        off = off + ln
+        u = u + 1
+    }
+    return name
+}
+
+// struct 类型 → 实例化实参表（若该 struct 是某模板的实例化）；否则空表
+func struct_inst_args(ty: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    if types.kind(ty) != K_STRUCT {
+        return out
+    }
+    var sname = sstate.struct_name_of(types.low(ty))
+    var rec = sstate.gin_find(sname)
+    if rec < 0 {
+        return out
+    }
+    return sstate.gin_args(rec)
+}
+
+// 绑定 TypeVar：tp_names 中的下标 tpi（实际存名 id）→ 实参类型 arg_ty
+func bind_tp(tpi: i64, arg_ty: i64, bk: ref table<i64>, bv: ref table<i64>, call_id: i64) -> i64 {
+    var b: i64 = 0
+    while b < len(bk) {
+        if bk[b] == tpi {
+            if bv[b] == arg_ty {
+                return 0
+            }
+            sm_err_line = s_lines[call_id]
+            sm_err_col = s_cols[call_id]
+            sm_err_msg = "类型参数 " + intern.lookup(tpi) + " 推断冲突: " + types.type_name(bv[b]) + " vs " + types.type_name(arg_ty)
+            return -2
+        }
+        b = b + 1
+    }
+    table_push(bk, tpi)
+    table_push(bv, arg_ty)
+    return 0
+}
+
+// 按模板参数顺序收尾 args。未绑定参数：p.8.2.6 若有默认类型参数则自动代入
+// 默认，否则报"无法推断"。优先级：显式实参 > 推断绑定 > 默认类型参数。
+func finish_args(gti: i64, tp_names: table<i64>, bk: table<i64>, bv: table<i64>, call_id: i64) -> table<i64> {
+    var kinds = sstate.gt_param_kinds(gti)
+    var defaults = sstate.gt_defaults(gti)
+    var args: table<i64> = table_new_i64()
+    var k: i64 = 0
+    while k < len(tp_names) {
+        // v2 值参数：显式实参（bk/bv 中该名，编码 <0）或默认整值；无 port 约束
+        if kinds[k] == 1 {
+            var enc: i64 = -1
+            var b: i64 = 0
+            while b < len(bk) {
+                if bk[b] == tp_names[k] {
+                    enc = bv[b]
+                    break
+                }
+                b = b + 1
+            }
+            if enc == -1 {
+                var dn = -1
+                if k < len(defaults) && defaults[k] >= 0 {
+                    dn = resolve_int_len_node(defaults[k])
+                }
+                if dn <= 0 {
+                    sm_err_line = s_lines[call_id]
+                    sm_err_col = s_cols[call_id]
+                    sm_err_msg = "值参数 " + intern.lookup(tp_names[k]) + " 未提供且无有效默认值（请显式指定，如 f<1280>(...)）"
+                    return table_new_i64()
+                }
+                enc = -1 - dn
+            }
+            table_push(args, enc)
+            k = k + 1
+            continue
+        }
+        var found: i64 = -1
+        var b2: i64 = 0
+        while b2 < len(bk) {
+            if bk[b2] == tp_names[k] {
+                found = bv[b2]
+                break
+            }
+            b2 = b2 + 1
+        }
+        if found < 0 {
+            // p.8.2.6 默认类型参数：未推断且带默认 → 自动代入默认（解析为类型 id）。
+            // 默认类型可为简单类型（i64/string/any）或模板 struct 引用（如
+            // Box<i64>，parse_generic_type_node 会实例化）；跨参数引用（引用
+            // 其他类型参数的默认）在此解析为未登记类型 → 报"无法推断"。
+            if k < len(defaults) && defaults[k] >= 0 {
+                var dty = parse_generic_type_node(defaults[k])
+                if dty >= 0 {
+                    table_push(args, dty)
+                    k = k + 1
+                    continue
+                }
+            }
+            sm_err_line = s_lines[call_id]
+            sm_err_col = s_cols[call_id]
+            sm_err_msg = "无法推断类型参数 " + intern.lookup(tp_names[k]) + "（调用点无足够信息，请显式指定类型实参，如 max<i64>(...)，或确认已声明默认类型）"
+            return table_new_i64()
+        }
+        table_push(args, found)
+        k = k + 1
+    }
+    return args
+}
+
+func alias_expand(alidx: i64, tid: i64) -> i64 {
+    if alias_depth > 32 {
+        sm_err_line = s_lines[tid]
+        sm_err_col = s_cols[tid]
+        sm_err_msg = "类型别名 '" + sstate.name_str(tid) + "' 展开超限（疑似循环别名）"
+        return -1
+    }
+    var anode = alias_vals[alidx]      // S_N_TYPE_ALIAS 节点
+    var tps = sstate.child(anode, 0)   // -1 或 N_TYPE_PARAMS
+    var tgt = sstate.child(anode, 1)   // 目标类型节点
+    if tps < 0 {
+        // 非泛型别名：直接展开目标类型节点
+        alias_depth = alias_depth + 1
+        var r = parse_generic_type_node(tgt)
+        alias_depth = alias_depth - 1
+        return r
+    }
+    // 泛型别名：形参名表 + 类型实参 → clone_inner 代换 → 递归展开
+    var ntp = sstate.nchild(tps)
+    var tp_names: table<i64> = table_new_i64()
+    var kinds: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < ntp {
+        table_push(tp_names, s_names[sstate.child(tps, i)])
+        table_push(kinds, 0)
+        i = i + 1
+    }
+    var slot = sstate.child(tid, 0)
+    if slot < 0 || s_tags[slot] != S_N_TYPE_ARGS {
+        sm_err_line = s_lines[tid]
+        sm_err_col = s_cols[tid]
+        sm_err_msg = "别名 '" + sstate.name_str(tid) + "' 是泛型别名，需要类型实参（如 " + sstate.name_str(tid) + "<i64>）"
+        return -1
+    }
+    var args = parse_type_args_ast(slot)
+    if len(args) == 0 {
+        return -1
+    }
+    if len(args) != ntp {
+        sm_err_line = s_lines[tid]
+        sm_err_col = s_cols[tid]
+        sm_err_msg = "别名 '" + sstate.name_str(tid) + "' 类型实参数不匹配（需 " + to_string(ntp) + " 个，实给 " + to_string(len(args)) + " 个）"
+        return -1
+    }
+    alias_depth = alias_depth + 1
+    var sub = clone_inner(tgt, tp_names, kinds, args)
+    var r2: i64 = -1
+    if sub >= 0 {
+        r2 = parse_generic_type_node(sub)
+    }
+    alias_depth = alias_depth - 1
+    return r2
+}
+
+}

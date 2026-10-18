@@ -1,0 +1,115 @@
+type tie<logic>
+// tests/_p9124_nsconst_probe/nsconst_probe.tie —— p.9.12.4 验收：命名空间体内 const 声明
+// ============================================================
+// EN: acceptance probe for `const NAME: T = 值` declarations inside namespace
+// bodies — consts are registered as globals under the namespace-qualified name
+// (ns::NAME, emitted as @ns$NAME in LLVM) and referenced via ns::NAME or bare
+// name + namespace-prefix resolution, mirroring top-level const semantics
+// (compile-time literal folding, read-only).
+//
+// 覆盖 / Coverage：
+//   · 命名空间内 const i64/string/f64/bool 四种标量声明
+//   · ns::NAME 限定引用（跨命名空间函数用常量：util::describe 引用 calc::*）
+//   · 命名空间内函数**裸名**引用常量（BASE * 2 常量折叠表达式）
+//   · 顶层同名常量不冲突（顶层 SHARED=5000 vs calc::SHARED=7，互不遮蔽）
+//   · 负例（const 重新赋值被拒）在伴生文件 nsconst_neg_probe.tie，编译必须失败
+//
+// 语义落点 / Notes：
+//   · 命名空间内 const 以全名 "ns::NAME" 登记 gb_*（scollect.collect_ns →
+//     collect_global_var），与命名空间函数同前缀规则；顶层同名因登记键不同
+//     （"SHARED" vs "calc::SHARED"）天然不冲突。
+//   · 引用端：`calc::BASE` 走 S_N_PATH → 全名查 gb_*（sinfer/irgen 同款）；
+//     `BASE` 裸名走「裸名 → 当前命名空间前缀逐级补全」（gb_find_ns_key /
+//     irgen scope_get_global），对齐裸函数名解析。
+//   · 发射端：llvmgen emit_globals/global_ref 对全名 ns_replace（::→$），
+//     @calc$BASE = global i64 100 等；标量字面量初值编译期折叠。
+
+// ---- 顶层同名常量（与命名空间内 calc::SHARED 不冲突） ----
+const SHARED: i64 = 5000
+
+namespace calc {
+    const BASE: i64 = 100
+    const RATE: f64 = 2.5
+    const FLAG: bool = true
+    const NAME: string = "calc-ns"
+    const SHARED: i64 = 7
+
+    // 裸名引用（BASE * 2 常量折叠表达式 → 200）
+    pub func doubled() -> i64 {
+        return BASE * 2
+    }
+    // 限定引用（calc::BASE * 2 → 200）
+    pub func qualified() -> i64 {
+        return calc::BASE * 2
+    }
+    pub func msg() -> string {
+        return NAME
+    }
+    pub func flag_v() -> bool {
+        return FLAG
+    }
+    pub func rate_v() -> f64 {
+        return RATE
+    }
+    pub func shared_v() -> i64 {
+        return SHARED
+    }
+}
+
+namespace util {
+    const PREFIX: string = "[u]"
+
+    // 跨命名空间函数用常量：限定引用 calc::NAME / calc::BASE
+    pub func describe() -> string {
+        return PREFIX + " " + calc::NAME + " base=" + to_string(calc::BASE)
+    }
+}
+
+var fails: i64 = 0
+var total: i64 = 0
+
+func check(cond: bool, msg: string) {
+    total = total + 1
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func main() {
+    // 1) ns::NAME 限定引用（i64 / string / f64 / bool）
+    check(calc::BASE == 100, "calc::BASE == 100")
+    check(calc::NAME == "calc-ns", "calc::NAME == \"calc-ns\"")
+    check(calc::RATE == 2.5, "calc::RATE == 2.5")
+    check(calc::FLAG == true, "calc::FLAG == true")
+
+    // 2) 命名空间内函数：裸名引用常量参与折叠表达式（BASE*2 → 200）
+    check(calc::doubled() == 200, "calc::doubled() (bare BASE*2) == 200, got " + to_string(calc::doubled()))
+    // 3) 限定引用同样折叠（calc::BASE*2 → 200）
+    check(calc::qualified() == 200, "calc::qualified() (calc::BASE*2) == 200")
+    check(calc::msg() == "calc-ns", "calc::msg() returns ns string const")
+    check(calc::flag_v() == true, "calc::flag_v() returns ns bool const")
+    check(calc::rate_v() == 2.5, "calc::rate_v() returns ns f64 const")
+
+    // 4) 顶层同名不冲突：限定 calc::SHARED(7) 与顶层 SHARED(5000) 互不遮蔽；
+    //    命名空间内**裸名** SHARED 按既有裸名解析规则（对齐 resolve_call_name
+    //    候选1 裸名优先）命中顶层 5000——与裸函数名解析行为一致。
+    check(calc::shared_v() == 5000, "bare SHARED in ns resolves top-level 5000 (bare-first rule)")
+    check(calc::SHARED == 7, "calc::SHARED == 7 (qualified ns const)")
+    check(SHARED == 5000, "top-level SHARED == 5000 (no clash with ns const)")
+
+    // 5) 跨命名空间函数用常量
+    check(util::describe() == "[u] calc-ns base=100",
+        "util::describe() cross-namespace consts, got \"" + util::describe() + "\"")
+
+    if fails == 0 {
+        println("PASS all " + to_string(total))
+    } else {
+        println("FAIL count=" + to_string(fails) + " / total=" + to_string(total))
+    }
+    if fails > 0 {
+        exit(1)
+    }
+}

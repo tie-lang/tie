@@ -1,0 +1,623 @@
+type tie<class>
+// compiler/frontend/pexpr_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 pexpr.tie。
+namespace pexpr {
+// 构造二元节点（span 取左操作数起点，对齐 Rust expr_span 行为）
+func mk_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
+    var n = ast.new_node(N_BINARY, -1, op, -1, ast.line(lhs), ast.col(lhs))
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, lhs)
+    table_push(kids, rhs)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 构造一元节点
+func mk_unary(op: i64, operand: i64, line: i64, col: i64) -> i64 {
+    var n = ast.new_node(N_UNARY, -1, op, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, operand)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 构造下标节点（span 取基址起点）
+func mk_index(base: i64, index: i64) -> i64 {
+    var n = ast.new_node(N_INDEX, -1, -1, -1, ast.line(base), ast.col(base))
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, base)
+    table_push(kids, index)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 路径段拼接：segs（intern id 表）→ "a::b::c" 全名 id。路径调用
+// `ns::add(...)` 的 N_CALL name 必须用全名（裸调用名解析依赖完整前缀）。
+func join_path_segs(segs: table<i64>) -> i64 {
+    var full: string = ""
+    var i: i64 = 0
+    while i < len(segs) {
+        if i > 0 {
+            full = full + "::"
+        }
+        full = full + interner.lookup(segs[i])
+        i = i + 1
+    }
+    return interner.intern(full)
+}
+
+// P1 数据流箭头（左结合，优先级低于三目）：`a -> f(...)`（传参，数据作末参）
+// 与 `x <- a`（赋值，镜像）。Fwd(->)：数据在 LHS、目标在 RHS；Rev(<-)：
+// 数据在 RHS、目标在 LHS。
+// 脱糖：目标侧是调用（f(...) / obj.m(...) / expr(...)）→ 把数据附加为末参，
+// 改写该调用节点（保持普通调用走既有语义/irgen 通道，无箭头节点残留）；
+// 否则保留 N_BINARY 箭头节点（裸函数引用 → 传参；可赋值 lvalue → 赋值，
+// 由语义层按目标类型分派）。
+// 链式：`a -> f() -> g()` = `(a -> f()) -> g()`（左结合）。裸函数名链
+// `x -> f -> g` = `(x->f)->g` = g(f(x))（每段箭头语义层按 fn 类型分派为调用）。
+//
+// p.8.2.8 确定性裁决（推广边界，与既有探针/语义一致，勿破坏）：
+//   D1) 调用目标一律「数据追加为末参」：`x -> f(y)` = f(y, x)（既有探针
+//       dataflow_arrow 依赖此序，故精度上「x 作首参」的形态不采用）。
+//   D2) 裸字段目标 `x -> obj.f` / `obj.f <- x` 保持**字段赋值**（与既有探针
+//       一致；裸方法名非一等值——tie 方法须经 obj.m() 调用，故裸 obj.m 无管道
+//       含义，方法管道用调用形态 `x -> obj.m()`）。
+//   D3) 下标目标 `arr[i] <- x` 保持 N_INDEX_ASSIGN。
+//   D4) 与尾随闭包（p.8.2.9）组合：`x -> f() { }` 中 `{ }` 先在 unary 层附着为
+//       调用首/末实参，数据再被箭头附加为**末参** → 结果 arg 序为 (…闭包, x)，
+//       需函数形参序匹配该排布（闭包形参在前）。此为确定性规则（见探针注释）。
+//   D5) 与推导式（p.8.2.5）组合：`[g(x -> f) for x in xs]` 中管道可嵌任一
+//       表达式上下文（元素表达式/实参），互不冲突。
+//   D6) 箭头不与 lambda 参数箭头歧义：tie 闭包唯一语法 func(...){...} 无裸
+//       lambda 形参箭头，`->`/`<-` 恒为数据流箭头，解析无歧义（token 唯一）。
+// 说明（p.9.13.4 拆分）：箭头一段的目标解析与折叠逻辑已迁至分片 4
+// （pexpr_p4.tie：arrow_step / arrow_fold / pipe_read_form / arrow_with_chain），
+// 本函数只保留「取 lhs + 循环消费箭头」的骨架，以满足 0 大函数纪律。
+func parse_arrow() -> i64 {
+    var lhs = parse_ternary()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op: i64 = -1
+        if putil.peek_tag() == lex_arrow {
+            op = B_ARROW_FWD
+        } else if putil.peek_tag() == lex_larrow {
+            op = B_ARROW_REV
+        }
+        if op < 0 {
+            d = true
+        } else {
+            putil.advance()
+            lhs = arrow_step(op, lhs)
+            if lhs < 0 {
+                return -1
+            }
+        }
+    }
+    return arrow_with_chain(lhs)
+}
+
+// 逻辑或 ||
+func parse_or() -> i64 {
+    var lhs = parse_and()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if putil.peek_tag() != lex_oror {
+            d = true
+        } else {
+            putil.advance()
+            var rhs = parse_and()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_OR, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 逻辑与 &&
+func parse_and() -> i64 {
+    var lhs = parse_bit_or()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if putil.peek_tag() != lex_andand {
+            d = true
+        } else {
+            putil.advance()
+            var rhs = parse_bit_or()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_AND, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 按位或 |
+func parse_bit_or() -> i64 {
+    var lhs = parse_bit_xor()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if putil.peek_tag() != lex_pipe {
+            d = true
+        } else {
+            putil.advance()
+            var rhs = parse_bit_xor()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_BITOR, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 按位异或 ^
+func parse_bit_xor() -> i64 {
+    var lhs = parse_bit_and()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if putil.peek_tag() != lex_caret {
+            d = true
+        } else {
+            putil.advance()
+            var rhs = parse_bit_and()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_BITXOR, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 按位与 &
+func parse_bit_and() -> i64 {
+    var lhs = parse_equality()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if putil.peek_tag() != lex_amp {
+            d = true
+        } else {
+            putil.advance()
+            var rhs = parse_equality()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_BITAND, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 相等 == !=
+// 注：内侧调用 parse_in_expr（而非 parse_comparison），使 `in` 比 `==` 更紧——
+// 于是 `x in xs == false` 解析为 `(x in xs) == false`（自然写法），
+// 且 `a == b in xs` 解析为 `a == (b in xs)`（确定性）。
+func parse_equality() -> i64 {
+    var lhs = parse_in_expr()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if putil.peek_tag() == lex_eqeq {
+            op = B_EQ
+        } else if putil.peek_tag() == lex_noteq {
+            op = B_NOTEQ
+        } else {
+            d = true
+        }
+        if !d {
+            putil.advance()
+            var rhs = parse_in_expr()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 比较链入口之上加一层 `is`（p.9.11，规范 §3.16）：`v is i64` 类型判定。
+// 优先级：紧于 `==`（equality 内侧是 in_expr → is）、松于 `< >`（操作数走
+// parse_comparison）⇒ `x == v is i64` 解析为 `x == (v is i64)`。
+// 右侧是**类型**不是表达式：直接走 pexpr_type.parse_type（i64/Point/table<T>/…），
+// 产出 N_IS[children=[操作数, 类型节点]]（语义层 stype.parse_type_node 解析类型 id）。
+func parse_is() -> i64 {
+    var lhs = parse_comparison()
+    if lhs < 0 {
+        return -1
+    }
+    if putil.peek_tag() != lex_is {
+        return lhs
+    }
+    var line = ast.line(lhs)
+    var col = ast.col(lhs)
+    putil.advance()
+    var tnode = pexpr_type.parse_type()
+    if tnode < 0 {
+        return -1
+    }
+    var n = ast.new_node(N_IS, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, lhs)
+    table_push(kids, tnode)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 比较 < > <= >=（p.8.2.2 链式比较：`a < b < c` desugar 为 `(a < b) && (b < c)`；
+// 中项表达式求值两次，保守语义——常用于变量/字面量）
+func parse_comparison() -> i64 {
+    var lhs = parse_shift()
+    if lhs < 0 {
+        return -1
+    }
+    var prev_rhs: i64 = -1
+    var result: i64 = -1
+    var d = false
+    while !d {
+        var op = -1
+        if putil.peek_tag() == lex_lt {
+            op = B_LT
+        } else if putil.peek_tag() == lex_gt {
+            op = B_GT
+        } else if putil.peek_tag() == lex_le {
+            op = B_LE
+        } else if putil.peek_tag() == lex_ge {
+            op = B_GE
+        } else {
+            d = true
+        }
+        if !d {
+            putil.advance()
+            var rhs = parse_shift()
+            if rhs < 0 {
+                return -1
+            }
+            if prev_rhs < 0 {
+                // 第一对：lhs op rhs
+                result = mk_binary(op, lhs, rhs)
+            } else {
+                // 链式：result && (prev_rhs op rhs)
+                var nxt = mk_binary(op, prev_rhs, rhs)
+                result = mk_binary(B_AND, result, nxt)
+            }
+            prev_rhs = rhs
+        }
+    }
+    if result < 0 {
+        return lhs
+    }
+    return result
+}
+
+// 移位 << >>
+func parse_shift() -> i64 {
+    var lhs = parse_term()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if putil.peek_tag() == lex_shl {
+            op = B_SHL
+        } else if putil.peek_tag() == lex_shr {
+            op = B_SHR
+        } else {
+            d = true
+        }
+        if !d {
+            putil.advance()
+            var rhs = parse_term()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 加减 + -
+func parse_term() -> i64 {
+    var lhs = parse_factor()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if putil.peek_tag() == lex_plus {
+            op = B_ADD
+        } else if putil.peek_tag() == lex_minus {
+            op = B_SUB
+        } else if putil.peek_tag() == lex_plusq {
+            // p.9.11.9 checked 加 `+?`（同 + 优先级）
+            op = B_CHECK_ADD
+        } else if putil.peek_tag() == lex_minusq {
+            // p.9.11.9 checked 减 `-?`（同 - 优先级）
+            op = B_CHECK_SUB
+        } else {
+            d = true
+        }
+        if !d {
+            putil.advance()
+            var rhs = parse_factor()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 幂 `**`（p.9.13.3）：右结合，优先级高于 `* / % \`（故 parse_factor 的操作数
+// 走本层而非直接 parse_unary）。右操作数递归本层 → `2 ** 3 ** 2` = `2 ** (3 ** 2)`。
+// 一元负号在本层**之下**（parse_unary 更紧）→ `-2 ** 2` = `(-2) ** 2` = 4
+//（与 Python 的 `-(2**2)` 不同，采用「一元最紧」惯例，与 tie 既有 `-a * b` 一致）。
+func parse_power() -> i64 {
+    var base = parse_unary()
+    if base < 0 {
+        return -1
+    }
+    if putil.peek_tag() == lex_starstar || putil.peek_tag() == lex_starstarq {
+        var is_checked = putil.peek_tag() == lex_starstarq
+        putil.advance()
+        var exp = parse_power()   // 右结合
+        if exp < 0 {
+            return -1
+        }
+        // p.9.13.3 `**?` checked 幂（与 `**` 同级；int 族溢出即报错）
+        if is_checked {
+            return mk_binary(B_CHECK_POW, base, exp)
+        }
+        return mk_binary(B_POW, base, exp)
+    }
+    return base
+}
+
+// 乘除模 * / % \ **（** 经 parse_power 占更高优先级）
+func parse_factor() -> i64 {
+    var lhs = parse_power()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if putil.peek_tag() == lex_star {
+            op = B_MUL
+        } else if putil.peek_tag() == lex_slash {
+            op = B_DIV
+        } else if putil.peek_tag() == lex_percent {
+            op = B_MOD
+        } else if putil.peek_tag() == lex_percentpercent {
+            // p.9.13.3 floor 取余 `%%`（与 % 同级）
+            op = B_FLOORMOD
+        } else if putil.peek_tag() == lex_backslash {
+            // p.9.13.3 整除 `\`（与 * / % 同级；设计稿原定 `//`，因与行注释冲突改符号）
+            op = B_IDIV
+        } else if putil.peek_tag() == lex_starq {
+            // p.9.11.9 checked 乘 `*?`（同 * 优先级）
+            op = B_CHECK_MUL
+        } else {
+            d = true
+        }
+        if !d {
+            putil.advance()
+            var rhs = parse_power()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 深拷贝节点 children 到一张表（读段偏移逐个取出）。
+func clone_children(id: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    var n = ast.child_count(id)
+    var i: i64 = 0
+    while i < n {
+        table_push(out, ast.child_at(id, i))
+        i = i + 1
+    }
+    return out
+}
+
+// 解析尾随闭包块。游标停在 `{` 上。如同 parse_fn_lit 的缺省形态：产出
+// `func() -> void { ... }`（无参、默认 void 返回），登记延迟闭包体快照后
+// 配平跳过块体（本体由 pstmt_flow.parse_deferred_closures 末尾回填）。
+// tie 闭包字面量唯一语法是 func(...) { ... }，无裸 lambda 参数形式，故
+// 尾随块一律按**无参 void 闭包**处理（决议见探针头注释）。
+func parse_trailing_closure(line: i64, col: i64) -> i64 {
+    var f = ast.new_node(N_FN_LIT, -1, -1, 0, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, -1)   // 泛型槽（闭包暂不支持显式类型参数）
+    // 返回类型：无 -> 缺省 void（TK_VOID=14，与 parse_fn_lit 缺省一致）
+    table_push(kids, ast.new_node(N_NAMED_TYPE, interner.intern("void"), 14, -1, line, col))
+    ast.set_children(f, kids)
+    putil.defer_closure_push(f)
+    if !skip_closure_body() {
+        return -1
+    }
+    return f
+}
+
+// 尾随闭包主判定/构造：当前游标在 `{` 上。若 expr 为可携带尾随闭包的调用
+// 节点则把块并入谓词位置并返回（重建后）新节点；否则返回 expr 原样。
+// 规则：已有实参的调用 → 块追加为末位实参；裸函数名/裸 `.method` → 把块
+// 构造为该调用的唯一实参（等价 `f(closure)` / `recv.method(closure)`）。
+func maybe_trailing_closure(expr: i64) -> i64 {
+    // p.8.2.9：控制流条件表达式内不判定尾随闭包（`while cond { }` / `if f { }`
+    // 的块开括号与尾随闭包语法同形，须交由控制流解析器消费，见 putil.enter_cond）。
+    if putil.in_cond() {
+        return expr
+    }
+    var t = ast.tag(expr)
+    var ok = false
+    if t == N_VAR || t == N_CALL || t == N_CALL_EXPR || t == N_METHOD_CALL || t == N_FIELD_ACCESS || t == N_RUN_ACTOR {
+        ok = true
+    } else if t == N_SAFE_ACCESS {
+        // 安全访问仅方法形态（name != -1 且已有实参槽）可追加；索引/字段不可
+        if ast.name(expr) >= 0 && ast.child_count(expr) >= 1 {
+            ok = true
+        }
+    }
+    if !ok {
+        return expr
+    }
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var clo = parse_trailing_closure(line, col)
+    if clo < 0 {
+        return -1
+    }
+    if t == N_VAR {
+        // 裸函数名 `f { }` → `f(closure)`
+        var c = ast.new_node(N_CALL, ast.name(expr), -1, -1, ast.line(expr), ast.col(expr))
+        var kkids: table<i64> = table_new_i64()
+        table_push(kkids, -1)   // 泛型槽
+        table_push(kkids, clo)
+        ast.set_children(c, kkids)
+        return c
+    }
+    if t == N_FIELD_ACCESS {
+        // 裸 `.method { }` → `recv.method(closure)`
+        var base = ast.child_at(expr, 0)
+        var m = ast.new_node(N_METHOD_CALL, ast.name(expr), -1, -1, ast.line(expr), ast.col(expr))
+        var mkids: table<i64> = table_new_i64()
+        table_push(mkids, -1)   // 泛型槽
+        table_push(mkids, base)
+        table_push(mkids, clo)
+        ast.set_children(m, mkids)
+        return m
+    }
+    // 其余调用节点（N_CALL/N_CALL_EXPR/N_METHOD_CALL/N_SAFE_ACCESS 方法形态/
+    // N_RUN_ACTOR）：追加为末位实参，重建为同 tag 新节点。
+    var e = clone_children(expr)
+    table_push(e, clo)
+    var nc = ast.new_node(t, ast.name(expr), ast.val(expr), ast.aux(expr), ast.line(expr), ast.col(expr))
+    ast.set_children(nc, e)
+    return nc
+}
+
+// 实参 `expr...`：若实参表达式后紧跟 `...`，则把整个表达式包装为 N_SPREAD_ARG
+// 节点（children=[expr]）。`...` 仅出现在实参位置（形参声明处的变参 `...T` 是
+// p.8.1.3 已完成的功能，互不相扰）。返回原 a（无 `...`）或包装后的 spread 节点。
+func wrap_spread_arg(a: i64) -> i64 {
+    if putil.peek_tag() != lex_ellipsis {
+        return a
+    }
+    putil.advance()   // '...'
+    var line = ast.line(a)
+    var col = ast.col(a)
+    var sp = ast.new_node(N_SPREAD_ARG, -1, -1, -1, line, col)
+    var skids: table<i64> = table_new_i64()
+    table_push(skids, a)
+    ast.set_children(sp, skids)
+    return sp
+}
+
+// p.9.12.1：插值字符串文本段的花括号转义折叠（{{→{ / }}→}）。
+// lexer 不再折叠（JSON/模板字面必须逐字保留 `}}`）；仅在此对**插值**段应用
+// 折叠。lid 为带引号 lexeme 的池 id；逐字扫描非 `\` 转义区间的 `{`/`}`。
+func interp_brace_collapse(lid: i64) -> i64 {
+    var raw = interner.lookup(lid)
+    var n: i64 = str_len(raw)
+    var is_raw = is_raw_str_lit(raw)
+    var out: string = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(raw, i)
+        if !is_raw && c == "{" && i + 1 < n && str_char(raw, i + 1) == "{" {
+            out = out + "{"
+            i = i + 2
+        } else if !is_raw && c == "}" && i + 1 < n && str_char(raw, i + 1) == "}" {
+            out = out + "}"
+            i = i + 2
+        } else {
+            out = out + c
+            i = i + 1
+        }
+    }
+    return interner.intern(out)
+}
+
+// 判断带引号 lexeme 是否为 raw 字符串（r"..."，无插值、不折叠花括号）
+func is_raw_str_lit(raw: string) -> bool {
+    var n = str_len(raw)
+    return n >= 3 && str_char(raw, 0) == "r" && str_char(raw, 1) == "\"" && str_char(raw, n - 1) == "\""
+}
+
+// p.8.2.3 插值字符串组装：lexer 已把 `"a{expr}b"` 拆为 STR("a") { expr } STR("b")
+// token 序列（插值 `{` 是 lex_interp_lbrace 专用 tag，块开括号 lex_lbrace 不误入）
+// ——这里组装为 `"a" + to_string(expr) + "b"` 拼接链（to_string 对
+// string 实参返回自身，irgen 已补分支）。`{}` 空插值由 parse_expr 对 `}` 报错。
+func parse_interp_chain(first_lid: i64, line: i64, col: i64) -> i64 {
+    var fl = interp_brace_collapse(first_lid)
+    var acc = ast.new_node(N_STR_LIT, fl, -1, -1, line, col)
+    var d = false
+    while !d {
+        if putil.peek_tag() != lex_interp_lbrace {
+            d = true
+            break
+        }
+        putil.advance()  // '{'
+        var expr = parse_expr()
+        if expr < 0 {
+            return -1
+        }
+        if !putil.expect(lex_rbrace, "'}'") {
+            return -1
+        }
+        // to_string(expr)（N_CALL 布局：[泛型槽, 实参]）
+        var ts = ast.new_node(N_CALL, interner.intern("to_string"), -1, -1, line, col)
+        var tkids: table<i64> = table_new_i64()
+        table_push(tkids, -1)
+        table_push(tkids, expr)
+        ast.set_children(ts, tkids)
+        acc = mk_binary(B_ADD, acc, ts)
+        // 下一文本段（lexer 插值模式保证续段是 lex_str）
+        if putil.peek_tag() != lex_str {
+            d = true
+            break
+        }
+        var lid2 = interp_brace_collapse(interner.intern(putil.peek_lexeme()))
+        putil.advance()
+        var seg = ast.new_node(N_STR_LIT, lid2, -1, -1, line, col)
+        acc = mk_binary(B_ADD, acc, seg)
+    }
+    return acc
+}
+
+}

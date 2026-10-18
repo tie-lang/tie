@@ -1,0 +1,114 @@
+type tie<logic>
+// ============================================================
+// p.9.13.1 单箭头统一正例探针：`->` 成为 tie 唯一箭头。
+//
+// 覆盖：
+//   1. match/switch 表达式臂：`pat -> expr`（原 `=>`，已改）——整数字面量、
+//     枚举 payload 解构、when 守卫、`_` 通配
+//   2. `->` 函数返回位（`fn f(a: i64) -> i64`）
+//   3. 宏返回位（`macro m(x: code) -> code`，函数式宏，编译期执行）
+//   4. 数据流管道（p.8.2.8 左结合 `data -> f(...)`：data 附加为末参）
+//   5. 消歧保留：`>=` 比较、`=` 赋值、`-` 减号、`>` 比较均不受损
+// 说明：探针刻意按小函数组织，规避后端对「单函数内多路字符串
+// 拼接临时 PHI」的未分组缺陷（与本改动无关的既有 LLVM 发射问题）。
+// ============================================================
+
+// ---- 整数校验：打印 PASS/FAIL 并失败即非零退出 ----
+func ok(name: string) {
+    println("PASS " + name)
+}
+func bad(name: string) {
+    println("FAIL " + name)
+    exit(1)
+}
+func chk(cond: bool, name: string) {
+    if cond { ok(name) } else { bad(name) }
+}
+
+// ---- 2）函数返回位 `->` ----
+func add(a: i64, b: i64) -> i64 {
+    return a + b
+}
+
+// 1) match/switch 表达式臂：值模式 + when 守卫（返回 i64 以规避字符串 PHI）
+func pick(n: i64) -> i64 {
+    return switch n {
+        1 when n > 0 -> 11,
+        0 -> 0,
+        _ -> 99
+    }
+}
+
+// 1) 枚举 payload 解构 + when 守卫 + 通配
+enum Color {
+    Red(i64)
+    Green(i64)
+    Blue(i64)
+}
+
+func paint(c: Color) -> i64 {
+    return switch c {
+        Red(v) -> v + 100,
+        Green(v) when v >= 5 -> -1,      // 5) `>=` 比较不受损
+        Green(v) -> v,
+        _ -> -7
+    }
+}
+
+// 1) 字符串臂（仅演示编译+运行路径，不走 `==` 比较）
+func sound(n: i64) -> string {
+    return switch n {
+        0 -> "zero",
+        1 -> "one",
+        _ -> "many"
+    }
+}
+
+// ---- 3）宏返回位 `-> code`（函数式宏，编译期执行）----
+macro twice(x: code) -> code {
+    return `( ($x) * 2 )
+}
+
+// ---- 4）数据流管道 `data -> f(...)`（左结合，data 附加为末参）----
+func add3(a: i64, b: i64, c: i64) -> i64 {
+    return a + b + c
+}
+
+func test_pick() -> bool {
+    return pick(1) == 11 && pick(0) == 0 && pick(42) == 99
+}
+
+func test_paint() -> bool {
+    return paint(Color.Red(7)) == 107 &&
+           paint(Color.Green(8)) == -1 &&
+           paint(Color.Green(2)) == 2 &&
+           paint(Color.Blue(0)) == -7
+}
+
+func test_macro() -> bool {
+    return twice(21) == 42
+}
+
+func test_pipe() -> bool {
+    return (5 -> add3(10, 20)) == 35   // add3(10, 20, 5) == 35
+}
+
+func test_assign() -> bool {
+    var x = 7
+    var y = 0
+    y = x - 2                           // `=` 赋值 + `-` 减法
+    return y == 5 && x > y              // `>` 比较
+}
+
+func main() {
+    chk(test_pick(), "switch arm literal+guard")
+    chk(test_paint(), "switch enum payload/guard/wildcard")
+    chk(test_macro(), "macro return arrow")
+    chk(test_pipe(), "dataflow pipe append-last")
+    chk(test_assign(), "assign/minus/gt")
+
+    // 字符串臂演示（赋值+打印，非 == 比较）
+    var s = sound(1)
+    ok("string switch arm value=" + s)
+    println("p.9.13.1 single-arrow probe all pass")
+}

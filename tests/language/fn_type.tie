@@ -1,0 +1,52 @@
+type tie<logic>
+
+// p.9.11.17 函数类型一等公民：`fn(参数类型...) -> 返回类型` 可用作变量类型
+// 注解 / 形参类型 / 返回类型 / struct 字段类型；函数值 = 函数名引用或闭包
+// `func(){}`；调用函数值 fv(args)。本探针验证全部四位承载 + fn 字段调用
+// （cb.f(99) 走函数值间接调用，非方法调用）+ 表达式接收者 fn 字段调用。
+
+func add1(x: i64) -> i64 { return x + 1 }
+func even(x: i64) -> bool { return x % 2 == 0 }
+
+// 形参类型：fn 值作参数
+func apply(f: fn(i64) -> i64, x: i64) -> i64 { return f(x) }
+
+// 返回类型：fn 值作返回
+func pick(b: i64) -> fn(i64) -> i64 {
+    if b > 0 { return add1 }
+    return add1
+}
+
+// struct 字段类型：fn 值作字段
+struct Callback {
+    var f: fn(i64) -> i64
+}
+
+// fn 字段接收者工厂（表达式接收者调用 make_cb().f(...)）
+func make_cb() -> Callback {
+    var cb: Callback = Callback()
+    cb.f = add1
+    return cb
+}
+
+func main() {
+    // 1. 变量类型注解 + 函数值调用
+    var g: fn(i64) -> i64 = add1
+    println(g(41))
+    // 2. fn 值作实参
+    println(apply(add1, 9))
+    // 3. fn 值作返回 + 链式调用
+    println(pick(1)(5))
+    // 4. fn 字段赋值 + fn 字段调用
+    var cb: Callback = Callback()
+    cb.f = add1
+    println(cb.f(99))
+    // 5. 表达式接收者的 fn 字段调用
+    println(make_cb().f(7))
+    // 6. 闭包作函数值
+    var cl: fn(i64) -> i64 = func(x: i64) -> i64 { return x + 100 }
+    println(cl(1))
+    // 7. bool 返回值函数作值
+    var p: fn(i64) -> bool = even
+    println(p(4))
+}

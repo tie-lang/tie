@@ -1,0 +1,56 @@
+type tie<logic>
+// p.9.5.x T2 探针：并发发送 → 串行 dispatch 精确（per-actor 多槽队列 + 原子单飞）。
+// 4 个 S-pool 任务**同时**向同一 actor 各发 16 条 async（共 64 = 队列深度上界，
+// 不触背压）；handler 内 busy 自增 + 忙等放大窗口检测并发——若任一时刻两个
+// dispatch 同时跑同一 actor（旧 pending 提前清 0 的竞态），busy>1 记违规。
+// 单飞标志保证同一 actor 任一时刻至多一个消费者任务 → dispatch 天然串行。
+// 验收：最终 get() 计数精确 == 64、violation == 0（无竞态错值、无丢消息）。
+actor Strict {
+    var busy: i64 = 0
+    var count: i64 = 0
+    pub async func bump() {
+        busy = busy + 1
+        if busy > 1 {
+            g_violation = 1
+        }
+        var t: i64 = 0
+        while t < 200000 {
+            t = t + 1
+        }
+        busy = busy - 1
+        count = count + 1
+    }
+    pub func get() -> i64 {
+        return count
+    }
+}
+var g_violation: i64 = 0
+func main() {
+    var c = run Strict()
+    var h = wg_new()
+    wg_add(h, 4)
+    var i: i64 = 0
+    while i < 4 {
+        var iv = i
+        var cc = c
+        spawn(func() -> i64 {
+            var cc2 = cc
+            var j: i64 = 0
+            while j < 16 {
+                cc2.bump()
+                j = j + 1
+            }
+            wg_done(h)
+            return iv
+        })
+        i = i + 1
+    }
+    wg_wait(h)
+    var v = c.get()
+    println("count=" + to_string(v) + " violation=" + to_string(g_violation))
+    if v == 64 && g_violation == 0 {
+        println("T2 并发发送串行 dispatch 精确通过")
+    } else {
+        println("T2 失败 count=" + to_string(v) + " violation=" + to_string(g_violation))
+    }
+}

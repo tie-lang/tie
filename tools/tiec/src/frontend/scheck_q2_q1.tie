@@ -1,0 +1,92 @@
+type tie<class>
+// compiler/frontend/scheck_q2_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 scheck_q2.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+import "./scheck_ie_ie1.tie"
+import "./scheck_ie_ie2.tie"
+
+namespace scheck {
+// 语句检查
+pub func check_stmt(s: i64) -> i64 {
+    var tag = s_tags[s]
+    if tag == S_N_STMTLIST {
+        return check_stmt_stmtlist(s)
+    }
+    if tag == S_N_CODE_LIT {
+        return check_stmt_code_lit(s)
+    }
+    if tag == S_N_UNSAFE_BLOCK {
+        return check_stmt_unsafe_block(s)
+    }
+    if tag == S_N_GUARD_USE {
+        return check_stmt_guard_use(s)
+    }
+    if tag == S_N_GUARD_WITH {
+        return check_stmt_guard_with(s)
+    }
+    if tag == S_N_PANIC {
+        return check_stmt_panic(s)
+    }
+    if tag == S_N_VAR_DECL {
+        return check_stmt_var_decl(s)
+    }
+    if tag == S_N_EXPR_STMT {
+        return check_stmt_expr_stmt(s)
+    }
+    if tag == S_N_ASSIGN {
+        return check_stmt_assign(s)
+    }
+    if tag == S_N_RETURN {
+        return check_stmt_return(s)
+    }
+    // p.9.11.15 yield 生成器产出语句：仅具名函数体内合法（闭包内禁止——生成器
+    // = 具名函数，闭包无独立产出通道）；产出值类型须与生成器声明返回类型
+    // （签名 = table<elem>）的元素兼容。生成器标记由 scollect.collect_fn
+    // 在收集阶段完成（含 yield → 签名返回类型 = table<elem>）。
+    if tag == S_N_YIELD {
+        return check_stmt_yield(s)
+    }
+    if tag == S_N_IF {
+        return check_stmt_if(s)
+    }
+    // p.8.2.11 guard else 早退：children=[cond, else_list]，语义等价 if not(cond)
+    // { else_list }。约束：else 块必须以跳转语句收尾（否则 guard 退化为 if，
+    // 前置检查失去"不再继续"的语义）。
+    if tag == S_N_GUARD_STMT {
+        return check_stmt_guard_stmt(s)
+    }
+    if tag == S_N_DEFER {
+        return check_stmt_defer(s)
+    }
+    if tag == S_N_WHILE {
+        return check_stmt_while(s)
+    }
+    if tag == S_N_FOR {
+        return check_stmt_for(s)
+    }
+    if tag == S_N_BREAK || tag == S_N_CONTINUE {
+        return check_stmt_break(s)
+    }
+    if tag == S_N_GOTO_LABEL {
+        return check_stmt_goto_label(s)
+    }
+    if tag == S_N_GOTO {
+        return check_stmt_goto(s)
+    }
+    if tag == S_N_SWITCH {
+        return check_stmt_switch(s)
+    }
+    if tag == S_N_FIELD_ASSIGN {
+        return check_stmt_field_assign(s)
+    }
+    if tag == S_N_INDEX_ASSIGN {
+        return check_stmt_index_assign(s)
+    }
+    if tag == S_N_IMPORT || tag == S_N_USING || tag == S_N_NAMESPACE || tag == S_N_STRUCT || tag == S_N_ENUM || tag == S_N_FN_DEF || tag == S_N_EXTERN {
+        return check_stmt_import(s)
+    }
+    return 0
+}
+
+}

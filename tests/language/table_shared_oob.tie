@@ -1,0 +1,66 @@
+type tie<logic>
+// table_shared_oob.tie —— r.1.6.9 越界写按引用计数分流（正例）
+// ============================================================================
+// 语义（本轮裁决）：
+//   越界写 `t[i] = v`（i >= len）会**改变表的形状**（len/cap）。这本身不是错，
+//   错的是它**隐式**影响别的别名——`var a=[1,2,3]; var b=a; b[100]=42` 之后
+//   `len(a)` 也变成 101，用户只写了一个元素却无声改变了**另一个变量**的形状。
+//   故按句柄 @40 的真实引用计数（tbl_retain/tbl_release 维护，无新状态）分流：
+//     rc == 1（唯一持有者）⇒ 照旧自动扩容（p.9.12.2 保留；编译器自举依赖此支）
+//     rc  > 1（存在别名）  ⇒ 运行时诊断 + exit(1)
+//
+// 配套负例：table_shared_oob_neg.tie（共享表越界写必须被拒）。
+//
+// 期望输出（逐行）：
+//   exclusive-oob: len=6 t[5]=9
+//   shared-inplace: a[0]=99 b[0]=99
+//   shared-push: len(c)=2 len(d)=2
+//   exclusive-push: len(e)=2
+//   OOBRC PASS
+// ============================================================================
+
+func main() -> i64 {
+    var fails: i64 = 0
+
+    // ---- 1) 独占表越界写：照旧自动扩容（p.9.12.2 语义保留）----
+    var t: table<i64> = []
+    t[5] = 9
+    println("exclusive-oob: len=" + to_string(len(t)) + " t[5]=" + to_string(t[5]))
+    if len(t) != 6 || t[5] != 9 {
+        fails = fails + 1
+    }
+
+    // ---- 2) 共享表**原位**写：别名可见（tie 的既有惯用法，不在本次裁决范围）----
+    var a: table<i64> = [1, 2, 3]
+    var b = a
+    b[0] = 99
+    println("shared-inplace: a[0]=" + to_string(a[0]) + " b[0]=" + to_string(b[0]))
+    if a[0] != 99 || b[0] != 99 {
+        fails = fails + 1
+    }
+
+    // ---- 3) 共享表 push：别名可见（push 是**显式**操作，共享可见即设计意图；
+    //         tiu 有 73 处依赖「struct 按值传参 + 表字段共享」累积结果）----
+    var c: table<i64> = [7]
+    var d = c
+    table_push(d, 8)
+    println("shared-push: len(c)=" + to_string(len(c)) + " len(d)=" + to_string(len(d)))
+    if len(c) != 2 || len(d) != 2 {
+        fails = fails + 1
+    }
+
+    // ---- 4) 独占表 push：正常（对照，确认分流没伤到常规路径）----
+    var e: table<i64> = [1]
+    table_push(e, 2)
+    println("exclusive-push: len(e)=" + to_string(len(e)))
+    if len(e) != 2 {
+        fails = fails + 1
+    }
+
+    if fails > 0 {
+        println("OOBRC FAIL(" + to_string(fails) + ")")
+    } else {
+        println("OOBRC PASS")
+    }
+    return 0
+}

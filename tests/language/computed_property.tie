@@ -1,0 +1,90 @@
+type tie<logic>
+
+// ============================================================
+// p.8.2.7 计算属性（computed property）验收
+//
+// 声明形式裁决：沿用子项 p.8.2.4 的「方法约定」——结构体绑定命名空间方法集中
+// 出现即以计算属性登记（getter = <Struct>::<name>，setter = <Struct>::<name>_set）：
+//   - getter：`pub func name(self: Struct) -> 属性类型 { ... }`（零额外参数）
+//   - setter：`pub func name_set(self: Struct, v: 属性类型) { ... }`（参数=新值）
+// 理由（对照字段级访问器块 `var x: T { get{..} set{..} }`）：struct 体当前不允许
+// 方法/self（parse_struct 拒绝 func），字段块需改动字段解析 + 把访问器体降级为
+// struct 方法并接线 self，改动面大、自举风险高；而方法约定完全复用 p.8.2.4 已建
+// 的 struct 方法 + 调用发射（含 tig_op_overload），零新增语言机制、两子项共享设计。
+//
+// 语义规则：
+//   R1 读 `obj.attr`：成员名**非字段**且 <Struct>::attr getter 存在 → 计算属性读
+//       = 发射 getter 调用（纯函数，不需可寻址；不产存储槽）。
+//   R2 写 `obj.attr = v`：成员名非字段且 <Struct>::attr_set 存在 → setter 调用。
+//   R3 查询属性/普通字段优先：若成员名命中真实存储字段 → 恒为普通字段（既有路径零变化）。
+//   R4 只读属性（仅 getter 无 setter）写 `obj.attr = v` → 编译拒绝（未定义字段诊断）。
+//
+// 期望输出（逐行）：
+//   fah=212 / celsius 写回=100 / area=24 / pn=(6,8) / mag=100 / ord=7 / conv=44
+// ============================================================
+
+struct Temperature {
+    var celsius: i64 = 0
+}
+namespace Temperature {
+    // 计算属性 fahrenheit：getter 转换 / setter 换算
+    pub func fahrenheit(self: Temperature) -> i64 {
+        return self.celsius * 9 / 5 + 32
+    }
+    pub func fahrenheit_set(self: Temperature, f: i64) {
+        self.celsius = (f - 32) * 5 / 9
+    }
+}
+
+// 只读计算属性（仅 getter，无 setter → 写报诊断，见 computed_property_neg.tie）
+struct Rect {
+    var w: i64 = 0
+    var h: i64 = 0
+}
+namespace Rect {
+    pub func area(self: Rect) -> i64 {
+        return self.w * self.h
+    }
+}
+
+// 与 p.8.2.4 运算符重载组合载体：op_add + 计算属性 magnitude（getter 经字段求值）
+struct Pnt {
+    var x: i64 = 0
+    var y: i64 = 0
+}
+namespace Pnt {
+    pub func op_add(self: Pnt, o: Pnt) -> Pnt {
+        return Pnt(self.x + o.x, self.y + o.y)
+    }
+    pub func magnitude(self: Pnt) -> i64 {
+        return self.x * self.x + self.y * self.y
+    }
+}
+
+func main() {
+    // 计算属性读（getter）：0℃ → 32℉
+    var t = Temperature(100)
+    println("fah=" + to_string(t.fahrenheit))   // 212
+
+    // 计算属性写（setter 换算回摄氏）：100℉ → (100-32)*5/9 = 37… 取整 37
+    t.fahrenheit = 212
+    println("celsius 写回=" + to_string(t.celsius))  // (212-32)*5/9 = 100
+
+    // 只读计算属性读通过
+    var r = Rect(6, 4)
+    println("area=" + to_string(r.area))        // 24
+
+    // 普通字段不受影响核对：w/h/x/y/celsius 仍是存储字段
+    var p1 = Pnt(1, 2)
+    var p2 = Pnt(5, 6)
+    var s = p1 + p2           // op_add → (6,8)
+    println("pn=(" + to_string(s.x) + "," + to_string(s.y) + ")")
+
+    // 组合验证：重载结果上的计算属性（read via getter on result）
+    println("mag=" + to_string(s.magnitude))     // 6²+8² = 100
+
+    // 普通字段直接读/写仍走存储槽
+    var conv = Temperature(7)
+    println("ord=" + to_string(conv.celsius))     // 7
+    println("conv=" + to_string(conv.fahrenheit))  // 7*9/5+32 = 44
+}

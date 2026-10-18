@@ -1,0 +1,130 @@
+type tie<logic>
+// tests/_p91119_zip_probe/zip_probe.tie —— p.9.1.1.19 验收：std/zip ZIP 容器库。
+// 全离线确定性探针：
+//   1. stored（level=0）打包→解包回环：名称/字节一致；
+//   2. deflate（level=8）打包→解包回环（重复数据压缩）；
+//   3. 多文件 + 目录形名（dir/xx）；
+//   4. crc32 校验（篡改数据 → zip_unpack ok=false）；
+//   5. zip_list 按名列列、zip_get 按名取；缺失名 → 空表。
+// 期望全部 PASS / exit 0。
+import "/std/zip.tie" as zip
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func sbytes(s: string) -> table<i64> {
+    var t = table_new_i64()
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        table_push(t, char_code(str_char(s, i)))
+        i = i + 1
+    }
+    return t
+}
+
+func eqbytes(a: table<i64>, b: table<i64>) -> bool {
+    var n = len(a)
+    if n != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 在 hay 中找 needle 首现位置；找不到 -1。
+func find_seq(hay: table<i64>, needle: table<i64>) -> i64 {
+    var n = len(hay)
+    var m = len(needle)
+    if m == 0 {
+        return 0
+    }
+    if m > n {
+        return -1
+    }
+    var i: i64 = 0
+    while i <= n - m {
+        var ok = true
+        var j: i64 = 0
+        while j < m {
+            if hay[i + j] != needle[j] {
+                ok = false
+            }
+            j = j + 1
+        }
+        if ok {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+func main() {
+    var names = table_new_string()
+    table_push(names, "a.txt")
+    table_push(names, "sub/b.txt")
+    table_push(names, "c.dat")
+    var d0 = sbytes("hello world")
+    var d1 = sbytes("aaaaabbbbbaaaabbbbaaaabbbb")   // 重复 → 压缩收益
+    var d2 = sbytes("MARKER010203040506070809MARKER")
+
+    var datas: table<table<i64>> = [d0]
+    table_push(datas, d1)
+    table_push(datas, d2)
+
+    // 1) stored 回环
+    var s1 = zip.zip_pack(names, datas, 0)
+    var r1 = zip.zip_unpack(s1)
+    check(r1.0 == true, "stored unpack ok")
+    check(len(r1.1) == 3, "stored names count 3")
+    check(r1.1[0] == "a.txt" && r1.1[1] == "sub/b.txt" && r1.1[2] == "c.dat", "stored names match")
+    check(eqbytes(r1.2[0], d0), "stored data0 match")
+    check(eqbytes(r1.2[1], d1), "stored data1 match")
+    check(eqbytes(r1.2[2], d2), "stored data2 match")
+
+    // 2) deflate 回环
+    var s2 = zip.zip_pack(names, datas, 8)
+    check(len(s2) < len(s1), "deflate smaller than stored")
+    var r2 = zip.zip_unpack(s2)
+    check(r2.0 == true, "deflate unpack ok")
+    check(eqbytes(r2.2[0], d0) && eqbytes(r2.2[1], d1) && eqbytes(r2.2[2], d2), "deflate data roundtrip")
+
+    // 3) zip_list / zip_get
+    var lst = zip.zip_list(s2)
+    check(len(lst) == 3 && lst[1] == "sub/b.txt", "zip_list names")
+    check(eqbytes(zip.zip_get(s2, "c.dat"), d2), "zip_get by name c.dat")
+    check(eqbytes(zip.zip_get(s2, "a.txt"), d0), "zip_get by name a.txt")
+    check(len(zip.zip_get(s2, "no/such.txt")) == 0, "zip_get missing -> empty")
+
+    // 4) CRC 校验：篡改 stored 包内数据字节 → unpack ok=false
+    var news = s1
+    var pat = sbytes("01020304050607")
+    var off2 = find_seq(news, pat)
+    check(off2 >= 0, "marker located in stored bytes")
+    if off2 >= 0 {
+        news[off2] = (news[off2] ^ 0xFF) & 0xFF
+    }
+    var r3 = zip.zip_unpack(news)
+    check(r3.0 == false, "corrupt stored data -> unpack ok=false (crc)")
+
+    if fails == 0 {
+        println("PASS")
+    } else {
+        println("FAILED")
+    }
+}

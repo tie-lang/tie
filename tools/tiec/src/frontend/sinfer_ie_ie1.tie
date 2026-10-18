@@ -1,0 +1,898 @@
+type tie<class>
+// compiler/frontend/sinfer_ie_ie1.tie —— infer_expr 分支提子函数分片 1（p.9.21 G2 单函数 ≤300 行）
+// ============================================================
+// 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
+// 分片内函数与原调度器同 namespace，跨文件裸名互调。
+namespace sinfer {
+pub func infer_expr_spread_arg(id: i64) -> i64 {
+    var tag = s_tags[id]
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "展开实参 `...` 仅支持用于带变长形参 `...T` 的普通函数调用；当前调用语境不支持展开"
+        return -1
+}
+
+pub func infer_expr_comprehension(id: i64) -> i64 {
+    var tag = s_tags[id]
+        var cvname = sstate.name_str(id)
+        var cvnid = intern.intern(cvname)
+        var csrc = sstate.child(id, 0)
+        var celem = sstate.child(id, 1)
+        var ccond = sstate.child(id, 2)
+        var cst = infer_expr(csrc)
+        if cst < 0 {
+            return -1
+        }
+        // p.9.11.16 迭代器协议源：struct 实现 has_next/next → 循环变量元素 =
+        // next 返回类型（与 for-in 消费分派一致）。协议未命中 → 表/数组源。
+        var celem_loop: i64 = types.named(TK_I64)
+        if !types.is_table(cst) {
+            var ip_c = iter_proto_elem(cst)
+            if ip_c >= 0 {
+                celem_loop = ip_c
+                lv_insert(cvnid, celem_loop, 0, -1, 0)
+                // p.9.22.6 全量符号表：推导式循环变量声明登记（kind 5）。
+                xref.reg_decl(cvnid, 5, celem_loop, id)
+                var celem_ty = infer_expr(celem)
+                if celem_ty < 0 {
+                    return -1
+                }
+                if ccond >= 0 {
+                    var ccond_ty = infer_expr(ccond)
+                    if ccond_ty < 0 {
+                        return -1
+                    }
+                    if ccond_ty != types.named(TK_BOOL) {
+                        sm_err_line = s_lines[id]
+                        sm_err_col = s_cols[id]
+                        sm_err_msg = "推导式 if 筛选条件必须是 bool，实际是 " + types.type_name(ccond_ty)
+                        return -1
+                    }
+                }
+                node_types[id] = types.table_of(celem_ty)
+                g_typed = g_typed + 1
+                return types.table_of(celem_ty)
+            }
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "推导式迭代源必须是表/数组或迭代器协议对象（struct 实现 has_next/next），实际是 " + types.type_name(cst)
+            return -1
+        }
+        var cte = types.table_elem(cst)
+        if cte >= 0 {
+            celem_loop = cte
+        }
+        // 登记循环变量（源元素类型；解构临时变量同此登记——字段访问再取 ItemK）
+        lv_insert(cvnid, celem_loop, 0, -1, 0)
+        // p.9.22.6 全量符号表：推导式循环变量声明登记（kind 5）。
+        xref.reg_decl(cvnid, 5, celem_loop, id)
+        var celem_ty = infer_expr(celem)
+        if celem_ty < 0 {
+            return -1
+        }
+        if ccond >= 0 {
+            var ccond_ty = infer_expr(ccond)
+            if ccond_ty < 0 {
+                return -1
+            }
+            if ccond_ty != types.named(TK_BOOL) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "推导式 if 筛选条件必须是 bool，实际是 " + types.type_name(ccond_ty)
+                return -1
+            }
+        }
+        node_types[id] = types.table_of(celem_ty)
+        g_typed = g_typed + 1
+        return types.table_of(celem_ty)
+}
+
+pub func infer_expr_tag0(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // S1.3 L3 后缀字面量：aux = 后缀类型 TyKw（-1 = 无后缀 → i64）
+        // 批次 2（i128/u128）：后缀类型含 TK_I128(21)/TK_U128(22)——
+        // 原 `sfx <= 9` 只覆盖 i8..f64，i128/u128 会落默认 i64 槽。
+        var sfx = s_aux[id]
+        if (sfx >= 0 && sfx <= 9) || sfx == TK_I128 || sfx == TK_U128 {
+            node_types[id] = types.named(sfx)
+            g_typed = g_typed + 1
+            return types.named(sfx)
+        }
+        node_types[id] = types.named(TK_I64)
+        g_typed = g_typed + 1
+        return types.named(TK_I64)
+}
+
+pub func infer_expr_tag1(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // S1.3 L3 浮点后缀：aux = f32(8)/f64(9)（parser 已定，无后缀默认 f64）
+        var sfx2 = s_aux[id]
+        if sfx2 == TK_F32 {
+            node_types[id] = types.named(TK_F32)
+            g_typed = g_typed + 1
+            return types.named(TK_F32)
+        }
+        node_types[id] = types.named(TK_F64)
+        g_typed = g_typed + 1
+        return types.named(TK_F64)
+}
+
+pub func infer_expr_tag2(id: i64) -> i64 {
+    var tag = s_tags[id]
+        node_types[id] = types.named(TK_STR)
+        g_typed = g_typed + 1
+        return types.named(TK_STR)
+}
+
+pub func infer_expr_tag3(id: i64) -> i64 {
+    var tag = s_tags[id]
+        node_types[id] = types.named(TK_CHAR)
+        g_typed = g_typed + 1
+        return types.named(TK_CHAR)
+}
+
+pub func infer_expr_tag4(id: i64) -> i64 {
+    var tag = s_tags[id]
+        node_types[id] = types.named(TK_BOOL)
+        g_typed = g_typed + 1
+        return types.named(TK_BOOL)
+}
+
+pub func infer_expr_tag5(id: i64) -> i64 {
+    var tag = s_tags[id]
+        node_types[id] = types.named(TK_TRIT)
+        g_typed = g_typed + 1
+        return types.named(TK_TRIT)
+}
+
+pub func infer_expr_tag136(id: i64) -> i64 {
+    var tag = s_tags[id]
+        node_types[id] = types.named(TK_CODE)
+        g_typed = g_typed + 1
+        return types.named(TK_CODE)
+}
+
+pub func infer_expr_tag137(id: i64) -> i64 {
+    var tag = s_tags[id]
+        node_types[id] = types.named(TK_CODE)
+        g_typed = g_typed + 1
+        return types.named(TK_CODE)
+}
+
+pub func infer_expr_var(id: i64) -> i64 {
+    var tag = s_tags[id]
+        var nm = sstate.name_str(id)
+        var nid = intern.intern(nm)
+        var lt = lv_find(nid)
+        if lt >= 0 {
+            // S2.2 闭包捕获分析：闭包体检查期间（g_clo_depth > 0）引用变量，
+            // 且该变量既非闭包参数（cl_params 段）、也非闭包体内局部（cl_locals
+            // 段）→ 属于登记时快照中的外层变量 → 捕获。登记 (名 id, 类型 id)
+            // 到 cl_capkeys/cl_capvals（当前闭包段内查重，重复引用只登记一次）。
+            if g_clo_depth > 0 && g_clo_cur >= 0 {
+                var ci = g_clo_cur
+                var is_param = sstate.seg_has(cl_params, cl_paramoff[ci], cl_nparams[ci], nid)
+                if is_param == 0 {
+                    var is_local = sstate.seg_has(cl_locals, cl_locloff[ci], len(cl_locals) - cl_locloff[ci], nid)
+                    if is_local == 0 {
+                        // p.9.11.22 安全区捕获面白名单 · 规则一：**禁止捕获 ref 形参**。
+                        // 依据（实测 2026-09-27）：捕获 ref 形参走的是**借用**而非副本
+                        // ——闭包内对被捕获表的写会回写到调用方（实测闭包内 push 后
+                        // 调用方 len 同步变化）。故一旦该闭包**逃逸**出声明它的函数，
+                        // 借用所指向的栈帧已销毁 ⇒ 悬垂引用。安全区必须拒绝；
+                        // unsafe 区（开发者担责）放宽。
+                        // 判定用 cl_owner_sig[ci]（闭包登记时记下的**外层函数**签名）：
+                        // 捕获分析是后置批量的，全局 g_curfn 此刻已不代表该闭包的外层
+                        // 函数（实测会停留在无关函数上）。
+                        // 注：本规则只针对 ref（可写借用）。immut 为只读借用，其外部
+                        // 可观察风险等级不同，暂随 unsafe 一并放宽，细则留设计稿。
+                        if ci < len(cl_owner_unsafe) && cl_owner_unsafe[ci] == 0 && ci < len(cl_owner_sig) &&
+                            sstate.is_ref_param_of(cl_owner_sig[ci], sstate.name_str(id)) == 1 {
+                            sm_err_line = s_lines[id]
+                            sm_err_col = s_cols[id]
+                            sm_err_msg = "安全区禁止闭包捕获 ref 形参 '" + sstate.name_str(id) + "'（捕获 ref 是借用而非副本，闭包逃逸会导致悬垂引用；需在 unsafe 块内或改用值/immut 形参）"
+                            return -1
+                        }
+                        var is_cap = sstate.seg_has(cl_capkeys, cl_capoff[ci], len(cl_capkeys) - cl_capoff[ci], nid)
+                        if is_cap == 0 {
+                            table_push(cl_capkeys, nid)
+                            table_push(cl_capvals, lt)
+                        }
+                    }
+                }
+            }
+            node_types[id] = lt
+            g_typed = g_typed + 1
+            // p.9.22.6 全量符号表：局部标识符引用登记（use→decl 经绑定栈）。
+            xref.reg_use(id, xref.bind_find(nid))
+            return lt
+        }
+        // p.9.21.5 II2 A2b：裸名经前缀补全命中 ns 常量时同样跟随 L1 梯度
+        var gkey = gb_find_ns_key(nid)
+        // share 门禁判据打点：闭包体内引用**全局可变容器** ⇒ 该闭包一旦交给执行流，
+        // 就是跨执行流共享同一份底层数据（规范 §10.5）。全局不在捕获集里（§5.10），
+        // 故在此解析处打点。标量全局（i64/string）不共享底层容器 ⇒ 不算。
+        if gkey >= 0 && g_clo_depth > 0 && g_clo_cur >= 0 {
+            var gt_g = gb_find(gkey)
+            if types.is_table(gt_g) || types.is_map(gt_g) {
+                while len(cl_grefs) <= g_clo_cur {
+                    table_push(cl_grefs, 0)
+                }
+                cl_grefs[g_clo_cur] = 1
+            }
+        }
+        if gkey >= 0 {
+            var vc = sstate.check_const_visibility_nid(gkey, id)
+            if vc < 0 {
+                return -1
+            }
+            var gt = gb_find(gkey)
+            node_types[id] = gt
+            g_typed = g_typed + 1
+            // p.9.22.6 全量符号表：全局标识符引用登记（use→decl 经绑定栈；
+            // 全局声明在根 scope 段，命名空间补全键与登记键同一 id 空间）。
+            xref.reg_use(id, xref.bind_find(gkey))
+            return gt
+        }
+        // S2.2 命名函数提升：变量查找失败后查函数签名（裸名 + 命名空间补全），
+        // 命中 → 构造 fn 类型（命名函数名可直接用作函数值，如 `var f: fn(A)->R
+        // = my_func`）。泛型模板（gt_find）暂不提升（单态化后函数值未定义）。
+        var full_f = resolve_call_name(nm)
+        var fsig = sstate.fn_sig(full_f)
+        if fsig >= 0 {
+            var fret = sg_ret[fsig]
+            var fnp = sg_nparams[fsig]
+            var foff = sg_off[fsig]
+            var fpts: table<i64> = table_new_i64()
+            var k2: i64 = 0
+            while k2 < fnp {
+                table_push(fpts, sp_tys[foff + k2])
+                k2 = k2 + 1
+            }
+            var fnty = types.fn_of(fret, fpts)
+            node_types[id] = fnty
+            g_typed = g_typed + 1
+            // p.9.22.6 全量符号表：命名函数引用登记（use→decl 直取定义节点）。
+            xref.reg_use(id, sstate.fn_def_node(full_f))
+            return fnty
+        }
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "未声明的变量 '" + nm + "'"
+        return -1
+}
+
+// p.9.13.3 `+` 扩展：容器拼接/合并。
+//   `table<T> + table<T>` → `lang::tbl_cat`（值语义新表）
+//   `map<V> + map<V>`     → `lang::map_cat`（值语义新映射，键冲突右覆盖左）
+// 返回 1 表示已改写（调用方应转 `infer_expr(id)` 重走调用通道），0 表示不适用。
+//
+// 关键手法：**保留原来的两个 children 不动**，只把 tag 换成 S_N_CALL、名字换成
+// 目标函数。之所以可行——`sstate.slot_off` 对「首子节点非 -1 泛型哨兵」的节点
+// 返回 **0**（不是 1），于是调用通道把 children[0..1] 当作两个实参，正好是
+// (a, b)。这样无需为本节点新增子节点（语义层没有加子节点的接口），又能走
+// **正常调用通道**——后者不可省：`tbl_cat<T>`/`map_cat<V>` 是泛型，没有具体
+// fn_sig，直接按名发射会 sig=-1 失败。
+func infer_table_cat_rewrite(id: i64) -> i64 {
+    var a = sstate.child(id, 0)
+    var b = sstate.child(id, 1)
+    if a < 0 || b < 0 {
+        return 0
+    }
+    var at = node_types[a]
+    var bt = node_types[b]
+    if at < 0 || bt < 0 {
+        return 0
+    }
+    var target: string = ""
+    // **is_map 必须先判**：实测 `types.is_table` 对 map 也返回 true（map 建在表
+    // 基座上），若先判 is_table 会把 map 误路由到 `tbl_cat`，进而报
+    // 「无法推断类型参数 T」——是路由错，不是泛型能力问题（实测踩过）。
+    if types.is_map(at) && types.is_map(bt) {
+        target = "lang::map_cat"
+    } else if types.is_table(at) && types.is_table(bt) {
+        target = "lang::tbl_cat"
+    } else {
+        return 0
+    }
+    s_tags[id] = S_N_CALL
+    s_names[id] = intern.intern(target)
+    s_vals[id] = -1
+    return 1
+}
+
+// p.9.11.34 短闭包 `t -> expr` 的**语义期**展开（供赋值位 `f = t -> expr`）。
+//
+// 与声明位（`var f: fn(A) -> R = t -> expr`，在解析期展开）互补：赋值位的目标类型
+// 只在语义期可知（`f` 的类型来自 `var f: fn(A) -> R` 的登记），故此处展开。
+//
+// 判据（两条同时成立）：
+//   1. 右值是 `N_BINARY(B_ARROW_FWD)`——`ident -> expr` 的语法形态；
+//   2. **赋值目标的类型是 fn 类型**——上下文要求一个函数值。
+// 不满足则返回 -1，赋值位按原样走既有路径（管道语义一字不变）。
+//
+// 展开产物为**完整闭包节点**（语义期新建，见 sstate.new_node_sem）：
+//   FnLit[泛型槽(-1), 返回类型(N_SEM_TYPE), Param[name=箭头左侧, children=[形参类型(N_SEM_TYPE), -1]], StmtList[Return(体)]]
+// 类型位用 N_SEM_TYPE 引用节点承载**类型 id**（语义期手上是 id 而非 AST 节点；
+// 复杂类型无法逆向构造），由 sgen.parse_generic_type_node 直接取回。
+// 展开后按闭包形态重新推断（infer_expr_fn_lit 会登记签名并入队延迟检查）。
+pub func try_lambda_form(arrow: i64, target_ty: i64) -> i64 {
+    if arrow < 0 || target_ty < 0 {
+        return -1
+    }
+    if s_tags[arrow] != S_N_BINARY || s_vals[arrow] != B_ARROW_FWD {
+        return -1
+    }
+    if !types.is_fn(target_ty) {
+        return -1
+    }
+    var base = sstate.child(arrow, 0)
+    var body = sstate.child(arrow, 1)
+    if base < 0 || body < 0 {
+        return -1
+    }
+    // 形态要求：箭头左侧是**裸标识符**（形参名），否则不是短闭包形态
+    if s_tags[base] != S_N_VAR {
+        return -1
+    }
+    var ret_ty = types.fn_ret_ty(target_ty)
+    var pty = types.fn_param_of(target_ty, 0)
+    if ret_ty < 0 || pty < 0 {
+        return -1
+    }
+    var line = s_lines[arrow]
+    var col = s_cols[arrow]
+    // 类型引用节点（val = 类型 id）
+    var pty_ref = sstate.new_node_sem(S_N_SEM_TYPE, -1, pty, -1, line, col)
+    var ret_ref = sstate.new_node_sem(S_N_SEM_TYPE, -1, ret_ty, -1, line, col)
+    // 形参：name = 箭头左侧标识符；children = [形参类型, 默认值或 -1]
+    var param = sstate.new_node_sem(S_N_PARAM, s_names[base], 0, 0, line, col)
+    var pk: table<i64> = table_new_i64()
+    table_push(pk, pty_ref)
+    table_push(pk, -1)
+    sstate.set_children(param, pk)
+    // 体：StmtList[Return(体表达式)]
+    var ret_n = sstate.new_node_sem(S_N_RETURN, -1, -1, -1, line, col)
+    var rk: table<i64> = table_new_i64()
+    table_push(rk, body)
+    sstate.set_children(ret_n, rk)
+    var sl = sstate.new_node_sem(S_N_STMTLIST, -1, -1, -1, line, col)
+    var sk: table<i64> = table_new_i64()
+    table_push(sk, ret_n)
+    sstate.set_children(sl, sk)
+    // 闭包：children = [泛型槽, 返回类型, 参数..., 体]；aux = 形参数
+    var f = sstate.new_node_sem(S_N_FN_LIT, -1, -1, 1, line, col)
+    var fk: table<i64> = table_new_i64()
+    table_push(fk, -1)
+    table_push(fk, ret_ref)
+    table_push(fk, param)
+    table_push(fk, sl)
+    sstate.set_children(f, fk)
+    return f
+}
+
+// p.9.11.34 短闭包**实参位**（上下文消歧，用户裁决 2026-10-09）：
+// 实参 `ident -> expr` 形态 + 形参类型是 fn ⇒ 语义期展开为闭包并**原位替换**
+// 调用节点的实参 child（arg_idx = 绝对 child 索引）。返回展开后的闭包节点 id；
+// 未命中返回 -1（实参原样保留——管道/箭头既有语义与诊断一字不变）。
+// ★ 消歧判据（为何无歧义）：解析期 `x -> expr` 恒按管道形态解析；管道语义
+// （数据作末参追加）要求被调目标是调用/可赋值变量——形参类型是 fn 时该解释
+// 不可能成立，故「形参 fn ⇒ 短闭包」分流确定。单参形态与 try_lambda_form
+// 一致（形参名 = 箭头左侧裸标识符，类型取 fn 签名第 0 形参）。
+pub func try_lambda_arg(call_id: i64, arg_idx: i64, arg_node: i64, want_ty: i64) -> i64 {
+    var lam = try_lambda_form(arg_node, want_ty)
+    if lam < 0 {
+        return -1
+    }
+    var kids: table<i64> = table_new_i64()
+    var nc = sstate.nchild(call_id)
+    var ci: i64 = 0
+    while ci < nc {
+        if ci == arg_idx {
+            table_push(kids, lam)
+        } else {
+            table_push(kids, sstate.child(call_id, ci))
+        }
+        ci = ci + 1
+    }
+    sstate.set_children(call_id, kids)
+    return lam
+}
+
+// p.9.13.3 `in` 中缀（语义期分派 + 改写为调用）。
+// 解析期产出 `N_BINARY(B_IN)`，children = **[泛型槽, 容器, 键/元素]**（与调用同形）。
+// 此处按容器类型选目标库函数，把节点**改写为 `S_N_CALL`**（仅换 tag/name/val，
+// children 长度不变——符合既有「就地改写调用节点 children 段」范式），再交
+// **正常调用通道**推断：这一步不可省，因为 `seq_has<T>`/`map_has<V>` 是泛型，
+// 无具体 `fn_sig`，直接按名发射会 sig=-1 失败（实测）。
+//   cont: string → `lang::str_has`（子串包含）
+//   cont: table  → `lang::seq_has`（元素包含，泛型）
+//   cont: map    → `lang::map_has`（键包含，O(1)）
+pub func infer_in_op(id: i64) -> i64 {
+    var cont = sstate.child(id, 1)
+    var elem = sstate.child(id, 2)
+    if cont < 0 || elem < 0 {
+        return -1
+    }
+    var ct = infer_expr(cont)
+    if ct < 0 {
+        return -1
+    }
+    if infer_expr(elem) < 0 {
+        return -1
+    }
+    var target: string = ""
+    if ct == types.named(TK_STR) {
+        target = "lang::str_has"
+    } else if types.is_map(ct) {
+        target = "lang::map_has"
+    } else if types.is_table(ct) {
+        target = "lang::seq_has"
+    } else {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'in' 的容器须为 string（子串）/ table（元素）/ map（键），实际是 " + types.type_name(ct)
+        return -1
+    }
+    s_tags[id] = S_N_CALL
+    s_names[id] = intern.intern(target)
+    s_vals[id] = -1
+    return infer_expr(id)
+}
+
+// p.9.13.4 块管道 `x -> { v -> expr }`：内联绑定。
+// 绑定名 v 的类型 = 数据表达式 x 的推断类型；整体类型 = 体表达式的类型。
+// 绑定登记进扁平局部表 lv_*（tie 语义层的块不弹栈，与既有 if/while 块一致），
+// 故后续同名块管道会覆盖登记——在各自体内推断时刻类型均正确。
+pub func infer_expr_block_pipe(id: i64) -> i64 {
+    var data = sstate.child(id, 0)
+    var body = sstate.child(id, 1)
+    if data < 0 || body < 0 {
+        return -1
+    }
+    var dt = infer_expr(data)
+    if dt < 0 {
+        return -1
+    }
+    lv_insert(s_names[id], dt, 0, -1, 0)
+    // p.9.22.6 全量符号表：循环体变量声明登记（kind 5）。
+    xref.reg_decl(s_names[id], 5, dt, id)
+    var bt = infer_expr(body)
+    if bt < 0 {
+        return -1
+    }
+    // 必须自写 node_types[id]（各 infer_expr_* 函数各自登记，分发层不代写）：
+    // 否则外层 `var f = x -> { v -> … }` 在 var-decl 的无标注分支读到 -1 →
+    // 槽型落默认 i64，而体的值可能是 ptr（字符串/表）→ LLVM 校验
+    // `store i64 %N, ptr %M`（'%N' defined with type 'ptr' but expected 'i64'）。
+    node_types[id] = bt
+    return bt
+}
+
+pub func infer_expr_range(id: i64) -> i64 {    var tag = s_tags[id]
+        var st = infer_expr(sstate.child(id, 0))
+        if st < 0 {
+            return -1
+        }
+        var en = infer_expr(sstate.child(id, 1))
+        if en < 0 {
+            return -1
+        }
+        if !types.is_int(st) || !types.is_int(en) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "范围两端必须是整数"
+            return -1
+        }
+        node_types[id] = types.named(TK_I64)
+        g_typed = g_typed + 1
+        return types.named(TK_I64)
+}
+
+pub func infer_expr_unary(id: i64) -> i64 {
+    var tag = s_tags[id]
+        var op = s_vals[id]
+        var operand = infer_expr(sstate.child(id, 0))
+        if operand < 0 {
+            return -1
+        }
+        if op == 0 {
+            // Neg：数字；trit 也允许（平衡取反 -1t/-(trit)，-1↔1、0 保持）
+            // p.8.2.4：操作数为用户 struct 且声明 op_neg → 重写为方法调用。
+            var ngres = try_op_overload_neg(sstate.child(id, 0), id)
+            if ngres >= 0 {
+                return ngres
+            }
+            if ngres < 0 && ngres != -2 {
+                return -1
+            }
+            if !types.is_number(operand) && operand != types.named(TK_TRIT) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "取负运算的操作数必须是数字"
+                return -1
+            }
+        } else if op == 1 {
+            // Not：bool 或 trit
+            if !types.is_bool_like(operand) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "逻辑非的操作数必须是 bool"
+                return -1
+            }
+        } else if op == U_BIT_NOT {
+            if !types.is_int(operand) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "按位取反的操作数必须是整数"
+                return -1
+            }
+        } else if op == U_AWAIT {
+            // p.9.11 `await`（规范 §10.6）：操作数须为 future<T> 凭据，结果 = T。
+            // 错误与结果走同一条路径（fail → raise，见 irgen tig_await）。
+            if types.kind(operand) != K_FUTURE {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "await 的操作数须为 future 凭据（async 非 void 方法调用的结果），实际是 " + types.type_name(operand)
+                return -1
+            }
+            var et = types.future_elem(operand)
+            if et < 0 {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "future 凭据负载类型解码失败"
+                return -1
+            }
+            node_types[id] = et
+            g_typed = g_typed + 1
+            return et
+        } else {
+            // 自增/自减：可写数字变量
+            var target = sstate.child(id, 0)
+            if s_tags[target] != S_N_VAR {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "自增/自减的操作数必须是可写数字变量"
+                return -1
+            }
+            var nm = sstate.name_str(target)
+            var nid2 = intern.intern(nm)
+            if lv_const_of(nid2) == 1 {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "不能对 const 变量 '" + nm + "' 自增/自减"
+                return -1
+            }
+            // p.9.11.11 immut 只读形参：自增/自减亦为重写，拒绝。
+            if sstate.im_is(nid2) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "不能对 immut 形参 '" + nm + "' 自增/自减；immut 形参只读"
+                return -1
+            }
+            if !types.is_number(operand) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "自增/自减的操作数必须是可写数字变量"
+                return -1
+            }
+        }
+        node_types[id] = operand
+        g_typed = g_typed + 1
+        return operand
+}
+
+pub func infer_expr_binary(id: i64) -> i64 {
+    var tag = s_tags[id]
+        var op = s_vals[id]
+        // P1 数据流箭头：非算术/比较——先分派（裸 Var 目标：fn → 传参 /
+        // 变量 → 赋值；调用/下标/字段目标已在解析器脱糖，不达此处）
+        if op == B_ARROW_FWD || op == B_ARROW_REV {
+            return infer_arrow(id, op)
+        }
+        // p.9.13.3 `in` 中缀：容器类型在此（语义期）才可知，故在此定目标库函数名
+        // （写 s_names[id]）；irgen 读该名直接发射调用，不重复分派。
+        if op == B_IN {
+            return infer_in_op(id)
+        }
+        var lhs = infer_expr(sstate.child(id, 0))
+        if lhs < 0 {
+            return -1
+        }
+        var rhs = infer_expr(sstate.child(id, 1))
+        if rhs < 0 {
+            return -1
+        }
+        // p.8.2.4 运算符重载：任一操作数为用户 struct 且声明对应 op_ 方法 →
+        // 重写为方法调用（返回方法返回类型）；否则 -2 沿用原算术/比较路径。
+        var ores = try_op_overload_binary(op, sstate.child(id, 0), sstate.child(id, 1), id)
+        if ores >= 0 {
+            return ores
+        }
+        if ores < 0 && ores != -2 {
+            return -1
+        }
+        // p.9.13.3 `+` 扩展（table+table → 值语义新表）：需在两侧类型已知后判定，
+        // 故置于此（op-overload 之后、类型一致性检查之前）。
+        if op == 0 && infer_table_cat_rewrite(id) == 1 {
+            return infer_expr(id)
+        }
+        // 枚举 ==/!= 比较拦截（一期）：枚举按 tag 比较语义未定义，报错
+        if op == 5 || op == 6 {
+            if types.kind(lhs) == K_ENUM || types.kind(rhs) == K_ENUM {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "枚举暂不支持 == 比较"
+                return -1
+            }
+        }
+        // 两侧类型一致（trit×i64 例外；int×float 混用；string+string 拼接）
+        var type_ok: bool = false
+        if lhs == rhs {
+            type_ok = true
+        } else if op == 20 && option_payload_ty(lhs) >= 0 {
+            // p.8.1.5 `?:` 安全默认值：Option<T> ?: T——类型兼容由下方特判校验
+            type_ok = true
+        } else if types.is_bool_like(lhs) && types.is_bool_like(rhs) {
+            type_ok = true
+        } else if lhs == TK_TRIT && types.is_int(rhs) {
+            type_ok = true
+        } else if rhs == TK_TRIT && types.is_int(lhs) {
+            type_ok = true
+        } else if types.is_int(lhs) && types.is_int(rhs) {
+            type_ok = true
+        } else if types.is_float(lhs) && types.is_float(rhs) {
+            type_ok = true
+        } else if types.is_int(lhs) && types.is_float(rhs) {
+            type_ok = true
+        } else if types.is_float(lhs) && types.is_int(rhs) {
+            type_ok = true
+        } else if op == 0 && lhs == TK_STR &&
+            (types.is_int(rhs) || types.is_float(rhs) || types.is_bool_like(rhs)) {
+            // p.9.13.3 `+` 扩展：string + 标量 → 自动 to_string 后拼接
+            type_ok = true
+        } else if op == 0 && rhs == TK_STR &&
+            (types.is_int(lhs) || types.is_float(lhs) || types.is_bool_like(lhs)) {
+            // 镜像：标量 + string（结果仍按「标量在前」拼接）
+            type_ok = true
+        } else if op == 0 && lhs == TK_STR && rhs == TK_STR {
+            // 字符串拼接
+            type_ok = true
+        } else if op >= 5 && op <= 10 && types.kind(lhs) == K_TUPLE &&
+            types.kind(rhs) == K_TUPLE && stype.tuple_equal(lhs, rhs) {
+            // 元组比较：结构相等（逐字段类型一致，嵌套元组递归）即合法——
+            // `(1,2) == (1,2)` 两侧各登记独立 tuple 类型 id，须按字段结构
+            // 比较（对齐 Rust 行为）；==/!= 放行，< > <= >= 在下文 op 分组
+            // 检查中报「比较运算符不能用于 tuple」
+            type_ok = true
+        } else if op >= 5 && op <= 10 && types.is_ptr(lhs) && types.is_ptr(rhs) {
+            // p.6.8.1 指针比较：==/!= 允许任意元素类型（地址等值比较）；< > <= >=
+            // 由比较运算符分组（op 5/6 之外）拒绝——指针是地址值，元素类型不影响
+            // 地址是否相等。
+            type_ok = true
+        }
+        if !type_ok {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "二元运算两侧类型不一致：" + types.type_name(lhs) + " 与 " + types.type_name(rhs)
+            return -1
+        }
+        // 按运算符分组校验
+        if op <= 4 || op == 13 || op == 14 || op == 15 || op == 16 || op == 17 ||
+            (op >= 21 && op <= 23) || op == 24 || op == 25 || op == 26 || op == 27 {
+            // 算术/位运算：数字（位运算需整数）；p.9.11.9 checked 运算（21/22/23）仅整数
+            if !types.is_number(lhs) && lhs != TK_STR && !(lhs == TK_TRIT || rhs == TK_TRIT) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "算术运算符不能用于 " + types.type_name(lhs)
+                return -1
+            }
+            // p.9.11.9 checked 运算溢出检测仅对整数有效（f64 溢出 = inf 不属于
+            // checked 溢出语义；trit 饱和算术也无溢出可言）——非整数报错。
+            // p.9.13.3 起 `**?`（27）同族。
+            if ((op >= 21 && op <= 23) || op == 27) && !types.is_int(lhs) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "checked 运算（+?/-?/*?/**?）只支持整数，不能用于 " + types.type_name(lhs)
+                return -1
+            }
+            // 位运算/移位（13..17）仅整数。注：上界不可省——否则 24（整除 `\`）
+            // 也落在 `op >= 13` 内被误判为位运算，f64 整除会报「位运算只支持整数」。
+            if op >= 13 && op <= 17 && !types.is_int(lhs) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "位运算只支持整数，不能用于 " + types.type_name(lhs)
+                return -1
+            }
+            // S1.3 B2 移位语义（r.1.4.3）：**编译期常量**移位量必须在
+            // 0..操作数位宽 范围内——负数移位/越界移位 = 编译错误（负例
+            // shift_neg_free 未拒根因）。运行期变量移位量保持既有定义行为
+            // （llvmgen & 63 掩码 / 窄类型 select 保护，shift_bound 探针不变）。
+            // i128 常量移位（1i128 << 100/127）按 128 位宽放行。
+            if op == 16 || op == 17 {
+                var sc = sstate.child(id, 1)
+                var cnt: i64 = 0
+                var is_const: bool = false
+                if s_tags[sc] == S_N_INT_LIT {
+                    cnt = s_vals[sc]
+                    is_const = true
+                } else if s_tags[sc] == S_N_UNARY && s_vals[sc] == 0 {
+                    // -N 字面量（U_NEG 包 IntLit）
+                    var oc = sstate.child(sc, 0)
+                    if s_tags[oc] == S_N_INT_LIT {
+                        cnt = 0 - s_vals[oc]
+                        is_const = true
+                    }
+                }
+                if is_const {
+                    var w = stype.int_width(lhs)
+                    if w > 0 && (cnt < 0 || cnt >= w) {
+                        sm_err_line = s_lines[id]
+                        sm_err_col = s_cols[id]
+                        sm_err_msg = "移位量超出操作数位宽（" + to_string(w) + " 位，当前 " + to_string(cnt) + "）"
+                        return -1
+                    }
+                }
+            }
+            if op == 4 && !types.is_int(lhs) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "取模运算只支持整数"
+                return -1
+            }
+        } else if op <= 10 {
+            // 比较：数字/字符串/bool/trit；元组仅 ==/!=（逐字段），< > <= >= 仍报错；
+            // ptr 仅 ==/!=（typed ptr 一等指针相等门禁，p.6.8.1）
+            if types.kind(lhs) == K_TUPLE || types.is_ptr(lhs) {
+                if op == 5 || op == 6 {
+                    // 元组/指针相等比较：合法（结果 bool，rt 在下方比较分支统一处理；
+                    // 指针经 ptrtoint 后整数比较，见 tig_binary_ptr）
+                } else {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "比较运算符不能用于 " + types.type_name(lhs)
+                    return -1
+                }
+            } else if !types.is_number(lhs) && lhs != TK_STR && !types.is_bool_like(lhs) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "比较运算符不能用于 " + types.type_name(lhs)
+                return -1
+            }
+        } else if op <= 12 {
+            // 逻辑：bool 或 trit
+            if !types.is_bool_like(lhs) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "逻辑运算符两侧必须是 bool（或两侧同为 trit）"
+                return -1
+            }
+        } else if op == 20 {
+            // p.8.1.5 `?:` 安全默认值：Option<T> ?: T → T（Some 解包 / None 用默认值）
+            var opt_pt = option_payload_ty(lhs)
+            if opt_pt < 0 {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "'?:' 左侧必须是 Option<T>（Some/None 形态枚举），实际是 " + types.type_name(lhs)
+                return -1
+            }
+            var rhs_node = sstate.child(id, 1)
+            if !stype.types_compatible(opt_pt, rhs) && !stype.types_match(opt_pt, rhs, rhs_node) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "'?:' 右侧类型 " + types.type_name(rhs) + " 与 Option 载荷 " + types.type_name(opt_pt) + " 不匹配"
+                return -1
+            }
+            node_types[id] = opt_pt
+            g_typed = g_typed + 1
+            return opt_pt
+        }
+        // p.6.9.15 警告（核心消息与 diagcode 警告目录逐字一致）：
+        // W0001 浮点相等比较（==/!= 对 f64/f32）；W0002 整数除法截断。
+        if op == 5 || op == 6 {
+            if types.is_float(lhs) && types.is_float(rhs) {
+                sm_warn_add(s_lines[id], s_cols[id], "浮点相等比较（==/!= 对 f64/f32 结果不可靠）")
+            }
+        }
+        if op == 3 {
+            if types.is_int(lhs) && types.is_int(rhs) {
+                sm_warn_add(s_lines[id], s_cols[id], "整数除法结果截断（如 7/2 == 3）")
+            }
+        }
+        // W00027：整数除法 / 取模的除数为「字面量 0」→ 运行期崩溃
+        //（LLVM sdiv/srem 除数为 0 未定义行为）。仅整数运算（op 3=除法，4=取模；
+        // 浮点除 0 得 inf，不崩，故不报）；除数是字面量才可静态判定，非字面量不报。
+        if op == 3 || op == 4 {
+            if types.is_int(lhs) && types.is_int(rhs) {
+                var w27r = sstate.child(id, 1)
+                if s_tags[w27r] == S_N_INT_LIT && s_vals[w27r] == 0 {
+                    sm_warn_add(s_lines[id], s_cols[id], "整数除零（字面量 0 作除数，运行期崩溃）")
+                }
+            }
+        }
+        var rt = lhs
+        // p.9.13.3 `+` 扩展：任一侧为 string 且另一侧为标量 → 结果为 string
+        //（两侧皆 string 时 lhs 已是 string，此判同样正确）
+        if op == 0 && (lhs == TK_STR || rhs == TK_STR) {
+            rt = types.named(TK_STR)
+        }
+        if types.is_int(lhs) && types.is_float(rhs) {
+            rt = rhs
+        }
+        if types.is_float(lhs) && types.is_int(rhs) {
+            rt = lhs
+        }
+        // S1.3 A1 混合宽度整数运算：结果 = 宽度更大者（i8 + i16 → i16 算术；
+        // i8 + u16 → 16 位算术。同宽度 i/u 混合 → 保持 lhs（LLVM 位模式一致，
+        // 无符号性区分——与 tie 现状有符号语义保持一致）。
+        // L2 上下文推断：字面量侧常量在对方窄类型范围内 → 按对方类型
+        // （`f + 1`：f 是 u8，常量 1 在 u8 范围 → u8 算术，结果 u8）
+        if types.is_int(lhs) && types.is_int(rhs) {
+            var l_node = sstate.child(id, 0)
+            var r_node = sstate.child(id, 1)
+            var l_lit = s_tags[l_node] == 0
+            var r_lit = s_tags[r_node] == 0
+            var lw = stype.int_width(lhs)
+            var rw = stype.int_width(rhs)
+            if l_lit && !r_lit {
+                // 左字面量、右变量：左常量在右类型范围 → 右类型；否则宽者
+                if lit_in_range(s_vals[l_node], rhs) {
+                    rt = rhs
+                } else {
+                    // W00018：字面量落在窄类型范围外（i64 不会溢出，不报）
+                    if rw < 64 {
+                        sm_warn_add(s_lines[id], s_cols[id], "大整数字面量溢出风险（超出目标窄类型范围）")
+                    }
+                    if rw > lw {
+                        rt = rhs
+                    } else {
+                        rt = lhs
+                    }
+                }
+            } else if r_lit && !l_lit {
+                // 右字面量、左变量：右常量在左类型范围 → 左类型；否则宽者
+                if lit_in_range(s_vals[r_node], lhs) {
+                    rt = lhs
+                } else {
+                    if lw < 64 {
+                        sm_warn_add(s_lines[id], s_cols[id], "大整数字面量溢出风险（超出目标窄类型范围）")
+                    }
+                    if lw > rw {
+                        rt = lhs
+                    } else {
+                        rt = rhs
+                    }
+                }
+            } else if !l_lit && !r_lit {
+                // 两侧变量：宽者
+                if rw > lw {
+                    rt = rhs
+                } else {
+                    rt = lhs
+                }
+            }
+            // 两侧字面量：无上下文 → 保持 i64（默认），由目标标注截断
+        }
+        // S1.3 f32 算术：f32 与 f64 混合 → f64；f32+f32 → 提升 f64 计算
+        // （f32 仅 extern/repr(C) 互操作，算术统一 f64——int-model 未决问题 1）
+        if (lhs == TK_F32 || rhs == TK_F32) && (lhs == TK_F64 || rhs == TK_F64) {
+            rt = types.named(TK_F64)
+        }
+        // trit × i64 混合（t + 5 / 5 - t）：结果 i64（irgen 生成 i64 运算并
+        // sext trit 侧——曾按 lhs 标 TK_TRIT，IR 结果 i64 却被当 i8 转换/打印）
+        if lhs == TK_TRIT && types.is_int(rhs) {
+            rt = rhs
+        }
+        if rhs == TK_TRIT && types.is_int(lhs) {
+            rt = lhs
+        }
+        if op <= 10 && op >= 5 {
+            // 比较/逻辑：结果 bool
+            rt = types.named(TK_BOOL)
+        }
+        node_types[id] = rt
+        g_typed = g_typed + 1
+        return rt
+}
+
+}

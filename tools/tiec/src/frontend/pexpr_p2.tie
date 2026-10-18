@@ -1,0 +1,772 @@
+type tie<class>
+// compiler/frontend/pexpr_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 pexpr.tie。
+namespace pexpr {
+// 原子表达式：字面量 / 标识符（路径/调用/变量）/ 括号元组 / 表字面量
+func parse_primary() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var tag = putil.peek_tag()
+    if tag == lex_unsafe {
+        // 三期 A 组 `unsafe.get(share)` / `unsafe.get(share -> obj)`（§7.1.1 +
+        // unsafe-model §13.4）：unsafe 后跟 `.get` 方法调用 = 取得 guard<cap> 凭据
+        // 表达式。仅 unsafe 上下文语义合法（语义层拦截）。产出 N_GUARD_GET。
+        var n1 = putil.peek_n(1)
+        if n1 == lex_dot {
+            var n2 = putil.peek_lexeme_n(2)
+            if n2 == "get" {
+                return parse_guard_get(line, col)
+            }
+            // r.1.6.7 `unsafe.revoke(g)` 凭据撤销（§11.6）：撤销后该凭据及其传递
+            // 派生出的凭据一并失效。
+            if n2 == "revoke" {
+                return parse_guard_revoke(line, col)
+            }
+        }
+        // 其余 unsafe 上下文（unsafe{}/unsafe goto 等）不在表达式位置出现
+        putil.set_err(line, col, "表达式位置 'unsafe' 仅支持 unsafe.get(share) / unsafe.revoke(g)")
+        return -1
+    }
+    if tag == lex_asm {
+        // S1.2 I1：`asm!("template", in(reg) expr, out(reg) expr)` 内联汇编
+        return parse_asm_expr(line, col)
+    }
+    // S3.3 准引用字面量：`` `(expr) ``（表达式形式，立即解析）或
+    // `` `{ stmts } ``（块形式，块体延迟解析——与 S2.2 闭包体同机制）。
+    if tag == lex_backtick {
+        return parse_quasi(line, col)
+    }
+    // S3.3 插值表达式：`$x`（宏参数/变量嵌入）或 `$(expr)`（复杂表达式嵌入）。
+    // 仅准引用内合法；普通代码出现由语义层对非宏上下文报错。
+    if tag == lex_dollar {
+        return parse_interp(line, col)
+    }
+    // S2.2 闭包字面量 `func(x: i64) -> i64 { ... }`：解析函数头（参数/返回
+    // 类型）+ 配平跳过函数体 + 延迟快照登记，函数体由 pstmt_flow.
+    // parse_deferred_closures 在 parse_program 末尾恢复解析（语义层 N_FN_LIT
+    // 推断已同步实现）。
+    if tag == lex_func {
+        return parse_fn_lit(line, col)
+    }
+    // p.9.13.1 单箭头统一：match/switch 表达式：`switch <subject> { pat -> expr, _ -> expr }`。
+    // 表达式位模式匹配——分支体为表达式（见 pstmt_flow.parse_switch_expr）。
+    // switch 为保留字 token，表达式位置出现即表达式分支式 switch。
+    if tag == lex_switch {
+        return pstmt_flow.parse_switch_expr(line, col)
+    }
+    // if 表达式：`if cond { thenExpr } else { elseExpr }`（else 必有，else if
+    // 链合法）。纯糖脱糖为 N_TERNARY（见 pstmt_flow.parse_if_expr）。语句位 if
+    // 由 parse_stmt 先行拦截（N_IF 语句），不达此处，互不影响。
+    if tag == lex_if {
+        return pstmt_flow.parse_if_expr(line, col)
+    }
+    if tag == lex_int {
+        var lex = putil.peek_lexeme()
+        // trit 字面量（trit 优化 L1）：整数后缀 't' 且值域 -1..1。
+        // 超出值域（2t/-2t）报「trit 字面量越界」；-1 由一元负号 + 1t 表达。
+        if putil.is_trit_lit(lex) {
+            var tv = putil.parse_int_lit(lex)
+            putil.advance()
+            if tv < -1 || tv > 1 {
+                putil.set_err(line, col, "trit 字面量越界: " + lex)
+                return -1
+            }
+            return ast.new_node(N_TRIT_LIT, -1, tv, -1, line, col)
+        }
+        // 批次 2：字面量值域限于 i64 可表示范围（parse_int_lit 返回 i64，
+        // i128/u128 常量经 add i128 0, i64 构造，超范围回绕符号扩展错误）
+        if putil.int_lit_overflow(lex) {
+            putil.set_err(line, col, "整数字面量超出 i64 可表示范围")
+            return -1
+        }
+        var v = putil.parse_int_lit(lex)
+        // S1.3 L3：aux = 后缀类型 TyKw（-1 = 无后缀，默认 i64）
+        var sufx = putil.parse_lit_suffix(lex)
+        putil.advance()
+        return ast.new_node(N_INT_LIT, -1, v, sufx, line, col)
+    }
+    if tag == lex_float {
+        // S1.3 L3：剥离 f32/f64 后缀存纯数字文本（llvmgen 输出用），
+        // aux = 后缀类型（无后缀 → f64，对齐现状 FloatLit 语义）
+        var lex = putil.peek_lexeme()
+        // p.9.11.19：浮点字面量含 `_` 分隔符（1_000.5）→ 输出文本剥离 `_`
+        var lid = interner.intern(putil.strip_underscores(putil.strip_lit_suffix(lex)))
+        var sufx = putil.parse_lit_suffix(lex)
+        if sufx < 0 {
+            sufx = 9   // TK_F64
+        }
+        putil.advance()
+        return ast.new_node(N_FLOAT_LIT, lid, -1, sufx, line, col)
+    }
+    if tag == lex_str {
+        var lid = interner.intern(putil.peek_lexeme())
+        putil.advance()
+        // p.8.2.3 字符串插值：`"Hello, {name}!"` → 拼接链（lexer 在插值段后
+        // 产 STR + lex_interp_lbrace（插值专用 tag）+ expr + } + STR ... 序列；
+        // 块/结构体开括号是 lex_lbrace，此处不误入）
+        if putil.peek_tag() == lex_interp_lbrace {
+            return parse_interp_chain(lid, line, col)
+        }
+        return ast.new_node(N_STR_LIT, lid, -1, -1, line, col)
+    }
+    if tag == lex_charlit {
+        var lid = interner.intern(putil.peek_lexeme())
+        putil.advance()
+        return ast.new_node(N_CHAR_LIT, lid, -1, -1, line, col)
+    }
+    if tag == lex_true {
+        putil.advance()
+        return ast.new_node(N_BOOL_LIT, -1, 1, -1, line, col)
+    }
+    if tag == lex_false {
+        putil.advance()
+        return ast.new_node(N_BOOL_LIT, -1, 0, -1, line, col)
+    }
+    if tag == lex_zero {
+        putil.advance()
+        return ast.new_node(N_TRIT_LIT, -1, 0, -1, line, col)
+    }
+    if tag == lex_ident {
+        var name = interner.intern(putil.peek_lexeme())
+        // 一期并发：run 上下文识别——`run <actor型名>(实参...)` 产出 N_RUN_ACTOR。
+        // run 非保留字（规避 toolchain 的 func run()），仅当「run + 标识符 + '('」
+        // 三连时按 actor 创建处理；其余情况（run(...) 函数调用 / run 作普通变量）
+        // 落回常规 N_VAR/N_CALL 路径。注意 `run(tool...)`（run 后直接 '('）不匹配，
+        // 恰好规避 toolchain 的 run(cmd) 调用误判。
+        if str_len(putil.peek_lexeme()) > 0 && putil.peek_lexeme() == "run" {
+            var nxt = putil.peek_n(1)
+            if nxt == lex_ident {
+                var anxt = putil.peek_n(2)
+                if anxt == lex_lparen {
+                    // `run <名>(...)`：actor 创建
+                    var rl = putil.peek_line()
+                    var rc = putil.peek_col()
+                    putil.advance()   // run
+                    var aname = putil.peek_lexeme()
+                    putil.advance()   // actor 型名
+                    // 实参（构造到 actor 的初始消息/参数；一期多为空）
+                    var args: table<i64> = table_new_i64()
+                    if putil.eat(lex_lparen) {
+                        if !parse_args_after_lparen(args) {
+                            return -1
+                        }
+                    }
+                    var run = ast.new_node(N_RUN_ACTOR, -1, -1, -1, rl, rc)
+                    var rkids: table<i64> = table_new_i64()
+                    // 首子节点 = actor 类型名（N_NAMED_TYPE，语义层解析为句柄类型）
+                    var tm = ast.new_node(N_NAMED_TYPE, interner.intern(aname), -1, -1, rl, rc)
+                    table_push(rkids, tm)
+                    var ai: i64 = 0
+                    while ai < len(args) {
+                        table_push(rkids, args[ai])
+                        ai = ai + 1
+                    }
+                    ast.set_children(run, rkids)
+                    return run
+                }
+            }
+        }
+        // p.9.11.3 try 错误聚合块：`try { ... }`（try 非保留字，仅当紧跟 `{` 按
+        // try 块解析；否则落回 N_VAR/N_CALL 常规路径，规避用户变量名 try）。块体
+        // 为语句块——pexpr 位于 import 树底层无法解析语句，复用 S2.2 延迟闭包体
+        // 快照机制（putil.defer_closure_push + 配平跳过 + skip_closure_body），
+        // 块体由 pstmt_flow.parse_deferred_closures 末尾 parse_block 解析并回填为
+        // N_TRY_BLOCK 的 children[0]（StmtList）。块内 `?` 传播点语义与块外一致
+        //（传播到当前函数，try 纯语法分组成错误聚合）。
+        if len(putil.peek_lexeme()) > 0 && putil.peek_lexeme() == "try" {
+            if putil.peek_n(1) == lex_lbrace {
+                var tl = putil.peek_line()
+                var tc = putil.peek_col()
+                putil.advance()   // try
+                var tn = ast.new_node(N_TRY_BLOCK, -1, -1, -1, tl, tc)
+                putil.defer_closure_push(tn)
+                if !skip_closure_body() {
+                    return -1
+                }
+                return tn
+            }
+        }
+        putil.advance()
+        // 点分命名空间前缀：`tie.ir::f` / `tie.ir::K`。
+        // 只在「点链后确实跟 ::」时合并（否则保持普通字段访问 t.a.b）。
+        var dotted_name = name
+        var dotted_path = false
+        if putil.peek_tag() == lex_dot {
+            var di: i64 = 0
+            var ok = false
+            while putil.peek_n(di) == lex_dot {
+                if putil.peek_n(di + 1) != lex_ident {
+                    break
+                }
+                if putil.peek_n(di + 2) == lex_dcolon {
+                    ok = true
+                    break
+                }
+                di = di + 2
+            }
+            if ok {
+                while putil.peek_tag() == lex_dot {
+                    if putil.peek_n(1) != lex_ident {
+                        break
+                    }
+                    putil.advance()   // .
+                    var ds = putil.expect_ident()
+                    if ds < 0 {
+                        return -1
+                    }
+                    dotted_name = interner.intern(interner.lookup(dotted_name) + "::" + interner.lookup(ds))
+                }
+                dotted_path = true
+            }
+        }
+        // 命名空间路径：a::b::c（含点分前缀 a.b::c）
+        if dotted_path || putil.peek_tag() == lex_dcolon {
+            var segs: table<i64> = table_new_i64()
+            table_push(segs, dotted_name)
+            while putil.eat(lex_dcolon) {
+                var s = putil.expect_ident()
+                if s < 0 {
+                    return -1
+                }
+                table_push(segs, s)
+            }
+            // 路径尾段后跟调用：`ns::max(...)` / `ns::max<i64>(...)`
+            // （2026-08-14 泛型语法）。段收集完毕，最后一段即函数名；产出
+            // N_CALL（name=**拼接全名** `ns::max`——裸调用名解析需要完整前缀，
+            // 否则 `calc::add(5)` 丢失 `calc::` 前缀报「未定义的函数 'add'」）。
+            // 若后跟 '.' 等则维持 N_PATH 原样（由 parse_unary 后缀链继续处理）。
+            var last = segs[len(segs) - 1]
+            var targs = -1
+            if putil.peek_tag() == lex_lt {
+                // 泛型调用探测：`ns::max<i64>(...)`。非泛型 '<'（比较）不消费。
+                if putil.is_generic_call_ahead() {
+                    targs = pexpr_type.parse_type_args()
+                    if targs < 0 {
+                        return -1
+                    }
+                }
+            }
+            if putil.peek_tag() == lex_lparen {
+                putil.advance()
+                var args: table<i64> = table_new_i64()
+                if !parse_args_after_lparen(args) {
+                    return -1
+                }
+                var call = ast.new_node(N_CALL, join_path_segs(segs), -1, -1, line, col)
+                var ckids: table<i64> = table_new_i64()
+                table_push(ckids, targs)
+                var k: i64 = 0
+                while k < len(args) {
+                    table_push(ckids, args[k])
+                    k = k + 1
+                }
+                ast.set_children(call, ckids)
+                return call
+            }
+            var path = ast.new_node(N_PATH, -1, -1, -1, line, col)
+            var pkids: table<i64> = table_new_i64()
+            var i: i64 = 0
+            while i < len(segs) {
+                table_push(pkids, ast.new_node(N_SEGMENT, segs[i], -1, -1, line, col))
+                i = i + 1
+            }
+            ast.set_children(path, pkids)
+            return path
+        }
+        // 泛型调用/构造探测：`max<i64>(3, 5)` / `Box<i64>(42)`（2026-08-14）。
+        // '<' 后是「完整类型实参列表 + '>' + '('」才按泛型处理，否则 '<' 是
+        // 普通比较运算符（is_generic_call_ahead 内部 save/restore，不消费 token）。
+        var targs = -1
+        if putil.peek_tag() == lex_lt {
+            if putil.is_generic_call_ahead() {
+                targs = pexpr_type.parse_type_args()
+                if targs < 0 {
+                    return -1
+                }
+            }
+        }
+        // 函数调用
+        if putil.eat(lex_lparen) {
+            var args: table<i64> = table_new_i64()
+            if !parse_args_after_lparen(args) {
+                return -1
+            }
+            var call = ast.new_node(N_CALL, name, -1, -1, line, col)
+            var ckids: table<i64> = table_new_i64()
+            table_push(ckids, targs)
+            var k: i64 = 0
+            while k < len(args) {
+                table_push(ckids, args[k])
+                k = k + 1
+            }
+            ast.set_children(call, ckids)
+            return call
+        }
+        return ast.new_node(N_VAR, name, -1, -1, line, col)
+    }
+    if tag == lex_lparen {
+        return parse_paren_or_tuple(line, col)
+    }
+    if tag == lex_lbracket {
+        return parse_table_lit(line, col)
+    }
+    // p.9.11.5 记录字面量 `{k: v}`：表达式起始位的 `{`。消歧判定表
+    //（写死规则，与 p.8.2.9 尾随闭包 / 语句块对 `{` 的消费逻辑正交）：
+    //   `{` 之后的**首元素**：
+    //     标识符/字符串字面量 + 紧跟 `:` → 记录字面量（键: 值 元素序列）；
+    //     `}`（空）            → 空记录（语义 = 空表/空映射；表达式位 `{}`
+    //                            无既有块语义——块是语句位，故可安全定义）；
+    //     其它                 → 非法（表达式位 `{` 无既有含义，报错引导）。
+    // 语句位 `{`（块）仍由 pstmt 层消费，不达此分支（parse_primary 仅当
+    // `{` 是表达式首个 token 时才命中）。尾随闭包 `expr { }` 的 `{` 由
+    // parse_unary 后缀链消费，与记录字面量互不冲突。
+    if tag == lex_lbrace {
+        return parse_record_lit(line, col)
+    }
+    putil.set_err(line, col, "无法以 " + putil.describe(tag) + " 开始表达式")
+    return -1
+}
+
+// `(` 起始：元组字面量 `(1, "a")` / `(x: 1, y: 2)`，或分组表达式 `(expr)`
+func parse_paren_or_tuple(line: i64, col: i64) -> i64 {
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    if putil.eat(lex_rparen) {
+        putil.set_err(line, col, "空元组 () 不支持")
+        return -1
+    }
+    var first = parse_tuple_field()
+    if first < 0 {
+        return -1
+    }
+    if putil.eat(lex_comma) {
+        var fields: table<i64> = table_new_i64()
+        table_push(fields, first)
+        var d = false
+        while !d {
+            var f = parse_tuple_field()
+            if f < 0 {
+                return -1
+            }
+            table_push(fields, f)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+        var tup = ast.new_node(N_TUPLE_LIT, -1, -1, -1, line, col)
+        ast.set_children(tup, fields)
+        return tup
+    }
+    // 无逗号 → 分组表达式
+    if !putil.expect(lex_rparen, "')'") {
+        return -1
+    }
+    if ast.name(first) != -1 {
+        putil.set_err(line, col, "命名字段必须作为元组元素（如 (x: 1, y: 2)），单个 (x: 1) 不是合法表达式")
+        return -1
+    }
+    return ast.child_at(first, 0)
+}
+
+// ---------- p.9.11.5 记录字面量 ----------
+// 记录字面量 `{k: v}`：`{` 已在表达式起始位判定为记录（见 parse_primary）。
+// 元素为「键: 值」对；键 = 标识符或字符串字面量，值 = 任意表达式；可嵌套
+// `{a: {b: 1}}`、可空 `{}`。
+//
+// 键化表裁决（type 模型）：记录**不新建独立 record 类型**，直接 desugar 为
+// 键化表（map）字面量 `["k": v, ...]`——复用既有 N_TABLE_LIT + N_TABLE_ID
+// 「字符串键 cell」路径：sinfer 推断为 map<V>，irgen 走 has_str_key 分支
+// 产出 s21_map 句柄。故 `rec.k`（点访问）与 `rec["name"]`（下标）一致性由
+// map 的字符串键读取天然保障（见 sinfer/irgen 对 N_FIELD_ACCESS 上 map 的
+// 扩展：均为 s21_map_get(base, "k")）。空 `{}` 产出无 cell 的 N_TABLE_LIT
+//（空表语义，与 `[]` 同）。
+func parse_record_lit(line: i64, col: i64) -> i64 {
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    if putil.eat(lex_rbrace) {
+        return ast.new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+    }
+    var cells: table<i64> = table_new_i64()
+    var d = false
+    while !d {
+        var kline = putil.peek_line()
+        var kcol = putil.peek_col()
+        var key_id: i64 = -1
+        if putil.peek_tag() == lex_ident {
+            if putil.peek_n(1) == lex_colon {
+                key_id = interner.intern(putil.peek_lexeme())
+                putil.advance()   // ident
+                putil.advance()   // ':'
+            }
+        } else if putil.peek_tag() == lex_str {
+            if putil.peek_n(1) == lex_colon {
+                key_id = interner.intern(putil.peek_lexeme())
+                putil.advance()   // 字符串
+                putil.advance()   // ':'
+            }
+        }
+        if key_id < 0 {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "记录字面量元素必须是 '键: 值'（键为标识符或字符串字面量），实际是 " + putil.describe(putil.peek_tag()))
+            return -1
+        }
+        var value = parse_expr()
+        if value < 0 {
+            return -1
+        }
+        var kid = ast.new_node(N_TABLE_ID, key_id, -1, -1, kline, kcol)
+        var cell = ast.new_node(N_TABLE_CELL, -1, 0, -1, kline, kcol)
+        var ckids: table<i64> = table_new_i64()
+        table_push(ckids, kid)
+        table_push(ckids, value)
+        ast.set_children(cell, ckids)
+        table_push(cells, cell)
+        if putil.eat(lex_comma) {
+            // 继续
+        } else {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            d = true
+        }
+    }
+    var t = ast.new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+    ast.set_children(t, cells)
+    return t
+}
+
+// 元组字段：`name: expr`（命名字段）或 `expr`（匿名）——返回 TupleField 节点
+func parse_tuple_field() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    if putil.peek_tag() == lex_ident {
+        if putil.peek_n(1) == lex_colon {
+            var name = interner.intern(putil.peek_lexeme())
+            putil.advance()
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var value = parse_expr()
+            if value < 0 {
+                return -1
+            }
+            var f = ast.new_node(N_TUPLE_FIELD, name, -1, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, value)
+            ast.set_children(f, kids)
+            return f
+        }
+    }
+    var value = parse_expr()
+    if value < 0 {
+        return -1
+    }
+    var f = ast.new_node(N_TUPLE_FIELD, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, value)
+    ast.set_children(f, kids)
+    return f
+}
+
+// 构建 `_tmp.ItemK` 字段访问节点（改写给解构名）：返回 N_FIELD_ACCESS[name=ItemK,
+// children=[N_VAR(_tmp)]]。tmp_id = 循环（临时）变量名池 id。
+func cpr_field_access(tmp_id: i64, idx: i64, line: i64, col: i64) -> i64 {
+    var tv = ast.new_node(N_VAR, tmp_id, -1, -1, line, col)
+    var fa = ast.new_node(N_FIELD_ACCESS, interner.intern("Item" + to_string(idx)), -1, -1, line, col)
+    var fk: table<i64> = table_new_i64()
+    table_push(fk, tv)
+    ast.set_children(fa, fk)
+    return fa
+}
+
+// 递归改写推导式内的解构变量引用：遍历以 id 为根的表达式子树，把 name ∈
+// dest_names（池 id 表，序号 0 起 → Item1..）的 N_VAR 叶子替换为字段访问。
+// 其它节点若子节点发生替换则重建同 tag/name/val/aux 的新节点；无变化返回原 id。
+func cpr_rewrite(id: i64, dest_names: table<i64>, tmp_id: i64) -> i64 {
+    if id < 0 {
+        return id
+    }
+    if ast.tag(id) == N_VAR {
+        var k: i64 = 0
+        while k < len(dest_names) {
+            if ast.name(id) == dest_names[k] {
+                return cpr_field_access(tmp_id, k + 1, ast.line(id), ast.col(id))
+            }
+            k = k + 1
+        }
+        return id
+    }
+    var n = ast.child_count(id)
+    if n == 0 {
+        return id
+    }
+    var kids: table<i64> = table_new_i64()
+    var changed: bool = false
+    var i: i64 = 0
+    while i < n {
+        var c = ast.child_at(id, i)
+        var nc = cpr_rewrite(c, dest_names, tmp_id)
+        table_push(kids, nc)
+        if nc != c {
+            changed = true
+        }
+        i = i + 1
+    }
+    if !changed {
+        return id
+    }
+    var nn = ast.new_node(ast.tag(id), ast.name(id), ast.val(id), ast.aux(id), ast.line(id), ast.col(id))
+    ast.set_children(nn, kids)
+    return nn
+}
+
+// 解析推导式主体（游标停在 `for` 上）：`for 迭代变量 in 源表 [if 条件]` → 节点。
+// elem 为首个 cell 的元素表达式（已解析）。返回 N_COMPREHENSION[name=循环变量名
+// 池 id, children=[源, 元素, 条件或 -1]]。
+func parse_comprehension(elem: i64, line: i64, col: i64) -> i64 {
+    putil.advance()   // 'for'
+    var var_id: i64 = -1
+    var dest_names: table<i64> = table_new_i64()
+    if putil.peek_tag() == lex_lparen {
+        // 解构 `for (a, b) in src`（与 for..in 解构一致）
+        putil.advance()  // '('
+        var dd = false
+        while !dd {
+            var nm = putil.expect_ident()
+            if nm < 0 {
+                return -1
+            }
+            table_push(dest_names, nm)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                dd = true
+            }
+        }
+        var_id = interner.intern("_c" + to_string(g_tmp))
+        g_tmp = g_tmp + 1
+    } else {
+        var_id = putil.expect_ident()
+        if var_id < 0 {
+            return -1
+        }
+    }
+    if !putil.expect(lex_in, "'in'") {
+        return -1
+    }
+    putil.enter_cond()   // 源表达式内不判定尾随闭包（对齐 for..in 迭代）
+    var source = parse_expr()
+    putil.exit_cond()
+    if source < 0 {
+        return -1
+    }
+    var cond: i64 = -1
+    if putil.eat(lex_if) {
+        cond = parse_expr()
+        if cond < 0 {
+            return -1
+        }
+    }
+    if !putil.expect(lex_rbracket, "']'") {
+        return -1
+    }
+    // 解构：把元素/条件里的解构名引用改写为 `_cN.ItemK`（源/元素/条件均已解析，
+    // 只需改写二者——源不含循环变量）
+    var fin_elem = elem
+    var fin_cond = cond
+    if len(dest_names) > 0 {
+        fin_elem = cpr_rewrite(elem, dest_names, var_id)
+        if cond >= 0 {
+            fin_cond = cpr_rewrite(cond, dest_names, var_id)
+        }
+    }
+    var n = ast.new_node(N_COMPREHENSION, var_id, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, source)
+    table_push(kids, fin_elem)
+    table_push(kids, fin_cond)
+    ast.set_children(n, kids)
+    return n
+}
+
+func parse_table_lit(line: i64, col: i64) -> i64 {
+    if !putil.expect(lex_lbracket, "'['") {
+        return -1
+    }
+    var cells: table<i64> = table_new_i64()
+    if putil.eat(lex_rbracket) {
+        return ast.new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+    }
+    var row: i64 = 0
+    // 解析首个 cell：其后若跟 `for` 关键字 → 推导式（element 已解析）
+    var first = parse_table_cell(row)
+    if first < 0 {
+        return -1
+    }
+    if putil.peek_tag() == lex_for {
+        return parse_comprehension(ast.child_at(first, 1), line, col)
+    }
+    table_push(cells, first)
+    var d = false
+    while !d {
+        var tag = putil.peek_tag()
+        if tag == lex_comma {
+            putil.advance()
+            var cell = parse_table_cell(row)
+            if cell < 0 {
+                return -1
+            }
+            table_push(cells, cell)
+        } else if tag == lex_semi {
+            putil.advance()
+            row = row + 1
+            var cell2 = parse_table_cell(row)
+            if cell2 < 0 {
+                return -1
+            }
+            table_push(cells, cell2)
+        } else if tag == lex_rbracket {
+            putil.advance()
+            d = true
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "期望 , 或 ; 或 ]，实际是 " + putil.describe(tag))
+            return -1
+        }
+    }
+    var t = ast.new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+    // 二维表 desugar：存在 row > 0 的 cell（出现过 `;` 分行）→ 按行分组，
+    // 每行构造一个**子表字面量**（N_TABLE_LIT，含该行全部 cell 作其子节点）
+    // 作为外层表字面量的 cell——`[1,2;3,4]` 等价于 `[[1,2],[3,4]]`（嵌套表）。
+    // 对齐 Rust 侧行为：多行 + 任何 id 元素（`id:value`）→ 报错。
+    var max_row: i64 = 0
+    var has_id: bool = false
+    var c0: i64 = 0
+    while c0 < len(cells) {
+        var cc = cells[c0]
+        var r = ast.val(cc)
+        if r > max_row {
+            max_row = r
+        }
+        if ast.child_at(cc, 0) >= 0 {
+            has_id = true
+        }
+        c0 = c0 + 1
+    }
+    if max_row > 0 {
+        if has_id {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "二维表不支持 id 元素")
+            return -1
+        }
+        // 外层表字面量的 cell 必须是 N_TABLE_CELL 包装（与手写嵌套表
+        // `[[1,2],[3,4]]` 结构一致：cell = [TableId或-1, 值]）——语义层
+        // TableLit 推断按「cell → child(cell,1) 取值」遍历，直接放子表
+        // 字面量作 cell 会被误当值节点（"无法推断表达式（节点 19）"）。
+        var sub: table<i64> = table_new_i64()
+        var r0: i64 = 0
+        while r0 <= max_row {
+            var rcells: table<i64> = table_new_i64()
+            var c1: i64 = 0
+            while c1 < len(cells) {
+                if ast.val(cells[c1]) == r0 {
+                    table_push(rcells, cells[c1])
+                }
+                c1 = c1 + 1
+            }
+            var subn = ast.new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+            ast.set_children(subn, rcells)
+            // 每行包一个 N_TABLE_CELL（无 id，值为子表）
+            var wcell = ast.new_node(N_TABLE_CELL, -1, -1, -1, line, col)
+            var wkids: table<i64> = table_new_i64()
+            table_push(wkids, -1)
+            table_push(wkids, subn)
+            ast.set_children(wcell, wkids)
+            table_push(sub, wcell)
+            r0 = r0 + 1
+        }
+        ast.set_children(t, sub)
+    } else {
+        ast.set_children(t, cells)
+    }
+    return t
+}
+
+// 三期 A 组 `unsafe.get(share)` 凭据获取表达式（§7.1.1 + unsafe-model §13.4）：
+// unsafe → . → get → ( 能力域名 [-> 对象绑定] )。
+//   unsafe.get(share)            → guard<share> 凭据（基础）
+//   unsafe.get(share -> obj)     → guard<share> 凭据对象绑定（只能碰 obj）
+// 产出 N_GUARD_GET[children=[能力域名节点, 对象绑定表达式或 -1]]。
+// 已探测 unsafe . get 三连（当前 peek = '(' 或 '.'）。
+func parse_guard_get(line: i64, col: i64) -> i64 {
+    putil.advance()   // unsafe
+    putil.advance()   // .
+    putil.advance()   // get
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var cap = putil.expect_ident()
+    if cap < 0 {
+        return -1
+    }
+    // 能力域白名单：share / mem / ext / lock（r.1.6.7 新增 lock = 绕过运行时表锁）
+    var capname = interner.lookup(cap)
+    if types.guard_cap_index(capname) < 0 {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "unsafe.get 的能力域必须是 share/mem/ext/lock，实际是 '" + capname + "'")
+        return -1
+    }
+    var bind = -1
+    if putil.eat(lex_arrow) {
+        // 对象绑定：`share -> obj`（凭据只能碰该对象，防滥用任意内存）
+        bind = parse_unary()
+        if bind < 0 {
+            return -1
+        }
+    }
+    if !putil.expect(lex_rparen, "')'") {
+        return -1
+    }
+    var n = ast.new_node(N_GUARD_GET, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ast.new_node(N_NAMED_TYPE, cap, -1, -1, line, col))
+    table_push(kids, bind)
+    ast.set_children(n, kids)
+    return n
+}
+
+// r.1.6.7 `unsafe.revoke(g)` 凭据撤销表达式（§11.6）：
+// unsafe → . → revoke → ( 凭据变量 )。
+// 产出 N_GUARD_REVOKE[children=[凭据表达式]]。实参须为 guard<cap> 变量
+// （语义层校验：类型 + 未失效）；撤销纯编译期生效，无运行时表示。
+// 已探测 unsafe . revoke 三连（当前 peek = '('）。
+func parse_guard_revoke(line: i64, col: i64) -> i64 {
+    putil.advance()   // unsafe
+    putil.advance()   // .
+    putil.advance()   // revoke
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var arg = parse_expr()
+    if arg < 0 {
+        return -1
+    }
+    if !putil.expect(lex_rparen, "')'") {
+        return -1
+    }
+    var n = ast.new_node(N_GUARD_REVOKE, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, arg)
+    ast.set_children(n, kids)
+    return n
+}
+
+}

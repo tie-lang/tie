@@ -1,0 +1,672 @@
+type tie<class>
+// compiler/frontend/mexpand_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 mexpand.tie。
+namespace mexpand {
+// 池快照：s_* 池 9 列 + node_types + s_n（节点总数）深拷贝到 g_pool_*。
+func pool_save() {
+    g_pool_tags = copy_i64(s_tags)
+    g_pool_names = copy_i64(s_names)
+    g_pool_vals = copy_i64(s_vals)
+    g_pool_aux = copy_i64(s_aux)
+    g_pool_coff = copy_i64(s_coff)
+    g_pool_nchild = copy_i64(s_nchild)
+    g_pool_children = copy_i64(s_children)
+    g_pool_lines = copy_i64(s_lines)
+    g_pool_cols = copy_i64(s_cols)
+    g_pool_types = copy_i64(node_types)
+    g_pool_sn = s_n
+}
+
+// 池恢复：**深拷贝** g_pool_* 快照到全新表（重新绑定 s_* = 快照会导致后续
+// append_ast/splice/gen_code_lit 追加直接改到 g_pool_* 本体——快照被污染，
+// 多宏展开时第二次 pool_restore 拿到的池含上一次的克隆垃圾，类型推断错乱）。
+// s_n 用拷贝后表长（快照保存时的 s_n 恒 == len(s_tags)，等价）。
+func pool_restore() {
+    s_tags = copy_i64(g_pool_tags)
+    s_names = copy_i64(g_pool_names)
+    s_vals = copy_i64(g_pool_vals)
+    s_aux = copy_i64(g_pool_aux)
+    s_coff = copy_i64(g_pool_coff)
+    s_nchild = copy_i64(g_pool_nchild)
+    s_children = copy_i64(g_pool_children)
+    s_lines = copy_i64(g_pool_lines)
+    s_cols = copy_i64(g_pool_cols)
+    node_types = copy_i64(g_pool_types)
+    s_n = len(s_tags)
+}
+
+// i64 表深拷贝。
+func copy_i64(src: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < len(src) {
+        table_push(out, src[i])
+        i = i + 1
+    }
+    return out
+}
+
+// 宏名查找：命中返回下标，未命中 -1。
+func macro_find(name_id: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_macro_keys) {
+        if g_macro_keys[i] == name_id {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 登记宏（name 池 id + 定义节点 id + 过程宏标记 + pub 标记 + 定义文件 id；
+// 重复登记覆盖——后定义优先）。
+func macro_put(name_id: i64, node: i64, isproc: i64, ispub: i64, file: i64) -> i64 {
+    var i = macro_find(name_id)
+    if i >= 0 {
+        g_macro_nodes[i] = node
+        g_macro_isproc[i] = isproc
+        g_macro_ispub[i] = ispub
+        g_macro_file[i] = file
+        return i
+    }
+    table_push(g_macro_keys, name_id)
+    table_push(g_macro_nodes, node)
+    table_push(g_macro_isproc, isproc)
+    table_push(g_macro_ispub, ispub)
+    table_push(g_macro_file, file)
+    table_push(g_macro_isdecl, 0)   // p.8.2.12 默认非声明式（collect 双层都对齐此长度）
+    return len(g_macro_keys) - 1
+}
+
+// 收集顶层宏定义（g_extra_tops 中的 N_MACRO_DEF——跨文件宏 dev33 批次10 任务29：
+// import 展开先于宏展开，g_extra_tops = 主 + 全部导入文件顶层语句）→ 宏表；
+// 同时重建 g_extra_tops 剔除宏定义（宏不参与语义/IR）。
+func collect_macros() -> i64 {
+    var kept: table<i64> = table_new_i64()
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        if s_tags[s] == N_MACRO_DEF || s_tags[s] == N_DECL_MACRO_DEF {
+            var nm_id = s_names[s]
+            if nm_id < 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "宏定义缺少名字"
+                return -1
+            }
+            if s_tags[s] == N_DECL_MACRO_DEF {
+                // p.8.2.12 声明式宏：登记模板 + 宏体 AST 协议 + 形参名表。
+                // 不注册进 interp（无编译期执行），展开由 decl 路径直接代换。
+                var dparams: table<i64> = table_new_i64()
+                var body_node = s_children[s_coff[s]]
+                if body_node < 0 {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "声明式宏 '" + interner.lookup(nm_id) + "' 缺少展开体"
+                    return -1
+                }
+                var body_proto = tiep.sstate_subtree_protocol(body_node)
+                if w_err != "" {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "声明式宏 '" + interner.lookup(nm_id) + "' 展开体序列化失败: " + w_err
+                    return -1
+                }
+                var npar = s_nchild[s] - 1
+                if npar < 0 {
+                    npar = 0
+                }
+                var k: i64 = 0
+                while k < npar {
+                    var pp = s_children[s_coff[s] + 1 + k]
+                    if pp < 0 || s_names[pp] < 0 {
+                        sm_err_line = s_lines[s]
+                        sm_err_col = s_cols[s]
+                        sm_err_msg = "声明式宏 '" + interner.lookup(nm_id) + "' 形参缺少名字"
+                        return -1
+                    }
+                    table_push(dparams, s_names[pp])
+                    k = k + 1
+                }
+                var idx = macro_put(nm_id, s, 0, 0, node_file_of(s))
+                if idx < 0 {
+                    return -1
+                }
+                // 使 g_dbody 与宏表对齐（macro_put 只对齐 g_macro_isdecl；
+                // g_dbody 是 string 表，须按长度补齐后按索引写，防越界）
+                while len(g_dbody) < len(g_macro_keys) {
+                    table_push(g_dbody, "")
+                }
+                g_macro_isdecl[idx] = 1
+                g_dbody[idx] = body_proto
+            } else {
+                // val 位标志：bit0=过程宏（#[macro]），bit1=pub 导出
+                var isproc: i64 = 0
+                var ispub: i64 = 0
+                if s_vals[s] % 2 == 1 {
+                    isproc = 1
+                }
+                if s_vals[s] / 2 % 2 == 1 {
+                    ispub = 1
+                }
+                var idx = macro_put(nm_id, s, isproc, ispub, node_file_of(s))
+                if idx < 0 {
+                    return -1
+                }
+                g_macro_isdecl[idx] = 0
+            }
+        } else {
+            table_push(kept, s)
+        }
+        i = i + 1
+    }
+    // 重建 g_extra_tops（剔除宏定义；收集/查找统一遍历用）
+    g_extra_tops = kept
+    return 0
+}
+
+// 节点所属文件 id：沿父链上溯到最近的已记录顶层 StmtList 根（g_file_roots），
+// 其文件 id 即节点所属文件；找不到（主文件顶层直接子节点）→ 0（主文件）。
+func node_file_of(node: i64) -> i64 {
+    var cur = node
+    var depth: i64 = 0
+    while depth < 64 {
+        var out: table<i64> = table_new_i64()
+        table_push(out, -1)
+        table_push(out, -1)
+        if find_parent(cur, out) < 0 {
+            break
+        }
+        var p = out[0]
+        // 已记录顶层 StmtList 根 → 其文件 id
+        var fi = file_root_find(p)
+        if fi >= 0 {
+            return fi
+        }
+        cur = p
+        depth = depth + 1
+    }
+    return 0
+}
+
+// 查 g_file_roots 中是否存在顶层 StmtList 根 id（线性；文件数少）。命中返回
+// 文件 id；未命中 -1。
+func file_root_find(root_id: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_file_roots) {
+        if g_file_roots[i] == root_id {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 注册全部宏到 interp：每个宏定义子树序列化为协议文本（根 = 宏定义
+// 节点 id 0）→ eval_proto（load_ast + 归档 + 顶层注册）。
+// 每轮注册前恢复池快照（上一轮 eval_proto 已重建 s_* 池）。
+func register_macros() -> i64 {
+    var i: i64 = 0
+    while i < len(g_macro_keys) {
+        // p.8.2.12 声明式宏不注册进 interp（无编译期执行，模板代换在
+        // expand_one 声明式路径完成）。
+        if len(g_macro_isdecl) > i && g_macro_isdecl[i] == 1 {
+            i = i + 1
+            continue
+        }
+        pool_restore()
+        var node = g_macro_nodes[i]
+        var proto = tiep.sstate_subtree_protocol(node)
+        if w_err != "" {
+            sm_err_line = s_lines[node]
+            sm_err_col = s_cols[node]
+            sm_err_msg = "宏定义序列化失败: " + w_err
+            return -1
+        }
+        var r = tiep.eval_proto(proto)
+        if w_err != "" {
+            sm_err_line = s_lines[node]
+            sm_err_col = s_cols[node]
+            sm_err_msg = "宏 '" + interner.lookup(g_macro_keys[i]) + "' 注册失败: " + r
+            return -1
+        }
+        i = i + 1
+    }
+    pool_restore()
+    return 0
+}
+
+// 展开单个宏调用（call_id 是 s_* 池 N_CALL 节点）：
+//   实参序列化 → eval_macro → 结果加载 → 替换调用点。
+// eval_macro 会重建 s_* 池（宏体执行环境），故执行前恢复池快照（池 =
+// 主文件 AST + 已展开追加），执行后再恢复并追加结果。
+func expand_one(call_id: i64) -> i64 {
+    var nm_id = s_names[call_id]
+    var mi = macro_find(nm_id)
+    // p.8.2.12 声明式宏：模板代换 + 卫生唯一化（不编译期执行，不需要 interp，
+    // 直接在新树副本上改写后 splice）。
+    if mi >= 0 && len(g_macro_isdecl) > mi && g_macro_isdecl[mi] == 1 {
+        return expand_decl_one(call_id, mi)
+    }
+    // 每次展开前重存工作池快照（当前 = 主文件 AST + 已展开追加；宏执行会
+    // 重建/污染 s_* 池，须在进入前保存干净状态，供完成后恢复）。
+    pool_save()
+    var name = interner.lookup(nm_id)
+    var isproc: i64 = 0
+    if mi >= 0 {
+        isproc = g_macro_isproc[mi]
+    }
+    // 实参序列化（跳过类型实参槽——宏不支持泛型，槽恒为 -1 或 N_TYPE_ARGS）
+    var soff: i64 = 0
+    if s_nchild[call_id] > 0 {
+        var c0 = s_children[s_coff[call_id]]
+        if c0 < 0 {
+            soff = 1
+        } else if s_tags[c0] == N_TYPE_ARGS || s_tags[c0] == N_TYPE_PARAMS {
+            soff = 1
+        }
+    }
+    if isproc == 1 {
+        // M4（dev33 批次9）过程宏：实参子树解引用为**源码文本**，绑定为
+        // 字符串传给宏体（宏体用 tokenize/deparse 驱动）；返回 code 值。
+        var argstrs: table<string> = table_new_string()
+        var k2: i64 = soff
+        while k2 < s_nchild[call_id] {
+            var a = s_children[s_coff[call_id] + k2]
+            if a < 0 {
+                sm_err_line = s_lines[call_id]
+                sm_err_col = s_cols[call_id]
+                sm_err_msg = "过程宏 '" + name + "' 的实参缺失"
+                return -1
+            }
+            var src = deparse_arg_expr(a)
+            if w_err != "" {
+                sm_err_line = s_lines[call_id]
+                sm_err_col = s_cols[call_id]
+                sm_err_msg = "过程宏实参解引用失败: " + w_err
+                return -1
+            }
+            table_push(argstrs, src)
+            k2 = k2 + 1
+        }
+        var rp = tiep.eval_macro_proc(name, argstrs)
+        if w_err != "" {
+            sm_err_line = s_lines[call_id]
+            sm_err_col = s_cols[call_id]
+            sm_err_msg = "过程宏 '" + name + "' 展开失败: " + rp
+            return -1
+        }
+        return finish_expand(call_id, name, rp)
+    }
+    var args: table<string> = table_new_string()
+    var k: i64 = soff
+    while k < s_nchild[call_id] {
+        var a = s_children[s_coff[call_id] + k]
+        if a < 0 {
+            sm_err_line = s_lines[call_id]
+            sm_err_col = s_cols[call_id]
+            sm_err_msg = "宏 '" + name + "' 的实参缺失"
+            return -1
+        }
+        var aproto = tiep.sstate_subtree_protocol(a)
+        if w_err != "" {
+            sm_err_line = s_lines[call_id]
+            sm_err_col = s_cols[call_id]
+            sm_err_msg = "宏实参序列化失败: " + w_err
+            return -1
+        }
+        table_push(args, aproto)
+        k = k + 1
+    }
+    // 执行宏（编译期；宏体错误在此暴露）
+    var result = tiep.eval_macro(name, args)
+    if w_err != "" {
+        sm_err_line = s_lines[call_id]
+        sm_err_col = s_cols[call_id]
+        sm_err_msg = "宏 '" + name + "' 展开失败: " + result
+        return -1
+    }
+    return finish_expand(call_id, name, result)
+}
+
+// 展开收尾（普通宏与过程宏共用）：恢复工作池 → 追加结果 → 替换调用点。
+func finish_expand(call_id: i64, name: string, result: string) -> i64 {
+    // 宏执行已重建 s_* 池：恢复工作池（主文件 AST + 已展开追加）后追加结果
+    pool_restore()
+    // 结果追加加载进 s_* 池（根 = base）
+    var base = sstate.append_ast(result)
+    if base < 0 {
+        sm_err_line = s_lines[call_id]
+        sm_err_col = s_cols[call_id]
+        sm_err_msg = "宏展开结果加载失败（AST 协议解析错误）"
+        return -1
+    }
+    // 语句位置 `$body` 插值块形式 code 值后，结果含嵌套 StmtList / 块形式
+    // N_CODE_LIT 作语句——由后端 tig_stmt 直接支持（逐语句生成）。
+    var new_root = base
+    // 找父节点与子下标（out 表输出：out[0]=父节点 id，out[1]=子下标）
+    var out: table<i64> = table_new_i64()
+    table_push(out, -1)
+    table_push(out, -1)
+    if find_parent(call_id, out) < 0 {
+        // 孤儿节点（宏定义被 collect_macros 移除后子树残留的 N_CALL）：
+        // 跳过不展开（返回 0 = 无变化，不触发重扫；其父已不在活树中）。
+        return 0
+    }
+    // 替换
+    var rc2 = splice_call(out[0], out[1], call_id, new_root)
+    if rc2 < 0 {
+        return -1
+    }
+    return 1
+}
+
+// ==================== M4 过程宏实参解引用（AST → 源码文本） ====================
+// 过程宏实参以**源码文本**传给宏体（token 流 API 驱动），此函数把 s_* 池
+// 表达式子树还原为源码。二元/一元/三目一律括号包裹保证重解析语义一致。
+// 覆盖常用表达式节点；未知节点置 w_err。
+func deparse_arg_expr(node: i64) -> string {
+    var t = s_tags[node]
+    if t == N_INT_LIT {
+        return to_string(s_vals[node])
+    }
+    if t == N_FLOAT_LIT {
+        if s_names[node] >= 0 {
+            return interner.lookup(s_names[node])
+        }
+        w_err = "浮点字面量缺少文本"
+        return ""
+    }
+    if t == N_STR_LIT {
+        if s_names[node] >= 0 {
+            return interner.lookup(s_names[node])
+        }
+        w_err = "字符串字面量缺少文本"
+        return ""
+    }
+    if t == N_CHAR_LIT {
+        if s_names[node] >= 0 {
+            return interner.lookup(s_names[node])
+        }
+        w_err = "字符字面量缺少文本"
+        return ""
+    }
+    if t == N_BOOL_LIT {
+        if s_vals[node] != 0 {
+            return "true"
+        }
+        return "false"
+    }
+    if t == N_TRIT_LIT {
+        return "zero"
+    }
+    if t == N_VAR {
+        if s_names[node] >= 0 {
+            return interner.lookup(s_names[node])
+        }
+        w_err = "变量节点缺少名字"
+        return ""
+    }
+    if t == N_UNARY {
+        var op = s_vals[node]
+        var opr = deparse_arg_expr(s_children[s_coff[node]])
+        if w_err != "" {
+            return ""
+        }
+        if op == 0 {
+            return "-(" + opr + ")"
+        }
+        if op == 1 {
+            return "!(" + opr + ")"
+        }
+        if op == U_BIT_NOT {
+            return "~(" + opr + ")"
+        }
+        if op == 2 || op == 3 {
+            return "(" + unary_sym(op) + opr + ")"
+        }
+        return "(" + opr + unary_sym(op) + ")"
+    }
+    if t == N_BINARY {
+        var op = s_vals[node]
+        var l = deparse_arg_expr(s_children[s_coff[node]])
+        if w_err != "" {
+            return ""
+        }
+        var r = deparse_arg_expr(s_children[s_coff[node] + 1])
+        if w_err != "" {
+            return ""
+        }
+        return "(" + l + " " + bin_sym(op) + " " + r + ")"
+    }
+    if t == N_TERNARY {
+        var c = deparse_arg_expr(s_children[s_coff[node]])
+        if w_err != "" {
+            return ""
+        }
+        var a = deparse_arg_expr(s_children[s_coff[node] + 1])
+        if w_err != "" {
+            return ""
+        }
+        var b = deparse_arg_expr(s_children[s_coff[node] + 2])
+        if w_err != "" {
+            return ""
+        }
+        return "(" + c + " ? " + a + " : " + b + ")"
+    }
+    if t == N_CALL {
+        var out: string = interner.lookup(s_names[node]) + "("
+        var nc = s_nchild[node]
+        var off: i64 = 0
+        if nc > 0 {
+            var c0 = s_children[s_coff[node]]
+            if c0 < 0 {
+                off = 1
+            } else if s_tags[c0] == N_TYPE_ARGS || s_tags[c0] == N_TYPE_PARAMS {
+                off = 1
+            }
+        }
+        var k: i64 = off
+        while k < nc {
+            if k > off {
+                out = out + ", "
+            }
+            out = out + deparse_arg_expr(s_children[s_coff[node] + k])
+            if w_err != "" {
+                return ""
+            }
+            k = k + 1
+        }
+        return out + ")"
+    }
+    if t == N_METHOD_CALL {
+        var recv = deparse_arg_expr(s_children[s_coff[node]])
+        if w_err != "" {
+            return ""
+        }
+        var out: string = recv + "." + interner.lookup(s_names[node]) + "("
+        var nc = s_nchild[node]
+        var off: i64 = 0
+        if nc > 0 {
+            var c0 = s_children[s_coff[node]]
+            if c0 < 0 {
+                off = 1
+            } else if s_tags[c0] == N_TYPE_ARGS {
+                off = 1
+            }
+        }
+        var k: i64 = off + 1
+        while k < nc {
+            if k > off + 1 {
+                out = out + ", "
+            }
+            out = out + deparse_arg_expr(s_children[s_coff[node] + k])
+            if w_err != "" {
+                return ""
+            }
+            k = k + 1
+        }
+        return out + ")"
+    }
+    if t == N_INDEX {
+        var base = deparse_arg_expr(s_children[s_coff[node]])
+        if w_err != "" {
+            return ""
+        }
+        var idx = deparse_arg_expr(s_children[s_coff[node] + 1])
+        if w_err != "" {
+            return ""
+        }
+        return base + "[" + idx + "]"
+    }
+    if t == N_FIELD_ACCESS {
+        var base = deparse_arg_expr(s_children[s_coff[node]])
+        if w_err != "" {
+            return ""
+        }
+        return base + "." + interner.lookup(s_names[node])
+    }
+    if t == N_RANGE {
+        var a = deparse_arg_expr(s_children[s_coff[node]])
+        if w_err != "" {
+            return ""
+        }
+        var b = deparse_arg_expr(s_children[s_coff[node] + 1])
+        if w_err != "" {
+            return ""
+        }
+        if s_vals[node] == 1 {
+            return a + "..=" + b
+        }
+        return a + ".." + b
+    }
+    if t == N_TABLE_LIT {
+        var out: string = "["
+        var nc = s_nchild[node]
+        var k: i64 = 0
+        while k < nc {
+            if k > 0 {
+                out = out + ", "
+            }
+            var cell = s_children[s_coff[node] + k]
+            var idn = s_children[s_coff[cell]]
+            if idn >= 0 {
+                out = out + interner.lookup(s_names[idn]) + ": " +
+                    deparse_arg_expr(s_children[s_coff[cell] + 1])
+            } else {
+                out = out + deparse_arg_expr(s_children[s_coff[cell] + 1])
+            }
+            if w_err != "" {
+                return ""
+            }
+            k = k + 1
+        }
+        return out + "]"
+    }
+    w_err = "过程宏实参解引用不支持节点类型 tag " + to_string(t)
+    return ""
+}
+
+// 二元运算符编号 → 符号文本（deparse_arg_expr 用；与 parser.op_symbol 一致）。
+func bin_sym(op: i64) -> string {
+    if op == 0 {
+        return "+"
+    }
+    if op == 1 {
+        return "-"
+    }
+    if op == 2 {
+        return "*"
+    }
+    if op == 3 {
+        return "/"
+    }
+    if op == 4 {
+        return "%"
+    }
+    if op == 5 {
+        return "=="
+    }
+    if op == 6 {
+        return "!="
+    }
+    if op == 7 {
+        return "<"
+    }
+    if op == 8 {
+        return ">"
+    }
+    if op == 9 {
+        return "<="
+    }
+    if op == 10 {
+        return ">="
+    }
+    if op == 11 {
+        return "&&"
+    }
+    if op == 12 {
+        return "||"
+    }
+    if op == 13 {
+        return "&"
+    }
+    if op == 14 {
+        return "|"
+    }
+    if op == 15 {
+        return "^"
+    }
+    if op == 16 {
+        return "<<"
+    }
+    if op == 17 {
+        return ">>"
+    }
+    return "?"
+}
+
+// 一元运算符编号 → 符号文本（deparse_arg_expr 用）。
+func unary_sym(op: i64) -> string {
+    if op == 0 {
+        return "-"
+    }
+    if op == 1 {
+        return "!"
+    }
+    if op == U_BIT_NOT {
+        return "~"
+    }
+    if op == 2 || op == 4 {
+        return "++"
+    }
+    if op == 3 || op == 5 {
+        return "--"
+    }
+    return "?"
+}
+
+// 找 child_id 的父节点与子下标（全池扫描）。out 表输出：out[0]=父节点 id，
+// out[1]=子下标。返回 0 找到；-1 未找到。
+func find_parent(child_id: i64, out: ref table<i64>) -> i64 {
+    var i: i64 = 0
+    while i < s_n {
+        var n = s_nchild[i]
+        var k: i64 = 0
+        while k < n {
+            if s_children[s_coff[i] + k] == child_id {
+                out[0] = i
+                out[1] = k
+                return 0
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+}

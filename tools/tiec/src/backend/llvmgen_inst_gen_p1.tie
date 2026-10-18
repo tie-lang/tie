@@ -1,0 +1,826 @@
+type tie<class>
+// compiler/backend/llvmgen_inst_gen_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 llvmgen_inst_gen.tie。
+namespace llvmgen {
+pub func gen_inst_b_20_alloca(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // alloca：已提升到 entry（g_hoisted_allocas 含本指令）→ 跳过不输出
+        // （entry 顶部已统一输出，重复输出会与 %N 值编号冲突）。
+        var hi: i64 = 0
+        while hi < g_hoisted_cnt {
+            if g_hoisted_allocas[hi] == inst_id {
+                return
+            }
+            hi = hi + 1
+        }
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = alloca " + ty)
+        return
+}
+
+pub func gen_inst_b_21_load(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // load：操作数[0] = 地址（全局 kind=3 → opnd_ref 输出 @name）
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = load " + ty + ", ptr " + opnd_ref(inst_id, 0))
+        return
+}
+
+pub func gen_inst_b_22_store(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // store：操作数 [类型IMM, 值VALUE, 地址VALUE]（全局 kind=3 → opnd_ref 输出 @name）
+        var vty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var vr = opnd_ref(inst_id, 1)
+        if vty == "ptr" {
+            // 值统一转真 ptr：const_str（i64 指针整数）/str_cat（i64）
+            // 不能直接 store ptr %N（%N 类型是 i64）——to_ptr 负责转换
+            vr = to_ptr(ir.ins_opnd(inst_id, 1))
+        }
+        line("store " + vty + " " + vr + ", ptr " + opnd_ref(inst_id, 2))
+        return
+}
+
+pub func gen_inst_b_71_volatile_load(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // volatile_load（任务15）：`load volatile Ty, ptr %p`（MMIO/硬件寄存器读，
+        // volatile 标志保证 LLVM 优化不删除/合并/重排该访存）。
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = load volatile " + ty + ", ptr " + opnd_ref(inst_id, 0))
+        return
+}
+
+pub func gen_inst_b_72_volatile_store(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // volatile_store（任务15）：`store volatile Ty %v, ptr %p`（MMIO/硬件寄存器写）
+        var vty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var vr = opnd_ref(inst_id, 1)
+        if vty == "ptr" {
+            vr = to_ptr(ir.ins_opnd(inst_id, 1))
+        }
+        line("store volatile " + vty + " " + vr + ", ptr " + opnd_ref(inst_id, 2))
+        return
+}
+
+pub func gen_inst_b_60_const_i(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // const_i：整型/布尔常量**不在文本里物化**——使用点由 opnd_ref 内联
+        // 立即数（见该函数注释）。省掉每常量一行 `add <ty> 0, C`。
+        var tyv0 = ir.ins_ty(inst_id)
+        if types.is_int(tyv0) || tyv0 == types.named(TK_BOOL) {
+            return
+        }
+        // 其余（如 ptr 形态）保持原样物化
+        var v = ir.ins_opnd(inst_id, 0)
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = add " + ty + " 0, " + to_string(v))
+        return
+}
+
+pub func gen_inst_b_62_const_str(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // const_str：字符串全局指针（ptr 类型结果）。S2.1：数据指针经 GEP
+        // 跳过 8 字节长度头（{ptr,len} 表示），值仍是 i64 指针整数。
+        var sid = ir.ins_opnd(inst_id, 0)
+        var slot = str_slot(sid)
+        // 返回全局字符串指针（作为 ptr 值）
+        line(reg + " = ptrtoint ptr " + str_data_ref(slot) + " to i64")
+        return
+}
+
+pub func gen_inst_b_63_const_global(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // const_global（S2.2 函数地址）：函数符号地址 → i64 指针整数。
+        // 作为值 id 使用（闭包 entry 字段）；store/参数等需真 ptr 处由
+        // to_ptr 直引 @sym（与 const_str 同模式）。命名空间函数用 $
+        // 分隔（ns_replace），对齐 call_sym_reg 的符号命名。
+        var gid = ir.ins_opnd(inst_id, 0)
+        line(reg + " = ptrtoint ptr @" + ns_replace(intern.lookup(gid)) + " to i64")
+        return
+}
+
+pub func gen_inst_b_0_add(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // add/sub/mul/div/mod
+        var opname = ""
+        if op == 0 {
+            opname = "add"
+        } else if op == 1 {
+            opname = "sub"
+        } else if op == 2 {
+            opname = "mul"
+        } else if op == 3 {
+            opname = "sdiv"
+        } else if op == 4 {
+            opname = "srem"
+        }
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = " + opname + " " + ty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        return
+}
+
+pub func gen_inst_b_46_udiv(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // udiv：无符号除（S1.3 checked_* 无符号反算检测用）
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = udiv " + ty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        return
+}
+
+pub func gen_inst_b_47_urem(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // urem：无符号模（批次 2：i128/u128 十进制打印取余）
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = urem " + ty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        return
+}
+
+pub func gen_inst_b_65_inline_asm(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // inline_asm（S1.2 I1）：`call [Ty] asm "模板", "约束"(操作数...)`。
+        // 操作数布局：① 模板串池 id（OK_VALUE）；随后每操作数 2 槽：
+        // 方向 IMM（0=in 1=out 2=inout）+ 值 VALUE。
+        // 约束拼接：out 在前 "=r"；inout "+r"；in "r"。
+        var tmpl_id = ir.ins_opnd(inst_id, 0)
+        var tmpl = intern.lookup(tmpl_id)
+        // p.9.23 缺陷修复（D3）：raw 字符串字面量 `r"..."` 的 lexeme 带 `r` 前缀
+        // （lex_scan.scan_raw_string 以 `r` 作 raw 标记），先剥前缀再剥引号——
+        // 否则 LLVM 收到 `asm "r"mov $0, 1""`（`r` 泄漏进模板）而报
+        // 「expected comma in inline asm expression」。
+        var tlen = str_len(tmpl)
+        var raw_tmpl: bool = false
+        if tlen >= 3 && str_char(tmpl, 0) == "r" && str_char(tmpl, 1) == "\"" {
+            // `r"body"` -> `body`：同时剥掉 r 与成对引号。
+            tmpl = l_slice(tmpl, 2, tlen - 1)
+            raw_tmpl = true
+        }
+        // 剥离普通模板串引号（lexer 存带引号 lexeme）；raw 路径已在上面完成。
+        tlen = str_len(tmpl)
+        if !raw_tmpl && tlen >= 2 && str_char(tmpl, 0) == "\"" && str_char(tmpl, tlen - 1) == "\"" {
+            tmpl = l_slice(tmpl, 1, tlen - 1)
+        }
+        // S1.2 I1：Rust 风格 `{N}` 占位符 → LLVM `$N`（LLVM inline asm 用 $N，
+        // 设计文档 asm!("mov {0}, rsp") 是 Rust 语法——编译器负责转换）
+        tmpl = asm_tmpl_convert(tmpl)
+        // 约束串必须**分段**拼（缺陷修复 2026-09-30）：LLVM 要求输出约束
+        // （`=r`）构成约束串的**前部**，输入约束在后部；而 inout 的正确表达是
+        // **tied operand** —— 一个 `=r` 输出 + 一个「纯数字」输入约束（数字 =
+        // 它绑定的输出序号），参数列表里给出该变量的值。
+        //
+        // 原先按「操作数出现顺序」逐个拼、并把 inout 写成 GCC 风格的 `+r`：
+        // 实测 LLVM 不把 `+r` 当输出（`opt` 报 "inline asm without outputs must
+        // return void"），且中间夹一个 `+r` 会把输出/输入两段打乱。改为
+        // 「先输出段、再输入段」，inout 生成 `=r` + 自身输出序号。
+        // n_ops = 操作数个数；操作数 val 低 2 位 = 方向（0=in 1=out 2=inout），
+        // bit2 = mem 约束（+4）。见 pexpr_p3 的编码说明。
+        var n_ops = (ir.ins_ops_cnt(inst_id) - 1) / 3
+        var out_seq = table_new_i64()   // 每个操作数 → 其输出序号（-1 = 无输出）
+        var cons_out = ""
+        var cons_in = ""
+        var args = ""
+        var first = true
+        // ---------- 输出段 ----------
+        // LLVM 要求输出约束位于约束串前部。reg 约束的 out/inout 值由 call
+        // 返回值承载、**不占参数**；而 mem（indirect）约束**每个都要占一个
+        // 指针参数**（LangRef），故输出段也要拼 args。
+        var n_out: i64 = 0
+        var i: i64 = 0
+        while i < n_ops {
+            var d0 = ir.ins_opnd(inst_id, 1 + i * 3)
+            var d0b = d0 % 4
+            if d0b == 1 || d0b == 2 {     // out / inout：都有输出
+                table_push(out_seq, n_out)
+                if str_len(cons_out) > 0 {
+                    cons_out = cons_out + ","
+                }
+                if d0 >= 4 {
+                    cons_out = cons_out + "=*m"
+                    var vt0 = ir.ins_opnd(inst_id, 2 + i * 3)
+                    var at0 = opnd_ref(inst_id, 3 + i * 3)
+                    var t0 = asm_mem_arg_ty(vt0)
+                    if first {
+                        first = false
+                        args = t0 + " " + at0
+                    } else {
+                        args = args + ", " + t0 + " " + at0
+                    }
+                } else {
+                    cons_out = cons_out + "=r"
+                }
+                n_out = n_out + 1
+            } else {
+                table_push(out_seq, 0 - 1)
+            }
+            i = i + 1
+        }
+        // ---------- 输入段（与参数列表**同序**推进）----------
+        // in(reg) → `r`；inout(reg) → 自身输出序号（tied）；out(reg) → 不产生
+        // 输入约束、不占参数。mem 约束的 in 与 inout 各给一个 `*m` 与一个指针
+        // 参数；out(mem) 的参数已在输出段给出，此处跳过。
+        i = 0
+        while i < n_ops {
+            var dir = ir.ins_opnd(inst_id, 1 + i * 3)
+            var vty = ir.ins_opnd(inst_id, 2 + i * 3)   // 实参类型 IMM
+            var db = dir % 4
+            if db == 1 && dir < 4 {
+                // out(reg)：值由 call 返回值承载
+                i = i + 1
+            } else if dir >= 4 {
+                // mem 约束：指针参数 + `*m`（in / inout 都在这给输入侧）
+                if db != 1 {
+                    if str_len(cons_in) > 0 {
+                        cons_in = cons_in + ","
+                    }
+                    cons_in = cons_in + "*m"
+                    var am = asm_mem_arg_ty(vty)
+                    var ap = opnd_ref(inst_id, 3 + i * 3)
+                    if first {
+                        first = false
+                        args = am + " " + ap
+                    } else {
+                        args = args + ", " + am + " " + ap
+                    }
+                }
+                i = i + 1
+            } else if db == 2 {
+                if str_len(cons_in) > 0 {
+                    cons_in = cons_in + ","
+                }
+                cons_in = cons_in + to_string(out_seq[i])
+                var at2 = opnd_ref(inst_id, 3 + i * 3)
+                if first {
+                    first = false
+                    args = llvm_ty(vty) + " " + at2
+                } else {
+                    args = args + ", " + llvm_ty(vty) + " " + at2
+                }
+                i = i + 1
+            } else {
+                if str_len(cons_in) > 0 {
+                    cons_in = cons_in + ","
+                }
+                cons_in = cons_in + "r"
+                var at3 = opnd_ref(inst_id, 3 + i * 3)
+                if first {
+                    first = false
+                    args = llvm_ty(vty) + " " + at3
+                } else {
+                    args = args + ", " + llvm_ty(vty) + " " + at3
+                }
+                i = i + 1
+            }
+        }
+        var cons = cons_out
+        if str_len(cons_in) > 0 {
+            if str_len(cons) > 0 {
+                cons = cons + ","
+            }
+            cons = cons + cons_in
+        }
+        // 返回值类型：ins_ty（-1/void = 无 out；具体类型 = out 变量接收）
+        var rty_id = ir.ins_ty(inst_id)
+        var ret_ty = "void"
+        if rty_id >= 0 && rty_id != TK_VOID {
+            ret_ty = llvm_ty(rty_id)
+        }
+        if ret_ty == "void" {
+            line("call void asm \"" + tmpl + "\", \"" + cons + "\"(" + args + ")")
+        } else {
+            line(reg + " = call " + ret_ty + " asm \"" + tmpl + "\", \"" + cons + "\"(" + args + ")")
+        }
+        return
+}
+
+pub func gen_inst_b_66_atomic_load(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // atomic_load（S1.2 A1）：`load atomic Ty, ptr %p <order>, align N`
+        // 操作数：① 地址 VALUE，② order IMM（0=relaxed 1=acquire 2=release
+        // 3=acq_rel 4=seq_cst）
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        var ord = ir.ins_opnd(inst_id, 1)
+        var ords = at_ord_name(ord)
+        line(reg + " = load atomic " + ty + ", ptr " + opnd_ref(inst_id, 0) + " " + ords + ", align 8")
+        return
+}
+
+pub func gen_inst_b_67_atomic_store(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // atomic_store：`store atomic Ty %v, ptr %p <order>, align N`
+        // 操作数：① 值类型 IMM，② 地址 VALUE，③ 值 VALUE，④ order IMM
+        var ty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var ord = ir.ins_opnd(inst_id, 3)
+        line("store atomic " + ty + " " + opnd_ref(inst_id, 2) + ", ptr " + opnd_ref(inst_id, 1) + " " + at_ord_name(ord) + ", align 8")
+        return
+}
+
+pub func gen_inst_b_68_atomicrmw(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // atomicrmw：`atomicrmw <op> ptr %p, Ty %v <order>`
+        // 操作数：① 地址，② 值，③ op IMM（0=add 1=sub 2=and 3=or 4=xor），
+        // ④ order IMM
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        var opn = ir.ins_opnd(inst_id, 2)
+        var opname = "add"
+        if opn == 1 {
+            opname = "sub"
+        } else if opn == 2 {
+            opname = "and"
+        } else if opn == 3 {
+            opname = "or"
+        } else if opn == 4 {
+            opname = "xor"
+        }
+        line(reg + " = atomicrmw " + opname + " ptr " + opnd_ref(inst_id, 0) + ", " + ty + " " + opnd_ref(inst_id, 1) + " " + at_ord_name(ir.ins_opnd(inst_id, 3)))
+        return
+}
+
+pub func gen_inst_b_69_cmpxchg(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // cmpxchg：`cmpxchg ptr %p, Ty %exp, Ty %new <succ> <fail>`
+        // 操作数：① 地址，② 期望，③ 新值，④ succ order，⑤ fail order。
+        // 结果 {Ty, i1}——成功标志提取（extractvalue 1）由调用方另行处理；
+        // 此处直接输出 cmpxchg，结果值为 {Ty, i1} 聚合。
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = cmpxchg ptr " + opnd_ref(inst_id, 0) + ", " + ty + " " + opnd_ref(inst_id, 1) + ", " + ty + " " + opnd_ref(inst_id, 2) + " " + at_ord_name(ir.ins_opnd(inst_id, 3)) + " " + at_ord_name(ir.ins_opnd(inst_id, 4)))
+        return
+}
+
+pub func gen_inst_b_12_icmp(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // icmp：操作数 [lhs VALUE, rhs VALUE, cmp IMM]。
+        // 比较类型：按操作数定义指令类型（i64 整数比较；i32 为 strcmp 结果
+        // 与 0 比较——字符串比较链）。通用取 llvm_ty(lhs 定义指令类型)。
+        var cmp = ir.ins_opnd(inst_id, 2)
+        var cname = "eq"
+        if cmp == 0 {
+            cname = "eq"
+        } else if cmp == 1 {
+            cname = "ne"
+        } else if cmp == 2 {
+            cname = "slt"
+        } else if cmp == 3 {
+            cname = "sgt"
+        } else if cmp == 4 {
+            cname = "sle"
+        } else if cmp == 5 {
+            cname = "sge"
+        } else if cmp == 6 {
+            // S1.3 无符号比较（checked_* 溢出检测用）：ult/ugt/ule/uge
+            cname = "ult"
+        } else if cmp == 7 {
+            cname = "ugt"
+        } else if cmp == 8 {
+            cname = "ule"
+        } else if cmp == 9 {
+            cname = "uge"
+        }
+        // 类型：默认 i64；lhs 定义指令为 i32（strcmp 结果）→ i32
+        var cmp_ty = "i64"
+        var lv = ir.ins_opnd(inst_id, 0)
+        var def = value_def(lv)
+        if def >= 0 {
+            cmp_ty = llvm_ty(ir.ins_ty(def))
+        }
+        // ptr 比较时字面量 0 必须写作 null（LLVM 语法：icmp eq ptr %x, null）
+        var op0 = opnd_ref(inst_id, 0)
+        var op1 = opnd_ref(inst_id, 1)
+        if cmp_ty == "ptr" {
+            if op0 == "0" {
+                op0 = "null"
+            }
+            if op1 == "0" {
+                op1 = "null"
+            }
+        }
+        line(reg + " = icmp " + cname + " " + cmp_ty + " " + op0 + ", " + op1)
+        return
+}
+
+pub func gen_inst_b_19_sext(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // sext：符号扩展（trit/窄整数提升）。操作数 [0]=源类型 IMM, [1]=值 VALUE；
+        // 目标类型 = ins_ty（如 i64 / i32）。
+        var sty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var tty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = sext " + sty + " " + opnd_ref(inst_id, 1) + " to " + tty)
+        return
+}
+
+pub func gen_inst_b_29_zext(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // zext：无符号扩展（无符号窄整数提升，S1.3 窄整数）。操作数
+        // [0]=源类型 IMM, [1]=值 VALUE；目标类型 = ins_ty。
+        var sty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var tty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = zext " + sty + " " + opnd_ref(inst_id, 1) + " to " + tty)
+        return
+}
+
+pub func gen_inst_b_37_trunc(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // trunc：整数截断（缩窄，S1.3 窄整数）。操作数 [0]=源类型 IMM,
+        // [1]=值 VALUE；目标类型 = ins_ty（更窄宽度）。
+        var sty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var tty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = trunc " + sty + " " + opnd_ref(inst_id, 1) + " to " + tty)
+        return
+}
+
+pub func gen_inst_b_38_fptosi(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // fptosi：浮点转整数（向零截断，S1.3 as_* 显式转换）。
+        // 操作数 [0]=源类型 IMM, [1]=值 VALUE；目标类型 = ins_ty。
+        var sty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var tty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = fptosi " + sty + " " + opnd_ref(inst_id, 1) + " to " + tty)
+        return
+}
+
+pub func gen_inst_b_39_fpext(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // fpext/fptrunc：浮点宽度转换（f32↔f64，S1.3）。操作数 [0]=源类型
+        // IMM, [1]=值 VALUE；目标类型 = ins_ty。按目标宽度自动选 fpext
+        // （窄→宽）/ fptrunc（宽→窄）。
+        var sty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var tty = llvm_ty(ir.ins_ty(inst_id))
+        var fop = "fpext"
+        if tty == "float" {
+            fop = "fptrunc"
+        }
+        line(reg + " = " + fop + " " + sty + " " + opnd_ref(inst_id, 1) + " to " + tty)
+        return
+}
+
+pub func gen_inst_b_28_sitofp(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // sitofp：整数转浮点（数学函数整数实参提升）。操作数 [0]=源类型 IMM,
+        // [1]=值 VALUE；目标类型 = ins_ty（double）。
+        var sty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var tty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = sitofp " + sty + " " + opnd_ref(inst_id, 1) + " to " + tty)
+        return
+}
+
+pub func gen_inst_b_26_bitcast(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // bitcast：位重解释（f64↔i64 同宽 64 位直读，zd v2 §4.2 原语）。
+        // 操作数 [0]=源类型 IMM, [1]=值 VALUE；目标类型 = ins_ty。
+        var sty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var tty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = bitcast " + sty + " " + opnd_ref(inst_id, 1) + " to " + tty)
+        return
+}
+
+pub func gen_inst_b_27_agg_gep(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // agg_gep：聚合元素指针（元组/struct 字段）。操作数 [0]=地址 VALUE,
+        // [1]=字段下标 IMM；ins_ty = 聚合类型 id → 生成
+        // `getelementptr T, ptr, i32 0, i32 <idx>`（双下标：第 0 行 + 字段列）。
+        // 注：索引必须 i32（LLVM 18 对结构体 GEP 的 i64 索引报 invalid
+        // getelementptr indices；表元素 GEP 是单索引 i8/i64 不受影响）
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = getelementptr " + ty + ", ptr " + opnd_ref(inst_id, 0) + ", i32 0, i32 " + to_string(ir.ins_opnd(inst_id, 1)))
+        return
+}
+
+pub func gen_inst_b_23_gep(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // gep（S1.2 ptr_add/slice_of 元素步长）：操作数 [0]=基址 VALUE,
+        // [1]=下标 VALUE；ins_ty = **元素类型**（步长 = 元素大小）。
+        // 生成 `getelementptr <elem>, ptr %base, i64 <idx>`（单索引元素步长）。
+        // S2.1：基址统一 to_ptr——字符串场景基址可为 const_str（i64 指针整数，
+        // 直引 @.str.N 常量表达式）或 str_cat 结果（i64，须 inttoptr 独立指令）
+        var ety = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = getelementptr " + ety + ", ptr " + to_ptr(ir.ins_opnd(inst_id, 0)) + ", i64 " + opnd_ref(inst_id, 1))
+        return
+}
+
+pub func gen_inst_b_24_ptrtoint(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // ptrtoint（S1.2 ptr_to_int）：`reg = ptrtoint ptr %x to i64`
+        line(reg + " = ptrtoint ptr " + opnd_ref(inst_id, 0) + " to i64")
+        return
+}
+
+pub func gen_inst_b_25_inttoptr(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // inttoptr（S1.2 int_to_ptr）：`reg = inttoptr i64 %x to ptr`
+        line(reg + " = inttoptr i64 " + opnd_ref(inst_id, 0) + " to ptr")
+        return
+}
+
+pub func gen_inst_b_13_fadd(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // fadd(13)/fsub(14)/fmul(15)/fdiv(16)/frem(17)——浮点算术（M4 扩展）
+        var opname = ""
+        if op == 13 {
+            opname = "fadd"
+        } else if op == 14 {
+            opname = "fsub"
+        } else if op == 15 {
+            opname = "fmul"
+        } else if op == 16 {
+            opname = "fdiv"
+        } else {
+            opname = "frem"
+        }
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = " + opname + " " + ty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        return
+}
+
+pub func gen_inst_b_18_fcmp(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // fcmp：操作数 [lhs VALUE, rhs VALUE, cmp IMM]（0=oeq 1=one 2=olt 3=ogt 4=ole 5=oge，
+        // 对齐 ir.cmp 常量；ordered 语义防 NaN 误判）
+        var cmp = ir.ins_opnd(inst_id, 2)
+        var cname = "oeq"
+        if cmp == 0 {
+            cname = "oeq"
+        } else if cmp == 1 {
+            cname = "one"
+        } else if cmp == 2 {
+            cname = "olt"
+        } else if cmp == 3 {
+            cname = "ogt"
+        } else if cmp == 4 {
+            cname = "ole"
+        } else if cmp == 5 {
+            cname = "oge"
+        }
+        // 操作数类型：取 lhs 定义指令类型（对齐 icmp 分支；fadd 结果 → double）
+        var fty = "double"
+        var lv0 = ir.ins_opnd(inst_id, 0)
+        var def0 = value_def(lv0)
+        if def0 >= 0 {
+            fty = llvm_ty(ir.ins_ty(def0))
+        }
+        line(reg + " = fcmp " + cname + " " + fty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        return
+}
+
+pub func gen_inst_b_51_const_f(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        // const_f：浮点常量 → fadd double <lit>, 0.0（结果寄存器；lit 规范化补小数点）。
+        // 操作数[0] = 浮点文本的字符串池 id（irgen 存 lexeme 原文本，规避 tie 无
+        // f64→文本转换；LLVM 要求字面量含小数点/指数）
+        var lit = intern.lookup(ir.ins_opnd(inst_id, 0))
+        var lit_txt = str.clone(lit)
+        if l_find_char(lit, ".") < 0 && l_find_char(lit, "e") < 0 && l_find_char(lit, "E") < 0 {
+            lit_txt = lit + ".0"
+        }
+        var fty2 = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = fadd " + fty2 + " " + lit_txt + ", 0.0")
+        return
+}
+
+}

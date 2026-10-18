@@ -1,0 +1,98 @@
+type tie<logic>
+
+// ============================================================
+// p.8.2.2 常用糖集验收：
+//   1. for..in 解构迭代：`for (k, v) in pairs`（元组元素解构；2/3 元素）
+//   2. 命名参数：`f(b: 3, a: 10)` 乱序 / 位置+命名混合
+//   3. 链式比较：`a < b < c` desugar 为 `(a<b) && (b<c)`（含混合运算符）
+//   4. 级联调用语境：tie 以方法链（recv.method().method()）与数据流箭头
+//      （P1 已有 `->`/`<-` 管道）承载级联风格——此处演示既有能力
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   6 / abc / 21 / 3 / 1 / hi hi / yo / 3 / 2 / 1 / 0 / 1 / 0 / 18 / ok
+// ============================================================
+
+func divmod(a: i64, b: i64) -> (i64, i64) {
+    return (a / b, a % b)
+}
+
+func greet(name: string, times: i64) -> string {
+    var s: string = ""
+    var i: i64 = 0
+    while i < times {
+        s = s + name + " "
+        i = i + 1
+    }
+    return s
+}
+
+// 级联/管道（P1 数据流箭头）：输入流经多级变换
+func triple(x: i64) -> i64 {
+    return x * 3
+}
+
+func main() {
+    // 1. for..in 解构迭代（2 元素）
+    var pairs = [(1, "a"), (2, "b"), (3, "c")]
+    var s: i64 = 0
+    var acc: string = ""
+    for (k, v) in pairs {
+        s = s + k
+        acc = acc + v
+    }
+    println(s)    // 6
+    println(acc)  // abc
+    // 1b. 3 元素解构
+    var triples = [(1, 2, 3), (4, 5, 6)]
+    var t: i64 = 0
+    for (a, b, c) in triples {
+        t = t + a + b + c
+    }
+    println(t)    // 21
+    // 2. 命名参数：乱序
+    var r = divmod(b: 3, a: 10)
+    var (q, m) = r
+    println(q)    // 3
+    println(m)    // 1
+    // 2b. 位置 + 命名混合
+    var g = greet("hi", times: 2)
+    println(g)    // hi hi
+    var g2 = greet("yo", 1)
+    println(g2)   // yo
+    var r2 = divmod(17, b: 5)
+    var (q2, m2) = r2
+    println(q2)   // 3
+    println(m2)   // 2
+    // 3. 链式比较
+    var x: i64 = 1
+    var y: i64 = 5
+    var z: i64 = 9
+    if x < y < z {
+        println(1)
+    } else {
+        println(0)
+    }
+    if z < y < x {
+        println(1)
+    } else {
+        println(0)
+    }
+    if x < y <= z {
+        println(1)
+    } else {
+        println(0)
+    }
+    if x < z < y {
+        println(1)
+    } else {
+        println(0)
+    }
+    // 4. 级联语境：方法链 + 数据流箭头管道（P1 已有 `a -> f() -> g()` 链式传参）
+    var w = 2 -> triple() -> triple()   // 箭头数据作末参：triple(triple(2)) = 18
+    println(w)  // 18
+    if w == 18 {
+        println("ok")
+    } else {
+        println(0)
+    }
+}

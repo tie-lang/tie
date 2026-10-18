@@ -1,0 +1,21 @@
+type tie<logic>
+// bounds_probe —— M14 --check-bounds 动态数组越界探针
+// 不带 --check-bounds：动态越界访问零检查，正常运行不崩溃；
+// 带 --check-bounds：越界输入触发 panic 消息 + 非 0 退出码。
+func main() -> i64 {
+    var a: array<f64, 64> = array_init(0.0)
+    var k: i64 = 3
+    if arg_count() > 0 {
+        k = parse_int(arg_string(0))
+    }
+    var j: i64 = 0
+    var s: f64 = 0.0
+    while j < k {
+        // a[j] 读 与 a[j] = 写 都用运行期动态下标（j 为运行期值，语义层不拦）
+        a[j] = a[j] + 1.0
+        s = s + a[j]
+        j = j + 1
+    }
+    println("done k=" + to_string(k))
+    return 0
+}

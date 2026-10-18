@@ -1,0 +1,915 @@
+type tie<class>
+// ============================================================================
+// ============================================================================
+// ★★ 归档（2026-10-11）：本模块保留、可用，但不再是哈希第一选择。
+//   哈希第一选择 = std/blake3.tie（更快、官方算法、行业兼容）。
+//   本模块定位：三值原生实现（GF(3) 海绵），供三值语义场景、教学与研究用途。
+//   与 tsha1 的"弃用"不同：tsha2 接口稳定、KAT 有效，直接使用无需迁移。
+// ============================================================================
+// tsha2.tie：标准库——TSHA2 哈希族（三进制海绵 + 48 进制 XOF）
+// 用途：tie 平台标准安全哈希底座（指纹 / 完整性 / 身份段），替代 tsha1 的语义位
+//   （tsha1 因有效输出空间仅名义 83–88% 且无 XOF 已退役，保留为历史兼容读，
+//   消费方 tink_v2 等暂不迁移）。
+//
+// == 结构（三进制海绵，位平面双编码）==
+//   状态 = N 子 lane × 64 列；每 trit 两个位平面（h=2、l=1，规范性 h & l == 0）。
+//   伙伴 = 双向环 (i+1)%N 与 (i−1+N)%N；更新顺序 = 偶数子 lane 先（全读旧值、
+//     彼此独立）→ 奇数子 lane 后（全读新值、彼此独立）——串行深度 2，构造性可逆
+//     （逆序先奇后偶逐 lane 恢复）。
+//   轮函数：lane_i ← lane_i + rot_k1( y1 × (y1 + c_i) ) + rot_k2( y2 × (y2 + c_i) )
+//     （逐 trit mod-3；乘 → 旋转 → 加）；c_i = 1+(i%2)，k1 = (i*7+5)%64，
+//     k2 = (i*11+23)%64。乘积项为 GF(3) 二次型 ⇒ planar/完美非线性：
+//     电路级 DDT 差分均匀度 1/3（理论理想）、LAT 全随机水平（逐值实测）。
+//   吸收：消息 8 字节小端成字，mod-3 加进子 lane 低位平面。
+//   填充（Merkle–Damgård 强化）：0x80 + 补零 + 尾块末 8 字节小端消息长度；
+//     保证同一消息在不同 rate 档下吸收态必然不同（档位区分）。
+//   挤出（XOF）：从 rate 子 lane 逐列取 trit（lane 优先），每 10 trit → 3 个 48 进制
+//     符号（3^10 = 59049 ≤ 48^3 = 110592，无损无偏）；rate trit 耗尽再置换一轮续挤。
+//
+// == 四档（2026-10-09 定名；实测见设计稿 §6.6/§6.6b）==
+//   tsha2r  N=4   rate 24B  R=12  容量 101 位熵（~50 位抗碰撞）⚠ 嵌入式/blk 完整性
+//   tsha2f  N=12  rate 64B  R=12  容量 405 位熵（~202 位抗碰撞）快速大流量
+//   tsha2b  N=12  rate 48B  R=12  容量 608 位熵（~304 位抗碰撞）身份指纹
+//   tsha2x  N=24  rate 96B  R=16  容量 1216 位熵（~608 位抗碰撞）特大容量
+//   f 与 b 共用同一 12-lane 置换（一个置换 + 两个吸收宽度）。
+//   安全注记：DDT/LAT 已闭合（PN 达标 + 密码级 χ²）；R=12 有 ~5% 位置级混合残差、
+//     R=16 完全干净（设计稿 §6.7）；外部审查未做，不宣称"安全性顶尖"。
+//
+// 接口（公开四函数；与 tsha1 同约定）：
+//   tsha2.tsha2r(msg, n, base=48) -> string   同理 tsha2f / tsha2b / tsha2x
+//   n = 48 进制符号数（1..65536，XOF 任意长度）；base ∈ {2,3,8,16,48}（默认 48）；
+//   非法 n / base 返回空串。base=48 输出字符台同 base48.tie
+//   （"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL"，一符号一字符）；
+//   base=16 输出 ⌊n·L48/8⌋ 字节的 hex（L48 = log2(48)）；base 2/3/8 走基转换。
+// 逐字节处理（str_byte + len），任意 UTF-8 原始字节可哈希；命名空间内互调为裸调用。
+// == 跨语言 KAT（向量 = 各语言实现的逐字节对拍基准；"123456789" 为 9 字节 ASCII）==
+//   tsha2r("",8)  = 75j4Gaov
+//   tsha2f("",8)  = bxGeEqjb   （f/b 空消息同输出：共享置换 + 零吸收态，已知特性）
+//   tsha2b("",8)  = bxGeEqjb
+//   tsha2x("",8)  = 3t67vbkD
+//   tsha2r("123456789",46) = 2aGbhf8ExnqL0L47DE1iBdeHbhL6nz8af5m01bc2hko8C0
+//   tsha2f("123456789",46) = ayC2pw3m0aue21Hj5Gdhr5Cl9II03x47BmbzbqvjhE1Ael
+//   tsha2b("123456789",46) = 51lcGckqLgyy0v68fg5AB31B8jr2aE2km5yt7nAoa3a4H0
+//   tsha2x("123456789",46) = ix45ike3f1yibqmhnh5G378jjqGenl4dydc0nxsghajLq7
+// == 语言移植矩阵 ==：主 tink 仓 27 语言实现目前仍为 tsha1 ⇒ 移植 tsha2 时以上述
+//   KAT 逐字节对拍后切换（后续波次）；zd-java 的 Tsha1f 同理。
+// ============================================================================
+
+// base48 字符台（同 std/base48.tie，索引 0..47 → '0'..）
+var t2_b48: string = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL"
+
+// ---------------------------------------------------------------------------
+// 位平面原语（mod-3 逐列；h = 高平面/值 2，l = 低平面/值 1）
+// ---------------------------------------------------------------------------
+
+var S2: table<i64>;
+
+var G2_MSG: string = "";
+
+var t2_cur_lane: i64 = 0;
+var t2_cur_col: i64 = 0;
+
+
+// 子 lane 混合（乘 → 旋转 → 加；自身值只经加法进入输出 ⇒ 逆序可恢复）
+inline func t2_mix(ih: i64, il: i64, y1h: i64, y1l: i64, y2h: i64, y2l: i64, c: i64, k1: i64, k2: i64) -> (i64, i64) {
+    var a1h: i64 = 0
+    var a1l: i64 = 0
+    var a2h: i64 = 0
+    var a2l: i64 = 0
+    if c == 1 {
+        a1h = (y1h ^ (0 - 1)) & y1l
+        a1l = (y1h ^ (0 - 1)) & (y1l ^ (0 - 1))
+        a2h = (y2h ^ (0 - 1)) & y2l
+        a2l = (y2h ^ (0 - 1)) & (y2l ^ (0 - 1))
+    } else {
+        a1h = (y1h ^ (0 - 1)) & (y1l ^ (0 - 1))
+        a1l = (y1h ^ (0 - 1)) & y1l
+        a2h = (y2h ^ (0 - 1)) & (y2l ^ (0 - 1))
+        a2l = (y2h ^ (0 - 1)) & y2l
+    }
+    var p1h = t2_mul_r0(y1h, y1l, a1h, a1l)
+    var p1l = t2_mul_r1(y1h, y1l, a1h, a1l)
+    var p2h = t2_mul_r0(y2h, y2l, a2h, a2l)
+    var p2l = t2_mul_r1(y2h, y2l, a2h, a2l)
+    var t1 = t2_add_r0(ih, il, t2_rotl(p1h, k1), t2_rotl(p1l, k1))
+    var oh = t2_add_r1(ih, il, t2_rotl(p1h, k1), t2_rotl(p1l, k1))
+    var t2v = t2_add_r0(oh, t1, t2_rotl(p2h, k2), t2_rotl(p2l, k2))
+    var oh2 = t2_add_r1(oh, t1, t2_rotl(p2h, k2), t2_rotl(p2l, k2))
+    return (oh2, t2v)
+}
+
+
+
+// mod-3 加法：返回 (高平面, 低平面)；输入须规范（h & l == 0）
+func t2_add_r0(a1: i64, a0: i64, b1: i64, b0: i64) -> i64 {
+    var s0 = a0 ^ b0
+    var c0 = a0 & b0
+    var t = a1 ^ b1
+    var s1 = t ^ c0
+    var s2 = (a1 & b1) | (t & c0)
+    return s2 | ((s2 ^ (0 - 1)) & s0 & (s1 ^ (0 - 1)))
+}
+
+func t2_add_r1(a1: i64, a0: i64, b1: i64, b0: i64) -> i64 {
+    var s0 = a0 ^ b0
+    var c0 = a0 & b0
+    var t = a1 ^ b1
+    var s1 = t ^ c0
+    var s2 = (a1 & b1) | (t & c0)
+    return (s2 ^ (0 - 1)) & s1 & (s0 ^ (0 - 1))
+}
+
+// GF(3) 乘法的位平面分解（mul_r0 = 低平面、mul_r1 = 高平面）
+func t2_mul_r0(a1: i64, a0: i64, b1: i64, b0: i64) -> i64 {
+    return ((a1 | a0) & (b1 | b0)) & ((a1 & b1) | (a0 & b0))
+}
+
+func t2_mul_r1(a1: i64, a0: i64, b1: i64, b0: i64) -> i64 {
+    return ((a1 | a0) & (b1 | b0)) & (((a1 & b1) | (a0 & b0)) ^ (0 - 1))
+}
+
+// 循环左移（tie 的 >> 是算术右移 ⇒ 必须掩码右移结果）
+func t2_rotl(v: i64, n: i64) -> i64 {
+    if n == 0 { return v }
+    return (v << n) | ((v >> (64 - n)) & ((1 << n) - 1))
+}
+
+// y + c 的三值编码（c 只取 1 或 2）
+func t2_tc(h: i64, l: i64, c: i64) -> (i64, i64) {
+    if c == 1 {
+        return ((h ^ (0 - 1)) & l, (h ^ (0 - 1)) & (l ^ (0 - 1)))
+    }
+    return ((h ^ (0 - 1)) & (l ^ (0 - 1)), (h ^ (0 - 1)) & l)
+}
+
+
+
+
+// ---------------------------------------------------------------------------
+// 状态与轮置换（全局状态表 S2：48 字 = 24 子 lane 上限；未用区域恒 0）
+// ---------------------------------------------------------------------------
+
+// N=4（tsha2r）：偶先奇后两相；常数 k1=(j*7+5)%64、k2=(j*11+23)%64、c=1+(j%2)
+func t2_perm4() {
+    var a0h = S2[0]
+    var a0l = S2[1]
+    var a1h = S2[2]
+    var a1l = S2[3]
+    var a2h = S2[4]
+    var a2l = S2[5]
+    var a3h = S2[6]
+    var a3l = S2[7]
+    var r: i64 = 0
+    while r < 12 {
+        var (e0h, e0l) = t2_mix(a0h, a0l, a1h, a1l, a3h, a3l, 1, 5, 23)
+        var (e2h, e2l) = t2_mix(a2h, a2l, a3h, a3l, a1h, a1l, 1, 19, 45)
+        var (o1h, o1l) = t2_mix(a1h, a1l, e2h, e2l, e0h, e0l, 2, 12, 34)
+        var (o3h, o3l) = t2_mix(a3h, a3l, e0h, e0l, e2h, e2l, 2, 26, 56)
+        var ph = e0h
+        var pl = e0l
+                var th1h = t2_add_r1(ph, pl, o1h, o1l)
+        pl = t2_add_r0(ph, pl, o1h, o1l)
+        ph = th1h
+                var th2h = t2_add_r1(ph, pl, e2h, e2l)
+        pl = t2_add_r0(ph, pl, e2h, e2l)
+        ph = th2h
+                var th3h = t2_add_r1(ph, pl, o3h, o3l)
+        pl = t2_add_r0(ph, pl, o3h, o3l)
+        ph = th3h
+        var n0h = t2_add_r1(e0h, e0l, t2_rotl(ph, 1), t2_rotl(pl, 1))
+        var n0l = t2_add_r0(e0h, e0l, t2_rotl(ph, 1), t2_rotl(pl, 1))
+        var n1h = t2_add_r1(o1h, o1l, t2_rotl(ph, 4), t2_rotl(pl, 4))
+        var n1l = t2_add_r0(o1h, o1l, t2_rotl(ph, 4), t2_rotl(pl, 4))
+        var n2h = t2_add_r1(e2h, e2l, t2_rotl(ph, 7), t2_rotl(pl, 7))
+        var n2l = t2_add_r0(e2h, e2l, t2_rotl(ph, 7), t2_rotl(pl, 7))
+        var n3h = t2_add_r1(o3h, o3l, t2_rotl(ph, 10), t2_rotl(pl, 10))
+        var n3l = t2_add_r0(o3h, o3l, t2_rotl(ph, 10), t2_rotl(pl, 10))
+        a0h = n0h
+        a0l = n0l
+        a1h = n1h
+        a1l = n1l
+        a2h = n2h
+        a2l = n2l
+        a3h = n3h
+        a3l = n3l
+        r = r + 1
+    }
+    S2[0] = a0h
+    S2[1] = a0l
+    S2[2] = a1h
+    S2[3] = a1l
+    S2[4] = a2h
+    S2[5] = a2l
+    S2[6] = a3h
+    S2[7] = a3l
+}
+
+// N=12（tsha2f / tsha2b）
+func t2_perm12() {
+    var a0h = S2[0]
+    var a0l = S2[1]
+    var a1h = S2[2]
+    var a1l = S2[3]
+    var a2h = S2[4]
+    var a2l = S2[5]
+    var a3h = S2[6]
+    var a3l = S2[7]
+    var a4h = S2[8]
+    var a4l = S2[9]
+    var a5h = S2[10]
+    var a5l = S2[11]
+    var a6h = S2[12]
+    var a6l = S2[13]
+    var a7h = S2[14]
+    var a7l = S2[15]
+    var a8h = S2[16]
+    var a8l = S2[17]
+    var a9h = S2[18]
+    var a9l = S2[19]
+    var a10h = S2[20]
+    var a10l = S2[21]
+    var a11h = S2[22]
+    var a11l = S2[23]
+    var r: i64 = 0
+    while r < 12 {
+        var (e0h, e0l) = t2_mix(a0h, a0l, a1h, a1l, a11h, a11l, 1, 5, 23)
+        var (e2h, e2l) = t2_mix(a2h, a2l, a3h, a3l, a1h, a1l, 1, 19, 45)
+        var (e4h, e4l) = t2_mix(a4h, a4l, a5h, a5l, a3h, a3l, 1, 33, 3)
+        var (e6h, e6l) = t2_mix(a6h, a6l, a7h, a7l, a5h, a5l, 1, 47, 25)
+        var (e8h, e8l) = t2_mix(a8h, a8l, a9h, a9l, a7h, a7l, 1, 61, 47)
+        var (e10h, e10l) = t2_mix(a10h, a10l, a11h, a11l, a9h, a9l, 1, 11, 5)
+        var (o1h, o1l) = t2_mix(a1h, a1l, e2h, e2l, e0h, e0l, 2, 12, 34)
+        var (o3h, o3l) = t2_mix(a3h, a3l, e4h, e4l, e2h, e2l, 2, 26, 56)
+        var (o5h, o5l) = t2_mix(a5h, a5l, e6h, e6l, e4h, e4l, 2, 40, 14)
+        var (o7h, o7l) = t2_mix(a7h, a7l, e8h, e8l, e6h, e6l, 2, 54, 36)
+        var (o9h, o9l) = t2_mix(a9h, a9l, e10h, e10l, e8h, e8l, 2, 4, 58)
+        var (o11h, o11l) = t2_mix(a11h, a11l, e0h, e0l, e10h, e10l, 2, 18, 16)
+        var ph = e0h
+        var pl = e0l
+                var th4h = t2_add_r1(ph, pl, o1h, o1l)
+        pl = t2_add_r0(ph, pl, o1h, o1l)
+        ph = th4h
+                var th5h = t2_add_r1(ph, pl, e2h, e2l)
+        pl = t2_add_r0(ph, pl, e2h, e2l)
+        ph = th5h
+                var th6h = t2_add_r1(ph, pl, o3h, o3l)
+        pl = t2_add_r0(ph, pl, o3h, o3l)
+        ph = th6h
+                var th7h = t2_add_r1(ph, pl, e4h, e4l)
+        pl = t2_add_r0(ph, pl, e4h, e4l)
+        ph = th7h
+                var th8h = t2_add_r1(ph, pl, o5h, o5l)
+        pl = t2_add_r0(ph, pl, o5h, o5l)
+        ph = th8h
+                var th9h = t2_add_r1(ph, pl, e6h, e6l)
+        pl = t2_add_r0(ph, pl, e6h, e6l)
+        ph = th9h
+                var th10h = t2_add_r1(ph, pl, o7h, o7l)
+        pl = t2_add_r0(ph, pl, o7h, o7l)
+        ph = th10h
+                var th11h = t2_add_r1(ph, pl, e8h, e8l)
+        pl = t2_add_r0(ph, pl, e8h, e8l)
+        ph = th11h
+                var th12h = t2_add_r1(ph, pl, o9h, o9l)
+        pl = t2_add_r0(ph, pl, o9h, o9l)
+        ph = th12h
+                var th13h = t2_add_r1(ph, pl, e10h, e10l)
+        pl = t2_add_r0(ph, pl, e10h, e10l)
+        ph = th13h
+                var th14h = t2_add_r1(ph, pl, o11h, o11l)
+        pl = t2_add_r0(ph, pl, o11h, o11l)
+        ph = th14h
+        var n0h = t2_add_r1(e0h, e0l, t2_rotl(ph, 1), t2_rotl(pl, 1))
+        var n0l = t2_add_r0(e0h, e0l, t2_rotl(ph, 1), t2_rotl(pl, 1))
+        var n1h = t2_add_r1(o1h, o1l, t2_rotl(ph, 4), t2_rotl(pl, 4))
+        var n1l = t2_add_r0(o1h, o1l, t2_rotl(ph, 4), t2_rotl(pl, 4))
+        var n2h = t2_add_r1(e2h, e2l, t2_rotl(ph, 7), t2_rotl(pl, 7))
+        var n2l = t2_add_r0(e2h, e2l, t2_rotl(ph, 7), t2_rotl(pl, 7))
+        var n3h = t2_add_r1(o3h, o3l, t2_rotl(ph, 10), t2_rotl(pl, 10))
+        var n3l = t2_add_r0(o3h, o3l, t2_rotl(ph, 10), t2_rotl(pl, 10))
+        var n4h = t2_add_r1(e4h, e4l, t2_rotl(ph, 13), t2_rotl(pl, 13))
+        var n4l = t2_add_r0(e4h, e4l, t2_rotl(ph, 13), t2_rotl(pl, 13))
+        var n5h = t2_add_r1(o5h, o5l, t2_rotl(ph, 16), t2_rotl(pl, 16))
+        var n5l = t2_add_r0(o5h, o5l, t2_rotl(ph, 16), t2_rotl(pl, 16))
+        var n6h = t2_add_r1(e6h, e6l, t2_rotl(ph, 19), t2_rotl(pl, 19))
+        var n6l = t2_add_r0(e6h, e6l, t2_rotl(ph, 19), t2_rotl(pl, 19))
+        var n7h = t2_add_r1(o7h, o7l, t2_rotl(ph, 22), t2_rotl(pl, 22))
+        var n7l = t2_add_r0(o7h, o7l, t2_rotl(ph, 22), t2_rotl(pl, 22))
+        var n8h = t2_add_r1(e8h, e8l, t2_rotl(ph, 25), t2_rotl(pl, 25))
+        var n8l = t2_add_r0(e8h, e8l, t2_rotl(ph, 25), t2_rotl(pl, 25))
+        var n9h = t2_add_r1(o9h, o9l, t2_rotl(ph, 28), t2_rotl(pl, 28))
+        var n9l = t2_add_r0(o9h, o9l, t2_rotl(ph, 28), t2_rotl(pl, 28))
+        var n10h = t2_add_r1(e10h, e10l, t2_rotl(ph, 31), t2_rotl(pl, 31))
+        var n10l = t2_add_r0(e10h, e10l, t2_rotl(ph, 31), t2_rotl(pl, 31))
+        var n11h = t2_add_r1(o11h, o11l, t2_rotl(ph, 34), t2_rotl(pl, 34))
+        var n11l = t2_add_r0(o11h, o11l, t2_rotl(ph, 34), t2_rotl(pl, 34))
+        a0h = n0h
+        a0l = n0l
+        a1h = n1h
+        a1l = n1l
+        a2h = n2h
+        a2l = n2l
+        a3h = n3h
+        a3l = n3l
+        a4h = n4h
+        a4l = n4l
+        a5h = n5h
+        a5l = n5l
+        a6h = n6h
+        a6l = n6l
+        a7h = n7h
+        a7l = n7l
+        a8h = n8h
+        a8l = n8l
+        a9h = n9h
+        a9l = n9l
+        a10h = n10h
+        a10l = n10l
+        a11h = n11h
+        a11l = n11l
+        r = r + 1
+    }
+    S2[0] = a0h
+    S2[1] = a0l
+    S2[2] = a1h
+    S2[3] = a1l
+    S2[4] = a2h
+    S2[5] = a2l
+    S2[6] = a3h
+    S2[7] = a3l
+    S2[8] = a4h
+    S2[9] = a4l
+    S2[10] = a5h
+    S2[11] = a5l
+    S2[12] = a6h
+    S2[13] = a6l
+    S2[14] = a7h
+    S2[15] = a7l
+    S2[16] = a8h
+    S2[17] = a8l
+    S2[18] = a9h
+    S2[19] = a9l
+    S2[20] = a10h
+    S2[21] = a10l
+    S2[22] = a11h
+    S2[23] = a11l
+}
+
+// N=24（tsha2x）
+func t2_perm24() {
+    var a0h = S2[0]
+    var a0l = S2[1]
+    var a1h = S2[2]
+    var a1l = S2[3]
+    var a2h = S2[4]
+    var a2l = S2[5]
+    var a3h = S2[6]
+    var a3l = S2[7]
+    var a4h = S2[8]
+    var a4l = S2[9]
+    var a5h = S2[10]
+    var a5l = S2[11]
+    var a6h = S2[12]
+    var a6l = S2[13]
+    var a7h = S2[14]
+    var a7l = S2[15]
+    var a8h = S2[16]
+    var a8l = S2[17]
+    var a9h = S2[18]
+    var a9l = S2[19]
+    var a10h = S2[20]
+    var a10l = S2[21]
+    var a11h = S2[22]
+    var a11l = S2[23]
+    var a12h = S2[24]
+    var a12l = S2[25]
+    var a13h = S2[26]
+    var a13l = S2[27]
+    var a14h = S2[28]
+    var a14l = S2[29]
+    var a15h = S2[30]
+    var a15l = S2[31]
+    var a16h = S2[32]
+    var a16l = S2[33]
+    var a17h = S2[34]
+    var a17l = S2[35]
+    var a18h = S2[36]
+    var a18l = S2[37]
+    var a19h = S2[38]
+    var a19l = S2[39]
+    var a20h = S2[40]
+    var a20l = S2[41]
+    var a21h = S2[42]
+    var a21l = S2[43]
+    var a22h = S2[44]
+    var a22l = S2[45]
+    var a23h = S2[46]
+    var a23l = S2[47]
+    var r: i64 = 0
+    while r < 16 {
+        var (e0h, e0l) = t2_mix(a0h, a0l, a1h, a1l, a23h, a23l, 1, 5, 23)
+        var (e2h, e2l) = t2_mix(a2h, a2l, a3h, a3l, a1h, a1l, 1, 19, 45)
+        var (e4h, e4l) = t2_mix(a4h, a4l, a5h, a5l, a3h, a3l, 1, 33, 3)
+        var (e6h, e6l) = t2_mix(a6h, a6l, a7h, a7l, a5h, a5l, 1, 47, 25)
+        var (e8h, e8l) = t2_mix(a8h, a8l, a9h, a9l, a7h, a7l, 1, 61, 47)
+        var (e10h, e10l) = t2_mix(a10h, a10l, a11h, a11l, a9h, a9l, 1, 11, 5)
+        var (e12h, e12l) = t2_mix(a12h, a12l, a13h, a13l, a11h, a11l, 1, 25, 27)
+        var (e14h, e14l) = t2_mix(a14h, a14l, a15h, a15l, a13h, a13l, 1, 39, 49)
+        var (e16h, e16l) = t2_mix(a16h, a16l, a17h, a17l, a15h, a15l, 1, 53, 7)
+        var (e18h, e18l) = t2_mix(a18h, a18l, a19h, a19l, a17h, a17l, 1, 3, 29)
+        var (e20h, e20l) = t2_mix(a20h, a20l, a21h, a21l, a19h, a19l, 1, 17, 51)
+        var (e22h, e22l) = t2_mix(a22h, a22l, a23h, a23l, a21h, a21l, 1, 31, 9)
+        var (o1h, o1l) = t2_mix(a1h, a1l, e2h, e2l, e0h, e0l, 2, 12, 34)
+        var (o3h, o3l) = t2_mix(a3h, a3l, e4h, e4l, e2h, e2l, 2, 26, 56)
+        var (o5h, o5l) = t2_mix(a5h, a5l, e6h, e6l, e4h, e4l, 2, 40, 14)
+        var (o7h, o7l) = t2_mix(a7h, a7l, e8h, e8l, e6h, e6l, 2, 54, 36)
+        var (o9h, o9l) = t2_mix(a9h, a9l, e10h, e10l, e8h, e8l, 2, 4, 58)
+        var (o11h, o11l) = t2_mix(a11h, a11l, e12h, e12l, e10h, e10l, 2, 18, 16)
+        var (o13h, o13l) = t2_mix(a13h, a13l, e14h, e14l, e12h, e12l, 2, 32, 38)
+        var (o15h, o15l) = t2_mix(a15h, a15l, e16h, e16l, e14h, e14l, 2, 46, 60)
+        var (o17h, o17l) = t2_mix(a17h, a17l, e18h, e18l, e16h, e16l, 2, 60, 18)
+        var (o19h, o19l) = t2_mix(a19h, a19l, e20h, e20l, e18h, e18l, 2, 10, 40)
+        var (o21h, o21l) = t2_mix(a21h, a21l, e22h, e22l, e20h, e20l, 2, 24, 62)
+        var (o23h, o23l) = t2_mix(a23h, a23l, e0h, e0l, e22h, e22l, 2, 38, 20)
+        var ph = e0h
+        var pl = e0l
+                var th15h = t2_add_r1(ph, pl, o1h, o1l)
+        pl = t2_add_r0(ph, pl, o1h, o1l)
+        ph = th15h
+                var th16h = t2_add_r1(ph, pl, e2h, e2l)
+        pl = t2_add_r0(ph, pl, e2h, e2l)
+        ph = th16h
+                var th17h = t2_add_r1(ph, pl, o3h, o3l)
+        pl = t2_add_r0(ph, pl, o3h, o3l)
+        ph = th17h
+                var th18h = t2_add_r1(ph, pl, e4h, e4l)
+        pl = t2_add_r0(ph, pl, e4h, e4l)
+        ph = th18h
+                var th19h = t2_add_r1(ph, pl, o5h, o5l)
+        pl = t2_add_r0(ph, pl, o5h, o5l)
+        ph = th19h
+                var th20h = t2_add_r1(ph, pl, e6h, e6l)
+        pl = t2_add_r0(ph, pl, e6h, e6l)
+        ph = th20h
+                var th21h = t2_add_r1(ph, pl, o7h, o7l)
+        pl = t2_add_r0(ph, pl, o7h, o7l)
+        ph = th21h
+                var th22h = t2_add_r1(ph, pl, e8h, e8l)
+        pl = t2_add_r0(ph, pl, e8h, e8l)
+        ph = th22h
+                var th23h = t2_add_r1(ph, pl, o9h, o9l)
+        pl = t2_add_r0(ph, pl, o9h, o9l)
+        ph = th23h
+                var th24h = t2_add_r1(ph, pl, e10h, e10l)
+        pl = t2_add_r0(ph, pl, e10h, e10l)
+        ph = th24h
+                var th25h = t2_add_r1(ph, pl, o11h, o11l)
+        pl = t2_add_r0(ph, pl, o11h, o11l)
+        ph = th25h
+                var th26h = t2_add_r1(ph, pl, e12h, e12l)
+        pl = t2_add_r0(ph, pl, e12h, e12l)
+        ph = th26h
+                var th27h = t2_add_r1(ph, pl, o13h, o13l)
+        pl = t2_add_r0(ph, pl, o13h, o13l)
+        ph = th27h
+                var th28h = t2_add_r1(ph, pl, e14h, e14l)
+        pl = t2_add_r0(ph, pl, e14h, e14l)
+        ph = th28h
+                var th29h = t2_add_r1(ph, pl, o15h, o15l)
+        pl = t2_add_r0(ph, pl, o15h, o15l)
+        ph = th29h
+                var th30h = t2_add_r1(ph, pl, e16h, e16l)
+        pl = t2_add_r0(ph, pl, e16h, e16l)
+        ph = th30h
+                var th31h = t2_add_r1(ph, pl, o17h, o17l)
+        pl = t2_add_r0(ph, pl, o17h, o17l)
+        ph = th31h
+                var th32h = t2_add_r1(ph, pl, e18h, e18l)
+        pl = t2_add_r0(ph, pl, e18h, e18l)
+        ph = th32h
+                var th33h = t2_add_r1(ph, pl, o19h, o19l)
+        pl = t2_add_r0(ph, pl, o19h, o19l)
+        ph = th33h
+                var th34h = t2_add_r1(ph, pl, e20h, e20l)
+        pl = t2_add_r0(ph, pl, e20h, e20l)
+        ph = th34h
+                var th35h = t2_add_r1(ph, pl, o21h, o21l)
+        pl = t2_add_r0(ph, pl, o21h, o21l)
+        ph = th35h
+                var th36h = t2_add_r1(ph, pl, e22h, e22l)
+        pl = t2_add_r0(ph, pl, e22h, e22l)
+        ph = th36h
+                var th37h = t2_add_r1(ph, pl, o23h, o23l)
+        pl = t2_add_r0(ph, pl, o23h, o23l)
+        ph = th37h
+        var n0h = t2_add_r1(e0h, e0l, t2_rotl(ph, 1), t2_rotl(pl, 1))
+        var n0l = t2_add_r0(e0h, e0l, t2_rotl(ph, 1), t2_rotl(pl, 1))
+        var n1h = t2_add_r1(o1h, o1l, t2_rotl(ph, 4), t2_rotl(pl, 4))
+        var n1l = t2_add_r0(o1h, o1l, t2_rotl(ph, 4), t2_rotl(pl, 4))
+        var n2h = t2_add_r1(e2h, e2l, t2_rotl(ph, 7), t2_rotl(pl, 7))
+        var n2l = t2_add_r0(e2h, e2l, t2_rotl(ph, 7), t2_rotl(pl, 7))
+        var n3h = t2_add_r1(o3h, o3l, t2_rotl(ph, 10), t2_rotl(pl, 10))
+        var n3l = t2_add_r0(o3h, o3l, t2_rotl(ph, 10), t2_rotl(pl, 10))
+        var n4h = t2_add_r1(e4h, e4l, t2_rotl(ph, 13), t2_rotl(pl, 13))
+        var n4l = t2_add_r0(e4h, e4l, t2_rotl(ph, 13), t2_rotl(pl, 13))
+        var n5h = t2_add_r1(o5h, o5l, t2_rotl(ph, 16), t2_rotl(pl, 16))
+        var n5l = t2_add_r0(o5h, o5l, t2_rotl(ph, 16), t2_rotl(pl, 16))
+        var n6h = t2_add_r1(e6h, e6l, t2_rotl(ph, 19), t2_rotl(pl, 19))
+        var n6l = t2_add_r0(e6h, e6l, t2_rotl(ph, 19), t2_rotl(pl, 19))
+        var n7h = t2_add_r1(o7h, o7l, t2_rotl(ph, 22), t2_rotl(pl, 22))
+        var n7l = t2_add_r0(o7h, o7l, t2_rotl(ph, 22), t2_rotl(pl, 22))
+        var n8h = t2_add_r1(e8h, e8l, t2_rotl(ph, 25), t2_rotl(pl, 25))
+        var n8l = t2_add_r0(e8h, e8l, t2_rotl(ph, 25), t2_rotl(pl, 25))
+        var n9h = t2_add_r1(o9h, o9l, t2_rotl(ph, 28), t2_rotl(pl, 28))
+        var n9l = t2_add_r0(o9h, o9l, t2_rotl(ph, 28), t2_rotl(pl, 28))
+        var n10h = t2_add_r1(e10h, e10l, t2_rotl(ph, 31), t2_rotl(pl, 31))
+        var n10l = t2_add_r0(e10h, e10l, t2_rotl(ph, 31), t2_rotl(pl, 31))
+        var n11h = t2_add_r1(o11h, o11l, t2_rotl(ph, 34), t2_rotl(pl, 34))
+        var n11l = t2_add_r0(o11h, o11l, t2_rotl(ph, 34), t2_rotl(pl, 34))
+        var n12h = t2_add_r1(e12h, e12l, t2_rotl(ph, 37), t2_rotl(pl, 37))
+        var n12l = t2_add_r0(e12h, e12l, t2_rotl(ph, 37), t2_rotl(pl, 37))
+        var n13h = t2_add_r1(o13h, o13l, t2_rotl(ph, 40), t2_rotl(pl, 40))
+        var n13l = t2_add_r0(o13h, o13l, t2_rotl(ph, 40), t2_rotl(pl, 40))
+        var n14h = t2_add_r1(e14h, e14l, t2_rotl(ph, 43), t2_rotl(pl, 43))
+        var n14l = t2_add_r0(e14h, e14l, t2_rotl(ph, 43), t2_rotl(pl, 43))
+        var n15h = t2_add_r1(o15h, o15l, t2_rotl(ph, 46), t2_rotl(pl, 46))
+        var n15l = t2_add_r0(o15h, o15l, t2_rotl(ph, 46), t2_rotl(pl, 46))
+        var n16h = t2_add_r1(e16h, e16l, t2_rotl(ph, 49), t2_rotl(pl, 49))
+        var n16l = t2_add_r0(e16h, e16l, t2_rotl(ph, 49), t2_rotl(pl, 49))
+        var n17h = t2_add_r1(o17h, o17l, t2_rotl(ph, 52), t2_rotl(pl, 52))
+        var n17l = t2_add_r0(o17h, o17l, t2_rotl(ph, 52), t2_rotl(pl, 52))
+        var n18h = t2_add_r1(e18h, e18l, t2_rotl(ph, 55), t2_rotl(pl, 55))
+        var n18l = t2_add_r0(e18h, e18l, t2_rotl(ph, 55), t2_rotl(pl, 55))
+        var n19h = t2_add_r1(o19h, o19l, t2_rotl(ph, 58), t2_rotl(pl, 58))
+        var n19l = t2_add_r0(o19h, o19l, t2_rotl(ph, 58), t2_rotl(pl, 58))
+        var n20h = t2_add_r1(e20h, e20l, t2_rotl(ph, 61), t2_rotl(pl, 61))
+        var n20l = t2_add_r0(e20h, e20l, t2_rotl(ph, 61), t2_rotl(pl, 61))
+        var n21h = t2_add_r1(o21h, o21l, t2_rotl(ph, 0), t2_rotl(pl, 0))
+        var n21l = t2_add_r0(o21h, o21l, t2_rotl(ph, 0), t2_rotl(pl, 0))
+        var n22h = t2_add_r1(e22h, e22l, t2_rotl(ph, 3), t2_rotl(pl, 3))
+        var n22l = t2_add_r0(e22h, e22l, t2_rotl(ph, 3), t2_rotl(pl, 3))
+        var n23h = t2_add_r1(o23h, o23l, t2_rotl(ph, 6), t2_rotl(pl, 6))
+        var n23l = t2_add_r0(o23h, o23l, t2_rotl(ph, 6), t2_rotl(pl, 6))
+        a0h = n0h
+        a0l = n0l
+        a1h = n1h
+        a1l = n1l
+        a2h = n2h
+        a2l = n2l
+        a3h = n3h
+        a3l = n3l
+        a4h = n4h
+        a4l = n4l
+        a5h = n5h
+        a5l = n5l
+        a6h = n6h
+        a6l = n6l
+        a7h = n7h
+        a7l = n7l
+        a8h = n8h
+        a8l = n8l
+        a9h = n9h
+        a9l = n9l
+        a10h = n10h
+        a10l = n10l
+        a11h = n11h
+        a11l = n11l
+        a12h = n12h
+        a12l = n12l
+        a13h = n13h
+        a13l = n13l
+        a14h = n14h
+        a14l = n14l
+        a15h = n15h
+        a15l = n15l
+        a16h = n16h
+        a16l = n16l
+        a17h = n17h
+        a17l = n17l
+        a18h = n18h
+        a18l = n18l
+        a19h = n19h
+        a19l = n19l
+        a20h = n20h
+        a20l = n20l
+        a21h = n21h
+        a21l = n21l
+        a22h = n22h
+        a22l = n22l
+        a23h = n23h
+        a23l = n23l
+        r = r + 1
+    }
+    S2[0] = a0h
+    S2[1] = a0l
+    S2[2] = a1h
+    S2[3] = a1l
+    S2[4] = a2h
+    S2[5] = a2l
+    S2[6] = a3h
+    S2[7] = a3l
+    S2[8] = a4h
+    S2[9] = a4l
+    S2[10] = a5h
+    S2[11] = a5l
+    S2[12] = a6h
+    S2[13] = a6l
+    S2[14] = a7h
+    S2[15] = a7l
+    S2[16] = a8h
+    S2[17] = a8l
+    S2[18] = a9h
+    S2[19] = a9l
+    S2[20] = a10h
+    S2[21] = a10l
+    S2[22] = a11h
+    S2[23] = a11l
+    S2[24] = a12h
+    S2[25] = a12l
+    S2[26] = a13h
+    S2[27] = a13l
+    S2[28] = a14h
+    S2[29] = a14l
+    S2[30] = a15h
+    S2[31] = a15l
+    S2[32] = a16h
+    S2[33] = a16l
+    S2[34] = a17h
+    S2[35] = a17l
+    S2[36] = a18h
+    S2[37] = a18l
+    S2[38] = a19h
+    S2[39] = a19l
+    S2[40] = a20h
+    S2[41] = a20l
+    S2[42] = a21h
+    S2[43] = a21l
+    S2[44] = a22h
+    S2[45] = a22l
+    S2[46] = a23h
+    S2[47] = a23l
+}
+
+// ---------------------------------------------------------------------------
+// 吸收 + 挤出
+// ---------------------------------------------------------------------------
+
+// 一个块的吸收：rate_bytes 字节 → rate_bytes/8 个子 lane（8 字节小端成字，
+//   mod-3 加进低位平面）。byte_at(k)：k < len 取消息字节，k == len 取 0x80，
+//   k > len 取 0（填充）。
+func t2_absorb(rate_lanes: i64, pos: i64, mlen: i64, plen: i64) {
+    var j: i64 = 0
+    while j < rate_lanes {
+        var w: i64 = 0
+        var i: i64 = 0
+        while i < 8 {
+            var at = pos + j * 8 + i
+            var byte: i64 = 0
+            if at < mlen {
+                byte = str_byte(G2_MSG, at)
+            } else if at == mlen {
+                byte = 128
+            } else if at >= plen - 8 {
+                // ★ 尾块最后 8 字节 = 消息字节长度（小端）——Merkle–Damgård 强化，
+                //   使同一消息在不同 rate 档下吸收态必然不同（b64/f 档位区分）
+                byte = (mlen >> ((at - (plen - 8)) * 8)) & 255
+            }
+            w = w | (byte << (i * 8))
+            i = i + 1
+        }
+        var hi = S2[2 * j]
+        var lo = S2[2 * j + 1]
+        var t = t2_add_r0(hi, lo, 0, w)
+        S2[2 * j] = t2_add_r1(hi, lo, 0, w)
+        S2[2 * j + 1] = t
+        j = j + 1
+    }
+}
+
+// 挤出光标：rate 子 lane 逐列取 trit（lane 优先），耗尽则置换一轮续挤
+func t2_next_trit(rate_lanes: i64, R: i64) -> i64 {
+    var h = (S2[2 * t2_cur_lane] >> t2_cur_col) & 1
+    var l = (S2[2 * t2_cur_lane + 1] >> t2_cur_col) & 1
+    var v = l + 2 * h
+    t2_cur_col = t2_cur_col + 1
+    if t2_cur_col == 64 {
+        t2_cur_col = 0
+        t2_cur_lane = t2_cur_lane + 1
+        if t2_cur_lane == rate_lanes {
+            t2_cur_lane = 0
+            if R == 16 {
+                t2_perm24()
+            } else if R == 12 {
+                if rate_lanes == 8 {
+                    t2_perm12()
+                } else {
+                    t2_perm4()
+                }
+            }
+        }
+    }
+    return v
+}
+
+// 挤出 n 个 48 进制符号（每 10 trit → 3 符号，高位在前）
+func t2_squeeze(rate_lanes: i64, R: i64, n: i64) -> table<i64> {
+    var out = table_new_i64()
+    var k: i64 = 0
+    while k < n {
+        var val: i64 = 0
+        var i: i64 = 0
+        while i < 10 {
+            val = val + t2_next_trit(rate_lanes, R) * t2_p3(i)
+            i = i + 1
+        }
+        table_push(out, val / 2304)
+        table_push(out, (val / 48) % 48)
+        table_push(out, val % 48)
+        k = k + 1
+    }
+    return out
+}
+
+func t2_p3(i: i64) -> i64 {
+    var v: i64 = 1
+    var k: i64 = 0
+    while k < i {
+        v = v * 3
+        k = k + 1
+    }
+    return v
+}
+
+// ---------------------------------------------------------------------------
+// 编码入口
+// ---------------------------------------------------------------------------
+
+// 吸收 + 挤出的公共路径：tier 0=r 1=f 2=b 3=x；符号表 → 目标进制字符串
+
+// θ：列奇偶扩散（Keccak θ 的三元版）——P_c = Σ_lane lane_i[c]（mod 3），
+//   lane_i += rot(P, i*3+1)。稀疏态一轮即扩散到全部 lane；N ≢ 2 (mod 3) ⇒ 可逆。
+
+
+func t2_run(tier: i64, msg: string, n: i64, base: i64) -> string {
+    var k: i64 = 0
+    var lanes: i64 = 4
+    var rate_lanes: i64 = 3
+    var rate_bytes: i64 = 24
+    var R: i64 = 12
+    if tier == 1 {
+        lanes = 12
+        rate_lanes = 8
+        rate_bytes = 64
+    } else if tier == 2 {
+        lanes = 12
+        rate_lanes = 6
+        rate_bytes = 48
+    } else if tier == 3 {
+        lanes = 24
+        rate_lanes = 12
+        rate_bytes = 96
+        R = 16
+    }
+    G2_MSG = msg
+    var mlen = len(msg)
+    // 状态清零
+    var q: i64 = 0
+    while q < 48 {
+        S2[q] = 0
+        q = q + 1
+    }
+    // 填充：0x80 + 补零 + 尾块末 8 字节消息长度（LE）。若 0x80 后余量不足 8 字节则加一块。
+    var plen = ((mlen + 1 + rate_bytes - 1) / rate_bytes) * rate_bytes
+    if plen - mlen < 9 {
+        plen = plen + rate_bytes
+    }
+    var pos: i64 = 0
+    while pos < plen {
+        t2_absorb(rate_lanes, pos, mlen, plen)
+        // 每块 R 轮置换（R=12/16，轮循环内置于各置换函数）
+        if R == 16 {
+            t2_perm24()
+        } else if rate_lanes == 8 {
+            t2_perm12()
+        } else if rate_lanes == 6 {
+            t2_perm12()
+        } else {
+            t2_perm4()
+        }
+        pos = pos + rate_bytes
+    }
+    // 挤出 n 符号（3n 个 base48 数字，取前 n 个）；★ 光标必须复位（全局残留 ⇒ 非确定）
+    t2_cur_lane = 0
+    t2_cur_col = 0
+    var syms = t2_squeeze(rate_lanes, R, n)
+    var b = base
+    if b <= 0 {
+        b = 48
+    }
+    if b != 2 && b != 3 && b != 8 && b != 16 && b != 48 {
+        return ""
+    }
+    var out: string = ""
+    if b == 48 {
+        while k < n {
+            out = out + str_char(t2_b48, syms[k])
+            k = k + 1
+        }
+        return out
+    }
+    // 其它进制：取前 b0 = ⌊n·L48/8⌋ 个符号字节（L48 = log2(48)），走基转换
+    var b0 = (n * 698121) / 1000000
+    if b0 < 1 { b0 = 1 }
+    // 符号字节 → hex（2×b0 字符）
+    var hexd = "0123456789abcdef"
+    var hexs: string = ""
+    k = 0
+    while k < b0 {
+        var sv = syms[k]
+        hexs = hexs + str_char(hexd, sv / 16) + str_char(hexd, sv % 16)
+        k = k + 1
+    }
+    if b == 16 {
+        return hexs
+    }
+    // base 2/3/8：字节池长除基转换
+    var pool = table_new_i64()
+    k = 0
+    while k < b0 {
+        var hi = syms[k] / 16
+        var lo2 = syms[k] % 16
+        table_push(pool, hi * 16 + lo2)
+        k = k + 1
+    }
+    var digs = table_new_i64()
+    while true {
+        var rem: i64 = 0
+        var nq = table_new_i64()
+        var allz = true
+        var j2: i64 = 0
+        while j2 < len(pool) {
+            var cur = rem * 256 + pool[j2]
+            var qq = cur / b
+            var rr = cur % b
+            if qq != 0 {
+                allz = false
+            }
+            table_push(nq, qq)
+            rem = rr
+            j2 = j2 + 1
+        }
+        table_push(digs, rem)
+        pool = nq
+        if allz {
+            break
+        }
+    }
+    // 位数目标：m = base_chars(b0, base)（进制位数换算公式）
+    var m: i64 = 0
+    if b == 2 {
+        m = b0 * 8
+    } else if b == 3 {
+        m = (b0 * 504744 + 99999) / 100000
+    } else {
+        m = (b0 * 8 + 2) / 3
+    }
+    var dch = "0123456789abcdef"
+    var res: string = ""
+    var kk = len(digs) - 1
+    while kk >= 0 {
+        res = res + str_char(dch, digs[kk])
+        kk = kk - 1
+    }
+    while len(res) < m {
+        res = "0" + res
+    }
+    return res
+}
+
+// ---------------------------------------------------------------------------
+// 公开接口（四档：n = 48 进制符号数，非法返回空串）
+// ---------------------------------------------------------------------------
+
+namespace tsha2 {
+
+pub func tsha2r(msg: string, n: i64, base: i64 = 48) -> string {
+    if n < 1 || n > 65536 { return "" }
+    return t2_run(0, msg, n, base)
+}
+
+pub func tsha2f(msg: string, n: i64, base: i64 = 48) -> string {
+    if n < 1 || n > 65536 { return "" }
+    return t2_run(1, msg, n, base)
+}
+
+pub func tsha2b(msg: string, n: i64, base: i64 = 48) -> string {
+    if n < 1 || n > 65536 { return "" }
+    return t2_run(2, msg, n, base)
+}
+
+pub func tsha2x(msg: string, n: i64, base: i64 = 48) -> string {
+    if n < 1 || n > 65536 { return "" }
+    return t2_run(3, msg, n, base)
+}
+
+} // namespace tsha2

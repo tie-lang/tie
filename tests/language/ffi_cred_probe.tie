@@ -1,0 +1,76 @@
+type tie<logic, unsafe:ext, unsafe:mem>
+// ffi_cred_probe.tie —— C 互操作边界（ext 域）与 cstr_to_string（mem）的门禁回归
+// ============================================================================
+// 归类（tie-main/docs/designs/domain-classification.md）把下面六项归为**须持证**：
+//   ext：cb_ptr（把 tie 函数交给 C）· load_library（装载任意动态代码）·
+//        get_proc（取符号）· dyn_call / dyn_call_p（按地址调用任意函数）
+//   mem：cstr_to_string（沿 C 指针走到 NUL ＝ 解引用）
+// 它们共同的危险面是「调用语言无法核对的代码」/「用指针触碰内存」——编译器无法
+// 静态验证其签名与行为，故须书写者显式承担。
+//
+// 本文件断言：**在 unsafe 上下文内**这六项都不再被拒（负例见 ffi_*_neg.tie 与
+// cstr_to_string_neg.tie：安全代码中调用应被拒）。
+
+// ---- 正例 1：ext 四件套（动态链接全链）----
+// 只验证编译通过 + load_library 真实调用（kernel32 已在进程内，安全）。
+func ext_open() -> i64 {
+    var h: i64 = 0
+    unsafe {
+        h = load_library("kernel32.dll")
+    }
+    return h
+}
+
+// 其余三项写成**不被调用**的函数：目的是证明「在 unsafe 内合法」，
+// 而不实际执行任意地址调用（那样会崩）。
+func ext_symbol(h: i64) -> i64 {
+    var p: i64 = 0
+    unsafe {
+        p = get_proc(h, "GetTickCount")
+    }
+    return p
+}
+func ext_call(addr: i64) -> i64 {
+    var r: i64 = 0
+    unsafe {
+        r = dyn_call(addr, 0, 0, 0, 0, 0)
+    }
+    return r
+}
+func ext_call_p(addr: i64) -> i64 {
+    var r: i64 = 0
+    unsafe {
+        r = dyn_call_p(addr, 0, 0, 0, 0, 0)
+    }
+    return r
+}
+// cb_ptr 要求**命名函数**（不接受闭包字面量）——写成顶层函数传入。
+func cb_target() -> i64 { return 1 }
+func ext_cb() -> i64 {
+    var cb: string = ""
+    unsafe {
+        cb = cb_ptr(cb_target)
+    }
+    return str_len(cb)
+}
+
+// ---- 正例 2：cstr_to_string（mem 域）----
+// 用「刚取到的 C 字符串」做安全来源：GetTickCount 不返回字符串，
+// 故这里只验证编译通过，不实际调用（任意地址会崩）。
+func mem_cstr(addr: i64) -> i64 {
+    var s: string = ""
+    unsafe {
+        s = cstr_to_string(addr)
+    }
+    return str_len(s)
+}
+
+func main() {
+    var h = ext_open()
+    // kernel32 必然已加载 ⇒ 句柄非 0
+    if h != 0 {
+        println("ffi-cred PASS (ext 5 项 + mem 1 项在 unsafe 内合法)")
+    } else {
+        println("ffi-cred FAIL (load_library 返回 0)")
+    }
+}

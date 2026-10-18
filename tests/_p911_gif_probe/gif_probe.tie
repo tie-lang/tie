@@ -1,0 +1,199 @@
+type tie<logic>
+// tests/_p911_gif_probe/gif_probe.tie —— p.9.1.1.5 验收：std/gif 编解码。
+// 全离线确定性探针：
+//   1. 解码参考 PIL 生成的小 GIF（含 LZW 字典/码宽增长、GCT）→ 像素/调色板对拍；
+//   2. encode_indexed → decode 回环（索引逐点一致，4 色小图 + 宽码 16 色大图
+//      触发码宽增长）；
+//   3. encode(rgb, palette) → decode → 经 palette 还原 RGB，颜色逐点一致；
+//   4. 负例：坏魔数 / 截断 → ok=false 不挂死。
+// 期望全部 PASS / exit 0。
+import "/std/gif.tie" as gif
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func hexv(c: i64) -> i64 {
+    if c >= 0x30 && c <= 0x39 {
+        return c - 0x30
+    }
+    if c >= 0x61 && c <= 0x66 {
+        return c - 0x61 + 10
+    }
+    if c >= 0x41 && c <= 0x46 {
+        return c - 0x41 + 10
+    }
+    return -1
+}
+func hexbytes(s: string) -> table<i64> {
+    var t = table_new_i64()
+    var nib: i64 = -1
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var v = hexv(str_byte(s, i))
+        if v >= 0 {
+            if nib < 0 {
+                nib = v
+            } else {
+                table_push(t, nib * 16 + v)
+                nib = -1
+            }
+        }
+        i = i + 1
+    }
+    return t
+}
+func eq(a: table<i64>, b: table<i64>) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ==================== 1) 解码参考 GIF（外部 PIL 生成，含字典+宽增长） ====================
+func section_reference() {
+    // 4x3，16色 GCT 中前4色：红绿蓝白；LZW min_cs=8，数据含字典压缩。
+    // 来源：Python PIL 开发期生成（见 memory p.9.1.1.5）。
+    var refgif = hexbytes(
+        "47 49 46 38 37 61 04 00 03 00 81 00 00"
+        + "ff 00 00 00 ff 00 00 00 ff ff ff ff"
+        + "2c 00 00 00 00 04 00 03 00 00"
+        + "08 0c 00 01 04 10 30 40 20 41 83 03 02 02 00 3b")
+    var d = gif.decode(refgif)
+    check(d.ok, "decode reference ok")
+    if d.ok {
+        check(d.w == 4 && d.h == 3, "ref dims 4x3")
+        check(d.has_gct, "ref has GCT")
+        // palette 前 4 色 = 红(255,0,0) 绿(0,255,0) 蓝(0,0,255) 白(255,255,255)
+        check(len(d.palette) >= 12
+              && d.palette[0] == 255 && d.palette[4] == 255 && d.palette[8] == 255 && d.palette[9] == 255,
+              "ref palette colors")
+        var expect = table_new_i64()
+        var i: i64 = 0
+        while i < 12 {
+            table_push(expect, i % 4)
+            i = i + 1
+        }
+        check(eq(d.pixels, expect), "ref pixels 0..3 row-major")
+    }
+}
+
+// ==================== 2) encode_indexed → decode 回环 ====================
+func build_ind() -> table<i64> {
+    var t = table_new_i64()
+    var v: i64 = 0
+    while v < 12 {
+        table_push(t, v % 4)
+        v = v + 1
+    }
+    return t
+}
+func build_pal() -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, 255); table_push(t, 0); table_push(t, 0)
+    table_push(t, 0); table_push(t, 255); table_push(t, 0)
+    table_push(t, 0); table_push(t, 0); table_push(t, 255)
+    table_push(t, 255); table_push(t, 255); table_push(t, 255)
+    return t
+}
+
+func section_roundtrip() {
+    var ind = build_ind()
+    var enc = gif.encode_indexed(ind, 4, 3, build_pal())
+    check(len(enc) > 20, "encode non-empty")
+    var dec = gif.decode(enc)
+    check(dec.ok, "roundtrip decode ok")
+    if dec.ok {
+        check(dec.w == 4 && dec.h == 3, "roundtrip dims")
+        check(eq(dec.pixels, ind), "roundtrip index pixels identical")
+    }
+    // 触发码宽增长的 16 色大图（min_cs 到 4，码宽从 5 增长）
+    var big = table_new_i64()
+    var k: i64 = 0
+    while k < 40 * 40 {
+        table_push(big, (k * 7 + k * k) % 16)
+        k = k + 1
+    }
+    var pal16 = table_new_i64()
+    var c: i64 = 0
+    while c < 16 {
+        table_push(pal16, (c * 20) % 256)
+        table_push(pal16, (c * 40) % 256)
+        table_push(pal16, (c * 60) % 256)
+        c = c + 1
+    }
+    var enc2 = gif.encode_indexed(big, 40, 40, pal16)
+    var dec2 = gif.decode(enc2)
+    check(dec2.ok && eq(dec2.pixels, big), "16-color 40x40 roundtrip (width growth)")
+}
+
+// ==================== 3) encode(rgb, palette) → decode 颜色一致 ====================
+func section_color() {
+    var palette = build_pal()
+    var rgb = table_new_i64()
+    var i: i64 = 0
+    while i < 12 {
+        var idx = i % 4
+        table_push(rgb, palette[idx * 3])
+        table_push(rgb, palette[idx * 3 + 1])
+        table_push(rgb, palette[idx * 3 + 2])
+        i = i + 1
+    }
+    var enc = gif.encode(rgb, 4, 3, palette)
+    var dec = gif.decode(enc)
+    check(dec.ok, "color encode decode ok")
+    if dec.ok {
+        // 用调色板还原 RGB
+        var back = table_new_i64()
+        var p: i64 = 0
+        while p < len(dec.pixels) {
+            var idx = dec.pixels[p]
+            table_push(back, dec.palette[idx * 3])
+            table_push(back, dec.palette[idx * 3 + 1])
+            table_push(back, dec.palette[idx * 3 + 2])
+            p = p + 1
+        }
+        check(eq(back, rgb), "color consistency via palette (encode->decode->rgb)")
+    }
+}
+
+// ==================== 4) 负例 ====================
+func section_invalid() {
+    var d1 = gif.decode(table_new_i64())
+    check(d1.ok == false && str_len(d1.err) > 0, "decode empty -> false")
+    // 前 3 字节不是 GIF
+    var bad = gif.decode(hexbytes("00 01 02"))
+    check(bad.ok == false && str_len(bad.err) > 0, "decode bad magic -> false")
+    // 版本不支持（GIFxxa：bytes[4] 非 7/9）
+    var badver = gif.decode(hexbytes("47 49 46 38 78 61" + "00 00 00 00 00 00 00"))
+    check(badver.ok == false, "decode bad version -> false")
+}
+
+func main() {
+    println("start")
+    section_reference()
+    section_roundtrip()
+    section_color()
+    section_invalid()
+    if fails == 0 {
+        println("PASS")
+    } else {
+        println("FAIL count=" + to_string(fails))
+    }
+    println("done")
+}

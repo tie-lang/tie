@@ -1,0 +1,132 @@
+type tie<logic>
+// tests/language/esc_safety.tie —— r.1.6.7 编译期独占免锁的**安全不变量**用例
+// ============================================================================
+// 本文件是一份**断言源**：`_tiec_verify/esc_safety.sh` 用 `--esc-audit` 编译它，
+// 然后核对审计输出必须同时满足：
+//   (A) 命名以 `g_` 开头的**全局表**从不出现（全局槽可被任意线程经名字触及）；
+//   (B) **函数形参**表从不出现（所有权在调用方）；
+//   (C) 下列 `no_*` 函数里的表**从不**出现（句柄会离开本次调用）；
+//   (D) 下列 `ok_*` 函数里的表**必须**出现（可证独占 ⇒ 免锁）。
+// 任一条不成立即判失败 —— 这是「不会漏锁」这一核心安全性质的回归护栏。
+//
+// 为什么这份护栏必须有：r.1.6.6 的运行期 esc 标志就是栽在「全局共享」上，
+// 而首次实现本分析时**也确实漏掉了全局**（`g_x = table_new_i64()` 被当成新鲜候选），
+// 是靠审计输出抓出来的。见 irgen_esc.tie 的 esc_is_global_name 注释。
+var g_global_tbl: table<i64> = []
+var g_acc: i64 = 0
+
+// ==================== (D) 必须命中：可证独占 ====================
+
+// 局部新鲜表 + push/读/写
+func ok_push(n: i64) -> i64 {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(t, i)
+        i = i + 1
+    }
+    return len(t)
+}
+func ok_read(n: i64) -> i64 {
+    var t = table_new_i64()
+    table_push(t, 11)
+    return t[0]
+}
+func ok_write(n: i64) -> i64 {
+    var t = table_new_i64()
+    table_push(t, 0)
+    t[0] = 7
+    return t[0]
+}
+// 表字面量也是新鲜分配
+func ok_literal(n: i64) -> i64 {
+    var t = [1, 2, 3]
+    table_push(t, 4)
+    return len(t)
+}
+// for 遍历（iter 是只读位）
+func ok_for_iter(n: i64) -> i64 {
+    var t = table_new_i64()
+    table_push(t, 5)
+    var s: i64 = 0
+    for x in t {
+        s = s + x
+    }
+    return s
+}
+// 泄漏点**之前**的访问仍享快路径（流敏感）
+func ok_before_leak(n: i64) -> i64 {
+    var t = table_new_i64()
+    table_push(t, 1)        // ← 必须命中
+    g_global_tbl = t        // 之后泄漏
+    return len(t)
+}
+
+// ==================== (A)(B)(C) 必须**不**命中 ====================
+
+// 形参表：所有权在调用方，永不独占
+func param_tbl(ref t: table<i64>) -> i64 {
+    table_push(t, 1)
+    return t[0]
+}
+
+// 全局表：初始化即全局，永不独占
+func global_tbl(n: i64) -> i64 {
+    table_push(g_global_tbl, 1)
+    return len(g_global_tbl)
+}
+// 全局表被**重新赋一个新鲜初值**也必须仍不独占（本项目实测抓出的漏洞形态）
+func global_refresh(n: i64) -> i64 {
+    g_global_tbl = table_new_i64()
+    table_push(g_global_tbl, 2)
+    return len(g_global_tbl)
+}
+// 返回表 ⇒ 句柄离开本次调用。注意 push 在 return**之前**，此刻 t 仍独占
+// ⇒ 该 push **应当**走快路径（流敏感的正确表现）；泄漏发生在 return 那一刻，
+// 之后已无访问可享/可漏。此例同时验证「流动方向理解正确」。
+func ret_tbl(n: i64) -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, 3)        // ← 必须命中
+    return t
+}
+// 传给用户函数
+func pass_tbl(n: i64) -> i64 {
+    var t = table_new_i64()
+    param_tbl(t)
+    table_push(t, 4)
+    return len(t)
+}
+// 闭包捕获（闭包可能被 spawn / 存全局 ⇒ 另一执行流可达）
+func capture_tbl(n: i64) -> i64 {
+    var t = table_new_i64()
+    var f = func() -> i64 { return len(t) }
+    table_push(t, 5)
+    return f()
+}
+// 存入另一容器
+func store_into(n: i64) -> i64 {
+    var inner = table_new_i64()
+    var outer: table<any> = []
+    table_push(outer, inner)     // inner 泄漏；outer 此点仍在前面
+    table_push(inner, 6)
+    return len(inner)
+}
+// 循环体内泄漏 ⇒ **整个循环**都必须加锁（本轮泄漏 / 下一轮误用）
+func loop_leak(n: i64) -> i64 {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(t, i)
+        g_global_tbl = t
+        i = i + 1
+    }
+    return len(t)
+}
+
+func main() {
+    g_acc = g_acc + ok_push(2) + ok_read(1) + ok_write(1) + ok_literal(1) +
+        ok_for_iter(1) + ok_before_leak(1) + param_tbl(g_global_tbl) +
+        global_tbl(1) + global_refresh(1) + len(ret_tbl(1)) + pass_tbl(1) +
+        capture_tbl(1) + store_into(1) + loop_leak(2)
+    println(to_string(g_acc))
+}

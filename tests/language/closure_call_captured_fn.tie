@@ -1,0 +1,25 @@
+type tie<logic>
+// ============================================================
+// 闭包调用"捕获的函数值"正例（2026-10-13 缺陷修复的语料）：
+//   VAR 分支的捕获分析只扫值节点，被调名不在 child 里——闭包体内调用
+//   捕获的 fn 值（形参/局部）曾因 ncap=0 报「无签名」。CALL 分支补收录。
+// 期望：编译成功 + 运行打印 "closure fn-call 探针全过"。
+// ============================================================
+func wrap_param(it: fn() -> i64) -> fn() -> i64 {
+    return func() -> i64 { return it() }
+}
+func mk_local() -> fn() -> i64 {
+    var g2 = func() -> i64 { return 5 }
+    return func() -> i64 { return g2() }
+}
+func main() {
+    var w = wrap_param(func() -> i64 { return 7 })
+    if w() != 7 {
+        panic("捕获形参调用失败")
+    }
+    var v = mk_local()
+    if v() != 5 {
+        panic("捕获局部调用失败")
+    }
+    println("closure fn-call 探针全过")
+}

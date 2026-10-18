@@ -1,0 +1,445 @@
+type tie<class>
+// compiler/interp/interp_call_p3.tie —— 分片 3（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 interp_call.tie。
+namespace tiep {
+// 单 token 匹配：pat 在 pi 处的 token 是否匹配 s 的 si 码点。成功返回消费的
+// s 码点数（1 或 0，视 token 语义）；token 无对应 s 则返回 -1（硬不匹配）。
+// 同时返回 (是否消耗一个 s 字符) —— 用返回值编码：>=0 已匹配（值为消费数），
+// -1 未匹配。token 后续量词由 find_here 统一处理。
+func find_tok(s: string, si: i64, pat: string, pi: i64, plen: i64, slen: i64) -> i64 {
+    var c = str_char(pat, pi)
+    // 转义 \c：下一个字符按字面量处理（若 pi+1 越界 → 转义无效，匹空失败）
+    if c == "\\" {
+        if pi + 1 >= plen {
+            return -1
+        }
+        var lit = str_char(pat, pi + 1)
+        if si >= slen {
+            return -1  // 空串上字面量须有字符 → 硬失败
+        }
+        if str_char(s, si) == lit {
+            return 1
+        }
+        return -1
+    }
+    if c == "." {
+        if si >= slen {
+            return -1  // . 须至少一字符
+        }
+        return 1  // 任意单字符
+    }
+    if c == "[" {
+        // 解析字符类 [^]? 内容…[] 支持范围与转义。返回匹配单个 s 字符的结果。
+        return find_cls(s, si, pat, pi, plen, slen)
+    }
+    // 普通字面量字符
+    if si >= slen {
+        return -1  // 空串上字面量须有字符 → 硬失败
+    }
+    if str_char(s, si) == c {
+        return 1
+    }
+    return -1
+}
+
+// 字符类内匹配：从 pat[pi]=='[' 解析到 ']'，判断 s[si] 是否命中。
+// 返回 1（命中）/ -1（未命中）。
+func find_cls(s: string, si: i64, pat: string, pi: i64, plen: i64, slen: i64) -> i64 {
+    var j = pi + 1
+    var neg = false
+    if j < plen && str_char(pat, j) == "^" {
+        neg = true
+        j = j + 1
+    }
+    var hit = false
+    // 收集类内是否命中 s[si]（si 越界时视为"无字符"，仅负类可命中）
+    if si < slen {
+        var sc = str_char(s, si)
+        var running = true
+        while running && j < plen && str_char(pat, j) != "]" {
+            var lo = str_char(pat, j)
+            var hi = lo
+            if j + 2 < plen && str_char(pat, j + 1) == "-" &&
+                str_char(pat, j + 2) != "]" {
+                hi = str_char(pat, j + 2)
+                j = j + 2
+            }
+            if sc >= lo && sc <= hi {
+                hit = true
+                running = false
+            } else {
+                j = j + 1
+            }
+        }
+    }
+    if neg {
+        if hit {
+            return -1
+        }
+        return 1  // 负类：si 越界亦视为命中（无该字符）
+    }
+    if hit {
+        return 1
+    }
+    return -1
+}
+
+// 递归回溯核心：让 pat[pi..] 从 s[si] 起完整匹配。成功返回匹配结束的 s 码点索引
+//（即 s 中后续继续的位置），失败返回 -1。处理量词 * + ?（贪婪 + 回溯）。
+func find_here(s: string, si: i64, pat: string, pi: i64) -> i64 {
+    var slen = str_len(s)
+    var plen = str_len(pat)
+    if pi >= plen {
+        return si  // pat 消费完 → 匹配到 si（可为 slen，即允许 s 耗尽）
+    }
+    var c = str_char(pat, pi)
+    // $ 行尾锚：必须是整体末 token，且 si 已达 s 尾（或其后续空匹配）
+    if c == "$" {
+        if pi == plen - 1 {
+            if si >= slen {
+                return si
+            }
+            return -1
+        }
+        return -1  // $ 非末 token → 非法，视不匹配
+    }
+    // 量词检查：token 后是否紧跟 * / + / ?
+    var tokpi = pi
+    var quant = ""
+    var qpos = pi + tok_len(pat, pi, plen)
+    if qpos < plen {
+        var qc = str_char(pat, qpos)
+        if qc == "*" || qc == "+" || qc == "?" {
+            quant = qc
+        }
+    }
+    // rest 起始：token 之后（含 token 全长的码点位置 qpos）。量词存在时须再 +1
+    // 跳过量词字符本身（qpos 正指向 * / + / ?）；否则 rest 即 qpos。
+    var irest: i64 = qpos
+    if quant != "" {
+        irest = qpos + 1
+    }
+    if quant == "" {
+        // 无量子词：单次匹配，硬失败传播
+        var r = find_tok(s, si, pat, tokpi, plen, slen)
+        if r < 0 {
+            return -1
+        }
+        // r==0（空字符上）；continue 到下一 token
+        return find_here(s, si + r, pat, irest)
+    }
+    // 有量词：贪婪回溯
+    if quant == "?" {
+        // 0 或 1 次：先试 1（若 token 能匹配），失败回退 0
+        var r1 = find_tok(s, si, pat, tokpi, plen, slen)
+        if r1 >= 0 {
+            var m1 = find_here(s, si + r1, pat, irest)
+            if m1 >= 0 {
+                return m1
+            }
+        }
+        return find_here(s, si, pat, irest)
+    }
+    // * 与 +：循环先取尽 token 单次匹配（贪婪），再回溯递减
+    var min = 0
+    if quant == "+" {
+        min = 1
+    }
+    var consumed: i64 = 0
+    var cur = si
+    var proceed = true
+    while proceed {
+        var rr = find_tok(s, cur, pat, tokpi, plen, slen)
+        if rr < 0 || rr == 0 {
+            proceed = false
+        } else {
+            consumed = consumed + 1
+            cur = cur + 1
+        }
+    }
+    // 回溯：从 consumed 递减到 min，每档试剩余 pat
+    var k = consumed
+    while k >= min {
+        var mres = find_here(s, si + k, pat, irest)
+        if mres >= 0 {
+            return mres
+        }
+        k = k - 1
+    }
+    return -1
+}
+
+// pat[pi] 处单 token 在 pat 中所占的码点长度（不含后续量词）。
+func tok_len(pat: string, pi: i64, plen: i64) -> i64 {
+    var c = str_char(pat, pi)
+    if c == "\\" {
+        return 2  // \ + 字面量
+    }
+    if c == "[" {
+        // 字符类：扫描到 ']'
+        var j = pi + 1
+        while j < plen && str_char(pat, j) != "]" {
+            j = j + 1
+        }
+        return j - pi + 1
+    }
+    return 1
+}
+
+// 字符串表按字节序（码点序）升序排序 → 新 Value::Table。
+// 先读入**局部** string 表（规避 tie-llvm 从 Value 表读串跨调用的缓冲 bug——
+// 对齐 value.tie 头注释的"局部表过渡"工作法），局部表内比较/交换安全，排序完
+// 再统一重建 Value 表。
+func b_sort_strings(tid: Value) -> Value {
+    var cnt = vval.elem_count(tid)
+    var strs: table<string> = table_new_string()
+    var i: i64 = 0
+    while i < cnt {
+        var e = vval.elem_at(tid, i)
+        if vval.type_of(e) != W_STR {
+            w_err = "sort_strings 表必须全为字符串元素"
+            return Value.Nil
+        }
+        table_push(strs, vval.str_val(e))
+        i = i + 1
+    }
+    // 插入排序（稳定；元素少，O(n²) 可接受）
+    var a: i64 = 1
+    while a < cnt {
+        var key = strs[a]
+        var j = a - 1
+        while j >= 0 && strs[j] > key {
+            strs[j + 1] = strs[j]
+            j = j - 1
+        }
+        strs[j + 1] = key
+        a = a + 1
+    }
+    var nt = vval.new_table()
+    var k: i64 = 0
+    while k < cnt {
+        nt = vval.table_push_val(nt, vval.new_str(strs[k]))
+        k = k + 1
+    }
+    return nt
+}
+
+func b_has_prefix(s: string, pre: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(pre)
+    if n < m { return false }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(pre, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+func b_has_suffix(s: string, suf: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(suf)
+    if n < m { return false }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, n - m + i) != str_char(suf, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+func b_contains(hay: string, needle: string) -> bool {
+    var hn = str_len(hay)
+    var nn = str_len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
+    var i: i64 = 0
+    var nend = hn - nn + 1
+    while i < nend {
+        var j: i64 = 0
+        var match = true
+        while j < nn {
+            if str_char(hay, i + j) != str_char(needle, j) { match = false; break }
+            j = j + 1
+        }
+        if match { return true }
+        i = i + 1
+    }
+    return false
+}
+
+func b_str_sub(s: string, lo: i64, hi: i64) -> string {
+    var out = ""
+    var n = str_len(s)
+    var end: i64 = hi
+    if end > n { end = n }
+    var i: i64 = lo
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+func b_str_to_table(t: table<string>) -> Value {
+    var nt = vval.new_table()
+    var i: i64 = 0
+    while i < len(t) {
+        nt = vval.table_push_val(nt, vval.new_str(t[i]))
+        i = i + 1
+    }
+    return nt
+}
+
+// 按 '\n' 切行（行尾去 '\r'）。
+func split_content_lines(s: string) -> table<string> {
+    var out: table<string> = table_new_string()
+    var cur = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\n" {
+            table_push(out, trim_cr2(cur))
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    if cur != "" {
+        table_push(out, trim_cr2(cur))
+    }
+    return out
+}
+
+func trim_cr2(s: string) -> string {
+    var n = str_len(s)
+    if n > 0 && str_char(s, n - 1) == "\r" {
+        return b_str_sub(s, 0, n - 1)
+    }
+    return s
+}
+
+func b_lines_to_table(t: table<string>) -> Value {
+    return b_str_to_table(t)
+}
+
+// 按单字符切分（保留空段；末段总产出）。
+func b_split_char_to_table(s: string, c: string) -> Value {
+    var nt = vval.new_table()
+    var cur = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var ch = str_char(s, i)
+        if ch == c {
+            nt = vval.table_push_val(nt, vval.new_str(cur))
+            cur = ""
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    nt = vval.table_push_val(nt, vval.new_str(cur))
+    return nt
+}
+
+// 把 s 中所有 old 子串替换为 new（空 old 不替换）。
+func b_replace_all(s: string, old: string, new: string) -> string {
+    var on = str_len(old)
+    if on == 0 {
+        return s
+    }
+    var out = ""
+    var i: i64 = 0
+    var n = str_len(s)
+    while i < n {
+        if b_has_prefix(b_str_sub(s, i, n), old) {
+            out = out + new
+            i = i + on
+        } else {
+            out = out + str_char(s, i)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// 路径末段（去尾部分隔符后的最后一段；形如 Windows 路径）。
+func b_basename(s: string) -> string {
+    var n = str_len(s)
+    var i = n - 1
+    while i >= 0 {
+        var c = str_char(s, i)
+        if c == "/" || c == "\\" {
+            return b_str_sub(s, i + 1, n)
+        }
+        i = i - 1
+    }
+    return s
+}
+
+// certutil SHA256：输出重定向到临时文件 → 读回 → 提取 64-hex（小写）。
+func b_file_hash(path: string) -> string {
+    var tmp = path + ".tsh.sha256.tmp"
+    var rc = exec_code("certutil -hashfile \"" + path + "\" SHA256 > \"" + tmp + "\" 2>nul")
+    var txt = ""
+    if file_exists(tmp) {
+        txt = file_read(tmp)
+        file_delete(tmp)
+    }
+    return b_extract_hex64(txt)
+}
+
+// 从文本扫出首个长恰 64 的连续 hex 运行（certutil 哈希行），小写返回。
+func b_extract_hex64(txt: string) -> string {
+    var run = ""
+    var n = str_len(txt)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(txt, i)
+        if b_is_hex(c) {
+            run = run + b_lower_hex(c)
+            if str_len(run) == 64 {
+                return run
+            }
+        } else {
+            run = ""
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+func b_is_hex(c: string) -> bool {
+    if c >= "0" && c <= "9" { return true }
+    if c >= "a" && c <= "f" { return true }
+    if c >= "A" && c <= "F" { return true }
+    return false
+}
+
+func b_lower_hex(c: string) -> string {
+    if c == "A" { return "a" }
+    if c == "B" { return "b" }
+    if c == "C" { return "c" }
+    if c == "D" { return "d" }
+    if c == "E" { return "e" }
+    if c == "F" { return "f" }
+    return c
+}
+
+// 参数值列表 → 打印文本（print/println 共用；to_print_string 无分隔符拼接）。
+func join_print(args: table<Value>) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < len(args) {
+        out = out + vval.to_print_string(args[i])
+        i = i + 1
+    }
+    return out
+}
+
+}

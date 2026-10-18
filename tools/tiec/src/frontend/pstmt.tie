@@ -1,0 +1,333 @@
+type tie<class>
+// compiler/frontend/pstmt.tie — T2.5 parser var声明/表达式赋值（再拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
+// 原 pstmt.tie 拆出「var/const 声明 + 元组解构 + 表达式赋值语句」部分。
+// 依赖：./pexpr.tie（表达式优先级链，经其传递可达 pexpr_type 类型解析 +
+// putil/ast）。2026-08-14 import 由 pexpr_type 改为 pexpr（pexpr import
+// pexpr_type），保持本模块对 pexpr_type.parse_type 的传递可达，树仍无环：
+//   pstmt → pexpr → pexpr_type → putil
+// 树式无环：由 pstmt_flow.tie import。
+import "./pexpr.tie"
+
+namespace pstmt {
+
+// p.9.11.34 短闭包 `t -> expr`（临时单参函数）：**在 fn 类型标注的声明位**把
+// `ident -> expr` 直接构造为闭包字面量。
+//
+// 为何可以在解析期消歧：本函数**只在** `var f: fn(A) -> R = …` 的初始化位被调用
+// （调用点已确认标注是 FN_TYPE）。该位置**明确要一个函数值**，故 `ident -> expr`
+// 的意图无歧义——而管道语义 `x -> f` 要求 x 是**已声明的值**，在「期望函数值」的
+// 位置写管道属罕见且易混的用法。规则据此定义：
+//
+//   * 有 fn 类型标注 + 初始化形如 `ident -> expr`  ⇒ **闭包**（形参 ident，体 expr）
+//   * 其余情形                                   ⇒ 维持既有管道语义（一字不变）
+//
+// 形参类型/返回类型取自标注（FN_TYPE children = [返回类型, 形参类型...]），故
+// 无需"未声明"判定（解析期本也做不到）——判据是**上下文**而非符号表。
+// 产出的是**完整闭包节点**（含体），不复用 parse_fn_lit 的延迟回填：回填机制只是
+// pexpr 层无法解析语句块的变通（模块依赖成环），此处自建等效形态即可。
+pub func build_short_lambda(fnty: i64, line: i64, col: i64) -> i64 {
+    var pname = putil.expect_ident()
+    if pname < 0 {
+        return -1
+    }
+    putil.advance()   // '->'
+    var body_expr = pexpr.parse_expr()
+    if body_expr < 0 {
+        return -1
+    }
+    var ret_ty = ast.child_at(fnty, 0)
+    var pty = ast.child_at(fnty, 1)
+    if ret_ty < 0 || pty < 0 {
+        putil.set_err(line, col, "短闭包 'x -> expr' 需要上下文的函数类型带至少 1 个形参（如 fn(A) -> R）")
+        return -1
+    }
+    // 形参：children = [类型, 默认值或 -1]
+    var p = ast.new_node(N_PARAM, pname, 0, 0, line, col)
+    var pk: table<i64> = table_new_i64()
+    table_push(pk, pty)
+    table_push(pk, -1)
+    ast.set_children(p, pk)
+    // 体：StmtList[Return(expr)]——与延迟回填后的闭包体形态一致
+    var ret = ast.new_node(N_RETURN, -1, -1, -1, line, col)
+    var rk: table<i64> = table_new_i64()
+    table_push(rk, body_expr)
+    ast.set_children(ret, rk)
+    var sl = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    var sk: table<i64> = table_new_i64()
+    table_push(sk, ret)
+    ast.set_children(sl, sk)
+    // 闭包：children = [泛型槽, 返回类型, 参数..., 体]；aux = 形参数
+    var f = ast.new_node(N_FN_LIT, -1, -1, 1, line, col)
+    var fk: table<i64> = table_new_i64()
+    table_push(fk, -1)
+    table_push(fk, ret_ty)
+    table_push(fk, p)
+    table_push(fk, sl)
+    ast.set_children(f, fk)
+    return f
+}
+
+pub func parse_var_decl(is_const: i64) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // var / const
+    if putil.peek_tag() == lex_lparen {
+        return parse_tuple_destructure(line, col, is_const)
+    }
+    // S3.3：宏体内 `var $tmp = ...`（准引用块里声明插值名变量）——
+    // expect_ident_quasi 支持 $ 前缀插值名（构造 code 值时替换为 gensym 结果）
+    var name = putil.expect_ident_quasi()
+    if name < 0 {
+        return -1
+    }
+    var ty = -1
+    if putil.eat(lex_colon) {
+        ty = pexpr_type.parse_type()
+        if ty < 0 {
+            return -1
+        }
+    }
+    var init = -1
+    if putil.eat(lex_eq) {
+        // p.9.11.34「临时单参函数」：声明位有 fn 类型标注时，把该类型放入
+        // pexpr 的期望槽，使初始化表达式中的闭包**可省略形参类型**
+        // （`var f: fn(i64) -> i64 = func(t) -> i64 { return t + 1 }`）。
+        // 保存-设置-恢复：只覆盖本次初始化表达式的解析，嵌套/后续不受影响。
+        var saved_fn_ty = g_expect_fn_ty
+        if ty >= 0 && ast.tag(ty) == N_FN_TYPE {
+            g_expect_fn_ty = ty
+        }
+        // p.9.11.34 短闭包形态：fn 标注位 + 形如 `ident -> expr` ⇒ 短闭包
+        //（判据是**上下文**而非符号表，详见 build_short_lambda 头注）。
+        // 该分支外的所有情形都走原路径，管道语义一字不变。
+        if ty >= 0 && ast.tag(ty) == N_FN_TYPE &&
+            putil.peek_tag() == lex_ident && putil.peek_n(1) == lex_arrow {
+            init = build_short_lambda(ty, putil.peek_line(), putil.peek_col())
+        } else {
+            init = pexpr.parse_expr()
+        }
+        g_expect_fn_ty = saved_fn_ty
+        if init < 0 {
+            return -1
+        }
+        if !putil.expect_stmt_end() {
+            return -1
+        }
+    } else if putil.is_table_type(ty) {
+        // T0.4 顶层表全局变量：表类型可省略初始化，合成空表 []（元素类型由标注决定）
+        if !putil.expect_stmt_end() {
+            return -1
+        }
+        init = ast.new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+    } else {
+        if !putil.expect(lex_eq, "'='") {
+            return -1
+        }
+        return -1
+    }
+    var v = ast.new_node(N_VAR_DECL, name, is_const, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ty)
+    table_push(kids, init)
+    ast.set_children(v, kids)
+    return v
+}
+
+
+// ---------- 表达式与赋值语句 ----------
+
+// 表达式语句与赋值语句统一入口：Ident op= → Assign；否则解析表达式后按目标分派
+pub func parse_expr_or_assign() -> i64 {
+    // 快速路径：变量名后紧跟赋值运算符 → Assign
+    if putil.peek_tag() == lex_ident {
+        var n1 = putil.peek_n(1)
+        if putil.is_assign_op_tag(n1) {
+            var line = putil.peek_line()
+            var col = putil.peek_col()
+            var name = interner.intern(putil.peek_lexeme())
+            putil.advance()   // 目标变量名
+            var op = putil.eat_assign_op()
+            if op == -2 {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "期望赋值运算符")
+                return -1
+            }
+            var value = pexpr.parse_expr()
+            if value < 0 {
+                return -1
+            }
+            if !putil.expect_stmt_end() {
+                return -1
+            }
+            var a = ast.new_node(N_ASSIGN, name, op, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, value)
+            ast.set_children(a, kids)
+            return a
+        }
+    }
+    // S3.3 快速路径 2：插值名后紧跟赋值运算符 → Assign（宏体内 `$a = $b`，
+    // 目标名存 "$a" 池 id；构造 code 值时替换为参数 AST 的变量名）
+    if putil.peek_tag() == lex_dollar {
+        if putil.peek_n(1) == lex_ident {
+            var n1 = putil.peek_n(2)
+            if putil.is_assign_op_tag(n1) {
+                var line = putil.peek_line()
+                var col = putil.peek_col()
+                var name = interner.intern("$" + putil.peek_lexeme_n(1))
+                putil.advance()   // $
+                putil.advance()   // 插值名
+                var op = putil.eat_assign_op()
+                if op == -2 {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "期望赋值运算符")
+                    return -1
+                }
+                var value = pexpr.parse_expr()
+                if value < 0 {
+                    return -1
+                }
+                if !putil.expect_stmt_end() {
+                    return -1
+                }
+                var a = ast.new_node(N_ASSIGN, name, op, -1, line, col)
+                var kids: table<i64> = table_new_i64()
+                table_push(kids, value)
+                ast.set_children(a, kids)
+                return a
+            }
+        }
+    }
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var expr = pexpr.parse_expr()
+    if expr < 0 {
+        return -1
+    }
+    // P1 箭头赋值已在 parse_expr 内脱糖为语句节点（N_ASSIGN/N_FIELD_ASSIGN/
+    // N_INDEX_ASSIGN）→ 消费语句终止符后直接返回（避免被 N_EXPR_STMT 包裹后
+    // 语义按表达式推断失败；终止符必须在此消费，否则留给下一条语句报「分号开始」）
+    var etag = ast.tag(expr)
+    if etag == N_ASSIGN || etag == N_FIELD_ASSIGN || etag == N_INDEX_ASSIGN {
+        if !putil.expect_stmt_end() {
+            return -1
+        }
+        return expr
+    }
+    var op = putil.eat_assign_op()
+    if op != -2 {
+        var tag = ast.tag(expr)
+        if tag == N_CODE_INTERP {
+            // S3.3 兜底：简单插值目标 `$a op= v`（快速路径 2 未命中时的防御）
+            if ast.name(expr) >= 0 {
+                var value = pexpr.parse_expr()
+                if value < 0 {
+                    return -1
+                }
+                if !putil.expect_stmt_end() {
+                    return -1
+                }
+                var a = ast.new_node(N_ASSIGN, ast.name(expr), op, -1, line, col)
+                var kids: table<i64> = table_new_i64()
+                table_push(kids, value)
+                ast.set_children(a, kids)
+                return a
+            }
+        }
+        if tag == N_INDEX {
+            // 表下标赋值：t[i] op= v / t[i][j] op= v
+            var value = pexpr.parse_expr()
+            if value < 0 {
+                return -1
+            }
+            if !putil.expect_stmt_end() {
+                return -1
+            }
+            var ia = ast.new_node(N_INDEX_ASSIGN, -1, op, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, expr)
+            table_push(kids, value)
+            ast.set_children(ia, kids)
+            return ia
+        }
+        if tag == N_FIELD_ACCESS {
+            // 字段赋值：obj.field op= v（base 需可寻址）
+            var base = ast.child_at(expr, 0)
+            if putil.is_addressable_base(base) {
+                var value = pexpr.parse_expr()
+                if value < 0 {
+                    return -1
+                }
+                if !putil.expect_stmt_end() {
+                    return -1
+                }
+                var fa = ast.new_node(N_FIELD_ASSIGN, ast.name(expr), op, -1, line, col)
+                var kids: table<i64> = table_new_i64()
+                table_push(kids, base)
+                table_push(kids, value)
+                ast.set_children(fa, kids)
+                return fa
+            }
+        }
+        if tag == N_VAR {
+            // 变量赋值（防御：快速路径已拦截，此处兜底）
+            var value = pexpr.parse_expr()
+            if value < 0 {
+                return -1
+            }
+            if !putil.expect_stmt_end() {
+                return -1
+            }
+            var a = ast.new_node(N_ASSIGN, ast.name(expr), op, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, value)
+            ast.set_children(a, kids)
+            return a
+        }
+        if tag == N_PATH {
+            // 命名空间限定的全局变量赋值：ns::g = v / ns::g op= v。
+            // 目标名 = 各段以 "::" 拼接的全名，与 gb_* 的登记名一致；
+            // 可见性/const 由 semantic 的 check_const_visibility_nid 与
+            // irgen 的 scope_get_global 复核。
+            var value = pexpr.parse_expr()
+            if value < 0 {
+                return -1
+            }
+            if !putil.expect_stmt_end() {
+                return -1
+            }
+            var full: string = ""
+            var nc = ast.child_count(expr)
+            var si: i64 = 0
+            while si < nc {
+                var seg = ast.child_at(expr, si)
+                if si > 0 {
+                    full = full + "::"
+                }
+                full = full + interner.lookup(ast.name(seg))
+                si = si + 1
+            }
+            var a = ast.new_node(N_ASSIGN, interner.intern(full), op, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, value)
+            ast.set_children(a, kids)
+            return a
+        }
+        putil.set_err(putil.peek_line(), putil.peek_col(), "赋值目标必须是变量或对象字段")
+        return -1
+    }
+    // 普通表达式语句
+    if !putil.expect_stmt_end() {
+        return -1
+    }
+    var e = ast.new_node(N_EXPR_STMT, -1, -1, -1, line, col)
+    var ekids: table<i64> = table_new_i64()
+    table_push(ekids, expr)
+    ast.set_children(e, ekids)
+    return e
+}
+
+
+}
+
+import "./pstmt_p1.tie"

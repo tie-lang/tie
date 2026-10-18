@@ -1,0 +1,176 @@
+type tie<class>
+// std/data.tie —— L3 数据预处理/加载库 data（命名空间 data）
+// ============================================================
+// 用途：微型扩散定调器训练的数据辅助：标准化、tile 混洗、batch 切片、raw f32 高度图
+// tile 读取、CSV 检查点/日志追加。纯 tie 实现，std 层。
+//
+// 【ABI】大数组 `ref array<f32,1024>` 通道，返回 void/小标量；Rng 值语义返回新 Rng。
+// 逐元素算术一律 f64 算 as_f32 回写；浮点字面量十进制。
+//
+// 【tile_load 文件头约定 / 字节序】
+//   约定 raw f32 高度图 tile 为**无文件头的裸 IEEE-754 f32 流**：从偏移 0 起每 4 字节是
+//  一个 f32，小端（低字节在前，与 buf.f32_at 一致）。函数读取全部 4 字节组依次入池，
+//   返回元素数 = cap/4（不满 4 字节的尾部忽略）；超出池长(1024)部截断。
+// EN: raw f32 heightmap tile = headerless little-endian IEEE-754 f32 stream; count=cap/4.
+
+import "/ext/buffer.tie";
+import "/std/fs.tie";
+import "/ext/trng.tie";
+
+namespace data {
+
+// ---- 就地 z-score 标准化：x=(x−m)/s；s==0 置 0 ----
+// EN: in-place z-score; zeroes when std==0.
+pub func zscore(me: ref array<f32, 1024>, n: i64) {
+    if n <= 0 {
+        return
+    }
+    var m: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        m = m + to_f64(me[i])
+        i = i + 1
+    }
+    m = m / to_f64(n)
+    var vr: f64 = 0.0
+    var j: i64 = 0
+    while j < n {
+        var d = to_f64(me[j]) - m
+        vr = vr + d * d
+        j = j + 1
+    }
+    vr = vr / to_f64(n)
+    var s = sqrt(vr)
+    var k: i64 = 0
+    while k < n {
+        if s > 0.0 {
+            me[k] = to_f32((to_f64(me[k]) - m) / s)
+        } else {
+            me[k] = 0.0
+        }
+        k = k + 1
+    }
+}
+
+// ---- z-score 统计：返回均值 m 与（总体）标准差 s（供反标准化/存 stats）----
+// EN: return (mean, population std) for denorm reuse. s==0 => raw 0.
+pub func zscore_stat(ma: ref array<f32, 1024>, n: i64) -> (m: f64, s: f64) {
+    if n <= 0 {
+        return (0.0, 0.0)
+    }
+    var m: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        m = m + to_f64(ma[i])
+        i = i + 1
+    }
+    m = m / to_f64(n)
+    var vr: f64 = 0.0
+    var j: i64 = 0
+    while j < n {
+        var d = to_f64(ma[j]) - m
+        vr = vr + d * d
+        j = j + 1
+    }
+    vr = vr / to_f64(n)
+    return (m, sqrt(vr))
+}
+
+// ---- 反标准化（就地）：x = m + s·x ----
+// EN: in-place denorm: x = m + s*x.
+pub func denorm(me: ref array<f32, 1024>, n: i64, m: f64, s: f64) {
+    var i: i64 = 0
+    while i < n {
+        me[i] = to_f32(m + s * to_f64(me[i]))
+        i = i + 1
+    }
+}
+
+// ---- tile 级 Fisher-Yates 混洗（就地，交换整 tile）----
+// 把一维池视为 ntiles×tile 的 tile 序列（tile*ntiles≤1024），遍历 i=ntiles-1..1 与随机
+// j∈[0,i] 交换整块 tile。tile 可为 1（退化为逐元素混洗）。返回新 Rng。
+// EN: Fisher-Yates over whole tiles; tile*ntiles<=1024.
+pub func shuffle_tiles(me: ref array<f32, 1024>, tile: i64, ntiles: i64, r: Rng) -> Rng {
+    var rr = r
+    if tile < 1 || ntiles < 1 {
+        return rr
+    }
+    var i = ntiles - 1
+    while i > 0 {
+        var pr = trng.int_range(rr, 0, i + 1)
+        rr = pr.r2
+        var j = pr.v2
+        if j != i {
+            var k: i64 = 0
+            while k < tile {
+                var tmp = me[i * tile + k]
+                me[i * tile + k] = me[j * tile + k]
+                me[j * tile + k] = tmp
+                k = k + 1
+            }
+        }
+        i = i - 1
+    }
+    return rr
+}
+
+// ---- batch 切片：拷贝第 bi 个 batch（元素 [bi*bs, min((bi+1)*bs,n))）到 out，返回实际元素数 ----
+// EN: slice batch bi into out, returns actual element count (0 when out of range).
+pub func batch_slice(me: ref array<f32, 1024>, n: i64, bs: i64, bi: i64, out: ref array<f32, 1024>) -> i64 {
+    if bs < 1 || bi < 0 {
+        return 0
+    }
+    var start = bi * bs
+    if start >= n {
+        return 0
+    }
+    var end = start + bs
+    if end > n {
+        end = n
+    }
+    var cnt = end - start
+    var i: i64 = 0
+    while i < cnt {
+        out[i] = me[start + i]
+        i = i + 1
+    }
+    return cnt
+}
+
+// ---- raw f32 高度图 tile 读取（见文件头字节约定）----
+// 从偏移 0 起把每 4 字节当一个 f32（buf.f32_at）填进池；返回实际读入元素数（cap/4，
+// 截断到 ≤1024 池长）。
+// EN: load raw little-endian f32 tile file into pool; returns element count.
+pub func tile_load(me: ref array<f32, 1024>, path: string) -> i64 {
+    var b = buf.load(path)
+    var total = buf.length(b)
+    var cnt = total / 4
+    if cnt < 0 {
+        cnt = 0
+    }
+    if cnt > 1024 {
+        cnt = 1024
+    }
+    var i: i64 = 0
+    while i < cnt {
+        me[i] = to_f32(buf.f32_at(b, i * 4))
+        i = i + 1
+    }
+    return cnt
+}
+
+// ---- CSV 检查点追加：step,loss,mse （一行）----
+// 用 fs.append_text（fs 提供 file_append 底座，文本追加，不存在则创建）。
+// EN: append a CSV checkpoint row (step,loss,mse) via fs.append_text.
+pub func tile_checkpoint(path: string, step: i64, loss: f64, mse: f64) {
+    var line = to_string(step) + "," + to_string(loss) + "," + to_string(mse) + "\n"
+    fs.append_text(path, line)
+}
+
+// ---- 日志行追加（任意一行）----
+// EN: append an arbitrary log line.
+pub func tile_log(path: string, line: string) {
+    fs.append_text(path, line + "\n")
+}
+
+}   // namespace data

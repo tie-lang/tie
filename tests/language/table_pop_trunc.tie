@@ -1,0 +1,74 @@
+type tie<logic>
+
+// ============================================================
+// p.8.1.6 表删除/缩表原语验收（ECS 实体/组件删除支撑前置）
+// `table_pop` / `table_trunc`：动态表 pop / 截断缩表（此前仅 table_push + 下标写，
+// 删除靠重建表模拟）。
+//
+// 覆盖场景：
+//   1. table_pop 栈式弹出（后进先出）：pop 尾元素 + len 递减
+//   2. 空表 table_pop → 元素零值（不崩溃，len 保持 0）
+//   3. table_trunc 截断到指定长度：保留前 n 个元素，len = n
+//   4. table_trunc n=0 → 空表；n<0 → 空表（钳制）；n≥len → 不变（钳制）
+//   5. 截断后 table_push 续用（容量/长度正确，无越界残留）
+//   6. 深表（table<table<i64>>）trunc：缩掉元素引用释放（防悬垂/泄漏）
+//   7. 深表 pop：弹出子表所有权转移（rc 不变，变量持有可继续用）
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   3 / 2 / 1 / 1 / 0 / 0 / 0          场景1+2：pop 栈序 + 空表零值
+//   2 / 1 / 2 / 0 / 0 / 0 / 7 / 1      场景3+4+5：trunc 各钳制 + 截断后 push 续用
+//   1 / 2                              场景6：深表 trunc 后 len 与保留子表
+//   2 / 1 / 3                          场景7：深表 pop 子表所有权转移
+// ============================================================
+
+func main() {
+    // 场景 1：table_pop 栈式弹出（LIFO）
+    var st = table_new_i64()
+    table_push(st, 1)
+    table_push(st, 2)
+    table_push(st, 3)
+    println(table_pop(st)) // 3
+    println(table_pop(st)) // 2
+    println(len(st))       // 1
+    println(table_pop(st)) // 1
+    println(len(st))       // 0
+    // 场景 2：空表 pop → 零值，len 保持 0
+    println(table_pop(st)) // 0（空表零值）
+    println(len(st))       // 0
+
+    // 场景 3：table_trunc 截断（保留前 n 个）
+    var t = table_new_i64()
+    table_push(t, 1)
+    table_push(t, 2)
+    table_push(t, 3)
+    table_push(t, 4)
+    table_push(t, 5)
+    table_trunc(t, 2)
+    println(len(t)) // 2
+    println(t[0])   // 1
+    println(t[1])   // 2
+    // 场景 4：n=0 → 空表；n<0 → 空表（钳制）；n≥len → 不变（钳制）
+    table_trunc(t, 0)
+    println(len(t)) // 0
+    table_trunc(t, -3)
+    println(len(t)) // 0
+    table_trunc(t, 10)
+    println(len(t)) // 0
+    // 场景 5：截断后 push 续用（容量/长度正确）
+    table_push(t, 7)
+    println(t[0]) // 7
+    println(len(t)) // 1
+
+    // 场景 6：深表 trunc —— 缩掉子表引用释放（防悬垂/泄漏）
+    var m = [[1, 2], [3, 4], [5, 6]]
+    table_trunc(m, 1)
+    println(len(m))    // 1
+    println(len(m[0])) // 2（保留的子表完好）
+
+    // 场景 7：深表 pop —— 弹出子表所有权转移给调用方
+    var m2 = [[1], [2], [3]]
+    var top = table_pop(m2)
+    println(len(m2)) // 2
+    println(len(top)) // 1
+    println(top[0])  // 3
+}

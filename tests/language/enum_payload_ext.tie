@@ -1,0 +1,80 @@
+type tie<logic>
+
+// ============================================================
+// p.8.1.7 enum payload 白名单放开验收：f64 / table<T> / map<V> / string
+// payload 构造 + switch 解构 + payload 取值全链路（ECS 组件标记/事件类型支撑）。
+//
+// 覆盖场景：
+//   1. f64 payload：构造 Tag.Num(3.5) + `case Num(x)` 解构绑定取值
+//   2. table<i64> payload：构造 Tag.Vec([1,2,3]) + 解构后 len / 下标读
+//   3. map<i64> payload：构造 Tag.M(["k": 9]) + 解构后下标读
+//   4. string payload：构造 Tag.S("hi") + 解构后直接使用
+//   5. table<f64> payload：构造 Tag.Tf([0.5, 1.5]) + 解构后下标读（浮点表）
+//   6. 无 payload 变体 + default 分支
+//   7. 负例边界（enum_neg.tie 已覆盖）：struct / 嵌套 enum payload 仍拒绝
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   num:3.5 / 3 / 1 / 3 / 9 / hi / 0.500000 / none
+// ============================================================
+
+enum Tag {
+    Num(f64)
+    Vec(table<i64>)
+    M(map<i64>)
+    S(string)
+    Tf(table<f64>)
+    None
+}
+
+func main() {
+    // 1. f64 payload 解构取值
+    var a = Tag.Num(3.5)
+    switch a {
+        case Num(x):
+            println("num:" + to_string(x))
+        default:
+            println("not-num")
+    }
+    // 2. table<i64> payload：解构后 len / 下标读
+    var b = Tag.Vec([1, 2, 3])
+    switch b {
+        case Vec(v):
+            println(len(v))
+            println(v[0])
+            println(v[2])
+        default:
+            println("not-vec")
+    }
+    // 3. map<i64> payload：解构后下标读
+    var c = Tag.M(["k": 9])
+    switch c {
+        case M(m):
+            println(m["k"])
+        default:
+            println("not-m")
+    }
+    // 4. string payload：解构后直接使用
+    var d = Tag.S("hi")
+    switch d {
+        case S(s):
+            println(s)
+        default:
+            println("not-s")
+    }
+    // 5. table<f64> payload：浮点表解构 + 下标读
+    var e = Tag.Tf([0.5, 1.5])
+    switch e {
+        case Tf(t):
+            println(t[0])
+        default:
+            println("not-tf")
+    }
+    // 6. 无 payload 变体 + default
+    var f = Tag.None
+    switch f {
+        case None:
+            println("none")
+        default:
+            println("not-none")
+    }
+}

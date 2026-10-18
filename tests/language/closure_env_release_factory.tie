@@ -1,0 +1,50 @@
+type tie<logic>
+// closure_env_release_factory.tie —— 工厂形态闭包的 env 释放回归（(b) 方案，2026-10-02）
+// ============================================================================
+// 形态：`var f = mk()`——闭包由**函数返回**，赋值点上编译器不知道它是哪个闭包
+// 字面量，故无法按名字调用其析构（A 方案在此形态下不覆盖，实测峰值 299.6MB）。
+//
+// (b) 方案：env 首字段本就是析构入口，释放点**从 env 读**即可，无需知道布局或
+// drop 名 ⇒ 工厂形态被统一覆盖。配合「无捕获闭包也指向静态空 env（析构 no-op）」，
+// env 恒有效 ⇒ 释放点无需判空。
+//
+// 实测：本探针峰值 8.2MB（修复前 291.3MB）。断言语义正确（捕获值必须读回准确）。
+
+func mk() -> fn() -> i64 {
+    var t: table<i64> = []
+    var i: i64 = 0
+    while i < 200 {
+        table_push(t, i)
+        i = i + 1
+    }
+    return func() -> i64 { return len(t) }
+}
+
+// 无捕获闭包（env = 静态空 env，析构 no-op）——同为 fn 类型初值，须一并安全释放
+func mk_plain() -> fn() -> i64 {
+    return func() -> i64 { return 7 }
+}
+
+func main() {
+    var n: i64 = 0
+    var acc: i64 = 0
+    while n < 200000 {
+        var f = mk()
+        var got = f()
+        if got != 200 {
+            println("FAIL 工厂形态捕获值错：len=" + to_string(got))
+            return
+        }
+        acc = acc + got
+        // 无捕获闭包同轮混用：其 env 是静态槽，不得被 free（否则崩）
+        var g = mk_plain()
+        acc = acc + g() - 7
+        n = n + 1
+    }
+    // 200000 × 200 = 40000000
+    if acc == 40000000 {
+        println("PASS closure-env-release-factory acc=" + to_string(acc))
+    } else {
+        println("FAIL closure-env-release-factory acc=" + to_string(acc))
+    }
+}

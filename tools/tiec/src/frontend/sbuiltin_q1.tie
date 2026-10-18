@@ -1,0 +1,183 @@
+type tie<class>
+import "./sbuiltin_call_gen.tie"
+// compiler/frontend/sbuiltin_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sbuiltin.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace sbuiltin {
+// 内置函数签名检查（参数个数 + 返回类型）
+pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+    if fn_name == "is_null" || fn_name == "slice_len" { return builtin_call_b_is_null(fn_name, args, call_node) }
+    if fn_name == "ptr_to_int" { return builtin_call_b_ptr_to_int(fn_name, args, call_node) }
+    if fn_name == "int_to_ptr" { return builtin_call_b_int_to_ptr(fn_name, args, call_node) }
+    if fn_name == "alloc" { return builtin_call_b_alloc(fn_name, args, call_node) }
+    if fn_name == "free" { return builtin_call_b_free(fn_name, args, call_node) }
+    if fn_name == "deref_write" { return builtin_call_b_deref_write(fn_name, args, call_node) }
+    if fn_name == "volatile_store" { return builtin_call_b_volatile_store(fn_name, args, call_node) }
+    if fn_name == "addr_of_field" { return builtin_call_b_addr_of_field(fn_name, args, call_node) }
+    if fn_name == "memcpy" || fn_name == "memset" { return builtin_call_b_memcpy(fn_name, args, call_node) }
+    // 动态返回类型 unsafe 内置（个数检查；类型由调用点 infer 特判）
+    if fn_name == "addr_of" || fn_name == "deref" || fn_name == "volatile_load" { return builtin_call_b_addr_of(fn_name, args, call_node) }
+    if fn_name == "ptr_add" || fn_name == "slice_index" { return builtin_call_b_ptr_add(fn_name, args, call_node) }
+    if fn_name == "slice_of" { return builtin_call_b_slice_of(fn_name, args, call_node) }
+    if fn_name == "share" { return builtin_call_b_share(fn_name, args, call_node) }
+    // ---------- S1.3 to_* 显式数值转换族（p.9.0-S.8 规范 §2.11 正名） ----------
+    // to_i8..to_u128 / to_f32 / to_f64：1 参数字 → 目标类型。
+    // as_* 中的 as_i64/as_f64 仍留在此组——其返回类型推导与解包目标相同，
+    // 实际行为由 builtin_expr 按参数是否为 any 分派（as_ 仅解包）。
+    if fn_name == "as_i8" || fn_name == "as_i16" || fn_name == "as_i32" || fn_name == "as_i64" || fn_name == "as_u8" || fn_name == "as_u16" || fn_name == "as_u32" || fn_name == "as_u64" || fn_name == "as_f32" || fn_name == "as_f64" || fn_name == "as_i128" || fn_name == "as_u128" || fn_name == "to_i8" || fn_name == "to_i16" || fn_name == "to_i32" || fn_name == "to_i64" || fn_name == "to_i128" || fn_name == "to_u8" || fn_name == "to_u16" || fn_name == "to_u32" || fn_name == "to_u64" || fn_name == "to_u128" || fn_name == "to_f32" || fn_name == "to_f64" { return builtin_call_b_as_i8(fn_name, args, call_node) }
+    // 精确个数匹配组
+    if fn_name == "println" || fn_name == "print" { return builtin_call_b_println(fn_name, args, call_node) }
+    if fn_name == "len" { return builtin_call_b_len(fn_name, args, call_node) }
+    // ---------- L1 定长数组：广播初始化 array_init(v) ----------
+    // 返回类型是**占位**（misc）：目标数组类型由上下文（var 标注/形参/返回）
+    // 决定，调用点（scheck/stype.types_match + irgen var-decl）据此校验实参并
+    // 生成 [N x T] 全等值填充。
+    if fn_name == "array_init" { return builtin_call_b_array_init(fn_name, args, call_node) }
+    // P2b：any 拆箱转换（as_*：1 参 any → 具体类型；实参类型由调用点检查）
+    // P2d：as_table_* 拆箱为元素化表（返回 table_of(元素)，tag = 精确表类型 id）
+    if fn_name == "as_i64" || fn_name == "as_f64" || fn_name == "as_bool" || fn_name == "as_string" || fn_name == "as_char" || fn_name == "as_table_i64" || fn_name == "as_table_string" || fn_name == "as_table_bool" || fn_name == "as_table_f64" || fn_name == "as_table_char" || fn_name == "as_table_any" { return builtin_call_b_as_i64(fn_name, args, call_node) }
+    // P2c：any_tag(x) → i64（读 {tag,payload} 的 tag 字段）
+    if fn_name == "any_tag" { return builtin_call_b_any_tag(fn_name, args, call_node) }
+    // P2d-D3：map 高阶——map_keys(m)→table<string>；map_values(m)→table<V>
+    //（V 由调用点 infer 从实参 map<string,V> 解码，此处占位 table<i64>）；
+    // map_contains(m, key)→bool（不 raise）
+    if fn_name == "map_keys" || fn_name == "map_values" { return builtin_call_b_map_keys(fn_name, args, call_node) }
+    if fn_name == "map_contains" { return builtin_call_b_map_contains(fn_name, args, call_node) }
+    if fn_name == "str_len" || fn_name == "str_char" || fn_name == "char_code" { return builtin_call_b_str_len(fn_name, args, call_node) }
+    // ---------- S2.1 字符串 {ptr,len} 原语 ----------
+    // 二进制安全字节访问 / UTF-8 码点解码 / StringBuilder 句柄。
+    // str_byte(s, i)：取第 i 字节（0 ≤ i < len(s)，越界未定义）；
+    // utf8_seq_len(s, i) / utf8_char_at(s, i)：字节 i 起码点序列长度/码点值；
+    // string_builder() → 句柄 i64；sb_append(h, s) / sb_append_byte(h, b) 原地
+    // 追加（返回 0）；sb_build(h) → 一次性产出 string（句柄仍有效可复用）。
+    if fn_name == "str_byte" || fn_name == "utf8_seq_len" || fn_name == "utf8_char_at" { return builtin_call_b_str_byte(fn_name, args, call_node) }
+    if fn_name == "string_builder" { return builtin_call_b_string_builder(fn_name, args, call_node) }
+    // SSO 短串池（dev33 批次3）：回退 malloc 累计次数（无参数，返回 i64）
+    if fn_name == "sso_malloc_count" { return builtin_call_b_sso_malloc_count(fn_name, args, call_node) }
+    // 可捕获 panic（dev33 批次7 任务18）：catch_panic(f) -> bool
+    //（f 为 fn() -> T 闭包；f 内 panic 被捕获 → true，消息已打印；否则 false）
+    if fn_name == "catch_panic" { return builtin_call_b_catch_panic(fn_name, args, call_node) }
+    // 闭包 → C 回调函数指针（dev33 批次8 任务23）：cb_ptr(f) -> string
+    //（f 须为无捕获闭包字面量或命名函数；返回 C 兼容回调地址，供 extern
+    //  函数指针参数使用——extern 参数按 string/ptr 槽声明）
+    if fn_name == "cb_ptr" { return builtin_call_b_cb_ptr(fn_name, args, call_node) }
+    if fn_name == "sb_append" || fn_name == "sb_append_byte" { return builtin_call_b_sb_append(fn_name, args, call_node) }
+    if fn_name == "sb_build" { return builtin_call_b_sb_build(fn_name, args, call_node) }
+    // sb_reset(h)：清空复用（len=0，cap/data 缓冲保留）→ i64（0）
+    if fn_name == "sb_reset" { return builtin_call_b_sb_reset(fn_name, args, call_node) }
+    // str_sub_bytes(s, lo, hi)：字节区间子串 [lo, hi)（clamp 越界）→ string。
+    // lexer 专用快路径（配合码点→字节偏移表，lexeme 切片 O(len) 单次 memcpy）
+    if fn_name == "str_sub_bytes" { return builtin_call_b_str_sub_bytes(fn_name, args, call_node) }
+    if fn_name == "str_from_code" { return builtin_call_b_str_from_code(fn_name, args, call_node) }
+    // ---------- 网络原语（P0：std/net）----------
+    // 签名：close/accept/listen/bind=1 参，connect/send/recv=2 参，udp_send=4 参；
+    // 返回：close=Bool、两个 recv=Str、其余 I64。参数类型由调用点语义检查。
+    if fn_name == "net_close" || fn_name == "net_tcp_accept" || fn_name == "net_tcp_listen" || fn_name == "net_udp_bind" { return builtin_call_b_net_close(fn_name, args, call_node) }
+    if fn_name == "net_tcp_connect" || fn_name == "net_tcp_send" || fn_name == "net_tcp_recv" || fn_name == "net_udp_recv" || fn_name == "net_tcp_recv_bytes" || fn_name == "net_tcp_send_bytes" || fn_name == "net_udp_recv_bytes" { return builtin_call_b_net_tcp_connect(fn_name, args, call_node) }
+    if fn_name == "net_udp_send" || fn_name == "net_udp_send_bytes" { return builtin_call_b_net_udp_send(fn_name, args, call_node) }
+    // ---------- 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）----------
+    // load_library(name) -> i64：LoadLibraryW 模块句柄（失败 0）。
+    // get_proc(handle, name) -> i64：GetProcAddress 函数地址（失败 0）。
+    // dyn_call(addr,a1..a5) -> i64：调 i32 返回 C 函数（zext i64；sqlite int 码）。
+    // dyn_call_p(addr,a1..a5) -> i64：调完整 64 位返回 C 函数（指针/句柄）。
+    // cstr_to_string(addr) -> string：C 字符串（NUL 结尾）→ tie 字符串。
+    if fn_name == "load_library" { return builtin_call_b_load_library(fn_name, args, call_node) }
+    if fn_name == "get_proc" { return builtin_call_b_get_proc(fn_name, args, call_node) }
+    if fn_name == "dyn_call" || fn_name == "dyn_call_p" { return builtin_call_b_dyn_call(fn_name, args, call_node) }
+    if fn_name == "cstr_to_string" { return builtin_call_b_cstr_to_string(fn_name, args, call_node) }
+    if fn_name == "to_string" || fn_name == "parse_int" || fn_name == "parse_float" || fn_name == "parse_trit" || fn_name == "to_trit" || fn_name == "trit_val" { return builtin_call_b_to_string(fn_name, args, call_node) }
+    if fn_name == "table_new_i64" || fn_name == "table_new_f64" || fn_name == "table_new_string" || fn_name == "table_new_bool" { return builtin_call_b_table_new_i64(fn_name, args, call_node) }
+    if fn_name == "table_push" { return builtin_call_b_table_push(fn_name, args, call_node) }
+    if fn_name == "table_at" { return builtin_call_b_table_at(fn_name, args, call_node) }
+    if fn_name == "table_pop" { return builtin_call_b_table_pop_p(fn_name, args, call_node) }
+    if fn_name == "table_trunc" { return builtin_call_b_table_trunc_p(fn_name, args, call_node) }
+    if fn_name == "table_append" { return builtin_call_b_table_append_p(fn_name, args, call_node) }
+    if fn_name == "table_append_raw" { return builtin_call_b_table_append_raw_p(fn_name, args, call_node) }
+    if fn_name == "table_reserve" { return builtin_call_b_table_reserve_p(fn_name, args, call_node) }
+    if fn_name == "exit" { return builtin_call_b_exit(fn_name, args, call_node) }
+    if fn_name == "read_line" || fn_name == "file_read" || fn_name == "file_delete" || fn_name == "file_exists" { return builtin_call_b_read_line(fn_name, args, call_node) }
+    // 完整 fs 元数据内置（UTF-8 桥）：file_size → i64（失败 -1）；
+    // file_is_dir / file_is_file → bool（路径类型判定）
+    if fn_name == "file_size" || fn_name == "file_is_dir" || fn_name == "file_is_file" { return builtin_call_b_file_size(fn_name, args, call_node) }
+    if fn_name == "file_write" || fn_name == "file_append" { return builtin_call_b_file_write(fn_name, args, call_node) }
+    if fn_name == "time_now" || fn_name == "arg_count" { return builtin_call_b_time_now(fn_name, args, call_node) }
+    if fn_name == "rand_range" { return builtin_call_b_rand_range(fn_name, args, call_node) }
+    if fn_name == "arg_string" { return builtin_call_b_arg_string(fn_name, args, call_node) }
+    if fn_name == "list_dir" || fn_name == "walk_dir" || fn_name == "byte_read" { return builtin_call_b_list_dir(fn_name, args, call_node) }
+    // p.6.9.1 stdio 字节原语：stdin_read(n) → i64 字节表（读到 n 字节或 EOF，EOF
+    // 空表）；stdout_write_bytes(字节表) / stdout_write_str(串) → 实际写入字节数
+    if fn_name == "stdin_read" || fn_name == "stdout_write_bytes" || fn_name == "stdout_write_str" { return builtin_call_b_stdin_read(fn_name, args, call_node) }
+    if fn_name == "sqrt" || fn_name == "sin" || fn_name == "cos" || fn_name == "tan" || fn_name == "exp" || fn_name == "log" || fn_name == "floor" || fn_name == "ceil" || fn_name == "round" || fn_name == "tanh" || fn_name == "sinh" || fn_name == "cosh" || fn_name == "asin" || fn_name == "acos" || fn_name == "atan" || fn_name == "log2" || fn_name == "log10" || fn_name == "expm1" || fn_name == "log1p" || fn_name == "cbrt" || fn_name == "exp2" || fn_name == "trunc" { return builtin_call_b_sqrt(fn_name, args, call_node) }
+    if fn_name == "atan2" || fn_name == "copysign" || fn_name == "fmod" || fn_name == "remainder" || fn_name == "hypot" { return builtin_call_b_atan2(fn_name, args, call_node) }
+    if fn_name == "bitcast_f64_i64" || fn_name == "bitcast_i64_f64" { return builtin_call_b_bitcast_f64_i64_f64(fn_name, args, call_node) }
+    if fn_name == "pow" { return builtin_call_b_pow(fn_name, args, call_node) }
+    if fn_name == "regex_match" || fn_name == "regex_find" || fn_name == "regex_replace" || fn_name == "regex_group" || fn_name == "regex_find_all" { return builtin_call_b_regex_match(fn_name, args, call_node) }
+    if fn_name == "exec_code" { return builtin_call_b_exec_code(fn_name, args, call_node) }
+    if fn_name == "exec_output" || fn_name == "get_env" || fn_name == "cwd" { return builtin_call_b_exec_output(fn_name, args, call_node) }
+    // 路径工具（M4+）：path_basename/path_dirname/path_abs/path_normalize → string
+    //（path_normalize 为 p.6.4.10 内联原语新增的前端类型登记）
+    if fn_name == "path_basename" || fn_name == "path_dirname" || fn_name == "path_abs" || fn_name == "path_normalize" { return builtin_call_b_path_basename(fn_name, args, call_node) }
+    if fn_name == "byte_write" { return builtin_call_b_byte_write(fn_name, args, call_node) }
+    if fn_name == "bit_read" || fn_name == "bit_write" { return builtin_call_b_bit_read(fn_name, args, call_node) }
+    if fn_name == "eval" { return builtin_call_b_eval(fn_name, args, call_node) }
+    if fn_name == "eval_call" { return builtin_call_b_eval_call(fn_name, args, call_node) }
+    if fn_name == "byte_concat" { return builtin_call_b_byte_concat(fn_name, args, call_node) }
+    if fn_name == "mkdir_all" || fn_name == "remove_dir_all" { return builtin_call_b_mkdir_all(fn_name, args, call_node) }
+    if fn_name == "path_join" { return builtin_call_b_path_join(fn_name, args, call_node) }
+    if fn_name == "set_env" { return builtin_call_b_set_env(fn_name, args, call_node) }
+    if fn_name == "print_err" { return builtin_call_b_print_err(fn_name, args, call_node) }
+    if fn_name == "msg_set_lang" { return builtin_call_b_msg_set_lang(fn_name, args, call_node) }
+    if fn_name == "msg_get_lang" { return builtin_call_b_msg_get_lang(fn_name, args, call_node) }
+    if fn_name == "msg_register" { return builtin_call_b_msg_register(fn_name, args, call_node) }
+    if fn_name == "msg_t" { return builtin_call_b_msg_t(fn_name, args, call_node) }
+    if fn_name == "msg_t_lang" { return builtin_call_b_msg_t_lang(fn_name, args, call_node) }
+    if fn_name == "http_get" { return builtin_call_b_http_get(fn_name, args, call_node) }
+    if fn_name == "http_get_file" || fn_name == "untar_gz" || fn_name == "unzip" { return builtin_call_b_http_get_file(fn_name, args, call_node) }
+    if fn_name == "copy_dir" || fn_name == "file_copy" || fn_name == "file_move" { return builtin_call_b_copy_dir(fn_name, args, call_node) }
+    // ---------- trm-lite 轻量执行体原语（阶段1块2） ----------
+    // spawn(f) -> i64（任务 id）：f 为 fn() -> i64 / fn() -> void 闭包。
+    if fn_name == "spawn" { return builtin_call_b_spawn(fn_name, args, call_node) }
+    // yield() -> void：协作式让出（排空就绪任务队列），0 参数。
+    if fn_name == "yield" { return builtin_call_b_yield(fn_name, args, call_node) }
+    // collect() -> i64（本轮回收对象数）：简单 mark-sweep GC，0 参数。
+    if fn_name == "collect" { return builtin_call_b_collect(fn_name, args, call_node) }
+    // gosched() -> void（p.6.7.10 协作抢占显式让出点，纯让出不等待），0 参数。
+    if fn_name == "gosched" { return builtin_call_b_gosched(fn_name, args, call_node) }
+    // ---------- WaitGroup 原语（p.6.7.11：Go sync.WaitGroup 语义） ----------
+    // wg_new() -> i64（新组句柄），0 参数。
+    if fn_name == "wg_new" { return builtin_call_b_wg_new(fn_name, args, call_node) }
+    // wg_add(h, n) -> void：计数 += n（n ≥ 0），2 参数。
+    if fn_name == "wg_add" { return builtin_call_b_wg_add(fn_name, args, call_node) }
+    // wg_done(h) -> void：计数 -= 1，归零广播，1 参数。
+    if fn_name == "wg_done" { return builtin_call_b_wg_done(fn_name, args, call_node) }
+    // wg_wait(h) -> void：等计数归零，1 参数。
+    if fn_name == "wg_wait" { return builtin_call_b_wg_wait(fn_name, args, call_node) }
+    // wg_count(h) -> i64（r.1.5.2）：观察量——当前未 done 的计数（wg_wait 轮询
+    // 用；与 trm-lite wg 实现一致，计数归零钳 0），1 参数。
+    if fn_name == "wg_count" { return builtin_call_b_wg_count(fn_name, args, call_node) }
+    // ---------- channel 原语（p.6.5.7：mailbox 承载，静态链接 trm_lite.a）----------
+    // ch_open() -> i64（新通道句柄），0 参数。
+    if fn_name == "ch_open" { return builtin_call_b_ch_open(fn_name, args, call_node) }
+    if fn_name == "ch_len" { return builtin_call_b_ch_len(fn_name, args, call_node) }
+    if fn_name == "ch_closed_flag" { return builtin_call_b_ch_closed_flag(fn_name, args, call_node) }
+    if fn_name == "ch_count" { return builtin_call_b_ch_count(fn_name, args, call_node) }
+    // ch_send(ch, v) -> i64（0=入队成功 1=失败），2 参数。
+    if fn_name == "ch_send" { return builtin_call_b_ch_send(fn_name, args, call_node) }
+    // ch_send_block(ch, v) -> i64（p.9.5.x T3 背压：队满阻塞等待空位，Go 阻塞
+    // send 语义；0=已入队 1=通道关闭），2 参数。
+    if fn_name == "ch_send_block" { return builtin_call_b_ch_send_block(fn_name, args, call_node) }
+    // ch_recv(ch) -> i64（消息值；0=空未关；-1=已关闭且空），1 参数。
+    if fn_name == "ch_recv" { return builtin_call_b_ch_recv(fn_name, args, call_node) }
+    // ch_close(ch) -> void（幂等关闭，唤醒等待者），1 参数。
+    if fn_name == "ch_close" { return builtin_call_b_ch_close(fn_name, args, call_node) }
+    // ch_select(handles, actions, values) -> i64（p.6.7.12）：命中分支下标/-1，3 参数。
+    if fn_name == "ch_select" { return builtin_call_b_ch_select(fn_name, args, call_node) }
+    // 未识别：按用户函数处理（返回 -3 表示不是内置）
+    return -3
+}
+
+}

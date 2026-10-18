@@ -1,0 +1,488 @@
+type tie<class>
+// compiler/driver/cli_args.tie —— driver CLI 参数与头部扫描子模块
+// ============================================================
+// 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
+// 拆分范式：同编译单元跨文件（文本内联）——本文件只含函数与注释，
+// 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
+// 风格 ns：函数在 `namespace driver` 内，一律 pub（driver 库 API 面）；
+// 主文件顶层 main() 以 driver.<名>() 调用。
+namespace driver {
+// 打印用法（--help）。返回 0。
+pub func usage() -> i64 {
+    dbg_txt("tiec —— tie 编译器")
+    dbg_txt("用法: tiec <input.tie> [选项]")
+    dbg_txt("  -o <file>        输出文件")
+    dbg_txt("  -l<0-3>          优化预设，默认 2：")
+    dbg_txt("                     0 = opt -O0 + clang -O0    1 = opt -O2 + clang -O0")
+    dbg_txt("                     2 = 不跑 opt + clang -O1    3 = 不跑 opt + clang -O2")
+    dbg_txt("  --opt=<0-2>      额外跑 IR 优化（opt），如 -l3 --opt=2")
+    dbg_txt("  -t<0-3>          tiec 中端优化档，默认 2")
+    dbg_txt("  --develop        开发模式预设 = -t1 -l1 -w（显式参数可覆盖）")
+    dbg_txt("  --release        发布模式预设 = -t3 -l3 -Werror（显式参数可覆盖）")
+    dbg_txt("  --mem-limit <MB>  内存上限，0 为不限")
+    dbg_txt("  --jobs <N>       编译并发度")
+    dbg_txt("  --no-cache       关闭编译缓存")
+    dbg_txt("  --no-warn        跳过警告检查")
+    dbg_txt("  -w, --warn       开启前端警告检查")
+    dbg_txt("  -Werror, --warn-error  有警告即报错")
+    dbg_txt("  --target <三元组>  交叉编译目标")
+    dbg_txt("  --emit-ir        只生成 LLVM IR，不继续编译")
+    dbg_txt("  --keep-ir        保留中间 IR 文件")
+    dbg_txt("  --ffast-math     启用 fast-math")
+    dbg_txt("  --check-bounds   数组越界检查")
+    dbg_txt("  --visibility=<档>  可见性档：a1a 全开放 / a1b 命名空间私有 / a1c 包级 / a1d 全私有，默认 a1b")
+    dbg_txt("  --shared         编译为动态库")
+    dbg_txt("  --prep-only      只做头部识别并打印结果")
+    dbg_txt("  --config <f>     构建配置文件，默认 ./config.data.tie")
+    dbg_txt("  --profile <p>    构建 profile：dev / release")
+    dbg_txt("  --backend <b>    后端实现选择，默认 win32")
+    dbg_txt("  --lib-root <dir>  内置库根目录")
+    dbg_txt("  --dll-export <names>  动态库导出白名单，逗号分隔")
+    dbg_txt("  --tieir-out <f>  编译后输出 tieir 文件")
+    dbg_txt("  --dump-irt <f>   输出 .tir 的可读摘要")
+    dbg_txt("  --dump-docs      输出 doc 注释注册表摘要")
+    dbg_txt("  --emit <阶段>:<格式>  结构化输出：阶段 tokens|ast|symtab|diag，格式 td|zd")
+    dbg_txt("  --emit-only      只做 --emit 输出，不继续编译")
+    dbg_txt("  --no-sym         不生成 .sym.zd 符号表")
+    dbg_txt("  --tink           stdout 帧流发送")
+    dbg_txt("  --tink-in        stdin 帧流接收")
+    dbg_txt("  --tink-file <f>  帧流写文件")
+    dbg_txt("  --tink-in-file <f> 帧流读文件")
+    dbg_txt("  --tink-save <dir> 收到的载荷落盘目录")
+    dbg_txt("  --help           显示本帮助")
+    return 0
+}
+
+// ==================== p.9.20 双轴优化档解析 ====================
+// 优化档值解析：严格单字符 '0'..'3'（负例返回 -1）。
+// 定义位置须早于 parse_args（tie 先定义后使用）。
+pub func parse_opt_level(s: string) -> i64 {
+    if str_len(s) != 1 {
+        return -1
+    }
+    var c = str_char(s, 0)
+    if c == "0" {
+        return 0
+    } else if c == "1" {
+        return 1
+    } else if c == "2" {
+        return 2
+    } else if c == "3" {
+        return 3
+    }
+    return -1
+}
+
+// 解析参数：返回 0 正常 / 2 请求帮助 / -1 参数错误。g_* 填充解析结果。
+pub func parse_args() -> i64 {
+    var n: i64 = arg_count()
+    var i: i64 = 0
+    var input_set: bool = false
+    // ---- 构建模式预扫描（--develop / --release）----
+    // 两组预设必须在主循环前应用，**显式参数才能无条件覆盖它们**（与书写顺序无关）。
+    // 模式只注入"默认值"：-t/-l 轴 + 警告策略；--ffast-math / --visibility /
+    // --no-sym 故意不注入（会静默改变数值语义或导出面，须显式选择）。
+    var mp: i64 = 0
+    var mj: i64 = 0
+    while mj < n {
+        var ma = arg_string(mj)
+        if ma == "--develop" {
+            if mp == 2 {
+                dbg_txt(diagcode.render_error(-1, -1, "构建模式冲突：--develop 与 --release 不能同时使用"))
+                return -1
+            }
+            mp = 1
+        } else if ma == "--release" {
+            if mp == 1 {
+                dbg_txt(diagcode.render_error(-1, -1, "构建模式冲突：--develop 与 --release 不能同时使用"))
+                return -1
+            }
+            mp = 2
+        }
+        mj = mj + 1
+    }
+    if mp == 1 {
+        // 开发：优化以"编得快、带警告"为准
+        g_build_mode = 1
+        g_tie_opt = 1
+        g_tie_set = true
+        g_llvm_opt = 1
+        g_llvm_set = true
+        g_front_warn = true
+    } else if mp == 2 {
+        // 发布：优化以"产物最快、警告即错"为准
+        g_build_mode = 2
+        g_tie_opt = 3
+        g_tie_set = true
+        g_llvm_opt = 3
+        g_llvm_set = true
+        g_warn_error = true
+        g_front_warn = true
+        g_no_warn = false
+    }
+    while i < n {
+        var a = arg_string(i)
+        if a == "--help" || a == "-h" {
+            return 2
+        }
+        if a == "--emit-ir" {
+            g_emit_ir = true
+        } else if a == "--keep-ir" {
+            g_keep_ir = true
+        } else if a == "--ffast-math" {
+            g_cli_fast_math = true
+        } else if a == "--check-bounds" {
+            g_cli_check_bounds = true
+        } else if a == "--esc-audit" {
+            // r.1.6.7：打印每处「独占免锁」判定（变量名/函数/行号）——用于人工
+            // 核对不变量：全局变量 / 函数参数 / 已泄漏变量**从不**出现在快路径。
+            g_cli_esc_audit = true
+        } else if a == "--compress-data" {
+            g_compress_data = true
+        } else if a == "--lsp" {
+            g_lsp = true
+        } else if a == "--shared" {
+            g_shared = true
+        } else if a == "--prep-only" {
+            g_prep_only = true
+        } else if a == "-o" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_output = arg_string(i + 1)
+            i = i + 1
+        } else if str_len(a) >= 2 && str_char(a, 0) == "-" && (str_char(a, 1) == "l" || str_char(a, 1) == "t") {
+            // p.9.20 双轴：-l<0-3> LLVM/clang 轴 / -t<0-3> tiec 中端轴（粘连取值）。
+            // 负例（-l9 / -lx / 分离式 -l 2）统一落到下面的明确诊断，不退化成
+            // 通用「参数错误」（否则用户无法定位是优化档写错）。
+            var lv = parse_opt_level(str.slice(a, 2, str_len(a)))
+            if lv < 0 {
+                var hint = "无效优化档 '" + a + "'：应为 -l<0-3>（LLVM/clang 轴）或 -t<0-3>（tiec 中端轴），例 -l2 -t0"
+                if str_len(a) == 2 {
+                    hint = "优化档需粘连取值：-l<0-3>（LLVM/clang 轴）/ -t<0-3>（tiec 中端轴），例 -l2 -t0；不支持 '" + a + " <值>' 分离式"
+                }
+                dbg_txt(diagcode.render_error(-1, -1, hint))
+                return -1
+            }
+            if str_char(a, 1) == "l" {
+                g_llvm_opt = lv
+                g_llvm_set = true
+            } else {
+                g_tie_opt = lv
+                g_tie_set = true
+            }
+        } else if has_prefix(a, "--visibility=") {
+            // p.9.21.4 II1 可见性梯度（L1 选项菜单）：a1a 全开放 / a1b ns 级
+            // 私有（默认，= 历史行为）/ a1c 包级 / a1d 全私有+显式导出。
+            var vs = str.slice(a, 13, str_len(a))
+            if vs == "a1a" {
+                g_cli_visibility = 0
+            } else if vs == "a1b" {
+                g_cli_visibility = 1
+            } else if vs == "a1c" {
+                g_cli_visibility = 2
+            } else if vs == "a1d" {
+                g_cli_visibility = 3
+            } else {
+                dbg_txt(diagcode.render_error(-1, -1, "无效可见性档 '" + a + "'：应为 --visibility=<a1a|a1b|a1c|a1d>（默认 a1b）"))
+                return -1
+            }
+        } else if has_prefix(a, "--llvm-opt=") {
+            g_llvm_opt = parse_opt_level(str.slice(a, 11, str_len(a)))
+            if g_llvm_opt < 0 {
+                dbg_txt(diagcode.render_error(-1, -1, "无效优化预设 '" + a + "'：应为 --llvm-opt=<0-3>"))
+                return -1
+            }
+            g_llvm_set = true
+        } else if a == "--opt" {
+            // 裸 --opt：等价 --opt=2（最常用）
+            g_opt_force = 2
+        } else if has_prefix(a, "--opt=") {
+            var ofl = parse_opt_level(str.slice(a, 6, str_len(a)))
+            if ofl < 0 || ofl > 2 {
+                dbg_txt(diagcode.render_error(-1, -1, "无效 IR 优化档 '" + a + "'：应为 --opt=<0-2>（opt -O<n> 的 n）"))
+                return -1
+            }
+            g_opt_force = ofl
+        } else if has_prefix(a, "--tie-opt=") {
+            g_tie_opt = parse_opt_level(str.slice(a, 10, str_len(a)))
+            if g_tie_opt < 0 {
+                dbg_txt(diagcode.render_error(-1, -1, "无效 tiec 优化档 '" + a + "'：应为 --tie-opt=<0-3>"))
+                return -1
+            }
+            g_tie_set = true
+        } else if str_len(a) >= 2 && str_char(a, 1) == "O" {
+            // p.9.20：-O* 硬移除（破坏性变更无兼容期），报错提示新用法
+            dbg_txt(diagcode.render_error(-1, -1, "优化参数 -O* 已移除：拆分为 -l<L>（LLVM/clang 轴）与 -t<T>（tiec 中端轴），例：-l2 -t0；长参 --llvm-opt=<0-3> / --tie-opt=<0-3>"))
+            return -1
+        } else if a == "--mem-limit" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_mem_limit = parse_int(arg_string(i + 1))
+            i = i + 1
+        } else if a == "--jobs" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_jobs = parse_int(arg_string(i + 1))
+            i = i + 1
+        } else if a == "--develop" || a == "--release" {
+            // 已在预扫描应用（此处仅消费参数，不重复赋值）
+        } else if a == "--no-cache" {
+            g_no_cache = true
+        } else if a == "--no-warn" {
+            // --no-warn：前端警告段（print_warns）与 driver 侧角色/优化档等
+            // 打印点全部静默；错误 error[E#####] 不受影响。降级行为
+            // （角色 output 回退 lib、O3→O2）照常执行，只抑制打印。
+            g_no_warn = true
+            g_front_warn = false
+        } else if a == "-w" || a == "--warn" {
+            // p.9.14.2 独立警告 pass：-w / --warn 显式开启前端警告检查
+            // （默认只报错）。与 --no-warn 相反；两者后出现者生效。
+            g_front_warn = true
+        } else if a == "-Werror" || a == "--warn-error" {
+            // -Werror：有警告即当错误。**隐含 -w**（不开警告检查就没有警告可数）。
+            // 与 --no-warn 同族：后出现者生效（--no-warn 在后 ⇒ 无警告 ⇒ 门闸通过）。
+            g_warn_error = true
+            g_front_warn = true
+            g_no_warn = false
+        } else if a == "--target" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_target = arg_string(i + 1)
+            if g_target == "trm" {
+                g_trm_mode = true
+            }
+            i = i + 1
+        } else if a == "--config" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_config_path = arg_string(i + 1)
+            i = i + 1
+        } else if a == "--profile" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_cli_profile = arg_string(i + 1)
+            i = i + 1
+        } else if a == "--backend" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_backend_cli = arg_string(i + 1)
+            if g_backend_cli == "trm" {
+                g_trm_mode = true
+            }
+            i = i + 1
+        } else if a == "--lib-root" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_lib_root_cli = arg_string(i + 1)
+            i = i + 1
+        } else if a == "--dll-export" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_dll_export_cli = arg_string(i + 1)
+            i = i + 1
+        } else if a == "--tieir-out" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_tieir_out = arg_string(i + 1)
+            i = i + 1
+        } else if a == "--dump-irt" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_dump_irt = arg_string(i + 1)
+            i = i + 1
+        } else if a == "--dump-docs" {
+            g_dump_docs = true
+        } else if a == "--emit" {
+            // p.9.22：结构化输出规格 <stage>:<fmt>（可重复；此处校验，错即明确诊断）
+            if i + 1 >= n {
+                return -1
+            }
+            var spec = arg_string(i + 1)
+            var col = find_char(str.clone(spec), ":")
+            var st = ""
+            var fm = ""
+            if col >= 0 {
+                st = str.slice(spec, 0, col)
+                fm = str.slice(spec, col + 1, str_len(spec))
+            }
+            if st != "tokens" && st != "ast" && st != "symtab" && st != "diag" {
+                dbg_txt(diagcode.render_error(-1, -1, "无效 --emit 阶段 '" + spec + "'：阶段应为 tokens|ast|symtab|diag，格式 td|zd（例 --emit ast:zd）"))
+                return -1
+            }
+            if fm != "td" && fm != "zd" {
+                dbg_txt(diagcode.render_error(-1, -1, "无效 --emit 格式 '" + spec + "'：格式应为 td|zd（例 --emit ast:zd）"))
+                return -1
+            }
+            table_push(g_emit_specs, spec)
+            i = i + 1
+        } else if a == "--emit-only" {
+            g_emit_only = true
+        } else if a == "--no-sym" {
+            g_no_sym = true
+        } else if a == "--tink" {
+            g_tink = true
+        } else if a == "--tink-serve" {
+            g_tink_serve = true
+        } else if a == "--serve-compile" {
+            g_serve_compile = true
+        } else if a == "--tink-in" {
+            g_tink_in = true
+        } else if a == "--tink-file" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_tink_file = arg_string(i + 1)
+            i = i + 1
+        } else if a == "--tink-in-file" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_tink_in_file = arg_string(i + 1)
+            i = i + 1
+        } else if a == "--tink-save" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_tink_save = arg_string(i + 1)
+            i = i + 1
+        } else if str_len(a) > 1 && str_char(a, 0) == "-" {
+            // 未知选项
+            return -1
+        } else {
+            if input_set {
+                return -1
+            }
+            g_input = a
+            input_set = true
+        }
+        i = i + 1
+    }
+    if !input_set && !g_tink_serve && !g_serve_compile {
+        // 常驻服务（--tink-serve 分析 / --serve-compile 编译）不吃命令行输入文件
+        // ——参数经请求帧传入。
+        return -1
+    }
+    return 0
+}
+
+// 目标三元组别名归一化（对齐 Rust normalize_target）：已知别名映射，
+// 未知名称原样透传。
+pub func normalize_target(t: string) -> string {
+    // r.1.6.6：空目标 → 本机默认。Windows 主机（OS=Windows_NT 存在）保持空串
+    // （传统 Windows 链接路径，行为零变化）；POSIX 主机默认 Linux 三元组——
+    // Linux 自举链（tiec-linux 编译探针/回归程序无 --target 时）走 Linux 平台
+    // 分支与链接参数（sockaddr/管道无 Windows 假设）。
+    if str_len(t) == 0 {
+        var osv = get_env("OS")
+        var osl: i64 = str_len(osv)
+        var wflag: i64 = 0
+        var j: i64 = 0
+        while j + 7 <= osl {
+            if slice(str.clone(osv), j, j + 7) == "Windows" {
+                wflag = 1
+            }
+            j = j + 1
+        }
+        if wflag == 0 {
+            return "x86_64-unknown-linux-gnu"
+        }
+        return t
+    }
+    if t == "win-x64" || t == "windows-x64" {
+        return "x86_64-pc-windows-msvc"
+    }
+    if t == "win-x86" || t == "windows-x86" {
+        return "i686-pc-windows-msvc"
+    }
+    if t == "win-arm64" || t == "windows-arm64" {
+        return "aarch64-pc-windows-msvc"
+    }
+    if t == "linux-x64" || t == "linux-x86_64" {
+        return "x86_64-unknown-linux-gnu"
+    }
+    if t == "linux-arm64" {
+        return "aarch64-unknown-linux-gnu"
+    }
+    if t == "macos-x64" || t == "macos-x86_64" {
+        return "x86_64-apple-darwin"
+    }
+    if t == "macos-arm64" {
+        return "aarch64-apple-darwin"
+    }
+    return t
+}
+
+// 从源码头部识别文件类型声明（新体系）：
+//   `type tie` → 类型 type；`type tie<X>` → X（X ∈ script/data/ui/class/logic/port/db/ir/zd）。
+//   ir 角色：直接生成 LLVM IR（.ll），不继续 opt/clang 链接（等价 --emit-ir）。
+// 头部区 = 文件最前连续行（允许空行），遇第一个非空非声明行即结束；
+// 只扫前 20 行。无声明默认 logic（可执行）。
+// 旧 `// tie:xxx` 注释指令体系已彻底移除：该类行只是普通注释，不再识别
+// 角色与 opt/target 选项（opt 仅 CLI 默认 O2；target 仅 CLI）。
+// 返回 0 成功；声明语法非法返回 -1（由 main 报错退出）。
+pub func scan_header(src: string) -> i64 {
+    // 性能修复：不再对全文件 split_lines（大文件如 irgen_expr 10k+ 行时，
+    // split 全文件→逐行建 builder 是 O(n²) 字符处理病源）。改为 in-place 扫描
+    // 前 max_head 行（最多取 20 行含空行；正常头部 1-3 行即达，常提前 return）。
+    g_role = "logic"
+    g_role_param = ""
+    g_role_mods = table_new_string()
+    var n: i64 = str_len(src)
+    var pos: i64 = 0
+    var line_no: i64 = 1
+    var max_head: i64 = 20
+    while pos < n && line_no <= max_head {
+        var ln_e = pos
+        while ln_e < n && str_char(src, ln_e) != "\n" {
+            ln_e = ln_e + 1
+        }
+        var ln = str.slice(src, pos, ln_e)
+        // CRLF 兼容：旧实现走 split_lines（逐字节跳过 13），in-place 扫描须显式
+        // 剥离行尾 \r，否则 `type tie<X>\r` 被判为非法声明（CRLF 源回归）。
+        if ln_e > pos && str_char(src, ln_e - 1) == "\r" {
+            ln = str.slice(src, pos, ln_e - 1)
+        }
+        var ln2 = trim(ln)
+        if str_len(ln2) == 0 {
+            pos = ln_e + 1
+            line_no = line_no + 1
+            continue
+        }
+        if has_prefix(str.clone(ln2), "type tie") {
+            var rest = trim(str.slice(ln2, 8, str_len(ln2)))
+            if str_len(rest) == 0 {
+                g_role = "type"
+                return 0
+            }
+            // 期望 `<X>` 形式，且无尾随内容
+            if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
+                var sub = trim(slice(str.clone(rest), 1, str_len(rest) - 1))
+                // S1.4 R2/R3：多角色解析（基础[:参数][, 修饰...]）
+                if parse_role_decl(sub) == 0 {
+                    g_role = g_role_base
+                    return 0
+                }
+                dbg_txt(diagcode.render_error(-1, -1, "文件类型声明错误: " + g_role_err + "（第 " + to_string(line_no) + " 行）"))
+                return -1
+            }
+            dbg_txt(diagcode.render_error(-1, -1, "文件类型声明错误: 非法声明 '" + ln2 + "'（第 " + to_string(line_no) + " 行），应为 `type tie` 或 `type tie<类型>`"))
+            return -1
+        }
+        // 第一个非空非声明行：头部区结束
+        break
+    }
+    return 0
+}
+
+}

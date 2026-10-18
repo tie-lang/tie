@@ -1,0 +1,87 @@
+type tie<tsh>
+// scripts/verify-tiedap.tsh.tie —— p.9.2.3 DAP 调试适配器验收脚本（tsh-role 移植 verify-tiedap.ps1）
+// ============================================================================
+// 职责：构建 tiedap.exe，按 Content-Length 帧在 stdin 模拟 DAP 客户端，驱动 tiedap 验证：
+//   initialize->initialized；setBreakpoints；launch；configurationDone->stopped；
+//   stackTrace（compute/main 帧）；variables（g_count/g_msg）；continue->terminated；disconnect。
+// 全部通过输出 "TIEDAP-VERIFY OK"，任一步失败 exit 1。
+// 移植说明：tsh 无「子进程交互式管道 stdin」内建，而 tiedap 逐字节读 stdin 且要求每帧
+//   独立管道写（整块喂文件只处理首帧）。等价方案：8 帧各写一临时文件，用 cmd
+//   `(type f0 & timeout /t 1 /nobreak & ... & type f7) | tiedap 2>&1` 逐一喂入（timeout
+//   保持管道不提前 EOF），exec_output 捕获 tiedap 全量输出做子串断言（8 个 command 名 +
+//   initialize/initialized/stopped/terminated 事件 + success/stack 帧/variables 全局，
+//   覆盖 .ps1 全部断言点）。
+
+func frame(body: string) -> string {
+    return "Content-Length: " + to_string(len(body)) + "\r\n\r\n" + body
+}
+
+var tiec = ".\\compiler\\tiec.exe"
+if arg_count() >= 1 && !is_empty(arg_at(0)) { tiec = arg_at(0) }
+
+var root = cwd()
+var src = root + "\\compiler\\dbug\\tiedap.tie"
+var exe = root + "\\compiler\\dbug\\tiedap.exe"
+var probe = replace_all(root + "\\compiler\\dbug\\_dap_probe.tie", "\\", "/")
+
+var fail = 0
+
+// 0) 构建 tiedap
+println("[0] 构建 tiedap...")
+var brc = exec_code("cmd /c " + tiec + " " + src + " -o " + exe + " --no-cache >nul 2>&1")
+if brc != 0 {
+    println("[0] TIEDAP-BUILD FAIL")
+    exit(1)
+}
+println("[0] build OK")
+
+// 8 个请求帧（路径已转正斜杠）
+var d = get_env("TEMP") + "\\dapf3"
+var _mk = mkdir_all(d)
+var _cl = exec_code("cmd /c del /Q \"" + d + "\\f*.txt\" >nul 2>&1")
+var f0 = frame("{\"seq\":1,\"type\":\"request\",\"command\":\"initialize\",\"arguments\":{}}")
+var f1 = frame("{\"seq\":2,\"type\":\"request\",\"command\":\"setBreakpoints\",\"arguments\":{\"source\":{\"path\":\"" + probe + "\"},\"breakpoints\":[{\"line\":11}]}}")
+var f2 = frame("{\"seq\":3,\"type\":\"request\",\"command\":\"launch\",\"arguments\":{\"type\":\"tie\",\"request\":\"launch\",\"program\":\"" + probe + "\"}}")
+var f3 = frame("{\"seq\":4,\"type\":\"request\",\"command\":\"configurationDone\",\"arguments\":{}}")
+var f4 = frame("{\"seq\":5,\"type\":\"request\",\"command\":\"stackTrace\",\"arguments\":{\"threadId\":1}}")
+var f5 = frame("{\"seq\":6,\"type\":\"request\",\"command\":\"variables\",\"arguments\":{\"variablesReference\":1}}")
+var f6 = frame("{\"seq\":7,\"type\":\"request\",\"command\":\"continue\",\"arguments\":{\"threadId\":1}}")
+var f7 = frame("{\"seq\":8,\"type\":\"request\",\"command\":\"disconnect\",\"arguments\":{}}")
+var _w0 = file_write(d + "\\f0.txt", f0)
+var _w1 = file_write(d + "\\f1.txt", f1)
+var _w2 = file_write(d + "\\f2.txt", f2)
+var _w3 = file_write(d + "\\f3.txt", f3)
+var _w4 = file_write(d + "\\f4.txt", f4)
+var _w5 = file_write(d + "\\f5.txt", f5)
+var _w6 = file_write(d + "\\f6.txt", f6)
+var _w7 = file_write(d + "\\f7.txt", f7)
+
+// 逐帧喂入（每帧独立 type + timeout 保持管道存活，等价于 .ps1 的逐 Write+Close）
+var cmdline = "( type \"" + d + "\\f0.txt\" & timeout /t 1 /nobreak >nul & type \"" + d + "\\f1.txt\" & timeout /t 1 /nobreak >nul & type \"" + d + "\\f2.txt\" & timeout /t 1 /nobreak >nul & type \"" + d + "\\f3.txt\" & timeout /t 1 /nobreak >nul & type \"" + d + "\\f4.txt\" & timeout /t 1 /nobreak >nul & type \"" + d + "\\f5.txt\" & timeout /t 1 /nobreak >nul & type \"" + d + "\\f6.txt\" & timeout /t 1 /nobreak >nul & type \"" + d + "\\f7.txt\" ) | \"" + exe + "\" 2>&1"
+var out = exec_output("cmd /c " + cmdline)
+
+// 清理临时帧文件
+var _cl2 = exec_code("cmd /c rd /s /q \"" + d + "\" >nul 2>&1")
+
+// --- 断言（覆盖 .ps1 全部断言点）---
+if !contains(out, "\"command\":\"initialize\"") { println("[1] INIT-REQ MISSING"); fail = 1 }
+if !contains(out, "\"success\":true") { println("[1a] INIT-RESPONSE FAIL"); fail = 1 }
+if !contains(out, "\"event\":\"initialized\"") { println("[1b] INITIALIZED-EVENT FAIL"); fail = 1 }
+if !contains(out, "\"command\":\"setBreakpoints\"") { println("[1c] SETBP REQ MISSING"); fail = 1 }
+if !contains(out, "\"command\":\"launch\"") { println("[1d] LAUNCH REQ MISSING"); fail = 1 }
+if !contains(out, "\"command\":\"configurationDone\"") { println("[1e] CFGDONE REQ MISSING"); fail = 1 }
+if !contains(out, "\"event\":\"stopped\"") { println("[2] NO-STOPPED-EVENT FAIL"); fail = 1 }
+if !contains(out, "\"command\":\"stackTrace\"") { println("[3] NO-STACKTRACE FAIL"); fail = 1 }
+if !(contains(out, "\"compute\"") && contains(out, "\"main\"")) { println("[3] STACKTRACE-FRAMES FAIL"); fail = 1 }
+if !contains(out, "\"command\":\"variables\"") { println("[4] NO-VARIABLES FAIL"); fail = 1 }
+if !(contains(out, "\"g_count\"") && contains(out, "\"g_msg\"")) { println("[4] VARIABLES-GLOBALS FAIL"); fail = 1 }
+if !contains(out, "\"command\":\"continue\"") { println("[5] CONTINUE REQ MISSING"); fail = 1 }
+if !contains(out, "\"event\":\"terminated\"") { println("[5] NO-TERMINATED FAIL"); fail = 1 }
+if !contains(out, "\"command\":\"disconnect\"") { println("[5] DISCONNECT REQ MISSING"); fail = 1 }
+
+if fail == 0 {
+    println("TIEDAP-VERIFY OK")
+    exit(0)
+}
+println("TIEDAP-VERIFY FAILED")
+exit(1)

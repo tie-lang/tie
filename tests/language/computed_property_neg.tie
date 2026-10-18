@@ -1,0 +1,22 @@
+type tie<logic>
+
+// ============================================================
+// p.8.2.7 负例：只读计算属性（仅 getter、无 setter）写 `obj.attr = v` → 编译拒绝。
+// Rect::area 只有 getter（无 area_set）→ `r.area = 5` 命中未定义字段诊断
+//（E00000 兜底 / 未定义字段路径不变；计算属性不产存储槽，故无 setter 写即拒绝）。
+// ============================================================
+
+struct Rect {
+    var w: i64 = 0
+    var h: i64 = 0
+}
+namespace Rect {
+    pub func area(self: Rect) -> i64 {
+        return self.w * self.h
+    }
+}
+
+func main() {
+    var r = Rect(6, 4)
+    r.area = 5   // 只读属性写 → 编译错误（无 setter / 未定义字段）
+}

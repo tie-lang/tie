@@ -1,0 +1,704 @@
+type tie<class>
+// compiler/backend/irgen_conv.tie —— 生成器 L3：数值/字符串转换辅助（parse_float/parse_dec/parse_octal/clen/…）
+// ============================================================
+// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// ==================== 去 Rust 桥：to_string(f64) / parse_float（p.6.4.4） ====================
+// f64 → 十进制字符串，替代 Rust 桥 tie_to_string_f64。**避免 CRT snprintf/printf 式变参**：
+// Windows 的 clang 对**手写 IR 的 FP 变参调用**（snprintf(buf,32,"%.17g",double)）在 x64
+// 阴影区传参会错位（实测 double 落错误槽 → 格式化出 1e-322 垃圾），故改用**非变参** CRT
+// `char* _gcvt(double value, int digits, char *buffer)`：把 %g 风格数字直接写入给定缓冲
+//（17 位有效数字；科学计数阈值对齐 libc）。有限精度对齐 Rust 最短表示差异可接受
+//（3.14→"3.1400000000000001" 含 "3.14"、1e100→"1.e+100" 含 "e+100"、1.0→去尾点"1"）。
+// 签名 v:f64 → 带头字符串数据指针 {len头,数据,\0}。全直线式（无块图 → 无重编号风险）。
+func tig_f64_to_str(v: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var T8 = types.named(TK_I8)
+    var I32 = types.named(TK_I32)
+    var F64 = types.named(TK_F64)
+    var P8 = types.ptr_of(T8)
+    var cdot = tig_int_lit_ty(46, T64)
+    var one64 = tig_int_lit_ty(1, T64)
+    // 1. raw 缓冲 64B（K_PTR 返回绕 op36 对 TK_STR 的 strlen 扫描——漏洞 A 类隐患）
+    var buf = s21_raw_alloc_str(tig_int_lit(64))
+    // 2. _gcvt(v, 17, buf) → %g 风格写入 buf（返回 char* 忽略；非变参，参数直传正确）
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, F64); table_push(avs, v)
+    table_push(ats, I32); table_push(avs, tig_int_lit_ty(17, I32))
+    table_push(ats, types.named(TK_STR)); table_push(avs, buf)
+    tig_ext_call_typed("_gcvt", ats, avs, P8)
+    // 3. 长度 = strlen(buf)（_gcvt 输出 NUL 结尾）
+    var len = tig_ext_call1("strlen", buf, types.named(TK_STR), T64)
+    // 4. 去尾点：_gcvt 对整数给 "1." / "0." → 若末字节 '.' 则长度 -1（%g 亦如此）
+    var lastp = s21_gep(buf, s21_bin(1, len, one64), false)  // buf + len - 1
+    var lastb = s21_zext(s21_load(lastp, T8), T8)
+    var isdot = tig_icmp_c(lastb, cdot, 0)  // eq '.'
+    var len2 = tig_select_i(isdot, s21_bin(1, len, one64), len, T64)
+    // 5. 构造带头串：SSO 分配 len2、写头、拷数据、尾 \0
+    var out = s21_sso_alloc(len2)
+    s21_store(s21_gep(out, 0, true), len2, T64)  // 长度头
+    var d0 = s21_gep(out, 8, true)
+    s21_memcpy_if(d0, buf, len2)
+    s21_store(s21_gep(d0, len2, false), tig_int_lit_ty(0, T8), T8)  // 尾 \0
+    var pi = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint
+    ir.add_operand(pi, d0, 0)
+    var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr → ptr
+    ir.add_operand(ip, ir.get_value(pi), 0)
+    return ir.get_value(ip)
+}
+// 字符串 → f64，替代 Rust 桥 tie_parse_float。签名 s:string + ok 出参槽（caller
+// alloca i8 出参，语义与 tig_parse_int 一致：无效 → ok=0 返回 0.0）。
+// 有限精度实现：逐位十进制 i64 尾数累积 + libm pow(10.0, e) 缩放。尾数最多累计
+// 18 位（>18：整数段折叠计数计入指数 big_slot（×10），小数段丢弃——精度 <1e-18
+// 可忽略），不保证完全对齐 Rust str::parse 最短舍入，但覆盖常见 "3.14" / "-2.5e3" /
+// "0.5" / "1e10" 及绝大多数值。合法输入 [±]int[.frac][(e|E)[±]exp] 且整数或小数
+// 至少一位数字；其余（空串/仅符号/"1e"无指数数字等）→ fail。
+// 结果 = mant × 10^(exp_total)，exp_total = (±exp) - fracn + big。
+// 控制流：entry→sign→int 循环→dot→frac 循环→have→exp→(succ/fail)→exit。
+// 全部跨块状态落内存槽；结果 f64 落 rs_slot，exit 统一写 ok 槽返回。
+func tig_parse_float(s: i64, ok_ptr: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var T8 = types.named(TK_I8)
+    var F64 = types.named(TK_F64)
+    var z64 = tig_int_lit_ty(0, T64)
+    var one = tig_int_lit_ty(1, T64)
+    var ten = tig_int_lit_ty(10, T64)
+    var c48 = tig_int_lit_ty(48, T64)
+    var c57 = tig_int_lit_ty(57, T64)
+    var cpl = tig_int_lit_ty(43, T64)   // '+'
+    var cmi = tig_int_lit_ty(45, T64)   // '-'
+    var cdot = tig_int_lit_ty(46, T64)  // '.'
+    var ce2 = tig_int_lit_ty(101, T64)  // 'e'
+    var cE2 = tig_int_lit_ty(69, T64)   // 'E'
+    var CLIM = tig_int_lit_ty(100000000000000000, T64)  // 1e17 尾数累积上限
+    var n = s21_str_head_len(s)
+    // 状态槽（跨块内存）：i / neg / dig / digf / mant / fracn / exps /
+    // expneg / expdig / big / et / ok / 结果 f64 rs
+    var i_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(i_a, T64, 2); var i_ptr = ir.get_value(i_a)
+    var ng_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(ng_a, T64, 2); var ng_ptr = ir.get_value(ng_a)
+    var dg_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(dg_a, T64, 2); var dg_ptr = ir.get_value(dg_a)
+    var df_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(df_a, T64, 2); var df_ptr = ir.get_value(df_a)
+    var mnt_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(mnt_a, T64, 2); var mnt_ptr = ir.get_value(mnt_a)
+    var frc_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(frc_a, T64, 2); var frc_ptr = ir.get_value(frc_a)
+    var esp_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(esp_a, T64, 2); var esp_ptr = ir.get_value(esp_a)
+    var enp_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(enp_a, T64, 2); var enp_ptr = ir.get_value(enp_a)
+    var edg_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(edg_a, T64, 2); var edg_ptr = ir.get_value(edg_a)
+    var big_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(big_a, T64, 2); var big_ptr = ir.get_value(big_a)
+    var et_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(et_a, T64, 2); var et_ptr = ir.get_value(et_a)
+    var ok_a = ir.new_inst(g_cur_block, 20, T64); ir.add_operand(ok_a, T64, 2); var ok2_ptr = ir.get_value(ok_a)
+    var rs_a = ir.new_inst(g_cur_block, 20, F64); ir.add_operand(rs_a, F64, 2); var rs_ptr = ir.get_value(rs_a)
+    // 初始化
+    s21_store(i_ptr, z64, T64)
+    s21_store(ng_ptr, z64, T64)
+    s21_store(dg_ptr, z64, T64)
+    s21_store(df_ptr, z64, T64)
+    s21_store(mnt_ptr, z64, T64)
+    s21_store(frc_ptr, z64, T64)
+    s21_store(esp_ptr, z64, T64)
+    s21_store(enp_ptr, z64, T64)
+    s21_store(edg_ptr, z64, T64)
+    s21_store(big_ptr, z64, T64)
+    s21_store(et_ptr, z64, T64)
+    s21_store(ok2_ptr, z64, T64)
+    s21_store(rs_ptr, tig_float_lit(interner.intern("0.0")), F64)
+    // 块
+    var sign_blk = ir.new_block(g_cur_func, interner.intern("pf.sign"))
+    var ic_blk = ir.new_block(g_cur_func, interner.intern("pf.ic"))
+    var ib_blk = ir.new_block(g_cur_func, interner.intern("pf.ib"))
+    var iv_blk = ir.new_block(g_cur_func, interner.intern("pf.iv"))
+    var ia_blk = ir.new_block(g_cur_func, interner.intern("pf.ia"))
+    var ibig_blk = ir.new_block(g_cur_func, interner.intern("pf.ig"))
+    var is_blk = ir.new_block(g_cur_func, interner.intern("pf.is"))
+    var dot_t = ir.new_block(g_cur_func, interner.intern("pf.dt"))
+    var dot_c = ir.new_block(g_cur_func, interner.intern("pf.dc"))
+    var dc_blk = ir.new_block(g_cur_func, interner.intern("pf.dd"))
+    var fc_blk = ir.new_block(g_cur_func, interner.intern("pf.fc"))
+    var fb_blk = ir.new_block(g_cur_func, interner.intern("pf.fb"))
+    var fv_blk = ir.new_block(g_cur_func, interner.intern("pf.fv"))
+    var fa_blk = ir.new_block(g_cur_func, interner.intern("pf.fa"))
+    var fsk_blk = ir.new_block(g_cur_func, interner.intern("pf.fk"))
+    var fs_blk = ir.new_block(g_cur_func, interner.intern("pf.fs"))
+    var hv_blk = ir.new_block(g_cur_func, interner.intern("pf.hv"))
+    var esc_blk = ir.new_block(g_cur_func, interner.intern("pf.e"))
+    var ec_blk = ir.new_block(g_cur_func, interner.intern("pf.ec"))
+    var esg_blk = ir.new_block(g_cur_func, interner.intern("pf.es"))
+    var esb_blk = ir.new_block(g_cur_func, interner.intern("pf.esb"))
+    var ebc_blk = ir.new_block(g_cur_func, interner.intern("pf.eb"))
+    var ebd_blk = ir.new_block(g_cur_func, interner.intern("pf.ed"))
+    var eac_blk = ir.new_block(g_cur_func, interner.intern("pf.ea"))
+    var eend_blk = ir.new_block(g_cur_func, interner.intern("pf.ee"))
+    var eff_blk = ir.new_block(g_cur_func, interner.intern("pf.ef"))
+    // pf.end：**全文消费校验**——数值段结束后必须已到串尾。
+    // 缺此块时 "1.2.3" / "12abc" 都被当成 1.2 / 12 静默接受（尾随垃圾被丢弃），
+    // 与「解析失败触发内建检查」的语义不符（Rust str::parse 亦要求整串合法）。
+    var pend_blk = ir.new_block(g_cur_func, interner.intern("pf.end"))
+    var okb_blk = ir.new_block(g_cur_func, interner.intern("pf.ok"))
+    var use_blk = ir.new_block(g_cur_func, interner.intern("pf.use"))
+    var pow_blk = ir.new_block(g_cur_func, interner.intern("pf.pow"))
+    var ngb_blk = ir.new_block(g_cur_func, interner.intern("pf.ngb"))
+    var ngy_blk = ir.new_block(g_cur_func, interner.intern("pf.ngy"))
+    var fin_blk = ir.new_block(g_cur_func, interner.intern("pf.fin"))
+    var fail_blk = ir.new_block(g_cur_func, interner.intern("pf.fail"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("pf.exit"))
+    // entry：n==0 → fail；否则 sign
+    var c_empty = tig_icmp_c(n, z64, 0)
+    var cb0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb0, c_empty, 0)
+    ir.add_operand(cb0, fail_blk, 1)
+    ir.add_operand(cb0, sign_blk, 1)
+    // sign：i = has_sign?1:0；neg = is_minus；→ ic
+    g_cur_block = sign_blk
+    var b0 = s21_str_byte(s, z64)
+    var is_plus = tig_icmp_c(b0, cpl, 0)
+    var is_minus = tig_icmp_c(b0, cmi, 0)
+    var has_sign = tig_or_i1(is_plus, is_minus)
+    s21_store(i_ptr, tig_select_i(has_sign, one, z64, T64), T64)
+    s21_store(ng_ptr, tig_select_i(is_minus, one, z64, T64), T64)
+    var bsign = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bsign, ic_blk, 1)
+    // ic：i<n → ib；否则 dot_t
+    g_cur_block = ic_blk
+    var c_i1 = tig_icmp_c(s21_load(i_ptr, T64), n, 6)  // ult
+    var cb1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb1, c_i1, 0)
+    ir.add_operand(cb1, ib_blk, 1)
+    ir.add_operand(cb1, dot_t, 1)
+    // ib：字节数字？→ iv；否则 dot_t
+    g_cur_block = ib_blk
+    var bv2 = s21_str_byte(s, s21_load(i_ptr, T64))
+    var isd2 = tig_and_i1(tig_icmp_c(bv2, c48, 5), tig_icmp_c(bv2, c57, 4))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, isd2, 0)
+    ir.add_operand(cb2, iv_blk, 1)
+    ir.add_operand(cb2, dot_t, 1)
+    // iv：dig=1；mant<CLIM → ia（累积）else ibig（折计入指数）
+    g_cur_block = iv_blk
+    s21_store(dg_ptr, one, T64)
+    var mlt3 = tig_icmp_c(s21_load(mnt_ptr, T64), CLIM, 2)  // slt
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, mlt3, 0)
+    ir.add_operand(cb3, ia_blk, 1)
+    ir.add_operand(cb3, ibig_blk, 1)
+    // ia：mant = mant*10 + (b-48)；→ is
+    g_cur_block = ia_blk
+    var bv4 = s21_str_byte(s, s21_load(i_ptr, T64))  // 先 load 再来 new_inst（防操作数段交错）
+    var cm4 = s21_load(mnt_ptr, T64)
+    var m4 = ir.new_inst(g_cur_block, 2, T64)  // mul
+    ir.add_operand(m4, cm4, 0)
+    ir.add_operand(m4, ten, 0)
+    var d4 = s21_bin(1, bv4, c48)                       // sub b-48
+    var nm4 = s21_bin(0, ir.get_value(m4), d4)          // add
+    s21_store(mnt_ptr, nm4, T64)
+    var bia = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bia, is_blk, 1)
+    // ibig：big = big+1；→ is
+    g_cur_block = ibig_blk
+    s21_store(big_ptr, s21_bin(0, s21_load(big_ptr, T64), one), T64)
+    var bib = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bib, is_blk, 1)
+    // is：i = i+1；→ ic
+    g_cur_block = is_blk
+    s21_store(i_ptr, s21_bin(0, s21_load(i_ptr, T64), one), T64)
+    var bis = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bis, ic_blk, 1)
+    // dot_t：i<n → dot_c（复核 '.')；否则 hv
+    g_cur_block = dot_t
+    var c_i5 = tig_icmp_c(s21_load(i_ptr, T64), n, 6)
+    var cb5 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb5, c_i5, 0)
+    ir.add_operand(cb5, dot_c, 1)
+    ir.add_operand(cb5, hv_blk, 1)
+    // dot_c：byte=='.' → dc（消费）else hv
+    g_cur_block = dot_c
+    var bv5 = s21_str_byte(s, s21_load(i_ptr, T64))
+    var isdot = tig_icmp_c(bv5, cdot, 0)
+    var cb5b = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb5b, isdot, 0)
+    ir.add_operand(cb5b, dc_blk, 1)
+    ir.add_operand(cb5b, hv_blk, 1)
+    // dc：i = i+1；→ fc
+    g_cur_block = dc_blk
+    s21_store(i_ptr, s21_bin(0, s21_load(i_ptr, T64), one), T64)
+    var bdc = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bdc, fc_blk, 1)
+    // fc：i<n → fb；否则 hv
+    g_cur_block = fc_blk
+    var c_i6 = tig_icmp_c(s21_load(i_ptr, T64), n, 6)
+    var cb6 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb6, c_i6, 0)
+    ir.add_operand(cb6, fb_blk, 1)
+    ir.add_operand(cb6, hv_blk, 1)
+    // fb：字节数字？→ fv；否则 hv
+    g_cur_block = fb_blk
+    var bv6 = s21_str_byte(s, s21_load(i_ptr, T64))
+    var isd6 = tig_and_i1(tig_icmp_c(bv6, c48, 5), tig_icmp_c(bv6, c57, 4))
+    var cb7 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb7, isd6, 0)
+    ir.add_operand(cb7, fv_blk, 1)
+    ir.add_operand(cb7, hv_blk, 1)
+    // fv：mant<CLIM → fa（累积）else fsk（丢弃小数位）
+    g_cur_block = fv_blk
+    var mlt7 = tig_icmp_c(s21_load(mnt_ptr, T64), CLIM, 2)
+    var cb8 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb8, mlt7, 0)
+    ir.add_operand(cb8, fa_blk, 1)
+    ir.add_operand(cb8, fsk_blk, 1)
+    // fa：mant=mant*10+d；fracn++；digf=1；→ fs
+    g_cur_block = fa_blk
+    var bv7 = s21_str_byte(s, s21_load(i_ptr, T64))
+    var cm7 = s21_load(mnt_ptr, T64)
+    var m7 = ir.new_inst(g_cur_block, 2, T64)  // mul
+    ir.add_operand(m7, cm7, 0)
+    ir.add_operand(m7, ten, 0)
+    var d7 = s21_bin(1, bv7, c48)
+    var nm7 = s21_bin(0, ir.get_value(m7), d7)
+    s21_store(mnt_ptr, nm7, T64)
+    s21_store(frc_ptr, s21_bin(0, s21_load(frc_ptr, T64), one), T64)
+    s21_store(df_ptr, one, T64)
+    var bfa = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bfa, fs_blk, 1)
+    // fsk：digf=1（有效但超 18 位丢弃）；→ fs
+    g_cur_block = fsk_blk
+    s21_store(df_ptr, one, T64)
+    var bfk = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bfk, fs_blk, 1)
+    // fs：i = i+1；→ fc
+    g_cur_block = fs_blk
+    s21_store(i_ptr, s21_bin(0, s21_load(i_ptr, T64), one), T64)
+    var bfs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bfs, fc_blk, 1)
+    // hv：dig||digf → esc；否则 fail
+    g_cur_block = hv_blk
+    var hasd = tig_or_i1(tig_icmp_c(s21_load(dg_ptr, T64), z64, 1), tig_icmp_c(s21_load(df_ptr, T64), z64, 1))
+    var cbh = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbh, hasd, 0)
+    ir.add_operand(cbh, esc_blk, 1)
+    ir.add_operand(cbh, fail_blk, 1)
+    // esc：i<n 且 byte==e/E → ec；否则 eff（无指数）
+    g_cur_block = esc_blk
+    var c_i8 = tig_icmp_c(s21_load(i_ptr, T64), n, 6)
+    var ebd_t8 = ir.new_block(g_cur_func, interner.intern("pf.escan"))
+    var cb9 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb9, c_i8, 0)
+    ir.add_operand(cb9, ebd_t8, 1)
+    ir.add_operand(cb9, eff_blk, 1)
+    // esd：byte==e||E → ec else eff
+    g_cur_block = ebd_t8
+    var bv8 = s21_str_byte(s, s21_load(i_ptr, T64))
+    var ise = tig_or_i1(tig_icmp_c(bv8, ce2, 0), tig_icmp_c(bv8, cE2, 0))
+    var cb9b = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb9b, ise, 0)
+    ir.add_operand(cb9b, ec_blk, 1)
+    ir.add_operand(cb9b, eff_blk, 1)
+    // ec：i = i+1（消费 e/E）；→ esg
+    g_cur_block = ec_blk
+    s21_store(i_ptr, s21_bin(0, s21_load(i_ptr, T64), one), T64)
+    var bec = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bec, esg_blk, 1)
+    // esg：i<n → esb；否则 fail（裸 "1e"）
+    g_cur_block = esg_blk
+    var c_ie = tig_icmp_c(s21_load(i_ptr, T64), n, 6)
+    var cbe = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbe, c_ie, 0)
+    ir.add_operand(cbe, esb_blk, 1)
+    ir.add_operand(cbe, fail_blk, 1)
+    // esb：可选 +/-：expneg=is_minus；若有符号 i++；→ ebc
+    g_cur_block = esb_blk
+    var bv9 = s21_str_byte(s, s21_load(i_ptr, T64))
+    var e_plus = tig_icmp_c(bv9, cpl, 0)
+    var e_minus = tig_icmp_c(bv9, cmi, 0)
+    var e_sign = tig_or_i1(e_plus, e_minus)
+    s21_store(enp_ptr, tig_select_i(e_minus, one, z64, T64), T64)
+    var i_adj = tig_select_i(e_sign, one, z64, T64)
+    s21_store(i_ptr, s21_bin(0, s21_load(i_ptr, T64), i_adj), T64)
+    var besb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(besb, ebc_blk, 1)
+    // ebc：i<n → ebd；否则 eend
+    g_cur_block = ebc_blk
+    var c_ie2 = tig_icmp_c(s21_load(i_ptr, T64), n, 6)
+    var cbe2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbe2, c_ie2, 0)
+    ir.add_operand(cbe2, ebd_blk, 1)
+    ir.add_operand(cbe2, eend_blk, 1)
+    // ebd：字节数字？→ eac；否则 eend
+    g_cur_block = ebd_blk
+    var bve = s21_str_byte(s, s21_load(i_ptr, T64))
+    var isd_e = tig_and_i1(tig_icmp_c(bve, c48, 5), tig_icmp_c(bve, c57, 4))
+    var cbde = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbde, isd_e, 0)
+    ir.add_operand(cbde, eac_blk, 1)
+    ir.add_operand(cbde, eend_blk, 1)
+    // eac：exps=exps*10+d；expdig=1；i++；→ ebc
+    g_cur_block = eac_blk
+    var bve2 = s21_str_byte(s, s21_load(i_ptr, T64))
+    var cme = s21_load(esp_ptr, T64)
+    var me = ir.new_inst(g_cur_block, 2, T64)  // mul
+    ir.add_operand(me, cme, 0)
+    ir.add_operand(me, ten, 0)
+    var de = s21_bin(1, bve2, c48)
+    var nme = s21_bin(0, ir.get_value(me), de)
+    s21_store(esp_ptr, nme, T64)
+    s21_store(edg_ptr, one, T64)
+    s21_store(i_ptr, s21_bin(0, s21_load(i_ptr, T64), one), T64)
+    var beac = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(beac, ebc_blk, 1)
+    // eend：expdig!=0 → eff（指数有效）；否则 fail（"1e"/"1e+" 无数字）
+    g_cur_block = eend_blk
+    var ed_c = tig_icmp_c(s21_load(edg_ptr, T64), z64, 1)  // ne
+    var cbed = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbed, ed_c, 0)
+    ir.add_operand(cbed, eff_blk, 1)
+    ir.add_operand(cbed, fail_blk, 1)
+    // eff：exptot = (±exps) - fracn + big；→ pend（尾随字符校验）
+    g_cur_block = eff_blk
+    var esv = s21_load(esp_ptr, T64)
+    var enpv = s21_load(enp_ptr, T64)
+    var is_en = tig_icmp_c(enpv, z64, 1)  // ne
+    var esub = ir.new_inst(g_cur_block, 1, T64)  // sub 0 - esv
+    ir.add_operand(esub, z64, 0)
+    ir.add_operand(esub, esv, 0)
+    var ev = tig_select_i(is_en, ir.get_value(esub), esv, T64)
+    var t1 = s21_bin(1, ev, s21_load(frc_ptr, T64))           // ev - fracn
+    var etot = s21_bin(0, t1, s21_load(big_ptr, T64))         // + big
+    s21_store(et_ptr, etot, T64)
+    var beff = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(beff, pend_blk, 1)
+    // pend：i == n（整串消费完）→ okb；否则 fail
+    g_cur_block = pend_blk
+    var at_end = tig_icmp_c(s21_load(i_ptr, T64), n, 0)  // eq：i == n
+    var cbpe = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbpe, at_end, 0)
+    ir.add_operand(cbpe, okb_blk, 1)
+    ir.add_operand(cbpe, fail_blk, 1)
+    // okb：ok=1；fmant = sitofp(mant)；et==0 → use else pow
+    g_cur_block = okb_blk
+    s21_store(ok2_ptr, one, T64)
+    var fmant = tig_to_f64(s21_load(mnt_ptr, T64), T64)
+    var ezero = tig_icmp_c(s21_load(et_ptr, T64), z64, 0)  // eq
+    var cbok = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbok, ezero, 0)
+    ir.add_operand(cbok, use_blk, 1)
+    ir.add_operand(cbok, pow_blk, 1)
+    // use：rs = fmant；→ ngb
+    g_cur_block = use_blk
+    s21_store(rs_ptr, fmant, F64)
+    var buse = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(buse, ngb_blk, 1)
+    // pow：eF = sitofp(et)；p = pow(10.0, eF)；rs = fmant * p；→ ngb
+    g_cur_block = pow_blk
+    var eF = tig_to_f64(s21_load(et_ptr, T64), T64)
+    var p = tig_ext_call2("pow", tig_float_lit(interner.intern("10.0")), F64, eF, F64, F64)
+    var fm = ir.new_inst(g_cur_block, 15, F64)  // fmul
+    ir.add_operand(fm, fmant, 0)
+    ir.add_operand(fm, p, 0)
+    s21_store(rs_ptr, ir.get_value(fm), F64)
+    var bpow = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bpow, ngb_blk, 1)
+    // ngb：neg!=0 → ngy else fin
+    g_cur_block = ngb_blk
+    var is_neg = tig_icmp_c(s21_load(ng_ptr, T64), z64, 1)  // ne
+    var cbng = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbng, is_neg, 0)
+    ir.add_operand(cbng, ngy_blk, 1)
+    ir.add_operand(cbng, fin_blk, 1)
+    // ngy：rs = 0.0 - rs；→ fin
+    g_cur_block = ngy_blk
+    var fzero = tig_float_lit(interner.intern("0.0"))  // 先建常量再建 fsub（防操作数段交错）
+    var rcv = s21_load(rs_ptr, F64)
+    var fs2 = ir.new_inst(g_cur_block, 14, F64)  // fsub
+    ir.add_operand(fs2, fzero, 0)
+    ir.add_operand(fs2, rcv, 0)
+    s21_store(rs_ptr, ir.get_value(fs2), F64)
+    var bng = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bng, fin_blk, 1)
+    // fin：→ exit
+    g_cur_block = fin_blk
+    var bfin = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bfin, exit_blk, 1)
+    // fail：ok 保持 0，rs 保持 0.0；→ exit
+    g_cur_block = fail_blk
+    var bfail = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bfail, exit_blk, 1)
+    // exit：写外部 ok 槽（trunc i8）；返回 rs（f64）
+    g_cur_block = exit_blk
+    var okv = s21_load(ok2_ptr, T64)
+    s21_store(ok_ptr, s21_trunc_i8(okv), T8)
+    return s21_load(rs_ptr, F64)
+}
+
+// ==================== to_i64(s) / to_f64(s)：文本解析 + 内建检查 ====================
+// 实参是文本时的 to_ 族入口（规范 §2.11「文本解析为数值；解析失败触发内建检查」）。
+// 复用既有解析器：to_i64 → tig_parse_int（十进制，语义 = Rust str::parse）、
+// to_f64 → tig_parse_float（[±]int[.frac][(e|E)[±]exp]）。
+// ok 出参为 0（空串 / 仅符号 / 含非数字字节）⇒ printf 诊断 + tig_panic_tail：
+// **与越界/除零同一失败语义**（处于 catch_panic 捕获域 → longjmp；否则 exit(1)），
+// 不另立一套。成功 ⇒ 返回解析值（i64 / f64，与 as_dst 一致）。
+// line 为调用点源码行号（编译期常量，直接内联进格式串参数）。
+func tig_str_num_checked(s: i64, to_float: bool, nm: string, line: i64) -> i64 {
+    var T8 = types.named(TK_I8)
+    // ok 出参槽：两个解析器都按 i8 写（0/1）
+    var pio = ir.new_inst(g_cur_block, 20, T8)  // alloca i8
+    ir.add_operand(pio, T8, 2)
+    var okp = ir.get_value(pio)
+    // 解析（内部自建块图，返回时 g_cur_block 已停在其 exit 块）
+    var rv: i64 = 0
+    if to_float {
+        rv = tig_parse_float(s, okp)
+    } else {
+        rv = tig_parse_int(s, okp)
+    }
+    var okv = s21_load(okp, T8)
+    var bad = tig_cmp_const(okv, 0, 0, T8)  // ok == 0 → 解析失败
+    var pnb = ir.new_block(g_cur_func, interner.intern("tsn.n"))  // 解析失败
+    var okb = ir.new_block(g_cur_func, interner.intern("tsn.o"))  // 正常继续
+    var cbr = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cbr, bad, 0)
+    ir.add_operand(cbr, pnb, 1)
+    ir.add_operand(cbr, okb, 1)
+    g_cur_block = pnb
+    // 消息为 ASCII：走 printf 直写（中文须经控制台编码契约，见 tig_print_str_line）
+    var lin = tig_int_lit(line)
+    var fmt = interner.intern(nm + ": invalid numeric text in " + g_cur_fn_name + " line %lld\n")
+    var pin = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+    ir.add_operand(pin, fmt, 0)
+    ir.add_operand(pin, lin, 0)
+    tig_panic_tail(okb)  // 已接管续块 okb；调用方勿再补 terminator
+    return rv
+}
+
+// i1 取反（xor i1 v, true；位越界判定组合用）
+func tig_not_i1(v: i64) -> i64 {
+    var one = tig_bool_lit(1)
+    var x = ir.new_inst(g_cur_block, 8, types.named(TK_BOOL))  // xor
+    ir.add_operand(x, v, 0)
+    ir.add_operand(x, one, 0)
+    return ir.get_value(x)
+}
+// trunc i64 → i32（ReadFile 的 DWORD count 参数用；declare 由调用签名推导为 i32）
+func sio_trunc_i32(v: i64) -> i64 {
+    var t = ir.new_inst(g_cur_block, 37, types.named(TK_I32))  // trunc
+    ir.add_operand(t, types.named(TK_I64), 2)
+    ir.add_operand(t, v, 0)
+    return ir.get_value(t)
+}
+// ==================== p.6.4.2 / p.6.4.3 文件系统原语内联（UTF-16 安全 Win32） ====================
+func tig_trunc_i32(v: i64) -> i64 {
+    var t = ir.new_inst(g_cur_block, 37, types.named(TK_I32))
+    ir.add_operand(t, types.named(TK_I64), 2)
+    ir.add_operand(t, v, 0)
+    return ir.get_value(t)
+}
+func tig_p2i(p: i64) -> i64 {
+    var pi = ir.new_inst(g_cur_block, 24, types.named(TK_I64))  // ptrtoint
+    ir.add_operand(pi, p, 0)
+    return ir.get_value(pi)
+}
+// 解析 buf[lo..hi) 十进制 ASCII 数字 → i64
+func tig_parse_dec(buf: i64, lo: i64, hi: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var aa = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(aa, T64, 2)
+    var ap = ir.get_value(aa)
+    var ka = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ka, T64, 2)
+    var kp = ir.get_value(ka)
+    s21_store(ap, tig_int_lit(0), T64)
+    s21_store(kp, lo, T64)
+    var hd = ir.new_block(g_cur_func, interner.intern("pd.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("pd.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("pd.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var kv = s21_load(kp, T64)
+    var kc = tig_icmp_c(kv, hi, 2)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, kc, 0)
+    ir.add_operand(cb, bd, 1)
+    ir.add_operand(cb, ex, 1)
+    g_cur_block = bd
+    var kv2 = s21_load(kp, T64)
+    var b = s21_zext(s21_load(s21_gep(buf, kv2, false), I8), I8)
+    var av = s21_load(ap, T64)
+    var tenv = tig_int_lit(10)
+    var mul = ir.new_inst(g_cur_block, 2, T64)
+    ir.add_operand(mul, av, 0)
+    ir.add_operand(mul, tenv, 0)
+    var nv = s21_bin(0, ir.get_value(mul), s21_bin(1, b, tig_int_lit(48)))
+    s21_store(ap, nv, T64)
+    s21_store(kp, s21_bin(0, kv2, tig_int_lit(1)), T64)
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)
+    g_cur_block = ex
+    return s21_load(ap, T64)
+}
+// 解析 HTTP Content-Length 头值：cpos = "content-length:" 位置；跳过其后
+// 空格/制表，扫描十进制数字；写 clenp（无数字 → -1）。body_off 为头结束位置。
+func tig_parse_clen(rdata: i64, rlen: i64, cpos: i64, body_off: i64, clenp: i64) {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    s21_store(clenp, tig_int_lit(-1), T64)
+    var pa = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(pa, T64, 2)
+    var pap = ir.get_value(pa)
+    var ds = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ds, T64, 2)
+    var dsp = ir.get_value(ds)
+    var hd = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(hd, T64, 2)
+    var hdp = ir.get_value(hd)
+    s21_store(pap, s21_bin(0, cpos, tig_int_lit(15)), T64)
+    s21_store(dsp, tig_int_lit(0), T64)
+    s21_store(hdp, tig_int_lit(0), T64)
+    var ch = ir.new_block(g_cur_func, interner.intern("cl.h"))
+    var cb2 = ir.new_block(g_cur_func, interner.intern("cl.b"))
+    var cx = ir.new_block(g_cur_func, interner.intern("cl.x"))
+    var bDo = ir.new_block(g_cur_func, interner.intern("cl.do"))
+    var bSp = ir.new_block(g_cur_func, interner.intern("cl.sp"))
+    var bStop = ir.new_block(g_cur_func, interner.intern("cl.st"))
+    var bFst = ir.new_block(g_cur_func, interner.intern("cl.f"))
+    var bNf = ir.new_block(g_cur_func, interner.intern("cl.n"))
+    var bHv = ir.new_block(g_cur_func, interner.intern("cl.hv"))
+    var bNo = ir.new_block(g_cur_func, interner.intern("cl.no"))
+    var bM = ir.new_block(g_cur_func, interner.intern("cl.m"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, ch, 1)
+    g_cur_block = ch
+    var pv = s21_load(pap, T64)
+    var pvl = tig_icmp_c(pv, body_off, 2)
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, pvl, 0)
+    ir.add_operand(cb3, cb2, 1)
+    ir.add_operand(cb3, cx, 1)
+    g_cur_block = cb2
+    var pv2 = s21_load(pap, T64)
+    var b = s21_str_byte(rdata, pv2)
+    var g48 = tig_icmp_c(b, tig_int_lit(48), 5)
+    var l57 = tig_icmp_c(b, tig_int_lit(57), 4)
+    var isd = tig_and_i1(g48, l57)
+    var sp1 = tig_icmp_c(b, tig_int_lit(32), 0)
+    var sp2 = tig_icmp_c(b, tig_int_lit(9), 0)
+    var issp = tig_or_i1(sp1, sp2)
+    var cb4 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb4, isd, 0)
+    ir.add_operand(cb4, bDo, 1)
+    ir.add_operand(cb4, bSp, 1)
+    // 空格：仅首数字前跳过（已见数字则停止）
+    g_cur_block = bSp
+    var hv = s21_load(hdp, T64)
+    var hvn = tig_icmp_c(hv, tig_int_lit(0), 1)
+    var cb5 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb5, hvn, 0)
+    ir.add_operand(cb5, bStop, 1)
+    ir.add_operand(cb5, bDo, 1)
+    g_cur_block = bStop
+    var brs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs, cx, 1)
+    // 数字：记录起点（首次）后前进
+    g_cur_block = bDo
+    var pv3 = s21_load(pap, T64)
+    var hv2 = s21_load(hdp, T64)
+    var hz = tig_icmp_c(hv2, tig_int_lit(0), 0)
+    var cb6 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb6, hz, 0)
+    ir.add_operand(cb6, bFst, 1)
+    ir.add_operand(cb6, bNf, 1)
+    g_cur_block = bFst
+    s21_store(dsp, pv3, T64)
+    s21_store(hdp, tig_int_lit(1), T64)
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, bNf, 1)
+    g_cur_block = bNf
+    var pv4 = s21_load(pap, T64)
+    s21_store(pap, s21_bin(0, pv4, tig_int_lit(1)), T64)
+    var brn = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brn, ch, 1)
+    // 扫描毕：有数字 → parse_dec
+    g_cur_block = cx
+    var hv3 = s21_load(hdp, T64)
+    var hzn = tig_icmp_c(hv3, tig_int_lit(0), 1)
+    var cb7 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb7, hzn, 0)
+    ir.add_operand(cb7, bHv, 1)
+    ir.add_operand(cb7, bNo, 1)
+    g_cur_block = bHv
+    var clv = tig_parse_dec(rdata, s21_load(dsp, T64), s21_load(pap, T64))
+    s21_store(clenp, clv, T64)
+    var brh = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brh, bM, 1)
+    g_cur_block = bNo
+    var brno = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brno, bM, 1)
+    g_cur_block = bM
+}
+// 解析 tar 八进制数字段（buf[off..off+n)，遇 NUL/空格/非八进制停止）
+func tig_parse_octal(buf: i64, off: i64, n: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var aa = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(aa, T64, 2)
+    var ap = ir.get_value(aa)
+    var ka = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ka, T64, 2)
+    var kp = ir.get_value(ka)
+    var sa = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(sa, T64, 2)
+    var sp = ir.get_value(sa)
+    s21_store(ap, tig_int_lit(0), T64)
+    s21_store(kp, tig_int_lit(0), T64)
+    s21_store(sp, tig_int_lit(0), T64)
+    var hd = ir.new_block(g_cur_func, interner.intern("po.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("po.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("po.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var stp = s21_load(sp, T64)
+    var stz = tig_icmp_c(stp, tig_int_lit(0), 0)  // stop == 0
+    var kv = s21_load(kp, T64)
+    var klt = tig_icmp_c(kv, n, 2)
+    var cont = tig_and_i1(stz, klt)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, cont, 0)
+    ir.add_operand(cb, bd, 1)
+    ir.add_operand(cb, ex, 1)
+    g_cur_block = bd
+    var kv2 = s21_load(kp, T64)
+    var b = s21_zext(s21_load(s21_gep(buf, s21_bin(0, off, kv2), false), I8), I8)
+    var nz = tig_icmp_c(b, tig_int_lit(0), 0)
+    var nsp = tig_icmp_c(b, tig_int_lit(32), 0)
+    var nlo = tig_icmp_c(b, tig_int_lit(48), 2)
+    var nhi = tig_icmp_c(b, tig_int_lit(55), 3)
+    var bad = tig_or_i1(tig_or_i1(nz, nsp), tig_or_i1(nlo, nhi))
+    var bDo = ir.new_block(g_cur_func, interner.intern("po.do"))
+    var bSk = ir.new_block(g_cur_func, interner.intern("po.sk"))
+    var bInc = ir.new_block(g_cur_func, interner.intern("po.ic"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, bad, 0)
+    ir.add_operand(cb2, bSk, 1)
+    ir.add_operand(cb2, bDo, 1)
+    g_cur_block = bDo
+    var av = s21_load(ap, T64)
+    var eightv = tig_int_lit(8)
+    var mul = ir.new_inst(g_cur_block, 2, T64)
+    ir.add_operand(mul, av, 0)
+    ir.add_operand(mul, eightv, 0)
+    s21_store(ap, s21_bin(0, ir.get_value(mul), s21_bin(1, b, tig_int_lit(48))), T64)
+    var brd = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brd, bInc, 1)
+    g_cur_block = bSk
+    s21_store(sp, tig_int_lit(1), T64)
+    var brs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs, bInc, 1)
+    g_cur_block = bInc
+    s21_store(kp, s21_bin(0, kv2, tig_int_lit(1)), T64)
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)
+    g_cur_block = ex
+    return s21_load(ap, T64)
+}
+}

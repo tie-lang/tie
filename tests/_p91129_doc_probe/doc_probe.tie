@@ -1,0 +1,138 @@
+type tie<logic>
+// tests/_p91129_doc_probe/doc_probe.tie —— p.9.11.29 doc 注释 /// 验收
+// ============================================================
+// 验收点（docs/designs/round3-sugar-safe-std-design.md §3）：
+//   1. 声明前连续 /// 行附着为该声明的文档字符串（\n 拼接）；
+//   2. 归属正确：函数/struct/字段/enum 各得其 doc，不串位；
+//   3. 无 doc 声明 pdoc_of 返回空串；
+//   4. 注册表接口 pdoc_* 可编程消费（tsp hover/补全取数口）。
+// 全部通过打印「p.9.11.29 doc 注释自检通过」exit 0；任一失败 exit 1。
+//
+// # import（语言边界）
+//   只 import frontend/parser.tie（单入口，树传递可达 ast/lextok/interner/
+//   pstmt_top）。本探针内嵌样例源码 → parser.parse_ast → pdoc_* 断言。
+
+import "../../compiler/frontend/parser.tie"
+
+// 断言辅助：失败打印明细；main 累积全部结果。
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("p.9.11.29 自检失败: " + what)
+    }
+    return ok
+}
+
+// 内嵌样例源码（逐行拼接，避免插值/转义干扰）。
+func build_src() -> string {
+    var s = ""
+    s = s + "\n"
+    s = s + "/// Adds two numbers.\n"
+    s = s + "/// Second line.\n"
+    s = s + "func add(a: i64, b: i64) -> i64 {\n"
+    s = s + "    return a + b\n"
+    s = s + "}\n"
+    s = s + "\n"
+    s = s + "/// A point struct.\n"
+    s = s + "struct Pt {\n"
+    s = s + "    /// x coord.\n"
+    s = s + "    var x: f64\n"
+    s = s + "    var y: f64\n"
+    s = s + "}\n"
+    s = s + "\n"
+    s = s + "/// A color enum.\n"
+    s = s + "enum Color {\n"
+    s = s + "    Red\n"
+    s = s + "    Green\n"
+    s = s + "}\n"
+    return s
+}
+
+// 在注册表中找「节点 tag + 名字」都匹配的条目序号；找不到返回 -1。
+func find_entry(tagv: i64, name: string) -> i64 {
+    var i: i64 = 0
+    while i < pstmt_top.pdoc_count() {
+        var node = pstmt_top.pdoc_node(i)
+        if ast.tag(node) == tagv {
+            if interner.name_str(ast.name(node)) == name {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 在 struct 节点的直接子节点里找字段（N_CLASS_FIELD）名为 name 的节点 id。
+func find_field(struct_node: i64, name: string) -> i64 {
+    var i: i64 = 0
+    while i < ast.child_count(struct_node) {
+        var c = ast.child_at(struct_node, i)
+        if c >= 0 {
+            if ast.tag(c) == N_CLASS_FIELD {
+                if interner.name_str(ast.name(c)) == name {
+                    return c
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+func main() {
+    var ok: bool = true
+
+    var src = build_src()
+    var rc = parser.parse_ast(src)
+    ok = check(rc == 0, "parse_ast 失败: " + parser.ast_err_protocol())
+    if !ok {
+        exit(1)
+    }
+
+    // 1. 条数：fn add + struct Pt + 字段 x + enum Color = 4（字段 y 无 doc）
+    ok = check(pstmt_top.pdoc_count() == 4, "doc 条数应为 4，实际 " + to_string(pstmt_top.pdoc_count()))
+
+    // 2. 函数 doc：两行 \n 拼接
+    var fi = find_entry(N_FN_DEF, "add")
+    ok = check(fi >= 0, "未找到 func add 的 doc 条目") && ok
+    if fi >= 0 {
+        ok = check(pstmt_top.pdoc_text(fi) == "Adds two numbers.\nSecond line.",
+            "add 文本不匹配: '" + pstmt_top.pdoc_text(fi) + "'") && ok
+        ok = check(pstmt_top.pdoc_line(fi) == 4, "add 起始行应为 4，实际 " + to_string(pstmt_top.pdoc_line(fi))) && ok
+    }
+
+    // 3. struct doc + 字段归属
+    var si = find_entry(N_STRUCT, "Pt")
+    ok = check(si >= 0, "未找到 struct Pt 的 doc 条目") && ok
+    if si >= 0 {
+        ok = check(pstmt_top.pdoc_text(si) == "A point struct.",
+            "Pt 文本不匹配: '" + pstmt_top.pdoc_text(si) + "'") && ok
+        var pt = pstmt_top.pdoc_node(si)
+        var xnode = find_field(pt, "x")
+        ok = check(xnode >= 0, "未找到字段 x") && ok
+        if xnode >= 0 {
+            ok = check(pstmt_top.pdoc_of(xnode) == "x coord.",
+                "字段 x 文本不匹配: '" + pstmt_top.pdoc_of(xnode) + "'") && ok
+        }
+        var ynode = find_field(pt, "y")
+        ok = check(ynode >= 0, "未找到字段 y") && ok
+        if ynode >= 0 {
+            ok = check(pstmt_top.pdoc_of(ynode) == "", "字段 y 不应有 doc") && ok
+        }
+    }
+
+    // 4. enum doc
+    var ei = find_entry(N_ENUM, "Color")
+    ok = check(ei >= 0, "未找到 enum Color 的 doc 条目") && ok
+    if ei >= 0 {
+        ok = check(pstmt_top.pdoc_text(ei) == "A color enum.",
+            "Color 文本不匹配: '" + pstmt_top.pdoc_text(ei) + "'") && ok
+    }
+
+    if ok {
+        println("p.9.11.29 doc 注释自检通过")
+        println(pstmt_top.pdoc_dump())
+        exit(0)
+    }
+    exit(1)
+}

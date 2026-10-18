@@ -1,0 +1,1101 @@
+type tie<class>
+// compiler/middle/tieir_ser.tie —— S3.2：tieir 序列化模块（.tir 二进制格式）
+// ============================================================
+// 里程碑：库/包模型 S3.2（docs/plans/tieir-format.md S3 + package-model.md L2）。
+// 把当前编译单元的 IR 本体（ir.tie 列式表）+ 元信息侧表（ir_meta.tie）序列化
+// 为**二进制 .tir 分发格式**（段 1-7），并可反序列化回内存结构（roundtrip）、
+// 输出可读摘要（dump）、计算内容哈希（P5c 签名载体）。
+//
+// # 段布局（对齐 tieir-format.md §2.1）
+//   段 1 魔数 + 格式版本    "TIEIR" + i64 版本（=1）
+//   段 2 模块头             包名/版本/IR 版本/编译器版本/依赖图（名+版本）
+//   段 3 字符串池           interner 池 0..len 全量（id 即下标，重建后 id 一致）
+//   段 4 符号表             sym_table 各列（name/sig/kind/vis/line/col）
+//   段 5 IR 主体            函数表/块表/指令表/操作数段（列式直写）
+//   段 6 导出表             export_table 各列（name/sig/line/col）
+//   段 7 span 段            inst_span 各列（file/line/col）
+//
+// # 编码约定（对齐 tieir-format.md §4「定宽 i64 编码，varint 后置」）
+//   - i64 一律定宽 8 字节大端（(v >> (56-8k)) & 0xFF，回绕式位移重建位模式）；
+//   - 字符串 = 长度(i64) + 逐码点(i64)（char_code 编码 / str_from_code 还原，
+//     支持任意 Unicode；字符串池 id 为进程内句柄，序列化必须还原文本——见
+//     lib/interner.tie 误用清单）；
+//   - 每段 = 段号(i64) + 段体字节数(i64) + 段体；反序列化按段号顺序严格校验；
+//   - 值 id/偏移列（params_off/ops_off）**序列化写入、反序列化校验**——重建时
+//     按「参数先于指令」的创建顺序自然复现（new_func 领参数值、new_inst 领
+//     结果值，单调递增），偏移一致性是 roundtrip 校验项而非重建依赖。
+//
+// # 校验（对齐 tieir-format.md §7：IR 语法校验防损坏/伪造）
+//   - 魔数/版本不匹配、段号乱序、段体越界、列长不匹配（如符号表六列行数
+//     不一致）、字符串长度越界 → 报错返回 -1（安装/加载失败安全底线）。
+//
+// # 哈希（P5c 签名载体）
+//   - tieir.hash_bytes：对段 2-7 字节区间的 FNV-1a 32 位哈希（自实现字节版，
+//     std/crypto 的 fnv1a 只收字符串——字节表须逐字节哈希，非可打印字节
+//     经 to_ascii 会丢失，不可复用）。
+//
+// # 语言边界（同 ir.tie 文件头）
+//   - 本模块 import ir_meta（其已 import ir + columnar，树式展开唯一路径）；
+//   - 表参数元素类型静态未知：跨模块只传字符串/标量；模块内局部表可下标；
+//   - && 非短路：边界判断与下标分开（嵌套 if）；
+//   - 无 continue/break/递归；ref table<i64> 写回用变量实参。
+//
+// 调用：import 后 tieir.serialize() / tieir.write(path) / tieir.read(path) /
+// tieir.dump_text() / tieir.hash_bytes(t, from, to) / tieir.err_msg()
+//
+// # pub 方法全集（组件契约，p.9.21 G7 库资格①；增删须同步此处与 ROAD）
+//   序列化：serialize() -> table<i64>（当前模块 → 字节表，段 1 魔数 / 2 版本 /
+//     3-7 元信息与列式段）content_hash() -> i64（段 2-7 FNV-1a 32）
+//     hash_bytes(t, from, to) -> i64（任意字节区间哈希）
+//   落盘：write(path) -> bool / read(path) -> i64（0 = 成功）
+//   重建：deserialize(t) -> i64（0 = 成功；完整重建 IR + 元信息，含
+//     段号/越界/列长 roundtrip 全级校验，魔数/版本损坏拒绝）
+//   诊断：err_msg() -> string / dump_text() -> string
+//   自检：middle/tieir_test.tie（无 driver 可跑，roundtrip + 防伪造验收）。
+
+import "./ir_meta.tie"
+import "./ir_blkattr.tie"
+import "../lib/interner.tie"
+import "/std/bytes.tie"
+
+// ---------- 格式常量（字面量 + 注释，防 import 合并顶层重名）----------
+// 魔数 "TIEIR" 的 5 个 ASCII 码点
+pub const TIEIR_MAGIC0: i64 = 84;    // 'T'
+pub const TIEIR_MAGIC1: i64 = 73;    // 'I'
+pub const TIEIR_MAGIC2: i64 = 69;    // 'E'
+pub const TIEIR_MAGIC3: i64 = 73;    // 'I'
+pub const TIEIR_MAGIC4: i64 = 82;    // 'R'
+// 格式版本（V3 迁移转换器触发条件）。v2（p.9.20）：模块头新增 t 轴档位与
+// pass 管道版本两个 i64——旧版读新版会错位，故 bump 并由版本校验拦截。
+// v3（p.9.22.8）：尾部新增**段 8 语义符号表**（可选，由调用方经 set_sec8
+// 注入；无注入 = 与 v2 同构的字节流）；读侧放宽——段号大于已知最大段的段按
+// 「段号 + 段长」整体跳过（前向兼容路径），v2 文件仍可读。
+const TIEIR_VERSION: i64 = 3;
+pub const SEC_HEAD: i64 = 2;         // 段号：模块头
+pub const SEC_STRPOOL: i64 = 3;      // 段号：字符串池
+pub const SEC_SYMTAB: i64 = 4;       // 段号：符号表
+pub const SEC_IRBODY: i64 = 5;       // 段号：IR 主体
+pub const SEC_EXPORT: i64 = 6;       // 段号：导出表
+const SEC_SPAN: i64 = 7;         // 段号：span 段
+const SEC_SEMSYS: i64 = 8;       // 段号：语义符号表（p.9.22.8，可选段）
+
+// ---------- 全局状态 ----------
+pub var tieir_out: table<i64>;       // 序列化输出字节表
+// p.9.22.8 段 8 注入（模块边界纪律：本模块不 import driver/dbgem——调用方
+// （driver 经 dbgem）先构建列组字节，再经 set_sec8 注入「段头 + 段体」完整
+// 字节；空 = 不写段 8。同 tieir_slice.set_fn_mods 注入先例。）
+var sec8_tail: table<i64>;
+// 读侧：段 8 解析结果（列头 + 扁平值；kind 1 列为池 id——已按读入池重映射）。
+var tieir_ss_n: i64 = 0;         // 列数（0 = 无段 8）
+var tieir_ss_fno: table<i64>;    // 列字段号
+var tieir_ss_kind: table<i64>;   // 0=i64 1=池 id
+var tieir_ss_len: table<i64>;    // 列行数
+var tieir_ss_off: table<i64>;    // 列在 tieir_ss_val 的起点
+var tieir_ss_val: table<i64>;    // 扁平值
+pub var tieir_pos: i64 = 0;          // 反序列化解析游标（rd_* 推进）
+pub var tieir_err: string = "";      // 最近错误消息（空 = 无错误）
+pub var tieir_sec_end: i64 = 0; // 当前段体结束位置（段边界校验）
+
+namespace tieir {
+
+// ---------- 错误 ----------
+
+// 设置错误消息（内部用）。
+func set_err(msg: string) {
+    tieir_err = msg
+}
+
+// 读取最近错误消息（空 = 上次操作成功）。
+pub func err_msg() -> string {
+    return tieir_err
+}
+
+// ---------- 编码原语 ----------
+
+// 写一个 i64（8 字节大端）到输出字节表（高字节在前，与 rd_i64 对称）。
+func wr_i64(t: ref table<i64>, v: i64) {
+    var k: i64 = 0
+    while k < 8 {
+        var shift: i64 = 56 - k * 8
+        var b = (v >> shift) & 255
+        table_push(t, b)
+        k = k + 1
+    }
+}
+
+// 写字符串：长度 + 逐码点。
+func wr_str(t: ref table<i64>, s: string) {
+    var n = str_len(s)
+    wr_i64(t, n)
+    var i: i64 = 0
+    while i < n {
+        wr_i64(t, char_code(str_char(s, i)))
+        i = i + 1
+    }
+}
+
+// 写段头（段号 + 段体字节数），返回段体起始下标（调用方写完后回填长度）。
+// 返回 -1 表示内部错误（不应发生，防御）。
+func wr_sec_head(t: ref table<i64>, sec: i64) -> i64 {
+    wr_i64(t, sec)
+    var len_pos = len(t)
+    wr_i64(t, 0)   // 占位长度（8 字节）
+    return len_pos
+}
+
+// 回填段体长度：段头长度槽（len_pos）← 从段体起点到当前末尾的字节数。
+func wr_sec_end(t: ref table<i64>, len_pos: i64, body_start: i64) {
+    var n = len(t)
+    var body_len = n - body_start
+    // 回写 8 字节大端长度到 len_pos 起的 8 个槽（高字节在前，同 wr_i64）
+    var k: i64 = 0
+    while k < 8 {
+        var shift: i64 = 56 - k * 8
+        var b = (body_len >> shift) & 255
+        t[len_pos + k] = b
+        k = k + 1
+    }
+}
+
+// ---------- 解码原语（tieir_pos 游标推进） ----------
+
+// 读一个 i64（8 字节大端）；越界返回 0 并记错误。
+func rd_i64(t: table<i64>) -> i64 {
+    var n = len(t)
+    if tieir_pos + 8 > n {
+        set_err("tieir 数据截断（读取 i64 越界）")
+        return 0
+    }
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        var b = t[tieir_pos + k]
+        // 字节须在 0..255（防御伪造数据）
+        if b < 0 || b > 255 {
+            set_err("tieir 字节越界（" + to_string(b) + "）")
+            return 0
+        }
+        v = (v << 8) | b
+        k = k + 1
+    }
+    tieir_pos = tieir_pos + 8
+    return v
+}
+
+// 读字符串（长度 + 逐码点）；越界返回空串并记错误。
+func rd_str(t: table<i64>) -> string {
+    var n = rd_i64(t)
+    if tieir_err != "" {
+        return ""
+    }
+    if n < 0 || n > 1000000 {
+        set_err("tieir 字符串长度非法（" + to_string(n) + "）")
+        return ""
+    }
+    var out: string = ""
+    var i: i64 = 0
+    while i < n {
+        var cp = rd_i64(t)
+        if tieir_err != "" {
+            return ""
+        }
+        // 码点合法性：0..0x10FFFF 且非代理区（str_from_code 校验，此处预判）
+        if cp < 0 || cp > 1114111 {
+            set_err("tieir 码点非法（" + to_string(cp) + "）")
+            return ""
+        }
+        out = out + str_from_code(cp)
+        i = i + 1
+    }
+    return out
+}
+
+// 检查当前游标是否仍在段体内（越界则报错返回 false）。
+func in_sec() -> bool {
+    if tieir_pos > tieir_sec_end {
+        set_err("tieir 段体越界")
+        return false
+    }
+    return true
+}
+
+// 读段头：校验段号 = 期望值，记录段体边界；返回 true。
+// 段体边界 = 当前游标 + 段体字节数（只允许读到该位置）。
+func rd_sec_head(t: table<i64>, expect_sec: i64) -> bool {
+    var sec = rd_i64(t)
+    if tieir_err != "" {
+        return false
+    }
+    if sec != expect_sec {
+        set_err("tieir 段号错误（期望 " + to_string(expect_sec) + " 实际 " + to_string(sec) + "）")
+        return false
+    }
+    var body_len = rd_i64(t)
+    if tieir_err != "" {
+        return false
+    }
+    if body_len < 0 {
+        set_err("tieir 段体长度非法（" + to_string(body_len) + "）")
+        return false
+    }
+    tieir_sec_end = tieir_pos + body_len
+    return true
+}
+
+// ---------- 字符串池辅助（池 id 与串的双向映射，重建用） ----------
+
+// 池 id → 串（池外哨兵 -1 返回空串）。
+func pool_str(id: i64) -> string {
+    if id < 0 {
+        return ""
+    }
+    return interner.name_str(id)
+}
+
+// 串 → 池 id（登记并返回；内部约定不登记空串——池中已有则返回原 id）。
+func str_pool(s: string) -> i64 {
+    return interner.intern(s)
+}
+
+// ---------- 序列化（段 1-7） ----------
+
+// 池 id 文件 → 进程重映射（deserialize 池引用转换；越界透传防御）。
+func pool_remap_id(pr: table<i64>, id: i64) -> i64 {
+    if id < 0 || id >= len(pr) {
+        return id
+    }
+    return pr[id]
+}
+
+// 把当前 ir + ir_meta 状态序列化为字节表。
+pub func serialize() -> table<i64> {
+    tieir_err = ""
+    tieir_out = table_new_i64()
+    // ---- 段 1：魔数 + 版本 ----
+    table_push(tieir_out, TIEIR_MAGIC0)
+    table_push(tieir_out, TIEIR_MAGIC1)
+    table_push(tieir_out, TIEIR_MAGIC2)
+    table_push(tieir_out, TIEIR_MAGIC3)
+    table_push(tieir_out, TIEIR_MAGIC4)
+    wr_i64(tieir_out, TIEIR_VERSION)
+    // ---- 段 2：模块头 ----
+    var hp = wr_sec_head(tieir_out, SEC_HEAD)
+    var hs = len(tieir_out)
+    wr_str(tieir_out, pool_str(ir_meta.get_pkg_name()))
+    wr_str(tieir_out, pool_str(ir_meta.get_pkg_version()))
+    wr_i64(tieir_out, ir_meta.get_ir_version())
+    wr_str(tieir_out, pool_str(ir_meta.get_compiler_version()))
+    // p.9.20：t 轴档位 + pass 管道版本（单元头可自证复现条件；格式版本 2 起）
+    wr_i64(tieir_out, ir_meta.get_tie_opt())
+    wr_i64(tieir_out, ir_meta.get_pass_ver())
+    wr_i64(tieir_out, ir_meta.dep_count())
+    var di: i64 = 0
+    while di < ir_meta.dep_count() {
+        wr_str(tieir_out, pool_str(ir_meta.dep_name(di)))
+        wr_str(tieir_out, pool_str(ir_meta.dep_ver(di)))
+        di = di + 1
+    }
+    wr_sec_end(tieir_out, hp, hs)
+    // ---- 段 3：字符串池（0..len 全量，id 即下标） ----
+    var sp = wr_sec_head(tieir_out, SEC_STRPOOL)
+    var ss = len(tieir_out)
+    var pool_n = interner.len()
+    wr_i64(tieir_out, pool_n)
+    var pi: i64 = 0
+    while pi < pool_n {
+        wr_str(tieir_out, interner.name_str(pi))
+        pi = pi + 1
+    }
+    wr_sec_end(tieir_out, sp, ss)
+    // ---- 段 4：符号表 ----
+    var yp = wr_sec_head(tieir_out, SEC_SYMTAB)
+    var ys = len(tieir_out)
+    wr_i64(tieir_out, ir_meta.sym_count())
+    var si: i64 = 0
+    while si < ir_meta.sym_count() {
+        wr_i64(tieir_out, ir_meta.sym_name(si))
+        wr_i64(tieir_out, ir_meta.sym_sig(si))
+        wr_i64(tieir_out, ir_meta.sym_kind(si))
+        wr_i64(tieir_out, ir_meta.sym_vis(si))
+        wr_i64(tieir_out, ir_meta.sym_line(si))
+        wr_i64(tieir_out, ir_meta.sym_col(si))
+        si = si + 1
+    }
+    wr_sec_end(tieir_out, yp, ys)
+    // ---- 段 5：IR 主体（函数表/块表/指令表/操作数段） ----
+    var ip = wr_sec_head(tieir_out, SEC_IRBODY)
+    var is_ = len(tieir_out)
+    // 函数表
+    wr_i64(tieir_out, ir.func_count())
+    var fi: i64 = 0
+    while fi < ir.func_count() {
+        wr_i64(tieir_out, ir.func_name(fi))
+        wr_i64(tieir_out, ir.func_ret(fi))
+        wr_i64(tieir_out, ir.func_params_off(fi))
+        wr_i64(tieir_out, ir.func_params_cnt(fi))
+        wr_i64(tieir_out, ir.func_entry(fi))
+        wr_i64(tieir_out, ir.func_inst_total(fi))
+        wr_i64(tieir_out, ir.func_exported(fi))
+        // 参数类型段（扁平，按函数顺序）
+        var pk: i64 = 0
+        while pk < ir.func_params_cnt(fi) {
+            wr_i64(tieir_out, ir.func_param_ty(fi, pk))
+            pk = pk + 1
+        }
+        fi = fi + 1
+    }
+    // 块表
+    wr_i64(tieir_out, ir.block_count())
+    var bi: i64 = 0
+    while bi < ir.block_count() {
+        wr_i64(tieir_out, ir.block_func(bi))
+        wr_i64(tieir_out, ir.block_name(bi))
+        wr_i64(tieir_out, ir.block_start(bi))
+        wr_i64(tieir_out, ir.block_end(bi))
+        bi = bi + 1
+    }
+    // 指令表（操作数段交织：每操作数 = 值 + kind；每条指令前写所属块 id——
+    // 反序列化时块区间尚未重建，归属须显式携带）。
+    // p.9.21.10：块归属改**归属表**（每块回填自己的区间 → O(ni)）——原单向
+    // 游标在「块表序 ≠ 指令 id 序」（irgen 乱序建块，区间不交叠但乱序）时
+    // 会越过目标块再也回不来，其后所有指令的 own 全部写成越界值
+    //（driver 实测 663730/663974 条 own==block_count）。
+    // p.9.21.11 §5.1：归属逻辑统一到 ir.blk_attr_fill（区间回填、表序后者
+    // 覆盖——与原内联回填逐位一致；空 sel 表 = 全部块参与）。
+    var blk_of: table<i64> = ir.blk_attr_fill(ir.inst_count(), table_new_i64())
+    wr_i64(tieir_out, ir.inst_count())
+    var ii: i64 = 0
+    while ii < ir.inst_count() {
+        wr_i64(tieir_out, blk_of[ii])
+        wr_i64(tieir_out, ir.ins_op(ii))
+        wr_i64(tieir_out, ir.ins_ty(ii))
+        wr_i64(tieir_out, ir.ins_val(ii))
+        wr_i64(tieir_out, ir.ins_ops_off(ii))
+        wr_i64(tieir_out, ir.ins_ops_cnt(ii))
+        var ok: i64 = 0
+        while ok < ir.ins_ops_cnt(ii) {
+            wr_i64(tieir_out, ir.ins_opnd(ii, ok))
+            wr_i64(tieir_out, ir.ins_opnd_kind(ii, ok))
+            ok = ok + 1
+        }
+        ii = ii + 1
+    }
+    wr_sec_end(tieir_out, ip, is_)
+    // ---- 段 6：导出表 ----
+    var ep = wr_sec_head(tieir_out, SEC_EXPORT)
+    var es = len(tieir_out)
+    wr_i64(tieir_out, ir_meta.export_count())
+    var ei: i64 = 0
+    while ei < ir_meta.export_count() {
+        wr_i64(tieir_out, ir_meta.exp_name(ei))
+        wr_i64(tieir_out, ir_meta.exp_sig(ei))
+        wr_i64(tieir_out, ir_meta.exp_line(ei))
+        wr_i64(tieir_out, ir_meta.exp_col(ei))
+        ei = ei + 1
+    }
+    wr_sec_end(tieir_out, ep, es)
+    // ---- 段 7：span 段 ----
+    var pp = wr_sec_head(tieir_out, SEC_SPAN)
+    var ps = len(tieir_out)
+    wr_i64(tieir_out, ir_meta.span_count())
+    var spi: i64 = 0
+    while spi < ir_meta.span_count() {
+        wr_i64(tieir_out, ir_meta.inst_file(spi))
+        wr_i64(tieir_out, ir_meta.inst_line(spi))
+        wr_i64(tieir_out, ir_meta.inst_col(spi))
+        spi = spi + 1
+    }
+    wr_sec_end(tieir_out, pp, ps)
+    // ---- 段 8：语义符号表（可选注入；字节 = 段头 + 段体，见 set_sec8） ----
+    if len(sec8_tail) > 0 {
+        tieir_out = byte_concat(tieir_out, sec8_tail)
+    }
+    return tieir_out
+}
+
+// 注入段 8（含段头；空表 = 清除）。调用方须在 write/serialize 之前调用。
+pub func set_sec8(t: table<i64>) {
+    sec8_tail = t
+}
+
+// 读侧：段 8 是否已解析（1 = 有）。
+pub func semsym_present() -> i64 {
+    if tieir_ss_n > 0 {
+        return 1
+    }
+    return 0
+}
+
+// 读侧：段 8 列数 / 列行数（越界 0）。
+pub func semsym_cols() -> i64 {
+    return tieir_ss_n
+}
+pub func semsym_len(c: i64) -> i64 {
+    if c < 0 || c >= tieir_ss_n {
+        return 0
+    }
+    return tieir_ss_len[c]
+}
+pub func semsym_fno(c: i64) -> i64 {
+    if c < 0 || c >= tieir_ss_n {
+        return 0
+    }
+    return tieir_ss_fno[c]
+}
+pub func semsym_kind(c: i64) -> i64 {
+    if c < 0 || c >= tieir_ss_n {
+        return 0
+    }
+    return tieir_ss_kind[c]
+}
+// 列第 r 行值（kind 0 = 值；kind 1 = 字符串池 id，经读入池重映射）。
+pub func semsym_at(c: i64, r: i64) -> i64 {
+    if c < 0 || c >= tieir_ss_n {
+        return -1
+    }
+    if r < 0 || r >= tieir_ss_len[c] {
+        return -1
+    }
+    return tieir_ss_val[tieir_ss_off[c] + r]
+}
+
+// 序列化并写入文件（字节表直写）。成功返回 true。
+pub func write(path: string) -> bool {
+    var t = serialize()
+    if tieir_err != "" {
+        return false
+    }
+    return bytes.write(path, t)
+}
+
+// ---------- 反序列化（roundtrip 重建 + 校验） ----------
+
+// 从字节表重建 ir + ir_meta（先复位再逐段解析）。
+// 返回 0 成功 / -1 失败（err_msg 取原因）。
+pub func deserialize(t: table<i64>) -> i64 {
+    tieir_err = ""
+    var n = len(t)
+    // ---- 段 1：魔数 + 版本 ----
+    if n < 5 + 8 {
+        set_err("tieir 文件过短（非有效 tieir）")
+        return -1
+    }
+    if t[0] != TIEIR_MAGIC0 || t[1] != TIEIR_MAGIC1 || t[2] != TIEIR_MAGIC2 ||
+        t[3] != TIEIR_MAGIC3 || t[4] != TIEIR_MAGIC4 {
+        set_err("tieir 魔数不匹配（非 .tir 文件）")
+        return -1
+    }
+    tieir_pos = 5
+    var ver = rd_i64(t)
+    if tieir_err != "" {
+        return -1
+    }
+    // v2（无段 8）与 v3（可选段 8）都可读；其余版本拒绝。
+    if ver != TIEIR_VERSION && ver != 2 {
+        set_err("tieir 版本不兼容（文件 " + to_string(ver) + "，编译器支持 " + to_string(TIEIR_VERSION) + "；旧版请用 tieir-migrate 转换）")
+        return -1
+    }
+    // 复位目标结构（本体 + 侧表配套）
+    ir.new_module()
+    ir_meta.reset_meta()
+    // p.9.22.8：段 8 读侧状态复位（无段 8 的 v2 文件读到 0 列）
+    tieir_ss_n = 0
+    tieir_ss_fno = table_new_i64()
+    tieir_ss_kind = table_new_i64()
+    tieir_ss_len = table_new_i64()
+    tieir_ss_off = table_new_i64()
+    tieir_ss_val = table_new_i64()
+    // ---- 段 2：模块头 ----
+    if !rd_sec_head(t, SEC_HEAD) {
+        return -1
+    }
+    var pkg_name = rd_str(t)
+    var pkg_ver = rd_str(t)
+    var ir_ver = rd_i64(t)
+    var comp_ver = rd_str(t)
+    // p.9.20：t 轴档位 + pass 管道版本（格式版本 2 起存在）
+    var tie_opt = rd_i64(t)
+    var pass_ver = rd_i64(t)
+    var dep_n = rd_i64(t)
+    if tieir_err != "" || !in_sec() {
+        return -1
+    }
+    if dep_n < 0 || dep_n > 100000 {
+        set_err("tieir 依赖数非法（" + to_string(dep_n) + "）")
+        return -1
+    }
+    ir_meta.set_pkg_name(str_pool(pkg_name))
+    ir_meta.set_pkg_version(str_pool(pkg_ver))
+    ir_meta.set_ir_version(ir_ver)
+    ir_meta.set_compiler_version(str_pool(comp_ver))
+    ir_meta.set_tie_opt(tie_opt)
+    ir_meta.set_pass_ver(pass_ver)
+    var dk: i64 = 0
+    while dk < dep_n {
+        var dn = rd_str(t)
+        var dv = rd_str(t)
+        if tieir_err != "" {
+            return -1
+        }
+        ir_meta.set_dep(str_pool(dn), str_pool(dv))
+        dk = dk + 1
+    }
+    tieir_pos = tieir_sec_end
+    // ---- 段 3：字符串池（重建 interner，id 即下标） ----
+    if !rd_sec_head(t, SEC_STRPOOL) {
+        return -1
+    }
+    var pool_n = rd_i64(t)
+    if tieir_err != "" {
+        return -1
+    }
+    if pool_n < 0 || pool_n > 1000000 {
+        set_err("tieir 字符串池大小非法（" + to_string(pool_n) + "）")
+        return -1
+    }
+    var pi2: i64 = 0
+    // 池 id 重映射（p.9.21.8）：pool_remap[文件 id] = 进程 id。全量池单元
+    //（serialize 主路径）重建序 = 原 id → 恒等；压缩池片段（write_mod_slice）
+    // 重建经 str_pool 幂等 intern → 文件 id 与进程 id 脱钩，段 4/5/6 池引用
+    // 统一经 pool_remap_id 转换。
+    var pool_remap = table_new_i64()
+    while pi2 < pool_n {
+        var s = rd_str(t)
+        if tieir_err != "" {
+            return -1
+        }
+        table_push(pool_remap, str_pool(s))
+        pi2 = pi2 + 1
+    }
+    tieir_pos = tieir_sec_end
+    // ---- 段 4：符号表 ----
+    if !rd_sec_head(t, SEC_SYMTAB) {
+        return -1
+    }
+    var sym_n = rd_i64(t)
+    if tieir_err != "" {
+        return -1
+    }
+    if sym_n < 0 || sym_n > 1000000 {
+        set_err("tieir 符号表行数非法（" + to_string(sym_n) + "）")
+        return -1
+    }
+    var si2: i64 = 0
+    while si2 < sym_n {
+        var nm = rd_i64(t)
+        var sg = rd_i64(t)
+        var kd = rd_i64(t)
+        var vs = rd_i64(t)
+        var ln = rd_i64(t)
+        var cl = rd_i64(t)
+        if tieir_err != "" {
+            return -1
+        }
+        ir_meta.set_sym(pool_remap_id(pool_remap, nm), pool_remap_id(pool_remap, sg), kd, vs, ln, cl)
+        si2 = si2 + 1
+    }
+    tieir_pos = tieir_sec_end
+    // ---- 段 5：IR 主体 ----
+    if !rd_sec_head(t, SEC_IRBODY) {
+        return -1
+    }
+    // 函数表
+    var fn_n = rd_i64(t)
+    if tieir_err != "" {
+        return -1
+    }
+    if fn_n < 0 || fn_n > 1000000 {
+        set_err("tieir 函数数非法（" + to_string(fn_n) + "）")
+        return -1
+    }
+    var fi2: i64 = 0
+    // p.9.21.7（D1）：文件布局 = 原模块交错序（每函数 [参数][指令操作数]），
+    // fpo/ops_off 是原布局位置——**不能**与重建自然偏移（函数表先建 → 参数
+    // 0..P-1 连续）比对。原布局一致性改由指令段的函数边界 fpo 连续性校验
+    //（见下方 inst 循环）；此处仅记录 + 基础边界检查。
+    var fpos = table_new_i64()
+    var fpcs = table_new_i64()
+    while fi2 < fn_n {
+        var fnm = rd_i64(t)
+        var frt = rd_i64(t)
+        var fpo = rd_i64(t)
+        var fpc = rd_i64(t)
+        var fen = rd_i64(t)
+        var fit = rd_i64(t)
+        var fex = rd_i64(t)
+        if tieir_err != "" {
+            return -1
+        }
+        if fpc < 0 || fpc > 10000 {
+            set_err("tieir 函数参数数非法（" + to_string(fpc) + "）")
+            return -1
+        }
+        if fpo < 0 {
+            set_err("tieir 函数参数段偏移非法（函数 " + to_string(fi2) + "）")
+            return -1
+        }
+        if fi2 == 0 && fpo != 0 {
+            set_err("tieir 首函数参数段偏移非 0")
+            return -1
+        }
+        var ptys = table_new_i64()
+        var pk2: i64 = 0
+        while pk2 < fpc {
+            var pt = rd_i64(t)
+            if tieir_err != "" {
+                return -1
+            }
+            table_push(ptys, pt)
+            pk2 = pk2 + 1
+        }
+        var fid = ir.new_func(pool_remap_id(pool_remap, fnm), frt, ptys)
+        ir.func_export_set(fid, fex)
+        // 入口块在块表重建后校验（此处记录期望值，用哨兵 -1 占位）
+        //（ir_meta 无函数入口槽，校验放块表重建后：块表 func 列一致性）
+        table_push(fpos, fpo)
+        table_push(fpcs, fpc)
+        fi2 = fi2 + 1
+    }
+    // 块表
+    var blk_n = rd_i64(t)
+    if tieir_err != "" {
+        return -1
+    }
+    if blk_n < 0 || blk_n > 1000000 {
+        set_err("tieir 块数非法（" + to_string(blk_n) + "）")
+        return -1
+    }
+    // 序列化的块区间暂存（指令重建后统一校验——重建时块先于指令创建，
+    // new_block 的 start/end 初始为 0，须等 new_inst 填充后再比对）
+    var blk_starts = table_new_i64()
+    var blk_ends = table_new_i64()
+    var bfunc = table_new_i64()
+    var bi2: i64 = 0
+    while bi2 < blk_n {
+        var bfn = rd_i64(t)
+        var bnm = rd_i64(t)
+        var bst = rd_i64(t)
+        var ben = rd_i64(t)
+        if tieir_err != "" {
+            return -1
+        }
+        if bfn < 0 || bfn >= fn_n {
+            set_err("tieir 块所属函数越界（块 " + to_string(bi2) + " → 函数 " + to_string(bfn) + "）")
+            return -1
+        }
+        table_push(bfunc, bfn)
+        var bid = ir.new_block(bfn, pool_remap_id(pool_remap, bnm))
+        table_push(blk_starts, bst)
+        table_push(blk_ends, ben)
+        bi2 = bi2 + 1
+    }
+    // 指令表（操作数交织：值 + kind）。
+    // p.9.21.7（D1）值空间重映射：文件值 id = 原模块交错创建序（函数边界处
+    // 参数领号、结果随指令领号）；重建模块函数表先建 → 参数 0..P-1、结果
+    // P.. 顺序领号。remap[原 id] = 重建 id；文件内部一致性由
+    // ①结果值连续性（ivl == next_orig）②函数边界 fpo 连续性 双校验保证。
+    var ins_n = rd_i64(t)
+    if tieir_err != "" {
+        return -1
+    }
+    if ins_n < 0 || ins_n > 10000000 {
+        set_err("tieir 指令数非法（" + to_string(ins_n) + "）")
+        return -1
+    }
+    // 累计参数基址（重建参数 id = cum_params[k] + j）
+    var cum_params = table_new_i64()
+    var p_total: i64 = 0
+    var ci: i64 = 0
+    while ci < fn_n {
+        table_push(cum_params, p_total)
+        p_total = p_total + fpcs[ci]
+        ci = ci + 1
+    }
+    var remap = table_new_i64()
+    var remap_n: i64 = 0
+    var next_orig: i64 = 0
+    var alloc_fns: i64 = 0
+    var result_ord: i64 = 0
+    var cur_fn: i64 = -1
+    var expected_fpo: i64 = 0
+    var fops_accum: i64 = 0
+    if fn_n > 0 {
+        expected_fpo = fpos[0]
+    }
+    var ii2: i64 = 0
+    while ii2 < ins_n {
+        var owner = rd_i64(t)
+        var iop = rd_i64(t)
+        var ity = rd_i64(t)
+        var ivl = rd_i64(t)
+        var iof = rd_i64(t)
+        var icn = rd_i64(t)
+        if tieir_err != "" {
+            return -1
+        }
+        if icn < 0 || icn > 100000 {
+            set_err("tieir 指令操作数个数非法（指令 " + to_string(ii2) + "）")
+            return -1
+        }
+        if owner < 0 || owner >= blk_n {
+            set_err("tieir 指令所属块越界（指令 " + to_string(ii2) + " → 块 " + to_string(owner) + "）")
+            return -1
+        }
+        var k = bfunc[owner]
+        if k < cur_fn {
+            set_err("tieir 指令所属函数乱序（指令 " + to_string(ii2) + "）")
+            return -1
+        }
+        if k > cur_fn {
+            // 收尾当前函数（fpo 连续性）+ 跳过空函数 + 进入函数 k
+            if cur_fn >= 0 {
+                expected_fpo = expected_fpo + fpcs[cur_fn] + fops_accum
+            }
+            var m = cur_fn + 1
+            while m < k {
+                expected_fpo = expected_fpo + fpcs[m]
+                m = m + 1
+            }
+            if fpos[k] != expected_fpo {
+                set_err("tieir 函数参数段偏移不连续（函数 " + to_string(k) + "）")
+                return -1
+            }
+            // 原值空间：函数 cur_fn+1..k 的参数在各自边界领号
+            var m2 = cur_fn + 1
+            while m2 <= k {
+                var j2: i64 = 0
+                while j2 < fpcs[m2] {
+                    var oid = next_orig + j2
+                    while remap_n <= oid {
+                        table_push(remap, 0 - 1)
+                        remap_n = remap_n + 1
+                    }
+                    remap[oid] = cum_params[m2] + j2
+                    j2 = j2 + 1
+                }
+                next_orig = next_orig + fpcs[m2]
+                m2 = m2 + 1
+            }
+            alloc_fns = k + 1
+            cur_fn = k
+            fops_accum = 0
+        }
+        fops_accum = fops_accum + icn
+        // 结果值：文件 ivl 必须 == next_orig（原空间结果按序领号）
+        var expect_rebuilt: i64 = 0 - 1
+        if ivl >= 0 {
+            if ivl != next_orig {
+                set_err("tieir 指令结果值非连续（指令 " + to_string(ii2) + " 文件 " + to_string(ivl) + " 期望 " + to_string(next_orig) + "）")
+                return -1
+            }
+            expect_rebuilt = p_total + result_ord
+            result_ord = result_ord + 1
+            next_orig = next_orig + 1
+            while remap_n <= ivl {
+                table_push(remap, 0 - 1)
+                remap_n = remap_n + 1
+            }
+            remap[ivl] = expect_rebuilt
+        }
+        var iid = ir.new_inst(owner, iop, ity)
+        if ivl >= 0 && ir.ins_val(iid) != expect_rebuilt {
+            set_err("tieir 指令结果值重建不一致（指令 " + to_string(ii2) + "）")
+            return -1
+        }
+        var ok2: i64 = 0
+        while ok2 < icn {
+            var ov = rd_i64(t)
+            var okd = rd_i64(t)
+            if tieir_err != "" {
+                return -1
+            }
+            // 池载荷判定（p.9.21.8）：kind 3 = 全局名；kind 0 的操作数①且
+            // opcode ∈ {const_str(62), const_f(51), call(35), extern_call(36),
+            // call_vararg(41)} = 池 id 载荷（与 llvmgen collect_strings/
+            // collect_externs 清单对齐）——经池重映射，不做值重映射。
+            var pool_load: i64 = 0
+            if okd == 3 {
+                pool_load = 1
+            }
+            if okd == 0 && ok2 == 0 {
+                if iop == 62 || iop == 51 || iop == 35 || iop == 36 || iop == 41 {
+                    pool_load = 1
+                }
+            }
+            if pool_load == 1 {
+                ov = pool_remap_id(pool_remap, ov)
+            } else {
+                // kind 0 = SSA 值（重映射）；kind 1 = 块（重建索引与文件一致，透传）
+                if okd == 0 {
+                    if ov < 0 || ov >= remap_n {
+                        set_err("tieir 值操作数越界（指令 " + to_string(ii2) + " 值 " + to_string(ov) + "）")
+                        return -1
+                    }
+                    if remap[ov] < 0 {
+                        set_err("tieir 值操作数引用未定义（指令 " + to_string(ii2) + " 值 " + to_string(ov) + "）")
+                        return -1
+                    }
+                    ov = remap[ov]
+                }
+            }
+            ir.add_operand(iid, ov, okd)
+            ok2 = ok2 + 1
+        }
+        if ir.ins_ops_cnt(iid) != icn {
+            set_err("tieir 指令操作数个数不一致（指令 " + to_string(ii2) + "）")
+            return -1
+        }
+        ii2 = ii2 + 1
+    }
+    // 尾部无指令函数的参数（原空间收尾分配；重建侧已在函数表建好）
+    while alloc_fns < fn_n {
+        var j3: i64 = 0
+        while j3 < fpcs[alloc_fns] {
+            var oid2 = next_orig + j3
+            while remap_n <= oid2 {
+                table_push(remap, 0 - 1)
+                remap_n = remap_n + 1
+            }
+            remap[oid2] = cum_params[alloc_fns] + j3
+            j3 = j3 + 1
+        }
+        next_orig = next_orig + fpcs[alloc_fns]
+        alloc_fns = alloc_fns + 1
+    }
+    // 指令重建完成后：校验块区间与序列化值一致（roundtrip 一致性关键项）
+    var bj2: i64 = 0
+    while bj2 < ir.block_count() {
+        if ir.block_start(bj2) != blk_starts[bj2] || ir.block_end(bj2) != blk_ends[bj2] {
+            set_err("tieir 块指令段不一致（块 " + to_string(bj2) + "）")
+            return -1
+        }
+        bj2 = bj2 + 1
+    }
+    tieir_pos = tieir_sec_end
+    // ---- 段 6：导出表 ----
+    if !rd_sec_head(t, SEC_EXPORT) {
+        return -1
+    }
+    var exp_n = rd_i64(t)
+    if tieir_err != "" {
+        return -1
+    }
+    if exp_n < 0 || exp_n > 1000000 {
+        set_err("tieir 导出表行数非法（" + to_string(exp_n) + "）")
+        return -1
+    }
+    var ei2: i64 = 0
+    while ei2 < exp_n {
+        var enm = rd_i64(t)
+        var esg = rd_i64(t)
+        var eln = rd_i64(t)
+        var ecl = rd_i64(t)
+        if tieir_err != "" {
+            return -1
+        }
+        ir_meta.export_add(pool_remap_id(pool_remap, enm), pool_remap_id(pool_remap, esg), eln, ecl)
+        ei2 = ei2 + 1
+    }
+    tieir_pos = tieir_sec_end
+    // ---- 段 7：span 段 ----
+    if !rd_sec_head(t, SEC_SPAN) {
+        return -1
+    }
+    var span_n = rd_i64(t)
+    if tieir_err != "" {
+        return -1
+    }
+    if span_n < 0 || span_n > 10000000 {
+        set_err("tieir span 行数非法（" + to_string(span_n) + "）")
+        return -1
+    }
+    var spi2: i64 = 0
+    while spi2 < span_n {
+        var sfl = rd_i64(t)
+        var sln = rd_i64(t)
+        var scl = rd_i64(t)
+        if tieir_err != "" {
+            return -1
+        }
+        ir_meta.set_inst_span(spi2, sln, scl)
+        ir_meta.set_inst_file(spi2, sfl)
+        spi2 = spi2 + 1
+    }
+    tieir_pos = tieir_sec_end
+    // ---- 尾部段循环（p.9.22.8）：段 8 = 语义符号表；未知段（段号 > 已知
+    // 最大段）按「段号 + 段长」整体跳过——前向兼容路径，防尾随垃圾仍成立
+    // （跳过必须严格落在段体末尾且不越界）。
+    while tieir_pos < n {
+        var tsec = rd_i64(t)
+        var tlen = rd_i64(t)
+        if tieir_err != "" {
+            return -1
+        }
+        if tlen < 0 || tieir_pos + tlen > n {
+            set_err("tieir 尾部段体越界（段 " + to_string(tsec) + "，长度 " + to_string(tlen) + "）")
+            return -1
+        }
+        if tsec == SEC_SEMSYS {
+            if !parse_semsys(t, tieir_pos + tlen, pool_remap) {
+                return -1
+            }
+        }
+        // 未知段（含未来段号）：整体跳过，不致命。
+        tieir_pos = tieir_pos + tlen
+    }
+    return 0
+}
+
+// 段 8 解析：列数 + 每列「字段号 + kind + 行数 + 行值（kind1 = 池 id，
+// 经 pool_remap 重映射）」。返回 true 成功。
+func parse_semsys(t: table<i64>, body_end: i64, pool_remap: table<i64>) -> bool {
+    tieir_sec_end = body_end
+    var nc = rd_i64(t)
+    if tieir_err != "" || !in_sec() {
+        return false
+    }
+    if nc < 0 || nc > 10000 {
+        set_err("tieir 段 8 列数非法（" + to_string(nc) + "）")
+        return false
+    }
+    tieir_ss_n = nc
+    var c: i64 = 0
+    while c < nc {
+        var fno = rd_i64(t)
+        var kd = rd_i64(t)
+        var ln = rd_i64(t)
+        if tieir_err != "" || !in_sec() {
+            return false
+        }
+        if (kd != 0 && kd != 1) || ln < 0 || ln > 10000000 {
+            set_err("tieir 段 8 列头非法（列 " + to_string(c) + "）")
+            return false
+        }
+        table_push(tieir_ss_fno, fno)
+        table_push(tieir_ss_kind, kd)
+        table_push(tieir_ss_len, ln)
+        table_push(tieir_ss_off, len(tieir_ss_val))
+        var r: i64 = 0
+        while r < ln {
+            var v = rd_i64(t)
+            if tieir_err != "" || !in_sec() {
+                return false
+            }
+            if kd == 1 {
+                v = pool_remap_id(pool_remap, v)
+            }
+            table_push(tieir_ss_val, v)
+            r = r + 1
+        }
+        c = c + 1
+    }
+    // 列体必须恰好用尽段体（防段内尾随垃圾）
+    if tieir_pos != body_end {
+        set_err("tieir 段 8 尾部多余数据（" + to_string(body_end - tieir_pos) + " 字节）")
+        return false
+    }
+    return true
+}
+
+// 从文件读取并反序列化。返回 0 成功 / -1 失败。
+pub func read(path: string) -> i64 {
+    var t = bytes.read(path)
+    if len(t) == 0 {
+        set_err("读取 tieir 文件失败: " + path)
+        return -1
+    }
+    return deserialize(t)
+}
+
+// ---------- dump（可读摘要，对齐 tieir-format.md §2.2 dump 工具） ----------
+
+// 输出当前状态的可读摘要文本（序列化或反序列化后均可调用）。
+pub func dump_text() -> string {
+    var s = "[tieir 摘要] 包=" + pool_str(ir_meta.get_pkg_name())
+    s = s + " 版本=" + pool_str(ir_meta.get_pkg_version())
+    s = s + " IR版本=" + to_string(ir_meta.get_ir_version())
+    s = s + " 编译器=" + pool_str(ir_meta.get_compiler_version())
+    s = s + " t档=" + to_string(ir_meta.get_tie_opt())
+    s = s + " pass版本=" + to_string(ir_meta.get_pass_ver())
+    s = s + " 依赖=" + to_string(ir_meta.dep_count())
+    s = s + " | IR 规模: 函数=" + to_string(ir.func_count())
+    s = s + " 块=" + to_string(ir.block_count())
+    s = s + " 指令=" + to_string(ir.inst_count())
+    s = s + " 值=" + to_string(ir.value_count())
+    s = s + " | 侧表: span=" + to_string(ir_meta.span_count())
+    if tieir_ss_n > 0 {
+        var ss_rows: i64 = 0
+        var ssc: i64 = 0
+        while ssc < tieir_ss_n {
+            ss_rows = ss_rows + tieir_ss_len[ssc]
+            ssc = ssc + 1
+        }
+        s = s + " 语义符号表: " + to_string(tieir_ss_n) + " 列/" + to_string(ss_rows) + " 行"
+    }
+    s = s + " 符号=" + to_string(ir_meta.sym_count())
+    s = s + " 导出=" + to_string(ir_meta.export_count())
+    s = s + " doc=" + to_string(ir_meta.doc_count())
+    s = s + "\n"
+    // 依赖明细
+    var di3: i64 = 0
+    while di3 < ir_meta.dep_count() {
+        s = s + "  [依赖] " + pool_str(ir_meta.dep_name(di3)) + "@" + pool_str(ir_meta.dep_ver(di3)) + "\n"
+        di3 = di3 + 1
+    }
+    // 符号表明细
+    var si3: i64 = 0
+    while si3 < ir_meta.sym_count() {
+        s = s + "  [符号] " + pool_str(ir_meta.sym_name(si3))
+        s = s + " sig=" + pool_str(ir_meta.sym_sig(si3))
+        s = s + " kind=" + to_string(ir_meta.sym_kind(si3))
+        s = s + " vis=" + to_string(ir_meta.sym_vis(si3))
+        s = s + " @" + to_string(ir_meta.sym_line(si3)) + ":" + to_string(ir_meta.sym_col(si3)) + "\n"
+        si3 = si3 + 1
+    }
+    // 导出表明细（L4b 载体：公共 API 清单）
+    var ei3: i64 = 0
+    while ei3 < ir_meta.export_count() {
+        s = s + "  [导出] " + pool_str(ir_meta.exp_name(ei3))
+        s = s + " sig=" + pool_str(ir_meta.exp_sig(ei3))
+        s = s + " @" + to_string(ir_meta.exp_line(ei3)) + ":" + to_string(ir_meta.exp_col(ei3)) + "\n"
+        ei3 = ei3 + 1
+    }
+    return s
+}
+
+// ---------- 内容哈希（P5c 签名载体；段 2-7 字节区间） ----------
+
+// 对字节表 [from, to) 区间计算 FNV-1a 32 位哈希（自实现字节版；
+// 段 1 不计——对齐 tieir-format.md §7「内容哈希：对段 2-7 计算」）。
+// 返回 32 位无符号值（0..0xFFFFFFFF）。
+pub func hash_bytes(t: table<i64>, from: i64, to: i64) -> i64 {
+    var h: i64 = 2166136261   // FNV offset basis（32 位）
+    var i: i64 = from
+    var end = to
+    var n = len(t)
+    if end > n {
+        end = n
+    }
+    while i < end {
+        var b = t[i]
+        if b < 0 || b > 255 {
+            b = 0
+        }
+        // FNV-1a：h = (h XOR byte) * prime（回绕式乘法；每步保持 32 位）
+        h = (h ^ b) * 16777619
+        h = h & 4294967295
+        i = i + 1
+    }
+    return h
+}
+
+// 便捷：对序列化产物（段 2 起）计算内容哈希。
+pub func content_hash() -> i64 {
+    var t = serialize()
+    if tieir_err != "" {
+        return 0
+    }
+    return hash_bytes(t, 13, len(t))
+}
+
+}   // namespace tieir

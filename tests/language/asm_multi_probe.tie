@@ -1,0 +1,66 @@
+type tie<logic>
+// asm_multi_probe.tie —— r.1.6.7 inline asm 操作数回归（三处缺陷修复 2026-09-30）
+// ============================================================================
+// 本探针锁住的三件事（修复前全数失败）：
+//   ① 含 in/inout 操作数 ⇒ 编译器内部错误「ir.add_operand 操作数段交错」。
+//      根因：入参求值 tig_expr(e) 在中途发射指令，把新操作数插进 inline_asm
+//      已 push 的操作数之间。修法：irgen 改**两遍法**（先求值全部入参，再统一
+//      add_operand）。与操作数个数无关 —— 单个 `in(reg) n` 即崩，而纯 out 一直正常。
+//   ② 纯 inout ⇒ 生成 `call void asm …, "+r"(…)`（约束声明有输出却用 void 接收）。
+//      修法：irgen 把「有输出」判据从只认 out(1) 扩到 out(1)|inout(2)。
+//   ③ inout 的约束被写成 GCC 风格 `+r`，LLVM 不认其输出 ⇒ opt 报
+//      "inline asm without outputs must return void"。修法：llvmgen 改为**分段**
+//      拼约束（输出段在前、输入段在后）+ tied operand（`=r` 配纯数字输入约束）。
+//
+// 写法提示：tie 的 asm 是 **AT&T 方言**（对照 atomic_asm.tie 的 `%rax`），
+// 故立即数须写 `$$N`（LLVM 里 `$$` 转义为字面 `$`），寄存器操作数用 `$N` 占位。
+
+// out + in：把 n 搬进 v（AT&T 的 mov 源在前、目标在后）
+func asm_out_in(n: i64) -> i64 {
+    var v: i64 = 0
+    unsafe {
+        asm!("mov $1, $0", out(reg) v, in(reg) n)
+    }
+    return v
+}
+
+// inout：`inc` 单操作数读写
+func asm_inout(n: i64) -> i64 {
+    var v: i64 = n
+    unsafe {
+        asm!("inc $0", inout(reg) v)
+    }
+    return v
+}
+
+// inout + 立即数（AT&T 立即数转义 `$$1`）：加 1
+func asm_inout_imm(n: i64) -> i64 {
+    var v: i64 = n
+    unsafe {
+        asm!("addq $$1, $0", inout(reg) v)
+    }
+    return v
+}
+
+// 单 in（无输出）：只要不崩即可（模板无实际效果）
+func asm_in_only(n: i64) -> i64 {
+    var r: i64 = 0
+    unsafe {
+        asm!("nop", in(reg) n)
+    }
+    return r
+}
+
+func main() {
+    var a = asm_out_in(42)        // 42
+    var b = asm_inout(7)          // 8
+    var c = asm_inout_imm(7)      // 8
+    var d = asm_in_only(1)        // 0
+    if a == 42 && b == 8 && c == 8 && d == 0 {
+        println("asm 多操作数 PASS (" + to_string(a) + " " + to_string(b) + " " +
+            to_string(c) + " " + to_string(d) + ")")
+    } else {
+        println("asm 多操作数 FAIL (" + to_string(a) + " " + to_string(b) + " " +
+            to_string(c) + " " + to_string(d) + ")")
+    }
+}

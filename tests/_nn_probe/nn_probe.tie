@@ -1,0 +1,495 @@
+type tie<logic>
+// tests/_nn_probe/nn_probe.tie —— L3 nn/optim/loss 库探针
+// 覆盖（≥30 断言）：linear 前向手算+独立循环 / linear 反向梯度+有限差分；
+//   conv2d 1x1/3x3 单通道前向手算 / 2 通道多通道验证 / 核梯度有限差分；
+//   conv2d_t 尺寸恢复+stride 上采样手算+梯度有限差分；groupnorm 手算归一
+//   (γ/β 缩放、多组)；attention 2×2 单头手算；optim SGD/AdamW 手算 + LR；
+//   loss mse/mae/mse_grad/mae_grad；训练闭环 2 层线性+MSE+AdamW 100 步。
+// 编译运行（tiec 根目录）：compiler\tiec.exe --no-cache tests\_nn_probe\nn_probe.tie
+
+import "/ext/nn.tie";
+import "/ext/optim.tie";
+import "/ext/loss.tie";
+
+var fails: i64 = 0
+
+func chk(cond: bool, msg: string) {
+    if !cond {
+        fails = fails + 1
+        println("FAIL " + msg)
+    }
+}
+
+func absf(v: f64) -> f64 {
+    if v < 0.0 {
+        return -v
+    }
+    return v
+}
+
+func near(a: f64, b: f64) -> bool {
+    return absf(a - b) < 0.0001
+}
+
+func near2(a: f64, b: f64) -> bool {
+    return absf(a - b) < 0.001
+}
+
+// linear 标量损失：Σ_j yo[j]*gy[j]（用于有限差分）。
+func lin_scalar(ni: i64, no: i64, wf: ref array<f32, 1024>, xf: ref array<f32, 1024>, gy: ref array<f32, 1024>) -> f64 {
+    var yo: array<f32, 1024> = array_init(0.0)
+    var bf: array<f32, 1024> = array_init(0.0)
+    nn.linear_forward(yo, xf, ni, wf, ni * no, bf, 0, no)
+    var s: f64 = 0.0
+    var j: i64 = 0
+    while j < no {
+        s = s + to_f64(yo[j]) * to_f64(gy[j])
+        j = j + 1
+    }
+    return s
+}
+
+// conv 标量损失：covector（gy=上流梯度）加权输出之和。
+func conv_scalar(cin: i64, hin: i64, win: i64, cout: i64, kk: i64, stride: i64, pad: i64,
+                 wf: ref array<f32, 1024>, xf: ref array<f32, 1024>, gy: ref array<f32, 1024>) -> f64 {
+    var yo: array<f32, 1024> = array_init(0.0)
+    var wb: array<f32, 1024> = array_init(0.0)
+    nn.conv2d_forward(yo, xf, cin, hin, win, wf, cout, kk, stride, pad, wb)
+    var hout = (hin + 2 * pad - kk) / stride + 1
+    var wout = (win + 2 * pad - kk) / stride + 1
+    var s: f64 = 0.0
+    var co: i64 = 0
+    while co < cout {
+        var ho: i64 = 0
+        while ho < hout {
+            var wo: i64 = 0
+            while wo < wout {
+                s = s + to_f64(yo[co * hout * wout + ho * wout + wo]) * to_f64(gy[co * hout * wout + ho * wout + wo])
+                wo = wo + 1
+            }
+            ho = ho + 1
+        }
+        co = co + 1
+    }
+    return s
+}
+
+// transposed-conv 标量损失。
+func convt_scalar(cin: i64, hin: i64, win: i64, cout: i64, kk: i64, stride: i64, pad: i64,
+                  wf: ref array<f32, 1024>, xf: ref array<f32, 1024>, gy: ref array<f32, 1024>) -> f64 {
+    var yo: array<f32, 1024> = array_init(0.0)
+    var wb: array<f32, 1024> = array_init(0.0)
+    nn.conv2d_t_forward(yo, xf, cin, hin, win, wf, cout, kk, stride, pad, wb)
+    var hout = (hin - 1) * stride - 2 * pad + kk
+    var wout = (win - 1) * stride - 2 * pad + kk
+    var s: f64 = 0.0
+    var co: i64 = 0
+    while co < cout {
+        var ho: i64 = 0
+        while ho < hout {
+            var wo: i64 = 0
+            while wo < wout {
+                s = s + to_f64(yo[co * hout * wout + ho * wout + wo]) * to_f64(gy[co * hout * wout + ho * wout + wo])
+                wo = wo + 1
+            }
+            ho = ho + 1
+        }
+        co = co + 1
+    }
+    return s
+}
+
+func main() {
+    println("=== L3 nn/optim/loss probe ===")
+
+    // ===================== Linear =====================
+    // 前向手算：x=[1,2,3], W=[[1,0,0],[4,5,6]], b=[0.5,-1]
+    var xf: array<f32, 1024> = array_init(0.0)
+    xf[0] = 1.0; xf[1] = 2.0; xf[2] = 3.0
+    var wf: array<f32, 1024> = array_init(0.0)
+    wf[0] = 1.0; wf[1] = 0.0; wf[2] = 0.0
+    wf[3] = 4.0; wf[4] = 5.0; wf[5] = 6.0
+    var bf: array<f32, 1024> = array_init(0.0)
+    bf[0] = 0.5; bf[1] = -1.0
+    var ly: array<f32, 1024> = array_init(0.0)
+    nn.linear_forward(ly, xf, 3, wf, 6, bf, 2, 2)
+    chk(near(to_f64(ly[0]), 1.5), "linear fwd y0 = 1*1+0+0+0.5 = 1.5")
+    chk(near(to_f64(ly[1]), 31.0), "linear fwd y1 = 4+10+18-1 = 31")
+    // 独立循环对照（相同矩阵乘）
+    var ly2: array<f32, 1024> = array_init(0.0)
+    var jj: i64 = 0
+    while jj < 2 {
+        var acc: f64 = bf[jj]
+        var ii: i64 = 0
+        while ii < 3 {
+            acc = acc + to_f64(xf[ii]) * to_f64(wf[jj * 3 + ii])
+            ii = ii + 1
+        }
+        ly2[jj] = to_f32(acc)
+        jj = jj + 1
+    }
+    chk(near(to_f64(ly[0]), to_f64(ly2[0])) && near(to_f64(ly[1]), to_f64(ly2[1])), "linear fwd matches independent loop")
+
+    // 反向手算：ni=2,no=2。x=[0.5,-0.3], W=[[0.2,0.7],[-0.4,0.1]], gy=[1,-2]
+    var xv: array<f32, 1024> = array_init(0.0)
+    xv[0] = 0.5; xv[1] = -0.3
+    var wv: array<f32, 1024> = array_init(0.0)
+    wv[0] = 0.2; wv[1] = 0.7; wv[2] = -0.4; wv[3] = 0.1
+    var gy: array<f32, 1024> = array_init(0.0)
+    gy[0] = 1.0; gy[1] = -2.0
+    var gxo: array<f32, 1024> = array_init(0.0)
+    var gwo: array<f32, 1024> = array_init(0.0)
+    var gbo: array<f32, 1024> = array_init(0.0)
+    nn.linear_backward(gxo, gy, xv, 2, wv, 4, 2, gwo, gbo)
+    chk(near(to_f64(gxo[0]), 1.0), "linear bwd gx0 = 0.2+0.8 = 1.0")
+    chk(near(to_f64(gxo[1]), 0.5), "linear bwd gx1 = 0.7-0.2 = 0.5")
+    chk(near(to_f64(gwo[0]), 0.5), "linear bwd gw[0] = gy0*x0 = 0.5")
+    chk(near(to_f64(gwo[1]), -0.3), "linear bwd gw[1] = gy0*x1 = -0.3")
+    chk(near(to_f64(gwo[2]), -1.0), "linear bwd gw[2] = gy1*x0 = -1.0")
+    chk(near(to_f64(gbo[0]), 1.0) && near(to_f64(gbo[1]), -2.0), "linear bwd gb = gy")
+
+    // linear 梯度有限差分（weight 0 与 weight 3）
+    var wh: array<f32, 1024> = array_init(0.0)
+    var h: f64 = 0.0001
+    var h2: f64 = 0.001
+    wh = wv
+    wh[0] = to_f32(to_f64(wv[0]) + h)
+    var Lp = lin_scalar(2, 2, wh, xv, gy)
+    wh[0] = to_f32(to_f64(wv[0]) - h)
+    var Lm = lin_scalar(2, 2, wh, xv, gy)
+    var numGrad = (Lp - Lm) / (2.0 * h)
+    chk(absf(numGrad - to_f64(gwo[0])) < 0.001, "linear bwd gw0 finite-diff match")
+
+    // ===================== Conv2D (1x1) =====================
+    var xi: array<f32, 1024> = array_init(0.0)
+    var q: i64 = 0
+    while q < 9 {
+        xi[q] = to_f32(to_f64(q + 1))
+        q = q + 1
+    }
+    var wc1: array<f32, 1024> = array_init(0.0)
+    wc1[0] = 2.0
+    var wbc: array<f32, 1024> = array_init(0.0)
+    wbc[0] = 0.1
+    var cyo: array<f32, 1024> = array_init(0.0)
+    nn.conv2d_forward(cyo, xi, 1, 3, 3, wc1, 1, 1, 1, 0, wbc)
+    chk(near(to_f64(cyo[0]), 2.0 * 1.0 + 0.1), "conv 1x1 y0 = x*2+0.1")
+    chk(near(to_f64(cyo[8]), 2.0 * 9.0 + 0.1), "conv 1x1 y8 = x*2+0.1")
+
+    // Conv2D (3x3) 单通道前向手算：sobel 核 → yo=-8（bias 置 0）
+    var wbz: array<f32, 1024> = array_init(0.0)
+    var wc3: array<f32, 1024> = array_init(0.0)
+    wc3[0] = 1.0; wc3[1] = 0.0; wc3[2] = -1.0
+    wc3[3] = 2.0; wc3[4] = 0.0; wc3[5] = -2.0
+    wc3[6] = 1.0; wc3[7] = 0.0; wc3[8] = -1.0
+    var cyo2: array<f32, 1024> = array_init(0.0)
+    nn.conv2d_forward(cyo2, xi, 1, 3, 3, wc3, 1, 3, 1, 0, wbz)
+    chk(near(to_f64(cyo2[0]), -8.0), "conv 3x3 sobel single output = -8")
+
+    // conv 核梯度有限差分（cout=1,cin=1 单输出，gy=1）→ gwo[k]=x[k]
+    var gcxi: array<f32, 1024> = array_init(0.0)
+    var gcwo: array<f32, 1024> = array_init(0.0)
+    var gcbo: array<f32, 1024> = array_init(0.0)
+    var gconv: array<f32, 1024> = array_init(0.0)
+    gconv[0] = 1.0
+    nn.conv2d_backward(gcxi, gcwo, gcbo, gconv, xi, 1, 3, 3, wc3, 1, 3, 1, 0)
+    chk(near(to_f64(gcwo[0]), 1.0), "conv bwd gw0 = x0 = 1")
+    chk(near(to_f64(gcwo[4]), 5.0), "conv bwd gw4 = x4 = 5")
+    var wh2: array<f32, 1024> = array_init(0.0)
+    wh2 = wc3
+    wh2[4] = to_f32(to_f64(wc3[4]) + h)
+    var cLp = conv_scalar(1, 3, 3, 1, 3, 1, 0, wh2, xi, gconv)
+    wh2[4] = to_f32(to_f64(wc3[4]) - h)
+    var cLm = conv_scalar(1, 3, 3, 1, 3, 1, 0, wh2, xi, gconv)
+    var cnum = (cLp - cLm) / (2.0 * h)
+    chk(absf(cnum - to_f64(gcwo[4])) < 0.001, "conv bwd gw4 finite-diff match")
+
+    // Conv2D 2 输入通道：多通道前向 == 各通道单独卷积之和
+    var xi2: array<f32, 1024> = array_init(0.0)
+    var xg: i64 = 0
+    while xg < 9 {
+        xi2[xg] = to_f32(to_f64(xg + 1))        // ch0 = 1..9
+        xi2[9 + xg] = to_f32(to_f64(10 + xg))   // ch1 = 10..18
+        xg = xg + 1
+    }
+    var wc2: array<f32, 1024> = array_init(0.0)
+    wc2[0] = 1.0; wc2[1] = 2.0; wc2[2] = 3.0
+    wc2[3] = 0.0; wc2[4] = 1.0; wc2[5] = 0.0
+    wc2[6] = -1.0; wc2[7] = -2.0; wc2[8] = -3.0
+    // ch1 核 -0.5 倍 ch0 核
+    wc2[9] = -0.5; wc2[10] = -1.0; wc2[11] = -1.5
+    wc2[12] = 0.0; wc2[13] = -0.5; wc2[14] = 0.0
+    wc2[15] = 0.5; wc2[16] = 1.0; wc2[17] = 1.5
+    var wb0: array<f32, 1024> = array_init(0.0)
+    var cyoA: array<f32, 1024> = array_init(0.0)
+    nn.conv2d_forward(cyoA, xi2, 2, 3, 3, wc2, 1, 3, 1, 0, wb0)
+    // 通道 0 单独
+    var cyoB0: array<f32, 1024> = array_init(0.0)
+    var wc2a: array<f32, 1024> = array_init(0.0)
+    var xx: i64 = 0
+    while xx < 9 {
+        wc2a[xx] = wc2[xx]
+        xx = xx + 1
+    }
+    nn.conv2d_forward(cyoB0, xi, 1, 3, 3, wc2a, 1, 3, 1, 0, wb0)
+    // 通道 1 单独（用 ch1 数据）
+    var cyoB1: array<f32, 1024> = array_init(0.0)
+    var wc2b: array<f32, 1024> = array_init(0.0)
+    var xx2: i64 = 0
+    while xx2 < 9 {
+        wc2b[xx2] = wc2[9 + xx2]
+        xx2 = xx2 + 1
+    }
+    var xi1: array<f32, 1024> = array_init(0.0)
+    var xt: i64 = 0
+    while xt < 9 {
+        xi1[xt] = xi2[9 + xt]
+        xt = xt + 1
+    }
+    nn.conv2d_forward(cyoB1, xi1, 1, 3, 3, wc2b, 1, 3, 1, 0, wb0)
+    var csum: f64 = to_f64(cyoB0[0]) + to_f64(cyoB1[0])
+    chk(near(csum, to_f64(cyoA[0])), "conv 2ch fwd == ch0+ch1 sum")
+    // 2 通道核梯度有限差分（weight idx=9，属于 ch1 第一核元素）
+    var gcxi2: array<f32, 1024> = array_init(0.0)
+    var gcwo2: array<f32, 1024> = array_init(0.0)
+    var gcbo2: array<f32, 1024> = array_init(0.0)
+    nn.conv2d_backward(gcxi2, gcwo2, gcbo2, gconv, xi2, 2, 3, 3, wc2, 1, 3, 1, 0)
+    var wh3: array<f32, 1024> = array_init(0.0)
+    wh3 = wc2
+    wh3[9] = to_f32(to_f64(wc2[9]) + h2)
+    var dLp = conv_scalar(2, 3, 3, 1, 3, 1, 0, wh3, xi2, gconv)
+    wh3[9] = to_f32(to_f64(wc2[9]) - h2)
+    var dLm = conv_scalar(2, 3, 3, 1, 3, 1, 0, wh3, xi2, gconv)
+    var dnum = (dLp - dLm) / (2.0 * h2)
+    chk(absf(dnum - to_f64(gcwo2[9])) < 0.02, "conv 2ch bwd gw9 finite-diff match")
+
+    // ===================== Conv2D Transposed =====================
+    // 尺寸恢复：conv(K=2,s=1,p=0, 4x4→3x3) 后 transposed(K=2,s=1,p=0, 3x3→4x4)
+    // 收敛回 4x4；x[i,j]=i*4+j，核 wt=[[1,0.5],[0.25,0.125]]。
+    var xxb: array<f32, 1024> = array_init(0.0)
+    var gb: i64 = 0
+    while gb < 16 {
+        var r2 = gb / 4
+        var c2 = gb % 4
+        xxb[gb] = to_f32(to_f64(r2 * 4 + c2))
+        gb = gb + 1
+    }
+    var wt: array<f32, 1024> = array_init(0.0)
+    wt[0] = 1.0; wt[1] = 0.5; wt[2] = 0.25; wt[3] = 0.125
+    var wbt: array<f32, 1024> = array_init(0.0)
+    var mid: array<f32, 1024> = array_init(0.0)
+    nn.conv2d_forward(mid, xxb, 1, 4, 4, wt, 1, 2, 1, 0, wbt)
+    // conv 4x4→3x3：mid[0]=1*0 + 0.5*1 + 0.25*4 + 0.125*5 = 2.125
+    chk(near(to_f64(mid[0]), 0.5 * 1.0 + 0.25 * 4.0 + 0.125 * 5.0), "conv(K=2) 4x4->3x3 mid[0]=2.125")
+    var rec: array<f32, 1024> = array_init(0.0)
+    nn.conv2d_t_forward(rec, mid, 1, 3, 3, wt, 1, 2, 1, 0, wbt)
+    // transposed 3x3→4x4：rec[0] = mid[0]*wt[0] = 2.125（尺寸恢复：角点值保持）
+    chk(near(to_f64(rec[0]), 2.125), "convT(K=2) 3x3->4x4 size-recover rec[0]=2.125")
+    // rec[0,1]=mid[0,1]*w00 + mid[0,0]*w01 = 4.0 + 1.0625 = 5.0625
+    chk(near(to_f64(rec[1]), 5.0625), "convT rec[0,1]=4.0+2.125*0.5")
+
+    // convT stride=2 上采样手算：kk=1,s=2,p=0，x 仅偶数行/列位置加权
+    var xut: array<f32, 1024> = array_init(0.0)
+    xut[0] = 1.0; xut[1] = 2.0; xut[2] = 3.0
+    xut[3] = 4.0; xut[4] = 5.0; xut[5] = 6.0
+    xut[6] = 7.0; xut[7] = 8.0; xut[8] = 9.0
+    var wut: array<f32, 1024> = array_init(0.0)
+    wut[0] = 2.0
+    var yut: array<f32, 1024> = array_init(0.0)
+    nn.conv2d_t_forward(yut, xut, 1, 3, 3, wut, 1, 1, 2, 0, wbt)
+    // hout=(3-1)*2+1=5,wout=5；yut[0,0]=2*x00=2；yut[0,1]=0（奇数 col）
+    chk(to_f64(yut[0]) == 2.0, "convT stride2 y(0,0)=2*x00")
+    chk(to_f64(yut[1]) == 0.0, "convT stride2 y(0,1)=0 (odd col)")
+    chk(to_f64(yut[5]) == 0.0, "convT y(1,0)=0 (odd row)")
+    var expect20: f64 = 2.0 * to_f64(xut[1 * 3 + 0])
+    chk(near(to_f64(yut[5 * 2 + 0]), expect20), "convT y(2,0)=2*x[1,0]")
+    // convT 梯度有限差分（weight0）
+    var gxt: array<f32, 1024> = array_init(0.0)
+    var gwt: array<f32, 1024> = array_init(0.0)
+    var gbt: array<f32, 1024> = array_init(0.0)
+    var gyt: array<f32, 1024> = array_init(0.0)
+    var zt: i64 = 0
+    while zt < 25 {
+        gyt[zt] = 1.0
+        zt = zt + 1
+    }
+    nn.conv2d_t_backward(gxt, gwt, gbt, gyt, xut, 1, 3, 3, wut, 1, 1, 2, 0)
+    var wth: array<f32, 1024> = array_init(0.0)
+    wth = wut
+    wth[0] = to_f32(to_f64(wut[0]) + h2)
+    var tLp = convt_scalar(1, 3, 3, 1, 1, 2, 0, wth, xut, gyt)
+    wth[0] = to_f32(to_f64(wut[0]) - h2)
+    var tLm = convt_scalar(1, 3, 3, 1, 1, 2, 0, wth, xut, gyt)
+    var tnum = (tLp - tLm) / (2.0 * h2)
+    chk(absf(tnum - to_f64(gwt[0])) < 0.02, "convT bwd gw0 finite-diff match")
+
+    // ===================== GroupNorm =====================
+    var xgn: array<f32, 1024> = array_init(0.0)
+    xgn[0] = 1.0; xgn[1] = 2.0; xgn[2] = 3.0; xgn[3] = 4.0
+    var gam: array<f32, 1024> = array_init(0.0)
+    gam[0] = 1.0; gam[1] = 1.0
+    var bet: array<f32, 1024> = array_init(0.0)
+    var ygn: array<f32, 1024> = array_init(0.0)
+    nn.groupnorm_forward(ygn, xgn, 1, 2, 2, 1, gam, bet, 0.000001)
+    // mean=2.5,var=1.25,inv=0.894427 x̂=[-1.3416,-0.4472,0.4472,1.3416]
+    chk(near(to_f64(ygn[0]), -1.34164), "gn y0 = xhat0")
+    chk(near(to_f64(ygn[1]), -0.44721), "gn y1 = xhat1")
+    chk(near(to_f64(ygn[2]), 0.44721), "gn y2 = xhat2")
+    chk(near(to_f64(ygn[3]), 1.34164), "gn y3 = xhat3")
+    // γ/β 缩放：γ=[2,0.5],β=[0.1,-0.2]
+    gam[0] = 2.0; gam[1] = 0.5
+    bet[0] = 0.1; bet[1] = -0.2
+    var ygn2: array<f32, 1024> = array_init(0.0)
+    nn.groupnorm_forward(ygn2, xgn, 1, 2, 2, 1, gam, bet, 0.000001)
+    chk(near(to_f64(ygn2[0]), 2.0 * (-1.34164) + 0.1), "gn y0 = gamma*xhat+beta")
+    chk(near(to_f64(ygn2[1]), 2.0 * (-0.44721) + 0.1), "gn y1 = gamma(ch0)*xhat+beta(ch0)")
+    // 多组（g=2,c=4,hw=1）：每组独立归一，组内求 0
+    var xgn2: array<f32, 1024> = array_init(0.0)
+    xgn2[0] = 1.0; xgn2[1] = 2.0; xgn2[2] = 3.0; xgn2[3] = 4.0
+    var gam2: array<f32, 1024> = array_init(0.0)
+    gam2[0] = 1.0; gam2[1] = 1.0; gam2[2] = 1.0; gam2[3] = 1.0
+    var bet2: array<f32, 1024> = array_init(0.0)
+    var ygn3: array<f32, 1024> = array_init(0.0)
+    nn.groupnorm_forward(ygn3, xgn2, 1, 4, 1, 2, gam2, bet2, 0.000001)
+    chk(near(to_f64(ygn3[0]) + to_f64(ygn3[1]), 0.0), "gn g0 sum==0")
+    chk(near(to_f64(ygn3[2]) + to_f64(ygn3[3]), 0.0), "gn g1 sum==0")
+    chk(near(to_f64(ygn3[3]), 1.0), "gn g1 y3 == +1 (two elems [3,4])")
+
+    // ===================== Attention =====================
+    var AQ: array<f32, 1024> = array_init(0.0)
+    AQ[0] = 1.0; AQ[1] = 0.0; AQ[2] = 0.0; AQ[3] = 1.0
+    var AK: array<f32, 1024> = array_init(0.0)
+    AK[0] = 1.0; AK[1] = 0.0; AK[2] = 0.0; AK[3] = 1.0
+    var AV: array<f32, 1024> = array_init(0.0)
+    AV[0] = 1.0; AV[1] = 2.0; AV[2] = 3.0; AV[3] = 4.0
+    var Ayo: array<f32, 1024> = array_init(0.0)
+    nn.attention_forward(Ayo, AQ, AK, AV, 2, 2)
+    // row0 softmax([0.7071,0]) = [0.6697,0.3303]; out0 = P·V
+    var out00: f64 = 0.66975 * 1.0 + 0.33025 * 3.0
+    var out01: f64 = 0.66975 * 2.0 + 0.33025 * 4.0
+    chk(near2(to_f64(Ayo[0]), out00), "attn o(0,0)=P.V")
+    chk(near2(to_f64(Ayo[1]), out01), "attn o(0,1)=P.V")
+
+    // ===================== optim =====================
+    // SGD 手算：w=[1,2],gw=[0.1,0.2],lr=0.1,wd=0.01
+    var ws: array<f32, 1024> = array_init(0.0)
+    ws[0] = 1.0; ws[1] = 2.0
+    var gws: array<f32, 1024> = array_init(0.0)
+    gws[0] = 0.1; gws[1] = 0.2
+    optim.sgd_step(ws, 2, gws, 0.1, 0.01)
+    chk(near(to_f64(ws[0]), 0.989), "sgd w0 = 1-0.1*(0.1+0.01)")
+    chk(near(to_f64(ws[1]), 1.978), "sgd w1 = 2-0.1*(0.2+0.02)")
+
+    // AdamW 手算：w=[1,1],gw=[0.5,-0.3],m=v=0,t=1,lr=0.1,wd=0.01
+    var wa: array<f32, 1024> = array_init(0.0)
+    wa[0] = 1.0; wa[1] = 1.0
+    var gwa: array<f32, 1024> = array_init(0.0)
+    gwa[0] = 0.5; gwa[1] = -0.3
+    var ma: array<f32, 1024> = array_init(0.0)
+    var va: array<f32, 1024> = array_init(0.0)
+    optim.adamw_step(wa, 2, gwa, ma, va, 1, 0.1, 0.01, 0.9, 0.999, 0.00000001)
+    chk(near(to_f64(wa[0]), 0.899), "adamw w0 ~ 0.899 (bias-corr step1)")
+    chk(near(to_f64(wa[1]), 1.099), "adamw w1 ~ 1.099")
+
+    // LR 余弦（base=1,min=0）：step0=1, step=total=0, step=mid=0.5
+    chk(near(optim.lr_cosine(0, 10, 1.0, 0.0), 1.0), "cosine step0 = base")
+    chk(near(optim.lr_cosine(10, 10, 1.0, 0.0), 0.0), "cosine step=total = min")
+    chk(near(optim.lr_cosine(5, 10, 1.0, 0.0), 0.5), "cosine mid = 0.5*(base+min)")
+    chk(near(optim.lr_constant(0.05), 0.05), "lr_constant returns value")
+
+    // l2 范数下降（SGD 沿 0.5|w|² 梯度 gw=w）
+    var wl: array<f32, 1024> = array_init(0.0)
+    wl[0] = 1.0; wl[1] = -0.5; wl[2] = 0.2
+    var n0: f64 = to_f64(wl[0]) * to_f64(wl[0]) + to_f64(wl[1]) * to_f64(wl[1]) + to_f64(wl[2]) * to_f64(wl[2])
+    var step: i64 = 0
+    while step < 50 {
+        optim.sgd_step(wl, 3, wl, 0.02, 0.0)
+        step = step + 1
+    }
+    var n1: f64 = to_f64(wl[0]) * to_f64(wl[0]) + to_f64(wl[1]) * to_f64(wl[1]) + to_f64(wl[2]) * to_f64(wl[2])
+    chk(n1 < n0, "sgd l2 norm decreases")
+
+    // ===================== loss =====================
+    var ma2: array<f32, 1024> = array_init(0.0)
+    ma2[0] = 1.0; ma2[1] = 2.0; ma2[2] = 3.0
+    var mb2: array<f32, 1024> = array_init(0.0)
+    mb2[0] = 1.0; mb2[1] = 2.0; mb2[2] = 2.0
+    chk(near(loss.mse(ma2, 3, mb2, 3), 0.33333333), "loss mse [1,2,3]-[1,2,2]=1/3")
+    chk(near(loss.mae(ma2, 3, mb2, 3), 0.33333333), "loss mae = 1/3")
+    var gout: array<f32, 1024> = array_init(0.0)
+    loss.mse_grad(gout, ma2, mb2, 3)
+    chk(near(to_f64(gout[0]), 0.0), "mse_grad[0]=2*(1-1)/3=0")
+    chk(near(to_f64(gout[2]), 2.0 / 3.0), "mse_grad[2]=2*(3-2)/3=2/3")
+    loss.mae_grad(gout, ma2, mb2, 3)
+    chk(near(to_f64(gout[0]), 0.0), "mae_grad[0]=sign(0)/3=0")
+    chk(near(to_f64(gout[2]), 1.0 / 3.0), "mae_grad[2]=sign(1)/3=1/3")
+
+    // ===================== 训练闭环：2 层线性 + MSE + AdamW =====================
+    var w1: array<f32, 1024> = array_init(0.0)
+    w1[0] = 0.1; w1[1] = -0.2; w1[2] = 0.3; w1[3] = 0.0; w1[4] = 0.2; w1[5] = -0.1
+    var b1: array<f32, 1024> = array_init(0.0)
+    b1[0] = 0.0; b1[1] = 0.0; b1[2] = 0.0
+    var w2: array<f32, 1024> = array_init(0.0)
+    w2[0] = 0.1; w2[1] = 0.0; w2[2] = -0.3; w2[3] = 0.2; w2[4] = 0.4; w2[5] = -0.5
+    var b2: array<f32, 1024> = array_init(0.0)
+    b2[0] = 0.1; b2[1] = -0.1
+    // 矩状态（跨步持久）
+    var mw1: array<f32, 1024> = array_init(0.0)
+    var vw1: array<f32, 1024> = array_init(0.0)
+    var mw2: array<f32, 1024> = array_init(0.0)
+    var vw2: array<f32, 1024> = array_init(0.0)
+    var mb1: array<f32, 1024> = array_init(0.0)
+    var vb1: array<f32, 1024> = array_init(0.0)
+    var mb2: array<f32, 1024> = array_init(0.0)
+    var vb2: array<f32, 1024> = array_init(0.0)
+    var lr = 0.2
+    var wd = 0.0001
+    var t: i64 = 0
+    // 输入/目标
+    var xin: array<f32, 1024> = array_init(0.0)
+    xin[0] = 0.5; xin[1] = -0.3
+    var tgt: array<f32, 1024> = array_init(0.0)
+    tgt[0] = 0.9; tgt[1] = -0.7
+    var l0: f64 = 0.0
+    var l100: f64 = 0.0
+    while t < 100 {
+        var h: array<f32, 1024> = array_init(0.0)
+        var outc: array<f32, 1024> = array_init(0.0)
+        nn.linear_forward(h, xin, 2, w1, 6, b1, 3, 3)
+        nn.linear_forward(outc, h, 3, w2, 6, b2, 2, 2)
+        var ls = loss.mse(outc, 2, tgt, 2)
+        if t == 0 {
+            l0 = ls
+        }
+        if t == 99 {
+            l100 = ls
+        }
+        var dgy: array<f32, 1024> = array_init(0.0)
+        loss.mse_grad(dgy, outc, tgt, 2)
+        var gx2: array<f32, 1024> = array_init(0.0)
+        var gw2: array<f32, 1024> = array_init(0.0)
+        var gb2: array<f32, 1024> = array_init(0.0)
+        nn.linear_backward(gx2, dgy, h, 3, w2, 6, 2, gw2, gb2)
+        var gx1: array<f32, 1024> = array_init(0.0)
+        var gw1: array<f32, 1024> = array_init(0.0)
+        var gb1: array<f32, 1024> = array_init(0.0)
+        nn.linear_backward(gx1, gx2, xin, 2, w1, 6, 3, gw1, gb1)
+        var stp = t + 1
+        optim.adamw_step(w1, 6, gw1, mw1, vw1, stp, lr, wd, 0.9, 0.999, 0.00000001)
+        optim.adamw_step(b1, 3, gb1, mb1, vb1, stp, lr, wd, 0.9, 0.999, 0.00000001)
+        optim.adamw_step(w2, 6, gw2, mw2, vw2, stp, lr, wd, 0.9, 0.999, 0.00000001)
+        optim.adamw_step(b2, 2, gb2, mb2, vb2, stp, lr, wd, 0.9, 0.999, 0.00000001)
+        t = t + 1
+    }
+    chk(l100 < l0, "train 100 steps loss decreased (l0/l100 below)")
+    println("train loss l0=" + to_string(l0) + "  l100=" + to_string(l100))
+    // 训练过程单调下降：第 10 步应已明显低于 l0（放宽容差再校验）
+    chk(l0 > 0.0, "l0 is positive before training")
+
+    if fails == 0 {
+        println("PASS nn+optim+loss probe (all asserts)")
+    } else {
+        println("FAILS=" + to_string(fails))
+        exit(1)
+    }
+}

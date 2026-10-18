@@ -1,0 +1,33 @@
+type tie<logic>
+// actor_closure_local.tie —— 任务 B：actor 方法体内创建闭包并调用
+var g_k: i64 = 5
+
+actor W {
+    // B1：方法体内自建闭包（不捕获）
+    pub func m1(y: i64) -> i64 {
+        var f = func(x: i64) -> i64 { return x * 3 }
+        return f(y)
+    }
+
+    // B2：方法体内自建闭包（捕获局部）
+    pub func m2(y: i64) -> i64 {
+        var k: i64 = 9
+        var f = func(x: i64) -> i64 { return x * k }
+        return f(y)
+    }
+
+    // B3：方法体内自建闭包（捕获 actor 字段）
+    pub func m3(y: i64) -> i64 {
+        var f = func(x: i64) -> i64 { return x + base }
+        return f(y)
+    }
+
+    var base: i64 = 100
+}
+
+func main() {
+    var w = run W()
+    println("B1=" + to_string(w.m1(7)) + " 期望 21")
+    println("B2=" + to_string(w.m2(7)) + " 期望 63")
+    println("B3=" + to_string(w.m3(7)) + " 期望 107")
+}

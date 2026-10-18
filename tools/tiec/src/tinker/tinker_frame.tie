@@ -1,0 +1,277 @@
+type tie<class>
+// compiler/tinker/tinker_frame.tie —— tink 帧编解码（tink **v3 线格式**；p.9.22.9 升级）
+// ============================================================
+// 帧格式（与 tlib std/tink.tie 逐字节一致，语言无关；设计见 tink v3 设计文档 §3）：
+//   16B 定长头：[magic 0x74 0x6B][ver=3][type=0x04 MESSAGE][flags u16]
+//               [stream_id u32=0][seq u32=0][len u16]
+//   载荷区：len 字节；**大载荷自动分片**（v3 §5.2）：分片帧 OFFSET 位置位、载荷前 4B
+//     BE 偏移（计入 len），首片偏移 0、末片 FIN；本层对收发透传——frame_next 一次
+//     返回重组后的完整载荷（与单帧语义等同），调用方零感知。
+//   尾部：CRC32C（Castagnoli，4B BE；覆盖「头 + 载荷」，本工具无扩展区）。
+//   flags：1=EXT 2=PROTECTED 4=CRC 8=FIN 16=OFFSET 32=URGENT（保留位必须为 0）。
+// 断代说明：v3 不承诺 v1 线格式兼容——旧 [len u32][payload][crc32] 帧将被拒（拒帧语义）。
+// 与 tlib std/tink.tie 的字节级互验由仓库外侧交叉探针覆盖（本地对拍，不入库）。
+// 本文件零 import（被 driver 链内联；自包含纪律同 zdw）。
+
+// CRC32C 查表（惰性构建；Castagnoli 反射式 poly 0x82F63B78）。
+var tk_crc_tab: table<i64>;
+var tk_crc_ready: i64 = 0;
+
+namespace tinker {
+
+// 构建 CRC32C 表（8 次「(t>>1) ^ (lsb ? 82F63B78 : 0)」）。
+func crc_tab_build() {
+    tk_crc_tab = table_new_i64()
+    var i: i64 = 0
+    while i < 256 {
+        var c: i64 = i
+        var k: i64 = 0
+        while k < 8 {
+            var lsb: i64 = c & 1
+            c = c >> 1
+            if lsb != 0 {
+                c = c ^ 0x82F63B78
+            }
+            k = k + 1
+        }
+        table_push(tk_crc_tab, c)
+        i = i + 1
+    }
+    tk_crc_ready = 1
+}
+
+// CRC32C 区间 [a, b)（与 std/tink crc32c_range 逐字节一致）。
+// 向量：crc32c("123456789") = 0xE3069283（交叉探针断言）。
+pub func crc32c_range(p: table<i64>, a: i64, b: i64) -> i64 {
+    if tk_crc_ready == 0 {
+        crc_tab_build()
+    }
+    var c: i64 = 0xFFFFFFFF
+    var i: i64 = a
+    while i < b {
+        var x = p[i]
+        if x < 0 || x > 255 {
+            x = 0
+        }
+        c = (c >> 8) ^ tk_crc_tab[(c ^ x) & 0xFF]
+        i = i + 1
+    }
+    return c ^ 0xFFFFFFFF
+}
+
+pub func crc32c(p: table<i64>) -> i64 {
+    return crc32c_range(p, 0, len(p))
+}
+
+// 单帧组装（无扩展区）：flags 由调用方给（含 CRC/FIN/OFFSET 位）；seq = 片序
+// （单帧 = 0；分片 i = i，与 tlib msg_split 对齐）；尾 = CRC32C(头‖载荷)。
+func frame_one(payload: table<i64>, flags: i64, seq: i64) -> table<i64> {
+    var out = table_new_i64()
+    var n = len(payload)
+    table_push(out, 0x74)
+    table_push(out, 0x6B)
+    table_push(out, 3)
+    table_push(out, 0x04)
+    table_push(out, (flags >> 8) & 0xFF)
+    table_push(out, flags & 0xFF)
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, (seq >> 24) & 0xFF)
+    table_push(out, (seq >> 16) & 0xFF)
+    table_push(out, (seq >> 8) & 0xFF)
+    table_push(out, seq & 0xFF)
+    table_push(out, (n >> 8) & 0xFF)
+    table_push(out, n & 0xFF)
+    var i: i64 = 0
+    while i < n {
+        table_push(out, payload[i])
+        i = i + 1
+    }
+    var c = crc32c(out)
+    table_push(out, (c >> 24) & 0xFF)
+    table_push(out, (c >> 16) & 0xFF)
+    table_push(out, (c >> 8) & 0xFF)
+    table_push(out, c & 0xFF)
+    return out
+}
+
+// 帧编码：逻辑载荷 → 单帧（CRC|FIN）；> 65531B 自动分片（OFFSET 位 + 4B 偏移，末片 FIN）。
+pub func frame_encode(payload: table<i64>) -> table<i64> {
+    var total = len(payload)
+    if total <= 65531 {
+        return frame_one(payload, 4 | 8, 0)
+    }
+    var out = table_new_i64()
+    var c: i64 = 65531
+    var nf = total / c
+    if nf * c < total {
+        nf = nf + 1
+    }
+    var i: i64 = 0
+    while i < nf {
+        var cs = i * c
+        var ce = cs + c
+        if ce > total {
+            ce = total
+        }
+        var body = table_new_i64()
+        table_push(body, (cs >> 24) & 0xFF)
+        table_push(body, (cs >> 16) & 0xFF)
+        table_push(body, (cs >> 8) & 0xFF)
+        table_push(body, cs & 0xFF)
+        var j: i64 = cs
+        while j < ce {
+            table_push(body, payload[j])
+            j = j + 1
+        }
+        var fl: i64 = 4 | 16
+        if i == nf - 1 {
+            fl = fl | 8
+        }
+        var fr = frame_one(body, fl, i)
+        out = byte_concat(out, fr)
+        i = i + 1
+    }
+    return out
+}
+
+// 头校验（magic/ver/type=0x04/保留位=0/无 EXT 与 PROTECTED/长度界内）→ 16 或 -1。
+func head_at(bytes: table<i64>, pos: i64) -> i64 {
+    var nb = len(bytes)
+    if pos < 0 || pos + 16 > nb {
+        return -1
+    }
+    if (bytes[pos] & 0xFF) != 0x74 || (bytes[pos + 1] & 0xFF) != 0x6B {
+        return -1
+    }
+    if (bytes[pos + 2] & 0xFF) != 3 {
+        return -1
+    }
+    if (bytes[pos + 3] & 0xFF) != 0x04 {
+        return -1
+    }
+    var fl = ((bytes[pos + 4] & 0xFF) << 8) | (bytes[pos + 5] & 0xFF)
+    if (fl & 0xFFC0) != 0 {
+        return -1
+    }
+    if (fl & 1) != 0 {
+        return -1
+    }
+    if (fl & 2) != 0 {
+        return -1
+    }
+    var ln = ((bytes[pos + 14] & 0xFF) << 8) | (bytes[pos + 15] & 0xFF)
+    var tlen: i64 = 0
+    if (fl & 4) != 0 {
+        tlen = 4
+    }
+    if pos + 16 + ln + tlen > nb {
+        return -1
+    }
+    return 16
+}
+
+// 读一单帧（CRC 校验）→ (ok, flags, payload 拷贝, next)；失败 ok=0/next=-1。
+func read_one(bytes: table<i64>, pos: i64) -> (i64, i64, table<i64>, i64) {
+    var empty = table_new_i64()
+    if head_at(bytes, pos) != 16 {
+        return (0, 0, empty, -1)
+    }
+    var fl = ((bytes[pos + 4] & 0xFF) << 8) | (bytes[pos + 5] & 0xFF)
+    var ln = ((bytes[pos + 14] & 0xFF) << 8) | (bytes[pos + 15] & 0xFF)
+    var tlen: i64 = 0
+    if (fl & 4) != 0 {
+        tlen = 4
+    }
+    var payload = table_new_i64()
+    var i: i64 = 0
+    while i < ln {
+        table_push(payload, bytes[pos + 16 + i])
+        i = i + 1
+    }
+    if tlen == 4 {
+        var q = pos + 16 + ln
+        var want = ((bytes[q] & 0xFF) << 24) | ((bytes[q + 1] & 0xFF) << 16) | ((bytes[q + 2] & 0xFF) << 8) | (bytes[q + 3] & 0xFF)
+        if want != crc32c_range(bytes, pos, q) {
+            return (0, 0, empty, -1)
+        }
+    }
+    return (1, fl, payload, pos + 16 + ln + tlen)
+}
+
+// 帧解析（含分片重组；逐片 CRC 校验）→ (payload, next)；失败 (空表, -1)。
+// 单帧（无 OFFSET）直返；分片连读至 FIN、按偏移严格重组（首片 0、无缝、偏移=已收字节数）。
+pub func frame_next(bytes: table<i64>, pos: i64) -> (table<i64>, i64) {
+    var empty = table_new_i64()
+    var r = read_one(bytes, pos)
+    if r.0 != 1 {
+        return (empty, -1)
+    }
+    var fl0 = r.1
+    var pl0 = r.2
+    var nx0 = r.3
+    if (fl0 & 16) == 0 {
+        return (pl0, nx0)
+    }
+    if len(pl0) < 4 {
+        return (empty, -1)
+    }
+    var first_off = ((pl0[0] & 0xFF) << 24) | ((pl0[1] & 0xFF) << 16) | ((pl0[2] & 0xFF) << 8) | (pl0[3] & 0xFF)
+    if first_off != 0 {
+        return (empty, -1)
+    }
+    var out = table_new_i64()
+    var j: i64 = 4
+    while j < len(pl0) {
+        table_push(out, pl0[j])
+        j = j + 1
+    }
+    var fin: i64 = 0
+    if (fl0 & 8) != 0 {
+        fin = 1
+    }
+    var cur = nx0
+    while fin == 0 {
+        var r2 = read_one(bytes, cur)
+        if r2.0 != 1 {
+            return (empty, -1)
+        }
+        var fl2 = r2.1
+        var pl2 = r2.2
+        if (fl2 & 16) == 0 || len(pl2) < 4 {
+            return (empty, -1)
+        }
+        var off2 = ((pl2[0] & 0xFF) << 24) | ((pl2[1] & 0xFF) << 16) | ((pl2[2] & 0xFF) << 8) | (pl2[3] & 0xFF)
+        if off2 != len(out) {
+            return (empty, -1)
+        }
+        var j2: i64 = 4
+        while j2 < len(pl2) {
+            table_push(out, pl2[j2])
+            j2 = j2 + 1
+        }
+        if (fl2 & 8) != 0 {
+            fin = 1
+        }
+        cur = r2.3
+    }
+    return (out, cur)
+}
+
+// 帧跳过（不校验 CRC；单帧粒度）。失败 -1。
+pub func frame_skip(bytes: table<i64>, pos: i64) -> i64 {
+    if head_at(bytes, pos) != 16 {
+        return -1
+    }
+    var fl = ((bytes[pos + 4] & 0xFF) << 8) | (bytes[pos + 5] & 0xFF)
+    var ln = ((bytes[pos + 14] & 0xFF) << 8) | (bytes[pos + 15] & 0xFF)
+    var tlen: i64 = 0
+    if (fl & 4) != 0 {
+        tlen = 4
+    }
+    return pos + 16 + ln + tlen
+}
+
+}   // namespace tinker

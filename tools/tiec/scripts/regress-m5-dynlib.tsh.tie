@@ -1,0 +1,172 @@
+type tie<tsh>
+// scripts/regress-m5-dynlib.tsh.tie —— M5 动态库编译回归（dev33 批次 12）（tsh-role 移植 regress-m5-dynlib.ps1）
+// ============================================================================
+// 覆盖：.dll 编译 / 导出面（pub 导出、私有不导出）/ C 冒烟（LoadLibrary+GetProcAddress）
+//       边界负例（--shared + 表/struct 违例应拒）/ --shared+logic 角色应拒 / 静态库编译无回归。
+// 用法（仓库根目录）：<tsh> -f scripts/regress-m5-dynlib.tsh.tie [tiec路径]
+// 移植说明：`file_exists` 内建对运行期新建文件失效 → 存在性走 cmd `if exist`（fex）。
+//           llvm-readobj/clang 为外部非 PS 工具；findstr/contains 判定符号导出面。
+
+func bstr(b: bool) -> string {
+    if b { return "T" }
+    return "F"
+}
+func fex(p: string) -> bool {
+    var r = exec_output("cmd /c if exist " + p + " (echo _FE_YES) else (echo _FE_NO) 2>&1")
+    return contains(r, "_FE_YES")
+}
+
+var tiec = ".\\compiler\\tiec.exe"
+if arg_count() >= 1 && !is_empty(arg_at(0)) { tiec = arg_at(0) }
+
+var root = cwd()
+var lib = root + "\\examples\\lib_math_dyn"
+var tmpdir = get_env("TEMP") + "\\m5_dynlib"
+var dll = tmpdir + "\\lib_math_dyn.dll"
+var ro = "D:\\LLVM\\bin\\llvm-readobj.exe"
+if !fex(ro) { ro = "llvm-readobj" }
+
+var pass: i64 = 0
+var fail: i64 = 0
+var rc: i64 = 0
+var syms = ""
+var out = ""
+var allPub = true
+var privHidden = true
+var pb = false
+var _x: i64 = 0
+
+// 清理并建临时目录。`rd` 后首次 mkdir 与清理存在竞态（偶发不建目录）→ 轮询直到真实存在。
+_x = exec_code("cmd /c rd /s /q " + tmpdir + " >nul 2>&1")
+var _mk: i64 = 0
+while _mk < 30 && !fex(tmpdir) {
+    var _md = exec_output("cmd /c if not exist " + tmpdir + " mkdir " + tmpdir + " 2>&1")
+    _mk = _mk + 1
+    sleep_ms(200)
+}
+
+println("=== M5 动态库回归（tiec=" + tiec + "）===")
+
+// 注：exec_code 对 tiec 编译的退出码在本运行期不可靠（成功构建偶报 rc=1，产物实际已
+//     生成/缓存命中）——运行时缺陷。故成功/拒绝判定统一以「产物是否存在」为准（fex），
+//     这与 .ps1 的《产物生成判定成功》语义一致且更稳（放弃依赖白盒 rc）。
+
+// ---- 1. .dll 编译（exec_code 带 >nul 不落盘产物——运行时缺陷；改用 exec_output）----
+out = exec_output("cmd /c " + tiec + " " + lib + "\\lib_math_dyn.tie -o " + dll + " 2>&1")
+if fex(dll) {
+    println("PASS 步骤1：tie 库编译为 .dll（产物已生成）")
+    pass = pass + 1
+} else {
+    println("FAIL 步骤1：tie 库编译为 .dll（rc=" + to_string(rc) + ", 无产物）")
+    fail = fail + 1
+}
+
+// ---- 2. 导出面检查 ----
+if fex(dll) {
+    syms = exec_output("cmd /c " + ro + " --coff-exports " + dll + " 2>&1")
+    allPub = contains(syms, "mathdyn$add") && contains(syms, "mathdyn$mul") &&
+             contains(syms, "mathdyn$sub") && contains(syms, "mathdyn$max2") &&
+             contains(syms, "mathdyn$neg") && contains(syms, "mathdyn$use_private")
+    privHidden = !contains(syms, "mathdyn$private_helper")
+    if allPub && privHidden {
+        println("PASS 步骤2：6 个 pub 符号导出、私有函数未导出")
+        pass = pass + 1
+    } else {
+        println("FAIL 步骤2：6 个 pub 符号导出、私有函数未导出")
+        fail = fail + 1
+    }
+} else {
+    println("FAIL 步骤2：无 .dll 可检查导出面")
+    fail = fail + 1
+}
+
+// ---- 3. C 冒烟 ----
+if fex(dll) {
+    rc = exec_code("cmd /c clang " + lib + "\\main.c -o " + tmpdir + "\\main.exe >nul 2>&1")
+    if fex(tmpdir + "\\main.exe") {
+        out = exec_output("cmd /c " + tmpdir + "\\main.exe " + dll + " 2>&1")
+        if contains(out, "=== C 冒烟全部通过 ===") {
+            println("PASS 步骤3：C LoadLibrary/GetProcAddress 调用全部通过")
+            pass = pass + 1
+        } else {
+            println("FAIL 步骤3：C 冒烟输出不符")
+            fail = fail + 1
+        }
+    } else {
+        println("FAIL 步骤3：main.c 编译失败（clang 不可用？）")
+        fail = fail + 1
+    }
+} else {
+    println("FAIL 步骤3：无 .dll 可做 C 冒烟")
+    fail = fail + 1
+}
+
+// ---- 4. 边界负例：--shared + 导出 table 参数/非 pod struct 返回应拒 ----
+out = exec_output("cmd /c " + tiec + " " + root + "\\tests\\m5_dynlib\\dynlib_boundary_neg.tie --shared -o " + tmpdir + "\\bnd.dll 2>&1")
+if !fex(tmpdir + "\\bnd.dll") {
+    println("PASS 步骤4：边界负例（导出 table 参数/非 pod struct 返回）被拒绝")
+    pass = pass + 1
+} else {
+    println("FAIL 步骤4：边界负例未被拒绝")
+    fail = fail + 1
+}
+
+// ---- 4b. 边界正例 ----
+out = exec_output("cmd /c " + tiec + " " + root + "\\tests\\m5_dynlib\\dynbound_pos.tie --shared -o " + tmpdir + "\\dynbound_pos.dll 2>&1")
+if fex(tmpdir + "\\dynbound_pos.dll") {
+    syms = exec_output("cmd /c " + ro + " --coff-exports " + tmpdir + "\\dynbound_pos.dll 2>&1")
+    pb = contains(syms, "dynbound_pos$sum_slice") && contains(syms, "dynbound_pos$pod_add")
+    if pb {
+        println("PASS 步骤4b：slice + pod struct 导出面（sum_slice/pod_add）")
+        pass = pass + 1
+    } else {
+        println("FAIL 步骤4b：slice + pod struct 导出面")
+        fail = fail + 1
+    }
+    rc = exec_code("cmd /c clang " + root + "\\tests\\m5_dynlib\\dynbound_c.c -o " + tmpdir + "\\dynbound_c.exe >nul 2>&1")
+    if fex(tmpdir + "\\dynbound_c.exe") {
+        out = exec_output("cmd /c " + tmpdir + "\\dynbound_c.exe " + tmpdir + "\\dynbound_pos.dll 2>&1")
+        if contains(out, "C 冒烟全部通过") {
+            println("PASS 步骤4c：slice/pod struct 跨库 C 冒烟（ABI 一致）")
+            pass = pass + 1
+        } else {
+            println("FAIL 步骤4c：跨库 C 冒烟输出不符")
+            fail = fail + 1
+        }
+    } else {
+        println("FAIL 步骤4c：dynbound_c.c 编译失败（clang 不可用？）")
+        fail = fail + 1
+    }
+} else {
+    println("FAIL 步骤4b：slice/pod struct 动态库编译失败")
+    fail = fail + 1
+}
+
+// ---- 5. --shared + logic 角色应拒（hello.tie 非 library 角色）----
+out = exec_output("cmd /c " + tiec + " " + root + "\\examples\\hello.tie --shared -o " + tmpdir + "\\x.dll 2>&1")
+if !fex(tmpdir + "\\x.dll") {
+    println("PASS 步骤5：--shared 非 library 角色被拒绝")
+    pass = pass + 1
+} else {
+    println("FAIL 步骤5：--shared 非 library 角色未被拒绝")
+    fail = fail + 1
+}
+
+// ---- 6. 静态库编译无回归 ----
+out = exec_output("cmd /c " + tiec + " " + lib + "\\lib_math_dyn.tie -o " + tmpdir + "\\lib_math_dyn.a 2>&1")
+if fex(tmpdir + "\\lib_math_dyn.a") {
+    println("PASS 步骤6：静态库 .a 编译无回归（产物已生成）")
+    pass = pass + 1
+} else {
+    println("FAIL 步骤6：静态库 .a 编译失败（无产物）")
+    fail = fail + 1
+}
+
+_x = exec_code("cmd /c rd /s /q " + tmpdir + " >nul 2>&1")
+
+println("")
+println("=== 汇总: PASS=" + to_string(pass) + " FAIL=" + to_string(fail) + " ===")
+if fail != 0 {
+    exit(1)
+}
+exit(0)

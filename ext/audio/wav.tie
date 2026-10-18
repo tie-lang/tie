@@ -1,0 +1,455 @@
+type tie<class>
+// ============================================================================
+// ext/audio/wav.tie —— 音频 WAV 编解码（命名空间 wav，纯 tie 全量）p.9.1.1.7
+// Audio WAV codec (namespace wav, full pure-tie).
+//
+// 覆盖 Coverage（原生 RIFF/WAVE，无外部运行时）：
+//   - RIFF/WAVE 容器解析 + fmt/data（+fact 跳过）chunk 遍历；数据平面 table<i64> 字节表；
+//   - PCM 8/16/24/32-bit（8 位无符号、16/24/32 有符号小端）样本读写；
+//   - IEEE-754 单精度 float（fmt=3，bits=32）样本读写（f64 ↔ f32 位重解释，经 bitcast 原语）；
+//   - 逐样本归一化 f64 视图（samples，-1..1）+ 原始整型样本读取（read_raw）；
+//   - 简单工具：混音 mix（逐元素相加并钳位）与增益 gain（缩放并钳位）。
+// 边界 Boundary（如实注明）：
+//   - 不实现有损/压缩：MP3/FLAC/Ogg/Vorbis 标注依赖 dr_libs/FFmpeg 待后续；
+//   - 多 data chunk 按序拼接；RIFX（大端）不支持；
+//   - fmt 为 PCM/float 之外（ADPCM/GSM 等）返回 ok=false；
+//   - float32 次正规数（|x|<2^-126）解码归零（近似边界，音频样本极少触达）；
+//   - 位深不落入 {8,16,24,32} 报错。
+// ============================================================================
+
+struct Wav {
+    var ok: bool = false
+    var err: string = ""
+    var channels: i64 = 0
+    var rate: i64 = 0
+    var bits: i64 = 0
+    var fmt: i64 = 0              // 1=PCM 3=IEEE float
+    var block_align: i64 = 0
+    var data_bytes: i64 = 0
+    var sample_count: i64 = 0     // = data_bytes / block_align
+    var data: table<i64> = table_new_i64()       // data chunk 原始字节
+    var samples: table<f64> = table_new_f64()    // 归一化 -1..1，声道交错
+}
+
+namespace wav {
+
+func le16(b: table<i64>, off: i64) -> i64 {
+    return b[off] | (b[off + 1] << 8)
+}
+func le32(b: table<i64>, off: i64) -> i64 {
+    return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)
+}
+func is4(b: table<i64>, off: i64, c0: i64, c1: i64, c2: i64, c3: i64) -> bool {
+    return b[off] == c0 && b[off + 1] == c1 && b[off + 2] == c2 && b[off + 3] == c3
+}
+func push_le16(ref buf: table<i64>, v: i64) {
+    table_push(buf, v & 0xFF)
+    table_push(buf, (v >> 8) & 0xFF)
+}
+func push_le32(ref buf: table<i64>, v: i64) {
+    table_push(buf, v & 0xFF)
+    table_push(buf, (v >> 8) & 0xFF)
+    table_push(buf, (v >> 16) & 0xFF)
+    table_push(buf, (v >> 24) & 0xFF)
+}
+func push_str(ref buf: table<i64>, s: string) {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        table_push(buf, str_byte(s, i))
+        i = i + 1
+    }
+}
+
+// ---- 有符号小端读取（16/24/32）----
+func s16(b: table<i64>, off: i64) -> i64 {
+    var v = b[off] | (b[off + 1] << 8)
+    if v >= 32768 {
+        v = v - 65536
+    }
+    return v
+}
+func s24(b: table<i64>, off: i64) -> i64 {
+    var v = b[off] | (b[off + 1] << 8) | (b[off + 2] << 16)
+    if v >= 8388608 {
+        v = v - 16777216
+    }
+    return v
+}
+func s32(b: table<i64>, off: i64) -> i64 {
+    var v = b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)
+    if v >= 2147483648 {          // bit31 置位 → 负
+        v = v - 4294967296
+    }
+    return v
+}
+
+// ---- 源字节数 / 声道（一次样本字节）----
+func bytes_per(bits: i64) -> i64 {
+    return (bits + 7) / 8
+}
+
+// ============================================================================
+// 一、float32 <-> float64（bitcast 原语）
+// ============================================================================
+// f64 → IEEE-754 单精度位模式（含 inf/nan；次正规归零为边界）。
+func f32_bits(x: f64) -> i64 {
+    var raw = bitcast_f64_i64(x)
+    var sign = (raw >> 63) & 0x1
+    var e64 = (raw >> 52) & 0x7FF
+    var m64 = raw & 0xFFFFFFFFFFFFF
+    if e64 == 0x7FF {
+        if m64 != 0 {
+            return (sign << 31) | (0xFF << 23) | 0x400000      // NaN
+        }
+        return (sign << 31) | (0xFF << 23)                      // ±Inf
+    }
+    if e64 == 0 {
+        return sign << 31                                        // ±0（含 f64 次正规→0 边界）
+    }
+    var e = e64 - 1023 + 127
+    if e >= 255 {
+        return (sign << 31) | (0xFF << 23)                       // 溢出→Inf
+    }
+    if e <= 0 {
+        return sign << 31                                        // 过小→±0（边界）
+    }
+    var keep0 = m64 >> 29                                        // 取高 23 尾数位
+    var rest = m64 & 0x1FFFFFFF
+    var round: i64 = 0
+    var half: i64 = 0x10000000   // 2^28
+    if rest > half {
+        round = 1
+    } else if rest == half && (keep0 & 1) != 0 {
+        round = 1                                               // round-half-even
+    }
+    var m32 = keep0 + round
+    if m32 >= 0x800000 {
+        m32 = 0
+        e = e + 1
+        if e >= 255 {
+            return (sign << 31) | (0xFF << 23)
+        }
+    }
+    return (sign << 31) | (e << 23) | m32
+}
+
+// IEEE-754 单精度位模式 → f64。次正规 f32 归零（边界）。
+func f32_to_f64(bits: i64) -> f64 {
+    var sign = (bits >> 31) & 1
+    var e = (bits >> 23) & 0xFF
+    var m = bits & 0x7FFFFF
+    if e == 0xFF {
+        if m != 0 {
+            return parse_float("nan")
+        }
+        if sign != 0 {
+            return -1.0 / 0.0
+        }
+        return 1.0 / 0.0
+    }
+    if e == 0 {
+        if m == 0 {
+            if sign != 0 {
+                return -0.0
+            }
+            return 0.0
+        }
+        return 0.0   // f32 次正规 → 0（边界）
+    }
+    var ee = e + 1023 - 127
+    var mm = m | 0x800000
+    // f64 尾数域 52 位不含隐式前导 1：丢弃 mm 的 bit23（隐式位），只放低 23 位。
+    var raw64 = (sign << 63) | (ee << 52) | ((mm & 0x7FFFFF) << 29)
+    return bitcast_i64_f64(raw64)
+}
+
+// ============================================================================
+// 二、decode：完整 RIFF/WAVE → Wav
+// ============================================================================
+pub func decode(bytes: table<i64>) -> Wav {
+    var w = Wav()
+    var nb = len(bytes)
+    if nb < 12 {
+        w.err = "truncated <12"
+        return w
+    }
+    if is4(bytes, 0, 0x52, 0x49, 0x46, 0x46) == false {
+        w.err = "bad RIFF magic"
+        return w
+    }
+    if is4(bytes, 8, 0x57, 0x41, 0x56, 0x45) == false {
+        w.err = "bad WAVE magic"
+        return w
+    }
+    var fmt_get: i64 = 0
+    var pos: i64 = 12
+    var data = table_new_i64()
+    while pos + 8 <= nb {
+        var ck = le32(bytes, pos + 4)
+        if ck < 0 || pos + 8 + ck > nb {
+            w.err = "chunk overrun"
+            return w
+        }
+        if is4(bytes, pos, 0x66, 0x6D, 0x74, 0x20) {        // "fmt "
+            if ck < 16 {
+                w.err = "fmt too small"
+                return w
+            }
+            w.fmt = le16(bytes, pos + 8)
+            w.channels = le16(bytes, pos + 10)
+            w.rate = le32(bytes, pos + 12)
+            w.bits = le16(bytes, pos + 22)
+            var bps = bytes_per(w.bits)
+            w.block_align = w.channels * bps
+            fmt_get = 1
+        } else if is4(bytes, pos, 0x64, 0x61, 0x74, 0x61) {  // "data"
+            var k: i64 = 0
+            while k < ck {
+                table_push(data, bytes[pos + 8 + k])
+                k = k + 1
+            }
+        }
+        pos = pos + 8 + ck
+        if (ck & 1) != 0 {
+            pos = pos + 1
+        }
+    }
+    if fmt_get == 0 {
+        w.err = "missing fmt"
+        return w
+    }
+    if w.channels <= 0 || w.rate <= 0 {
+        w.err = "bad fmt channels/rate"
+        return w
+    }
+    if len(data) == 0 {
+        w.err = "missing data"
+        return w
+    }
+    if w.fmt != 1 && w.fmt != 3 {
+        w.err = "unsupported fmt (PCM=1 float=3 only)"
+        return w
+    }
+    if w.bits != 8 && w.bits != 16 && w.bits != 24 && w.bits != 32 {
+        w.err = "unsupported bits; need 8/16/24/32"
+        return w
+    }
+    if w.block_align <= 0 {
+        w.err = "bad block_align"
+        return w
+    }
+    w.data = data
+    w.data_bytes = len(data)
+    var bps = bytes_per(w.bits)
+    w.sample_count = len(data) / bps       // 总样本数（各声道），非帧数
+    // 归一化样本
+    var samples = table_new_f64()
+    var i: i64 = 0
+    if w.fmt == 1 {
+        var scale: f64 = 1.0
+        if w.bits == 8 {
+            scale = 128.0
+        } else if w.bits == 16 {
+            scale = 32768.0
+        } else if w.bits == 24 {
+            scale = 8388608.0
+        } else {
+            scale = 2147483648.0
+        }
+        var n = w.sample_count
+        var s: i64 = 0
+        while s < n {
+            var off = s * bps
+            var rawv: i64 = 0
+            if w.bits == 8 {
+                rawv = data[off]
+            } else if w.bits == 16 {
+                rawv = s16(data, off)
+            } else if w.bits == 24 {
+                rawv = s24(data, off)
+            } else {
+                rawv = s32(data, off)
+            }
+            var nv = parse_float(to_string(rawv))
+            if w.bits == 8 {
+                nv = nv - 128.0
+            }
+            var fv = nv / scale
+            table_push(samples, fv)
+            s = s + 1
+        }
+    } else {
+        // float32
+        var n = w.sample_count
+        var s: i64 = 0
+        while s < n {
+            var off = s * bps
+            var bits = le32(data, off)
+            table_push(samples, f32_to_f64(bits))
+            s = s + 1
+        }
+    }
+    w.samples = samples
+    w.ok = true
+    return w
+}
+
+// read_raw：读第 i 个样本的实际整型（PCM）字节解释值（8 位无符号 0..255；16/24/32 有符号）。
+pub func read_raw(w: Wav, i: i64) -> i64 {
+    if w.ok == false || w.fmt != 1 || i < 0 || i >= w.sample_count {
+        return 0
+    }
+    var bps = bytes_per(w.bits)
+    var off = i * bps
+    if w.bits == 8 {
+        return w.data[off]
+    }
+    if w.bits == 16 {
+        return s16(w.data, off)
+    }
+    if w.bits == 24 {
+        return s24(w.data, off)
+    }
+    return s32(w.data, off)
+}
+
+// ============================================================================
+// 三、encode：PCM / float32
+// ============================================================================
+func push_fmt(ref buf: table<i64>, fmt: i64, channels: i64, rate: i64, bps: i64, ba: i64, bits: i64) {
+    push_str(buf, "fmt ")
+    push_le32(buf, 16)
+    push_le16(buf, fmt)
+    push_le16(buf, channels)
+    push_le32(buf, rate)
+    push_le32(buf, rate * ba)
+    push_le16(buf, ba)
+    push_le16(buf, bits)
+}
+
+// PCM 整数样本（交错）→ WAV 字节表。bits ∈{8,16,24,32}；8 位按 0..255 无符号存取。
+pub func encode_pcm(samples: table<i64>, channels: i64, rate: i64, bits: i64) -> table<i64> {
+    var out = table_new_i64()
+    if channels <= 0 || rate <= 0 {
+        return out
+    }
+    var bps = bytes_per(bits)
+    if bits != 8 && bits != 16 && bits != 24 && bits != 32 {
+        return out
+    }
+    var data = table_new_i64()
+    var i: i64 = 0
+    while i < len(samples) {
+        var s = samples[i]
+        if bits == 8 {
+            table_push(data, s & 0xFF)
+        } else if bits == 16 {
+            push_le16(data, s & 0xFFFF)
+        } else if bits == 24 {
+            table_push(data, s & 0xFF)
+            table_push(data, (s >> 8) & 0xFF)
+            table_push(data, (s >> 16) & 0xFF)
+        } else {
+            push_le32(data, s)
+        }
+        i = i + 1
+    }
+    var ba = channels * bps
+    push_str(out, "RIFF")
+    var sz = 4 + (8 + 16) + (8 + len(data))     // WAVE+fmt+data
+    if (sz & 1) != 0 {
+        sz = sz + 1
+    }
+    push_le32(out, sz)
+    push_str(out, "WAVE")
+    push_fmt(out, 1, channels, rate, bps, ba, bits)
+    push_str(out, "data")
+    push_le32(out, len(data))
+    var k: i64 = 0
+    while k < len(data) {
+        table_push(out, data[k])
+        k = k + 1
+    }
+    if (len(data) & 1) != 0 {
+        table_push(out, 0)
+    }
+    return out
+}
+
+// float32 样本（-1..1，交错）→ WAV 字节表（fmt=3，bits=32）。
+pub func encode_f32(floats: table<f64>, channels: i64, rate: i64) -> table<i64> {
+    var out = table_new_i64()
+    if channels <= 0 || rate <= 0 {
+        return out
+    }
+    var data = table_new_i64()
+    var i: i64 = 0
+    while i < len(floats) {
+        push_le32(data, f32_bits(floats[i]))
+        i = i + 1
+    }
+    var ba = channels * 4
+    push_str(out, "RIFF")
+    var sz = 4 + (8 + 16) + (8 + len(data))
+    if (sz & 1) != 0 {
+        sz = sz + 1
+    }
+    push_le32(out, sz)
+    push_str(out, "WAVE")
+    push_fmt(out, 3, channels, rate, 4, ba, 32)
+    push_str(out, "data")
+    push_le32(out, len(data))
+    var k: i64 = 0
+    while k < len(data) {
+        table_push(out, data[k])
+        k = k + 1
+    }
+    if (len(data) & 1) != 0 {
+        table_push(out, 0)
+    }
+    return out
+}
+
+// ============================================================================
+// 四、工具：混音 / 增益（归一化 f64 视图）
+// ============================================================================
+// 混音：对应样本相加并钳位到 [-1,1]；长度取较短者。
+pub func mix(a: table<f64>, b: table<f64>) -> table<f64> {
+    var out = table_new_f64()
+    var n = len(a)
+    if len(b) < n {
+        n = len(b)
+    }
+    var i: i64 = 0
+    while i < n {
+        var v = a[i] + b[i]
+        if v > 1.0 {
+            v = 1.0
+        } else if v < -1.0 {
+            v = -1.0
+        }
+        table_push(out, v)
+        i = i + 1
+    }
+    return out
+}
+
+// 增益：缩放并钳位到 [-1,1]。
+pub func gain(x: table<f64>, g: f64) -> table<f64> {
+    var out = table_new_f64()
+    var i: i64 = 0
+    while i < len(x) {
+        var v = x[i] * g
+        if v > 1.0 {
+            v = 1.0
+        } else if v < -1.0 {
+            v = -1.0
+        }
+        table_push(out, v)
+        i = i + 1
+    }
+    return out
+}
+
+}   // namespace wav

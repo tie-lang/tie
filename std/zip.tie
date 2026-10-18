@@ -1,0 +1,392 @@
+type tie<class>
+// ============================================================================
+// std/zip.tie —— ZIP 归档容器库（命名空间 zip，纯 tie）p.9.1.1.19
+// 实现 ZIP 其容器结构：local file headers + central directory + end-of-central
+// directory record + 每项 CRC-32。数据平面：全部 table<i64>（字节表，元素
+// 0..255）+ table<string>（文件名），绝不转 string 承载二进制。
+//
+// 打包压缩：
+//   - level != 0 且数据非空 → DEFLATE（method=8，复用 std/zlib 的 deflate）；
+//   - level == 0 或空数据 → 直存（method=0，stored，无压缩）。
+// 解包：按 central directory 定位每项，method 8 走 zlib.inflate、method 0 直拷，
+// 并用 zlib.crc32 校验逐项 CRC。文件名以 UTF-8 编码（general purpose bit 0x0800）。
+//
+// 接口（数据平面适配裁决）：
+//   tie 的 std 层容器仅支持标量参数化表（table_new_i64/string/f64/bool），
+//   **不支持 `table<(name,data)>` 元组表 / 表内混存 string+table**；嵌套表的
+//   构建/传参/返回经「表字面量 [t] + table_push + table<table<i64>> 标注」可行
+//   （已探针验证）。故原设计签名的 `table<(name,data)>` 改以**并行平行表对**
+//   `names: table<string> + datas: table<table<i64>>`（按下标一一对应）表达。
+//     zip_pack(names, datas, level) -> table<i64>            （字节）
+//     zip_unpack(z) -> (bool, names, datas)
+//     zip_list(z) -> table<string>      （按名列出入库文件名）
+//     zip_get(z, name) -> table<i64>    （按名取字节；不存在返回空表）
+//   Zip64（>4GB / 超大数量）不实现（注明：32 位 csize/usize/offset 字段式微）；
+//   UTF-16 文件名 / 加密 / 数据描述符（bit3）亦不处理（本库产出的归档不含）。
+// ============================================================================
+
+import "./zlib.tie" as zlib
+
+namespace zip {
+
+// ============================================================================
+// 一、字节级辅助（小端写 / 读 / 切片 / 追加）
+// ============================================================================
+
+// 追加 u16 LE（2 字节）到 out。
+func push_le16(ref out: table<i64>, v: i64) {
+    table_push(out, v & 0xFF)
+    table_push(out, (v >> 8) & 0xFF)
+}
+
+// 追加 u32 LE（4 字节）到 out。
+func push_le32(ref out: table<i64>, v: i64) {
+    table_push(out, v & 0xFF)
+    table_push(out, (v >> 8) & 0xFF)
+    table_push(out, (v >> 16) & 0xFF)
+    table_push(out, (v >> 24) & 0xFF)
+}
+
+// 读 u16 LE：b[pos..pos+2)。
+func rd_le16(b: table<i64>, pos: i64) -> i64 {
+    return (b[pos] & 0xFF) | ((b[pos + 1] & 0xFF) << 8)
+}
+
+// 读 u32 LE：b[pos..pos+4)。
+func rd_le32(b: table<i64>, pos: i64) -> i64 {
+    return (b[pos] & 0xFF) | ((b[pos + 1] & 0xFF) << 8) |
+        ((b[pos + 2] & 0xFF) << 16) | ((b[pos + 3] & 0xFF) << 24)
+}
+
+// 把整张表 b 追加到 out 末尾。
+func push_all(ref out: table<i64>, b: table<i64>) {
+    var n = len(b)
+    var i: i64 = 0
+    while i < n {
+        table_push(out, b[i])
+        i = i + 1
+    }
+}
+
+// 取 b[pos .. pos+n) 的切片副本。
+func subbytes(b: table<i64>, pos: i64, n: i64) -> table<i64> {
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        if pos + i < len(b) {
+            table_push(out, b[pos + i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================================
+// 二、文件名 UTF-8 编解码（容器名按字节存取，跨平台安全）
+// ============================================================================
+
+// 字符串 → UTF-8 字节表（逐码点编码）。
+func utf8_enc(s: string) -> table<i64> {
+    var out = table_new_i64()
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var cp = char_code(str_char(s, i))
+        if cp <= 0x7F {
+            table_push(out, cp)
+        } else if cp <= 0x7FF {
+            table_push(out, 0xC0 | (cp >> 6))
+            table_push(out, 0x80 | (cp & 0x3F))
+        } else if cp <= 0xFFFF {
+            table_push(out, 0xE0 | (cp >> 12))
+            table_push(out, 0x80 | ((cp >> 6) & 0x3F))
+            table_push(out, 0x80 | (cp & 0x3F))
+        } else {
+            table_push(out, 0xF0 | (cp >> 18))
+            table_push(out, 0x80 | ((cp >> 12) & 0x3F))
+            table_push(out, 0x80 | ((cp >> 6) & 0x3F))
+            table_push(out, 0x80 | (cp & 0x3F))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// UTF-8 字节表 → 字符串（逐序列解码；畸形字节按码值直落，尽力而为）。
+func utf8_str(b: table<i64>) -> string {
+    var out: string = ""
+    var n = len(b)
+    var i: i64 = 0
+    while i < n {
+        var c0 = b[i] & 0xFF
+        var cp: i64 = 0
+        var adv: i64 = 1
+        if c0 < 0x80 {
+            cp = c0
+        } else if (c0 & 0xE0) == 0xC0 {
+            if i + 1 < n {
+                cp = ((c0 & 0x1F) << 6) | (b[i + 1] & 0x3F)
+            } else {
+                cp = c0
+            }
+            adv = 2
+        } else if (c0 & 0xF0) == 0xE0 {
+            if i + 2 < n {
+                cp = ((c0 & 0x0F) << 12) | ((b[i + 1] & 0x3F) << 6) | (b[i + 2] & 0x3F)
+            } else {
+                cp = c0
+            }
+            adv = 3
+        } else if (c0 & 0xF8) == 0xF0 {
+            if i + 3 < n {
+                cp = ((c0 & 0x07) << 18) | ((b[i + 1] & 0x3F) << 12) |
+                    ((b[i + 2] & 0x3F) << 6) | (b[i + 3] & 0x3F)
+            } else {
+                cp = c0
+            }
+            adv = 4
+        } else {
+            cp = c0
+        }
+        out = out + str_from_code(cp)
+        i = i + adv
+    }
+    return out
+}
+
+// ============================================================================
+// 三、打包 zip_pack
+// ============================================================================
+
+// 把 names/datas（下标一一对应）打成 ZIP 字节表。level：0=直存，非 0=DEFLATE。
+pub func zip_pack(names: table<string>, datas: table<table<i64>>, level: i64) -> table<i64> {
+    var out = table_new_i64()
+    var n = len(names)
+    var offs = table_new_i64()
+    var crcs = table_new_i64()
+    var csizes = table_new_i64()
+    var usizes = table_new_i64()
+    var methods = table_new_i64()
+
+    var i: i64 = 0
+    while i < n {
+        var data = datas[i]
+        var sz = len(data)
+        var crc = zlib.crc32(data)
+        var cdat = data
+        var m: i64 = 0
+        if level != 0 && sz > 0 {
+            cdat = zlib.deflate(data)
+            m = 8
+        }
+        var off = len(out)
+        table_push(offs, off)
+        table_push(crcs, crc)
+        table_push(csizes, len(cdat))
+        table_push(usizes, sz)
+        table_push(methods, m)
+        var nb = utf8_enc(names[i])
+        // local file header（30 字节固定）+ name + data
+        push_le32(out, 0x04034B50)          // sig local
+        push_le16(out, 20)                  // version needed
+        push_le16(out, 0x0800)              // flags: UTF-8 name
+        push_le16(out, m)                   // method
+        push_le16(out, 0)                   // mod time
+        push_le16(out, 0)                   // mod date
+        push_le32(out, crc)
+        push_le32(out, len(cdat))
+        push_le32(out, sz)
+        push_le16(out, len(nb))
+        push_le16(out, 0)                   // extra len
+        push_all(out, nb)
+        push_all(out, cdat)
+        i = i + 1
+    }
+
+    var cd_off = len(out)
+    var ents = n
+    var j: i64 = 0
+    while j < ents {
+        var nb2 = utf8_enc(names[j])
+        push_le32(out, 0x02014B50)          // sig central
+        push_le16(out, 20)                  // version made by
+        push_le16(out, 20)                  // version needed
+        push_le16(out, 0x0800)
+        push_le16(out, methods[j])
+        push_le16(out, 0)                   // mod time
+        push_le16(out, 0)                   // mod date
+        push_le32(out, crcs[j])
+        push_le32(out, csizes[j])
+        push_le32(out, usizes[j])
+        push_le16(out, len(nb2))
+        push_le16(out, 0)                   // extra len
+        push_le16(out, 0)                   // comment len
+        push_le16(out, 0)                   // disk start
+        push_le16(out, 0)                   // internal attrs
+        push_le32(out, 0)                   // external attrs
+        push_le32(out, offs[j])             // local header offset
+        push_all(out, nb2)
+        j = j + 1
+    }
+    var cd_size = len(out) - cd_off
+
+    // end-of-central-directory record（22 字节）
+    push_le32(out, 0x06054B50)
+    push_le16(out, 0)                       // disk
+    push_le16(out, 0)                       // disk with cd
+    push_le16(out, ents)
+    push_le16(out, ents)
+    push_le32(out, cd_size)
+    push_le32(out, cd_off)
+    push_le16(out, 0)                       // comment len
+    return out
+}
+
+// ============================================================================
+// 四、解包 zip_unpack
+// ============================================================================
+
+// 在 z 中反向扫描 EOCD 签名（尾部 ←倒数 22+65535 窗内）；返回其位置，找不到 -1。
+func find_eocd(z: table<i64>) -> i64 {
+    var n = len(z)
+    var lo = n - 22 - 65535
+    if lo < 0 {
+        lo = 0
+    }
+    var i = n - 22
+    while i >= lo {
+        if z[i] == 0x50 && z[i + 1] == 0x4B && z[i + 2] == 0x05 && z[i + 3] == 0x06 {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// 解包 ZIP 字节 → (ok, names, datas)。ok=false 表示结构非法 / CRC 校验失败。
+pub func zip_unpack(z: table<i64>) -> (bool, table<string>, table<table<i64>>) {
+    var names = table_new_string()
+    var empty_ds: table<table<i64>> = [subbytes(z, 0, 0)]
+    if len(z) < 22 {
+        return (false, names, empty_ds)
+    }
+    var eocd = find_eocd(z)
+    if eocd < 0 {
+        return (false, names, empty_ds)
+    }
+    var ents = rd_le16(z, eocd + 10)
+    var cd_off = rd_le32(z, eocd + 16)
+    // 解析 central directory 到平行标量表
+    var lhos = table_new_i64()
+    var csizes = table_new_i64()
+    var usizes = table_new_i64()
+    var methods = table_new_i64()
+    var crcs = table_new_i64()
+    var pos = cd_off
+    var k: i64 = 0
+    while k < ents {
+        if pos + 46 > len(z) {
+            return (false, names, empty_ds)
+        }
+        if rd_le32(z, pos) != 0x02014B50 {
+            return (false, names, empty_ds)
+        }
+        var method = rd_le16(z, pos + 10)
+        var crc = rd_le32(z, pos + 16)
+        var csize = rd_le32(z, pos + 20)
+        var usize = rd_le32(z, pos + 24)
+        var nlen = rd_le16(z, pos + 28)
+        var elen = rd_le16(z, pos + 30)
+        var clen = rd_le16(z, pos + 32)
+        var lho = rd_le32(z, pos + 42)
+        table_push(lhos, lho)
+        table_push(csizes, csize)
+        table_push(usizes, usize)
+        table_push(methods, method)
+        table_push(crcs, crc)
+        table_push(names, utf8_str(subbytes(z, pos + 46, nlen)))
+        pos = pos + 46 + nlen + elen + clen
+        k = k + 1
+    }
+    // 逐项按 local offset 取数据并校验
+    if ents == 0 {
+        return (true, names, empty_ds)
+    }
+    var d0 = extract_entry(z, lhos[0], csizes[0], usizes[0], methods[0], crcs[0])
+    if d0.0 == false {
+        return (false, names, empty_ds)
+    }
+    var datas: table<table<i64>> = [d0.1]
+    var j: i64 = 1
+    while j < ents {
+        var dj = extract_entry(z, lhos[j], csizes[j], usizes[j], methods[j], crcs[j])
+        if dj.0 == false {
+            return (false, names, datas)
+        }
+        table_push(datas, dj.1)
+        j = j + 1
+    }
+    return (true, names, datas)
+}
+
+// 取单个条目数据：在 local offset 处按 local header 定位数据段，解压并 CRC 校验。
+func extract_entry(z: table<i64>, lho: i64, csize: i64, usize: i64, method: i64, crc: i64) -> (bool, table<i64>) {
+    var empty = table_new_i64()
+    if lho + 30 > len(z) {
+        return (false, empty)
+    }
+    var lnamelen = rd_le16(z, lho + 26)
+    var lextralen = rd_le16(z, lho + 28)
+    var dstart = lho + 30 + lnamelen + lextralen
+    var comp = subbytes(z, dstart, csize)
+    var out = empty
+    if method == 0 {
+        out = comp
+    } else if method == 8 {
+        var rr = zlib.inflate(comp)
+        if rr.0 == false {
+            return (false, empty)
+        }
+        out = rr.1
+    } else {
+        return (false, empty)   // 未知压缩方法
+    }
+    if len(out) != usize {
+        return (false, empty)
+    }
+    if zlib.crc32(out) != crc {
+        return (false, empty)
+    }
+    return (true, out)
+}
+
+// ============================================================================
+// 五、按名列列 / 按名取
+// ============================================================================
+
+// 列出入库文件名（按 zip 内的存储顺序）。
+pub func zip_list(z: table<i64>) -> table<string> {
+    var r = zip_unpack(z)
+    return r.1
+}
+
+// 按名取一个条目字节（解压后）；存名不存在 / 结构非法 → 空表。
+pub func zip_get(z: table<i64>, name: string) -> table<i64> {
+    var r = zip_unpack(z)
+    if r.0 == false {
+        return table_new_i64()
+    }
+    var names = r.1
+    var datas = r.2
+    var n = len(names)
+    var i: i64 = 0
+    while i < n {
+        if names[i] == name {
+            return datas[i]
+        }
+        i = i + 1
+    }
+    return table_new_i64()
+}
+
+}   // namespace zip

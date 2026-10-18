@@ -1,0 +1,700 @@
+type tie<class>
+// compiler/backend/irgen_fs.tie —— 生成器 L3：文件系统辅助（open/stat/read/write/exists/size/delete/copy/move）
+// ============================================================
+// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// 构件模式串（两字符，如 "rb"/"wb"）：sso 池分配块 {头, 数据, \0}，返回数据指针
+func tig_bt_mode2(c0: i64, c1: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var n = tig_int_lit(2)
+    var mbuf = s21_sso_alloc(n)
+    s21_store(s21_gep(mbuf, 0, true), n, T64)  // 长度头 = 2
+    var md = s21_gep(mbuf, 8, true)
+    s21_store(s21_gep(md, 0, true), tig_int_lit_ty(c0, I8), I8)
+    s21_store(s21_gep(md, 1, true), tig_int_lit_ty(c1, I8), I8)
+    s21_store(s21_gep(md, 2, true), tig_int_lit_ty(0, I8), I8)  // 尾 \0
+    return md
+}
+// 失败输出：路径 + 固定前缀（byte_read 诊断）→ 控制台编码契约分派 + exit(1)。
+// （原为 printf(fmt, path)、fmt 由调用方传入；唯一调用点 bits.tie byte_read。）
+func tig_bt_fail(p: i64) {
+    var pre = tig_str_lit(interner.intern("\"byte_read: 打开/读取文件失败: \""))
+    var msg = tig_binary_str(0, pre, p)
+    tig_print_str_line(msg, true)
+    var one = tig_int_lit_ty(1, types.named(TK_I64))
+    tig_ext_call1("exit", one, types.named(TK_I64), -1)
+}
+// libc 包装：fseek（返回值忽略，FILE* 以 ptr<i8> 类型传参）
+func tig_bt_fseek(f: i64, off: i64, whence: i64) {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.ptr_of(types.named(TK_I8)))
+    table_push(avs, f)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, off)
+    table_push(ats, types.named(TK_I32))
+    table_push(avs, whence)
+    tig_ext_call_typed("fseek", ats, avs, types.named(TK_I32))
+}
+// fread(buf, n, f)：size=1, count=n；返回实际读到的元素数
+func tig_bt_fread(buf: i64, n: i64, f: i64) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.ptr_of(types.named(TK_I8)))
+    table_push(avs, buf)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, tig_int_lit(1))
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, n)
+    table_push(ats, types.ptr_of(types.named(TK_I8)))
+    table_push(avs, f)
+    return tig_ext_call_typed("fread", ats, avs, types.named(TK_I64))
+}
+// fwrite(buf, n, f)：size=1, count=n；返回实际写出的元素数
+func tig_bt_fwrite(buf: i64, n: i64, f: i64) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.ptr_of(types.named(TK_I8)))
+    table_push(avs, buf)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, tig_int_lit(1))
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, n)
+    table_push(ats, types.ptr_of(types.named(TK_I8)))
+    table_push(avs, f)
+    return tig_ext_call_typed("fwrite", ats, avs, types.named(TK_I64))
+}
+// fclose(f)：FILE* 关闭（返回值忽略）
+func tig_bt_fclose(f: i64) {
+    tig_ext_call1("fclose", f, types.ptr_of(types.named(TK_I8)), types.named(TK_I32))
+}
+// 当前编译目标是否 Linux（irgen 侧判定；g_asm_target 恒非空）
+func tig_is_linux() -> bool {
+    var t = g_asm_target
+    var n: i64 = str_len(t)
+    var i: i64 = 0
+    while i <= n - 5 {
+        if slice(str.clone(t), i, i + 5) == "linux" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+// POSIX open(path, flags, mode) → i32 fd（mode 仅 O_CREAT 时有效；
+// x86_64 SysV 变参调用约定与定参一致，固定 3 参安全）
+func tig_posix_open3(p: i64, flags: i64, mode: i64) -> i64 {
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8);  table_push(avs, p)
+    table_push(ats, I32); table_push(avs, flags)
+    table_push(ats, I32); table_push(avs, mode)
+    return tig_ext_call_typed("open", ats, avs, I32)
+}
+// POSIX stat 读取 st_mode（u32@24 → i64）；失败（不存在等）→ -1 哨兵
+func tig_posix_stat_mode(p: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var st = s21_raw_alloc_str(tig_int_lit(144))
+    var rc = tig_ext_call2("stat", p, types.named(TK_STR), st, P8, I32)
+    var ok = tig_cmp_zero(rc, 0)  // rc == 0 → 成功
+    var mode = s21_zext(s21_load(s21_gep(st, 24, true), I32), I32)
+    tig_ext_call1("free", st, types.named(TK_STR), -1)
+    return tig_select_i(ok, mode, tig_int_lit(-1), T64)
+}
+// POSIX stat 读取 st_size（i64@48）；失败 → -1 哨兵（对齐 Win32 file_size）
+func tig_posix_stat_size(p: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var st = s21_raw_alloc_str(tig_int_lit(144))
+    var rc = tig_ext_call2("stat", p, types.named(TK_STR), st, P8, I32)
+    var ok = tig_cmp_zero(rc, 0)
+    var sz = s21_load(s21_gep(st, 48, true), T64)  // st_size@48
+    tig_ext_call1("free", st, types.named(TK_STR), -1)
+    return tig_select_i(ok, sz, tig_int_lit(-1), T64)
+}
+// POSIX 文件复制（file_copy 与 copy_dir 文件条目共用）：
+// open src O_RDONLY → open dst O_WRONLY|O_CREAT|O_TRUNC(0644) →
+// 循环 read/write（64KB 块）→ close。成功 true / 任一步失败 false。
+func tig_posix_copy_file(a: i64, b: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var I8 = types.named(TK_I8)
+    var P8 = types.ptr_of(I8)
+    var rs = ir.new_inst(g_cur_block, 20, types.named(TK_BOOL))
+    ir.add_operand(rs, types.named(TK_BOOL), 2)
+    var rp = ir.get_value(rs)
+    s21_store(rp, tig_bool_lit(0), types.named(TK_BOOL))
+    var fds = tig_posix_open3(a, tig_int_lit_ty(0, I32), tig_int_lit_ty(0, I32))  // O_RDONLY
+    var ok = tig_icmp_c(fds, tig_int_lit_ty(-1, I32), 3)  // fd > -1
+    var bOk = ir.new_block(g_cur_func, interner.intern("pc.o"))
+    var bFail = ir.new_block(g_cur_func, interner.intern("pc.f"))
+    var bM = ir.new_block(g_cur_func, interner.intern("pc.m"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, ok, 0)
+    ir.add_operand(cb, bOk, 1)
+    ir.add_operand(cb, bFail, 1)
+    g_cur_block = bFail
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, bM, 1)
+    g_cur_block = bOk
+    var fdd = tig_posix_open3(b, tig_int_lit_ty(0x241, I32), tig_int_lit_ty(420, I32))
+    var ok2 = tig_icmp_c(fdd, tig_int_lit_ty(-1, I32), 3)
+    var bOk2 = ir.new_block(g_cur_func, interner.intern("pc.o2"))
+    var bFail2 = ir.new_block(g_cur_func, interner.intern("pc.f2"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, ok2, 0)
+    ir.add_operand(cb2, bOk2, 1)
+    ir.add_operand(cb2, bFail2, 1)
+    g_cur_block = bFail2
+    tig_ext_call1("close", fds, I32, I32)
+    var brf2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf2, bM, 1)
+    // 复制循环：read(fds, buf, 65536) → write(fdd, buf, nr)；nr<=0 结束
+    g_cur_block = bOk2
+    var chunk = tig_int_lit(65536)
+    var buf = s21_raw_alloc_str(chunk)
+    var hd = ir.new_block(g_cur_func, interner.intern("pc.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("pc.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("pc.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, I32);  table_push(avs, fds)
+    table_push(ats, P8);   table_push(avs, buf)
+    table_push(ats, T64);  table_push(avs, chunk)
+    var nr = tig_ext_call_typed("read", ats, avs, T64)
+    var more = tig_icmp_c(nr, tig_int_lit(0), 3)  // nr > 0
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, more, 0)
+    ir.add_operand(cb3, bd, 1)
+    ir.add_operand(cb3, ex, 1)
+    g_cur_block = bd
+    var ats2: table<i64> = table_new_i64()
+    var avs2: table<i64> = table_new_i64()
+    table_push(ats2, I32);  table_push(avs2, fdd)
+    table_push(ats2, P8);   table_push(avs2, buf)
+    table_push(ats2, T64);  table_push(avs2, nr)
+    tig_ext_call_typed("write", ats2, avs2, T64)  // 常规文件单次写满，返回值忽略
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)
+    g_cur_block = ex
+    tig_ext_call1("close", fdd, I32, I32)
+    tig_ext_call1("close", fds, I32, I32)
+    tig_ext_call1("free", buf, types.named(TK_STR), -1)
+    s21_store(rp, tig_bool_lit(1), types.named(TK_BOOL))
+    var brk = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brk, bM, 1)
+    g_cur_block = bM
+    return s21_load(rp, types.named(TK_BOOL))
+}
+// 建目录（平台分派）：Linux mkdir(path, 0755) UTF-8 直通；Windows 走
+// UTF-16 CreateDirectoryW。返回忽略（mkdir_all 语义恒 true）。
+func tig_mkdir_utf8(p: i64) {
+    if tig_is_linux() {
+        var I32 = types.named(TK_I32)
+        tig_ext_call2("mkdir", p, types.named(TK_STR),
+            tig_int_lit_ty(493, I32), I32, I32)  // 0755
+    } else {
+        tig_mkdir_w(tig_wide16(p))
+    }
+}
+// Linux list_dir 实现：opendir/readdir 收集非 . .. 条目名（d_name UTF-8
+// 直通，strlen 定长 + tig_bytes_to_tie 构 tie 串）→ 表句柄；失败返回空表。
+func tig_posix_list_names(d: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var I8 = types.named(TK_I8)
+    var P8 = types.ptr_of(I8)
+    var dp = tig_ext_call1("opendir", d, types.named(TK_STR), P8)
+    var rslt = ir.new_inst(g_cur_block, 20, types.named(TK_STR))
+    ir.add_operand(rslt, types.named(TK_STR), 2)
+    var sv = ir.get_value(rslt)
+    s21_store(sv, tig_fill_table(s21_raw_alloc_str(tig_int_lit(8)), tig_int_lit(0), tig_int_lit(0)), types.named(TK_STR))
+    var ok = tig_cmp_zero(dp, 1)  // dp != null
+    var bOk = ir.new_block(g_cur_func, interner.intern("pl.o"))
+    var bNo = ir.new_block(g_cur_func, interner.intern("pl.n"))
+    var bM = ir.new_block(g_cur_func, interner.intern("pl.m"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, ok, 0)
+    ir.add_operand(cb, bOk, 1)
+    ir.add_operand(cb, bNo, 1)
+    g_cur_block = bNo
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, bM, 1)
+    // 收集表 blob（增长式，仿 tig_walk_dir 的 rbh）
+    g_cur_block = bOk
+    var rbh = s21_raw_alloc_str(tig_int_lit(24))
+    s21_store(s21_gep(rbh, 0, true), tig_int_lit(0), T64)
+    s21_store(s21_gep(rbh, 8, true), tig_int_lit(0), T64)
+    s21_store(s21_gep(rbh, 16, true), tig_int_lit(0), types.named(TK_STR))
+    var top = ir.new_block(g_cur_func, interner.intern("pl.t"))
+    var brc = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brc, top, 1)
+    g_cur_block = top
+    var ent = tig_ext_call1("readdir", dp, P8, P8)
+    var isend = tig_cmp_zero(ent, 0)  // ent == null → 结束
+    var bEnd = ir.new_block(g_cur_func, interner.intern("pl.e"))
+    var bPr = ir.new_block(g_cur_func, interner.intern("pl.p"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, isend, 0)
+    ir.add_operand(cb2, bEnd, 1)
+    ir.add_operand(cb2, bPr, 1)
+    g_cur_block = bPr
+    var namep = s21_gep(ent, tig_int_lit(19), false)  // d_name@19
+    var nlen = tig_ext_call1("strlen", namep, P8, T64)
+    var nm = tig_bytes_to_tie(namep, nlen)
+    var ndv = tig_not_i1(tig_is_dotname(nm))
+    var bInc = ir.new_block(g_cur_func, interner.intern("pl.i"))
+    var bSkip = ir.new_block(g_cur_func, interner.intern("pl.s"))
+    var bAdv = ir.new_block(g_cur_func, interner.intern("pl.a"))
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, ndv, 0)
+    ir.add_operand(cb3, bInc, 1)
+    ir.add_operand(cb3, bSkip, 1)
+    g_cur_block = bInc
+    tig_blob_push(rbh, nm)
+    var bri = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bri, bAdv, 1)
+    g_cur_block = bSkip
+    var brs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs, bAdv, 1)
+    g_cur_block = bAdv
+    var brb2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb2, top, 1)
+    // 结束：closedir + 组装结果表
+    g_cur_block = bEnd
+    tig_ext_call1("closedir", dp, P8, I32)
+    var cap = s21_load(s21_gep(rbh, 0, true), T64)
+    var lenn = s21_load(s21_gep(rbh, 8, true), T64)
+    var dat = s21_load(s21_gep(rbh, 16, true), types.named(TK_STR))
+    s21_store(sv, tig_fill_table(dat, cap, lenn), types.named(TK_STR))
+    var brd = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brd, bM, 1)
+    g_cur_block = bM
+    return s21_load(sv, types.named(TK_STR))
+}
+func tig_create_file_w(pw: i64, access: i64, disp: i64) -> i64 {
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var nullsa = tig_null_ptr()
+    var nulltm = tig_null_ptr()
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8);  table_push(avs, pw)
+    table_push(ats, I32); table_push(avs, access)
+    table_push(ats, I32); table_push(avs, tig_int_lit_ty(3, I32))
+    table_push(ats, P8);  table_push(avs, nullsa)
+    table_push(ats, I32); table_push(avs, disp)
+    table_push(ats, I32); table_push(avs, tig_int_lit_ty(0x80, I32))
+    table_push(ats, P8);  table_push(avs, nulltm)
+    return tig_ext_call_typed("CreateFileW", ats, avs, P8)
+}
+func tig_file_attr_w(p: i64) -> i64 {
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var pw = tig_wide16(p)
+    return tig_ext_call1("GetFileAttributesW", pw, P8, types.named(TK_I32))
+}
+func tig_mkdir_w(pw: i64) {
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var nullsa = tig_null_ptr()
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8); table_push(avs, pw)
+    table_push(ats, P8); table_push(avs, nullsa)
+    tig_ext_call_typed("CreateDirectoryW", ats, avs, I32)
+}
+func tig_find_first_w(pw: i64, fd: i64) -> i64 {
+    var P8 = types.ptr_of(types.named(TK_I8))
+    return tig_ext_call2("FindFirstFileW", pw, P8, fd, P8, P8)
+}
+func tig_find_next_w(hf: i64, fd: i64) -> i64 {
+    var P8 = types.ptr_of(types.named(TK_I8))
+    return tig_ext_call2("FindNextFileW", hf, P8, fd, P8, types.named(TK_I32))
+}
+func tig_find_close(hf: i64) {
+    var P8 = types.ptr_of(types.named(TK_I8))
+    tig_ext_call1("FindClose", hf, P8, types.named(TK_I32))
+}
+func tig_is_dotname(n: i64) -> i64 {
+    var l = s21_str_head_len(n)
+    var e1 = tig_icmp_c(l, tig_int_lit(1), 0)
+    var b0 = s21_str_byte(n, tig_int_lit(0))
+    var d0c = tig_icmp_c(b0, tig_int_lit(0x2E), 0)
+    var d1 = tig_and_i1(e1, d0c)
+    var e2 = tig_icmp_c(l, tig_int_lit(2), 0)
+    var b1 = s21_str_byte(n, tig_int_lit(1))
+    var d1c = tig_icmp_c(b1, tig_int_lit(0x2E), 0)
+    var d2 = tig_and_i1(e2, tig_and_i1(d0c, d1c))
+    return tig_or_i1(d1, d2)
+}
+func tig_read_file(p: i64) -> i64 {
+    // r.1.6.2 Linux 分支：open(O_RDONLY) → 循环 read(64KB) 到 EOF → StringBuilder
+    // 拼装 → close。UTF-8 路径直通。失败（打不开）→ 空串（对齐 Win32 哨兵）。
+    if tig_is_linux() {
+        var T64 = types.named(TK_I64)
+        var I32 = types.named(TK_I32)
+        var I8 = types.named(TK_I8)
+        var P8 = types.ptr_of(I8)
+        var fd = tig_posix_open3(p, tig_int_lit_ty(0, I32), tig_int_lit_ty(0, I32))  // O_RDONLY, mode 忽略
+        var rslt = ir.new_inst(g_cur_block, 20, types.named(TK_STR))
+        ir.add_operand(rslt, types.named(TK_STR), 2)
+        var sv = ir.get_value(rslt)
+        s21_store(sv, tig_str_lit(interner.intern("\"\"")), types.named(TK_STR))
+        var ok = tig_icmp_c(fd, tig_int_lit_ty(-1, I32), 3)  // fd > -1
+        var bOk = ir.new_block(g_cur_func, interner.intern("rdl.ok"))
+        var bFail = ir.new_block(g_cur_func, interner.intern("rdl.f"))
+        var bM = ir.new_block(g_cur_func, interner.intern("rdl.m"))
+        var cb = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb, ok, 0)
+        ir.add_operand(cb, bOk, 1)
+        ir.add_operand(cb, bFail, 1)
+        g_cur_block = bFail
+        var brf = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brf, bM, 1)
+        g_cur_block = bOk
+        var chunk = tig_int_lit(65536)
+        var buf = s21_raw_alloc_str(chunk)
+        var sb = s21_sb_new()
+        var hd = ir.new_block(g_cur_func, interner.intern("rdl.h"))
+        var bd = ir.new_block(g_cur_func, interner.intern("rdl.b"))
+        var ex = ir.new_block(g_cur_func, interner.intern("rdl.x"))
+        var br0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br0, hd, 1)
+        g_cur_block = hd
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, I32);  table_push(avs, fd)
+        table_push(ats, P8);   table_push(avs, buf)
+        table_push(ats, T64);  table_push(avs, chunk)
+        var nr = tig_ext_call_typed("read", ats, avs, T64)
+        var more = tig_icmp_c(nr, tig_int_lit(0), 3)  // nr > 0 继续读
+        var cb2 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb2, more, 0)
+        ir.add_operand(cb2, bd, 1)
+        ir.add_operand(cb2, ex, 1)
+        g_cur_block = bd
+        var part = tig_bytes_to_tie(buf, nr)
+        s21_sb_append(sb, part)
+        var brb = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brb, hd, 1)
+        g_cur_block = ex
+        s21_store(sv, s21_sb_build(sb), types.named(TK_STR))
+        tig_ext_call1("close", fd, I32, I32)
+        tig_ext_call1("free", buf, types.named(TK_STR), -1)
+        var brk = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brk, bM, 1)
+        g_cur_block = bM
+        return s21_load(sv, types.named(TK_STR))
+    }
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var I8 = types.named(TK_I8)
+    var P8 = types.ptr_of(I8)
+    var pw = tig_wide16(p)
+    var rslt = ir.new_inst(g_cur_block, 20, types.named(TK_STR))
+    ir.add_operand(rslt, types.named(TK_STR), 2)
+    var sv = ir.get_value(rslt)
+    s21_store(sv, tig_str_lit(interner.intern("\"\"")), types.named(TK_STR))
+    var h = tig_create_file_w(pw, tig_int_lit_ty(0x120089, I32), tig_int_lit_ty(3, I32))
+    var szb = s21_raw_alloc_str(tig_int_lit(8))
+    var ok1 = tig_ext_call2("GetFileSizeEx", h, P8, szb, P8, I32)
+    var okb = tig_win_ok(ok1)
+    var bOk = ir.new_block(g_cur_func, interner.intern("rd.ok"))
+    var bFail = ir.new_block(g_cur_func, interner.intern("rd.f"))
+    var bM = ir.new_block(g_cur_func, interner.intern("rd.m"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, okb, 0)
+    ir.add_operand(cb, bOk, 1)
+    ir.add_operand(cb, bFail, 1)
+    g_cur_block = bFail
+    tig_ext_call1("CloseHandle", h, P8, I32)
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, bM, 1)
+    g_cur_block = bOk
+    var size = s21_load(szb, T64)
+    var big = tig_cmp_const(size, 3, 0x7FFFFFFF, T64)
+    var toread = tig_select_i(big, tig_int_lit(0x7FFFFFFF), size, T64)
+    // 直读：ReadFile 直接写入最终串块的数据区。块布局 = n+41（8B 长度头 + 数据
+    // + \0 + 32B 尾部填充，与 tig_bytes_to_tie 同构），故省掉中转缓冲那次
+    // malloc/free 与整文件 memcpy（435KB 实测 156→125µs）。语义不变：长度头仍写
+    // **实读字节数**（文件在两调用间变短时按实际读到算）。
+    var sblk = s21_sso_alloc(toread)
+    var sd = s21_gep(sblk, 8, true)   // 数据区起点（头后）
+    var nrb = s21_raw_alloc_str(tig_int_lit(4))
+    s21_store(s21_gep(nrb, 0, true), tig_int_lit_ty(0, I32), I32)
+    var nullov = tig_null_ptr()
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8);  table_push(avs, h)
+    table_push(ats, P8);  table_push(avs, sd)
+    table_push(ats, I32); table_push(avs, tig_trunc_i32(toread))
+    table_push(ats, P8);  table_push(avs, nrb)
+    table_push(ats, P8);  table_push(avs, nullov)
+    tig_ext_call_typed("ReadFile", ats, avs, I32)
+    var nr = s21_zext(s21_load(nrb, I32), I32)
+    s21_store(s21_gep(sblk, 0, true), nr, T64)                       // 长度头 = 实读字节数
+    s21_store(s21_gep(sd, nr, false), tig_int_lit_ty(0, I8), I8)     // 尾 \0
+    s21_store(sv, sd, types.named(TK_STR))
+    tig_ext_call1("CloseHandle", h, P8, I32)
+    tig_ext_call1("free", nrb, types.named(TK_STR), -1)
+    tig_ext_call1("free", szb, types.named(TK_STR), -1)
+    var brk = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brk, bM, 1)
+    g_cur_block = bM
+    return s21_load(sv, types.named(TK_STR))
+}
+func tig_write_file(p: i64, c: i64, append: bool) -> i64 {
+    // r.1.6.2 Linux 分支：open(O_WRONLY|O_CREAT|O_TRUNC / O_APPEND, 0644) →
+    // write 单次全量 → close。成功（写满 n 字节）→ true（对齐 Win32 哨兵）。
+    if tig_is_linux() {
+        var T64 = types.named(TK_I64)
+        var I32 = types.named(TK_I32)
+        var I8 = types.named(TK_I8)
+        var P8 = types.ptr_of(I8)
+        var flags = tig_int_lit_ty(0x241, I32)  // O_WRONLY|O_CREAT|O_TRUNC
+        if append {
+            flags = tig_int_lit_ty(0x401, I32)  // O_WRONLY|O_CREAT|O_APPEND
+        }
+        var fd = tig_posix_open3(p, flags, tig_int_lit_ty(420, I32))  // 0644
+        var rs = ir.new_inst(g_cur_block, 20, types.named(TK_BOOL))
+        ir.add_operand(rs, types.named(TK_BOOL), 2)
+        var rp = ir.get_value(rs)
+        s21_store(rp, tig_bool_lit(0), types.named(TK_BOOL))
+        var hok = tig_icmp_c(fd, tig_int_lit_ty(-1, I32), 3)  // fd > -1
+        var bOk = ir.new_block(g_cur_func, interner.intern("wrl.ok"))
+        var bFail = ir.new_block(g_cur_func, interner.intern("wrl.f"))
+        var bM = ir.new_block(g_cur_func, interner.intern("wrl.m"))
+        var cb = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb, hok, 0)
+        ir.add_operand(cb, bOk, 1)
+        ir.add_operand(cb, bFail, 1)
+        g_cur_block = bFail
+        var brf = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brf, bM, 1)
+        g_cur_block = bOk
+        var dlen = s21_str_head_len(c)
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, I32);  table_push(avs, fd)
+        table_push(ats, P8);   table_push(avs, c)
+        table_push(ats, T64);  table_push(avs, dlen)
+        var wr = tig_ext_call_typed("write", ats, avs, T64)
+        var full = tig_icmp_c(wr, dlen, 0)  // 写满 n 字节
+        tig_ext_call1("close", fd, I32, I32)
+        s21_store(rp, full, types.named(TK_BOOL))
+        var brw = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brw, bM, 1)
+        g_cur_block = bM
+        return s21_load(rp, types.named(TK_BOOL))
+    }
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var pw = tig_wide16(p)
+    var acc = tig_int_lit_ty(0x120116, I32)   // FILE_GENERIC_WRITE
+    var dsp = tig_int_lit_ty(2, I32)          // CREATE_ALWAYS
+    if append {
+        acc = tig_int_lit_ty(0x0004, I32)     // FILE_APPEND_DATA
+        dsp = tig_int_lit_ty(4, I32)          // OPEN_ALWAYS
+    }
+    var slt = ir.new_inst(g_cur_block, 20, I32)
+    ir.add_operand(slt, I32, 2)
+    var rsv = ir.get_value(slt)
+    s21_store(rsv, tig_int_lit_ty(0, I32), I32)
+    var h = tig_create_file_w(pw, acc, dsp)
+    var hok = tig_icmp_c(tig_p2i(h), tig_int_lit(-1), 1)
+    var bOk = ir.new_block(g_cur_func, interner.intern("wr.ok"))
+    var bFail = ir.new_block(g_cur_func, interner.intern("wr.f"))
+    var bM = ir.new_block(g_cur_func, interner.intern("wr.m"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, hok, 0)
+    ir.add_operand(cb, bOk, 1)
+    ir.add_operand(cb, bFail, 1)
+    g_cur_block = bFail
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, bM, 1)
+    g_cur_block = bOk
+    var dlen = s21_str_head_len(c)
+    var data = c
+    var nwb = s21_raw_alloc_str(tig_int_lit(4))
+    s21_store(s21_gep(nwb, 0, true), tig_int_lit_ty(0, I32), I32)
+    var nullov = tig_null_ptr()
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8);  table_push(avs, h)
+    table_push(ats, P8);  table_push(avs, data)
+    table_push(ats, I32); table_push(avs, tig_trunc_i32(dlen))
+    table_push(ats, P8);  table_push(avs, nwb)
+    table_push(ats, P8);  table_push(avs, nullov)
+    var wr = tig_ext_call_typed("WriteFile", ats, avs, I32)
+    tig_ext_call1("CloseHandle", h, P8, I32)
+    tig_ext_call1("free", nwb, types.named(TK_STR), -1)
+    s21_store(rsv, wr, I32)
+    var brw = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brw, bM, 1)
+    g_cur_block = bM
+    return tig_win_ok(s21_load(rsv, I32))
+}
+func tig_attr_invalid(a: i64) -> i64 {
+    var I32 = types.named(TK_I32)
+    return tig_icmp_c(a, tig_int_lit_ty(-1, I32), 0)
+}
+func tig_exists_inline(p: i64) -> i64 {
+    // r.1.6.2 Linux：access(p, F_OK=0) == 0 → 存在
+    if tig_is_linux() {
+        var I32 = types.named(TK_I32)
+        return tig_cmp_zero(tig_ext_call2("access", p, types.named(TK_STR),
+            tig_int_lit_ty(0, I32), I32, I32), 0)
+    }
+    return tig_not_i1(tig_attr_invalid(tig_file_attr_w(p)))
+}
+func tig_is_dir_inline(p: i64) -> i64 {
+    // r.1.6.2 Linux：stat 成功且 (st_mode & S_IFMT) == S_IFDIR
+    if tig_is_linux() {
+        var mode = tig_posix_stat_mode(p)  // 失败 → -1
+        var bad = tig_icmp_c(mode, tig_int_lit(-1), 0)
+        var mask = s21_bin(6, mode, tig_int_lit(0xF000))  // & S_IFMT
+        var dirf = tig_icmp_c(mask, tig_int_lit(0x4000), 0)  // == S_IFDIR
+        return tig_and_i1(tig_not_i1(bad), dirf)
+    }
+    var I32 = types.named(TK_I32)
+    var a = tig_file_attr_w(p)
+    var a6 = s21_zext(a, I32)
+    var dirf = tig_icmp_c(s21_bin(6, a6, tig_int_lit(0x10)), tig_int_lit(0), 1)
+    return tig_and_i1(tig_not_i1(tig_attr_invalid(a)), dirf)
+}
+func tig_is_file_inline(p: i64) -> i64 {
+    // r.1.6.2 Linux：stat 成功且 (st_mode & S_IFMT) == S_IFREG
+    if tig_is_linux() {
+        var mode = tig_posix_stat_mode(p)  // 失败 → -1
+        var bad = tig_icmp_c(mode, tig_int_lit(-1), 0)
+        var mask = s21_bin(6, mode, tig_int_lit(0xF000))  // & S_IFMT
+        var filf = tig_icmp_c(mask, tig_int_lit(0x8000), 0)  // == S_IFREG
+        return tig_and_i1(tig_not_i1(bad), filf)
+    }
+    var I32 = types.named(TK_I32)
+    var a = tig_file_attr_w(p)
+    var a6 = s21_zext(a, I32)
+    var dirf = tig_icmp_c(s21_bin(6, a6, tig_int_lit(0x10)), tig_int_lit(0), 1)
+    return tig_and_i1(tig_not_i1(tig_attr_invalid(a)), tig_not_i1(dirf))
+}
+func tig_size_inline(p: i64) -> i64 {
+    // r.1.6.2 Linux：stat → st_size；失败 → -1（对齐 Win32 哨兵）
+    if tig_is_linux() {
+        return tig_posix_stat_size(p)
+    }
+    var T64 = types.named(TK_I64)
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var pw = tig_wide16(p)
+    var h = tig_create_file_w(pw, tig_int_lit_ty(0x120089, I32), tig_int_lit_ty(3, I32))
+    var szb = s21_raw_alloc_str(tig_int_lit(8))
+    var ok1 = tig_ext_call2("GetFileSizeEx", h, P8, szb, P8, I32)
+    var okb = tig_win_ok(ok1)
+    var slt = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(slt, T64, 2)
+    var sv = ir.get_value(slt)
+    s21_store(sv, tig_int_lit(-1), T64)
+    var bOk = ir.new_block(g_cur_func, interner.intern("sz.ok"))
+    var bFail = ir.new_block(g_cur_func, interner.intern("sz.f"))
+    var bM = ir.new_block(g_cur_func, interner.intern("sz.m"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, okb, 0)
+    ir.add_operand(cb, bOk, 1)
+    ir.add_operand(cb, bFail, 1)
+    g_cur_block = bFail
+    tig_ext_call1("CloseHandle", h, P8, I32)
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, bM, 1)
+    g_cur_block = bOk
+    s21_store(sv, s21_load(szb, T64), T64)
+    tig_ext_call1("CloseHandle", h, P8, I32)
+    var brk = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brk, bM, 1)
+    g_cur_block = bM
+    tig_ext_call1("free", szb, types.named(TK_STR), -1)
+    return s21_load(sv, T64)
+}
+func tig_delete_inline(p: i64) -> i64 {
+    // r.1.6.2 Linux：unlink(p) == 0 → true（目录删除失败，与 DeleteFileW 一致）
+    if tig_is_linux() {
+        var I32 = types.named(TK_I32)
+        return tig_cmp_zero(tig_ext_call1("unlink", p, types.named(TK_STR), I32), 0)
+    }
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var pw = tig_wide16(p)
+    return tig_win_ok(tig_ext_call1("DeleteFileW", pw, P8, I32))
+}
+func tig_copy_file(a: i64, b: i64) -> i64 {
+    // r.1.6.2 Linux：POSIX 复制（open/read/write/close）
+    if tig_is_linux() {
+        return tig_posix_copy_file(a, b)
+    }
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var aw = tig_wide16(a)
+    var bw = tig_wide16(b)
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, P8);  table_push(avs, aw)
+    table_push(ats, P8);  table_push(avs, bw)
+    table_push(ats, I32); table_push(avs, tig_int_lit_ty(0, I32))  // bFailIfExists=0
+    var r = tig_ext_call_typed("CopyFileW", ats, avs, I32)
+    return tig_win_ok(r)
+}
+func tig_move_file(a: i64, b: i64) -> i64 {
+    // r.1.6.2 Linux：rename(a, b) == 0 → true
+    if tig_is_linux() {
+        var I32 = types.named(TK_I32)
+        return tig_cmp_zero(tig_ext_call2("rename", a, types.named(TK_STR),
+            b, types.named(TK_STR), I32), 0)
+    }
+    var I32 = types.named(TK_I32)
+    var P8 = types.ptr_of(types.named(TK_I8))
+    var aw = tig_wide16(a)
+    var bw = tig_wide16(b)
+    return tig_win_ok(tig_ext_call2("MoveFileW", aw, P8, bw, P8, I32))
+}
+func tig_blob_push(bhp: i64, sp: i64) {
+    var T64 = types.named(TK_I64)
+    var cap = s21_load(s21_gep(bhp, 0, true), T64)
+    var lenn = s21_load(s21_gep(bhp, 8, true), T64)
+    var data = s21_load(s21_gep(bhp, 16, true), types.named(TK_STR))
+    var need = s21_bin(0, lenn, tig_int_lit(1))
+    var gc = tig_icmp_c(need, cap, 3)
+    var gt = ir.new_block(g_cur_func, interner.intern("bp.gt"))
+    var ge = ir.new_block(g_cur_func, interner.intern("bp.ge"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, gc, 0)
+    ir.add_operand(cb, gt, 1)
+    ir.add_operand(cb, ge, 1)
+    g_cur_block = gt
+    var nc = tig_select_i(tig_cmp_zero(cap, 0), tig_int_lit(4), s21_bin(2, cap, tig_int_lit(2)), T64)
+    var c_lt = tig_icmp_c(nc, need, 2)
+    var newcap = tig_select_i(c_lt, need, nc, T64)
+    var nd = s21_raw_alloc_str(s21_bin(2, newcap, tig_int_lit(8)))
+    s21_memcpy_if(nd, data, s21_bin(2, lenn, tig_int_lit(8)))
+    tig_ext_call1("free", data, types.named(TK_STR), -1)
+    s21_store(s21_gep(bhp, 16, true), nd, types.named(TK_STR))
+    s21_store(s21_gep(bhp, 0, true), newcap, T64)
+    var brg = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brg, ge, 1)
+    g_cur_block = ge
+    var data2 = s21_load(s21_gep(bhp, 16, true), types.named(TK_STR))
+    var l2 = s21_load(s21_gep(bhp, 8, true), T64)
+    s21_store(s21_gep(data2, s21_bin(2, l2, tig_int_lit(8)), false), sp, types.named(TK_STR))
+    s21_store(s21_gep(bhp, 8, true), need, T64)
+}
+}

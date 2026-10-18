@@ -1,0 +1,330 @@
+type tie<class>
+// compiler/frontend/cfg_preproc.tie —— p.9.11.13 #cfg 条件编译预处理（词法前）
+// ============================================================
+// 在 driver 读文件后、头部扫描（scan_header）/词法（lex）之前按行扫描指令：
+//   `#cfg(条件)`  → 条件块开始（真保留、假裁剪）
+//   `#else`       → 反向（真分支被裁时保留，反之裁剪）
+//   `#end` / `#endif` → 条件块结束
+// 条件为假时**裁剪**该文本块（整行从源流移除，不 lex/parse）；真时原样保留。
+//
+// 边界与裁决（p.9.11.13 务实定界）：
+//   - 行级/块级文本行裁剪：裁剪区整体从源流移除；后续诊断行号相对裁剪后
+//     源码计算（近似，可接受，注明）；
+//   - 单层：不允许嵌套 #cfg；一个 #cfg 块最多一个 #else；#else/#end 悬空、
+//     #cfg 未闭合均报诊断（error[E...]，经 ERR 协议返回 driver 渲染）；
+//   - 条件 = 简单键值比较：`#cfg(os=windows)` / `#cfg(target=linux)` /
+//     `#cfg(debug)` / `#cfg(release)` / `#cfg(!debug)`（`!` 取反，`=` 后值可
+//     带双引号如 `os=="linux"`）；未知键 = 假；已知键未知值 = 假；
+//   - 求值源：os/target 键 = 目标三元组（--target > 配置 target > 空=主机，
+//     与 driver.normalize_target 同规则）；debug/release = 生效 profile
+//     （--profile > 配置顶层 profile 键；dev=debug，release=release）；
+//   - 与既有 `// tie:` 头部指令、`#[...]` 属性语法不冲突——仅精确匹配
+//     指令形态（行首 trim 后 `#cfg(` 前缀 / 整行 `#else`/`#end`/`#endif`），
+//     其余 `#` 开头行（如 `#[unsafe.share]`）原样透传；
+//   - 已知局限（注明）：纯行级文本处理，不识别字符串/块注释内的 `#else` 等
+//     字样（块注释跨行内含指令行会被误判——语言层后续批次再处理）；
+//   - 自举安全：compiler 自身源码无 #cfg 行 → 恒为透传（仅拆行/重连成本）。
+//
+// 调用：import 后 cfgpre.preprocess(src, target, profile) —— 返回裁剪后源码；
+// 失败返回 "ERR:<line> <col> <msg>"（driver 用 diagcode.render_err_proto 渲染）。
+// 依赖：仅 ./errors.tie（消息文本；经 import 树去重可达，无环）。
+import "./errors.tie"
+
+namespace cfgpre {
+
+// ---------- 字节级工具（自包含） ----------
+
+// 子串 [a, b)（字节级）。
+func cp_slice(immut s: string, a: i64, b: i64) -> string {
+    var sb = string_builder()
+    var i: i64 = a
+    while i < b {
+        sb_append_byte(sb, str_byte(s, i))
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// s 是否以 prefix 开头（字节级）。
+func cp_starts(s: string, pre: string) -> bool {
+    var n = len(s)
+    var m = len(pre)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_byte(s, i) != str_byte(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// s 是否含子串 needle（字节级；O(n·m)，目标串都很短）。
+func cp_contains(s: string, needle: string) -> bool {
+    var n = len(s)
+    var m = len(needle)
+    if m == 0 {
+        return true
+    }
+    if m > n {
+        return false
+    }
+    var i: i64 = 0
+    while i <= n - m {
+        var j: i64 = 0
+        var hit: bool = true
+        while j < m && hit {
+            if str_byte(s, i + j) != str_byte(needle, j) {
+                hit = false
+            }
+            j = j + 1
+        }
+        if hit {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 去首尾空白（空格/制表）。
+func cp_trim(immut s: string) -> string {
+    var n = len(s)
+    var a: i64 = 0
+    var b: i64 = n
+    while a < b {
+        var c = str_byte(s, a)
+        if c == 32 || c == 9 {
+            a = a + 1
+        } else {
+            break
+        }
+    }
+    while b > a {
+        var c = str_byte(s, b - 1)
+        if c == 32 || c == 9 {
+            b = b - 1
+        } else {
+            break
+        }
+    }
+    return cp_slice(s, a, b)
+}
+
+// ---------- 条件求值 ----------
+
+// 目标三元组 → 操作系统名（windows/linux/macos）。
+// 对齐 driver.normalize_target：三元组含 windows/linux/apple(darwin) 子串判定；
+// 空/未知目标 → 主机判定（Windows 宿主经环境变量 OS 含 "Windows"，其余 Linux）。
+func eval_os(target: string) -> string {
+    if cp_contains(target, "windows") {
+        return "windows"
+    }
+    if cp_contains(target, "linux") {
+        return "linux"
+    }
+    if cp_contains(target, "apple") || cp_contains(target, "darwin") {
+        return "macos"
+    }
+    var osv = get_env("OS")
+    if cp_contains(osv, "Windows") {
+        return "windows"
+    }
+    return "linux"
+}
+
+// 求值单个条件：`键=值` / `键` / `!条件`（取反）。
+// 支持键：os / target（值 = 操作系统名）、debug / release（值可省略或 0/false
+// 取反）；未知键 = 假；已知键未知值 = 假。
+func eval_cond(cond: string, target: string, profile: string) -> bool {
+    var neg: bool = false
+    var c = cond
+    if len(c) > 0 && str_byte(c, 0) == 33 {   // '!'
+        neg = true
+        c = cp_slice(c, 1, len(c))
+    }
+    // 拆分 键=值
+    var key = c
+    var val: string = ""
+    var eq: i64 = -1
+    var k: i64 = 0
+    while k < len(c) {
+        if str_byte(c, k) == 61 {   // '='
+            eq = k
+            k = len(c)
+        } else {
+            k = k + 1
+        }
+    }
+    if eq >= 0 {
+        key = cp_slice(c, 0, eq)
+        val = cp_trim(cp_slice(c, eq + 1, len(c)))
+        // 去双引号（`os=="linux"` 形态）
+        if len(val) >= 2 {
+            if str_byte(val, 0) == 34 && str_byte(val, len(val) - 1) == 34 {   // '"'
+                val = cp_slice(val, 1, len(val) - 1)
+            }
+        }
+    }
+    // ★ 键也要 trim（2026-10-07 修）：此前只 trim 了 val ⇒ `#cfg(os = windows)` 的键
+    //   带着尾空格，既不等于 "os" 也不等于任何已知键 ⇒ 走「未知键 = 假」分支，
+    //   **静默选错分支且零诊断**（症状是分支被整段丢弃：main 消失、链接报「必须定义入口点」）。
+    //   规范里唯一的示例 `#cfg(os = linux)` 正好是带空格形态。
+    key = cp_trim(key)
+    var r: bool = false
+    if key == "os" || key == "target" {
+        if len(val) == 0 {
+            r = false   // 裸键（无值）= 假（要求 `键=值` 形态）
+        } else if val == eval_os(target) {
+            r = true
+        } else {
+            r = false
+        }
+    } else if key == "debug" {
+        r = (profile == "dev")
+        if len(val) > 0 {
+            if val == "0" || val == "false" {
+                r = !r
+            }
+        }
+    } else if key == "release" {
+        r = (profile == "release")
+        if len(val) > 0 {
+            if val == "0" || val == "false" {
+                r = !r
+            }
+        }
+    } else {
+        r = false   // 未知键 = 假
+    }
+    if neg {
+        r = !r
+    }
+    return r
+}
+
+// ---------- 主预处理 ----------
+
+// 按行裁剪 #cfg 条件块。返回裁剪后源码；失败返回 "ERR:<line> <col> <msg>"。
+// 参数：target = 目标三元组（--target > 配置 target > 空）；profile = 生效
+// profile（--profile > 配置顶层 profile 键）。
+pub func preprocess(src: string, target: string, profile: string) -> string {
+    // 性能快路径（2026-10-12）：源中不含 '#' 字节 ⇒ 必无任何指令/属性行，
+    // 原样返回（免逐行拆分与重建——被导入文件现全部经此函数，自举链多数
+    // 文件走此路径）。含 '#' 的文件走下方原路径（行为不变）。
+    var fast = true
+    var q: i64 = 0
+    var qn = len(src)
+    while q < qn {
+        if str_byte(src, q) == 35 {
+            fast = false
+            q = qn
+        } else {
+            q = q + 1
+        }
+    }
+    if fast {
+        return src
+    }
+    var out = string_builder()
+    var n = len(src)
+    var i: i64 = 0
+    var line_no: i64 = 1
+    var in_block: bool = false   // 是否在 #cfg 块内
+    var active: bool = true      // 当前行是否保留
+    var block_active: bool = false  // 当前块 then 分支条件值（#else 反向用）
+    var seen_else: bool = false  // 当前块是否已见 #else
+    var cfg_line: i64 = 0        // 打开当前块的 #cfg 行号（未闭合诊断用）
+    while i < n {
+        // 取一行 [ln_s, ln_e)；has_nl 表示行尾有换行
+        var ln_s = i
+        var ln_e = i
+        while ln_e < n && str_byte(src, ln_e) != 10 {
+            ln_e = ln_e + 1
+        }
+        var has_nl = ln_e < n
+        var next_i = ln_e
+        if has_nl {
+            next_i = ln_e + 1
+        }
+        var line_txt = cp_slice(src, ln_s, ln_e)
+        var t = cp_trim(line_txt)
+        var handled: bool = false
+        if cp_starts(t, "#cfg(") {
+            // ---- #cfg(条件) ----
+            if in_block {
+                return "ERR:" + to_string(line_no) + " 1 " + errors.syn_cfg_nested()
+            }
+            // 定位匹配 ')'（条件单行，不允许嵌套括号）
+            var close: i64 = -1
+            var k: i64 = 5   // 跳过 "#cfg("
+            while k < len(t) {
+                if str_byte(t, k) == 41 {   // ')'
+                    close = k
+                    k = len(t)
+                } else {
+                    k = k + 1
+                }
+            }
+            if close < 0 {
+                return "ERR:" + to_string(line_no) + " 1 " + errors.syn_cfg_malformed()
+            }
+            // 尾随内容检查（`#cfg(debug) xyz` → 错误；只允许空白）
+            var tail = cp_trim(cp_slice(t, close + 1, len(t)))
+            if len(tail) > 0 {
+                return "ERR:" + to_string(line_no) + " 1 " + errors.syn_cfg_trailing()
+            }
+            var cond = cp_trim(cp_slice(t, 5, close))
+            var val = eval_cond(cond, target, profile)
+            in_block = true
+            seen_else = false
+            block_active = val
+            active = val
+            cfg_line = line_no
+            handled = true
+        } else if t == "#else" {
+            // ---- #else ----
+            if !in_block {
+                return "ERR:" + to_string(line_no) + " 1 " + errors.syn_cfg_unmatched()
+            }
+            if seen_else {
+                return "ERR:" + to_string(line_no) + " 1 " + errors.syn_cfg_dup_else()
+            }
+            seen_else = true
+            active = !block_active
+            handled = true
+        } else if t == "#end" || t == "#endif" {
+            // ---- #end / #endif ----
+            if !in_block {
+                return "ERR:" + to_string(line_no) + " 1 " + errors.syn_cfg_unmatched()
+            }
+            in_block = false
+            active = true
+            handled = true
+        } else if cp_starts(t, "#else") || cp_starts(t, "#end") ||
+            cp_starts(t, "#endif") {
+            // 指令前缀但带尾随内容（#elsex / #end x）→ 尾随内容错误
+            return "ERR:" + to_string(line_no) + " 1 " + errors.syn_cfg_trailing()
+        }
+        if !handled {
+            if !in_block || active {
+                sb_append(out, line_txt)
+                if has_nl {
+                    sb_append_byte(out, 10)
+                }
+            }
+        }
+        i = next_i
+        line_no = line_no + 1
+    }
+    if in_block {
+        // #cfg 未闭合（缺 #end/#endif）——报在打开它的 #cfg 行
+        return "ERR:" + to_string(cfg_line) + " 1 " + errors.syn_cfg_unclosed()
+    }
+    return sb_build(out)
+}
+
+}   // namespace cfgpre

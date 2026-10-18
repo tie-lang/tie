@@ -1,0 +1,355 @@
+type tie<class>
+// compiler/backend/irgen_bi_msg.tie —— 内置生成器：消息系统原语（p.6.4.7）
+// ============================================================
+// 自 irgen_expr.tie 的 builtin_expr 拆出（p.9.21.2 两步制①）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `msg_set_lang`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_msg_set_lang(nm: string, id: i64) -> i64 {
+if nm == "msg_set_lang" {
+    tig_msg_reg_globals()
+    var e1 = tig_expr(call_arg(id, 0))
+    if e1 < 0 {
+        return -1
+    }
+    tig_msg_gstore("__msg_lang", types.named(TK_STR), e1)
+    g_builtin_res = tig_int_lit(0)  // void：哑值
+    return 0
+}
+}
+
+// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `msg_get_lang`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_msg_get_lang(nm: string, id: i64) -> i64 {
+if nm == "msg_get_lang" {
+    tig_msg_reg_globals()
+    g_builtin_res = tig_msg_gload("__msg_lang", types.named(TK_STR))
+    return 0
+}
+}
+
+// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `msg_register`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_msg_register(nm: string, id: i64) -> i64 {
+if nm == "msg_register" {
+    var q1 = tig_expr(call_arg(id, 0))
+    if q1 < 0 {
+        return -1
+    }
+    var q2 = tig_expr(call_arg(id, 1))
+    if q2 < 0 {
+        return -1
+    }
+    var q3 = tig_expr(call_arg(id, 2))
+    if q3 < 0 {
+        return -1
+    }
+    tig_msg_register(q1, q2, q3)
+    g_builtin_res = tig_int_lit(0)  // void：哑值
+    return 0
+}
+}
+
+// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `msg_t`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_msg_t(nm: string, id: i64) -> i64 {
+if nm == "msg_t" {
+    tig_msg_reg_globals()
+    var s1 = tig_expr(call_arg(id, 0))
+    if s1 < 0 {
+        return -1
+    }
+    // 当前语言查表；未命中回退 key 本身
+    g_builtin_res = tig_msg_find(s1, tig_msg_gload("__msg_lang", types.named(TK_STR)), s1)
+    return 0
+}
+}
+
+// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `msg_t_lang`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_msg_t_lang(nm: string, id: i64) -> i64 {
+if nm == "msg_t_lang" {
+    tig_msg_reg_globals()
+    var a1 = tig_expr(call_arg(id, 0))
+    if a1 < 0 {
+        return -1
+    }
+    var a2 = tig_expr(call_arg(id, 1))
+    if a2 < 0 {
+        return -1
+    }
+    // 指定语言查表；未命中返空串（对齐 Rust 桥原语义，ext/log 回退链 lookup 依赖）
+    g_builtin_res = tig_msg_find(a1, a2, tig_str_lit(interner.intern("\"\"")))
+    return 0
+}
+}
+
+// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `rand_range`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_rand_range(nm: string, id: i64) -> i64 {
+if nm == "rand_range" {
+    var d1 = tig_expr(call_arg(id, 0))
+    if d1 < 0 {
+        return -1
+    }
+    var d2 = tig_expr(call_arg(id, 1))
+    if d2 < 0 {
+        return -1
+    }
+    g_builtin_res = tig_rand_range(d1, d2)
+    return 0
+}
+}
+
+// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `table_at`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_table_at(nm: string, id: i64) -> i64 {
+// table_at：表 + 下标 → 元素（与 t[i] 同语义；元素类型 fallback 判定）
+if nm == "table_at" {
+    var tb = tig_expr(call_arg(id, 0))
+    if tb < 0 {
+        return -1
+    }
+    var ti = tig_expr(call_arg(id, 1))
+    if ti < 0 {
+        return -1
+    }
+    // 元素类型：语义节点类型（表实参的 node_types 可能是 TK_TABLE——元素类型
+    // 按 var_table_elem 尽力推断，失败 fallback i64）
+    var elem: i64 = types.named(TK_I64)
+    var tn = call_arg(id, 0)
+    if s_tags[tn] == 6 {
+        var te = sinfer.var_table_elem(intern.intern(sstate.name_str(tn)))
+        if te >= 0 {
+            elem = te
+        }
+    }
+    var suffix = bridge_suffix(elem)
+    var ret_ty = types.named(TK_I64)
+    var ek2 = types.kind(elem)
+    if ek2 == K_STRUCT || ek2 == K_ENUM || ek2 == K_FN || ek2 == K_TUPLE {
+        // P2a 复合元素：返回类型 = 元素类型 id（多字元素类型化 load）
+        ret_ty = elem
+    } else if suffix == "string" {
+        ret_ty = types.named(TK_STR)
+    } else if suffix == "f64" {
+        // f64 表元素：返回类型 double（曾落默认 i64 → `call i64 @tie_table_at_f64`
+        // 与 declare 的 double 返回不匹配，opt 报类型错）
+        ret_ty = types.named(TK_F64)
+    } else if suffix == "bool" {
+        ret_ty = types.named(TK_BOOL)
+    }
+    var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+    ir.add_operand(ok_slot, types.named(TK_I8), 2)
+    var ok_addr = ir.get_value(ok_slot)
+    g_builtin_res = s21_table_at(tb, ti, ok_addr, ret_ty)
+    return 0
+}
+// p.8.1.6 表删除/缩表原语：table_pop(t) → 表尾元素（空表返回零值）。
+// 语义 = tbl_at(len-1, slot) + 非空则 tbl_set_len(len-1)。弹出元素所有权
+// 转移给调用方（rc 不变，与 push 瞬态值转移对称——容器不再持有该元素，
+// 调用方变量赋值免 retain（函数调用 tag 7）、出口 release 恰好 -1 平衡）。
+}
+
+// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `table_pop`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_table_pop(nm: string, id: i64) -> i64 {
+// p.8.1.6 表删除/缩表原语：table_pop(t) → 表尾元素（空表返回零值）。
+// 语义 = tbl_at(len-1, slot) + 非空则 tbl_set_len(len-1)。弹出元素所有权
+// 转移给调用方（rc 不变，与 push 瞬态值转移对称——容器不再持有该元素，
+// 调用方变量赋值免 retain（函数调用 tag 7）、出口 release 恰好 -1 平衡）。
+if nm == "table_pop" {
+    var tb = tig_expr(call_arg(id, 0))
+    if tb < 0 {
+        return -1
+    }
+    // 元素类型推断链（对齐 table_push）：tblvar_get → scope 完整类型 →
+    // node_types → sinfer 兜底
+    var elem: i64 = types.named(TK_I64)
+    var tn = call_arg(id, 0)
+    var tnid = interner.intern(sstate.name_str(tn))
+    var tv_own = tblvar_get(tnid)
+    if tv_own >= 0 {
+        elem = tv_own
+    } else if scope_get(tnid) >= 0 && types.is_table(g_lookup_ty) {
+        var le = types.table_elem(g_lookup_ty)
+        if le > 0 {
+            elem = le
+        }
+    }
+    if s_tags[tn] == 6 {
+        var aty = node_types[tn]
+        if types.is_table(aty) && !types.is_map(aty) && aty != types.named(TK_TABLE) {
+            var ale = types.table_elem(aty)
+            if ale > 0 {
+                elem = ale
+            }
+        }
+    }
+    if elem == types.named(TK_I64) && s_tags[tn] == 6 {
+        var te = sinfer.var_table_elem(tnid)
+        if te >= 0 {
+            elem = te
+        }
+    }
+    var suffix = bridge_suffix(elem)
+    var ret_ty = types.named(TK_I64)
+    var ek2 = types.kind(elem)
+    if ek2 == K_STRUCT || ek2 == K_ENUM || ek2 == K_FN || ek2 == K_TUPLE {
+        ret_ty = elem
+    } else if suffix == "string" {
+        ret_ty = types.named(TK_STR)
+    } else if suffix == "f64" {
+        ret_ty = types.named(TK_F64)
+    } else if suffix == "bool" {
+        ret_ty = types.named(TK_BOOL)
+    }
+    var T64 = types.named(TK_I64)
+    var len_v = s21_table_len(tb)
+    var ok_slot2 = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+    ir.add_operand(ok_slot2, types.named(TK_I8), 2)
+    var ok_addr2 = ir.get_value(ok_slot2)
+    // 尾下标钳制：len>0 ? len-1 : 0——空表时 last=0，tbl_at 越界（0<0）写零
+    // 且 ok=0 → 不 set_len（tl_tbl.tbl_at 仅判 `i<len`，负下标 i=-1 会被误判
+    // 命中并拷贝 data-8 垃圾，且 ok=1 触发错误 set_len 使 len 变负）
+    var last = tig_select_i(tig_icmp_c(len_v, tig_int_lit(0), 3),
+        s21_bin(1, len_v, tig_int_lit(1)), tig_int_lit(0), T64)
+    var val = s21_table_at(tb, last, ok_addr2, ret_ty)
+    // 深表元素（元素为表）：槽存 i64 句柄，返回给表变量槽（ptr）须 inttoptr
+    // 还原——对齐 s21_table_new 的 t21_intp 桥（表变量槽类型是 ptr）。
+    if types.is_table(elem) {
+        var pip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
+        ir.add_operand(pip, val, 0)
+        val = ir.get_value(pip)
+    }
+    // 非空（ok!=0）→ set_len(len-1)：cond_br + 汇合
+    var okv = s21_load(ok_addr2, types.named(TK_I8))
+    var cond = tig_cond_to_bool(okv, types.named(TK_I8))
+    var ok_blk = ir.new_block(g_cur_func, interner.intern("tblp.ok"))
+    var merge_blk = ir.new_block(g_cur_func, interner.intern("tblp.mg"))
+    var cbr = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbr, cond, 0)
+    ir.add_operand(cbr, ok_blk, 1)
+    ir.add_operand(cbr, merge_blk, 1)
+    g_cur_block = ok_blk
+    tl_void_2("tl_tbl$tbl_set_len", t21_ptri(tb), last)
+    var br1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br1, merge_blk, 1)
+    g_cur_block = merge_blk
+    g_builtin_res = val
+    return 0
+}
+// p.8.1.6 表删除/缩表原语：table_trunc(t, n) → void。
+// 截断到 n（n≤0 → 空表；n≥len → 不变）。深表（元素为表）缩掉的部分逐元素
+// release（引用计数 -1，防缩表悬垂/泄漏）；标量/字符串表直接 set_len。
+}
+
+// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `table_trunc`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_table_trunc(nm: string, id: i64) -> i64 {
+// p.8.1.6 表删除/缩表原语：table_trunc(t, n) → void。
+// 截断到 n（n≤0 → 空表；n≥len → 不变）。深表（元素为表）缩掉的部分逐元素
+// release（引用计数 -1，防缩表悬垂/泄漏）；标量/字符串表直接 set_len。
+if nm == "table_trunc" {
+    var tb2 = tig_expr(call_arg(id, 0))
+    if tb2 < 0 {
+        return -1
+    }
+    var nv = tig_expr(call_arg(id, 1))
+    if nv < 0 {
+        return -1
+    }
+    var T64b = types.named(TK_I64)
+    var len_v2 = s21_table_len(tb2)
+    // 钳制 n 到 [0, len]：n<0 → 0；n>len → len（越界安全截断）
+    var nz = tig_select_i(tig_icmp_c(nv, tig_int_lit(0), 2), tig_int_lit(0), nv, T64b)
+    var nn = tig_select_i(tig_icmp_c(nz, len_v2, 3), len_v2, nz, T64b)
+    // 元素类型推断（对齐 table_pop）：深表（元素为表）需逐元素 release
+    var elem2: i64 = types.named(TK_I64)
+    var tn2 = call_arg(id, 0)
+    var tnid2 = interner.intern(sstate.name_str(tn2))
+    var tv_own2 = tblvar_get(tnid2)
+    if tv_own2 >= 0 {
+        elem2 = tv_own2
+    } else if scope_get(tnid2) >= 0 && types.is_table(g_lookup_ty) {
+        var le2 = types.table_elem(g_lookup_ty)
+        if le2 > 0 {
+            elem2 = le2
+        }
+    }
+    if s_tags[tn2] == 6 {
+        var aty2 = node_types[tn2]
+        if types.is_table(aty2) && !types.is_map(aty2) && aty2 != types.named(TK_TABLE) {
+            var ale2 = types.table_elem(aty2)
+            if ale2 > 0 {
+                elem2 = ale2
+            }
+        }
+    }
+    if elem2 == types.named(TK_I64) && s_tags[tn2] == 6 {
+        var te2 = sinfer.var_table_elem(tnid2)
+        if te2 >= 0 {
+            elem2 = te2
+        }
+    }
+    var is_deep: bool = types.is_table(elem2)
+    // 条件：nn < len → 截断路径（缩表）；否则原样
+    var cond2 = tig_icmp_c(nn, len_v2, 2)  // nn < len (slt)
+    var cut_blk = ir.new_block(g_cur_func, interner.intern("tblt.cut"))
+    var merge_blk2 = ir.new_block(g_cur_func, interner.intern("tblt.mg"))
+    var cbr2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbr2, cond2, 0)
+    ir.add_operand(cbr2, cut_blk, 1)
+    ir.add_operand(cbr2, merge_blk2, 1)
+    g_cur_block = cut_blk
+    if is_deep {
+        // 释放循环（alloca 槽计数，免 phi）：i 从 len-1 递减到 nn；
+        // tbl_at(t, i, slot) 取元素句柄 + tl_tbl$tbl_release(-1)
+        var islot = ir.new_inst(g_cur_block, 20, T64b)
+        ir.add_operand(islot, T64b, 2)
+        var islotp = ir.get_value(islot)
+        s21_store(islotp, s21_bin(1, len_v2, tig_int_lit(1)), T64b)  // i = len-1
+        var head = ir.new_block(g_cur_func, interner.intern("tblt.hd"))
+        var body = ir.new_block(g_cur_func, interner.intern("tblt.bd"))
+        var exit = ir.new_block(g_cur_func, interner.intern("tblt.ex"))
+        var br0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br0, head, 1)
+        g_cur_block = head
+        var i_v = s21_load(islotp, T64b)
+        var cond3 = tig_icmp_c(i_v, nn, 5)  // i >= nn → 继续释放（sge）
+        var cbr3 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cbr3, cond3, 0)
+        ir.add_operand(cbr3, body, 1)
+        ir.add_operand(cbr3, exit, 1)
+        g_cur_block = body
+        var slot2 = ir.new_inst(g_cur_block, 20, T64b)  // 元素槽（句柄 i64）
+        ir.add_operand(slot2, T64b, 2)
+        var slot2p = ir.get_value(slot2)
+        var ok_slot3 = ir.new_inst(g_cur_block, 20, types.named(TK_I8))
+        ir.add_operand(ok_slot3, types.named(TK_I8), 2)
+        var ok_addr3 = ir.get_value(ok_slot3)
+        s21_table_at(tb2, i_v, ok_addr3, T64b)
+        var e_v = s21_load(slot2p, T64b)
+        var atys3 = table_new_i64()
+        var avs3 = table_new_i64()
+        table_push(atys3, T64b)
+        table_push(avs3, e_v)
+        tig_trmlite_call("tl_tbl$tbl_release", atys3, avs3, -1)
+        s21_store(islotp, s21_bin(1, i_v, tig_int_lit(1)), T64b)  // i-1
+        var br2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br2, head, 1)
+        g_cur_block = exit
+    }
+    tl_void_2("tl_tbl$tbl_set_len", t21_ptri(tb2), nn)
+    var br3 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br3, merge_blk2, 1)
+    g_cur_block = merge_blk2
+    g_builtin_res = tig_int_lit(0)
+    return 0
+}
+// ---------- trm-lite 轻量执行体原语（阶段1块2：spawn/yield/collect）----------
+}
+
+}

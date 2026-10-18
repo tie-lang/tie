@@ -1,0 +1,300 @@
+type tie<class>
+// compiler/backend/tig_expr_seg1.tie —— tig_expr 分派链分段 1（p.9.21 G2 单函数 ≤300 行）
+// ============================================================
+// 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
+// 与原函数同 namespace，跨文件裸名互调；段尾 return <sentinel> = 本段未命中。
+namespace irgen {
+func tig_expr_seg1(id: i64) -> i64 {
+    var tag = s_tags[id]
+    // p.9.13.4 块管道（tag 162）：内联绑定槽 + 体求值
+    if tag == 162 {
+        return tig_block_pipe(id)
+    }
+    if tag == 0 {
+        // IntLit：按推断类型生成常量（后缀字面量 i128/u128/窄整数 → 对应
+        // 类型；默认 i64）。曾固定 tig_int_lit(i64)——`1i128 << 64` 左操作数
+        // 落 i64，移位生成 trunc i128 %i64 类型错（批次 2 修复）。
+        var lt = node_types[id]
+        if lt >= 0 && lt != types.named(TK_I64) && types.is_int(lt) {
+            return tig_int_lit_ty(s_vals[id], lt)
+        }
+        return tig_int_lit(s_vals[id])
+    }
+    if tag == 1 {
+        // FloatLit：按推断类型生成常量（后缀 f32 → const_f float；默认 f64）。
+        // 对齐上方 IntLit 的后缀分派（批次 2 同款）。此前恒 f64——f32 字面量的
+        // IR 值落 double，存入 float 槽/参与 f32 算术/进 f32 phi 全部 LLVM 类型
+        // 错（2026-10-09 修；f32 变量 load 本就是 float，此后字面量与变量一致）。
+        var lt = node_types[id]
+        if lt >= 0 && lt != types.named(TK_F64) && types.is_float(lt) {
+            return tig_float_lit_ty(s_names[id], lt)
+        }
+        return tig_float_lit(s_names[id])
+    }
+    if tag == 2 {
+        // StrLit
+        return tig_str_lit(s_names[id])
+    }
+    if tag == 3 {
+        // CharLit：'a' / 转义 → i32 码点常量（对齐 Rust CharLit → i32）
+        return tig_char_lit(s_names[id])
+    }
+    if tag == 5 {
+        // TritLit：zero → i8 0（true/false 走 BoolLit + trit 上下文改写）
+        return tig_trit_lit(s_vals[id])
+    }
+    if tag == 6 {
+        // Var
+        var vnid6 = interner.intern(sstate.name_str(id))
+        if scope_get_global(vnid6) >= 0 {
+            return tig_var_ref(vnid6)
+        }
+        // S2.2 命名函数提升：变量未入作用域但语义类型是 fn 类型 → 命名函数名
+        // 用作函数值（生成适配器 + 构造 {null, @adapt}）。节点类型由 sinfer
+        // S_N_VAR 分支登记（fn_sig 命中 → fn 类型）。
+        if node_types[id] >= 0 && types.is_fn(node_types[id]) {
+            var full_nm = resolve_call_name(sstate.name_str(id))
+            return tig_named_fn_value(id, full_nm, node_types[id])
+        }
+        return tig_var_ref(vnid6)
+    }
+    if tag == 16 {
+        // p.9.12.4：命名空间路径作值 = 命名空间常量引用（ns::NAME → 全名
+        // 查全局 gb_*，与 sinfer S_N_PATH 分支对齐；标量全局 load @ns$NAME）
+        var pfull = sinfer.recv_path_name(id)
+        var pnid = interner.intern(pfull)
+        if scope_get_global(pnid) >= 0 {
+            return tig_var_ref(pnid)
+        }
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "命名空间路径 '" + pfull + "' 不能作为值使用（只能用于调用，如 'x::f()'）"
+        return -1
+    }
+    if tag == 9 {
+        // Binary
+        // 注：p.9.13.3 的 `in` 中缀**不达此处**——语义层已把该节点改写为 S_N_CALL
+        // （泛型目标需走正常调用通道，见 sinfer.infer_in_op）。
+        // p.9.13.3 幂 `**` 与 checked 幂 `**?`：按操作数类型分派（需 node id 才能
+        // 走按名调用，故在本层处理而非 tig_binary 内部）。
+        if s_vals[id] == B_POW || s_vals[id] == B_CHECK_POW {
+            return tig_pow(id)
+        }
+        return tig_binary(s_vals[id], sstate.child(id, 0), sstate.child(id, 1))
+    }
+    if tag == 10 {
+        // Ternary：cond ? then : else → cond_br + phi（对齐 Rust 三块短路结构）
+        return tig_ternary(id)
+    }
+    if tag == 11 {
+        // Range：for 迭代起点/终点
+        return tig_expr(sstate.child(id, 0))
+    }
+    if tag == N_IS {
+        // p.9.11 `is` 类型判定（规范 §3.16）：读 any 装箱 tag 与期望 tag 比较
+        return tig_is_check(id)
+    }
+    if tag == 7 {
+        // Call：println/print / tie 运行时桥内置 / 字符串表数学内置 / 用户函数
+        var nm = sstate.name_str(id)
+        if nm == "" {
+        }
+        if nm == "println" || nm == "print" {
+            return tig_println(id, nm == "println")
+        }
+        // S2.2 函数值调用：调用名是 fn 类型变量（闭包字面量/函数值参数/全局 fn）
+        // → 间接调用 entry(env, args...)。语义层已校验（sinfer 函数值调用分支），
+        // 此处先于 struct/enum/内置/用户函数解析——fn 变量名不可能与类型/函数重名。
+        var fv_nid = interner.intern(nm)
+        if scope_get_global(fv_nid) >= 0 && types.is_fn(g_lookup_ty) {
+            return tig_call_indirect(id, nm)
+        }
+        // struct 构造调用：StructName(args...) → 聚合值（优先级高于内置/用户
+        // 函数解析——构造名不可能与函数/内置重名，语义层已校验）
+        if is_struct_name(nm) {
+            return tig_struct_construct(id, nm)
+        }
+        // 枚举构造调用（防御路径：旧式点号名 `EnumName.Variant(...)` 若 parser
+        // 产出 Call 则在此处理；现行 parser 对枚举构造产 FieldAccess/MethodCall，
+        // 见 tag 15/tag 18 分支。nm 为点号全名时只取枚举段匹配。）
+        if is_enum_name(nm) {
+            return tig_enum_construct(sstate.bs_find(en_keys, interner.intern(nm)), "", id, sstate.slot_off(id))
+        }
+        // 内置（语言底座原语 → tie_* 桥或 libc）：非用户函数。
+        // 名字命中内置集后失败必须传播（-1 保留原 sm_err_msg），绝不降级为
+        // 用户调用——否则内置参数内的未支持表达式会连锁成"函数 X 无签名"
+        // 误导错误（历史根因：table_push(j_fvals, 0.0) 曾报 table_push 无签名）
+        if is_builtin_name(nm) {
+            var br = builtin_expr(nm, id)
+            if br >= 0 {
+                return g_builtin_res
+            }
+            if str_len(sm_err_msg) == 0 {
+                sm_err_msg = "内置调用 '" + nm + "' 生成失败（函数 " + g_cur_fn_name + "）"
+            }
+            return -1
+        }
+        // 用户函数：裸调用名解析（当前命名空间补全）
+        var full = resolve_call_name(nm)
+        // Call children = [泛型槽, 实参...] → 实参从 children[slot_off] 起
+        var aoff = sstate.slot_off(id)
+        // 兼容旧式点号名（历史 parser 曾对 `myns.add(...)` 生成 children=[接收者,
+        // 实参...]；新 parser 不再产出，防御保留 +1 语义）
+        if ig_find_char(nm, ".") >= 0 {
+            aoff = aoff + 1
+        }
+        return tig_user_call_from(full, id, aoff)
+    }
+    if tag == 148 {
+        // P2a 调用表达式 `t[0](5)`：被调者为 fn 值表达式 → 间接调用
+        return tig_call_expr(id)
+    }
+    if tag == 4 {
+        // BoolLit → i1 常量（trit 上下文 → i8：true=1 / false=-1，对齐 Rust）
+        if node_types[id] == types.named(TK_TRIT) {
+            var tv: i64 = -1
+            if s_vals[id] == 1 {
+                tv = 1
+            }
+            return tig_trit_lit(tv)
+        }
+        return tig_bool_lit(s_vals[id])
+    }
+    if tag == 8 {
+        // Unary：0=Neg 1=Not（driver 树无 ++/--）
+        var op = s_vals[id]
+        var operand = sstate.child(id, 0)
+        var ov = tig_expr(operand)
+        if ov < 0 {
+            return -1
+        }
+        var oty = node_types[operand]
+        if op == U_AWAIT {
+            // p.9.11 `await`（规范 §10.6）：future<T> 凭据取值；结果类型 = T
+            //（语义层已从 future 负载解出并登记 node_types[id]）
+            return tig_await(ov, node_types[id])
+        }
+        if op == 2 || op == 3 || op == 4 || op == 5 {
+            // 自增/自减（M4）：2=++i 3=--i 4=i++ 5=i--；操作数必须是变量
+            // （语义层保证），直接读写其槽：load → add/sub 1 → store；
+            // 前缀返回新值，后缀返回旧值（对齐 Rust tig_inc_dec）
+            return tig_inc_dec(op, operand)
+        }
+        if op == 0 {
+            // Neg：整数 → sub 0, x；浮点 → fsub 0.0, x（对齐 Rust fneg 语义）。
+            // 立即数 0 在浮点上下文必须为 0.0（LLVM：fsub double 0, %x 非法）
+            // p.8.2.4：操作数为用户 struct 且声明 op_neg → 发射方法调用。
+            var noty = node_types[operand]
+            if noty >= 0 && types.kind(noty) == K_STRUCT {
+                var ofull = op_method_full_ir(noty, 0, 0)
+                if ofull != "" {
+                    var onone: table<i64> = table_new_i64()
+                    return tig_op_overload(ofull, operand, noty, onone)
+                }
+            }
+            if oty == types.named(TK_TRIT) {
+                // trit 取反（-1↔1，0 保持）：i8 width，sub i8 0, x（与 Not 同款
+                // 平衡三值；对齐 interp eval_unary op==0 的 T_TRIT 分支）
+                var tneg = ir.new_inst(g_cur_block, 1, types.named(TK_I8))  // sub i8
+                ir.add_operand(tneg, 0, 2)
+                ir.add_operand(tneg, ov, 0)
+                return ir.get_value(tneg)
+            }
+            if oty == types.named(TK_F64) || oty == types.named(TK_F32) {
+                // f32 语义（2026-10-09）：操作数提升 f64 取负，结果按语义类型
+                // 回窄（对齐二元浮点算术的统一 f64 计算）。f32 变量 IR 值为
+                // float，须先 fpext；f32 字面量自字面量分派修复后同为 float。
+                var ovf = tig_coerce(ov, oty, types.named(TK_F64))
+                var zf = tig_float_lit(interner.intern("0.0"))
+                var fneg = ir.new_inst(g_cur_block, 14, types.named(TK_F64))  // fsub
+                ir.add_operand(fneg, zf, 0)
+                ir.add_operand(fneg, ovf, 0)
+                var negv = ir.get_value(fneg)
+                var rsem = node_types[id]
+                if rsem == types.named(TK_F32) {
+                    negv = tig_coerce(negv, types.named(TK_F64), rsem)
+                }
+                return negv
+            }
+            // S1.3 A1 窄整数取负：按操作数宽度生成 sub（i8 取负 → sub i8 0, x）
+            var nty = types.named(TK_I64)
+            if types.is_int(oty) {
+                nty = oty
+            }
+            var inst = ir.new_inst(g_cur_block, 1, nty)  // sub
+            ir.add_operand(inst, 0, 2)
+            ir.add_operand(inst, ov, 0)
+            return ir.get_value(inst)
+        }
+        if op == 1 {
+            // Not：bool → xor i1 true；trit → sub i8 0, x（取反，-1↔1，0 保持）
+            if oty == types.named(TK_TRIT) {
+                var tnot = ir.new_inst(g_cur_block, 1, types.named(TK_I8))  // sub i8
+                ir.add_operand(tnot, 0, 2)
+                ir.add_operand(tnot, ov, 0)
+                return ir.get_value(tnot)
+            }
+            var inst = ir.new_inst(g_cur_block, 8, types.named(TK_BOOL))  // xor
+            ir.add_operand(inst, ov, 0)
+            ir.add_operand(inst, 1, 2)
+            return ir.get_value(inst)
+        }
+        if op == U_BIT_NOT {
+            // 按位取反 = 与同宽全 1 位模式异或。
+            var bitnot = ir.new_inst(g_cur_block, 8, oty)
+            ir.add_operand(bitnot, ov, 0)
+            ir.add_operand(bitnot, -1, 2)
+            return ir.get_value(bitnot)
+        }
+        return -1
+    }
+    if tag == 18 {
+        // MethodCall：命名空间函数调用（receiver 路径 + 方法名）
+        return tig_method_call(id)
+    }
+    if tag == 13 {
+        // Index：t[i] 表下标读（动态表 → tie_table_at 桥）
+        return tig_index_read(id)
+    }
+    if tag == 150 {
+        // p.8.1.5 可空链安全访问：`a?[i]` / `opt?.field` → Option 包装传播
+        return tig_safe_access(id)
+    }
+    if tag == 14 {
+        // TupleLit：元组字面量 (a, b) → 聚合值（alloca + 逐字段 store + load）
+        return tig_tuple_lit(id)
+    }
+    if tag == 15 {
+        // FieldAccess：.q / .Item1 / .0 字段访问（元组/struct）→ 地址 + GEP + load。
+        // 枚举变体常量探测（EnumName.Variant 无 payload）：base 是未绑定变量且
+        // 命中 en_keys → 枚举构造（仿 sinfer FieldAccess 分支，必须先于
+        // tig_field_access——否则枚举名被当变量查作用域报错）
+        var base_node15 = sstate.child(id, 0)
+        if s_tags[base_node15] == 6 {  // Var
+            var bnm15 = sstate.name_str(base_node15)
+            var eidx15 = sstate.bs_find(en_keys, interner.intern(bnm15))
+            if eidx15 >= 0 {
+                return tig_enum_construct(eidx15, sstate.name_str(id), id, -1)
+            }
+        }
+        return tig_field_access(id)
+    }
+    if tag == 12 {
+        // TableLit：动态表创建（仅 var 初始化/实参场景；直接求值 → 建表）
+        return tig_table_lit(id)
+    }
+    if tag == N_COMPREHENSION {
+        // p.8.2.5 表/数组推导式：`[expr for x in src if cond]` → 新建表
+        return tig_comprehension(id)
+    }
+    if tag == N_WITH {
+        // p.9.11.6 表不可变更新 `t with {k: v}` → 新表/新映射（见 irgen_agg）
+        return tig_with(id)
+    }
+    if tag == N_SLICE {
+        // p.9.11.7 切片/区间 `t[1..3]`/string 子串（见 irgen_agg）
+        return tig_slice(id)
+    }
+    return -1  // 本段未命中
+}
+}

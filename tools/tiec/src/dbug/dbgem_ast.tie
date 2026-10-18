@@ -1,0 +1,76 @@
+type tie<class>
+// compiler/dbug/dbgem_ast.tie —— 结构化输出·ast / tokens 阶段 dump（p.9.22.3）
+// ============================================================
+// ast（字段 100-109；来源 = 语义池 s_*，多文件单元 = import 展开后的全量节点，
+// 与设计稿 §3「100-108 九列直拷 + 109 file_ids」对齐）：
+//   100 tags · 101 names · 102 vals · 103 aux · 104 coff · 105 nchild ·
+//   106 children（扁平段）· 107 lines · 108 cols · 109 file_ids（节点→源文件）
+// tokens（字段 300-303；来源 = 主源词法重跑）：
+//   300 kinds · 301 text · 302 lines · 303 cols
+
+namespace dbgem {
+
+// ast 阶段列构建。
+pub func build_ast() {
+    cols_reset()
+    var n = len(s_tags)
+    var i: i64 = 0
+    // 名字列（str）：s_names 即池 id（-1 = 无名字 → 空串）
+    var names: table<i64> = table_new_i64()
+    while i < n {
+        table_push(names, s_names[i])
+        i = i + 1
+    }
+    push_col_i64(100, "tags", s_tags)
+    push_col_str_ids(101, "names", names)
+    push_col_i64(102, "vals", s_vals)
+    push_col_i64(103, "aux", s_aux)
+    push_col_i64(104, "coff", s_coff)
+    push_col_i64(105, "nchild", s_nchild)
+    push_col_i64(106, "children", s_children)
+    push_col_i64(107, "lines", s_lines)
+    push_col_i64(108, "cols", s_cols)
+    // file_ids：逐节点所属文件。节点按文件连续追加（g_file_base 升序），
+    // 单遍边界推进 O(n + 文件数)。
+    var fids: table<i64> = table_new_i64()
+    var nf = len(g_file_base)
+    var fid: i64 = 0
+    i = 0
+    while i < n {
+        while fid + 1 < nf && i >= g_file_base[fid + 1] {
+            fid = fid + 1
+        }
+        table_push(fids, fid)
+        i = i + 1
+    }
+    push_col_i64(109, "file_ids", fids)
+}
+
+// tokens 阶段列构建：重跑主源词法（此刻 token 表已含末期 import 模块的词素，
+// 主文件 token 须以 k_g_src 显式重建；确定性 = 同输入同输出）。词法失败时
+// 保持空列（部分 token 不落盘——失败路径由 diag 记录承担）。
+pub func build_tokens() {
+    cols_reset()
+    if !lexer.run_lex(k_g_src) {
+        return
+    }
+    var n = lexer.token_count()
+    var kinds: table<i64> = table_new_i64()
+    var textids: table<i64> = table_new_i64()
+    var lns: table<i64> = table_new_i64()
+    var cls: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(kinds, lexer.token_tag(i))
+        table_push(textids, lexer.token_lexeme_id(i))
+        table_push(lns, lexer.token_line(i))
+        table_push(cls, lexer.token_col(i))
+        i = i + 1
+    }
+    push_col_i64(300, "kinds", kinds)
+    push_col_str_ids(301, "text", textids)
+    push_col_i64(302, "lines", lns)
+    push_col_i64(303, "cols", cls)
+}
+
+}   // namespace dbgem

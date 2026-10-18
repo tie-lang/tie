@@ -1,0 +1,770 @@
+type tie<class>
+// compiler/backend/irgen_bi_dyn.tie —— 内置生成器：动态加载原语（winsqlite3.dll C ABI 桥）
+// ============================================================
+// 自 irgen_expr.tie 的 builtin_expr 拆出（p.9.21.2 两步制①）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `load_library`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_load_library(nm: string, id: i64) -> i64 {
+if nm == "load_library" {
+    var namev = tig_expr(call_arg(id, 0))
+    if namev < 0 {
+        return -1
+    }
+    var w = tig_wide16(namev)
+    var h = tig_ext_call1("LoadLibraryW", w, types.named(TK_STR), types.named(TK_I64))
+    g_builtin_res = h
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `get_proc`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_get_proc(nm: string, id: i64) -> i64 {
+if nm == "get_proc" {
+    var hnd = tig_expr(call_arg(id, 0))
+    if hnd < 0 {
+        return -1
+    }
+    var nmv = tig_expr(call_arg(id, 1))
+    if nmv < 0 {
+        return -1
+    }
+    var hty = node_types[call_arg(id, 0)]
+    if hty != types.named(TK_I64) && hty != types.named(TK_U64) && hty >= 0 {
+        var sh = tig_sext(hnd, hty, types.named(TK_I64))
+        if sh < 0 {
+            return -1
+        }
+        hnd = sh
+    }
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_I64)); table_push(avs, hnd)
+    table_push(ats, types.named(TK_STR)); table_push(avs, nmv)
+    var p = tig_ext_call_typed("GetProcAddress", ats, avs, types.named(TK_I64))
+    g_builtin_res = p
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `cstr_to_string`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_cstr_to_string(nm: string, id: i64) -> i64 {
+if nm == "cstr_to_string" {
+    var addr = tig_expr(call_arg(id, 0))
+    if addr < 0 {
+        return -1
+    }
+    // addr 是 i64 指针整数（dyn_call_p/get_proc 返回值）→ inttoptr → ptr，
+    // 否则 s21_gep 基址被 to_ptr 原样输出（i64 当 ptr → LLVM 类型错）
+    var ap = ir.new_inst(g_cur_block, 25, types.named(TK_STR))
+    ir.add_operand(ap, addr, 0)
+    var addrp = ir.get_value(ap)
+    var hv = s21_sb_new()
+    var ia = ir.new_inst(g_cur_block, 20, types.named(TK_I64))
+    ir.add_operand(ia, types.named(TK_I64), 2)
+    var ip = ir.get_value(ia)
+    s21_store(ip, tig_int_lit(0), types.named(TK_I64))
+    var hd = ir.new_block(g_cur_func, interner.intern("cs.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("cs.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("cs.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var iv = s21_load(ip, types.named(TK_I64))
+    var byt = s21_zext(s21_load(s21_gep(addrp, iv, false), types.named(TK_I8)), types.named(TK_I8))
+    var nul = tig_cmp_zero(byt, 0)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, nul, 0)
+    ir.add_operand(cb, ex, 1)
+    ir.add_operand(cb, bd, 1)
+    g_cur_block = bd
+    var iv2 = s21_load(ip, types.named(TK_I64))
+    s21_sb_append_byte(hv, byt)
+    s21_store(ip, s21_bin(0, iv2, tig_int_lit(1)), types.named(TK_I64))
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)
+    g_cur_block = ex
+    g_builtin_res = s21_sb_build(hv)
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `to_string`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_to_string(nm: string, id: i64) -> i64 {
+if nm == "to_string" {
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    // 实参类型：f64 → 用 i128 内联除数换成「浮点暂保留 Rust 桥」见下；
+    // i64/u64 → tig_i64_to_str（去 Rust）；窄整数 sext → i64 后再内联。
+    var vt = node_types[call_arg(id, 0)]
+    if vt == types.named(TK_STR) {
+        // p.8.2.3 字符串插值：to_string(string) 返回自身（插值拼接链
+        // 统一包 to_string——string 段直通，数字/布尔段走数值转换）
+        g_builtin_res = v
+    } else if vt == types.named(TK_BOOL) {
+        // p.8.2.3 bool 插值：cond_br + phi → "true"/"false"
+        //（const_str 是 i64 指针整数，llvmgen 字符串 phi 分支自动转真 ptr）
+        var t_str = tig_str_lit(interner.intern("\"true\""))
+        var f_str = tig_str_lit(interner.intern("\"false\""))
+        var bcond = tig_cond_to_bool(v, types.named(TK_BOOL))
+        var t_blk = ir.new_block(g_cur_func, interner.intern("tos.t"))
+        var f_blk = ir.new_block(g_cur_func, interner.intern("tos.f"))
+        var m_blk = ir.new_block(g_cur_func, interner.intern("tos.m"))
+        var cbr = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cbr, bcond, 0)
+        ir.add_operand(cbr, t_blk, 1)
+        ir.add_operand(cbr, f_blk, 1)
+        g_cur_block = t_blk
+        var br1 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br1, m_blk, 1)
+        g_cur_block = f_blk
+        var br2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br2, m_blk, 1)
+        g_cur_block = m_blk
+        var phi = ir.new_inst(g_cur_block, 33, types.named(TK_STR))
+        ir.add_operand(phi, t_str, 0)
+        ir.add_operand(phi, t_blk, 1)
+        ir.add_operand(phi, f_str, 0)
+        ir.add_operand(phi, f_blk, 1)
+        g_builtin_res = ir.get_value(phi)
+    } else if vt == types.named(TK_F64) || vt == types.named(TK_F32) {
+        // p.6.4.4：去 Rust 桥（tie_to_string_f64）→ 内联 tig_f64_to_str
+        //（CRT snprintf "%.17g" → 带头串；Rust 最短表示差异可接受）。
+        var fv = v
+        if vt == types.named(TK_F32) {
+            fv = tig_coerce(v, types.named(TK_F32), types.named(TK_F64))  // fpext → f64
+        }
+        g_builtin_res = tig_f64_to_str(fv)
+    } else if vt == types.named(TK_I128) || vt == types.named(TK_U128) {
+        // 批次 2（i128/u128）：内联除法循环生成十进制串
+        g_builtin_res = tig_i128_to_str(v, vt == types.named(TK_I128))
+    } else if vt == types.named(TK_I64) {
+        g_builtin_res = tig_i64_to_str(v, true)
+    } else if vt == types.named(TK_U64) {
+        g_builtin_res = tig_i64_to_str(v, false)
+    } else if vt < 0 {
+        g_builtin_res = tig_i64_to_str(v, false)
+    } else {
+        // 窄类型（trit/char/i8/i16/i32/u8/u16/u32 等）：sext → i64
+        var sv = tig_sext(v, vt, types.named(TK_I64))
+        if sv < 0 {
+            return -1
+        }
+        g_builtin_res = tig_i64_to_str(sv, true)
+    }
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `parse_int`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_parse_int(nm: string, id: i64) -> i64 {
+if nm == "parse_int" {
+    // 去 Rust 桥（批次A）：tig_parse_int 内联 IR 生成（字节循环累加），
+    // 替代 Rust 桥 tie_parse_int。签名 (s, ok 出参槽) -> i64。不再置 g_used_interp。
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    var pio = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8 ok
+    ir.add_operand(pio, types.named(TK_I8), 2)
+    g_builtin_res = tig_parse_int(v, ir.get_value(pio))
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `parse_float`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_parse_float(nm: string, id: i64) -> i64 {
+if nm == "parse_float" {
+    // p.6.4.4：去 Rust 桥（tie_parse_float）→ 内联 tig_parse_float IR（字节循环
+    // 十进制解析 + libm pow 指数缩放，有限精度）。签名 (s, ok 出参槽) -> f64。
+    // 不再置 g_used_interp。
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    var pfo = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+    ir.add_operand(pfo, types.named(TK_I8), 2)
+    g_builtin_res = tig_parse_float(v, ir.get_value(pfo))
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `parse_trit`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_parse_trit(nm: string, id: i64) -> i64 {
+if nm == "parse_trit" {
+    // 去 Rust 桥（批次A）：tig_parse_trit 内联 IR 生成，替代桥 tie_parse_trit。
+    // 返回 i8（值域 -1/0/1，语义类型标 TK_TRIT）。不再置 g_used_interp。
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    var pto = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+    ir.add_operand(pto, types.named(TK_I8), 2)
+    g_builtin_res = tig_parse_trit(v, ir.get_value(pto))
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `to_trit`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_to_trit(nm: string, id: i64) -> i64 {
+if nm == "to_trit" {
+    // i64 → 饱和钳制 trit（i8，值域 -1/0/1；对齐 interp_bin clamp_trit）：
+    // lt = x< -1 → -1；gt = x>1 → 1；否则 x。clamp 后 trunc i8。
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    var T64 = types.named(TK_I64)
+    var lt = tig_icmp_c(v, tig_int_lit(-1), 2)          // x < -1 (slt)
+    var c1 = tig_select_i(lt, tig_int_lit(-1), v, T64)  // c1 = clamp 下界
+    var gt = tig_icmp_c(c1, tig_int_lit(1), 3)          // x > 1 (sgt)
+    var c2 = tig_select_i(gt, tig_int_lit(1), c1, T64)  // c2 ∈ [-1,1]
+    g_builtin_res = s21_trunc_i8(c2)                    // i64 → i8 trit
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `trit_val`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_trit_val(nm: string, id: i64) -> i64 {
+if nm == "trit_val" {
+    // trit（i8）→ i64：sext 符号扩展（-1/0/1 → i64）
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    g_builtin_res = tig_sext(v, types.named(TK_I8), types.named(TK_I64))
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `len`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_len(nm: string, id: i64) -> i64 {
+if nm == "len" {
+    // S2.1：len(表) → tie_table_len；len(字符串) → 读 {ptr,len} 长度头（O(1)，
+    // 不再 strlen 扫描——字符串值统一带头部（字面量 .rodata 头 / str_cat 头 /
+    // 桥返回自动补头 / StringBuilder build 头）。行为与旧 strlen 一致（字节数）。
+    // L1：len(定长数组) → 编译期常量 N。
+    var a = call_arg(id, 0)
+    var at = node_types[a]
+    if at >= 0 && types.is_array(at) {
+        g_builtin_res = tig_int_lit_ty(types.array_len(at), types.named(TK_I64))
+        return 0
+    }
+    if at == types.named(TK_STR) {
+        // 字符串：读 ptr-8 的 i64 长度头（S2.1）
+        var v = tig_expr(a)
+        if v < 0 {
+            return -1
+        }
+        g_builtin_res = s21_str_head_len(v)
+        return 0
+    }
+    var v2 = tig_expr(a)
+    if v2 < 0 {
+        return -1
+    }
+    g_builtin_res = s21_table_len(v2)
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `any_tag`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_any_tag(nm: string, id: i64) -> i64 {
+if nm == "any_tag" {
+    var a1 = call_arg(id, 0)
+    var av1 = tig_expr(a1)
+    if av1 < 0 {
+        return -1
+    }
+    var any_ty6 = types.named(TK_ANY)
+    var slot6 = ir.new_inst(g_cur_block, 20, any_ty6)
+    ir.add_operand(slot6, any_ty6, 2)
+    var sp6 = ir.get_value(slot6)
+    var st6 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st6, any_ty6, 2)
+    ir.add_operand(st6, av1, 0)
+    ir.add_operand(st6, sp6, 0)
+    var g6 = ir.new_inst(g_cur_block, 27, any_ty6)
+    ir.add_operand(g6, sp6, 0)
+    ir.add_operand(g6, 0, 2)
+    var ld6 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+    ir.add_operand(ld6, ir.get_value(g6), 0)
+    g_builtin_res = ir.get_value(ld6)
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `map_contains`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_map_contains(nm: string, id: i64) -> i64 {
+if nm == "map_contains" {
+    var m1 = tig_expr(call_arg(id, 0))
+    if m1 < 0 {
+        return -1
+    }
+    var k1 = tig_expr(call_arg(id, 1))
+    if k1 < 0 {
+        return -1
+    }
+    g_builtin_res = s21_map_contains(m1, k1)
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `table_push`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_table_push(nm: string, id: i64) -> i64 {
+if nm == "table_push" {
+    // 第 1 参数 = 表变量（语义已保证）；元素类型查 lv_telem/gb_telem
+    var tname_node = call_arg(id, 0)
+    var tname = sstate.name_str(tname_node)
+    var elem: i64 = types.named(TK_I64)
+    // 优先 irgen 作用域完整类型（table_new_f64() 初始化的变量 scope 里是
+    // table_of(f64) → 元素 f64）。var_table_elem 是语义层每函数重置的，
+    // irgen 阶段只可靠查到最后一次登记——跨函数场景（parse_series 里
+    // push parse_float 结果）会误判为 i64 导致 push_i64(double) 类型错
+    var te: i64 = -1
+    var tnid = interner.intern(tname)
+    // p.9.12.6 边界：table_push 不支持作用于行池 table<R>（行池无"追加"，只有按 id 写）
+    if rp_is(tnid) {
+        sm_err_msg = "table_push 不支持作用于行池 table<R>（p.9.12.6 边界，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var tv_own = tblvar_get(tnid)
+    if tv_own >= 0 {
+        te = tv_own  // irgen 自维护登记（最可靠）
+    } else if scope_get(tnid) >= 0 && types.is_table(g_lookup_ty) {
+        var le = types.table_elem(g_lookup_ty)
+        if le > 0 {
+            te = le
+        }
+    }
+    // r.1.1.7：**目标表实参节点的语义类型**（按目标表元素静态类型，非值类型
+    // 启发）——table<T> 标注/推断的变量节点 node_types 是逐表达式语义推断，
+    // 不依赖按名登记的 lv_telem（后者在 irgen 阶段只剩最后一次登记，同模块
+    // 混合 i64/string 表时 ref 参数/局部表 push 会误取另一函数的同名登记 →
+    // 误选 string 桥生成 `store ptr <i64值>` → opt 类型错）。裸 table（
+    // table_new_* 返回）node_types 无元素类型，自然落空继续走 sinfer 兜底。
+    if te < 0 {
+        var aty = node_types[tname_node]
+        if types.is_table(aty) && !types.is_map(aty) && aty != types.named(TK_TABLE) {
+            var ale = types.table_elem(aty)
+            if ale > 0 {
+                te = ale
+            }
+        }
+    }
+    if te < 0 {
+        te = sinfer.var_table_elem(tnid)
+    }
+
+    if te >= 0 {
+        elem = te
+    }
+    var t = tig_expr(tname_node)
+    if t < 0 {
+        return -1
+    }
+    var x = tig_expr(call_arg(id, 1))
+    if x < 0 {
+        return -1
+    }
+    // p.6.10.4：嵌套表元素 retain——push 表值（如容器表 push 另一张表）→ 容器
+    // 元素持有引用。容器 release 只释放 data 缓冲、不释放元素表，元素表由各自
+    // 引用方负责释放——此处在 push 前 retain 保证元素表引用计数正确不悬垂。
+    // r.1.1.4：仅**别名值**（变量/下标/字段读，tag≠7/12）retain（源槽仍持引用，
+    // 容器与源各自持 1 份）；**瞬态值**（调用返回 tag 7 / 表字面量 tag 12）所有权
+    // 转移给容器（rc 不变）——否则字面量 rc=1 + retain=2，容器 release 只 -1 剩
+    // 1 份无人释放 → 每 push 泄漏 1 引用（嵌套表/扁平表重绑定内存无界增长）。
+    // 在桥选/装箱之前对原始表句柄 retain（x 可能是后续装箱产物，非表句柄）。
+    var pv_t = node_types[call_arg(id, 1)]
+    var pv_tag = s_tags[call_arg(id, 1)]
+    if pv_t >= 0 && types.is_table(pv_t) && pv_tag != 7 && pv_tag != 12 {
+        tig_tbl_retain_call(x)
+    }
+    // 桥选择：按**值**的实际类型判定（嵌套表/字符串值 → push_string 存 ptr；
+    // 浮点值 → push_f64；曾按声明元素类型选桥——parse_series 把 parse_float
+    // 结果 push 进 i64 表会 push_i64(double) 类型错，Rust 按值类型选桥）
+    var suffix = bridge_suffix(elem)
+    var pty = types.named(TK_I64)
+    var vt = node_types[call_arg(id, 1)]
+    var ek = types.kind(elem)
+    if ek == K_STRUCT || ek == K_ENUM || ek == K_FN || ek == K_TUPLE || elem == types.named(TK_ANY) {
+        // P2a/P2b 复合元素：槽类型 = 元素类型 id（多字元素类型化 store）
+        pty = elem
+    } else if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR)) {
+        suffix = "string"
+        pty = types.named(TK_STR)
+    } else if vt >= 0 && (vt == types.named(TK_F64) || vt == types.named(TK_F32)) {
+        suffix = "f64"
+        pty = types.named(TK_F64)
+    } else if suffix == "string" {
+        pty = types.named(TK_STR)
+    } else if suffix == "bool" {
+        pty = types.named(TK_BOOL)
+    }
+    if pty == types.named(TK_ANY) {
+        // P2b 异构元素装箱：推入值 → any {tag, payload}
+        var vt4 = node_types[call_arg(id, 1)]
+        if vt4 >= 0 && vt4 != types.named(TK_ANY) {
+            var bx = tig_box_any(x, vt4)
+            if bx < 0 {
+                return -1
+            }
+            x = bx
+        }
+    }
+    // r.1.6.7 独占免锁：目标表是第一实参且为**裸局部变量**、静态证得独占
+    // （句柄从未离开本次调用）→ tbl_push_nl。判据见 irgen_esc.tie。
+    // r.1.6.14：值语义模式下先分离（默认关 ⇒ no-op，逐指令等价）
+    t = tig_cow_before_write(t, tnid)
+    s21_table_push_ex(t, pty, x, esc_take(tname_node, "table_push"))
+    g_builtin_res = tig_int_lit(0)  // void 结果：哑值（调用方丢弃）
+    return 0
+}
+}
+
+// 内置 `table_append`（appfuse 底座：把 src 前 n 个元素批量追加到 dst 尾）
+// 语义：与「连续 min(n, len(src)) 次 table_push」逐元素等价（同扩容规则、同 len
+// 提交、同 COW 分离与免锁判据）；元素宽以 dst 为准，两侧元素类型一致（此处校验）。
+// 元素类别门（v1）：仅拷贝型元素（标量/字符串）——深表须逐元素 retain、复合/any
+// 须逐元素桥/装箱，一律拒绝。发射 tl_tbl$tbl_append_tbl[_nl]（_nl = dst 写侧
+// esc_take ∧ src 读侧 esc_live_or_lock 双成立）。
+pub func bi_table_append(nm: string, id: i64) -> i64 {
+if nm == "table_append" {
+    var tname_node = call_arg(id, 0)
+    var tname = sstate.name_str(tname_node)
+    var tnid = interner.intern(tname)
+    if rp_is(tnid) {
+        sm_err_msg = "table_append 不支持作用于行池 table<R>（p.9.12.6 边界，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    // 目标元素类型解析级联（对齐 table_push）
+    var elem: i64 = types.named(TK_I64)
+    var te: i64 = -1
+    var tv_own = tblvar_get(tnid)
+    if tv_own >= 0 {
+        te = tv_own
+    } else if scope_get(tnid) >= 0 && types.is_table(g_lookup_ty) {
+        var le = types.table_elem(g_lookup_ty)
+        if le > 0 {
+            te = le
+        }
+    }
+    if te < 0 {
+        var aty = node_types[tname_node]
+        if types.is_table(aty) && !types.is_map(aty) && aty != types.named(TK_TABLE) {
+            var ale = types.table_elem(aty)
+            if ale > 0 {
+                te = ale
+            }
+        }
+    }
+    if te < 0 {
+        te = sinfer.var_table_elem(tnid)
+    }
+    if te >= 0 {
+        elem = te
+    }
+    // 元素类别门（v1）：拷贝型元素（标量/字符串）才可整段 memcpy
+    var ek = types.kind(elem)
+    if types.is_table(elem) || types.is_map(elem) || elem == types.named(TK_ANY) ||
+        ek == K_STRUCT || ek == K_ENUM || ek == K_FN || ek == K_TUPLE {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "table_append 暂不支持该元素类型（深表/复合/any 须逐元素处理，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    // 源元素类型（尽力解析：两侧皆可知且不一致 ⇒ 拒绝；不可知则信任调用方）
+    var s_node = call_arg(id, 1)
+    var se: i64 = -1
+    var sty = node_types[s_node]
+    if sty >= 0 && types.is_table(sty) && !types.is_map(sty) && sty != types.named(TK_TABLE) {
+        var sle = types.table_elem(sty)
+        if sle > 0 {
+            se = sle
+        }
+    }
+    if se < 0 && s_tags[s_node] == 6 {   // 6 = S_N_VAR
+        var sid = interner.intern(sstate.name_str(s_node))
+        var sv_own = tblvar_get(sid)
+        if sv_own >= 0 {
+            se = sv_own
+        } else if scope_get(sid) >= 0 && types.is_table(g_lookup_ty) {
+            var sl2 = types.table_elem(g_lookup_ty)
+            if sl2 > 0 {
+                se = sl2
+            }
+        }
+    }
+    if se >= 0 && te >= 0 && se != te {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "table_append 两侧元素类型不一致：目标 " + types.type_name(te) + " ← 源 " + types.type_name(se)
+        return -1
+    }
+    var t = tig_expr(tname_node)
+    if t < 0 {
+        return -1
+    }
+    var s = tig_expr(s_node)
+    if s < 0 {
+        return -1
+    }
+    var nv = tig_expr(call_arg(id, 2))
+    if nv < 0 {
+        return -1
+    }
+    // r.1.6.7 免锁：dst 写侧 esc_take（对齐 table_push）；src 读侧 esc_live_or_lock
+    // （只查询版本，不重复计数）。双成立才走 _nl 入口。
+    var nl_ok = esc_take(tname_node, "table_append") && esc_live_or_lock(s_node)
+    // r.1.6.14 值语义分离（默认关 ⇒ no-op；非全局槽目标，对齐 table_push）
+    t = tig_cow_before_write(t, tnid)
+    g_used_trmlite = true
+    if nl_ok {
+        tl_void_3("tl_tbl$tbl_append_tbl_nl", t21_ptri(t), t21_ptri(s), nv)
+    } else {
+        tl_void_3("tl_tbl$tbl_append_tbl", t21_ptri(t), t21_ptri(s), nv)
+    }
+    g_builtin_res = tig_int_lit(0)  // void 结果：哑值（调用方丢弃）
+    return 0
+}
+}
+
+
+// 内置 `table_reserve`（预留容量：单次分配扩容 ≥n，不动 len；幂等）
+pub func bi_table_reserve(nm: string, id: i64) -> i64 {
+if nm == "table_reserve" {
+    g_used_trmlite = true
+    var t = tig_expr(call_arg(id, 0))
+    if t < 0 {
+        return -1
+    }
+    var nv = tig_expr(call_arg(id, 1))
+    if nv < 0 {
+        return -1
+    }
+    tl_void_2("tl_tbl$tbl_reserve", t21_ptri(t), nv)
+    g_builtin_res = tig_int_lit(0)
+    return 0
+}
+}
+
+// 内置 `table_append_raw`（从裸内存批量追加：table_append_raw(dst, ptr, n)）
+// 语义：与 table_append 同（元素宽度取 dst；n 个元素一次锁内拷入 dst 尾），差别在
+// 源是**原始地址**（供缓冲区/arena → 表）。元素类别门与 table_append 一致。
+pub func bi_table_append_raw(nm: string, id: i64) -> i64 {
+if nm == "table_append_raw" {
+    g_used_trmlite = true
+    var tname_node = call_arg(id, 0)
+    var tname = sstate.name_str(tname_node)
+    var tnid = interner.intern(tname)
+    if rp_is(tnid) {
+        sm_err_msg = "table_append_raw 不支持作用于行池 table<R>（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    // 元素类别门（v1）：与 table_append 同（拷贝型元素才可整段 memcpy）
+    var elem: i64 = types.named(TK_I64)
+    var te: i64 = -1
+    var tv_own = tblvar_get(tnid)
+    if tv_own >= 0 {
+        te = tv_own
+    } else if scope_get(tnid) >= 0 && types.is_table(g_lookup_ty) {
+        var le = types.table_elem(g_lookup_ty)
+        if le > 0 {
+            te = le
+        }
+    }
+    if te < 0 {
+        var aty = node_types[tname_node]
+        if types.is_table(aty) && !types.is_map(aty) && aty != types.named(TK_TABLE) {
+            var ale = types.table_elem(aty)
+            if ale > 0 {
+                te = ale
+            }
+        }
+    }
+    if te < 0 {
+        te = sinfer.var_table_elem(tnid)
+    }
+    if te >= 0 {
+        elem = te
+    }
+    var ek = types.kind(elem)
+    if types.is_table(elem) || types.is_map(elem) || elem == types.named(TK_ANY) ||
+        ek == K_STRUCT || ek == K_ENUM || ek == K_FN || ek == K_TUPLE {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "table_append_raw 暂不支持该元素类型（深表/复合/any 须逐元素处理，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var t = tig_expr(tname_node)
+    if t < 0 {
+        return -1
+    }
+    var p = tig_expr(call_arg(id, 1))
+    if p < 0 {
+        return -1
+    }
+    var nv = tig_expr(call_arg(id, 2))
+    if nv < 0 {
+        return -1
+    }
+    var nl_ok = esc_take(tname_node, "table_append_raw")
+    t = tig_cow_before_write(t, tnid)
+    var addr = t21_ptri(p)
+    if nl_ok {
+        tl_void_3("tl_tbl$tbl_append_nl", t21_ptri(t), addr, nv)
+    } else {
+        tl_void_3("tl_tbl$tbl_append", t21_ptri(t), addr, nv)
+    }
+    g_builtin_res = tig_int_lit(0)
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `exit`（p.9.21.2 两步制①：自 builtin_expr 提取）
+
+pub func bi_exit(nm: string, id: i64) -> i64 {
+if nm == "exit" {
+    // 去 Rust 桥（dev33 批次3 关联）：exit 是 libc 符号（tig_ext_call1 经
+    // is_libc 不置 interp），原误置 g_used_interp 把纯 libc 程序也拉进
+    // tie_interp.lib。移除——link_exe 的 prefer_interp=false 时仅链 runtime.a。
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    // C 运行时 exit() 自带 stdio flush，无需显式 fflush
+    tig_ext_call1("exit", v, types.named(TK_I64), -1)
+    g_builtin_res = tig_int_lit(0)  // exit 不返回：哑值
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `arg_count`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_arg_count(nm: string, id: i64) -> i64 {
+if nm == "arg_count" {
+    // p.6.4.1：内联 CommandLineToArgvW（shell32，非 interp 桥）
+    g_builtin_res = tig_arg_count()
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `arg_string`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_arg_string(nm: string, id: i64) -> i64 {
+if nm == "arg_string" {
+    var i = tig_expr(call_arg(id, 0))
+    if i < 0 {
+        return -1
+    }
+    g_builtin_res = tig_arg_string(i)
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `file_read`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_file_read(nm: string, id: i64) -> i64 {
+if nm == "file_read" {
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    g_builtin_res = tig_read_file(p)
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `file_size`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_file_size(nm: string, id: i64) -> i64 {
+if nm == "file_size" {
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    g_builtin_res = tig_size_inline(p)
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `file_exists`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_file_exists(nm: string, id: i64) -> i64 {
+if nm == "file_exists" {
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    g_builtin_res = tig_exists_inline(p)
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `file_delete`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_file_delete(nm: string, id: i64) -> i64 {
+if nm == "file_delete" {
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    g_builtin_res = tig_delete_inline(p)
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `print_err`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_print_err(nm: string, id: i64) -> i64 {
+if nm == "print_err" {
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    tig_print_err(v)  // CRT _write fd=2（p.6.4.1，零 Rust 桥）
+    g_builtin_res = tig_int_lit(0)  // void：哑值
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `mkdir_all`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_mkdir_all(nm: string, id: i64) -> i64 {
+if nm == "mkdir_all" {
+    var p = tig_expr(call_arg(id, 0))
+    if p < 0 {
+        return -1
+    }
+    g_builtin_res = tig_mkdir_all(p)
+    return 0
+}
+}
+
+// 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
+// 内置 `regex_find_all`（p.9.21.2 两步制①：自 builtin_expr 提取）
+pub func bi_regex_find_all(nm: string, id: i64) -> i64 {
+if nm == "regex_find_all" {
+    // p.6.4.8：内联纯 tie 最小正则引擎（不再经 Rust tie_interp 桥）
+    return tig_regex_find_all(id)
+}
+}
+
+}

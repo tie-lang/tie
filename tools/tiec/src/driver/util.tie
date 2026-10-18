@@ -1,0 +1,256 @@
+type tie<class>
+// compiler/driver/util.tie —— driver 文本/路径工具子模块
+
+// p.9.22.10 tinker：人读文本出口（--tink 时 stdout 让位帧流，文本改走 stderr；
+// 非 tink 模式与 println 逐字节等价）。编译路径的 println 统一经此出口。
+// 常驻编译服务：g_svc_cap_on 时改为**按请求捕获**（帧内回传，客户端按请求配对，
+// 不依赖共享 stderr 的时序切分）。
+pub func dbg_txt(s: string) {
+    if g_svc_cap_on {
+        g_svc_cap = g_svc_cap + s + "\n"
+        return
+    }
+    // 任何「stdout 是帧流」的模式都必须把人读文本改道 stderr：
+    // --tink（一次性帧输出）、--tink-serve（分析角色）、--serve-compile（编译角色）。
+    if g_tink || g_tink_serve || g_serve_compile {
+        print_err(s + "\n")
+    } else {
+        println(s)
+    }
+}
+// ============================================================
+// 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
+// 拆分范式：同编译单元跨文件（文本内联）——本文件只含函数与注释，
+// 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
+// 风格 flat：顶层平铺函数。本组工具被同单元其他组件裸名依赖（实测
+// consteval.tie 等 12+ 处裸调 slice/trim/split_lines…），收进 ns 会切断
+// 这些调用；待语言层 L1 可见性梯度落地后再收敛进 driver ns。
+// ★ p.9.16.1：**纯文本工具已迁出**到 `frontend/textutil.tie`（find_char /
+// has_prefix / slice / trim / split_char / split_lines / strip_type_header）。
+// 为什么迁：frontend 有 7 个纯文本工具是**裸名依赖**本文件的，但 frontend 树
+// 不能依赖 driver（p.9.21.1 依赖方向契约）——LSP（tsp）只编译 frontend 树，
+// 不编译 driver ⇒ 这些函数缺失，**LSP 根本编不出来**（实测 E00489）。
+// 迁到 frontend 后：frontend 自足，driver 侧经同编译单元仍可见（零调用点改动）。
+// 在 s 中查找子串 needle 首次出现位置（0 起字符索引）；未找到返回 -1。
+pub func find_str(immut s: string, immut needle: string) -> i64 {
+    var n = str_len(s)
+    var m = str_len(needle)
+    if m == 0 {
+        return 0
+    }
+    if m > n {
+        return -1
+    }
+    var i: i64 = 0
+    while i <= n - m {
+        var j: i64 = 0
+        var hit = true
+        while j < m {
+            if str_char(s, i + j) != str_char(needle, j) {
+                hit = false
+            }
+            j = j + 1
+        }
+        if hit {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 按字符拆分（码点级；driver 自写工具）
+// 源码目录（不含文件名/扩展名）；无分隔符返回 "."
+pub func base_dir_of(p: string) -> string {
+    var n = str_len(p)
+    var i: i64 = n - 1
+    while i >= 0 {
+        var c = str_char(p, i)
+        if c == "/" || c == "\\" {
+            return slice(p, 0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+// 取路径的目录部分（含末尾分隔符；无分隔符返回空串）；\ 与 / 都识别，
+// 输出归一化为 /（import 展开需要）。
+pub func dir_of(path: string) -> string {
+    var n: i64 = str_len(path)
+    var last: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(path, i)
+        if c == "/" || c == "\\" {
+            last = i
+        }
+        i = i + 1
+    }
+    if last < 0 {
+        return ""
+    }
+    var d = slice(path, 0, last + 1)
+    var sb = string_builder()
+    var j: i64 = 0
+    while j < str_len(d) {
+        var c2 = str_char(d, j)
+        if c2 == "\\" {
+            sb_append(sb, "/")
+        } else {
+            sb_append(sb, c2)
+        }
+        j = j + 1
+    }
+    return sb_build(sb)
+}
+
+// 替换路径扩展名（basename 最后一个 . 后替换；无 . 直接追加）。
+// 例：examples/hello.tie + "exe" → examples/hello.exe；a.opt.ll + "ll" → a.opt.ll。
+pub func replace_ext(path: string, new_ext: string) -> string {
+    var n: i64 = str_len(path)
+    var last_dot: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        if str_char(path, i) == "." {
+            last_dot = i
+        }
+        i = i + 1
+    }
+    var base: string = str.clone(path)
+    if last_dot > 0 {
+        base = slice(path, 0, last_dot)
+    }
+    // r.1.6.1：空后缀（Linux 可执行文件无扩展名）→ 返回去扩展名的基名，不带尾点
+    if str_len(new_ext) == 0 {
+        return base
+    }
+    return base + "." + new_ext
+}
+
+// 取路径的文件名部分（最后一个 / 或 \ 之后；无分隔符返回原串）。
+pub func file_name_of(path: string) -> string {
+    var n: i64 = str_len(path)
+    var last: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(path, i)
+        if c == "/" || c == "\\" {
+            last = i
+        }
+        i = i + 1
+    }
+    if last < 0 {
+        return path
+    }
+    return slice(path, last + 1, n)
+}
+
+pub func role_from_filename(name: string) -> string {
+    g_name_param = ""
+    g_name_mods = table_new_string()
+    var n: i64 = str_len(name)
+    var first_dot: i64 = -1
+    var last_dot: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        if str_char(name, i) == "." {
+            if first_dot < 0 {
+                first_dot = i
+            }
+            last_dot = i
+        }
+        i = i + 1
+    }
+    // 需要至少两段（首点存在且与末点不同）：xxx.<角色>.tie
+    if first_dot < 0 || last_dot <= first_dot {
+        return ""
+    }
+    if slice(str.clone(name), last_dot + 1, n) != "tie" {
+        return ""
+    }
+    var role = slice(name, first_dot + 1, last_dot)
+    // F1 连字符拆分：第一段（或从后往前找到的角色段）= 基础角色；
+    // 其后的连字符段 = 参数（紧跟基础）或修饰（与头部 parse_role_decl 对齐）
+    var segs = split_char(role, "-")
+    var base = segs[0]
+    var base_idx: i64 = 0
+    if !driver.is_valid_base_role(str.clone(base)) {
+        // 非角色名作首段（如 app.myproto-v2 的 app）：多段解析——
+        // 从后往前找已知角色段（含 config 注册的自定义角色）
+        var k = len(segs) - 1
+        var hit = false
+        while k >= 1 {
+            if driver.is_valid_base_role(str.clone(segs[k])) {
+                base = segs[k]
+                base_idx = k
+                hit = true
+                break
+            }
+            k = k - 1
+        }
+        if !hit {
+            return ""
+        }
+        // base 之前的段是工程名前缀，忽略
+    }
+    // 参数：角色段后的首个连字符段命中参数白名单 → g_name_param；其余段修饰
+    var seg_i: i64 = base_idx + 1
+    while seg_i < len(segs) {
+        var seg = segs[seg_i]
+        if str_len(g_name_param) == 0 && driver.is_valid_role_param(str.clone(base), str.clone(seg)) {
+            g_name_param = seg
+        } else if driver.is_valid_mod_role(str.clone(seg)) {
+            table_push(g_name_mods, seg)
+        } else {
+            // 未知段：非角色文件名（默认逻辑）
+            g_name_param = ""
+            g_name_mods = table_new_string()
+            return ""
+        }
+        seg_i = seg_i + 1
+    }
+    return base
+}
+
+// 动态库模式检测：--shared 显式开关，或输出路径扩展名为 .dll / .so（大小写不敏感）。
+pub func detect_shared_mode() -> bool {
+    if g_shared {
+        return true
+    }
+    if str_len(g_output) == 0 {
+        return false
+    }
+    return has_dll_so_ext(g_output)
+}
+
+// 路径是否以 .dll（4 字符）/ .so（3 字符）结尾（大小写不敏感）。
+func has_dll_so_ext(path: string) -> bool {
+    var n: i64 = str_len(path)
+    if n >= 4 {
+        var tail4 = slice(str.clone(path), n - 4, n)
+        if tail4 == ".dll" || tail4 == ".DLL" {
+            return true
+        }
+    }
+    if n >= 3 {
+        var tail3 = slice(str.clone(path), n - 3, n)
+        if tail3 == ".so" || tail3 == ".SO" {
+            return true
+        }
+    }
+    return false
+}
+
+// 目标三元组是否 Linux（.so 默认扩展名分派用）。
+pub func is_linux_target(target: string) -> bool {
+    var n: i64 = str_len(target)
+    var i: i64 = 0
+    while i <= n - 5 {
+        if slice(str.clone(target), i, i + 5) == "linux" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}

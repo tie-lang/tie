@@ -1,0 +1,418 @@
+type tie<class>
+// compiler/frontend/sinfer_ie_ie3.tie —— infer_expr 分支提子函数分片 3（p.9.21 G2 单函数 ≤300 行）
+// ============================================================
+// 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
+// 分片内函数与原调度器同 namespace，跨文件裸名互调。
+namespace sinfer {
+pub func infer_expr_table_lit(id: i64) -> i64 {
+    var tag = s_tags[id]
+        var nc = sstate.nchild(id)
+        if nc == 0 {
+            // 空表：i64
+            node_types[id] = types.named(TK_I64)
+            g_typed = g_typed + 1
+            return types.named(TK_I64)
+        }
+        // map 检测：TableId 子节点存在
+        var is_map: bool = false
+        var i: i64 = 0
+        while i < nc {
+            var cell = sstate.child(id, i)
+            var cid = sstate.child(cell, 0)
+            if cid >= 0 {
+                if s_tags[cid] == S_N_TABLE_ID {
+                    is_map = true
+                }
+            }
+            i = i + 1
+        }
+        if is_map {
+            // map<val_ty>：值类型一致；P2c 异构值（非同类收窄）→ map<any>
+            var val_ty: i64 = -1
+            var i2: i64 = 0
+            while i2 < nc {
+                var cell = sstate.child(id, i2)
+                var vt = infer_expr(sstate.child(cell, 1))
+                if vt < 0 {
+                    return -1
+                }
+                if val_ty < 0 {
+                    val_ty = vt
+                } else {
+                    if vt != val_ty && !(types.is_int(vt) && types.is_int(val_ty)) {
+                        if types.is_float(vt) && types.is_float(val_ty) {
+                            val_ty = vt  // 浮点族（f32/f64）收窄
+                        } else {
+                            // P2c 异构 map 值（`["k1":1, "k2":"x"]`）→ map<any>
+                            // 动态值类型（装箱在 irgen 层完成，对齐 table<any>）
+                            val_ty = types.named(TK_ANY)
+                        }
+                    }
+                }
+                i2 = i2 + 1
+            }
+            node_types[id] = types.map_of(val_ty)
+            g_typed = g_typed + 1
+            return types.map_of(val_ty)
+        }
+        // 普通表：元素类型一致（空表字面量 [] 跳过——类型由兄弟元素决定，
+        // 否则 [[1,2],[]] 会因空表 fallback i64 报"表元素类型不一致"）
+        var elem_ty: i64 = -1
+        var i3: i64 = 0
+        while i3 < nc {
+            var cell = sstate.child(id, i3)
+            var val_node = sstate.child(cell, 1)
+            if s_tags[val_node] == S_N_TABLE_LIT && sstate.nchild(val_node) == 0 {
+                i3 = i3 + 1
+                continue  // 空表：不取类型、不校验（由兄弟元素定型）
+            }
+            var vt = infer_expr(val_node)
+            if vt < 0 {
+                return -1
+            }
+            if elem_ty < 0 {
+                elem_ty = vt
+            } else {
+                // p.8.2.2：tuple 字面量每次登记独立 tuple 类型 id——结构相等
+                // 的元组（如 (1,"a") 与 (2,"b")）视为一致，不落 any 异构
+                var tuple_same: bool = false
+                if types.kind(vt) == K_TUPLE && types.kind(elem_ty) == K_TUPLE {
+                    tuple_same = stype.tuple_equal(vt, elem_ty)
+                }
+                if !tuple_same && vt != elem_ty && !(types.is_int(vt) && types.is_int(elem_ty)) && !(types.is_float(vt) && types.is_float(elem_ty)) {
+                    // P2b 异构元素：类型不一致（非同类收窄）→ 推断为 any 动态
+                    // 类型（`[1, "a", true]` → table<any>；装箱在 irgen 层完成）
+                    elem_ty = types.named(TK_ANY)
+                }
+            }
+            i3 = i3 + 1
+        }
+        if elem_ty < 0 {
+            elem_ty = types.named(TK_I64)  // 全空表：兜底 i64
+        }
+        node_types[id] = types.table_of(elem_ty)
+        g_typed = g_typed + 1
+        return types.table_of(elem_ty)
+}
+
+pub func infer_expr_tuple_lit(id: i64) -> i64 {
+    var tag = s_tags[id]
+        var nc = sstate.nchild(id)
+        if nc == 0 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "空元组 () 不支持"
+            return -1
+        }
+        // 字段名查重
+        var i: i64 = 0
+        while i < nc {
+            var f = sstate.child(id, i)
+            var fnid = s_names[f]
+            if fnid >= 0 {
+                var j: i64 = 0
+                while j < i {
+                    var g = sstate.child(id, j)
+                    if s_names[g] == fnid {
+                        sm_err_line = s_lines[id]
+                        sm_err_col = s_cols[id]
+                        sm_err_msg = "元组字段名 '" + intern.lookup(fnid) + "' 重复"
+                        return -1
+                    }
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+        // 登记 tuple 类型（先占位再填值保证字段段紧凑）
+        var idx = len(tuple_tys)
+        var off = len(tup_names)
+        table_push(tup_offs, off)
+        table_push(tup_n, nc)
+        table_push(tuple_tys, types.tuple_of(idx))
+        var jj: i64 = 0
+        while jj < nc {
+            table_push(tup_names, -1)
+            table_push(tup_tys, 0)
+            jj = jj + 1
+        }
+        var i2: i64 = 0
+        while i2 < nc {
+            var f = sstate.child(id, i2)
+            var ft = infer_expr(sstate.child(f, 0))
+            if ft < 0 {
+                return -1
+            }
+            tup_names[off + i2] = s_names[f]
+            tup_tys[off + i2] = ft
+            i2 = i2 + 1
+        }
+        var rt = types.tuple_of(idx)
+        node_types[id] = rt
+        g_typed = g_typed + 1
+        return rt
+}
+
+pub func infer_expr_fn_lit(id: i64) -> i64 {
+    var tag = s_tags[id]
+        var slot = sstate.slot_off(id)
+        var nparams = s_aux[id]
+        // 返回类型节点：children[slot]（N_FN_LIT 布局 = 泛型槽(0)、返回类型(1)、
+        // 参数(2..)、函数体(末尾)；slot_off 返回 1 = 有泛型槽）
+        var ret_node = sstate.child(id, slot)
+        var ret_ty = sgen.parse_generic_type_node(ret_node)
+        if ret_ty < 0 {
+            return -1
+        }
+        // 参数类型收集：children[slot+1 .. slot+1+nparams)，N_PARAM child(0)=pty
+        // p.6.2.4：参数节点 s_vals = ref 标志（1=按引用）、s_aux = 变参标志。
+        // 变参（`...T`）签名类型 = table<T>（对齐普通函数 scollect 变参登记）；
+        // ref 仅支持表参数（对齐普通函数校验）。
+        var ptys: table<i64> = table_new_i64()
+        var p_refs: table<i64> = table_new_i64()
+        var has_var: i64 = 0
+        var k: i64 = 0
+        while k < nparams {
+            var pnode = sstate.child(id, slot + 1 + k)
+            var pty_node = sstate.child(pnode, 0)
+            var pty = sgen.parse_generic_type_node(pty_node)
+            if pty < 0 {
+                return -1
+            }
+            var p_ref = s_vals[pnode]
+            var p_var = s_aux[pnode]
+            if p_var == 1 {
+                has_var = 1
+                pty = types.table_of(pty)   // 变参 → table<T>
+            }
+            if p_ref == 1 && !types.is_table(pty) {
+                sm_err_line = s_lines[pnode]
+                sm_err_col = s_cols[pnode]
+                sm_err_msg = "闭包参数 '" + sstate.name_str(pnode) + "' 的 ref 修饰仅支持表参数（table/table<T>），实际是 " + types.type_name(pty)
+                return -1
+            }
+            table_push(ptys, pty)
+            table_push(p_refs, p_ref)
+            k = k + 1
+        }
+        // 变参必须是最后一个参数（对齐普通函数；parser 已拦非末尾，防御兜底）
+        var kv: i64 = 0
+        while kv < nparams - 1 {
+            if s_aux[sstate.child(id, slot + 1 + kv)] == 1 {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "闭包变参参数必须是最后一个参数"
+                return -1
+            }
+            kv = kv + 1
+        }
+        var fnty = types.fn_of2(ret_ty, ptys, p_refs, has_var)
+        node_types[id] = fnty
+        g_typed = g_typed + 1
+        // 登记闭包：入队 + 签名段 + 登记时 lv 快照 + 父闭包链
+        var ci = len(g_clo_pending)
+        table_push(g_clo_pending, id)
+        table_push(cl_parent, g_clo_cur)   // 父闭包索引（嵌套闭包捕获传播用）
+        table_push(cl_owner_sig, g_curfn)   // p.9.11.22：外层函数签名（捕获面判定用）
+        // 登记时定下 unsafe 上下文（后置批量分析时 g_unsafe_depth 已复位）
+        var own_unsafe: i64 = 0
+        if g_unsafe_depth > 0 || sstate.sig_unsafe(g_curfn) == 1 {
+            own_unsafe = 1
+        }
+        table_push(cl_owner_unsafe, own_unsafe)
+        table_push(cl_ret, ret_ty)
+        table_push(cl_nparams, nparams)
+        table_push(cl_paroff, len(cl_ptys))
+        var k2: i64 = 0
+        while k2 < nparams {
+            table_push(cl_ptys, ptys[k2])
+            k2 = k2 + 1
+        }
+        // 参数名段（捕获遮蔽判定：闭包参数遮蔽外层同名变量）
+        table_push(cl_paramoff, len(cl_params))
+        var k3: i64 = 0
+        while k3 < nparams {
+            var pnode2 = sstate.child(id, slot + 1 + k3)
+            table_push(cl_params, s_names[pnode2])
+            k3 = k3 + 1
+        }
+        // 登记时 lv 快照（捕获基准：五表拍平进 cl_o* 段）
+        table_push(cl_off, len(cl_okeys))
+        var ni: i64 = 0
+        while ni < len(lv_keys) {
+            table_push(cl_okeys, lv_keys[ni])
+            table_push(cl_ovals, lv_vals[ni])
+            table_push(cl_oconst, lv_const[ni])
+            table_push(cl_otelem, lv_telem[ni])
+            table_push(cl_odyn, lv_dyn[ni])
+            ni = ni + 1
+        }
+        table_push(cl_nouter, len(lv_keys))
+        // p.9.22.6 全量符号表：闭包登记时快照 xref 绑定段（捕获变量在闭包
+        // 体内的 use→decl 解析基准；与上方 cl_o* 快照同一时刻、同一语义）。
+        xref.snapshot_bind(ci)
+        // 闭包局部段起点（检查闭包体时 check_var_decl 动态追加）
+        table_push(cl_locloff, len(cl_locals))
+        // 捕获段起点（S_N_VAR 捕获登记时动态追加）
+        table_push(cl_capoff, len(cl_capkeys))
+        // share 门禁判据：本闭包是否引用全局可变容器（0 = 否；infer 时打点为 1，
+        // scheck 阶段再沿 cl_parent 上溯传播）
+        while len(cl_grefs) <= ci {
+            table_push(cl_grefs, 0)
+        }
+        return fnty
+}
+
+pub func infer_expr_call(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // W00014：实参为 bool 字面量（foo(true) 无法表达参数语义）。
+        // children[0] = 被调名，children[1..] = 实参。
+        var nc_bc = sstate.nchild(id)
+        var k_bc: i64 = 1
+        while k_bc < nc_bc {
+            var an_bc = sstate.child(id, k_bc)
+            if s_tags[an_bc] == S_N_BOOL_LIT {
+                sm_warn_add(s_lines[an_bc], s_cols[an_bc], "布尔参数调用（实参为 bool 字面量，语义不明）")
+            }
+            k_bc = k_bc + 1
+        }
+        return infer_call(id)
+}
+
+pub func infer_expr_call_expr(id: i64) -> i64 {
+    var tag = s_tags[id]
+        return infer_call_expr(id)
+}
+
+pub func infer_expr_method_call(id: i64) -> i64 {
+    var tag = s_tags[id]
+        return infer_method_call(id)
+}
+
+pub func infer_expr_run_actor(id: i64) -> i64 {
+    var tag = s_tags[id]
+        var aty_node = sstate.child(id, 0)
+        var anm = sstate.name_str(aty_node)
+        var aidx = sstate.actor_find(anm)
+        if aidx < 0 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "run 的 '" + anm + "' 不是已声明的 actor 类型"
+            return -1
+        }
+        // 构造实参逐个推断（类型一致性在 A4/A5 与消息契约校对）
+        var nc = sstate.nchild(id)
+        var k: i64 = 1
+        while k < nc {
+            var at = infer_expr(sstate.child(id, k))
+            if at < 0 {
+                return -1
+            }
+            k = k + 1
+        }
+        var ht = types.actor_of(aidx)
+        node_types[id] = ht
+        g_typed = g_typed + 1
+        return ht
+}
+
+pub func infer_expr_guard_get(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // 三期 A 组 `unsafe.get(share)` 凭据获取 → guard<cap> 类型。仅 unsafe 上下文
+        // 合法（安全代码取得凭据 = 无门禁 = 绕过机制，编译期拦截）。
+        if g_unsafe_depth == 0 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "unsafe.get 只能在 unsafe 上下文使用（unsafe 块或 unsafe 函数内）"
+            return -1
+        }
+        var capn = sstate.name_str(sstate.child(id, 0))
+        // r.1.6.7：域映射走 types 层单一事实源（新增 lock 域）
+        var cap = types.guard_cap_index(capn)
+        if cap < 0 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "unsafe.get 的能力域必须是 share/mem/ext/lock，实际是 '" + capn + "'"
+            return -1
+        }
+        // 对象绑定表达式推断（凭据绑定的对象必须有类型）
+        var bind = sstate.child(id, 1)
+        if bind >= 0 {
+            var bt = infer_expr(bind)
+            if bt < 0 {
+                return -1
+            }
+        }
+        var gt = types.guard_of(cap)
+        node_types[id] = gt
+        g_typed = g_typed + 1
+        return gt
+}
+
+// r.1.6.7 `unsafe.revoke(g)` 凭据撤销（§11.6）：撤销该凭据后，由它**传递**派生出的
+// 凭据一并失效；此后使用这些凭据报诊断。纯编译期语义（凭据无运行时表示）。
+// 流敏感且单调：语句按序推断，撤销点之后的才失效。
+pub func infer_expr_guard_revoke(id: i64) -> i64 {
+    var tag = s_tags[id]
+        // 仅 unsafe 上下文合法（安全代码撤销凭据 = 无凭据可撤销 = 门禁机制外）
+        if g_unsafe_depth == 0 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "unsafe.revoke 只能在 unsafe 上下文使用（unsafe 块或 unsafe 函数内）"
+            return -1
+        }
+        var arg = sstate.child(id, 0)
+        var at = infer_expr(arg)
+        if at < 0 {
+            return -1
+        }
+        if !types.is_guard(at) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "unsafe.revoke 的实参必须是 guard<cap> 凭据，实际是其它类型"
+            return -1
+        }
+        // 撤销的是「那份凭据」本身，故实参必须是裸变量（不能是表达式/字段/下标）
+        if s_tags[arg] != S_N_VAR {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "unsafe.revoke 的实参必须是凭据变量（不能是表达式、字段或下标）"
+            return -1
+        }
+        var nid = interner.intern(sstate.name_str(arg))
+        if sstate.gr_is_dead(nid) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "凭据 '" + sstate.name_str(arg) + "' 已被撤销，不能重复撤销"
+            return -1
+        }
+        // 撤销：自身 + 传递派生凭据一并失效
+        sstate.gr_revoke(nid)
+        // 撤销亦消费该凭据：标记 moved，后续使用由既有 moved 检查再兜一层
+        sstate.lv_moved_mark(nid)
+        // 撤销是动作、无值：void（与 println 等语句型内置一致）
+        var vt = types.named(TK_VOID)
+        node_types[id] = vt
+        g_typed = g_typed + 1
+        return vt
+}
+
+pub func infer_expr_try(id: i64) -> i64 {
+    var tag = s_tags[id]
+        return infer_try_unwrap(id)
+}
+
+pub func infer_expr_try_block(id: i64) -> i64 {
+    var tag = s_tags[id]
+        var tr = scheck.check_try(id)
+        if tr < 0 {
+            return -1
+        }
+        var tv = node_types[id]
+        if tv < 0 {
+            tv = types.named(TK_I64)
+        }
+        return tv
+}
+
+}

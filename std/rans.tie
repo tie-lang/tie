@@ -1,0 +1,347 @@
+type tie<class>
+// tlib/std/rans.tie —— 静态 rANS 熵编码（tzp 熵层；字节字母表；确定性规范形式）
+// ============================================================================
+// 算法：静态（两遍）range Asymmetric Numeral Systems，参数固定：
+//   M = 4096（2^12 归一化频率总量）· RANS_L = 2^31（状态下界）· 阈值 2^39 · 64 位状态
+//   renorm 输出 8 位单元；编码自末符号向前、解码自首符号向后。
+//
+// 流格式（自描述、规范形式——同输入 ⇒ 同字节）：
+//   [raw_len u64 BE]                —— 原始字节数
+//   [freq 256 × u16 BE]             —— 归一化频率（和恰为 4096；未出现符号 = 0）
+//   [state u64 BE]                  —— 编码终态（∈ [2^31, 2^39)）
+//   [renorm 字节流]                  —— 编码吐出的字节按时间序逆置（解码正序读）
+//
+// 归一化（build_model，确定性）：freq = max(1, floor(cnt*M/n)) 起步；Σ 与 M 的差额
+//   按符号值升序多轮 ±1 调整（只动出现符号；减时不低于 1）。同计数表 ⇒ 同模型。
+//
+// 性能：编码每符号 1 除 1 模 + renorm；解码每符号 1 次 4096 项直查 + 1 除。全迭代。
+//
+// 二进制纪律：字节流走 string_builder / sb_append 通道（含 NUL 安全）；禁 `+` 拼接。
+//
+// 接口：
+//   rans_compress(data: string) -> string
+//   rans_decompress(z: string) -> (bool, string)
+//   rans_raw_len(z: string) -> i64            （探测原始长度；流非法返回 -1）
+// ============================================================================
+
+namespace rans {
+
+// ---------- 常量 ----------
+func model_m() -> i64 { return 4096 }
+func rans_l() -> i64 { return 2147483648 }          // 2^31
+func alphabet() -> i64 { return 256 }
+func raw_len_cap() -> i64 { return 4503599627370496 }  // 2^42 硬上限（防解压炸弹）
+
+// ---------- 字节工具（自备） ----------
+pub func u8_at(s: string, pos: i64) -> i64 {
+    if pos < 0 {
+        return -1
+    }
+    if pos >= len(s) {
+        return -1
+    }
+    return str_byte(s, pos) & 0xFF
+}
+
+func enc_u16be(v: i64) -> string {
+    var sb = string_builder()
+    sb_append_byte(sb, (v >> 8) & 0xFF)
+    sb_append_byte(sb, v & 0xFF)
+    return sb_build(sb)
+}
+
+func enc_u64be(v: i64) -> string {
+    var sb = string_builder()
+    sb_append_byte(sb, (v >> 56) & 0xFF)
+    sb_append_byte(sb, (v >> 48) & 0xFF)
+    sb_append_byte(sb, (v >> 40) & 0xFF)
+    sb_append_byte(sb, (v >> 32) & 0xFF)
+    sb_append_byte(sb, (v >> 24) & 0xFF)
+    sb_append_byte(sb, (v >> 16) & 0xFF)
+    sb_append_byte(sb, (v >> 8) & 0xFF)
+    sb_append_byte(sb, v & 0xFF)
+    return sb_build(sb)
+}
+
+func read_u16be(s: string, pos: i64) -> i64 {
+    if pos < 0 {
+        return -1
+    }
+    if pos + 2 > len(s) {
+        return -1
+    }
+    return ((u8_at(s, pos) << 8) | u8_at(s, pos + 1))
+}
+
+func read_u64be(s: string, pos: i64) -> i64 {
+    if pos < 0 {
+        return -1
+    }
+    if pos + 8 > len(s) {
+        return -1
+    }
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        v = (v << 8) | u8_at(s, pos + i)
+        i = i + 1
+    }
+    return v
+}
+
+// ---------- 模型构建（确定性归一化） ----------
+// 返回 (freq, cum)：两表均 256 项；freq 和恰为 M；cum = 前缀和。
+func build_model(data: string) -> (table<i64>, table<i64>) {
+    var cnt = table_new_i64()
+    var i: i64 = 0
+    while i < alphabet() {
+        table_push(cnt, 0)
+        i = i + 1
+    }
+    var n: i64 = len(data)
+    i = 0
+    while i < n {
+        var b = u8_at(data, i)
+        cnt[b] = cnt[b] + 1
+        i = i + 1
+    }
+    var freq = table_new_i64()
+    i = 0
+    while i < alphabet() {
+        table_push(freq, 0)
+        i = i + 1
+    }
+    if n > 0 {
+        i = 0
+        while i < alphabet() {
+            if cnt[i] > 0 {
+                var f = (cnt[i] * model_m()) / n
+                if f < 1 {
+                    f = 1
+                }
+                freq[i] = f
+            }
+            i = i + 1
+        }
+        // 差额调整（升序多轮；只动出现符号；减时不低于 1）
+        var sum: i64 = 0
+        i = 0
+        while i < alphabet() {
+            sum = sum + freq[i]
+            i = i + 1
+        }
+        var diff = model_m() - sum
+        while diff > 0 {
+            i = 0
+            while i < alphabet() {
+                if diff == 0 {
+                    break
+                }
+                if freq[i] > 0 {
+                    freq[i] = freq[i] + 1
+                    diff = diff - 1
+                }
+                i = i + 1
+            }
+        }
+        while diff < 0 {
+            i = 0
+            while i < alphabet() {
+                if diff == 0 {
+                    break
+                }
+                if freq[i] > 1 {
+                    freq[i] = freq[i] - 1
+                    diff = diff + 1
+                }
+                i = i + 1
+            }
+        }
+    }
+    var cum = table_new_i64()
+    var acc: i64 = 0
+    i = 0
+    while i < alphabet() {
+        table_push(cum, acc)
+        acc = acc + freq[i]
+        i = i + 1
+    }
+    return (freq, cum)
+}
+
+// ---------- 编码 ----------
+pub func rans_compress(data: string) -> string {
+    var n: i64 = len(data)
+    var mm = build_model(data)
+    var freq = mm.0
+    var cum = mm.1
+    // 逆序编码
+    var x = rans_l()
+    var out = table_new_i64()
+    if n > 0 {
+        var i = n - 1
+        while i >= 0 {
+            var s = u8_at(data, i)
+            var f = freq[s]
+            var c = cum[s]
+            // 标准 rANS 编码（rans_byte 式）：**前置 renorm**——先把 x 压到
+            // x_max = ((L>>12)<<8)*f 之下，再更新 x' = (x/f)*M + (x%f) + c。
+            // 两条实测教训：①更新公式必须用 x%f（写 x%M 破坏互逆，小样本可能侥幸过）；
+            // ②renorm 必须前置且阈值随 freq（后置固定阈值的写法在 renorm 场景不可逆）。
+            // 移植前以 Python 对照三组（AB×12 / 偏斜 / 0..255 模式）双向验证一致。
+            var x_max = ((rans_l() >> 12) << 8) * f
+            while x >= x_max {
+                table_push(out, x & 0xFF)
+                x = x >> 8
+            }
+            x = (x / f) * model_m() + (x % f) + c
+            i = i - 1
+        }
+    }
+    // 组装：len + freq + state + 逆置的 renorm 字节
+    var sb = string_builder()
+    sb_append(sb, enc_u64be(n))
+    var k: i64 = 0
+    while k < alphabet() {
+        sb_append(sb, enc_u16be(freq[k]))
+        k = k + 1
+    }
+    sb_append(sb, enc_u64be(x))
+    var j = len(out) - 1
+    while j >= 0 {
+        sb_append_byte(sb, out[j])
+        j = j - 1
+    }
+    return sb_build(sb)
+}
+
+// ---------- 解码 ----------
+// 头解析：返回 (ok, raw_len, freq 表, state, 流起点)。ok=false 时其余无意义。
+func parse_head(z: string) -> (bool, i64, table<i64>, i64, i64) {
+    var empty = table_new_i64()
+    if len(z) < 8 + 512 + 8 {
+        return (false, 0, empty, 0, 0)
+    }
+    var n = read_u64be(z, 0)
+    if n < 0 {
+        return (false, 0, empty, 0, 0)
+    }
+    if n > raw_len_cap() {
+        return (false, 0, empty, 0, 0)
+    }
+    var freq = table_new_i64()
+    var sum: i64 = 0
+    var i: i64 = 0
+    while i < alphabet() {
+        var f = read_u16be(z, 8 + i * 2)
+        if f < 0 {
+            return (false, 0, empty, 0, 0)
+        }
+        table_push(freq, f)
+        sum = sum + f
+        i = i + 1
+    }
+    if n > 0 {
+        if sum != model_m() {
+            return (false, 0, empty, 0, 0)
+        }
+    } else {
+        // 空数据：模型为空（全零频率）
+        if sum != 0 {
+            return (false, 0, empty, 0, 0)
+        }
+    }
+    if n > 0 {
+        // 至少一个符号非零（n>0 时模型必含出现符号）
+        var nonz: i64 = 0
+        i = 0
+        while i < alphabet() {
+            if freq[i] > 0 {
+                nonz = 1
+            }
+            i = i + 1
+        }
+        if nonz == 0 {
+            return (false, 0, empty, 0, 0)
+        }
+    }
+    var x = read_u64be(z, 8 + 512)
+    if x < 0 {
+        return (false, 0, empty, 0, 0)
+    }
+    if n > 0 {
+        if x < rans_l() {
+            return (false, 0, empty, 0, 0)
+        }
+    }
+    return (true, n, freq, x, 8 + 512 + 8)
+}
+
+pub func rans_raw_len(z: string) -> i64 {
+    var h = parse_head(z)
+    if h.0 == false {
+        return 0 - 1
+    }
+    return h.1
+}
+
+pub func rans_decompress(z: string) -> (bool, string) {
+    var h = parse_head(z)
+    if h.0 == false {
+        return (false, "")
+    }
+    var n = h.1
+    var freq = h.2
+    var x = h.3
+    var pos = h.4
+    var total: i64 = len(z)
+    var sb = string_builder()
+    if n > 0 {
+        // 解码表：slot(4096) → 符号
+        var slot_sym = table_new_i64()
+        var acc: i64 = 0
+        var s: i64 = 0
+        while s < alphabet() {
+            var f = freq[s]
+            var k: i64 = 0
+            while k < f {
+                table_push(slot_sym, s)
+                k = k + 1
+            }
+            s = s + 1
+        }
+        // cum 前缀（复用 slot 表无法给 c —— 现算：解码循环里用 slot 与 freq 反推 c 需表；建 cum）
+        var cum = table_new_i64()
+        acc = 0
+        s = 0
+        while s < alphabet() {
+            table_push(cum, acc)
+            acc = acc + freq[s]
+            s = s + 1
+        }
+        var i: i64 = 0
+        while i < n {
+            var slot = x % model_m()
+            var sym = slot_sym[slot]
+            var f = freq[sym]
+            var c = cum[sym]
+            x = f * (x / model_m()) + slot - c
+            while x < rans_l() {
+                if pos >= total {
+                    return (false, "")
+                }
+                x = (x << 8) | u8_at(z, pos)
+                pos = pos + 1
+            }
+            sb_append_byte(sb, sym)
+            i = i + 1
+        }
+    }
+    // 严格校验：renorm 字节应恰读完
+    if pos != total {
+        return (false, "")
+    }
+    return (true, sb_build(sb))
+}
+
+}

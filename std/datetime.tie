@@ -1,0 +1,454 @@
+type tie<class>
+// ============================================================================
+// std/datetime.tie —— 日期时间库（命名空间 datetime，纯 tie）p.9.1.1.4
+// 完整日历：儒略日（JD）参照历（1970-01-01 = 0 足天，proleptic Gregorian，
+// Howard Hinnant civil_from_days/days_from_civil 算法），闰年、星期、时区偏移，
+// ISO 8601 子集解析 / "%Y-%m-%d %H:%M:%S" 风格格式化（%d/%p 无）。
+//
+// 参照历与精度：
+//   - epoch_days(y,m,d)：自 1970-01-01 起的天数（可为负，表示更早；1970-01-01=0）。
+//   - 内部用 floor 除法，支持公元纪年 y∈[0..9999] 及 1970 之前的负 epoch_days；
+//     算法为广义儒略日（JDN）同构，参照 1968JD0=2440588 附近；只需 floor 语义。
+//   - struct DateTime 字段：y/mo/d/h/mi/s + wday(0=周日..6=周六) + offset(UTC 偏移分钟)。
+//   - offset 语义：本地墙钟 = UTC + offset 分钟（东正数，含 +08:00=480）。
+//     from_epoch(sec) 视为 UTC(offset=0)；from_epoch_offset(sec,off) 得该时区墙钟。
+//     to_epoch(dt) 按 dt.offset 换算回 UTC 秒。
+//
+// 字符串构建：全程 string_builder（sb_new/sb_append/sb_build），避免 O(N²) 拼接。
+// 命名规范：namespace 内函数不加 datetime_ 前缀；pub func 显式导出。
+//
+// 调用：import 后 datetime.now() / datetime.parse("...") / datetime.format(dt, fmt)。
+// ============================================================================
+
+import "./time.tie"
+
+// 日期时间值类型。
+struct DateTime {
+    var ok: bool = true          // 解析/构造是否有效
+    var err: string = ""
+    var y: i64 = 1970
+    var mo: i64 = 1
+    var d: i64 = 1
+    var h: i64 = 0
+    var mi: i64 = 0
+    var s: i64 = 0
+    var wday: i64 = 0            // 0=周日 .. 6=周六
+    var offset: i64 = 0          // UTC 偏移分钟（本地=UTC+offset）
+}
+
+namespace datetime {
+
+// 任意除的向下取整（对正除数）：floor(a/b)。处理负 a。
+func fdiv(a: i64, b: i64) -> i64 {
+    if a >= 0 {
+        return a / b
+    }
+    return (a - b + 1) / b
+}
+
+// 向下取整的余数（0<=r<b）；命名避开 tiec 内建 fmod（f64 数学内建会劫持同名用户函数）。
+func floor_mod(a: i64, b: i64) -> i64 {
+    return a - fdiv(a, b) * b
+}
+
+// 闰年（格里高利）。
+pub func is_leap(y: i64) -> bool {
+    if y % 4 != 0 {
+        return false
+    }
+    if y % 100 == 0 && y % 400 != 0 {
+        return false
+    }
+    return true
+}
+
+// 某月的天数。
+pub func days_in_month(y: i64, mo: i64) -> i64 {
+    if mo == 2 {
+        if is_leap(y) {
+            return 29
+        }
+        return 28
+    }
+    if mo == 4 || mo == 6 || mo == 9 || mo == 11 {
+        return 30
+    }
+    return 31
+}
+
+// 校历法合法性。
+func valid_date(y: i64, mo: i64, d: i64) -> bool {
+    if y < 0 || y > 9999 {
+        return false
+    }
+    if mo < 1 || mo > 12 {
+        return false
+    }
+    if d < 1 || d > days_in_month(y, mo) {
+        return false
+    }
+    return true
+}
+
+// 公历 (y,mo,d) → 自 1970-01-01 的天数（1970-01-01=0）。Hinnant。
+pub func epoch_days(y: i64, mo: i64, d: i64) -> i64 {
+    var yy = y
+    if mo <= 2 {
+        yy = yy - 1
+    }
+    var era = fdiv(yy, 400)
+    var yoe = yy - era * 400
+    var mpo = mo
+    if mo > 2 {
+        mpo = mo - 3
+    } else {
+        mpo = mo + 9
+    }
+    var doy = (153 * mpo + 2) / 5 + d - 1
+    var doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+// 天数（自 1970-01-01）→ (y,mo,d)。Hinnant 逆。
+func civil_from_days(z: i64) -> (i64, i64, i64) {
+    var zz = z + 719468
+    var era = fdiv(zz, 146097)
+    var doe = zz - era * 146097
+    var yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    var y = yoe + era * 400
+    var doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    var mp = (5 * doy + 2) / 153
+    var dd = doy - (153 * mp + 2) / 5 + 1
+    var mm = mp
+    if mp < 10 {
+        mm = mp + 3
+    } else {
+        mm = mp - 9
+    }
+    var yy = y
+    if mm <= 2 {
+        yy = y + 1
+    }
+    return (yy, mm, dd)
+}
+
+// 星期（0=周日..6=周六）。ed=epoch_days。
+func weekday(ed: i64) -> i64 {
+    return floor_mod((ed + 4) % 7, 7)
+}
+
+// 由墙钟字段构 DateTime（默认 UTC，offset=0），附带星期。
+func mk(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64, off: i64) -> DateTime {
+    var dt = DateTime()
+    dt.y = y
+    dt.mo = mo
+    dt.d = d
+    dt.h = h
+    dt.mi = mi
+    dt.s = s
+    dt.offset = off
+    if valid_date(y, mo, d) == false {
+        dt.ok = false
+        dt.err = "invalid calendar date"
+        return dt
+    }
+    dt.wday = weekday(epoch_days(y, mo, d))
+    dt.ok = true
+    return dt
+}
+
+// 墙钟字段 → UTC 秒（按 dt.offset 换算）。
+pub func to_epoch(dt: DateTime) -> i64 {
+    var days = epoch_days(dt.y, dt.mo, dt.d)
+    var utc = days * 86400 + dt.h * 3600 + dt.mi * 60 + dt.s - dt.offset * 60
+    return utc
+}
+
+// UTC 秒 → DateTime（offset=0）。
+pub func from_epoch(sec: i64) -> DateTime {
+    var days = fdiv(sec, 86400)
+    var r = floor_mod(sec, 86400)
+    var c = civil_from_days(days)
+    var dt = DateTime()
+    dt.y = c.0
+    dt.mo = c.1
+    dt.d = c.2
+    dt.h = r / 3600
+    dt.mi = (r % 3600) / 60
+    dt.s = r % 60
+    dt.offset = 0
+    dt.wday = weekday(days)
+    dt.ok = true
+    return dt
+}
+
+// UTC 秒 + 时区偏移（分钟）→ 该时区墙钟 DateTime。
+pub func from_epoch_offset(sec: i64, off: i64) -> DateTime {
+    var dt = from_epoch(sec + off * 60)
+    dt.offset = off
+    return dt
+}
+
+// 当前 UTC 时间（基于 time.now() 纪元秒）。
+pub func now() -> DateTime {
+    return from_epoch(time.now())
+}
+
+// 当前本地时间（以给定时区偏移分钟；缺省视为 +08:00=480 需调用方指定）。
+pub func now_local(off: i64) -> DateTime {
+    return from_epoch_offset(time.now(), off)
+}
+
+// 相加秒数（跨日/跨月/跨年回绕），返回新 DateTime（保留 offset）。
+pub func add_seconds(dt: DateTime, delta: i64) -> DateTime {
+    var total = epoch_days(dt.y, dt.mo, dt.d) * 86400 + dt.h * 3600 + dt.mi * 60 + dt.s + delta
+    var days = fdiv(total, 86400)
+    var r = floor_mod(total, 86400)
+    var c = civil_from_days(days)
+    var out = DateTime()
+    out.y = c.0
+    out.mo = c.1
+    out.d = c.2
+    out.h = r / 3600
+    out.mi = (r % 3600) / 60
+    out.s = r % 60
+    out.offset = dt.offset
+    out.wday = weekday(days)
+    out.ok = true
+    return out
+}
+
+// ---------- 格式化 ----------
+
+// 数字补零字符串。
+func z2(n: i64) -> string {
+    if n < 10 {
+        return "0" + to_string(n)
+    }
+    return to_string(n)
+}
+
+func z4(n: i64) -> string {
+    var s = to_string(n)
+    var len = str_len(s)
+    var t: string = ""
+    var i: i64 = 0
+    while i < (4 - len) {
+        t = t + "0"
+        i = i + 1
+    }
+    return t + s
+}
+
+// 时区偏移格式化为 %z（如 +0800 / -0330）。
+func offset_str(off: i64) -> string {
+    var sign: string = "+"
+    var a = off
+    if off < 0 {
+        sign = "-"
+        a = -off
+    }
+    return sign + z2(a / 60) + z2(a % 60)
+}
+
+// 按 fmt（%Y %y %m %d %H %M %S %w %u %j %z %Z）格式化。
+pub func format(dt: DateTime, fmt: string) -> string {
+    var sb = string_builder()
+    var n = str_len(fmt)
+    var i: i64 = 0
+    var dty = epoch_days(dt.y, dt.mo, dt.d)
+    var jan1 = epoch_days(dt.y, 1, 1)
+    var doy = dty - jan1 + 1
+    while i < n {
+        var c = str_char(fmt, i)
+        if c == "%" && i + 1 < n {
+            var cc = str_char(fmt, i + 1)
+            if cc == "Y" {
+                sb_append(sb, z4(dt.y))
+            } else if cc == "y" {
+                sb_append(sb, z2(dt.y % 100))
+            } else if cc == "m" {
+                sb_append(sb, z2(dt.mo))
+            } else if cc == "d" {
+                sb_append(sb, z2(dt.d))
+            } else if cc == "H" {
+                sb_append(sb, z2(dt.h))
+            } else if cc == "M" {
+                sb_append(sb, z2(dt.mi))
+            } else if cc == "S" {
+                sb_append(sb, z2(dt.s))
+            } else if cc == "w" {
+                sb_append(sb, to_string(dt.wday))
+            } else if cc == "u" {
+                var u = dt.wday
+                if u == 0 {
+                    u = 7
+                }
+                sb_append(sb, to_string(u))
+            } else if cc == "j" {
+                sb_append(sb, to_string(doy / 100))
+                sb_append(sb, to_string((doy % 100) / 10))
+                sb_append(sb, to_string(doy % 10))
+            } else if cc == "z" {
+                sb_append(sb, offset_str(dt.offset))
+            } else if cc == "%" {
+                sb_append(sb, "%")
+            } else {
+                sb_append(sb, "%")
+                sb_append(sb, cc)
+            }
+            i = i + 2
+        } else {
+            sb_append(sb, c)
+            i = i + 1
+        }
+    }
+    return sb_build(sb)
+}
+
+// "YYYY-MM-DD"。
+pub func format_date(dt: DateTime) -> string {
+    return format(dt, "%Y-%m-%d")
+}
+
+// "HH:MM:SS"。
+pub func format_time(dt: DateTime) -> string {
+    return format(dt, "%H:%M:%S")
+}
+
+// "YYYY-MM-DD HH:MM:SS"。
+pub func format_iso(dt: DateTime) -> string {
+    return format(dt, "%Y-%m-%d %H:%M:%S")
+}
+
+// ---------- ISO 8601 子集解析 ----------
+
+// 从 s[idx..] 读连续十进制数字，返回 (值, 新idx)；无数字返回 (-1, idx)。
+func read_digits(s: string, idx: i64) -> (i64, i64) {
+    var val: i64 = 0
+    var i = idx
+    var n = str_len(s)
+    var anydig = false
+    while i < n {
+        var c = str_byte(s, i)
+        if c >= 0x30 && c <= 0x39 {
+            val = val * 10 + (c - 0x30)
+            anydig = true
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if anydig == false {
+        return (-1, idx)
+    }
+    return (val, i)
+}
+
+// 解析 ISO 8601 子集：
+//   "YYYY-MM-DD" / "YYYY-MM-DDTHH:MM:SS" / "YYYY-MM-DD HH:MM:SS"
+//   可选尾部时区偏移 ±HH[:MM]（无偏移时 offset=0 视为 UTC）。
+// 失败返回 {ok=false, err}。
+pub func parse(s: string) -> DateTime {
+    var bad = DateTime()
+    bad.ok = false
+    var idx: i64 = 0
+    var n = str_len(s)
+    // 年 4 位
+    var y = read_digits(s, idx)
+    if y.0 < 0 || (y.1 - idx) != 4 {
+        bad.err = "expected 4-digit year"
+        return bad
+    }
+    idx = y.1
+    var mo: i64 = 1
+    var d: i64 = 1
+    if idx < n && str_char(s, idx) == "-" {
+        var m = read_digits(s, idx + 1)
+        if m.0 < 0 {
+            bad.err = "expected month"
+            return bad
+        }
+        mo = m.0
+        idx = m.1
+        if idx < n && str_char(s, idx) == "-" {
+            var dd = read_digits(s, idx + 1)
+            if dd.0 < 0 {
+                bad.err = "expected day"
+                return bad
+            }
+            d = dd.0
+            idx = dd.1
+        }
+    }
+    var h: i64 = 0
+    var mi: i64 = 0
+    var sec: i64 = 0
+    if idx < n {
+        var c = str_char(s, idx)
+        if c == "T" {
+            idx = idx + 1
+        } else if c == " " {
+            idx = idx + 1
+        }
+        var hh = read_digits(s, idx)
+        if hh.0 >= 0 && hh.1 - idx == 2 {
+            h = hh.0
+            idx = hh.1
+            if idx < n && str_char(s, idx) == ":" {
+                var mm = read_digits(s, idx + 1)
+                if mm.0 >= 0 {
+                    mi = mm.0
+                    idx = mm.1
+                    if idx < n && str_char(s, idx) == ":" {
+                        var ss = read_digits(s, idx + 1)
+                        if ss.0 >= 0 {
+                            sec = ss.0
+                            idx = ss.1
+                        }
+                    }
+                }
+            }
+        }
+    }
+    var off: i64 = 0
+    if idx < n {
+        var c = str_char(s, idx)
+        var sign: i64 = 1
+        if c == "+" {
+            sign = 1
+        } else if c == "-" {
+            sign = -1
+        } else {
+            sign = 0
+        }
+        if sign != 0 {
+            var oh = read_digits(s, idx + 1)
+            if oh.0 >= 0 {
+                var offset_min = oh.0 * 60
+                idx = oh.1
+                if idx < n && str_char(s, idx) == ":" {
+                    var om = read_digits(s, idx + 1)
+                    if om.0 >= 0 {
+                        offset_min = offset_min + (om.0 % 60)
+                        idx = om.1
+                    }
+                }
+                off = sign * offset_min
+            }
+        }
+    }
+    return mk(y.0, mo, d, h, mi, sec, off)
+}
+
+// 解析为 UTC（即便带偏移，也换算为 UTC 字段，offset 归 0）。
+pub func parse_utc(s: string) -> DateTime {
+    var dt = parse(s)
+    if dt.ok {
+        var sec = to_epoch(dt)
+        return from_epoch(sec)
+    }
+    return dt
+}
+
+}   // namespace datetime

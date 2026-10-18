@@ -1,0 +1,651 @@
+type tie<logic>
+// compiler/dbug/tiedap.tie —— p.9.2.3 DAP 调试适配器服务（Debug Adapter Protocol）
+// ============================================================
+// 交付形态：独立工具（tiec 编译成 tiedap.exe），作为 **DAP 适配器服务**在
+// stdin 上按 DAP JSON-RPC（Content-Length 帧）通信，驱动 compiler/interp 解释器
+// 执行被测 tie 程序。
+//
+// > 注：import 非 std/json.tie——interp 自带的 parser 已声明全局 `g_pos`，
+// > json.tie 亦声明 `g_pos`，同编译单元合并会「全局变量重复定义」（E00285）。
+// > 故本文件用**手写极简 JSON 字段提取**（fj_*）解析 DAP 请求需要的字段，
+// > 不引入 json 命名空间。见 docs/p.9.2.3.md 说明。
+//
+// 务实定界（运行至完成模型）：
+//   - 解释器为单线程树遍历求值器，无法中途挂起/续行；故一次性跑完被测程序
+//     收全 interp_dbug 里程碑事件流（C/R/S），随后按游标 td_cursor 在事件流
+//     上移动停止点服务断点/单步/调用栈：continue/next/stepIn→下一局部(S)事件，
+//     stepOut→深度更低的下一个(S)事件；line 断点命中于该行首个(S)。
+//   - 断点为行级：被测程序把 `type tie<...>` 角色头替换为注释行（保留行号），
+//     interp_dbug 记录语句行 → 与断点行精确匹配。
+//   - 调用栈：由事件流重建（当前函数帧 + 函数体首行）。
+//   - 变量：全局（isess g_keys/g_vals，运行后保留）可查；**局部变量**在运行至
+//     完成模型下已随作用域弹出不可得——提供 Global 作用域，局部标注说明并预留
+//     接口（增量求值器改造后接 local scope）。
+//   - 支持命令：initialize / setBreakpoints / launch / configurationDone /
+//     threads / stackTrace / scopes / variables / continue / next / stepIn /
+//     stepOut / disconnect。
+//   - 被测程序约定：模块式（只定义函数）、入口无参 `func main()`（launch 的
+//     program 参数给定路径）。
+//
+// 协议事件：initialized（启动）→ [stopped] → terminated（跑完）。
+// 用法: `tiedap.exe` （stdin 服务，VS Code debugServer 拉起）。
+// 验收：scripts/verify-tiedap.ps1。
+
+import "../tiep/tiep.tie"
+
+// ---------------- 全局状态 ----------------
+var td_seq: i64 = 1;            // 出站消息序列号
+var td_prog: string = "";       // 被测程序路径
+var td_src: string = "";        // 预处理后源码
+var td_loaded: bool = false;    // 程序已加载
+var td_bplines: table<i64> = [];// 断点行集合
+var td_cursor: i64 = -1;        // 当前停止点（事件下标，-1=起点）
+var td_term: bool = false;
+
+// ---------------- 极简 JSON 字段提取 ----------------
+
+func fj_has_prefix_from(s: string, from: i64, p: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(p)
+    if from + m > n { return false }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, from + i) != str_char(p, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+func fj_isspace_b(b: i64) -> bool { return b == 32 || b == 9 || b == 13 || b == 10 }
+func fj_digit(b: i64) -> bool { return b >= 48 && b <= 57 }
+// 找 "key" 子串的首位置；找不到 -1。
+func fj_keypos(s: string, key: string) -> i64 {
+    var needle = "\"" + key + "\""
+    var n = str_len(s)
+    var m = str_len(needle)
+    var i: i64 = 0
+    while i + m <= n {
+        if fj_has_prefix_from(s, i, needle) { return i }
+        i = i + 1
+    }
+    return -1
+}
+// 提取 "key": <int> 。
+func fj_int(s: string, key: string) -> i64 {
+    var p = fj_keypos(s, key)
+    if p < 0 { return 0 }
+    var i = p + str_len("\"" + key + "\"")
+    var n = str_len(s)
+    while i < n && fj_isspace_b(char_code(str_char(s, i))) { i = i + 1 }
+    if i < n && char_code(str_char(s, i)) == 58 { i = i + 1 }   // ':'
+    while i < n && fj_isspace_b(char_code(str_char(s, i))) { i = i + 1 }
+    var v: i64 = 0
+    var seen: bool = false
+    while i < n && fj_digit(char_code(str_char(s, i))) {
+        seen = true
+        v = v * 10 + (char_code(str_char(s, i)) - 48)
+        i = i + 1
+    }
+    if seen { return v }
+    return 0
+}
+// 提取 "key": "<str>"（处理 \" 与 \\）。
+func fj_str(s: string, key: string) -> string {
+    var p = fj_keypos(s, key)
+    if p < 0 { return "" }
+    var i = p + str_len("\"" + key + "\"")
+    var n = str_len(s)
+    while i < n && fj_isspace_b(char_code(str_char(s, i))) { i = i + 1 }
+    if i < n && char_code(str_char(s, i)) == 58 { i = i + 1 }
+    while i < n && fj_isspace_b(char_code(str_char(s, i))) { i = i + 1 }
+    if i >= n || char_code(str_char(s, i)) != 34 { return "" }   // '"'
+    i = i + 1
+    var sb = string_builder()
+    while i < n {
+        var c = str_char(s, i)
+        var cd = char_code(c)
+        if cd == 34 { break }
+        if cd == 92 {   // '\'
+            i = i + 1
+            if i >= n { break }
+            var nc = char_code(str_char(s, i))
+            if nc == 110 { sb_append(sb, "\n") }
+            else if nc == 114 { sb_append(sb, "\r") }
+            else if nc == 116 { sb_append(sb, "\t") }
+            else if nc == 34 { sb_append(sb, "\"") }
+            else if nc == 92 { sb_append(sb, "\\") }
+            else { sb_append(sb, str_char(s, i)) }
+        } else {
+            sb_append(sb, c)
+        }
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+// 提取源文件断点行：收集 body 中所有 "line":N。
+func fj_collect_lines(s: string) {
+    td_bplines = table_new_i64()
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var pos = fj_keypos_at(s, i, "line")
+        if pos < 0 { break }
+        // 定位 "line" 后的数字
+        var j = pos + 4   // "line" len = 5? "line" is 6 incl quotes; keypos returns index of '"'. Let's recompute
+        // fj_keypos returns index of '"' of "line"; advance past "\"line\""
+        j = pos + str_len("\"line\"")
+        while j < n && fj_isspace_b(char_code(str_char(s, j))) { j = j + 1 }
+        if j < n && char_code(str_char(s, j)) == 58 { j = j + 1 }
+        while j < n && fj_isspace_b(char_code(str_char(s, j))) { j = j + 1 }
+        var v: i64 = 0
+        while j < n && fj_digit(char_code(str_char(s, j))) {
+            v = v * 10 + (char_code(str_char(s, j)) - 48)
+            j = j + 1
+        }
+        var isdup: bool = false
+        var k: i64 = 0
+        while k < len(td_bplines) {
+            if td_bplines[k] == v { isdup = true }
+            k = k + 1
+        }
+        if isdup == false { table_push(td_bplines, v) }
+        i = j
+    }
+}
+func fj_keypos_at(s: string, from: i64, key: string) -> i64 {
+    var needle = "\"" + key + "\""
+    var n = str_len(s)
+    var m = str_len(needle)
+    var i = from
+    while i + m <= n {
+        if fj_has_prefix_from(s, i, needle) { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ---------------- 协议运输（Content-Length 帧） ----------------
+
+func tp_has_suffix(s: string, p: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(p)
+    if n < m { return false }
+    var k: i64 = 0
+    while k < m {
+        if str_char(s, n - m + k) != str_char(p, k) { return false }
+        k = k + 1
+    }
+    return true
+}
+func tp_content_length(hdr: string) -> i64 {
+    var n = str_len(hdr)
+    var i: i64 = 0
+    var found: bool = false
+    var val: i64 = 0
+    while i < n {
+        var b = char_code(str_char(hdr, i))
+        if found == false {
+            if fj_has_prefix_from(hdr, i, "Content-Length") {
+                found = true
+                i = i + 14
+                continue
+            }
+            i = i + 1
+            continue
+        }
+        if b == 58 { i = i + 1; continue }
+        if fj_isspace_b(b) { i = i + 1; continue }
+        if fj_digit(b) { val = val * 10 + (b - 48); i = i + 1; continue }
+        return val
+    }
+    return val
+}
+func jesc(s: string) -> string {
+    var sb = string_builder()
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\"" { sb_append(sb, "\\\"") }
+        else if c == "\\" { sb_append(sb, "\\\\") }
+        else if char_code(c) == 10 { sb_append(sb, "\\n") }
+        else if char_code(c) == 13 { sb_append(sb, "\\r") }
+        else if char_code(c) == 9 { sb_append(sb, "\\t") }
+        else { sb_append(sb, c) }
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+// 读一条 DAP 消息（content-length 帧），返回 body JSON；EOF 返回 ""。
+func dap_read() -> string {
+    var hdr = ""
+    while true {
+        var chunk = stdin_read(1)
+        if len(chunk) < 1 { return "" }
+        hdr = hdr + str_from_code(chunk[0])
+        if tp_has_suffix(hdr, "\r\n\r\n") { break }
+    }
+    var clen = tp_content_length(hdr)
+    var bs = string_builder()
+    var got: i64 = 0
+    while got < clen {
+        var want = clen - got
+        if want > 65536 { want = 65536 }
+        var chunk = stdin_read(want)
+        var n = len(chunk)
+        if n <= 0 { break }
+        var k: i64 = 0
+        while k < n {
+            sb_append(bs, str_from_code(chunk[k]))
+            k = k + 1
+        }
+        got = got + n
+    }
+    return sb_build(bs)
+}
+func td_byte_len(s: string) -> i64 {
+    // UTF-8 字节数：按码点计算 utf8 长度
+    var n = str_len(s)
+    var total: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var cd = char_code(str_char(s, i))
+        if cd < 128 { total = total + 1 }
+        else if cd < 2048 { total = total + 2 }
+        else if cd < 65536 { total = total + 3 }
+        else { total = total + 4 }
+        i = i + 1
+    }
+    return total
+}
+func dap_send(msg: string) {
+    var n = td_byte_len(msg)
+    var frame = "Content-Length: " + to_string(n) + "\r\n\r\n" + msg
+    stdout_write_str(frame)
+}
+func dap_response(req_seq: i64, cmd: string, body: string) -> string {
+    td_seq = td_seq + 1
+    return "{\"seq\":" + to_string(td_seq) + ",\"type\":\"response\",\"request_seq\":" +
+        to_string(req_seq) + ",\"success\":true,\"command\":\"" + cmd + "\",\"body\":" +
+        body + "}"
+}
+func dap_error(req_seq: i64, cmd: string, msg: string) -> string {
+    td_seq = td_seq + 1
+    return "{\"seq\":" + to_string(td_seq) + ",\"type\":\"response\",\"request_seq\":" +
+        to_string(req_seq) + ",\"success\":false,\"command\":\"" + cmd + "\",\"message\":\"" +
+        jesc(msg) + "\"}"
+}
+func dap_event(ev: string, body: string) -> string {
+    td_seq = td_seq + 1
+    return "{\"seq\":" + to_string(td_seq) + ",\"type\":\"event\",\"event\":\"" + ev +
+        "\",\"body\":" + body + "}"
+}
+
+// ---------------- 断点 / 事件流分析 ----------------
+
+func tp_in_bplines(lin: i64) -> bool {
+    var i: i64 = 0
+    while i < len(td_bplines) {
+        if td_bplines[i] == lin { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ---------------- 调用栈（字符串实现） ----------------
+// 用简单字符串 + 简单循环实现（规避自举解析怪癖：interp 导入 + 复杂嵌套）。
+// 栈条目 = `name\tline`，以 \n 连接；td_frames 自外向内。
+
+func str_to_upto(s: string, n: i64) -> string {
+    var out = ""
+    var i: i64 = 0
+    while i < n {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+func fpush(s: string, entry: string) -> string {
+    if s == "" { return entry }
+    return s + "\n" + entry
+}
+func fpop(s: string) -> string {
+    var n = str_len(s)
+    var last: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        if char_code(str_char(s, i)) == 10 { last = i }
+        i = i + 1
+    }
+    if last < 0 { return "" }
+    return str_to_upto(s, last)
+}
+func frame_count(s: string) -> i64 {
+    if s == "" { return 0 }
+    var cnt: i64 = 1
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if char_code(str_char(s, i)) == 10 { cnt = cnt + 1 }
+        i = i + 1
+    }
+    return cnt
+}
+// 取第 idx 段的 name/line（输出全局槽）。idx 0=最外层。
+var td_fr_name: string = "";
+var td_fr_line: i64 = 0;
+func frame_at(s: string, idx: i64) {
+    var seg: i64 = 0
+    var start: i64 = 0
+    var n = str_len(s)
+    var i: i64 = 0
+    while i <= n {
+        var end: i64 = i
+        var is_nl: bool = false
+        if i == n { is_nl = true }
+        else if char_code(str_char(s, i)) == 10 { is_nl = true }
+        if is_nl {
+            if seg == idx {
+                // 段 = s[start..end]，分隔符 \t
+                var name = ""
+                var line_txt = ""
+                var j = start
+                var seen_tab: bool = false
+                while j < end {
+                    if char_code(str_char(s, j)) == 9 {
+                        seen_tab = true
+                    } else if seen_tab {
+                        line_txt = line_txt + str_char(s, j)
+                    } else {
+                        name = name + str_char(s, j)
+                    }
+                    j = j + 1
+                }
+                td_fr_name = name
+                var lv: i64 = 0
+                var mk: i64 = 0
+                var ln = str_len(line_txt)
+                while mk < ln {
+                    var b = char_code(str_char(line_txt, mk))
+                    if b >= 48 && b <= 57 { lv = lv * 10 + (b - 48) }
+                    mk = mk + 1
+                }
+                td_fr_line = lv
+                return
+            }
+            seg = seg + 1
+            start = end + 1
+        }
+        i = i + 1
+    }
+    td_fr_name = ""
+    td_fr_line = 0
+}
+
+// 重建事件 at 处的调用栈 → td_frames（自外向内）。
+var td_frames: string = "";
+func rebuild_stack(at: i64) {
+    var st = ""
+    var i: i64 = 0
+    while i <= at {
+        var k = tiep.dbg_ev_kind(i)
+        if k == "C" {
+            st = fpush(st, tiep.dbg_ev_name(i) + "\t" + to_string(tiep.dbg_ev_line(i)))
+        } else if k == "R" {
+            st = fpop(st)
+        }
+        i = i + 1
+    }
+    td_frames = st
+}
+func ev_depth(i: i64) -> i64 { return tiep.dbg_ev_d(i) }
+
+// 从 td_cursor+1 起扫描；命中写入 td_cursor 返回 1，否则 0（终止）。
+func dap_advance(mode: string) -> i64 {
+    var base_d: i64 = 1
+    if td_cursor >= 0 { base_d = ev_depth(td_cursor) }
+    var i = td_cursor + 1
+    var total = tiep.dbg_ev_count()
+    while i < total {
+        var k = tiep.dbg_ev_kind(i)
+        // break 模式同时匹配 C(函数入口行) 与 S(语句行)：函数体首条语句的行
+        // 由 C 事件承载（exec 首条语句不单独发 S），保证行断点命中可靠。
+        if k == "S" {
+            var lin = tiep.dbg_ev_line(i)
+            var stop: bool = false
+            if mode == "break" { if tp_in_bplines(lin) { stop = true } }
+            else if mode == "next" || mode == "stepin" { stop = true }
+            else if mode == "stepout" {
+                if ev_depth(i) < base_d { stop = true }
+            }
+            if stop { td_cursor = i; return 1 }
+        } else if k == "C" && mode == "break" {
+            if tp_in_bplines(tiep.dbg_ev_line(i)) {
+                td_cursor = i
+                return 1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---------------- 程序装载与执行 ----------------
+// 把 `type tie<...>` 角色头替换为注释行（保留原始行号）。
+func tp_prepare(src: string) -> string {
+    var out = ""
+    var ln = ""
+    var i: i64 = 0
+    var n = str_len(src)
+    while i < n {
+        var c = str_char(src, i)
+        if char_code(c) == 10 {
+            var tt = tp_trim(ln)
+            if fj_has_prefix_from(tt, 0, "type tie") {
+                out = out + "// role-header preserved for line numbers\n"
+            } else {
+                out = out + ln + "\n"
+            }
+            ln = ""
+        } else {
+            ln = ln + c
+        }
+        i = i + 1
+    }
+    var tl = tp_trim(ln)
+    if tl != "" {
+        if fj_has_prefix_from(tl, 0, "type tie") {
+            out = out + "// role-header preserved for line numbers"
+        } else {
+            out = out + ln
+        }
+    }
+    return out
+}
+func tp_trim(s: string) -> string {
+    var n = str_len(s)
+    var a: i64 = 0
+    while a < n && (char_code(str_char(s, a)) == 32 || char_code(str_char(s, a)) == 9) { a = a + 1 }
+    var b: i64 = n
+    while b > a && (char_code(str_char(s, b - 1)) == 32 || char_code(str_char(s, b - 1)) == 9) { b = b - 1 }
+    var out = ""
+    var i: i64 = a
+    while i < b { out = out + str_char(s, i); i = i + 1 }
+    return out
+}
+
+func dap_run() -> string {
+    tiep.reset()
+    tiep.dbg_start(true)
+    var c1 = tiep.eval(td_src)
+    if w_err != "" { return "程序注册失败: " + w_err }
+    var c2 = tiep.eval("func __tie_dap_entry__(arg: string) -> i64 { main() ; return 0 }")
+    if w_err != "" { return "注入入口失败（需无参 main()）: " + w_err }
+    var _r = tiep.eval_call("__tie_dap_entry__", "")
+    return ""
+}
+
+// ---------------- 命令处理 ----------------
+
+func frames_json() -> string {
+    var sb = string_builder()
+    sb_append(sb, "[")
+    var n = frame_count(td_frames)
+    var i: i64 = 0
+    while i < n {
+        if i > 0 { sb_append(sb, ",") }
+        // DAP 帧 0 = 最内层 → 反向
+        var idx = n - 1 - i
+        frame_at(td_frames, idx)
+        sb_append(sb, "{\"id\":" + to_string(i) + ",\"name\":\"" +
+            jesc(td_fr_name) + "\",\"line\":" + to_string(td_fr_line) +
+            ",\"column\":0,\"source\":{\"name\":\"main.tie\",\"path\":\"" +
+            jesc(td_prog) + "\"}}")
+        i = i + 1
+    }
+    sb_append(sb, "]")
+    return sb_build(sb)
+}
+
+func handle(req_seq: i64, cmd: string, body: string) {
+    if cmd == "initialize" {
+        dap_send(dap_response(req_seq, "initialize",
+            "{\"supportsConfigurationDoneRequest\":true,\"supportsConditionalBreakpoints\":false," +
+            "\"supportsFunctionBreakpoints\":false,\"supportsSetVariable\":false}"))
+        dap_send(dap_event("initialized", "{}"))
+        return
+    }
+    if cmd == "setBreakpoints" {
+        fj_collect_lines(body)
+        var sbb = string_builder()
+        sb_append(sbb, "[")
+        var k: i64 = 0
+        while k < len(td_bplines) {
+            if k > 0 { sb_append(sbb, ",") }
+            sb_append(sbb, "{\"verified\":true,\"line\":" + to_string(td_bplines[k]) + "}")
+            k = k + 1
+        }
+        sb_append(sbb, "]")
+        dap_send(dap_response(req_seq, "setBreakpoints", "{\"breakpoints\":" + sb_build(sbb) + "}"))
+        return
+    }
+    if cmd == "launch" {
+        td_prog = fj_str(body, "program")
+        if str_len(td_prog) == 0 { td_prog = fj_str(body, "file") }
+        if !file_exists(td_prog) {
+            dap_send(dap_error(req_seq, "launch", "程序文件不存在: " + td_prog))
+            return
+        }
+        td_src = tp_prepare(file_read(td_prog))
+        td_loaded = true
+        dap_send(dap_response(req_seq, "launch", "{}"))
+        return
+    }
+    if cmd == "configurationDone" {
+        dap_send(dap_response(req_seq, "configurationDone", "{}"))
+        if td_loaded && !td_term {
+            var er = dap_run()
+            if er != "" {
+                dap_send(dap_event("terminated", "{\"reason\":\"error\"}"))
+                return
+            }
+            td_cursor = -1
+            if len(td_bplines) > 0 {
+                if dap_advance("break") == 0 {
+                    td_term = true
+                    dap_send(dap_event("terminated", "{}"))
+                    return
+                }
+            } else {
+                if dap_advance("next") == 0 {
+                    td_term = true
+                    dap_send(dap_event("terminated", "{}"))
+                    return
+                }
+            }
+            rebuild_stack(td_cursor)
+            dap_send(dap_event("stopped", "{\"reason\":\"breakpoint\",\"threadId\":1," +
+                "\"allThreadsStopped\":true}"))
+        } else if td_term {
+            dap_send(dap_event("terminated", "{}"))
+        }
+        return
+    }
+    if cmd == "disconnect" {
+        dap_send(dap_response(req_seq, "disconnect", "{}"))
+        exit(0)
+        return
+    }
+    if cmd == "threads" {
+        dap_send(dap_response(req_seq, "threads", "{\"threads\":[{\"id\":1,\"name\":\"main\"}]}"))
+        return
+    }
+    if cmd == "stackTrace" {
+        rebuild_stack(td_cursor)
+        dap_send(dap_response(req_seq, "stackTrace",
+            "{\"stackFrames\":" + frames_json() + ",\"totalFrames\":" +
+            to_string(frame_count(td_frames)) + "}"))
+        return
+    }
+    if cmd == "scopes" {
+        dap_send(dap_response(req_seq, "scopes",
+            "{\"scopes\":[{\"name\":\"Global\",\"presentationHint\":\"globals\"," +
+            "\"expensive\":false,\"variablesReference\":1}," +
+            "{\"name\":\"Locals (unavailable)\",\"variableReference\":0}]}"))
+        return
+    }
+    if cmd == "variables" {
+        var vr = fj_int(body, "variablesReference")
+        var sb_ = string_builder()
+        sb_append(sb_, "[")
+        if vr == 1 {
+            var nkeys = len(g_keys)
+            var i: i64 = 0
+            while i < nkeys {
+                if i == 0 { sb_append(sb_, "{") } else { sb_append(sb_, ",{") }
+                sb_append(sb_, "\"name\":\"" + jesc(g_keys[i]) +
+                    "\",\"value\":\"" + jesc(vval.to_print_string(g_vals[i])) +
+                    "\",\"type\":\"" + jesc(vval.type_name(g_vals[i])) + "\"}")
+                i = i + 1
+            }
+        }
+        sb_append(sb_, "]")
+        dap_send(dap_response(req_seq, "variables", "{\"variables\":" + sb_build(sb_) + "}"))
+        return
+    }
+    if cmd == "continue" || cmd == "next" || cmd == "stepIn" || cmd == "stepOut" {
+        var mode = "break"
+        if cmd == "continue" { mode = "break" }
+        else if cmd == "next" { mode = "next" }
+        else if cmd == "stepIn" { mode = "stepin" }
+        else if cmd == "stepOut" { mode = "stepout" }
+        if cmd == "continue" {
+            dap_send(dap_response(req_seq, "continue", "{\"allThreadsContinued\":true}"))
+        } else {
+            dap_send(dap_response(req_seq, cmd, "{}"))
+        }
+        if dap_advance(mode) == 0 {
+            td_term = true
+            dap_send(dap_event("terminated", "{}"))
+            return
+        }
+        rebuild_stack(td_cursor)
+        dap_send(dap_event("stopped", "{\"reason\":\"step\",\"threadId\":1," +
+            "\"allThreadsStopped\":true}"))
+        return
+    }
+    dap_send(dap_response(req_seq, cmd, "{}"))
+}
+
+func main() -> i64 {
+    while true {
+        var body = dap_read()
+        if body == "" { break }
+        // 解析请求：type/seq/command
+        var typ = fj_str(body, "type")
+        if typ != "request" { continue }
+        var req_seq = fj_int(body, "seq")
+        var cmd = fj_str(body, "command")
+        handle(req_seq, cmd, body)
+    }
+    return 0
+}

@@ -1,0 +1,215 @@
+type tie<class>
+// compiler/backend/irgen_strutil.tie —— 生成器 L3：字符串/字节查找辅助（starts_with/bfind/bytes_sub/cstr_len）
+// ============================================================
+// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
+// 顶层全局 var 与 import 树留在 irgen.tie 主文件。
+namespace irgen {
+// 前缀匹配：s 是否以 p（带头串）开头（逐字节；s 短则 false）
+func tig_str_starts_with(s: i64, p: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var TB = types.named(TK_BOOL)
+    var sn = s21_str_head_len(s)
+    var pn = s21_str_head_len(p)
+    var short_c = tig_icmp_c(sn, pn, 2)  // sn < pn
+    var rs = ir.new_inst(g_cur_block, 20, TB)
+    ir.add_operand(rs, TB, 2)
+    var rp = ir.get_value(rs)
+    s21_store(rp, tig_bool_lit(0), TB)
+    var bOk = ir.new_block(g_cur_func, interner.intern("sw.ok"))
+    var bSh = ir.new_block(g_cur_func, interner.intern("sw.sh"))
+    var bM = ir.new_block(g_cur_func, interner.intern("sw.m"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, short_c, 0)
+    ir.add_operand(cb, bSh, 1)
+    ir.add_operand(cb, bOk, 1)
+    g_cur_block = bSh
+    var brs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs, bM, 1)
+    // 逐字节比较
+    g_cur_block = bOk
+    var ia = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ia, T64, 2)
+    var ip = ir.get_value(ia)
+    var ka = ir.new_inst(g_cur_block, 20, TB)
+    ir.add_operand(ka, TB, 2)
+    var kp = ir.get_value(ka)
+    s21_store(ip, tig_int_lit(0), T64)
+    s21_store(kp, tig_bool_lit(1), TB)
+    var hd = ir.new_block(g_cur_func, interner.intern("sw.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("sw.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("sw.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var iv = s21_load(ip, T64)
+    var ic = tig_icmp_c(iv, pn, 2)
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, ic, 0)
+    ir.add_operand(cb2, bd, 1)
+    ir.add_operand(cb2, ex, 1)
+    g_cur_block = bd
+    var iv2 = s21_load(ip, T64)
+    var bs = s21_str_byte(s, iv2)
+    var bp = s21_str_byte(p, iv2)
+    var eq = tig_icmp_c(bs, bp, 0)
+    var kv = s21_load(kp, TB)
+    s21_store(kp, tig_and_i1(kv, eq), TB)
+    s21_store(ip, s21_bin(0, iv2, tig_int_lit(1)), T64)
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)
+    g_cur_block = ex
+    var kv2 = s21_load(kp, TB)
+    s21_store(rp, kv2, TB)
+    var brk = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brk, bM, 1)
+    g_cur_block = bM
+    return s21_load(rp, TB)
+}
+// ASCII 大小写折叠（'A'-'Z' → +32）：HTTP 头名大小写不敏感匹配
+func tig_tolower_b(b: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var is_upper = tig_and_i1(tig_icmp_c(b, tig_int_lit(65), 5), tig_icmp_c(b, tig_int_lit(90), 4))
+    return tig_select_i(is_upper, s21_bin(0, b, tig_int_lit(32)), b, T64)
+}
+// 原始字节缓冲 buf[0..blen) 中查找模式 pat（带头串）从 start 起；
+// ci=大小写不敏感。返回首个匹配下标（-1 未找到）。
+func tig_bfind(buf: i64, blen: i64, pat: i64, plen: i64, start: i64, ci: bool) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var rs = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(rs, T64, 2)
+    var rp = ir.get_value(rs)
+    s21_store(rp, tig_int_lit(-1), T64)
+    var ia = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ia, T64, 2)
+    var ip = ir.get_value(ia)
+    s21_store(ip, start, T64)
+    var last = s21_bin(1, s21_bin(0, blen, tig_int_lit(1)), plen)  // blen+1-plen（i 上限）
+    var hd = ir.new_block(g_cur_func, interner.intern("bf.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("bf.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("bf.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var iv = s21_load(ip, T64)
+    var ic = tig_icmp_c(iv, last, 2)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, ic, 0)
+    ir.add_operand(cb, bd, 1)
+    ir.add_operand(cb, ex, 1)
+    // body：内层 j 循环匹配
+    g_cur_block = bd
+    var ja = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ja, T64, 2)
+    var jp = ir.get_value(ja)
+    var ma = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ma, T64, 2)
+    var mp = ir.get_value(ma)
+    s21_store(jp, tig_int_lit(0), T64)
+    s21_store(mp, tig_int_lit(1), T64)
+    var jh = ir.new_block(g_cur_func, interner.intern("bf.jh"))
+    var jb = ir.new_block(g_cur_func, interner.intern("bf.jb"))
+    var jx = ir.new_block(g_cur_func, interner.intern("bf.jx"))
+    var brj = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brj, jh, 1)
+    g_cur_block = jh
+    var jv = s21_load(jp, T64)
+    var jc = tig_icmp_c(jv, plen, 2)
+    var cbj = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbj, jc, 0)
+    ir.add_operand(cbj, jb, 1)
+    ir.add_operand(cbj, jx, 1)
+    g_cur_block = jb
+    var j2 = s21_load(jp, T64)
+    var iv2 = s21_load(ip, T64)
+    var bb = s21_zext(s21_load(s21_gep(buf, s21_bin(0, iv2, j2), false), I8), I8)
+    var pb = s21_zext(s21_load(s21_gep(pat, j2, false), I8), I8)
+    if ci {
+        bb = tig_tolower_b(bb)
+        pb = tig_tolower_b(pb)
+    }
+    var eq = tig_icmp_c(bb, pb, 0)
+    var m1 = s21_load(mp, T64)
+    s21_store(mp, tig_select_i(eq, m1, tig_int_lit(0), T64), T64)
+    s21_store(jp, s21_bin(0, j2, tig_int_lit(1)), T64)
+    var brjb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brjb, jh, 1)
+    // jx：匹配 → 写结果并退出；否则 i++ 继续
+    g_cur_block = jx
+    var mv = s21_load(mp, T64)
+    var ism = tig_icmp_c(mv, tig_int_lit(1), 0)
+    var bGot = ir.new_block(g_cur_func, interner.intern("bf.g"))
+    var bNxt = ir.new_block(g_cur_func, interner.intern("bf.n"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, ism, 0)
+    ir.add_operand(cb2, bGot, 1)
+    ir.add_operand(cb2, bNxt, 1)
+    g_cur_block = bGot
+    s21_store(rp, s21_load(ip, T64), T64)
+    var brg = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brg, ex, 1)
+    g_cur_block = bNxt
+    s21_store(ip, s21_bin(0, s21_load(ip, T64), tig_int_lit(1)), T64)
+    var brn = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brn, hd, 1)
+    g_cur_block = ex
+    return s21_load(rp, T64)
+}
+// NUL 终止串长度：buf[off..off+maxn) 内首个 0 的偏移（无 NUL → maxn）
+func tig_cstr_len(buf: i64, off: i64, maxn: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var rs = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(rs, T64, 2)
+    var rp = ir.get_value(rs)
+    var ka = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ka, T64, 2)
+    var kp = ir.get_value(ka)
+    s21_store(rp, maxn, T64)
+    s21_store(kp, tig_int_lit(0), T64)
+    var hd = ir.new_block(g_cur_func, interner.intern("cs.h"))
+    var bd = ir.new_block(g_cur_func, interner.intern("cs.b"))
+    var ex = ir.new_block(g_cur_func, interner.intern("cs.x"))
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, hd, 1)
+    g_cur_block = hd
+    var kv = s21_load(kp, T64)
+    var klt = tig_icmp_c(kv, maxn, 2)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, klt, 0)
+    ir.add_operand(cb, bd, 1)
+    ir.add_operand(cb, ex, 1)
+    g_cur_block = bd
+    var kv2 = s21_load(kp, T64)
+    var b = s21_zext(s21_load(s21_gep(buf, s21_bin(0, off, kv2), false), I8), I8)
+    var nz = tig_icmp_c(b, tig_int_lit(0), 0)
+    var bF = ir.new_block(g_cur_func, interner.intern("cs.f"))
+    var bI = ir.new_block(g_cur_func, interner.intern("cs.i"))
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, nz, 0)
+    ir.add_operand(cb2, bF, 1)
+    ir.add_operand(cb2, bI, 1)
+    g_cur_block = bF
+    s21_store(rp, kv2, T64)
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, ex, 1)
+    g_cur_block = bI
+    s21_store(kp, s21_bin(0, kv2, tig_int_lit(1)), T64)
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, hd, 1)
+    g_cur_block = ex
+    return s21_load(rp, T64)
+}
+// 从原始字节区 buf[off..off+n) 构造带头 tie 串
+func tig_bytes_sub(buf: i64, off: i64, n: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var I8 = types.named(TK_I8)
+    var s = s21_sso_alloc(n)
+    s21_store(s21_gep(s, 0, true), n, T64)
+    var d0 = s21_gep(s, 8, true)
+    s21_memcpy_if(d0, s21_gep(buf, off, false), n)
+    s21_store(s21_gep(d0, n, false), tig_int_lit_ty(0, I8), I8)
+    return d0
+}
+}

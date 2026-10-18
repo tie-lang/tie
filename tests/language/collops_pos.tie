@@ -1,0 +1,51 @@
+type tie<logic>
+// ============================================================
+// 2.20 集合批正例（2026-10-13）：seq_sort / seq_sort_by / seq_reverse /
+// seq_distinct / seq_group_by（prelude lang 家族裸名）+ concat（tbl_cat）。
+// 原地操作返回自身可接管道；数据作末参的箭头链。
+// 期望：编译成功 + 运行打印 "collops 探针全过"。
+// ============================================================
+func main() {
+    var xs: table<i64> = [5, 1, 4, 2, 3]
+    var sorted = xs -> seq_sort()
+    if sorted[0] != 1 || sorted[4] != 5 || len(sorted) != 5 {
+        panic("seq_sort i64 失败")
+    }
+    var rev = xs -> seq_reverse()
+    if rev[0] != 5 || rev[4] != 1 {
+        panic("seq_reverse 失败")
+    }
+    var ds: table<i64> = [1, 2, 2, 3, 3, 3]
+    var uniq = seq_distinct(ds)
+    if len(uniq) != 3 || uniq[0] != 1 || uniq[2] != 3 {
+        panic("seq_distinct 失败")
+    }
+    if len(ds) != 6 {
+        panic("seq_distinct 改了入参")
+    }
+    var cat = tbl_cat(xs, ds)
+    if len(cat) != 11 || cat[0] != 5 || cat[10] != 3 {
+        panic("tbl_cat 失败")
+    }
+    var ws: table<string> = ["b", "a", "c", "a"]
+    var s2 = ws -> seq_sort()
+    if s2[0] != "a" || s2[1] != "a" || s2[3] != "c" {
+        panic("seq_sort string 失败")
+    }
+    var by_desc = seq_sort_by(func(a: i64, b: i64) -> bool { return a > b }, xs)
+    if by_desc[0] != 5 || by_desc[4] != 1 {
+        panic("seq_sort_by 失败")
+    }
+    var words: table<string> = ["apple", "avocado", "banana", "blueberry", "cherry"]
+    // 注一：短闭包 `w -> expr` 的右值不能是调用（会被解析为箭头并入：末参追加）；
+    // 调用体闭包用完整 `func(...) -> T { ... }` 形态。
+    // 注二：`words -> seq_group_by(...)` 外层箭头与本闭包嵌套时，箭头并入会找错
+    // 目标（误并内层调用·已记档），故此调用用直接形态。
+    var g = seq_group_by(func(w: string) -> string { return str_char(w, 0) }, words)
+    var a = g["a"]
+    var b = g["b"]
+    if len(a) != 2 || len(b) != 2 || len(g["c"]) != 1 {
+        panic("seq_group_by 失败")
+    }
+    println("collops 探针全过")
+}

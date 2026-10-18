@@ -1,0 +1,57 @@
+type tie<logic>
+// tests/_p91130_triple_probe/triple_probe.tie —— p.9.11.30 三引号多行字符串验收
+// 由新编译器编译运行（期望全部 t:OK*，exit 0）。
+// 验收点：①跨行字面 ②闭引号行基准缩进剥离（Swift 对齐）③raw 语义（\n 不转义）
+// ④插值（与单行同机制）⑤单行首 `"""` 后内容紧跟（无首行换行）。
+
+func main() {
+    // ① 跨行字面 + ② 缩进剥离：闭引号行 4 空格基准 → 各行剥 4 空格
+    var s1 = """
+    line one
+    line two
+    """
+    if s1 == "line one\nline two" {
+        println("t:OK1")
+    } else {
+        println("t:FAIL1 [" + s1 + "]")
+    }
+    // ③ raw 语义：\n 保持两字符（反斜杠 + n）
+    var s2 = """
+    a\nb
+    """
+    if s2 == "a\\nb" {
+        println("t:OK2")
+    } else {
+        println("t:FAIL2 [" + s2 + "]")
+    }
+    // ④ 插值（同单行机制）+ 文本
+    var name = "tie"
+    var v = 7
+    var s3 = """
+    hello {name}!
+    v={v}
+    """
+    if s3 == "hello tie!\nv=7" {
+        println("t:OK3")
+    } else {
+        println("t:FAIL3 [" + s3 + "]")
+    }
+    // ⑤ 首行紧跟内容（开引号后不换行）
+    var s4 = """inline
+    tail
+    """
+    if s4 == "inline\ntail" {
+        println("t:OK4")
+    } else {
+        println("t:FAIL4 [" + s4 + "]")
+    }
+    // ⑥ `\{` 插值转义 → 字面 `{}`
+    var s5 = """
+    \{name} literal
+    """
+    if s5 == "{" + "name} literal" {
+        println("t:OK5")
+    } else {
+        println("t:FAIL5 [" + s5 + "]")
+    }
+}

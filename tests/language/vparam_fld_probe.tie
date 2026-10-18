@@ -1,0 +1,75 @@
+type tie<logic>
+// vparam_fld_probe.tie —— W00031「按值形参的表字段重绑定」告警探针（r.1.6.10）
+// ============================================================================
+// 依据：§13.1「赋值与传参默认按值」+ struct 表字段是指向同一张堆表的**句柄**。
+// 于是同一个形参上有两种相反的可见性：
+//   · 经句柄改内容（table_push / h[i] = v）→ 调用方**看得见**（tie 惯用法）
+//   · 重新赋值字段本身（p.t = 新表）        → 调用方**看不见**（只改本地副本）
+// 后者**无声失效**：语法合法、运行无效果、读代码却像改了调用方。本告警给它出声。
+//
+// 本探针覆盖两类**应告警**与四类**不应告警**：
+//   应告警 ① 字段重绑定（p.t = 新表）        → 一般措辞
+//   应告警 ② 自赋值（var h = p.t; …; p.t = h）→ 升级措辞（空操作）
+//   不告警 ③ 经句柄追加内容（table_push(h, x)）
+//   不告警 ④ 经句柄原位写元素（h[0] = v）
+//   不告警 ⑤ 标量字段赋值（s.n = 77，本地计算）
+//   不告警 ⑥ 局部 struct（非形参）的字段赋值
+// 编译用 `-w`，期望恰好 2 条 W00031（①②），③④⑤⑥ 处无告警。
+//
+// 实测（2026-10-04，编译期判定；编译本身必须成功——本文件不带 `_neg` 后缀）：
+//   $ tiec -w vparam_fld_probe.tie -o x.exe
+//   warning[W00031] ... 按值形参表字段重绑定；struct 按值传参时会拷贝，…换表请改为返回新 struct。
+//   warning[W00031] ... 按值形参表字段重绑定；`var h = p.f` 取出的 h 就是 p.f 本身，…
+// ============================================================================
+
+struct S {
+    var n: i64 = 0;
+    var t: table<i64> = [];
+}
+
+// ① 应告警：字段重绑定（调用方看不到）
+func w31_rebind(s: S) {
+    s.t = table_new_i64()
+}
+
+// ② 应告警：自赋值（左右本就是同一句柄，此行纯空操作）
+func w31_selfassign(p: S) {
+    var ops = p.t
+    table_push(ops, 1)
+    p.t = ops
+}
+
+// ③ 不告警：经句柄追加内容（惯用法，调用方看得见）
+func ok_push_into(s: S) {
+    var h = s.t
+    table_push(h, 99)
+}
+
+// ④ 不告警：经句柄原位写元素
+func ok_set_elem(s: S) {
+    var h = s.t
+    h[0] = 55
+}
+
+// ⑤ 不告警：标量字段（改本地副本是正常本地计算）
+func ok_scalar(s: S) {
+    s.n = 77
+}
+
+// ⑥ 不告警：局部 struct（非形参）
+func ok_local() -> i64 {
+    var loc = S(0, [1, 2])
+    loc.t = table_new_i64()
+    return len(loc.t)
+}
+
+func main() -> i64 {
+    var s = S(0, [1, 2, 3])
+    w31_rebind(s)
+    w31_selfassign(s)
+    ok_push_into(s)
+    ok_set_elem(s)
+    ok_scalar(s)
+    println("len=" + to_string(len(s.t)) + " n=" + to_string(s.n) + " loc=" + to_string(ok_local()))
+    return 0
+}

@@ -1,0 +1,259 @@
+type tie<class>
+// compiler/middle/tieir_fmt_v3.tie —— p.9.21.11 片段格式 v3 编解码原语
+// ============================================================
+// 只服务模块片段（write_mod_slice 写 / asm_parse_slice 读）；全量
+// serialize/deserialize 的 v2 格式（wr_i64 大端 8B + 字符串 8B/码点）不动。
+//
+// # v3 编码（与 v2 的差异，读写两侧注释互锁）
+//   - 整数一律 **u32 小端**（4B）：池 id、opcode、ty、值 id、ops 偏移、计数、
+//     行列号等——实测域 < 2^31，越界写侧 set_err 响亮拒写、读侧越界响亮报错。
+//   - kind 2（立即数）操作数载荷例外：**i64 小端 8B**（立即数全值域）。
+//   - 可能取 -1 的结构字段用 **+1 偏置**存 u32（0 = -1，1 = 0，…）：函数
+//     ret/入口块、指令 ty/结果值、块 start/end、sym/exp 行列号。
+//   - 字符串 = **u32 字节长 + UTF-8 字节流**（v2 是 8B 码点数 + 8B/码点）。
+//   - 操作数序改 **[kind, payload]**（v2 是 [payload, kind]）——payload 的
+//     编码宽度依赖 kind，kind 先行读侧才能分派。
+//   - 版本标记：5 魔数字节后接 u32 LE = 3（SLICE_VERSION；v2 此处是 8B 大端
+//     的 2，字节形态天然可区分）。段 7（span）在 v3 **整体移除**（片段 span
+//     恒为全 0 冗余，装配器从不消费——findings §9 勘误）。
+//
+// # 自检
+//   middle/tieir_test.tie 片段 roundtrip 用例（写 → asm 路径装配回读 → 断言）；
+//   驱动树 218 片段写读 roundtrip 由 gv 探针 + regress 门禁覆盖。
+
+import "./tieir_ser.tie"
+
+namespace tieir {
+
+// 片段格式版本（v3；与全量 .tir 的 TIEIR_VERSION=2 相互独立）。
+const SLICE_VERSION: i64 = 3
+// rd_str3 字节长防御上限（标识符/路径量级；超出即响亮报错）。
+const SLICE_STR_MAX: i64 = 4194304
+
+// ---------- 写侧原语 ----------
+
+// 写 u32 小端（4 字节）；越界（负或 ≥2^31）响亮报错（调用方中止写入）。
+func wr_u32(t: ref table<i64>, v: i64) {
+    if v < 0 || v > 2147483647 {
+        set_err("片段 v3 字段越界（" + to_string(v) + "，域须 0..2^31-1）")
+        return
+    }
+    table_push(t, v & 255)
+    table_push(t, (v >> 8) & 255)
+    table_push(t, (v >> 16) & 255)
+    table_push(t, (v >> 24) & 255)
+}
+
+// 写可能为 -1 的字段（+1 偏置：-1→0，0→1，…）；v < -1 或 v+1 ≥ 0x7FFFFFFF
+// 时走 **i64 逃逸**：先写哨兵 0x7FFFFFFF，再写 i64 LE 全值。
+// （实测动因：op36 extern_call 的 ins_ty 槽在活体 IR 中可带 7.7e12 量级野值
+//  ——v2 的 8B 大端容得下，v3 u32 装不下；逃逸保证不静默截断、不错位。）
+func wr_u32p1(t: ref table<i64>, v: i64) {
+    if v >= -1 && v < 2147483646 {
+        wr_u32(t, v + 1)
+        return
+    }
+    wr_u32(t, 2147483647)
+    wr_i64_le(t, v)
+}
+
+// 写 i64 小端（8 字节；kind 2 立即数全值域专用）。
+func wr_i64_le(t: ref table<i64>, v: i64) {
+    var k: i64 = 0
+    while k < 8 {
+        table_push(t, (v >> (k * 8)) & 255)
+        k = k + 1
+    }
+}
+
+// 写字符串 v3：u32 字节长 + UTF-8 字节流。先编码进临时表拿字节长，再写
+// 前缀与字节（单遍编码；标识符/路径量级，临时表成本可忽略）。
+func wr_str3(t: ref table<i64>, s: string) {
+    var n = str_len(s)
+    var buf: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        var cp = char_code(str_char(s, i))
+        if cp < 0 || cp > 1114111 {
+            set_err("片段 v3 字符串码点非法（" + to_string(cp) + "）")
+            return
+        }
+        if cp < 128 {
+            table_push(buf, cp)
+        } else {
+            if cp < 2048 {
+                table_push(buf, 192 | (cp >> 6))
+                table_push(buf, 128 | (cp & 63))
+            } else {
+                if cp < 65536 {
+                    table_push(buf, 224 | (cp >> 12))
+                    table_push(buf, 128 | ((cp >> 6) & 63))
+                    table_push(buf, 128 | (cp & 63))
+                } else {
+                    table_push(buf, 240 | (cp >> 18))
+                    table_push(buf, 128 | ((cp >> 12) & 63))
+                    table_push(buf, 128 | ((cp >> 6) & 63))
+                    table_push(buf, 128 | (cp & 63))
+                }
+            }
+        }
+        i = i + 1
+    }
+    wr_u32(t, len(buf))
+    i = 0
+    while i < len(buf) {
+        table_push(t, buf[i])
+        i = i + 1
+    }
+}
+
+// 写段头 v3（u32 段号 + u32 段体长占位），返回长度槽下标。
+func wr_sec3_head(t: ref table<i64>, sec: i64) -> i64 {
+    wr_u32(t, sec)
+    var len_pos = len(t)
+    wr_u32(t, 0)
+    return len_pos
+}
+
+// 回填段体长度 v3（4 字节小端，同 wr_u32 字节序）。
+func wr_sec3_end(t: ref table<i64>, len_pos: i64, body_start: i64) {
+    var body_len = len(t) - body_start
+    if body_len < 0 || body_len > 2147483647 {
+        set_err("片段 v3 段体长度越界（" + to_string(body_len) + "）")
+        return
+    }
+    var k: i64 = 0
+    while k < 4 {
+        t[len_pos + k] = (body_len >> (k * 8)) & 255
+        k = k + 1
+    }
+}
+
+// ---------- 读侧原语（tieir_pos 游标推进） ----------
+
+// 读 u32 小端；越界响亮报错返回 0。
+func rd_u32(t: table<i64>) -> i64 {
+    var n = len(t)
+    if tieir_pos + 4 > n {
+        set_err("片段 v3 数据截断（读 u32 越界）")
+        return 0
+    }
+    var v: i64 = t[tieir_pos] | (t[tieir_pos + 1] << 8) | (t[tieir_pos + 2] << 16) | (t[tieir_pos + 3] << 24)
+    tieir_pos = tieir_pos + 4
+    return v
+}
+
+// 读 +1 偏置字段（0 → -1）；哨兵 0x7FFFFFFF → 读 i64 LE 逃逸值。
+func rd_u32p1(t: table<i64>) -> i64 {
+    var r = rd_u32(t)
+    if tieir_err != "" {
+        return -1
+    }
+    if r == 2147483647 {
+        return rd_i64_le(t)
+    }
+    return r - 1
+}
+
+// 读 i64 小端（kind 2 立即数专用）。
+func rd_i64_le(t: table<i64>) -> i64 {
+    var n = len(t)
+    if tieir_pos + 8 > n {
+        set_err("片段 v3 数据截断（读 i64 越界）")
+        return 0
+    }
+    var v: i64 = 0
+    var k: i64 = 8
+    while k > 0 {
+        k = k - 1
+        var b = t[tieir_pos + k]
+        if b < 0 || b > 255 {
+            set_err("片段 v3 字节越界（" + to_string(b) + "）")
+            return 0
+        }
+        v = (v << 8) | b
+    }
+    tieir_pos = tieir_pos + 8
+    return v
+}
+
+// 读字符串 v3（u32 字节长 + UTF-8）：string_builder 逐字节累积 + 一次
+// sb_build——消灭 v2 rd_str 的逐字符 SSO 分配与 O(n²) 拼接（敌人 #5/#6）。
+// 轻量校验：lead 字节定序列长 1-4、续字节须 0x80..0xBF、不越段。
+func rd_str3(t: table<i64>) -> string {
+    var n = rd_u32(t)
+    if tieir_err != "" {
+        return ""
+    }
+    if n < 0 || n > SLICE_STR_MAX {
+        set_err("片段 v3 字符串长度非法（" + to_string(n) + "）")
+        return ""
+    }
+    if n == 0 {
+        return ""
+    }
+    var total = len(t)
+    var sb = string_builder()
+    var i: i64 = 0
+    while i < n {
+        if tieir_pos >= total {
+            set_err("片段 v3 字符串数据截断")
+            return ""
+        }
+        var b = t[tieir_pos]
+        var seq: i64 = 1
+        if b >= 192 && b < 224 {
+            seq = 2
+        } else {
+            if b >= 224 && b < 240 {
+                seq = 3
+            } else {
+                if b >= 240 && b < 248 {
+                    seq = 4
+                }
+            }
+        }
+        if i + seq > n || tieir_pos + seq > total {
+            set_err("片段 v3 UTF-8 序列越界（偏移 " + to_string(i) + "）")
+            return ""
+        }
+        // 续字节校验（防御截断/伪造；字节本体直传 builder——零解码分配）
+        var k: i64 = 1
+        while k < seq {
+            var cb = t[tieir_pos + k]
+            if cb < 128 || cb > 191 {
+                set_err("片段 v3 UTF-8 续字节非法（偏移 " + to_string(i + k) + "）")
+                return ""
+            }
+            k = k + 1
+        }
+        k = 0
+        while k < seq {
+            sb_append_byte(sb, t[tieir_pos + k])
+            k = k + 1
+        }
+        tieir_pos = tieir_pos + seq
+        i = i + seq
+    }
+    return sb_build(sb)
+}
+
+// 读段头 v3：校验段号、记录段体边界；返回 true。
+func rd_sec3_head(t: table<i64>, expect_sec: i64) -> bool {
+    var sec = rd_u32(t)
+    if tieir_err != "" {
+        return false
+    }
+    if sec != expect_sec {
+        set_err("片段 v3 段号错误（期望 " + to_string(expect_sec) + " 实际 " + to_string(sec) + "）")
+        return false
+    }
+    var body_len = rd_u32(t)
+    if tieir_err != "" {
+        return false
+    }
+    tieir_sec_end = tieir_pos + body_len
+    return true
+}
+
+}   // namespace tieir

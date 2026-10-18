@@ -1,0 +1,130 @@
+type tie<logic>
+
+// ============================================================
+// p.8.1.2 错误处理统一验收：Option/Result 泛型增强 + `?` 解包深化（无异常保持）
+//
+// 覆盖场景：
+//   1. 泛型函数 enum 模板形参（此前缺口）：`func r_map<T, E>(r: Result<T, E>, ...)`
+//      ——组合子可泛型化（i64,string / string,string 多实例）
+//   2. 泛型 Option 组合子（Some/None 分支 + 泛型 T）
+//   3. `?` 解包链（Result）：Err 提前返回 / Ok 逐级解包（try_div 嵌套）
+//   4. `?` 解包链（Option）：None 提前返回 / Some 逐级解包
+//   5. 泛型函数体内 case 解构绑定变量（Result<T,E> 的 Ok(v)/Err(e)）
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   p.8.1.2 泛型 Result/Option + ? 解包链全过
+// ============================================================
+import "/std/result.tie"
+import "/std/assert.tie"
+using assert;
+
+// 泛型 Result 组合子：map（Ok 转换 / Err 透传）——enum 模板形参（p.8.1.2）
+func r_map<T, E>(r: Result<T, E>, f: fn(T) -> T) -> Result<T, E> {
+    switch r {
+        case Ok(v): return Result.Ok(f(v));
+        case Err(e): return Result.Err(e);
+    }
+}
+
+// 泛型 unwrap_or
+func r_unwrap_or<T, E>(r: Result<T, E>, def: T) -> T {
+    switch r {
+        case Ok(v): return v;
+        case Err(e): return def;
+    }
+}
+
+// 泛型 Option 组合子：map
+func o_map<T>(o: Option<T>, f: fn(T) -> T) -> Option<T> {
+    switch o {
+        case Some(v): return Option.Some(f(v));
+        case None: return Option.None;
+    }
+}
+
+// `?` 解包链（Result）：Err 提前返回
+func try_div(a: i64, b: i64) -> Result<i64, string> {
+    if b == 0 {
+        return Result.Err("div0")
+    }
+    return Result.Ok(a / b)
+}
+
+func chain2(a: i64, b: i64) -> Result<i64, string> {
+    var x = try_div(a, b) ?   // Err → 函数提前返回 Err
+    var y = try_div(x, 2) ?   // 再次解包
+    return Result.Ok(y + 1)
+}
+
+// `?` 解包链（Option）：None 提前返回
+func half(n: i64) -> Option<i64> {
+    if n % 2 != 0 {
+        return Option.None
+    }
+    return Option.Some(n / 2)
+}
+
+func qchain(n: i64) -> Option<i64> {
+    var a = half(n) ?
+    var b = half(a) ?
+    return Option.Some(b + 1)
+}
+
+func main() {
+    // 1. 泛型 Result 组合子（i64,string 实例）
+    var r1: Result<i64, string> = Result.Ok(21)
+    var m1 = r_map(r1, func(x: i64) -> i64 { return x * 2; })
+    switch m1 {
+        case Ok(v): assert.assert_eq(v, 42)
+        case Err(e): panic("r_map(i64) 不应 Err")
+    }
+    // 1b. 泛型 Result 组合子（string,string 实例）
+    var r2: Result<string, string> = Result.Ok("ab")
+    var m2 = r_map(r2, func(s: string) -> string { return s + "c"; })
+    switch m2 {
+        case Ok(v):
+            if v != "abc" {
+                panic("r_map(string) 结果错")
+            }
+        case Err(e): panic("r_map(string) 不应 Err")
+    }
+    // 2. 泛型 unwrap_or
+    var r3: Result<i64, string> = Result.Err("bad")
+    assert.assert_eq(r_unwrap_or(r3, 99), 99)
+    var r4: Result<i64, string> = Result.Ok(7)
+    assert.assert_eq(r_unwrap_or(r4, 99), 7)
+    // 3. 泛型 Option 组合子
+    var o1: Option<i64> = Option.Some(5)
+    var om = o_map(o1, func(x: i64) -> i64 { return x * 3; })
+    switch om {
+        case Some(v): assert.assert_eq(v, 15)
+        case None: panic("o_map 不应 None")
+    }
+    var o2: Option<i64> = Option.None
+    var om2 = o_map(o2, func(x: i64) -> i64 { return x * 3; })
+    switch om2 {
+        case Some(v): panic("o_map(None) 不应 Some")
+        case None: assert.assert(true)
+    }
+    // 4. `?` 解包链（Result）：(10/2)/2+1 = 3
+    switch chain2(10, 2) {
+        case Ok(v): assert.assert_eq(v, 3)
+        case Err(e): panic("chain2 不应 Err")
+    }
+    // Err 提前返回透传
+    switch chain2(10, 0) {
+        case Ok(v): panic("chain2(10,0) 不应 Ok")
+        case Err(e): assert.assert_eq(e, "div0")
+    }
+    // 5. `?` 解包链（Option）：20/2=10, 10/2=5, 5+1=6
+    switch qchain(20) {
+        case Some(v): assert.assert_eq(v, 6)
+        case None: panic("qchain(20) 不应 None")
+    }
+    // None 提前返回透传：6/2=3, 3 奇数 → None
+    switch qchain(6) {
+        case Some(v): panic("qchain(6) 不应 Some")
+        case None: assert.assert(true)
+    }
+    println("p.8.1.2 泛型 Result/Option + ? 解包链全过")
+}

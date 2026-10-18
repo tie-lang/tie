@@ -1,0 +1,111 @@
+type tie<logic>
+// compiler/frontend/diagcode_test.tie —— tie.diag 库独立自检（p.9.21 G7 库资格②）
+// ============================================================
+// 无 driver 可跑：本文件即入口（tie<logic>），只 import 被测库
+// （diagcode → diagcode_cat.gen → errors），覆盖诊断标号中央的对外契约：
+//   - 错误标号查表：归一化折叠（ASCII 运行 → '%'）后 exact 命中目录
+//     （私有函数调用消息 → E00331）；
+//   - 输出格式：error[E#####] @行:列: 消息名。；
+//   - ERR 协议渲染：render_err_proto("ERR:行 列 消息") → @行:列；
+//   - 消息构造器：errors.err_lex_err / syn_expect 产出 ERR 协议 / 参数化文本；
+//   - 警告目录：warn_reg 注册 → render_warning 命中 W 码 + 建议可读回；
+//   - 未登记警告：未注册核心消息落 W00000 并进 warn_unreg 审计清单。
+// 全部通过输出「diag 自检通过」exit 0；任一失败打印明细 exit 1。
+//
+// # 语言边界应用（同 ir_test.tie）
+//   - import 文本内联后与目录/警告表全局同作用域：**不定义本地常量**；
+//   - 前缀调用（diagcode.xxx / errors.xxx）；断言失败累积用嵌套 if。
+//
+// 运行（repo 根）：
+//   compiler\tiec.exe compiler\frontend\diagcode_test.tie -o <tmp>\diagtest.exe
+//   <tmp>\diagtest.exe       # -> 「diag 自检通过」exit 0
+
+import "./diagcode.tie"
+import "./errors.tie"
+// std/string 仅本自检使用（errors 与 gen 均为叶、无 import，无重复定义风险；
+// std 前缀依赖不参与门禁，只统计）
+import "/std/string.tie"
+
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+func main() {
+    var ok: bool = true
+
+    // ---------- 错误标号查表（exact 归一化命中）----------
+    // 与 sstate.check_visibility 的发射文本逐字一致。私有函数拦截 = E00332
+    // （diagcode_cat.gen 的配对是「键在前、码在后」，目录即权威）。
+    var privmsg = "函数 'f' 是命名空间 'x' 的私有函数（默认私有，`pub func` 显式导出），不可在命名空间之外调用"
+    var e = diagcode.render_error(3, 5, privmsg)
+    if !check(str.contains(e, "E00332"), "私有函数调用消息命中 E00332") {
+        ok = false
+    }
+    if !check(str.contains(e, "error[E00332] @3:5"), "错误输出格式 error[E#####] @行:列") {
+        ok = false
+    }
+
+    // ---------- 未分类兜底（目录外消息 → E00000）----------
+    var m2 = diagcode.render_error(1, 1, "自检用的未知错误消息")
+    if !check(str.contains(m2, "E00000"), "目录外消息落 E00000 兜底") {
+        ok = false
+    }
+
+    // ---------- ERR 协议渲染 ----------
+    var proto = errors.err_lex_err(1, 9, "字符串未闭合")
+    if !check(str.contains(proto, "ERR:1 9 "), "err_lex_err 产出 ERR 协议") {
+        ok = false
+    }
+    var rp = diagcode.render_err_proto(proto)
+    if !check(str.contains(rp, "@1:9"), "render_err_proto 还原行列") {
+        ok = false
+    }
+
+    // ---------- 参数化消息构造器 ----------
+    if !check(errors.syn_expect("分号", "标识符") == "期望 分号，实际是 标识符",
+              "syn_expect 参数化拼接") {
+        ok = false
+    }
+    if !check(errors.syn_expect_ident("字符串") == "期望标识符，实际是 字符串",
+              "syn_expect_ident 参数化拼接") {
+        ok = false
+    }
+
+    // ---------- 警告目录：注册 + 渲染 ----------
+    diagcode.warn_reg("自检警告核心消息", "W90001", "selftest_warn", "这是自检建议")
+    var w = diagcode.render_warning(2, 3, "自检警告核心消息")
+    if !check(str.contains(w, "W90001"), "已注册警告命中 W 码") {
+        ok = false
+    }
+    if !check(str.contains(w, "warning[W90001] @2:3"), "警告输出格式 warning[W#####] @行:列") {
+        ok = false
+    }
+    if !check(diagcode.warn_name_of("自检警告核心消息") == "selftest_warn", "警告短名读回") {
+        ok = false
+    }
+    if !check(diagcode.warn_tip_of("自检警告核心消息") == "这是自检建议", "警告建议读回") {
+        ok = false
+    }
+    if !check(diagcode.warn_count() > 0, "警告目录非空") {
+        ok = false
+    }
+
+    // ---------- 未登记警告：W00000 + 审计清单 ----------
+    var before = diagcode.warn_unreg_count()
+    var wu = diagcode.render_warning(1, 1, "自检未登记的核心消息")
+    if !check(str.contains(wu, "W00000"), "未登记警告落 W00000") {
+        ok = false
+    }
+    if !check(diagcode.warn_unreg_count() == before + 1, "未登记警告进审计清单") {
+        ok = false
+    }
+
+    // ---------- 汇总 ----------
+    if !ok {
+        exit(1)
+    }
+    println("diag 自检通过")
+}

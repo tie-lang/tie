@@ -1,0 +1,252 @@
+type tie<class>
+// tlib/std/zd_ext.tie —— zd 扩展能力（null/optional、ext、schema 容器、内容哈希；自 tiedb 提炼）
+// ============================================================================
+// 设计基准 docs/superpowers/specs/2026-08-31-zd-v2-design.md §3/§6：
+//   - null/optional 核心类型（0xc0）：区分「缺失」与「空值」；注意 0xc0 ≠ fixint
+//     0x00（后者是整数值 0）；
+//   - ext 扩展类型（0xd7 + 类型标记 varint + 长度 varint + 载荷）：tie 特有 char/
+//     trit 与 code（tie-IR）载荷走此子类型；未知 ext 类型可整体跳过；
+//   - flags 字节处理（bit0 字典 / bit1 列式 / bit2 ext / bit3 流式 / bit4 压缩）；
+//   - schema 段（字段名 + 类型数组的容器段，供任意语言反序列化到对象）；
+//   - 内容哈希段（FNV-1a 64 位，数据段后附加 8 字节大端哈希，读端完整性校验）。
+// 复用 ../src/zd.tie 基础原语（字节一律 table<i64>，错误哨兵 -1）。
+
+import "./zd.tie"
+
+namespace zd_ext {
+
+// ---------- null / optional（0xc0） ----------
+
+// encode_null：空值 → 单字节 [0xC0]。
+pub func encode_null() -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0xC0)
+    return out
+}
+
+// decode_null：校验 pos 处字节是否为 0xC0。
+//   是 → (true, pos+1)；否 → (false, pos)（不消费字节，便于 optional 继续解码）。
+pub func decode_null(t: table<i64>, pos: i64) -> (bool, i64) {
+    if zd.u8_at(t, pos) == 0xC0 {
+        return (true, pos + 1)
+    }
+    return (false, pos)
+}
+
+// encode_optional_i64：可选 i64。has=true → encode_i64(value)；has=false → 0xC0（缺失）。
+pub func encode_optional_i64(value: i64, has: bool) -> table<i64> {
+    if has {
+        return zd.encode_i64(value)
+    }
+    return encode_null()
+}
+
+// decode_optional_i64：→ (present, value, next)。
+//   0xC0（缺失/null）→ (false, 0, pos+1)；正常 i64 → (true, value, next)；
+//   0x00（fixint 0，整数值 0）→ (true, 0, pos+1)，与「缺失」严格区分。
+pub func decode_optional_i64(t: table<i64>, pos: i64) -> (bool, i64, i64) {
+    var (is_null, p2) = decode_null(t, pos)
+    if is_null {
+        return (false, 0, p2)
+    }
+    var (v, p3) = zd.decode_i64(t, pos)
+    if p3 < 0 {
+        return (false, 0, -1)
+    }
+    return (true, v, p3)
+}
+
+// ---------- ext 扩展类型（0xd7 + tag varint + len varint + payload） ----------
+
+// ext 子类型标记约定（tie 特有载荷，对齐设计文档 §3/§6）：
+//   tag 1 = char（载荷 = UTF-8 字节）；tag 2 = trit（载荷 = 1 字节 i8 值）；
+//   tag 3 = code（tie-IR，载荷 = TIEIR 7 段格式字节）。
+pub func encode_ext(tag: i64, payload: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0xD7)
+    out = zd.concat(out, zd.write_varint(tag))
+    out = zd.concat(out, zd.write_varint(len(payload)))
+    return zd.concat(out, payload)
+}
+
+// decode_ext：→ (tag, payload, next)。非 0xD7 → (tag=-1, 空表, next=-1)。
+//   未知 ext 类型无需解析载荷：next 即 ext 整体占用区间的 end，调用方可直接跳过。
+pub func decode_ext(t: table<i64>, pos: i64) -> (i64, table<i64>, i64) {
+    if zd.u8_at(t, pos) != 0xD7 {
+        return (-1, table_new_i64(), -1)
+    }
+    var (tag, p2) = zd.read_varint(t, pos + 1)
+    if p2 < 0 {
+        return (-1, table_new_i64(), -1)
+    }
+    var (ln, p3) = zd.read_varint(t, p2)
+    if p3 < 0 {
+        return (-1, table_new_i64(), -1)
+    }
+    var n: i64 = len(t)
+    if p3 + ln > n {
+        return (-1, table_new_i64(), -1)
+    }
+    return (tag, zd.slice(t, p3, p3 + ln), p3 + ln)
+}
+
+// ---------- flags 字节处理（bit2 = ext） ----------
+
+// set_flag：置位。flags | (1 << bit)。
+pub func set_flag(flags: i64, bit: i64) -> i64 {
+    return flags | (1 << bit)
+}
+
+// has_flag：查询位是否置位。
+pub func has_flag(flags: i64, bit: i64) -> bool {
+    return (flags & (1 << bit)) != 0
+}
+
+// （v2 文件头构造与落盘接口已废弃删除；zd 文档读写唯一入口 = zd_doc.tie 的 make_header / save。）
+
+// ---------- schema 段（字段名 + 类型数组的容器段，自描述） ----------
+
+// 格式：fixmap(2)：{"names": [string...], "types": [i64...]}。
+//   字段名编码为字符串数组、类型号编码为 i64 数组（类型号约定由调用方 schema 定义，
+//   如 0=i64 1=f64 2=string 3=bool 8=trit）。任意语言可据 names+tys 反序列化到对象。
+pub func encode_schema(names: table<string>, tys: table<i64>) -> table<i64> {
+    var body = table_new_i64()
+    body = zd.concat(body, zd.encode_string("names"))
+    body = zd.concat(body, zd.encode_string_array(names))
+    body = zd.concat(body, zd.encode_string("types"))
+    body = zd.concat(body, zd.encode_i64_array(tys))
+    var head = table_new_i64()
+    table_push(head, 0x82)   // fixmap 2 条目
+    return zd.concat(head, body)
+}
+
+// read_string_array / read_i64_array：内部数组解码（规避 decode_table 泛型返回的
+// 类型问题；对元素类型严格按 string / i64 处理）。
+func read_string_array(t: table<i64>, pos: i64) -> (table<string>, i64) {
+    var out = table_new_string()
+    var (n, dp) = zd.array_tag(t, pos)
+    if n < 0 {
+        return (out, -1)
+    }
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (s, np) = zd.decode_string(t, p)
+        if np < 0 {
+            return (out, -1)
+        }
+        table_push(out, s)
+        p = np
+        i = i + 1
+    }
+    return (out, p)
+}
+
+func read_i64_array(t: table<i64>, pos: i64) -> (table<i64>, i64) {
+    var out = table_new_i64()
+    var (n, dp) = zd.array_tag(t, pos)
+    if n < 0 {
+        return (out, -1)
+    }
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (v, np) = zd.decode_i64(t, p)
+        if np < 0 {
+            return (out, -1)
+        }
+        table_push(out, v)
+        p = np
+        i = i + 1
+    }
+    return (out, p)
+}
+
+// decode_schema：→ (names, tys, next)。格式不符 → (空表, 空表, -1)。
+//   next = schema 段整体终点（容器自定界），调用方可直接续读数据段。
+pub func decode_schema(t: table<i64>, pos: i64) -> (table<string>, table<i64>, i64) {
+    var en = table_new_string()
+    var et = table_new_i64()
+    var (n, dp) = zd.map_tag(t, pos)
+    if n != 2 {
+        return (en, et, -1)
+    }
+    var names = table_new_string()
+    var tys = table_new_i64()
+    var got_names: bool = false
+    var got_types: bool = false
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (k, p2) = zd.decode_string(t, p)
+        if p2 < 0 {
+            return (en, et, -1)
+        }
+        p = p2
+        if k == "names" {
+            var (na, p3) = read_string_array(t, p)
+            if p3 < 0 {
+                return (en, et, -1)
+            }
+            names = na
+            p = p3
+            got_names = true
+        } else if k == "types" {
+            var (ty, p3) = read_i64_array(t, p)
+            if p3 < 0 {
+                return (en, et, -1)
+            }
+            tys = ty
+            p = p3
+            got_types = true
+        } else {
+            return (en, et, -1)
+        }
+        i = i + 1
+    }
+    if !got_names || !got_types {
+        return (en, et, -1)
+    }
+    return (names, tys, p)
+}
+
+// encode_with_schema：schema 段 + 数据段组装（schema 段自定界，next 即数据段起点）。
+pub func encode_with_schema(body: table<i64>, names: table<string>, tys: table<i64>) -> table<i64> {
+    return zd.concat(encode_schema(names, tys), body)
+}
+
+// ---------- 内容哈希段（FNV-1a 64 位完整性） ----------
+
+// content_hash：FNV-1a 64（内联实现）。偏移量 14695981039346656037
+//   （= 0xcbf29ce484222325，二补码 i64 = -3750763034362895579）、
+//   素数 1099511628211（= 0x100000001b3）。tie i64 乘法按 mod 2^64 回绕，
+//   逐字节 hash = (hash ^ byte) * prime 即得标准 FNV-1a 64 结果。
+pub func content_hash(bytes: table<i64>) -> i64 {
+    var h: i64 = -3750763034362895579
+    var n: i64 = len(bytes)
+    var i: i64 = 0
+    while i < n {
+        h = h ^ (bytes[i] & 0xFF)
+        h = h * 1099511628211
+        i = i + 1
+    }
+    return h
+}
+
+// encode_with_hash：数据段后附加 8 字节大端 FNV-1a 64 内容哈希。
+pub func encode_with_hash(body: table<i64>) -> table<i64> {
+    return zd.concat(body, zd.write_u64_be(content_hash(body)))
+}
+
+// decode_hash_end：→ (hash, body_end)。取末 8 字节大端哈希；body_end = len - 8
+//   （数据段边界）。长度不足 8 → (0, -1)。
+pub func decode_hash_end(t: table<i64>) -> (i64, i64) {
+    var n: i64 = len(t)
+    if n < 8 {
+        return (0, -1)
+    }
+    var (h, np) = zd.read_u64_be(t, n - 8)
+    return (h, n - 8)
+}
+
+}

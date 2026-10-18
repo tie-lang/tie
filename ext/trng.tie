@@ -1,0 +1,259 @@
+type tie<class>
+// std/trng.tie —— L2 随机扩展库（命名空间 trng）（L2 random extension library, namespace trng）
+// 用途：微型扩散模型训练的确定性批量采样 / shuffle / batch（deterministic batch sampling,
+// shuffle, batching for tiny diffusion-model training）。纯 tie 实现，自足，不依赖 rng_adv.a。
+// 值语义：struct Rng 按值传递，每次 next 返回"新 Rng + 随机值"（纯函数更新，无副作用），
+// 同 seed 恒产生完全相同序列（确定性硬要求）。（Value semantics: struct Rng passed by value;
+// each next returns a new Rng plus a random value as a pure-function update. Same seed ⇒
+// identical sequence, a hard requirement for deterministic batching.）
+//
+// 状态为双槽 128 位 xorshift（xorshift64x2：s0、s1 两槽各自独立推进 xorshift64,13/7/17）。
+// 位运算只用 shift + xor（逻辑右移经 & 0x7FFF.. 达成），无乘法溢出，规避大 hex 常数
+// （>i64::MAX 字面量会被编译器拒绝）。（Two-slot xorshift64x2 using only shifts + xor with
+// logical right shift via a mask; no overflowing multiply, avoiding rejected large hex literals.）
+//
+// 调用：import "/ext/trng.tie" 后 trng.new(...) / trng.next(...) 等。内建数学
+// log/sqrt/sin/cos 为裸名（bare names）。
+
+// 结构体 Rng：128 位状态（两个 64 位槽 s0/s1），值语义。（struct Rng: 128-bit state.）
+struct Rng {
+    var s0: i64;
+    var s1: i64;
+}
+
+namespace trng {
+
+// 私有：xorshift64 单步核心（13 左移、7 右移、17 左移，逻辑右移用掩码）。(xorshift64 step.)
+func _step(x: i64) -> i64 {
+    var z = x
+    z = z ^ (z << 13)
+    z = z ^ ((z >> 7) & 0x7FFFFFFFFFFFFFFF)
+    z = z ^ (z << 17)
+    return z
+}
+
+// 私有：确定性种子散列（avalanche，纯 shift/xor），铺满两槽时打散 seed。(deterministic seed hash.)
+func _aval(z: i64) -> i64 {
+    var x = z
+    x = x ^ (x << 21)
+    x = x ^ ((x >> 15) & 0x7FFFFFFFFFFFFFFF)
+    x = x ^ (x << 27)
+    return x
+}
+
+// 私有：取样 (0,1] 的均匀数（m+1）/2^53，确保 log()>0。(uniform in (0,1] so log()>0.)
+func _u_probe(r: Rng) -> (r2: Rng, v2: f64) {
+    var p = next(r)
+    var u = (p.v2 >> 11) & 0x1FFFFFFFFFFFFF
+    return (p.r2, to_f64(u + 1) / 9007199254740992.0)
+}
+
+// 新建 Rng：seed 散列铺满双槽（非零保护），同 seed 恒同序列。(new Rng from seed, same seed ⇒ same seq.)
+pub func new(seed: i64) -> Rng {
+    var s0 = _aval(seed)
+    var s1 = _aval(s0) ^ 0x2545F4914F6CDD1D
+    if s0 == 0 {
+        s0 = 0x2545F4914F6CDD1D
+    }
+    if s1 == 0 {
+        s1 = 0x517CC1B727220A95
+    }
+    return Rng(s0, s1)
+}
+
+// 推进状态并返回 64 位随机整（无符号位模式，经 i64 承载）。(advance and return a 64-bit integer.)
+pub func next(r: Rng) -> (r2: Rng, v2: i64) {
+    var ns0 = _step(r.s0)
+    var ns1 = _step(r.s1)
+    return (Rng(ns0, ns1), ns0)
+}
+
+// 推进状态并返回 64 位整（与 next 等价，命名对应 u64 语义）。(advance, return 64-bit int.)
+pub func next_u64(r: Rng) -> (r2: Rng, v2: i64) {
+    return next(r)
+}
+
+// 推进状态并返回 i64 有符号整。(advance, return signed i64.)
+pub func next_i64(r: Rng) -> (r2: Rng, v2: i64) {
+    return next(r)
+}
+
+// [0,1) 均匀浮点：取高 53 位 / 2^53。(uniform float in [0,1): top 53 bits / 2^53.)
+pub func float01(r: Rng) -> (r2: Rng, v2: f64) {
+    var p = next(r)
+    var u = (p.v2 >> 11) & 0x1FFFFFFFFFFFFF
+    return (p.r2, to_f64(u) / 9007199254740992.0)
+}
+
+// [lo, hi) 均匀浮点：lo + u*(hi-lo)。(uniform float in [lo, hi).)
+pub func range(r: Rng, lo: f64, hi: f64) -> (r2: Rng, v2: f64) {
+    var p = float01(r)
+    return (p.r2, lo + p.v2 * (hi - lo))
+}
+
+// [lo, hi) 均匀整数（乘模法，可处理负 lo）。(uniform integer in [lo, hi), multiply-mod.)
+pub func int_range(r: Rng, lo: i64, hi: i64) -> (r2: Rng, v2: i64) {
+    var w = hi - lo
+    if w <= 0 {
+        return (r, lo)
+    }
+    var p = float01(r)
+    var idx = to_i64(p.v2 * to_f64(w))
+    if idx >= w {
+        idx = w - 1
+    }
+    return (p.r2, lo + idx)
+}
+
+// 标准正态单样本（Box-Muller，消耗两均匀数取 cos 分支）。(standard normal via Box-Muller.)
+pub func gauss(r: Rng) -> (r2: Rng, v2: f64) {
+    var p1 = _u_probe(r)
+    var p2 = float01(p1.r2)
+    var a = sqrt(-2.0 * log(p1.v2))
+    return (p2.r2, a * cos(6.283185307179586 * p2.v2))
+}
+
+// 一次消耗两均匀数产两个独立标准正态（cos/sin 双分支）。(one draw yields two normals, cos/sin.)
+pub func gauss_pair(r: Rng) -> (r2: Rng, g1: f64, g2: f64) {
+    var p1 = _u_probe(r)
+    var p2 = float01(p1.r2)
+    var a = sqrt(-2.0 * log(p1.v2))
+    var th = 6.283185307179586 * p2.v2
+    return (p2.r2, a * cos(th), a * sin(th))
+}
+
+// 带均值/标准差的正态（gauss 缩放平移）。(normal with mean/std, gauss scaled & shifted.)
+pub func normal(r: Rng, mean: f64, std: f64) -> (r2: Rng, v2: f64) {
+    var p = gauss(r)
+    return (p.r2, mean + p.v2 * std)
+}
+
+// 就地 Fisher-Yates 混洗定长数组，返回新 Rng（窗口 8）。(in-place shuffle, window 8.)
+pub func shuffle8(r: Rng, a: ref array<i64, 8>) -> Rng {
+    var rr = r
+    var i = 7
+    while i > 0 {
+        var pr = int_range(rr, 0, i + 1)
+        rr = pr.r2
+        var j = pr.v2
+        var tmp = a[i]
+        a[i] = a[j]
+        a[j] = tmp
+        i = i - 1
+    }
+    return rr
+}
+
+// 就地 Fisher-Yates 混洗定长数组，返回新 Rng（窗口 16）。(shuffle window 16.)
+pub func shuffle16(r: Rng, a: ref array<i64, 16>) -> Rng {
+    var rr = r
+    var i = 15
+    while i > 0 {
+        var pr = int_range(rr, 0, i + 1)
+        rr = pr.r2
+        var j = pr.v2
+        var tmp = a[i]
+        a[i] = a[j]
+        a[j] = tmp
+        i = i - 1
+    }
+    return rr
+}
+
+// 就地 Fisher-Yates 混洗定长数组，返回新 Rng（窗口 32）。(shuffle window 32.)
+pub func shuffle32(r: Rng, a: ref array<i64, 32>) -> Rng {
+    var rr = r
+    var i = 31
+    while i > 0 {
+        var pr = int_range(rr, 0, i + 1)
+        rr = pr.r2
+        var j = pr.v2
+        var tmp = a[i]
+        a[i] = a[j]
+        a[j] = tmp
+        i = i - 1
+    }
+    return rr
+}
+
+// 就地 Fisher-Yates 混洗定长数组，返回新 Rng（窗口 64）。(shuffle window 64.)
+pub func shuffle64(r: Rng, a: ref array<i64, 64>) -> Rng {
+    var rr = r
+    var i = 63
+    while i > 0 {
+        var pr = int_range(rr, 0, i + 1)
+        rr = pr.r2
+        var j = pr.v2
+        var tmp = a[i]
+        a[i] = a[j]
+        a[j] = tmp
+        i = i - 1
+    }
+    return rr
+}
+
+// 就地 Fisher-Yates 混洗定长数组，返回新 Rng（窗口 128）。(shuffle window 128.)
+pub func shuffle128(r: Rng, a: ref array<i64, 128>) -> Rng {
+    var rr = r
+    var i = 127
+    while i > 0 {
+        var pr = int_range(rr, 0, i + 1)
+        rr = pr.r2
+        var j = pr.v2
+        var tmp = a[i]
+        a[i] = a[j]
+        a[j] = tmp
+        i = i - 1
+    }
+    return rr
+}
+
+// 就地 Fisher-Yates 混洗定长数组，返回新 Rng（窗口 256）。(shuffle window 256.)
+pub func shuffle256(r: Rng, a: ref array<i64, 256>) -> Rng {
+    var rr = r
+    var i = 255
+    while i > 0 {
+        var pr = int_range(rr, 0, i + 1)
+        rr = pr.r2
+        var j = pr.v2
+        var tmp = a[i]
+        a[i] = a[j]
+        a[j] = tmp
+        i = i - 1
+    }
+    return rr
+}
+
+// 就地 Fisher-Yates 混洗定长数组，返回新 Rng（窗口 512）。(shuffle window 512.)
+pub func shuffle512(r: Rng, a: ref array<i64, 512>) -> Rng {
+    var rr = r
+    var i = 511
+    while i > 0 {
+        var pr = int_range(rr, 0, i + 1)
+        rr = pr.r2
+        var j = pr.v2
+        var tmp = a[i]
+        a[i] = a[j]
+        a[j] = tmp
+        i = i - 1
+    }
+    return rr
+}
+
+// 就地 Fisher-Yates 混洗定长数组，返回新 Rng（窗口 1024）。(shuffle window 1024.)
+pub func shuffle1024(r: Rng, a: ref array<i64, 1024>) -> Rng {
+    var rr = r
+    var i = 1023
+    while i > 0 {
+        var pr = int_range(rr, 0, i + 1)
+        rr = pr.r2
+        var j = pr.v2
+        var tmp = a[i]
+        a[i] = a[j]
+        a[j] = tmp
+        i = i - 1
+    }
+    return rr
+}
+
+}   // namespace trng

@@ -1,0 +1,350 @@
+type tie<class>
+// compiler/backend/builtin_expr_seg1.tie —— builtin_expr 分派链分段 1（p.9.21 G2 单函数 ≤300 行）
+// ============================================================
+// 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
+// 与原函数同 namespace，跨文件裸名互调；段尾 return <sentinel> = 本段未命中。
+namespace irgen {
+    func builtin_expr_seg1(nm: string, id: i64) -> i64 {
+        // ---------- S1.2 unsafe 指针/内存内置 ----------
+        // 全部要求 unsafe 上下文（语义层 infer 已拦截安全代码调用）。
+        // ---------- S1.2 unsafe 指针/内存内置 ----------
+        if nm == "addr_of" { return bi_addr_of(nm, id) }
+        if nm == "addr_of_field" { return bi_addr_of_field(nm, id) }
+        if nm == "deref" { return bi_deref(nm, id) }
+        if nm == "deref_write" { return bi_deref_write(nm, id) }
+        if nm == "volatile_load" { return bi_volatile_load(nm, id) }
+        if nm == "share" { return bi_share(nm, id) }
+        if nm == "volatile_store" { return bi_volatile_store(nm, id) }
+        if nm == "is_null" { return bi_is_null(nm, id) }
+        if nm == "ptr_add" { return bi_ptr_add(nm, id) }
+        if nm == "ptr_to_int" { return bi_ptr_to_int(nm, id) }
+        if nm == "int_to_ptr" { return bi_int_to_ptr(nm, id) }
+        if nm == "alloc" { return bi_alloc(nm, id) }
+        if nm == "free" { return bi_free(nm, id) }
+        if nm == "memcpy" { return bi_memcpy(nm, id) }
+        if nm == "memset" { return bi_memset(nm, id) }
+        if nm == "slice_of" { return bi_slice_of(nm, id) }
+        if nm == "slice_len" { return bi_slice_len(nm, id) }
+        if nm == "slice_index" { return bi_slice_index(nm, id) }
+        var as_dst: i64 = -1
+        if nm == "as_i8" || nm == "to_i8" {
+            as_dst = types.named(TK_I8)
+        } else if nm == "as_i16" || nm == "to_i16" {
+            as_dst = types.named(TK_I16)
+        } else if nm == "as_i32" || nm == "to_i32" {
+            as_dst = types.named(TK_I32)
+        } else if nm == "as_i64" || nm == "to_i64" {
+            as_dst = types.named(TK_I64)
+        } else if nm == "as_u8" || nm == "to_u8" {
+            as_dst = types.named(TK_U8)
+        } else if nm == "as_u16" || nm == "to_u16" {
+            as_dst = types.named(TK_U16)
+        } else if nm == "as_u32" || nm == "to_u32" {
+            as_dst = types.named(TK_U32)
+        } else if nm == "as_u64" || nm == "to_u64" {
+            as_dst = types.named(TK_U64)
+        } else if nm == "as_f32" || nm == "to_f32" {
+            as_dst = types.named(TK_F32)
+        } else if nm == "as_f64" || nm == "to_f64" {
+            as_dst = types.named(TK_F64)
+        } else if nm == "as_i128" || nm == "to_i128" {
+            as_dst = types.named(TK_I128)
+        } else if nm == "as_u128" || nm == "to_u128" {
+            as_dst = types.named(TK_U128)
+        }
+        if as_dst >= 0 {
+            var av = tig_expr(call_arg(id, 0))
+            if av < 0 {
+                return -1
+            }
+            var at = node_types[call_arg(id, 0)]
+            // p.9.0-S.8 三族职责收口（对齐规范 §2.11）：
+            //   to_* 只做**数值类型转换**（参数必须是数值）；
+            //   as_* 只做**从 any 解包**（参数必须是 any）。
+            // 此前两组共用一个分支，靠「返回类型恰好兼容」实现双身份——
+            // as_i64 既做数值转换又做解包，与规范的三族正交划分不符。
+            var is_num_conv = nm == "to_i8" || nm == "to_i16" || nm == "to_i32" ||
+                nm == "to_i64" || nm == "to_i128" || nm == "to_u8" || nm == "to_u16" ||
+                nm == "to_u32" || nm == "to_u64" || nm == "to_u128" ||
+                nm == "to_f32" || nm == "to_f64"
+            if at == types.named(TK_ANY) {
+                if is_num_conv {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = nm + "() 是数值类型转换，不接受 any；从 any 解包请用 as_ 族"
+                    return -1
+                }
+                var ux = tig_unbox_any(av, as_dst, nm)
+                if ux < 0 {
+                    return -1
+                }
+                g_builtin_res = ux
+                return 0
+            }
+            // 文本实参（规范 §2.11）：to_i64(s) / to_f64(s) 是 to_ 族**唯一**的
+            // 文本入口，语义 = 十进制解析 + 解析失败触发内建检查（与越界/除零同一
+            // 失败语义，catch_panic 可捕）。其余宽度不提供隐式文本解析——窄化须
+            // 显式书写（to_i32(to_i64(s))），以免「解析」顺带做丢信息的截断。
+            // 此前该路径落到下面的「同型直通」，把字符串指针写进 i64/f64 槽 ⇒
+            // IR 非法，opt 报 `defined with type 'ptr' but expected 'i64'`（E00883）。
+            if at == types.named(TK_STR) {
+                if nm == "to_i64" || nm == "to_f64" {
+                    var pv = tig_str_num_checked(av, nm == "to_f64", nm, s_lines[id])
+                    if pv < 0 {
+                        return -1
+                    }
+                    g_builtin_res = pv
+                    return 0
+                }
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = nm + "() 不接受文本实参；文本解析只有 to_i64 / to_f64，窄化请显式嵌套"
+                return -1
+            }
+            if at >= 0 && (types.is_int(at) || types.is_float(at)) {
+                if !is_num_conv {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = nm + "() 只做从 any 解包；数值类型转换请用 to_ 族（如 to_i64）"
+                    return -1
+                }
+                if at == as_dst {
+                    g_builtin_res = av
+                    return 0
+                }
+                var cv = tig_coerce(av, at, as_dst)
+                if cv < 0 {
+                    return -1
+                }
+                g_builtin_res = cv
+                return 0
+            }
+            // 类型未知（泛型 typevar / 占位）→ 直通：具体类型要到实例化后才有，
+            // 此处无法判断表示宽度。
+            if at < 0 || types.kind(at) == types.K_TYPEVAR {
+                g_builtin_res = av
+                return 0
+            }
+            // i64 占位表示的句柄（actor/guard/future）→ 直通，宽度已是 i64。
+            var ak = types.kind(at)
+            if ak == types.K_ACTOR || ak == types.K_GUARD || ak == types.K_FUTURE {
+                g_builtin_res = av
+                return 0
+            }
+            // 其余具体类型（bool/char/trit/struct/table/slice/fn/…）：表示宽度不是
+            // i64/f64，直通必然产出宽度不匹配的 store。此前正是静默直通 ⇒ 用户只
+            // 看到 clang 的 E00883，指不到源码行；这里改为明确诊断。
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = nm + "() 的参数必须是数值，实际为 " + types.type_name(at)
+            return -1
+        }
+        // ---------- S1.3 checked_* 溢出检测族 ----------
+        if nm == "checked_add" || nm == "checked_sub" || nm == "checked_mul" ||
+        nm == "checked_div" || nm == "checked_shl" || nm == "checked_shr" ||
+        nm == "checked_neg" {
+            var cv2 = tig_checked(nm, id)
+            if cv2 < 0 {
+                return -1
+            }
+            g_builtin_res = cv2
+            return 0
+        }
+        // ---------- S1.3 checked_* 溢出检测族 ----------
+        if nm == "exec_code" { return bi_exec_code(nm, id) }
+        if nm == "time_now" { return bi_time_now(nm, id) }
+        if nm == "get_env" { return bi_get_env(nm, id) }
+        if nm == "exec_output" { return bi_exec_output(nm, id) }
+        if nm == "str_len" { return bi_str_len(nm, id) }
+        if nm == "char_code" { return bi_char_code(nm, id) }
+        if nm == "str_char" { return bi_str_char(nm, id) }
+        if nm == "str_from_code" { return bi_str_from_code(nm, id) }
+        // ---------- S2.1 字符串 {ptr,len} 原语 ----------
+        // 二进制安全字节访问 / UTF-8 码点解码 / StringBuilder（实现见文件尾 s21_* 组）。
+        // ---------- S2.1 字符串 {ptr,len} 原语 ----------
+        if nm == "str_byte" { return bi_str_byte(nm, id) }
+        if nm == "utf8_seq_len" { return bi_utf8_seq_len(nm, id) }
+        if nm == "utf8_char_at" { return bi_utf8_char_at(nm, id) }
+        // SSO 短串池回退 malloc 累计次数（dev33 批次3 验收探针用：断言 = 0）
+        if nm == "sso_malloc_count" { return bi_sso_malloc_count(nm, id) }
+        // 可捕获 panic（dev33 批次7 任务18）：catch_panic(f) -> bool
+        if nm == "catch_panic" { return bi_catch_panic(nm, id) }
+        // 闭包 → C 回调函数指针（dev33 批次8 任务23）：cb_ptr(f) -> string
+        if nm == "cb_ptr" { return bi_cb_ptr(nm, id) }
+        if nm == "string_builder" { return bi_string_builder(nm, id) }
+        if nm == "sb_append" { return bi_sb_append(nm, id) }
+        if nm == "sb_append_byte" { return bi_sb_append_byte(nm, id) }
+        if nm == "sb_build" { return bi_sb_build(nm, id) }
+        if nm == "sb_reset" { return bi_sb_reset(nm, id) }
+        if nm == "str_sub_bytes" { return bi_str_sub_bytes(nm, id) }
+        // ---------- 网络原语（P0：std/net）----------
+        // 参数签名：i=整数（窄整数 sext 到 i64）、s=字符串（ptr 直传）；桥符号 tie_<name>；
+        // net_close 返回 i8→bool（icmp ne），两个 recv 返回堆串（tig_stmt 统一 free），其余 i64。
+        if nm == "net_close" || nm == "net_tcp_accept" || nm == "net_tcp_connect" ||
+        nm == "net_tcp_listen" || nm == "net_tcp_recv" || nm == "net_tcp_send" ||
+        nm == "net_udp_bind" || nm == "net_udp_recv" || nm == "net_udp_send" ||
+        nm == "net_tcp_recv_bytes" || nm == "net_tcp_send_bytes" ||
+        nm == "net_udp_recv_bytes" || nm == "net_udp_send_bytes" {
+            // p.6.4.5：net_* 全部内联 Winsock2 直调（去 Rust 桥 tie_net_*）。
+            // 置位 g_used_wsock → driver 链 ws2_32（详见 tig_net_* helper）。
+            // r.1.6.4：Linux 目标走 POSIX socket 直调（g_asm_target 含 "linux"，
+            // 见 tig_is_linux），不置位——ws2_32 只在 Windows 链接分支消费。
+            if tig_is_linux() {
+                var lnet_wsock: i64 = 0  // Linux net 直调：零 wsock 标记
+            } else {
+                g_used_wsock = true
+            }
+            if nm == "net_close" {
+                // 单参句柄 → closesocket（0=成功）→ bool
+                var h = tig_expr(call_arg(id, 0))
+                if h < 0 {
+                    return -1
+                }
+                var ht = node_types[call_arg(id, 0)]
+                if ht != types.named(TK_I64) && ht != types.named(TK_U64) && ht >= 0 {
+                    var sh = tig_sext(h, ht, types.named(TK_I64))
+                    if sh < 0 {
+                        return -1
+                    }
+                    h = sh
+                }
+                g_builtin_res = tig_net_close(h)
+                return 0
+            }
+            // 通用参值提取：i 整数（窄 sext→i64）、s 串/表（ptr 直传）
+            var pat: table<string> = table_new_string()
+            if nm == "net_udp_send" || nm == "net_udp_send_bytes" {
+                table_push(pat, "i")
+                table_push(pat, "s")
+                table_push(pat, "i")
+                table_push(pat, "s")
+            } else if nm == "net_tcp_connect" {
+                table_push(pat, "s")
+                table_push(pat, "i")
+            } else if nm == "net_tcp_send" || nm == "net_tcp_send_bytes" {
+                table_push(pat, "i")
+                table_push(pat, "s")
+            } else if nm == "net_tcp_recv" || nm == "net_udp_recv" ||
+            nm == "net_tcp_recv_bytes" || nm == "net_udp_recv_bytes" {
+                table_push(pat, "i")
+                table_push(pat, "i")
+            } else {
+                // listen/accept/udp_bind：单 i 参（句柄/端口）
+                table_push(pat, "i")
+            }
+            var avs: table<i64> = table_new_i64()
+            var k: i64 = 0
+            while k < len(pat) {
+                var a = call_arg(id, k)
+                var v = tig_expr(a)
+                if v < 0 {
+                    return -1
+                }
+                if pat[k] == "i" {
+                    var vt = node_types[a]
+                    if vt != types.named(TK_I64) && vt != types.named(TK_U64) && vt >= 0 {
+                        var sv = tig_sext(v, vt, types.named(TK_I64))
+                        if sv < 0 {
+                            return -1
+                        }
+                        v = sv
+                    }
+                }
+                table_push(avs, v)
+                k = k + 1
+            }
+            // 按原语分派内联实现
+            if nm == "net_tcp_listen" {
+                g_builtin_res = tig_net_tcp_listen(avs[0])
+            } else if nm == "net_tcp_accept" {
+                g_builtin_res = tig_net_tcp_accept(avs[0])
+            } else if nm == "net_tcp_connect" {
+                g_builtin_res = tig_net_tcp_connect(avs[0], avs[1])
+            } else if nm == "net_tcp_send" {
+                g_builtin_res = tig_net_tcp_send(avs[0], avs[1])
+            } else if nm == "net_tcp_recv" {
+                g_builtin_res = tig_net_tcp_recv(avs[0], avs[1])
+            } else if nm == "net_tcp_send_bytes" {
+                g_builtin_res = tig_net_tcp_send_bytes(avs[0], avs[1])
+            } else if nm == "net_tcp_recv_bytes" {
+                g_builtin_res = tig_net_tcp_recv_bytes(avs[0], avs[1])
+            } else if nm == "net_udp_bind" {
+                g_builtin_res = tig_net_udp_bind(avs[0])
+            } else if nm == "net_udp_send" {
+                g_builtin_res = tig_net_udp_send(avs[0], avs[1], avs[2], avs[3])
+            } else if nm == "net_udp_recv" {
+                g_builtin_res = tig_net_udp_recv(avs[0], avs[1])
+            } else if nm == "net_udp_send_bytes" {
+                g_builtin_res = tig_net_udp_send_bytes(avs[0], avs[1], avs[2], avs[3])
+            } else if nm == "net_udp_recv_bytes" {
+                g_builtin_res = tig_net_udp_recv_bytes(avs[0], avs[1])
+            } else {
+                g_builtin_res = tig_net_close(avs[0])
+            }
+            return 0
+        }
+        // ---------- 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）----------
+        // load_library(name) -> i64：宽名缓冲 + LoadLibraryW（kernel32；失败 0）。
+        // get_proc(handle, name) -> i64：GetProcAddress（kernel32；失败 0）。
+        // dyn_call / dyn_call_p（addr + 5×i64 实参）-> i64：op73 动态 C 调用
+        // （字符串实参按 TK_STR 原样传 ptr = const char*；整数传 i64；可空指针传 0）。
+        // cstr_to_string(addr) -> string：NUL 结尾 C 字符串 → tie 字符串。
+        // ---------- 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥） ----------
+        if nm == "load_library" { return bi_load_library(nm, id) }
+        if nm == "get_proc" { return bi_get_proc(nm, id) }
+        if nm == "dyn_call" || nm == "dyn_call_p" {
+            var T64 = types.named(TK_I64)
+            var retmode: i64 = 0
+            if nm == "dyn_call_p" {
+                retmode = 1
+            }
+            // 先求值全部 6 个实参（避免 add_operand 段交错：常量/求值必须发生在
+            // 一切 new_inst+add_operand 序列之前）
+            var avs: table<i64> = table_new_i64()
+            var atys: table<i64> = table_new_i64()
+            var k: i64 = 0
+            while k < 6 {
+                var anode = call_arg(id, k)
+                var av = tig_expr(anode)
+                if av < 0 {
+                    return -1
+                }
+                var at = node_types[anode]
+                if at == types.named(TK_STR) {
+                    // 字符串实参：按 TK_STR 传（llvmgen 渲染 ptr <ref> = const char*），
+                    // 零拷贝直传 tie 字符串数据指针（{ptr,len} 布局 + 尾 NUL 兼容 C）
+                    table_push(atys, at)
+                    table_push(avs, av)
+                } else {
+                    if at != T64 && at != types.named(TK_U64) && at >= 0 {
+                        var sa = tig_sext(av, at, T64)
+                        if sa < 0 {
+                            return -1
+                        }
+                        av = sa
+                    }
+                    table_push(atys, T64)
+                    table_push(avs, av)
+                }
+                k = k + 1
+            }
+            // addr（实参 0）inttoptr → ptr（op73 entry 值）
+            var fp = ir.new_inst(g_cur_block, 25, T64)
+            ir.add_operand(fp, avs[0], 0)
+            var fpv = ir.get_value(fp)
+            var inst = ir.new_inst(g_cur_block, 73, T64)
+            ir.add_operand(inst, fpv, 0)
+            ir.add_operand(inst, retmode, 2)
+            var k2: i64 = 1
+            while k2 < 6 {
+                ir.add_operand(inst, atys[k2], 2)
+                ir.add_operand(inst, avs[k2], 0)
+                k2 = k2 + 1
+            }
+            g_builtin_res = ir.get_value(inst)
+            return 0
+        }
+        if nm == "cstr_to_string" { return bi_cstr_to_string(nm, id) }
+        return -1  // 本段未命中
+    }
+}

@@ -1,0 +1,209 @@
+type tie<class>
+// compiler/dbug/dbgem.tie —— 结构化输出主入口（p.9.22.1）
+// ============================================================
+// tiec 阶段数据（tokens/ast/symtab/diag）的 td/zd 双形态落盘器（dbgem）。
+// 设计稿：docs/superpowers/specs/2026-09-25-structured-output-tinker-design.md。
+//
+// # 组成（p.9.21 模块纪律：主文件持全局 + import 树 + 分派薄壳）
+//   dbgem_colzd.tie 列登记 + zd 列编码（push 式直写）
+//   dbgem_coltd.tie td 可读投影（tie:data 表字面量，可解析回校验）
+//   dbgem_env.tie   信封（1-5 字段）与 zd 记录组装/落盘
+//   dbgem_ast.tie   ast / tokens 阶段构建
+//   dbgem_diag.tie  diag 阶段构建（解析错误槽注入）
+//   dbgem_sym.tie   symtab 阶段构建（sstate 直拷 + xref）与伴生 .sym.zd
+//
+// # CLI（driver/cli_args 解析）
+//   --emit <stage>:<fmt>（可重复）· --emit-only · --no-sym
+//
+// # 失败语义
+//   dump 失败只打印不改变编译退出码（辅助输出不阻塞构建）；--emit-only 时
+//   全流程即 dump，退出码随前端成败。
+
+// ==================== 全局（主文件持） ====================
+// 列登记（dbgem_colzd 登记；dbgem_env / dbgem_coltd 消费）。
+pub var dc_fno: table<i64>;       // 列字段号
+pub var dc_kind: table<i64>;      // 0=i64 1=str
+pub var dc_label: table<string>;  // td 键（语义名）
+pub var dc_len: table<i64>;       // 列行数
+pub var dc_off: table<i64>;       // 列在扁平段起点
+pub var dc_i64: table<i64>;       // i64 列数据（扁平）
+pub var dc_str: table<string>;    // str 列数据（扁平）
+pub var dc_ids: table<i64>;       // str 列源池 id（tieir 段 8 用；-1 = 非池来源）
+// 注：标量全局必须带初始值（语法要求）；初值**不生效**（tie 全局 var 初值
+// 不运行）——真实初值由 boot()/cols_reset() 显式置位。
+pub var dg_sym_ready: i64 = 0;    // symtab 列就绪标记（1 = tieir 段 8 可写）
+// 解析错误槽（driver 解析失败路径经 set_err_proto 注入；diag 来源优先级：
+// 本槽 > sm_err_*）。
+pub var dg_err_line: i64 = -1;
+pub var dg_err_col: i64 = -1;
+pub var dg_err_msg: string = "";
+
+import "./dbgem_colzd.tie"
+import "./dbgem_coltd.tie"
+import "./dbgem_env.tie"
+import "./dbgem_ast.tie"
+import "./dbgem_diag.tie"
+import "./dbgem_sym.tie"
+
+namespace dbgem {
+
+// 显式初始化（全局 var 初值不生效；driver 在编译入口调用，幂等）。
+pub func boot() {
+    cols_reset()
+    dg_err_line = -1
+    dg_err_col = -1
+    dg_err_msg = ""
+}
+
+// ==================== 规格拆分 / 查验 ====================
+
+// "stage:fmt" 的 ':' 前段（无 ':' → 整串）。
+pub func spec_stage(spec: string) -> string {
+    var n = str_len(spec)
+    var i: i64 = 0
+    while i < n {
+        if str_char(spec, i) == ":" {
+            return str.slice(spec, 0, i)
+        }
+        i = i + 1
+    }
+    return spec
+}
+
+// "stage:fmt" 的 ':' 后段（无 ':' → 空串）。
+pub func spec_fmt(spec: string) -> string {
+    var n = str_len(spec)
+    var i: i64 = 0
+    while i < n {
+        if str_char(spec, i) == ":" {
+            return str.slice(spec, i + 1, n)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 阶段名 → 阶段枚举（tokens 1 / ast 2 / symtab 3 / diag 4；未知 0）。
+pub func stage_of(st: string) -> i64 {
+    if st == "tokens" {
+        return 1
+    }
+    if st == "ast" {
+        return 2
+    }
+    if st == "symtab" {
+        return 3
+    }
+    if st == "diag" {
+        return 4
+    }
+    return 0
+}
+
+// ==================== 落盘分派（薄壳） ====================
+
+// 单规格落盘。only_diag = 1（解析失败路径）时只跑 diag。
+// 返回 0 成功/跳过；-1 落盘失败（打印已出）。
+pub func dump_one(st: string, fmt: string, only_diag: i64) -> i64 {
+    if st == "diag" {
+        build_diag()
+    } else if st == "tokens" {
+        if only_diag == 1 {
+            return 0
+        }
+        build_tokens()
+    } else if st == "ast" {
+        if only_diag == 1 {
+            return 0
+        }
+        build_ast()
+    } else if st == "symtab" {
+        if only_diag == 1 {
+            return 0
+        }
+        build_sym()
+    } else {
+        return 0
+    }
+    if fmt == "zd" {
+        var p = emit_path(st, "zd")
+        if zd_write(stage_of(st), p) {
+            dbg_txt("[emit] " + p)
+            return 0
+        }
+        dbg_txt(diagcode.render_error(-1, -1, "结构化输出落盘失败: " + p))
+        return -1
+    }
+    if fmt == "td" {
+        var p2 = emit_path(st, "td")
+        if td_write(stage_of(st), st, p2) {
+            dbg_txt("[emit] " + p2)
+            return 0
+        }
+        dbg_txt(diagcode.render_error(-1, -1, "结构化输出落盘失败: " + p2))
+        return -1
+    }
+    return 0
+}
+
+// 规格 → zd 记录字节（tinker stage 帧复用同一套记录；不落盘）。
+pub func spec_record_bytes(st: string) -> table<i64> {
+    if st == "tokens" {
+        build_tokens()
+    } else if st == "ast" {
+        build_ast()
+    } else if st == "symtab" {
+        build_sym()
+    } else if st == "diag" {
+        build_diag()
+    } else {
+        return table_new_i64()
+    }
+    return zd_record(stage_of(st))
+}
+
+// 跑全部 --emit 请求（前端出口调用；only_diag = 1 为解析失败路径）。
+pub func run_emit_dumps(only_diag: i64) -> i64 {
+    if len(g_emit_specs) == 0 {
+        return 0
+    }
+    var i: i64 = 0
+    while i < len(g_emit_specs) {
+        dump_one(spec_stage(g_emit_specs[i]), spec_fmt(g_emit_specs[i]), only_diag)
+        i = i + 1
+    }
+    return 0
+}
+
+// 伴生符号表出口（前端成功后调用；library/class 且未 --no-sym 时写 .sym.zd）。
+pub func run_sidecar() -> i64 {
+    if sym_sidecar_wanted() != 1 {
+        return 0
+    }
+    if xref.enabled() != 1 {
+        return 0
+    }
+    return write_sym_sidecar()
+}
+
+// ==================== 采集门判据（driver 单点调用） ====================
+
+// 是否需要开启 xref 采集（--emit symtab / tieir 段 8 / trm 目标 / 伴生 .sym.zd）。
+pub func sym_wanted() -> i64 {
+    var i: i64 = 0
+    while i < len(g_emit_specs) {
+        if spec_stage(g_emit_specs[i]) == "symtab" {
+            return 1
+        }
+        i = i + 1
+    }
+    if str_len(g_tieir_out) > 0 || g_trm_mode {
+        return 1
+    }
+    if sym_sidecar_wanted() == 1 {
+        return 1
+    }
+    return 0
+}
+
+}   // namespace dbgem

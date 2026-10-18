@@ -1,0 +1,167 @@
+type tie<class>
+// compiler/frontend/parser.tie —— 自举 v2 T2.5：完整语法分析器（模块拆分后主入口）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5（.omo/plans/self-hosting-v2.md）。由 T1.2 原型
+// compiler/proto/parser.tie 升版（6/6 文件 AST 与 Rust 一致），行为基准
+// Rust crates/tie-frontend/src/parser.rs（语法错误消息逐字对齐）。
+// # 模块拆分（2026-08-11）：原 2877 行单文件按「无环 import 树」拆为 4 模块——
+//   pst.tie（全局状态）/ putil.tie（token 流/工具/describe）/
+//   pexpr.tie（表达式/类型解析）/ pstmt.tie（语句解析）/
+//   本文件（parse 主入口 + 协议输出 + parse_debug）。
+//   本文件只 import ./pstmt.tie，其余经树传递可达（唯一路径防重复定义）。
+// # 相比原型改造：
+//   - 节点池复用 ast.tie（T2.1，删除 proto 自带 9 表）；
+//   - token 流由「协议文本 re-parse」改为 putil.fill_pending 直接消费
+//     lexer 列式表（T2.4 正式版）；
+//   - 语法错误消息统一走 errors.tie syn_*（对齐 Rust parser.rs）。
+// # 协议（parse 返回值，T2.6 语义单遍将消费）：
+//   首行 <N>:（N = 节点总数）
+//   之后每行：<id> <tag> <name_id> <val> <aux> <line> <col> <nchild> <c1> <c2>...
+//   语法错误：ERR:<line> <col> <message>（对齐 Rust「语法错误 @行:列: 消息」）。
+import "./textutil.tie"
+import "./pstmt_top.tie"
+
+namespace parser {
+
+// ---------- 主入口 ----------
+
+// 主入口：token 流 → AST 协议文本。
+// 前提：lexer 列式 token 表已被 lexer.tokenize/run_lex 填充（parse_src 内部完成）。
+// proto_text 仅用于调试透传（词法错误 ERR 原样返回）。
+pub func parse(proto_text: string) -> string {
+    if putil.has_prefix(proto_text, "ERR:") {
+        return proto_text
+    }
+    ast.reset()
+    g_pos = 0
+    g_pending_idx = 0
+    g_tmp = 0
+    p_err_msg = ""
+    putil.fill_pending()
+    var root = pstmt_top.parse_program()
+    if root < 0 {
+        return putil.err_protocol()
+    }
+    var bp = build_protocol()
+    return bp
+}
+
+// 便捷入口：源码字符串 → 词法 + 语法 → AST 协议文本（T2.6/验收程序用）
+pub func parse_src(src: string) -> string {
+    var ok = lexer.run_lex(src)
+    if !ok {
+        // 词法错误：直接读 lexer 的全局错误槽（词法失败时 token 表不可靠）
+        return "ERR:" + to_string(g_err_line) + " " + to_string(g_err_col) + " " + g_err_msg
+    }
+    var pr = parse("")
+    return pr
+}
+
+// 内存版便捷入口：源码字符串 → 词法 + 语法 → AST 节点池（保留在 ast 内存，
+// 不产出协议文本；T5.3 消除 AST 文本协议往返的性能优化）。
+// 返回 0 成功；-1 失败。失败时错误信息在错误槽位中：
+//   - 词法错误：lexer 的 g_err_line/g_err_col/g_err_msg（run_lex 返回 false）
+//   - 语法错误：putil 的 p_err_line/p_err_col/p_err_msg（parse_program 返回负）
+// 错误协议文本统一用 ast_err_protocol() 组装（与 parse_src 返回格式一致）。
+// 语义与 parse_src 完全等价：内部逻辑逐行对齐 parse_src → parse("") 的
+// 语法分析主体（ast.reset + 游标重置 + fill_pending + parse_program），仅省略
+// 末尾 build_protocol() 的文本序列化——AST 留在 ast 全局节点池，由
+// semantic.copy_ast_tables / append_ast_mem 直接内存复制，省去大文件（3000+
+// 节点）每次编译数千次 to_string/parse + 子串分配。
+pub func parse_ast(src: string) -> i64 {
+    var ok = lexer.run_lex(src)
+    if !ok {
+        // 词法错误：lexer 错误槽已置，直接返回 -1（与 parse_src 一致——
+        // 词法失败时 token 表不可靠，不进入语法分析）
+        return -1
+    }
+    return parse_ast_lexed()
+}
+
+// 内存版第二段：词法已完成（run_lex 成功），继续 fill_pending + parse_program。
+// 与 parse_ast 后半段完全一致（ast.reset + 游标重置 + fill_pending +
+// parse_program），供 semantic 的 import 展开细分计时（lex 与语法构建分开
+// 计量）复用；错误槽位语义与 parse_ast 相同（语法错误读 putil 槽）。
+pub func parse_ast_lexed() -> i64 {
+    var f = parse_ast_lexed_stage1()
+    if f < 0 {
+        return -1
+    }
+    return parse_ast_lexed_stage2()
+}
+
+// 内存版第 1 段：reset + fill_pending（token 列式表 → pending 队列）。
+// 供 semantic 细分计时（lex / fill / program 三段）。
+pub func parse_ast_lexed_stage1() -> i64 {
+    // —— 以下与 parse("") 的主体完全一致（parse 对 "" 的 "ERR:" 前缀检查
+    //   恒不命中，故省略该检查直接展开其内部逻辑）——
+    ast.reset()
+    g_pos = 0
+    g_pending_idx = 0
+    g_tmp = 0
+    p_err_msg = ""
+    putil.fill_pending()
+    return 0
+}
+
+// 内存版第 2 段：parse_program（语法构建，AST 留在节点池）。
+// 错误槽位语义与 parse_ast 相同（语法错误读 putil 槽）。
+pub func parse_ast_lexed_stage2() -> i64 {
+    var root = pstmt_top.parse_program()
+    if root < 0 {
+        // 语法错误：putil 错误槽已置
+        return -1
+    }
+    // 成功：AST 节点池保留在 ast 全局表内存中，不做 build_protocol 序列化
+    return 0
+}
+
+// 组装最近一次 parse_ast 失败的错误协议文本：ERR:<line> <col> <msg>。
+// 格式对齐 parse_src 的返回（词法错误 "ERR:line col msg" 直接拼 lexer 槽；
+// 语法错误走 putil.err_protocol()，两者最终文本一致），供 driver.err_span 与
+// semantic 的 import 展开错误消息复用。
+// 词法/语法判定：parse_ast 走到语法阶段前 run_lex 必已成功——run_lex 每次
+// 开头把 g_err_msg 清空，故 g_err_msg 非空 ⇔ 本次是词法错误；
+// 语法错误时 g_err_msg 必为 ""，此时读取 putil 语法错误槽。
+pub func ast_err_protocol() -> string {
+    if lexer.lex_err_msg() != "" {
+        // 词法错误：直接拼 lexer 的 g_err_* 槽（对齐 parse_src 的词法分支）
+        return "ERR:" + to_string(lexer.lex_err_line()) + " " +
+            to_string(lexer.lex_err_col()) + " " + lexer.lex_err_msg()
+    }
+    // 语法错误：putil.err_protocol() 组装 p_err_* 槽
+    return putil.err_protocol()
+}
+
+// 可读 AST 树形输出（缩进展示 tag 名 + lexeme + span + 顶层语句序列），供人工对比
+pub func parse_debug(src: string) -> string {
+    var ok = lexer.run_lex(src)
+    if !ok {
+        return "ERR:" + to_string(g_err_line) + " " + to_string(g_err_col) + " " + g_err_msg
+    }
+    ast.reset()
+    g_pos = 0
+    g_pending_idx = 0
+    g_tmp = 0
+    p_err_msg = ""
+    putil.fill_pending()
+    var root = pstmt_top.parse_program()
+    if root < 0 {
+        return putil.err_protocol()
+    }
+    var out: string = "共 " + to_string(ast.count()) + " 个节点，顶层 " +
+        to_string(ast.child_count(root)) + " 条语句\n"
+    out = out + "顶层语句 tag 序列: " + top_seq(root) + "\n"
+    out = out + dump_node(root, 0) + "\n"
+    return out
+}
+
+// ---------- 树形输出（parse_debug 用）----------
+
+
+// ---------- AST 协议输出 ----------
+
+
+}
+
+import "./parser_p1.tie"

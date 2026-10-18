@@ -1,0 +1,48 @@
+func main() {
+    // p.9.11.32 alias 验收（由新编译器编译运行）
+    // ① 非泛型别名：类型标注位透明替换
+    var m: Matrix = table_new_f64()
+    table_push(m, 1.5)
+    table_push(m, 2.5)
+    if sum(m) == 4.0 {
+        println("a:OK1")
+    } else {
+        println("a:FAIL1")
+    }
+    // ② 泛型别名：Pair<i64> → (i64, i64)
+    var p: Pair<i64> = (3, 4)
+    var q = swap(p)
+    if q.0 == 4 && q.1 == 3 && p.0 == 3 {
+        println("a:OK2")
+    } else {
+        println("a:FAIL2")
+    }
+    // ③ 别名间赋值透明（同为底层类型）
+    var m2: Matrix = m
+    table_push(m2, 0.5)
+    if len(m) == 3 && len(m2) == 3 {
+        println("a:OK3")
+    } else {
+        println("a:FAIL3")
+    }
+}
+
+// 表别名：Matrix ≡ table<f64>
+alias Matrix = table<f64>
+
+// 元组别名：Pair<T> ≡ (T, T)
+alias Pair<T> = (T, T)
+
+func sum(m: Matrix) -> f64 {
+    var t: f64 = 0.0
+    var i: i64 = 0
+    while i < len(m) {
+        t = t + m[i]
+        i = i + 1
+    }
+    return t
+}
+
+func swap(p: Pair<i64>) -> Pair<i64> {
+    return (p.1, p.0)
+}

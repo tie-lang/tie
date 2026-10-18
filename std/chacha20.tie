@@ -1,0 +1,202 @@
+type tie<class>
+// std/chacha20.tie —— ChaCha20-Poly1305 AEAD（RFC 8439；命名空间 chacha20）
+// 提供：块函数（64B keystream）、流加密（32 位初始计数器）、AEAD（96 位 nonce；
+//   IETF 构造：otk = block(key,nonce,0) 前 32B；密文自计数器 1 起；tag 16B）。
+// 用途：tink v3 Secure 默认套件 TINK_CHACHA20_POLY1305_SHA256 的 AEAD 原语。
+// 实现纪律：32 位字全 i64 承载（每步 & 0xFFFFFFFF 恒正）；旋转 = (v<<n)|(v>>(32-n))；
+//   tag 比较走常数时间累加（无早退分支）。
+// KAT：RFC 8439 §2.3.2 / §2.4.2 / §2.5.2 / §2.8.2 全向量（见 std/tink_aead_probe.tie）。
+
+import "./bytes.tie" as bytes
+import "./poly1305.tie" as poly
+
+namespace chacha20 {
+
+// ---------- 基础 ----------
+
+// 32 位循环左移
+func rotl(v: i64, n: i64) -> i64 {
+    return ((v << n) | (v >> (32 - n))) & 0xFFFFFFFF
+}
+
+// 四分之一轮（就地）
+func qr(ref s: table<i64>, a: i64, b: i64, c: i64, d: i64) {
+    s[a] = (s[a] + s[b]) & 0xFFFFFFFF
+    s[d] = rotl(s[d] ^ s[a], 16)
+    s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+    s[b] = rotl(s[b] ^ s[c], 12)
+    s[a] = (s[a] + s[b]) & 0xFFFFFFFF
+    s[d] = rotl(s[d] ^ s[a], 8)
+    s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+    s[b] = rotl(s[b] ^ s[c], 7)
+}
+
+// ChaCha20 块函数 → 64 字节 keystream（LE 序列化）
+pub func block(key_hex: string, nonce_hex: string, counter: i64) -> table<i64> {
+    var st = table_new_i64()
+    table_push(st, 0x61707865)
+    table_push(st, 0x3320646e)
+    table_push(st, 0x79622d32)
+    table_push(st, 0x6b206574)
+    var kb = bytes.from_hex(key_hex)
+    var i: i64 = 0
+    while i < 8 {
+        var v: i64 = 0
+        var j: i64 = 0
+        while j < 4 {
+            var bx: i64 = 0
+            if i * 4 + j < len(kb) { bx = kb[i * 4 + j] & 0xFF }
+            v = v | (bx << (8 * j))
+            j = j + 1
+        }
+        table_push(st, v)
+        i = i + 1
+    }
+    table_push(st, counter & 0xFFFFFFFF)
+    var nb = bytes.from_hex(nonce_hex)
+    i = 0
+    while i < 3 {
+        var v2: i64 = 0
+        var j2: i64 = 0
+        while j2 < 4 {
+            var bx2: i64 = 0
+            if i * 4 + j2 < len(nb) { bx2 = nb[i * 4 + j2] & 0xFF }
+            v2 = v2 | (bx2 << (8 * j2))
+            j2 = j2 + 1
+        }
+        table_push(st, v2)
+        i = i + 1
+    }
+    var wk = table_new_i64()
+    i = 0
+    while i < 16 {
+        table_push(wk, st[i])
+        i = i + 1
+    }
+    var r: i64 = 0
+    while r < 10 {
+        qr(wk, 0, 4, 8, 12)
+        qr(wk, 1, 5, 9, 13)
+        qr(wk, 2, 6, 10, 14)
+        qr(wk, 3, 7, 11, 15)
+        qr(wk, 0, 5, 10, 15)
+        qr(wk, 1, 6, 11, 12)
+        qr(wk, 2, 7, 8, 13)
+        qr(wk, 3, 4, 9, 14)
+        r = r + 1
+    }
+    var out = table_new_i64()
+    i = 0
+    while i < 16 {
+        var v3 = (wk[i] + st[i]) & 0xFFFFFFFF
+        var j3: i64 = 0
+        while j3 < 4 {
+            table_push(out, (v3 >> (8 * j3)) & 0xFF)
+            j3 = j3 + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 流加密/解密：自 counter 起逐块 XOR（计数器不回绕由调用方纪律保证）
+pub func xor_stream(key_hex: string, nonce_hex: string, counter: i64, data: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var n = len(data)
+    var pos: i64 = 0
+    var ctr = counter
+    while pos < n {
+        var ks = block(key_hex, nonce_hex, ctr)
+        var i: i64 = 0
+        while i < 64 && pos + i < n {
+            table_push(out, (data[pos + i] & 0xFF) ^ ks[i])
+            i = i + 1
+        }
+        pos = pos + 64
+        ctr = ctr + 1
+    }
+    return out
+}
+
+// ---------- AEAD（RFC 8439 §2.8） ----------
+
+// MAC 输入：aad ‖ pad16 ‖ ct ‖ pad16 ‖ u64le(len aad) ‖ u64le(len ct)（二进制安全串）
+func mac_input(aad: table<i64>, ct: table<i64>) -> string {
+    var sb = string_builder()
+    var i: i64 = 0
+    while i < len(aad) {
+        sb_append_byte(sb, aad[i] & 0xFF)
+        i = i + 1
+    }
+    while i % 16 != 0 {
+        sb_append_byte(sb, 0)
+        i = i + 1
+    }
+    var j: i64 = 0
+    while j < len(ct) {
+        sb_append_byte(sb, ct[j] & 0xFF)
+        j = j + 1
+    }
+    while j % 16 != 0 {
+        sb_append_byte(sb, 0)
+        j = j + 1
+    }
+    var la = len(aad)
+    var lc = len(ct)
+    var k: i64 = 0
+    while k < 8 {
+        sb_append_byte(sb, (la >> (8 * k)) & 0xFF)
+        k = k + 1
+    }
+    k = 0
+    while k < 8 {
+        sb_append_byte(sb, (lc >> (8 * k)) & 0xFF)
+        k = k + 1
+    }
+    return sb_build(sb)
+}
+
+// tag = Poly1305(block(key,nonce,0)[0..32], MAC 输入) → hex
+pub func aead_mac(key_hex: string, nonce_hex: string, aad: table<i64>, ct: table<i64>) -> string {
+    var b0 = block(key_hex, nonce_hex, 0)
+    var ok = table_new_i64()
+    var i: i64 = 0
+    while i < 32 {
+        table_push(ok, b0[i])
+        i = i + 1
+    }
+    return poly.poly1305(bytes.to_hex(ok), mac_input(aad, ct))
+}
+
+// 常数时间字节相等（积累式，无早退）
+pub func ct_eq(a: table<i64>, b: table<i64>) -> bool {
+    if len(a) != len(b) { return false }
+    var d: i64 = 0
+    var i: i64 = 0
+    while i < len(a) {
+        d = d | ((a[i] ^ b[i]) & 0xFF)
+        i = i + 1
+    }
+    return d == 0
+}
+
+// 密封：→ ct ‖ tag（密文自计数器 1 起；otk 用计数器 0）
+pub func aead_seal(key_hex: string, nonce_hex: string, aad: table<i64>, pt: table<i64>) -> table<i64> {
+    var ct = xor_stream(key_hex, nonce_hex, 1, pt)
+    var tag_hex = aead_mac(key_hex, nonce_hex, aad, ct)
+    return bytes.concat(ct, bytes.from_hex(tag_hex))
+}
+
+// 开启：(ok, pt)；tag 不符 → (0, 空)
+pub func aead_open(key_hex: string, nonce_hex: string, aad: table<i64>, ct_tag: table<i64>) -> (i64, table<i64>) {
+    var empty = table_new_i64()
+    var n = len(ct_tag)
+    if n < 16 { return (0, empty) }
+    var ct = bytes.slice(ct_tag, 0, n - 16)
+    var tag = bytes.slice(ct_tag, n - 16, n)
+    var th = aead_mac(key_hex, nonce_hex, aad, ct)
+    if !ct_eq(bytes.from_hex(th), tag) { return (0, empty) }
+    return (1, xor_stream(key_hex, nonce_hex, 1, ct))
+}
+
+}   // namespace chacha20

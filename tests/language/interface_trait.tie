@@ -1,0 +1,106 @@
+type tie<logic, unsafe:mem>
+
+// ============================================================
+// p.9.11.21 interface/trait 轻量化正例：结构性接口（鸭子多态的类型安全升级）
+//
+// 语法：`interface Name { pub func 签名... }`（方法签名集合，第一参 self，
+// 无函数体——与 S2.4 port 同形态；新关键字 interface，tag 106）。
+// 语义：**结构性隐式实现**——struct/enum 的命名空间方法签名兼容（方法名 +
+// 参数 + 返回，首参 auto-ref 对齐）即算实现 interface，无需显式 impl 块。
+// 消费：①泛型约束 `<T: Drawable>`（约束校验走结构性判定，静态分派展开到
+// 具体类型方法）；②接口对象（unsafe 提升 var d: Drawable = 实例，复用
+// S2.4 vtable 动态分发——首次结构性判定通过自动合成 impl 记录，后端零改动）。
+// ============================================================
+
+interface Drawable {
+    pub func draw(self, ctx: i64)
+    pub func area(self) -> i64
+}
+interface Named {
+    pub func name(self) -> string
+}
+
+struct Circle {
+    var r: i64 = 0
+}
+namespace Circle {
+    pub func draw(self: Circle, ctx: i64) {
+        // 绘制占位（ctx = 画布 id）
+    }
+    pub func area(self: Circle) -> i64 {
+        return 3 * self.r * self.r
+    }
+    pub func name(self: Circle) -> string {
+        return "circle"
+    }
+}
+
+struct Rect {
+    var w: i64 = 0
+    var h: i64 = 0
+}
+namespace Rect {
+    pub func draw(self: Rect, ctx: i64) {
+    }
+    pub func area(self: Rect) -> i64 {
+        return self.w * self.h
+    }
+    pub func name(self: Rect) -> string {
+        return "rect"
+    }
+}
+
+// enum 关联方法（p.9.11.20）实现 interface：结构性判定支持 K_ENUM
+enum Shape {
+    Round(i64)
+    Box(i64, i64)
+}
+namespace Shape {
+    pub func draw(self: Shape, ctx: i64) {
+    }
+    pub func area(self: Shape) -> i64 {
+        switch self {
+            case Round(r):
+                return r * r
+            case Box(w, h):
+                return w * h
+        }
+    }
+    pub func name(self: Shape) -> string {
+        return "shape"
+    }
+}
+
+// 泛型约束消费 interface（静态分派：实例化时校验 T 实现 Drawable/Named）
+func area_of<T: Drawable>(x: T) -> i64 {
+    return x.area()
+}
+func label<T: Named>(x: T) -> string {
+    return x.name()
+}
+
+func main() {
+    var c = Circle()
+    c.r = 3
+    println(area_of(c))     // 27
+    println(label(c))       // circle
+    var r = Rect()
+    r.w = 3
+    r.h = 4
+    println(area_of(r))     // 12
+    println(label(r))       // rect
+    var s = Shape.Round(5)
+    println(area_of(s))     // 25
+    println(label(s))       // shape
+    // 接口对象：unsafe 提升（结构性实现，无 impl 块）+ vtable 动态分发
+    unsafe {
+        var d: Drawable = c
+        println(d.area())   // 27（动态分发 vt.Drawable.Circle）
+        d.draw(1)
+        var d2: Drawable = d   // 接口对象拷贝（指针拷贝，无新借用）
+        println(d2.area())     // 27
+        var n: Named = c
+        println(n.name())      // circle
+    }
+    println("done")
+}

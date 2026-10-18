@@ -1,0 +1,55 @@
+type tie<tsc>
+
+// p.9.11 `..=` 闭区间确认探针（ROAD §2.1：716c961 重进后的行为锁定）。
+// 覆盖：for-in 闭区间 / start==end / switch 表达式区间臂 / 语句位区间模式 /
+//       interp 侧 `..=` 模式匹配（经 interp.eval）。
+// 断言自包含：全部通过打印 VERDICT OK，任一失败打印 F<n> 细节并 exit(1)。
+
+import "../../compiler/tiep/tiep.tie"
+
+func main() -> i64 {
+    var ok: i64 = 0
+    // 1. for-in 闭区间含端点：0..=5 求和 = 15
+    var s: i64 = 0
+    for i in 0..=5 { s = s + i }
+    if s == 15 { ok = ok + 1 } else { println("F1 sum=" + to_string(s)) }
+    // 2. start == end 闭区间恰执行一次（5..=5）
+    var c: i64 = 0
+    for i in 5..=5 { c = c + 1 }
+    if c == 1 { ok = ok + 1 } else { println("F2 cnt=" + to_string(c)) }
+    // 3. switch 表达式：闭区间臂命中上界
+    var g = switch 7 { 1..=3 -> "lo", 4..=9 -> "mid", _ -> "hi" }
+    if g == "mid" { ok = ok + 1 } else { println("F3 g=" + g) }
+    // 4. switch 表达式：`..` 左闭右开不命中上界
+    var h = switch 9 { 4..9 -> "half", 9..=9 -> "edge", _ -> "no" }
+    if h == "edge" { ok = ok + 1 } else { println("F4 h=" + h) }
+    // 5. 语句位 switch：case 4..=6: 命中
+    var hit: i64 = 0
+    var v: i64 = 5
+    switch v {
+        case 1..=3: hit = 1
+        case 4..=6: hit = 2
+        default: hit = 3
+    }
+    if hit == 2 { ok = ok + 1 } else { println("F5 hit=" + to_string(hit)) }
+    // 6. interp 侧 `..=` 模式匹配（经 interp.eval，解释器 nval==1 路径）
+    tiep.reset()
+    var r1 = tiep.eval("var x = 7; switch x { case 3..=7: 20; default: 0; }")
+    if r1 == "20" { ok = ok + 1 } else { println("F6 r1=" + r1) }
+    // 7. interp 侧闭区间上界不命中时落 default
+    tiep.reset()
+    var r2 = tiep.eval("var x = 8; switch x { case 3..=7: 20; default: 0; }")
+    if r2 == "0" { ok = ok + 1 } else { println("F7 r2=" + r2) }
+    // 8. for-in 开区间对照：0..5 求和 = 10（语义差异仍在）
+    var s2: i64 = 0
+    for i in 0..5 { s2 = s2 + i }
+    if s2 == 10 { ok = ok + 1 } else { println("F8 sum2=" + to_string(s2)) }
+
+    if ok == 8 {
+        println("VERDICT OK")
+        return 0
+    }
+    println("VERDICT FAIL ok=" + to_string(ok) + "/8")
+    exit(1)
+    return 0
+}

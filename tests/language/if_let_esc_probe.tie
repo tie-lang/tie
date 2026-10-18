@@ -1,0 +1,58 @@
+type tie<logic>
+// ============================================================================
+// if_let_esc_probe.tie —— `if let` 解构语句回归（2026-10-03）
+// ----------------------------------------------------------------------------
+// 修掉的缺陷：后端逃逸分析 `esc_scan` 缺 N_CASE_BIND（tag 140）分支。
+//
+// N_CASE_BIND 的 children = [变体引用**节点**, 绑定名 intern id, 绑定名 intern id…]
+// —— 第 1 个槽往后**不是 AST 节点**。esc_scan 无此分支时落到末尾的
+// `esc_scan_children` 默认兜底 ⇒ 把 interned 名 id 当节点 id 递归 ⇒ 读到垃圾
+// tag ⇒ 无限递归爆栈 ⇒ **编译器段错误、零输出**（连诊断都来不及写）。
+//
+// `if let P = E { }`（p.9.10.2）脱糖成 switch + N_CASE_BIND，故必触发。
+// 本探针覆盖：无 else / 有 else / 嵌套 Option / 局部枚举变体绑定 /
+// 变体引用链 A.B 形式。编译本文件本身曾稳定段错误。
+// ============================================================================
+
+enum Point2 {
+    Pt(i64, string)
+}
+
+func report(tag: string, got: i64, want: i64) {
+    if got == want {
+        println("PASS " + tag + "=" + to_string(got))
+    } else {
+        println("FAIL " + tag + "=" + to_string(got) + " 期望 " + to_string(want))
+    }
+}
+
+func main() {
+    // ① 无 else（default 为嵌套空 StmtList）
+    var o1: Option<i64> = Option.Some(42)
+    if let Some(x) = o1 {
+        report("some", x, 42)
+    }
+
+    // ② 有 else，None 分支
+    var o2: Option<i64> = Option.None
+    if let Some(y) = o2 {
+        report("unexpected_some", y, -1)
+    } else {
+        report("none_branch", 1, 1)
+    }
+
+    // ③ 局部枚举 + 单绑定
+    var p = Point2.Pt(7, "hi")
+    if let Pt(n, s) = p {
+        report("local_enum_n", n, 7)
+        report("local_enum_s_len", str_len(s), 2)
+    } else {
+        report("local_enum_miss", 0, 1)
+    }
+
+    // ④ 多绑定（`Pt(a, b)` 的 N_CASE_BIND 有 3 个槽：引用 + 2 个名 id）
+    if let Pt(a, b) = p {
+        report("multi_a", a, 7)
+        report("multi_b_len", str_len(b), 2)
+    }
+}

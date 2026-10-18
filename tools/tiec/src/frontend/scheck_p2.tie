@@ -1,0 +1,578 @@
+type tie<class>
+// compiler/frontend/scheck_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 scheck.tie。
+namespace scheck {
+// 枚举 switch 的 case 模式/守卫检查（原 check_enum_switch_case 的枚举段，
+// 不含分支体检查）。
+func check_arm_patterns_enum(c: i64, subj_ty: i64) -> i64 {
+    var plist = sstate.child(c, 0)
+    var when_n = sstate.child(c, 1)
+    var ei = types.low(subj_ty)
+    var ename = sstate.enum_name_of(ei)
+    var np = sstate.nchild(plist)
+    var i: i64 = 0
+    while i < np {
+        var p = sstate.child(plist, i)
+        // 批次 7：N_CASE_BIND（`Ok(v)` 解构）→ 变体引用 + 绑定变量名池 id
+        var bind_id: i64 = -1
+        var vr = p
+        if s_tags[p] == N_CASE_BIND {
+            vr = sstate.child(p, 0)
+            bind_id = sstate.child(p, 1)
+        }
+        // 变体引用解析：FieldAccess（Enum.Variant）或裸 Var（Variant，枚举名取 subject）
+        if s_tags[vr] != S_N_FIELD_ACCESS && s_tags[vr] != S_N_VAR {
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "case 值必须是枚举变体引用（如 " + ename + ".Variant / " + ename + ".Variant(v)）"
+            return -1
+        }
+        var bname = ""
+        var vname = ""
+        if s_tags[vr] == S_N_FIELD_ACCESS {
+            var base = sstate.child(vr, 0)
+            if s_tags[base] != S_N_VAR {
+                sm_err_line = s_lines[c]
+                sm_err_col = s_cols[c]
+                sm_err_msg = "case 值必须是枚举变体引用（如 " + ename + ".Variant）"
+                return -1
+            }
+            bname = sstate.name_str(base)
+            vname = sstate.name_str(vr)
+        } else {
+            // 裸变体名（`case Ok(v)`）：枚举名取 switch 对象类型
+            bname = sstate.enum_name_of(ei)
+            vname = sstate.name_str(vr)
+        }
+        var eidx = sstate.bs_find(en_keys, intern.intern(bname))
+        if eidx < 0 {
+            // 泛型 enum 模板：switch 对象必须是对应模板的实例化
+            //（如 subject 是 Option$i64，case 写 Option.Some）。
+            // 通过 gin 记录反查：subject 的 mangled 名 → 记录 → 模板匹配。
+            var gidx = sstate.gt_find(bname)
+            if gidx < 0 || gty_is_struct[gidx] != 2 {
+                sm_err_line = s_lines[c]
+                sm_err_col = s_cols[c]
+                sm_err_msg = "case 值 '" + bname + "' 与 switch 对象枚举类型 " + types.type_name(subj_ty) + " 不匹配"
+                return -1
+            }
+            var rec = sstate.gin_find(sstate.enum_name_of(ei))
+            if rec < 0 || gin_tmpl[rec] != gidx {
+                sm_err_line = s_lines[c]
+                sm_err_col = s_cols[c]
+                sm_err_msg = "case 值 '" + bname + "' 与 switch 对象枚举类型 " + types.type_name(subj_ty) + " 不匹配（泛型 enum 实例）"
+                return -1
+            }
+        } else if en_vals[eidx] != ei {
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "case 值 '" + bname + "' 与 switch 对象枚举类型 " + types.type_name(subj_ty) + " 不匹配"
+            return -1
+        }
+        // 在变体段中找该变体（返回 tag 值 0..nvar-1）
+        var varoff = en_varoff[ei]
+        var nvar = en_nvar[ei]
+        var tag: i64 = -1
+        var k: i64 = 0
+        while k < nvar {
+            if intern.lookup(en_vnames[varoff + k]) == vname {
+                tag = en_vtags[varoff + k]
+                break
+            }
+            k = k + 1
+        }
+        if tag < 0 {
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "枚举 '" + ename + "' 没有变体 '" + vname + "'"
+            return -1
+        }
+        // p.8.1.4：多字段解构绑定变量登记（绑定变量数须 == 变体 payload 字段数；
+        // 逐个按字段类型 lv_insert）
+        if bind_id >= 0 {
+            var foff = en_vfldoff[varoff + tag]
+            var nfld = en_vnfld[varoff + tag]
+            var nbinds = sstate.nchild(p) - 1
+            if nbinds != nfld {
+                sm_err_line = s_lines[c]
+                sm_err_col = s_cols[c]
+                sm_err_msg = "case 解构要求变体 '" + vname + "' 恰有 " + to_string(nfld) + " 个 payload 字段，实际绑定 " + to_string(nbinds) + " 个变量"
+                return -1
+            }
+            var b: i64 = 0
+            while b < nfld {
+                sinfer.lv_insert(sstate.child(p, 1 + b), en_ftys[foff + b], 0, -1, 0)
+                // p.9.22.6 全量符号表：解构绑定声明登记（kind 5；绑定名 id 存于
+                // N_CASE_BIND 槽位，节点取该绑定节点）。
+                xref.reg_decl(sstate.child(p, 1 + b), 5, en_ftys[foff + b], p)
+                b = b + 1
+            }
+        }
+        // 重复 case 检测（tag 为去重键，对齐字面量 key 风格）。
+        // p.8.1.4：带 when 守卫的 case 不判重（守卫使同变体多分支语义不同，
+        // 如 `case Circle(r) when r<10:` 与 `case Circle(r):` 共存合法）。
+        var key = "e:" + ename + ":" + vname
+        if when_n < 0 {
+            var d: i64 = 0
+            var dup: bool = false
+            while d < len(g_case_seen) {
+                if g_case_seen[d] == key {
+                    dup = true
+                    break
+                }
+                d = d + 1
+            }
+            if dup {
+                sm_err_line = s_lines[c]
+                sm_err_col = s_cols[c]
+                sm_err_msg = "重复的 case 值 " + key
+                return -1
+            }
+            table_push(g_case_seen, key)
+        }
+        i = i + 1
+    }
+    if when_n >= 0 {
+        var wt = sinfer.infer_expr(when_n)
+        if wt < 0 {
+            return -1
+        }
+        if !types.is_bool_like(wt) {
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "when 守卫必须是布尔表达式，实际是 " + types.type_name(wt)
+            return -1
+        }
+    }
+    return 0
+}
+
+// W00012 收窄版的统计遍历：递归收集整数字面量的值 / 出现次数 / 首次位置。
+// 只覆盖单棵函数体子树（含闭包 FN_LIT 子树），因此计数天然是「同一函数内」。
+// 0 / 1 / -1 不计（正常用法）。
+func lit_scan(node: i64, ref vals: table<i64>, ref cnts: table<i64>, ref lns: table<i64>, ref cls_ln: table<i64>) {
+    if node < 0 {
+        return
+    }
+    if s_tags[node] == S_N_INT_LIT {
+        var v = s_vals[node]
+        if v != 0 && v != 1 && v != -1 {
+            var idx: i64 = -1
+            var i: i64 = 0
+            var nv = len(vals)
+            while i < nv {
+                if vals[i] == v {
+                    idx = i
+                    i = nv
+                } else {
+                    i = i + 1
+                }
+            }
+            if idx >= 0 {
+                cnts[idx] = cnts[idx] + 1
+            } else {
+                table_push(vals, v)
+                table_push(cnts, 1)
+                table_push(lns, s_lines[node])
+                table_push(cls_ln, s_cols[node])
+            }
+        }
+    }
+    var n = sstate.nchild(node)
+    var k: i64 = 0
+    while k < n {
+        lit_scan(sstate.child(node, k), vals, cnts, lns, cls_ln)
+        k = k + 1
+    }
+}
+
+// 三期 goto 统一校验（函数体检查完后）：逐 goto 请求校验 R1/R2/R3。
+// R1 同函数：标签必须存在（函数级标签表）。
+// R2 同块或已执行外层块：目标链是 goto 链前缀（同块或外层块）；外层块须向后跳
+// （标签全局序号 < goto 全局序号 = 已执行）。禁止跳入更内层块（非前缀）。
+// R3 不越过初始化：同块前向跳（goto 序号 < 标签序号）不得跨 var/const 声明。
+func check_goto_refs() -> i64 {
+    var i: i64 = 0
+    while i < len(g_gtg_keys) {
+        var gnm = g_gtg_keys[i]
+        var gi = gt_find(gnm)
+        if gi < 0 {
+            sm_err_line = g_gtg_line[i]
+            sm_err_col = g_gtg_col[i]
+            sm_err_msg = "goto 的目标标签 '#" + intern.lookup(gnm) + "' 未定义（R1 同函数：同函数内必须有 #[tag." + intern.lookup(gnm) + "] 标签）"
+            return -1
+        }
+        var tchain = g_gt_chain[gi]
+        var gchain = g_gtg_chain[i]
+        // R2：目标链是 goto 链前缀（同块或外层块）
+        if !chain_is_prefix(tchain, gchain) {
+            sm_err_line = g_gtg_line[i]
+            sm_err_col = g_gtg_col[i]
+            sm_err_msg = "goto 目标 '#" + intern.lookup(gnm) + "' 不在同块或外层块（禁止跳入更内层块/跨块跳转，R2）"
+            return -1
+        }
+        if str_len(tchain) < str_len(gchain) {
+            // 外层块：须向后跳（标签已执行，标签序号 < goto 序号）
+            if g_gt_seq[gi] >= g_gtg_seq[i] {
+                sm_err_line = g_gtg_line[i]
+                sm_err_col = g_gtg_col[i]
+                sm_err_msg = "goto 目标 '#" + intern.lookup(gnm) + "' 在外层块但位于 goto 之后（只能向后跳到已执行的外层块头，R2）"
+                return -1
+            }
+        } else if tchain == gchain {
+            // 同块：R3 不越过初始化——仅前向跳（goto 序号 < 标签序号，跳过后续
+            // 声明）违规；向后跳同块头合法（重新初始化）。
+            if g_gt_seq[gi] > g_gtg_seq[i] {
+                // 块内语句区间 (goto_idx, label_idx)：标签与 goto 同块，块内序号
+                // 可比较。扫描标签所在块 StmtList 的 (goto_idx+1 .. label_idx)
+                // 直接语句，若有 var/const 声明 → 违规。
+                var lo = g_gtg_blkidx[i]
+                var hi = g_gt_blkidx[gi]
+                if blk_has_var_decl(g_gt_blknode[gi], lo + 1, hi) {
+                    sm_err_line = g_gtg_line[i]
+                    sm_err_col = g_gtg_col[i]
+                    sm_err_msg = "goto 向前跳过局部变量初始化（goto 与标签之间不得经过 var/const 声明，R3）"
+                    return -1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// full 名 "::" 段（除最后一段函数名）压 ns_stack，返回压入段数。
+// check_fn_walk 快路径的命名空间上下文重建（对齐旧扫描路径的 ns_push 行为）。
+func push_ns_of(full: string) -> i64 {
+    var cnt: i64 = 0
+    var n = str_len(full)
+    var pos: i64 = 0
+    var seg_start: i64 = 0
+    while pos < n {
+        // 找 "::" 分隔（段边界）
+        if pos + 1 < n && str_char(full, pos) == ":" && str_char(full, pos + 1) == ":" {
+            var seg = str.slice(full, seg_start, pos)
+            sstate.ns_push(intern.intern(seg))
+            cnt = cnt + 1
+            pos = pos + 2
+            seg_start = pos
+        } else {
+            pos = pos + 1
+        }
+    }
+    return cnt
+}
+
+// 命名空间体内递归检查（含嵌套 namespace）
+func check_fn_walk_in_ns(blk: i64, full: string) -> i64 {
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(blk, i)
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            if sstate.ns_full_name(sstate.name_str(s)) == full {
+                var r = check_fn(s, full)
+                if r < 0 {
+                    return -1
+                }
+                return 1
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var j: i64 = 0
+            while j < nsegs {
+                var seg = sstate.child(s, j)
+                sstate.ns_push(s_names[seg])
+                j = j + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var r = check_fn_walk_in_ns(body, full)
+            j = 0
+            while j < nsegs {
+                ns_top = ns_top - 1
+                j = j + 1
+            }
+            if r < 0 {
+                return -1
+            }
+            if r == 1 {
+                return 1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// S2.2 捕获传播（嵌套闭包，任务21）：闭包 k 的有效捕获 = 直接捕获 ∪ 子闭包
+// 传播捕获，再减自身参数/局部（自身参数/局部走本地槽，无需进 env）。
+// 后处理：所有闭包体检查完后调用（cl_params/cl_locals/cl_cap* 均已定型）。
+// 处理顺序：闭包索引越大越内层（FIFO 登记），从内到外收集——内层闭包的有效
+// 捕获先算好，传播给祖先闭包时直接读子闭包已算好的有效段。
+// 例（probe6 三层）：C3 直接捕获 a/b/c → C2 有效 = {a,b}（c 是 C2 局部排除）→
+// C1 有效 = {a}（b 是 C1 局部排除）。闭包值构造点的 gen_var_ref 才找得到外层变量。
+func propagate_captures() -> i64 {
+    var n = len(g_clo_pending)
+    if n == 0 {
+        return 0
+    }
+    // eff_start[c]/eff_len[c]：闭包 c 有效捕获段（eff_keys/eff_vals）
+    // 注意：tie 表下标写 i>=len 静默失败（须 table_push），先按闭包数预填，
+    // 后续用下标回填 eff_start[c]/eff_len[c]（读侧 cl_capoff 等已由登记预填）。
+    var eff_start: table<i64> = table_new_i64()
+    var eff_len: table<i64> = table_new_i64()
+    var eff_keys: table<i64> = table_new_i64()
+    var eff_vals: table<i64> = table_new_i64()
+    var pf: i64 = 0
+    while pf < n {
+        table_push(eff_start, 0)
+        table_push(eff_len, 0)
+        pf = pf + 1
+    }
+    var c: i64 = n - 1
+    while c >= 0 {
+        eff_start[c] = len(eff_keys)
+        // ① 直接捕获（现有 cl_capkeys 段，检查期间已登记）
+        var off = cl_capoff[c]
+        var end = len(cl_capkeys)
+        if c + 1 < len(cl_capoff) {
+            end = cl_capoff[c + 1]
+        }
+        var j: i64 = off
+        while j < end {
+            var v = cl_capkeys[j]
+            if is_closure_own(c, v) == 0 && sstate.seg_has(eff_keys, eff_start[c], len(eff_keys) - eff_start[c], v) == 0 {
+                table_push(eff_keys, v)
+                table_push(eff_vals, cl_capvals[j])
+            }
+            j = j + 1
+        }
+        // ② 子闭包传播：cl_parent[ch] == c 的子闭包有效捕获并入（减自身参数/局部）
+        var ch: i64 = c + 1
+        while ch < n {
+            if cl_parent[ch] == c {
+                var k: i64 = 0
+                while k < eff_len[ch] {
+                    var v2 = eff_keys[eff_start[ch] + k]
+                    if is_closure_own(c, v2) == 0 && sstate.seg_has(eff_keys, eff_start[c], len(eff_keys) - eff_start[c], v2) == 0 {
+                        table_push(eff_keys, v2)
+                        table_push(eff_vals, eff_vals[eff_start[ch] + k])
+                    }
+                    k = k + 1
+                }
+            }
+            ch = ch + 1
+        }
+        eff_len[c] = len(eff_keys) - eff_start[c]
+        c = c - 1
+    }
+    // ===== share 域门禁 · ⑤子闭包传播 =====
+    // 闭包引用全局可变容器 ⇒ 其**嵌套子闭包**同样携带该引用（闭包返回值时子闭包被带出，
+    // 交给执行流后同样是那份全局数据）。沿 cl_parent 上溯：c 从 n-1 递减，子闭包（索引大）
+    // 已处理完，故一次遍历即闭合。
+    var gc: i64 = n - 1
+    while gc >= 0 {
+        if gc < len(cl_grefs) {
+            var gch: i64 = gc + 1
+            while gch < n {
+                if cl_parent[gch] == gc && gch < len(cl_grefs) && cl_grefs[gch] == 1 {
+                    cl_grefs[gc] = 1
+                }
+                gch = gch + 1
+            }
+        }
+        gc = gc - 1
+    }
+    // 重建 cl_capoff/cl_capkeys/cl_capvals（闭包索引升序布局，后端 gen_closure_lit
+    // 按 [cl_capoff[c], cl_capoff[c+1]) 读段）
+    cl_capoff = table_new_i64()
+    cl_capkeys = table_new_i64()
+    cl_capvals = table_new_i64()
+    var i2: i64 = 0
+    while i2 < n {
+        table_push(cl_capoff, len(cl_capkeys))
+        var j2: i64 = 0
+        while j2 < eff_len[i2] {
+            table_push(cl_capkeys, eff_keys[eff_start[i2] + j2])
+            table_push(cl_capvals, eff_vals[eff_start[i2] + j2])
+            j2 = j2 + 1
+        }
+        i2 = i2 + 1
+    }
+    // ===== share 域门禁 · ⑥末段判定 =====
+    // 时机：打点（infer 阶段）与子闭包传播（上方）此刻都已完成。
+    // 凭据用 infer 时**快照**（`g_spawn_caps`/`g_spawn_unsafe`）——此刻作用域已出栈。
+    var sp: i64 = 0
+    while sp < len(g_spawn_nodes) {
+        var sarg = g_spawn_args[sp]
+        var shares = 1
+        if sp < len(g_spawn_force) && g_spawn_force[sp] == 1 {
+            shares = 1
+        } else if sarg >= 0 && s_tags[sarg] == 132 {
+            // 闭包字面量 ⇒ 精确判（含嵌套子闭包传播结果）
+            var sci: i64 = -1
+            var sidx: i64 = 0
+            while sidx < len(g_clo_pending) {
+                if g_clo_pending[sidx] == sarg {
+                    sci = sidx
+                    break
+                }
+                sidx = sidx + 1
+            }
+            if sci >= 0 && sci < len(cl_grefs) {
+                shares = cl_grefs[sci]
+            }
+        }
+        // shares = 1 ⇒ 可能（确证引用全局可变容器，或形态无法证明不共享）
+        if shares == 1 {
+            var snode = g_spawn_nodes[sp]
+            if g_spawn_unsafe[sp] == 0 {
+                sm_err_line = s_lines[snode]
+                sm_err_col = s_cols[snode]
+                // 措辞不提 spawn：本判据覆盖三处交付入口（spawn / 并行池 pp_submit /
+                // actor 消息投递闭包），统称「交给执行流」。
+                sm_err_msg = "把一个引用全局可变容器的闭包交给执行流（spawn / 并行池提交 / actor 消息投递）必须在 unsafe 块或 unsafe 函数中（闭包与执行流共享同一份底层数据，并发写入由书写者负责排除）"
+                return -1
+            }
+            // 域位：1 = share（0=share 1=mem 2=ext 3=lock 4=raw）
+            if (g_spawn_caps[sp] & 1) == 0 {
+                sm_err_line = s_lines[snode]
+                sm_err_col = s_cols[snode]
+                var held_sp = types.cap_set_name(g_spawn_caps[sp])
+                if str_len(held_sp) == 0 {
+                    held_sp = "none"
+                }
+                sm_err_msg = "把一个引用全局可变容器的闭包交给执行流（spawn / 并行池提交 / actor 消息投递）需要 share 域凭据（当前作用域持：" + held_sp +
+                    "）。持证方式：文件头 `type tie<角色, unsafe:share>`、函数级 `#[unsafe.share]`、或块级 `unsafe with(share) { }` / `unsafe use g { }`"
+                return -1
+            }
+        }
+        sp = sp + 1
+    }
+    return 0
+}
+
+// 闭包 c 自身可直访名：参数段 ∪ 局部段（命中 → 走本地槽，不捕获）。
+// 局部段边界取 [cl_locloff[c], cl_locloff[c+1])（闭包检查 FIFO 序，c 的局部
+// 全部在 c+1 检查开始前追加；末段到 len(cl_locals)）。
+func is_closure_own(c: i64, v: i64) -> i64 {
+    if sstate.seg_has(cl_params, cl_paramoff[c], cl_nparams[c], v) == 1 {
+        return 1
+    }
+    var lend = len(cl_locals)
+    if c + 1 < len(cl_locloff) {
+        lend = cl_locloff[c + 1]
+    }
+    if sstate.seg_has(cl_locals, cl_locloff[c], lend - cl_locloff[c], v) == 1 {
+        return 1
+    }
+    return 0
+}
+
+// 检查单个闭包体：重建独立 lv 作用域 + 闭包返回类型栈 + 检查后恢复
+func check_closure_body(ci: i64) -> i64 {
+    var fn_node = g_clo_pending[ci]
+    // 保存外层 lv 五表与 loop 栈（函数检查残留，闭包体检查后恢复）
+    var s_keys = lv_keys
+    var s_vals = lv_vals
+    var s_const = lv_const
+    var s_telem = lv_telem
+    var s_dyn = lv_dyn
+    var s_lp = lp_stack
+    var s_lpt = lp_top
+    // p.9.11.11 immut：闭包体重建作用域时重置 immut 集合（闭包无 immut 形参
+    // 语法；外层函数 immut 集此刻已随 check_fn 结束而清空——若沿用会残留最后
+    // 一个检查函数的陈旧集合导致误报。捕获外层 immut 形参的闭包写**不拦截**，
+    // 属已知边界：immut 保证作用于函数体直接写的形参绑定）。
+    sstate.im_reset()
+    // 重建 lv = 登记时快照段（cl_o* 五表并行段，登记时已排序，直拷保持序）
+    lv_keys = table_new_i64()
+    lv_vals = table_new_i64()
+    lv_const = table_new_i64()
+    lv_telem = table_new_i64()
+    lv_dyn = table_new_i64()
+    lp_stack = table_new_i64()
+    lp_top = 0
+    var ooff = cl_off[ci]
+    var nouter = cl_nouter[ci]
+    var j: i64 = 0
+    while j < nouter {
+        table_push(lv_keys, cl_okeys[ooff + j])
+        table_push(lv_vals, cl_ovals[ooff + j])
+        table_push(lv_const, cl_oconst[ooff + j])
+        table_push(lv_telem, cl_otelem[ooff + j])
+        table_push(lv_dyn, cl_odyn[ooff + j])
+        j = j + 1
+    }
+    // p.9.22.6：闭包体 = 新 xref 作用域（owner = 闭包字面量节点）。先装载
+    // 登记时绑定快照（捕获变量的 use→decl 解析基础；与 cl_o* 快照同语义），
+    // 形参/局部随检查过程登记。退出时 pop（与 lv 五表恢复同点）。
+    xref.push_scope(fn_node)
+    xref.load_bind(ci)
+    // 闭包参数插入 lv（telem/dyn 表类型处理同 check_fn 参数模板）
+    var nparams = cl_nparams[ci]
+    var poff = cl_paramoff[ci]
+    var tyoff = cl_paroff[ci]
+    var k: i64 = 0
+    while k < nparams {
+        var pnid = cl_params[poff + k]
+        var pty = cl_ptys[tyoff + k]
+        var telem: i64 = -1
+        var dyn: i64 = 0
+        if types.is_table(pty) {
+            telem = types.table_elem(pty)
+            if telem < 0 {
+                telem = types.named(TK_STR)
+            }
+            dyn = 1
+        }
+        sinfer.lv_insert(pnid, pty, 0, telem, dyn)
+        // p.9.22.6 全量符号表：闭包形参声明登记（kind 6；参数节点同布局）。
+        xref.reg_decl(pnid, 6, pty, sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + k))
+        k = k + 1
+    }
+    // 闭包局部/捕获段起点：检查开始时定位（覆盖登记时占位值，避免
+    // 嵌套闭包登记后外层闭包继续追加局部/捕获造成的段污染）
+    cl_locloff[ci] = len(cl_locals)
+    cl_capoff[ci] = len(cl_capkeys)
+    // 压闭包返回类型（S_N_RETURN 检查优先取栈顶而非 sg_ret[g_curfn]）。
+    // 复用槽位模式（同 lp_stack/ns_push）：表不截断、top 游标定位——
+    // 直接 table_push 会让旧值残留错位（第二次 push 后栈顶索引指到残留值）。
+    if g_clo_ret_top < len(g_clo_ret_stack) {
+        g_clo_ret_stack[g_clo_ret_top] = cl_ret[ci]
+    } else {
+        table_push(g_clo_ret_stack, cl_ret[ci])
+    }
+    g_clo_ret_top = g_clo_ret_top + 1
+    // 进入闭包体上下文（S_N_VAR 捕获登记 / check_var_decl 局部登记）
+    g_clo_cur = ci
+    g_clo_depth = g_clo_depth + 1
+    // 闭包体：children[slot+1+nparams]（泛型槽0、返回类型1、参数2..、体末尾）
+    var slot = sstate.slot_off(fn_node)
+    var body = sstate.child(fn_node, slot + 1 + nparams)
+    g_cf_depth = 0   // 闭包嵌套深度独立计（不继承外层函数）
+    var r = check_block(body)
+    // 退出闭包体上下文
+    g_clo_depth = g_clo_depth - 1
+    g_clo_cur = -1
+    g_clo_ret_top = g_clo_ret_top - 1
+    // 恢复外层 lv 五表与 loop 栈
+    lv_keys = s_keys
+    lv_vals = s_vals
+    lv_const = s_const
+    lv_telem = s_telem
+    lv_dyn = s_dyn
+    lp_stack = s_lp
+    lp_top = s_lpt
+    // p.9.22.6：退出闭包 xref 作用域（与 lv 恢复同点）。
+    xref.pop_scope()
+    if r < 0 {
+        return -1
+    }
+    return 0
+}
+
+}

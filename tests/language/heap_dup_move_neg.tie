@@ -1,0 +1,19 @@
+type tie<logic>
+// heap_dup_move_neg.tie —— 负例：可变容器的重复转移必须被拒绝
+// ============================================================================
+// tie 的表赋值是**浅拷贝共享**（实测 `var b = a; b[0]=99` 会改到 `a[0]`），
+// 若放行 `var b = a; var c = a`，同一份可变数据出现三个别名，写入互相可见。
+// 移动检查把源标记「已移动」正是为了拦住这种别名扩散（对照：string 是
+// 不可变值，按值赋合法，不做此检查——见 smove.is_owned 注释）。
+// 第 2 次 `var c = a` 必须报「已移动」。
+
+func dup_table() -> i64 {
+    var a: table<i64> = [1, 2, 3]
+    var b = a
+    var c = a
+    return b[0] + c[1]
+}
+
+func main() {
+    println(to_string(dup_table()))
+}

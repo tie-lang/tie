@@ -1,0 +1,112 @@
+type tie<logic>
+
+// ============================================================
+// p.9.11.4 defer 资源释放验收：`defer { <stmts> }` —— 注册到所在作用域（函数/
+// 循环体）退出时**逆序**（后注册先执行）执行的清理块。覆盖退出路径：
+//   函数正常走到块尾 / return / `?` 早退 / break（循环体）；多次 defer 逆序；
+//   defer 块内可读作用域变量（含循环控制变量）。
+// 裁决注：continue 不退出循环体作用域故不触发（与 Go 语义一致）；panic 不可
+// 恢复（进程退出）不执行 defer；defer 在条件分支/零迭代循环中注册的边界行为
+// 见报告（标志位未被该路径写入时为未定义）。
+//
+// 覆盖场景（打印顺序验证）：
+//   1. 多次 defer 逆序：函数自然收尾 → 后注册先执行
+//   2. return 前触发（逆序 LIFO）
+//   3. 读作用域变量
+//   4. break 触发（循环体内 defer，break 后运行倒序）
+//   5. defer + `?` 早退组合（`?` 传播前运行 defer）
+//   6. 多次 defer 逆序 + 读循环变量
+//
+// 期望输出（逐行，与 println 一一对应）：见下。
+// ============================================================
+
+// 1. 多次 defer 逆序（函数自然收尾）
+func order() {
+    defer { println("A") }    // 注册 A
+    defer { println("B") }    // 注册 B
+    println("1")
+    defer { println("C") }    // 注册 C
+    println("2")
+}   // 自然收尾：逆序 C,B,A → 输出 1,2,C,B,A
+
+// 2. return 前触发（逆序）
+func retorder() {
+    defer { println("R1") }
+    defer { println("R2") }
+    println("before-return")
+    return
+    println("after-return")   // 死代码（编译器 opt DCE 清理）
+}
+
+// 3. 读作用域变量（函数局部）
+func readvar() {
+    var tag2 = "X"
+    defer { println("defer-sees:" + tag2) }
+    println("body:" + tag2)
+}
+
+// 4. break 触发（循环体内 defer，break 后运行；同一 defer 语句跨迭代单次落库）
+func brk() {
+    var i = 0
+    while i < 5 {
+        defer { println("brk-D") }
+        if i == 2 {
+            break
+        }
+        i = i + 1
+    }
+    println("after-loop")
+}
+
+// 4b. 多次 defer 逆序（循环体作用域，退出时倒序）+ 读循环控制变量。
+// 注：defer 以「循环体作用域」注册，循环退出（break/自然结束）时逆序执行一次
+// （作用于本次循环中注册的 defer 语句集合），不会逐迭代重复。
+func brk2() {
+    var i = 0
+    while i < 3 {
+        defer { println("L:" + to_string(i)) }   // 读循环变量（退出时 = 最后值 3）
+        defer { println("B") }
+        i = i + 1
+    }
+    println("done-loop")
+}
+
+import "/std/result.tie"
+
+func div2(a: i64, b: i64) -> Result<i64, string> {
+    if b == 0 {
+        return Result.Err("div0")
+    }
+    return Result.Ok(a / b)
+}
+
+// 5. defer + `?` 早退：Err 传播前先运行 defer（资源安全）
+func useq(a: i64, b: i64) -> Result<i64, string> {
+    defer { println("cleanup-of-q") }
+    var x = div2(a, b) ?
+    return Result.Ok(x * 2)
+}
+
+func caller_of_useq() -> string {
+    var q = useq(1, 0)   // div2(1,0) → Err("div0")，`?` 前运行 cleanup
+    switch q {
+        case Ok(v): return "q-ok:" + to_string(v)
+        case Err(e): return "q-err:" + e
+    }
+}
+
+func main() {
+    println("--order--")
+    order()          // 1,2, 逆序 C,B,A
+    println("--retorder--")
+    retorder()       // before-return 后逆序 R2,R1
+    println("--readvar--")
+    readvar()
+    println("--brk--")
+    brk()            // brk-D（break 触发）→ after-loop
+    println("--brk2--")
+    brk2()           // B,L:3（逆序 B 先）→ done-loop
+    println("--useq--")
+    println(caller_of_useq())   // cleanup-of-q 一次 + q-err:div0
+    println("p.9.11.4 defer 全过")
+}

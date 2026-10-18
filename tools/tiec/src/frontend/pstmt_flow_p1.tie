@@ -1,0 +1,726 @@
+type tie<class>
+// compiler/frontend/pstmt_flow_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 pstmt_flow.tie。
+namespace pstmt_flow {
+// S3.3 准引用块内函数定义：`func name(params) -> ret { body }`（宏生成函数）。
+// 与顶层 parse_fn_def 同构的简化版（无 pub/unsafe/泛型/默认值参数）：
+// name/参数名支持 `$` 插值名（expect_ident_quasi——gensym 结果作函数名），
+// 产出 N_FN_DEF（name, val=0, aux=nparams, children=[泛型槽-1, 返回类型,
+// 参数..., 函数体]——与顶层函数定义布局完全一致，展开后走正常语义检查）。
+func parse_fn_def_in_block() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // func
+    var name = putil.expect_ident_quasi()
+    if name < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    if !putil.eat(lex_rparen) {
+        var d = false
+        while !d {
+            var pname = putil.expect_ident_quasi()
+            if pname < 0 {
+                return -1
+            }
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var pty = pexpr_type.parse_type()
+            if pty < 0 {
+                return -1
+            }
+            var p = ast.new_node(N_PARAM, pname, 0, 0, putil.peek_line(), putil.peek_col())
+            var pkids: table<i64> = table_new_i64()
+            table_push(pkids, pty)
+            table_push(pkids, -1)
+            ast.set_children(p, pkids)
+            table_push(params, p)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    var ret_ty = -1
+    if putil.eat(lex_arrow) {
+        ret_ty = pexpr_type.parse_type()
+        if ret_ty < 0 {
+            return -1
+        }
+    } else {
+        ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), 14, -1, line, col)
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var f = ast.new_node(N_FN_DEF, name, 0, len(params), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, -1)   // 泛型槽（块内函数定义暂不支持泛型）
+    table_push(kids, ret_ty)
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    table_push(kids, body)
+    ast.set_children(f, kids)
+    return f
+}
+
+// `panic(expr)`：S2.3 不可恢复错误（消息为 string 表达式；可配置目标行为——
+// 桌面打印+退出 / 嵌入式 halt / wasm trap，语义层校验）。
+func parse_panic() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // panic
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var msg = pexpr.parse_expr()
+    if msg < 0 {
+        return -1
+    }
+    if !putil.expect(lex_rparen, "')'") {
+        return -1
+    }
+    if !putil.expect_stmt_end() {
+        return -1
+    }
+    var n = ast.new_node(N_PANIC, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, msg)
+    ast.set_children(n, kids)
+    return n
+}
+
+// unsafe 块：`unsafe { stmts }` → N_UNSAFE_BLOCK（children=[StmtList 或直接语句]）。
+// 与普通块同结构（N_STMTLIST 包装体），语义层按节点标记开启 unsafe 上下文。
+func parse_unsafe_block() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // unsafe
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        if putil.peek_tag() == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if putil.peek_tag() == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else {
+            var s = parse_stmt()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        }
+    }
+    var n = ast.new_node(N_UNSAFE_BLOCK, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ast.new_node(N_STMTLIST, -1, -1, -1, line, col))
+    ast.set_children(n, kids)
+    ast.set_children(ast.child_at(n, 0), stmts)
+    return n
+}
+
+// 三期 goto（§7.1.5）：`unsafe goto #x` 无条件跳转语句（仅 unsafe 上下文）。
+// 解析：`unsafe`（已由 parse_stmt 探测，此处直接消费）→ `goto` → `#` → 标签名
+// → 分号。产出 N_GOTO[name=目标标签名池 id]。`#` 前缀区分循环标签 `标识符:`。
+func parse_goto_stmt() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // unsafe
+    putil.advance()   // goto
+    if !putil.expect(lex_hash, "'#'") {
+        return -1
+    }
+    var tname = putil.expect_ident()
+    if tname < 0 {
+        return -1
+    }
+    if !putil.expect_stmt_end() {
+        return -1
+    }
+    return ast.new_node(N_GOTO, tname, -1, -1, line, col)
+}
+
+// 三期 goto 标签（§7.1.5）：`#[tag.x]` 语句位置标签（标定一条语句前为跳转点）。
+// 解析：`#[` → `tag` 段 → `.` → 标签名 → `]`。`#[]` 紧跟声明 = 属性；紧跟语句
+// + `tag.` 前缀 = 跳转标签。产出 N_GOTO_LABEL[name=标签名池 id]。
+// ASI 可能补分号（`]` 行尾补 `;`），标签后无分号语义，吃掉补充分号。
+func parse_goto_label() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // #
+    if !putil.expect(lex_lbracket, "'['") {
+        return -1
+    }
+    // 属性名段：必须是 `tag`（标识符或关键字 token 均可读 lexeme）
+    if interner.lookup(putil.expect_ident()) != "tag" {
+        putil.set_err(line, col, "标签必须是 #[tag.名称] 形式（tag. 前缀区分 goto 标签与属性）")
+        return -1
+    }
+    if !putil.expect(lex_dot, "'.'") {
+        return -1
+    }
+    var tname = putil.expect_ident()
+    if tname < 0 {
+        return -1
+    }
+    if !putil.expect(lex_rbracket, "']'") {
+        return -1
+    }
+    putil.eat(lex_semi)   // 吃掉 ASI 补分号（标签本身无分号语义）
+    return ast.new_node(N_GOTO_LABEL, tname, -1, -1, line, col)
+}
+
+// 三期 A 组 `unsafe use g { ... }` 持证越界块（§7.1.1 + unsafe-model §13.4）：
+// unsafe → use → 凭据变量名（guard<cap> 变量）→ { stmts }。块内以凭据身份开启
+// 对应能力域（语义层校验 g 的类型与块内持证越界）。产出 N_GUARD_USE[name=凭据
+// 变量名池 id, children=[块 StmtList]]。
+func parse_guard_use() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // unsafe
+    putil.advance()   // use
+    var gname = putil.expect_ident()
+    if gname < 0 {
+        return -1
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var n = ast.new_node(N_GUARD_USE, gname, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, body)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 三期 A 组 `unsafe with(share) { ... }` 临时凭据块（§7.1.1 + unsafe-model §13.4）：
+// unsafe → with → ( 能力域名 ) → { stmts }。块内创建临时 guard<cap> 凭据，退块
+// 自动回收。产出 N_GUARD_WITH[children=[能力域名节点, 块 StmtList]]。
+func parse_guard_with() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // unsafe
+    putil.advance()   // with
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var cap = putil.expect_ident()
+    if cap < 0 {
+        return -1
+    }
+    if !putil.expect(lex_rparen, "')'") {
+        return -1
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var n = ast.new_node(N_GUARD_WITH, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ast.new_node(N_NAMED_TYPE, cap, -1, -1, line, col))
+    table_push(kids, body)
+    ast.set_children(n, kids)
+    return n
+}
+
+// `if cond { } else { }` / else if 链；p.9.10.2 增加 `if let <pattern> = <expr> { }`
+// 解构条件（见 parse_if_let）。
+func parse_if() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    // p.9.10.2 if-let：`if let <pattern> = <expr> { then } [else { else }]`。
+    // `let` 非保留字（lex_ident），此处按语境识别——`if` 后紧跟 `let` 即按
+    // if-let 解析（纯糖，脱糖为现有 switch 语句）。先消费 `if`（parse_if_let
+    // 游标停在 `let` 上，其内部再消费 `let`）。
+    if putil.peek_n(1) == lex_ident && putil.peek_lexeme_n(1) == "let" {
+        putil.advance()   // if
+        return parse_if_let(line, col)
+    }
+    putil.advance()   // if
+    putil.enter_cond()   // p.8.2.9：条件内不判定尾随闭包
+    var cond = pexpr.parse_expr()
+    putil.exit_cond()
+    if cond < 0 {
+        return -1
+    }
+    var then_list = parse_block()
+    if then_list < 0 {
+        return -1
+    }
+    var else_list = -1
+    if putil.eat(lex_else) {
+        if putil.peek_tag() == lex_if {
+            var inner = parse_if()
+            if inner < 0 {
+                return -1
+            }
+            var tmp: table<i64> = table_new_i64()
+            table_push(tmp, inner)
+            else_list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+            ast.set_children(else_list, tmp)
+        } else {
+            else_list = parse_block()
+            if else_list < 0 {
+                return -1
+            }
+        }
+    }
+    // 无 else 时 else 槽保持 -1（= 该子节点不存在），**不得**造空 StmtList 占位：
+    // 空 StmtList 与「显式 `else {}`」在 AST 上完全同形，下游（W00010 空语句块
+    // 检查）无法区分二者，会把任何无 else 的 if 误报成空语句块。
+    // 下游消费者一律按 `child(id, 2) >= 0` 读取该槽（irgen/smove/sgen/scollect/
+    // consteval/tiep），-1 正是它们预期的「无 else」表示。
+    var n = ast.new_node(N_IF, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, cond)
+    table_push(kids, then_list)
+    table_push(kids, else_list)
+    ast.set_children(n, kids)
+    return n
+}
+
+// p.9.10.2 `if let <pattern> = <expr> { then } [else { else }]` 解构条件。
+// 游标停在 `let` 上（parse_if 已确认后跟 `let`）。纯糖：脱糖为现有 switch 语句
+//   if let P = E { B } [else { EB }]  ≡  switch E { case P: B ; default: EB }
+// 复用语句位 switch 的模式/解构/守卫语义：匹配成功进入 then 块并把 P 解构出的
+// 子值绑定为块内变量；失败走 default（else；无 else 时空走）。else 分支无绑定
+// 变量（switch 语义保证）。else if 链由 parse_if 递归处理。
+func parse_if_let(line: i64, col: i64) -> i64 {
+    putil.advance()   // let
+    var pat = parse_case_pattern()
+    if pat < 0 {
+        return -1
+    }
+    if !putil.expect(lex_eq, "'='") {
+        return -1
+    }
+    putil.enter_cond()   // p.8.2.9：条件内不判定尾随闭包
+    var expr = pexpr.parse_expr()
+    putil.exit_cond()
+    if expr < 0 {
+        return -1
+    }
+    var then_list = parse_block()
+    if then_list < 0 {
+        return -1
+    }
+    var else_list = -1
+    if putil.eat(lex_else) {
+        if putil.peek_tag() == lex_if {
+            var inner = parse_if()
+            if inner < 0 {
+                return -1
+            }
+            var tmp2: table<i64> = table_new_i64()
+            table_push(tmp2, inner)
+            else_list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+            ast.set_children(else_list, tmp2)
+        } else {
+            else_list = parse_block()
+            if else_list < 0 {
+                return -1
+            }
+        }
+    } else {
+        // 无 else：default 为空块。必须让 default 列表**非空**（嵌一个空
+        // StmtList 作 no-op），否则脱糖 switch 被语义层判为「无 default」而触发
+        // 枚举穷尽检查——if-let 是条件测试，不该要求覆盖全部变体。
+        var noop = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+        var tmp3: table<i64> = table_new_i64()
+        table_push(tmp3, noop)
+        else_list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+        ast.set_children(else_list, tmp3)
+    }
+    // 脱糖：switch E { case P: then_list ; default: else_list }
+    var c = ast.new_node(N_SWITCH_CASE, -1, -1, -1, line, col)
+    var pl = ast.new_node(N_PATTERN_LIST, -1, -1, -1, line, col)
+    var pats: table<i64> = table_new_i64()
+    table_push(pats, pat)
+    ast.set_children(pl, pats)
+    var ckids: table<i64> = table_new_i64()
+    table_push(ckids, pl)
+    table_push(ckids, -1)          // when 槽（无守卫）
+    table_push(ckids, then_list)
+    ast.set_children(c, ckids)
+    var n = ast.new_node(N_SWITCH, -1, -1, 1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, expr)
+    table_push(kids, c)
+    table_push(kids, else_list)
+    ast.set_children(n, kids)
+    return n
+}
+
+// p.8.2.11 `guard <cond> else { stmts }` 早退语句。语法脱糖语义：
+//   guard c else { B } ≡ if not(c) { B }
+// 解析产出 N_GUARD_STMT[cond, else_list]（else 块必须跳转收尾由 scheck 校验，
+// irgen 按 if-not 发射）。游标停在 `guard` 上（调用方已验证后不跟 `<`/`=`）。
+func parse_guard_else() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // guard
+    // 条件表达式（enter_cond 防尾随闭包把 else 块 `{` 误吞）
+    putil.enter_cond()
+    var cond = pexpr.parse_expr()
+    putil.exit_cond()
+    if cond < 0 {
+        return -1
+    }
+    if !putil.expect(lex_else, "'else'") {
+        return -1
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var n = ast.new_node(N_GUARD_STMT, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, cond)
+    table_push(kids, body)
+    ast.set_children(n, kids)
+    return n
+}
+
+// p.9.11.4 `defer { stmts }` 资源释放语句。游标停在 `defer` 上（调用方已确认
+// 后跟 `{`）。产出 N_DEFER[children=[块 StmtList]]。defer 块内禁止 return/break/
+// continue/yield/goto/panic/嵌套 defer 由 scheck 校验（仅允许表达式语句与
+// 赋值/读作用域变量）。
+func parse_defer() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // defer
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var n = ast.new_node(N_DEFER, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, body)
+    ast.set_children(n, kids)
+    return n
+}
+
+// `while cond { }`（label 为循环标签，E5）
+func parse_while(label: i64) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // while
+    putil.enter_cond()   // p.8.2.9：条件内不判定尾随闭包
+    var cond = pexpr.parse_expr()
+    putil.exit_cond()
+    if cond < 0 {
+        return -1
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var n = ast.new_node(N_WHILE, label, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, cond)
+    table_push(kids, body)
+    ast.set_children(n, kids)
+    return n
+}
+
+// `for var in expr { }`（label 为循环标签，E5）
+func parse_for(label: i64) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // for
+    var var_id: i64 = -1
+    var dest_names: table<i64> = table_new_i64()
+    if putil.peek_tag() == lex_lparen {
+        // p.8.2.2 for..in 解构迭代：`for (a, b) in t` → desugar 为
+        // `for _tmpN in t { var a = _tmpN.Item1; var b = _tmpN.Item2; body }`
+        putil.advance()  // '('
+        var dd = false
+        while !dd {
+            var nm = putil.expect_ident()
+            if nm < 0 {
+                return -1
+            }
+            table_push(dest_names, nm)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                dd = true
+            }
+        }
+        var_id = interner.intern("_tmp" + to_string(g_tmp))
+        g_tmp = g_tmp + 1
+    } else {
+        var_id = putil.expect_ident()
+        if var_id < 0 {
+            return -1
+        }
+    }
+    if !putil.expect(lex_in, "'in'") {
+        return -1
+    }
+    putil.enter_cond()   // p.8.2.9：迭代容器表达式内不判定尾随闭包
+    var iter = pexpr.parse_expr()
+    putil.exit_cond()
+    if iter < 0 {
+        return -1
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    // 解构：逐字段声明（var a = _tmpN.Item1; ...）前插到 body 头部
+    if len(dest_names) > 0 {
+        var decls: table<i64> = table_new_i64()
+        var i: i64 = 0
+        while i < len(dest_names) {
+            var var_node = ast.new_node(N_VAR, var_id, -1, -1, line, col)
+            var fa = ast.new_node(N_FIELD_ACCESS, interner.intern("Item" + to_string(i + 1)), -1, -1, line, col)
+            var fkids: table<i64> = table_new_i64()
+            table_push(fkids, var_node)
+            ast.set_children(fa, fkids)
+            var fv = ast.new_node(N_VAR_DECL, dest_names[i], 0, -1, line, col)
+            var vkids: table<i64> = table_new_i64()
+            table_push(vkids, -1)
+            table_push(vkids, fa)
+            ast.set_children(fv, vkids)
+            table_push(decls, fv)
+            i = i + 1
+        }
+        var merged: table<i64> = table_new_i64()
+        var di: i64 = 0
+        while di < len(decls) {
+            table_push(merged, decls[di])
+            di = di + 1
+        }
+        // 注意：parse 阶段 ast 表与 sstate 表未同步——须用 ast.child_count/child_at
+        var bi: i64 = 0
+        while bi < ast.child_count(body) {
+            table_push(merged, ast.child_at(body, bi))
+            bi = bi + 1
+        }
+        ast.set_children(body, merged)
+    }
+    var n = ast.new_node(N_FOR, var_id, -1, label, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, iter)
+    table_push(kids, body)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 探测「循环标签前缀」：当前标识符 + 冒号 + while/for（E5）
+func is_loop_label_ahead() -> bool {
+    if putil.peek_tag() != lex_ident {
+        return false
+    }
+    if putil.peek_n(1) != lex_colon {
+        return false
+    }
+    var n2 = putil.peek_n(2)
+    if n2 == lex_while {
+        return true
+    }
+    if n2 == lex_for {
+        return true
+    }
+    return false
+}
+
+// `L: while/for` 带标签循环（E5）
+func parse_labeled_loop() -> i64 {
+    var label = putil.expect_ident()
+    if label < 0 {
+        return -1
+    }
+    putil.advance()   // 冒号
+    var tag = putil.peek_tag()
+    if tag == lex_while {
+        return parse_while(label)
+    }
+    if tag == lex_for {
+        return parse_for(label)
+    }
+    putil.set_err(putil.peek_line(), putil.peek_col(), "标签 '" + interner.lookup(label) + "' 后必须是 while 或 for")
+    return -1
+}
+
+// `break` / `continue`（可选标签 break L / continue L，E1+E5）
+func parse_loop_jump(is_continue: bool) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // break / continue
+    var label = -1
+    if putil.peek_tag() == lex_ident {
+        var n1 = putil.peek_n(1)
+        if n1 == lex_semi {
+            label = interner.intern(putil.peek_lexeme())
+            putil.advance()
+        } else if n1 == lex_eof {
+            label = interner.intern(putil.peek_lexeme())
+            putil.advance()
+        } else if n1 == lex_rbrace {
+            label = interner.intern(putil.peek_lexeme())
+            putil.advance()
+        }
+    }
+    if !putil.expect_stmt_end() {
+        return -1
+    }
+    if is_continue {
+        return ast.new_node(N_CONTINUE, label, -1, -1, line, col)
+    }
+    return ast.new_node(N_BREAK, label, -1, -1, line, col)
+}
+
+// `switch subject { case ...: ... default: ... }`
+func parse_switch() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // switch
+    putil.enter_cond()   // p.8.2.9：判分子表达式内不判定尾随闭包
+    var subject = pexpr.parse_expr()
+    putil.exit_cond()
+    if subject < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var cases: table<i64> = table_new_i64()
+    var default_list = -1
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_case {
+            var cl = putil.peek_line()
+            var cc = putil.peek_col()
+            putil.advance()   // case
+            var pats: table<i64> = table_new_i64()
+            var p = parse_case_pattern()
+            if p < 0 {
+                return -1
+            }
+            table_push(pats, p)
+            while putil.eat(lex_comma) {
+                p = parse_case_pattern()
+                if p < 0 {
+                    return -1
+                }
+                table_push(pats, p)
+            }
+            var when_expr = -1
+            if putil.eat(lex_when) {
+                when_expr = pexpr.parse_expr()
+                if when_expr < 0 {
+                    return -1
+                }
+            }
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var body = parse_switch_body()
+            if body < 0 {
+                return -1
+            }
+            var c = ast.new_node(N_SWITCH_CASE, -1, -1, -1, cl, cc)
+            var pl = ast.new_node(N_PATTERN_LIST, -1, -1, -1, cl, cc)
+            ast.set_children(pl, pats)
+            var ckids: table<i64> = table_new_i64()
+            table_push(ckids, pl)
+            table_push(ckids, when_expr)
+            table_push(ckids, body)
+            ast.set_children(c, ckids)
+            table_push(cases, c)
+        } else if tag == lex_default {
+            putil.advance()   // default
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            default_list = parse_switch_body()
+            if default_list < 0 {
+                return -1
+            }
+        } else if tag == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if tag == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "switch 体内只允许 case/default/右花括号，实际是 " + putil.describe(tag))
+            return -1
+        }
+    }
+    if default_list < 0 {
+        default_list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    }
+    var n = ast.new_node(N_SWITCH, -1, -1, len(cases), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, subject)
+    var i: i64 = 0
+    while i < len(cases) {
+        table_push(kids, cases[i])
+        i = i + 1
+    }
+    table_push(kids, default_list)
+    ast.set_children(n, kids)
+    return n
+}
+
+// case/default 分支体：连续语句直到下一个 case/default/右花括号/文件结束
+func parse_switch_body() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_case {
+            done = true
+        } else if tag == lex_default {
+            done = true
+        } else if tag == lex_rbrace {
+            done = true
+        } else if tag == lex_eof {
+            done = true
+        } else {
+            var s = parse_stmt()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        }
+    }
+    var list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    ast.set_children(list, stmts)
+    return list
+}
+
+}

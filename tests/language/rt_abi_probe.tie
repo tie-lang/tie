@@ -1,0 +1,69 @@
+type tie<logic, unsafe:mem>
+// rt_abi_probe.tie —— 表句柄 ABI 一致性探针（编译器内联快路径的前提）
+// ============================================================
+// 依据：compiler/backend/rt_abi.tie 的偏移常量（RT_TBL_OFF_*）。codegen 的
+// 免锁读/写/push 快路径按这些偏移直接 gep+load/store——本探针在运行期经
+// trm-lite 入口建表，再按同偏移读句柄字段断言：对不上即 FAIL（布局漂移必被拦）。
+// 期望输出：PASS 若干行 + "ABI OK"
+import "../../../trm-lite/core/tbl/tl_tbl.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// 按偏移读 8 字节字段（与 codegen 内联同一手法：常量尺寸 memcpy）
+unsafe func rd(h: i64, off: i64) -> i64 {
+    var v: i64 = 0
+    memcpy(int_to_ptr(ptr_to_int(addr_of(v))), int_to_ptr(h + off), 8)
+    return v
+}
+
+unsafe func wr(h: i64, off: i64, v: i64) {
+    var s: i64 = v
+    memcpy(int_to_ptr(h + off), int_to_ptr(ptr_to_int(addr_of(s))), 8)
+}
+
+func main() {
+  unsafe {
+    // ---- 新建句柄：cap=0 / len=0 / data=null / esz=8 / rc=1 ----
+    var h = tl_tbl.tbl_new(8)
+    check(rd(h, 0) == 0, "新建 cap=0")
+    check(rd(h, 8) == 0, "新建 len=0")
+    check(rd(h, 16) == 0, "新建 data=null")
+    check(rd(h, 24) == 8, "新建 esz=8（i64）")
+    check(rd(h, 40) == 1, "新建 rc=1")
+    // ---- 元素追加：len/cap/data 更新，esz 不变 ----
+    var tmp: i64 = 7
+    tl_tbl.tbl_push_nl(h, ptr_to_int(addr_of(tmp)))
+    check(rd(h, 8) == 1, "push 后 len=1")
+    check(rd(h, 0) >= 1, "push 后 cap>=1")
+    check(rd(h, 16) != 0, "push 后 data 非空")
+    check(rd(h, 24) == 8, "push 后 esz 不变=8")
+    // ---- 宽度变体：bool 表 esz=1；字符串表按句柄宽 8 ----
+    var hb = tl_tbl.tbl_new(1)
+    check(rd(hb, 24) == 1, "bool 表 esz=1")
+    var hs = tl_tbl.tbl_new(8)
+    check(rd(hs, 24) == 8, "string 表 esz=8")
+    // ---- 语言层表与运行期前缀一致：len(t) 内联读 [h+8] 与运行期 len 相同 ----
+    var t = table_new_i64()
+    var k: i64 = 0
+    while k < 5 {
+        table_push(t, k + 100)
+        k = k + 1
+    }
+    check(len(t) == 5, "语言层 len(t)=5（内联字段读）")
+    check(t[4] == 104, "语言层 t[4]=104")
+    if fails == 0 {
+        println("ABI OK")
+    } else {
+        println("ABI FAIL count=" + to_string(fails))
+    }
+  }
+}

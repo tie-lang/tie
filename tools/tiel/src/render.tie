@@ -1,0 +1,30 @@
+type tie<class>
+// render.tie —— tiel 错误文本拼装（独立呈现层；核心不依赖本文件）
+// ============================================================
+// 输出形态（目标口径）：error[E#####] @行:列: 消息。
+//   * 消息取完整文本（不做短名切分一类的渲染加工）；
+//   * 位置为前端给出的用户视角行列（自 1 起）；line < 0 时省略位置段；
+//   * 错误码取自错误槽（置错时经 emcodes 查询填入；未分类消息为 E00000）。
+// 入口：
+//   rd_error_line(line, col, msg, code) —— 纯函数拼装（测试 / 自定义用法）
+//   rd_err_slot() —— 从错误槽拼装（常规用法）
+// 边界：本文件只做文本拼装，不改动核心状态；嵌入者不引用它即无此层。
+// 前缀 rd_。
+
+import "./emit.tie"
+import "./emcodes.tie"
+namespace tiel;
+
+// 纯函数拼装：error[code] @line:col: msg。
+pub func rd_error_line(line: i64, col: i64, msg: string, ecode: string) -> string {
+    var out = "error[" + ecode + "]"
+    if line >= 0 {
+        out = out + " @" + to_string(line) + ":" + to_string(col)
+    }
+    return out + ": " + msg + "。"
+}
+
+// 从错误槽拼装（前置：已置错；返回完整错误行）。
+pub func rd_err_slot() -> string {
+    return rd_error_line(em_err_line(), em_err_col(), em_err_msg(), em_err_code())
+}

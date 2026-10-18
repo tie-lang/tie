@@ -1,0 +1,583 @@
+type tie<class>
+// compiler/frontend/lex_scan.tie —— T2.4 token 扫描器（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）完整词法器
+// lexer.tie 拆分为 5 模块之一（本文件 = 各 token 扫描器 + 错误槽写入）。
+// 共享状态（g_codes/g_n/g_src/g_line_starts/g_err_*）来自 ./lex_state.tie
+// （经 ./lex_tokdefs.tie 传递可达），tag 常量来自 ./lex_tokdefs.tie，
+// 关键字/符号查表走 ./lex_symtab.tie，错误消息走 ./errors.tie，
+// 字符串函数走 /std/string.tie，池化走 ../lib/interner.tie。
+// 依赖：./lex_tokdefs.tie（tag 常量 + 列式表 + 字符分类 + 行列反推，
+// 经其传递可达 ./lex_state.tie 共享全局 + ../lib/interner.tie 池 +
+// /std/string.tie 字符串函数）+ ./lex_symtab.tie（关键字/符号查表）
+// + ./errors.tie（错误消息）。树状无环，唯一 import 路径。
+// 由 lexer.tie import。
+
+import "./lex_tokdefs.tie"
+import "./lex_symtab.tie"
+import "./errors.tie"
+
+namespace lexscan {
+
+
+// ---------- 各 token 扫描器 ----------
+// 输入 pos（当前字符位置），返回扫描结束后的位置；出错置全局错误槽返回 -1。
+
+
+// 字符串（可跨行；lexeme = 原始切片含引号，parser 阶段再解码转义）。
+// p.8.2.3 字符串插值：遇未转义 '{'（'{{' 转义字面）→ 当前段以合成 lexeme
+// `"text"` 发 lex_str + 发 lex_interp_lbrace（插值专用 tag，区别于块开括号
+// lex_lbrace，避免 `if s == "a" {` 的块 lbrace 被 parser 误认插值）标记插值
+// 开始（g_str_interp=1），返回 `{` 后位置由主循环继续 lex 表达式；主循环遇
+// `}`（g_str_interp==1）置 2，下一 token 经主循环分派本函数**续扫**（无开引号，
+// g_str_interp==2）。
+pub func scan_string(pos: i64) -> i64 {
+    var start = pos
+    var cont = g_str_interp == 2
+    // p.9.23.1 插值显式化（对齐规范 §1.9）：插值仅发生在 h"..." 插值字符串
+    //（g_str_hmode，主循环 h 分支置位）；普通串花括号一律字面——JSON/模板/
+    // 代码片段/正则照原样书写。原前瞻插值判定（含 p.9.23 D3 asm 模板特判，
+    // 其语义被「普通串花括号字面」覆盖）整体移除；插值表达式按 h"{expr}" 紧贴
+    // 书写，h 串内字面花括号写作 {{ / }}。
+    var interp_mode = g_str_hmode
+    if !cont {
+        pos = pos + 1   // 跳过开引号 '"'（h 串由主循环分支先跳过 'h'）
+    }
+    // 段文本构建（字面 `{`/`}` 原样保留；`{{`/`}}` **不**在 lexer 折叠——
+    // p.9.12.1：字符串字面量里的 `}}` 是 JSON/模板合法字节，逐字保留，不能
+    // 折叠成 `}`（曾致 tsp 等 JSON 响应缺尾括号）。插值字符串段的花括号
+    // 转义（{{→{ / }}→}）改由 parser 的 parse_interp_chain 折叠；\X 转义原样
+    // 保留，由 parser 的 str_unescape_quoted 统一还原）
+    var sb = string_builder()
+    var done = false
+    while pos < g_n {
+        if g_codes[pos] == 92 {        // 反斜杠
+            pos = pos + 1
+            if pos >= g_n {
+                set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_escape_missing"))
+                return -1
+            }
+            var e = g_codes[pos]
+            if !is_valid_escape(e) {
+                set_err(lextok.line_of(start), lextok.col_of(start),
+                    errors.lex_unknown_escape(str_char(g_src, pos)))
+                return -1
+            }
+            sb_append_byte(sb, 92)     // '\' 原样
+            sb_append_byte(sb, e)
+            pos = pos + 1
+        } else if g_codes[pos] == 34 { // 闭引号 '"'
+            pos = pos + 1
+            done = true
+            break
+        } else if interp_mode && g_codes[pos] == 123 && pos + 1 < g_n && g_codes[pos + 1] == 123 {
+            // h 串 '{{' → '{' 字面花括号（规范 §1.9：插值串内双写代表一个）
+            sb_append_byte(sb, 123)
+            pos = pos + 2
+        } else if interp_mode && g_codes[pos] == 125 && pos + 1 < g_n && g_codes[pos + 1] == 125 {
+            // h 串 '}}' → '}' 字面花括号
+            sb_append_byte(sb, 125)
+            pos = pos + 2
+        } else if interp_mode && g_codes[pos] == 123 {
+            // h 串插值：无条件触发（字面花括号用 {{ / }} 转义；表达式紧贴书写
+            // h"{expr}"）。段以合成 lexeme 发 lex_str + 发 lex_interp_lbrace，
+            // 主循环继续 lex 表达式（g_str_interp 状态机不变）。
+            var seg = sb_build(sb)
+            var lid = interner.intern("\"" + seg + "\"")
+            lextok.push_token_at(lex_str, start, lid)
+            var lb = interner.intern("{")
+            lextok.push_token_at(lex_interp_lbrace, pos, lb)
+            g_str_interp = 1
+            return pos + 1
+        } else {
+            // 普通码点：按 UTF-8 字节序列追加（非 ASCII 码点 >255，不能直存字节）
+            var bs = g_byte_starts[pos]
+            var be = g_byte_starts[pos + 1]
+            var bi: i64 = bs
+            while bi < be {
+                sb_append_byte(sb, str_byte(g_src, bi))
+                bi = bi + 1
+            }
+            pos = pos + 1
+        }
+    }
+    if !done {
+        set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_str_unclosed"))
+        return -1
+    }
+    var seg2 = sb_build(sb)
+    var lid2 = interner.intern("\"" + seg2 + "\"")
+    lextok.push_token_at(lex_str, start, lid2)
+    if g_str_interp == 2 {
+        g_str_interp = 0   // 续段闭合 → 退出插值模式
+        g_str_hmode = false
+    }
+    return pos
+}
+
+
+pub func scan_triple_string(pos: i64) -> i64 {
+    var cont = g_str_interp == 2
+    // p.9.23.1：h"""...""" 多行插值串（g_str_hmode）——语义同 h"..."；
+    // 普通三引号花括号一律字面（前瞻插值判定移除）。
+    var interp_mode = g_str_hmode
+    var start = pos
+    var c0 = pos
+    var close = -1
+    var margin: i64 = 0
+    if !cont {
+        close = find_triple_end(pos + 3)
+        if close < 0 {
+            set_err(lextok.line_of(pos), lextok.col_of(pos), errors.err_msg("lex_str_unclosed"))
+            return -1
+        }
+        margin = triple_line_indent(close)
+        c0 = pos + 3
+        // 首行 `"""` 后紧跟换行 → 内容自下一行起（LF/CR+LF）
+        if c0 < close {
+            if g_codes[c0] == 10 {
+                c0 = c0 + 1
+            } else if g_codes[c0] == 13 && c0 + 1 < g_n && g_codes[c0 + 1] == 10 {
+                c0 = c0 + 2
+            }
+        }
+    } else {
+        close = find_triple_end(pos)
+        if close < 0 {
+            set_err(lextok.line_of(pos), lextok.col_of(pos), errors.err_msg("lex_str_unclosed"))
+            return -1
+        }
+        margin = triple_line_indent(close)
+    }
+    // 闭引号行处理：若最后一行仅空白（闭引号独立成行的常规形态），连同其前的
+    // 换行一并丢弃（Swift 对齐）；否则内容原样保留。
+    var c1 = close
+    var p2 = c1
+    while p2 > c0 && (g_codes[p2 - 1] == 32 || g_codes[p2 - 1] == 9) {
+        p2 = p2 - 1
+    }
+    if p2 > c0 && g_codes[p2 - 1] == 10 {
+        c1 = p2 - 1
+        if c1 > c0 && g_codes[c1 - 1] == 13 {
+            c1 = c1 - 1
+        }
+    }
+    var sb = string_builder()
+    var p = c0
+    var at_line_start: bool = !cont
+    var pending_ws: i64 = 0   // 当前行已累积的行首空白（未超 margin 前暂存）
+    while p < c1 {
+        var ch = g_codes[p]
+        // 行首空白：暂存不写，超过 margin 或遇非空白时按 margin 上限补写
+        if at_line_start && (ch == 32 || ch == 9) {
+            pending_ws = pending_ws + 1
+            if pending_ws > margin {
+                var bs0 = g_byte_starts[p]
+                var be0 = g_byte_starts[p + 1]
+                var bi0: i64 = bs0
+                while bi0 < be0 {
+                    sb_append_byte(sb, str_byte(g_src, bi0))
+                    bi0 = bi0 + 1
+                }
+                at_line_start = false
+            }
+            p = p + 1
+            continue
+        }
+        if at_line_start {
+            at_line_start = false   // 行首空白不足 margin：无剥离
+        }
+        if ch == 10 {
+            var bs1 = g_byte_starts[p]
+            var be1 = g_byte_starts[p + 1]
+            var bi1: i64 = bs1
+            while bi1 < be1 {
+                sb_append_byte(sb, str_byte(g_src, bi1))
+                bi1 = bi1 + 1
+            }
+            at_line_start = true
+            pending_ws = 0
+            p = p + 1
+        } else if ch == 13 && p + 1 < c1 && g_codes[p + 1] == 10 {
+            p = p + 1   // CR+LF：只保留 LF（源内 CRLF 统一）
+        } else if interp_mode && ch == 92 && p + 1 < c1 && g_codes[p + 1] == 123 {
+            // h 三引号 `\{` → 字面 `{`（插值转义；raw 语义下其余 \X 逐字保留）
+            sb_append_byte(sb, 123)
+            p = p + 2
+        } else if ch == 92 {
+            // raw 语义：`\X` 逐字保留。但 lexeme 送 parser str_unescape_quoted
+            // 统一还原，`\` 会被当转义前缀——此处双写 `\`（unesc 后还原为单）。
+            sb_append_byte(sb, 92)
+            sb_append_byte(sb, 92)
+            var bs2 = g_byte_starts[p + 1]
+            var be2 = g_byte_starts[p + 2]
+            var bi2: i64 = bs2
+            while bi2 < be2 {
+                sb_append_byte(sb, str_byte(g_src, bi2))
+                bi2 = bi2 + 1
+            }
+            p = p + 2
+        } else if interp_mode && ch == 123 && p + 1 < c1 && g_codes[p + 1] == 123 {
+            // h 三引号 '{{' → '{' 字面花括号
+            sb_append_byte(sb, 123)
+            p = p + 2
+        } else if interp_mode && ch == 125 && p + 1 < c1 && g_codes[p + 1] == 125 {
+            // h 三引号 '}}' → '}' 字面花括号
+            sb_append_byte(sb, 125)
+            p = p + 2
+        } else if ch == 123 {
+            // p.9.23.1：插值开始——h 三引号（g_str_hmode）内无条件触发；
+            // 普通三引号花括号一律字面（原前瞻判定移除，对齐规范 §1.9）。
+            if interp_mode {
+                var seg = sb_build(sb)
+                var lid = interner.intern("\"" + seg + "\"")
+                lextok.push_token_at(lex_str, start, lid)
+                var lb = interner.intern("{")
+                lextok.push_token_at(lex_interp_lbrace, p, lb)
+                g_str_interp = 1
+                g_str_triple = 1
+                return p + 1
+            }
+            var bs3 = g_byte_starts[p]
+            var be3 = g_byte_starts[p + 1]
+            var bi3: i64 = bs3
+            while bi3 < be3 {
+                sb_append_byte(sb, str_byte(g_src, bi3))
+                bi3 = bi3 + 1
+            }
+            p = p + 1
+        } else if ch == 34 && p + 2 < g_n && g_codes[p + 1] == 34 && g_codes[p + 2] == 34 {
+            // 内容中 `"""` → 提前闭合（不应到达：close 已预扫，防御）
+            break
+        } else {
+            var bs4 = g_byte_starts[p]
+            var be4 = g_byte_starts[p + 1]
+            var bi4: i64 = bs4
+            while bi4 < be4 {
+                sb_append_byte(sb, str_byte(g_src, bi4))
+                bi4 = bi4 + 1
+            }
+            p = p + 1
+        }
+    }
+    var seg2 = sb_build(sb)
+    var lid2 = interner.intern("\"" + seg2 + "\"")
+    lextok.push_token_at(lex_str, start, lid2)
+    if g_str_interp == 2 {
+        g_str_interp = 0
+        g_str_hmode = false
+    }
+    g_str_triple = 0
+    return close + 3
+}
+
+// p.9.11.19 raw 字符串 r"..."：免转义字面（`\n` 保持两字符；**无插值**——`{`
+// 原样字符，不触发 p.8.2.3 插值链）。内双引号转义形态裁决：`""` 双写 → 字面
+// `"`（`r"a""b"` = a"b）；否则遇 `"` 结束（`r""` 空串）。跨行 raw 不做专门
+// 支持（内容含换行照常原样收录，与普通字符串一致）。入口：scan_ident 扫到
+// 标识符 "r" 且下一字符为 '"'（pos 已指向开引号）。产出 lex_str token，
+// lexeme = `"` + 段（"" 已还原为 "）+ `"`（parser 复用 str_unescape_quoted）。
+pub func scan_raw_string(pos: i64) -> i64 {
+    var start = pos - 1   // 指向 'r'（token 起点）
+    pos = pos + 1         // 跳过开引号 '"'
+    var sb = string_builder()
+    var done = false
+    while pos < g_n {
+        if g_codes[pos] == 34 {          // '"'
+            if pos + 1 < g_n && g_codes[pos + 1] == 34 {
+                sb_append_byte(sb, 34)   // "" → 字面 '"'
+                pos = pos + 2
+            } else {
+                pos = pos + 1
+                done = true
+                break
+            }
+        } else {
+            // 原样码点（UTF-8 字节序列追加；不处理 \ 转义）
+            var bs = g_byte_starts[pos]
+            var be = g_byte_starts[pos + 1]
+            var bi: i64 = bs
+            while bi < be {
+                sb_append_byte(sb, str_byte(g_src, bi))
+                bi = bi + 1
+            }
+            pos = pos + 1
+        }
+    }
+    if !done {
+        set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_str_unclosed"))
+        return -1
+    }
+    var seg = sb_build(sb)
+    // lexeme = `r"` + 段 + `"`（r 前缀标记 raw，str_unescape_quoted/unescape_str
+    // 识别后不反转义；普通字符串 lexeme 无前缀）
+    var lid = interner.intern("r\"" + seg + "\"")
+    lextok.push_token_at(lex_str, start, lid)
+    return pos
+}
+
+// 字符字面量 'a' / '\n' / '\''（单引号包裹恰好一个字符，支持转义）
+pub func scan_char(pos: i64) -> i64 {
+    var start = pos
+    pos = pos + 1   // 开引号 '\''
+    if pos >= g_n {
+        set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_char_unclosed"))
+        return -1
+    }
+    if g_codes[pos] == 92 {            // 反斜杠转义
+        pos = pos + 1
+        if pos >= g_n {
+            set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_escape_missing"))
+            return -1
+        }
+        var e = g_codes[pos]
+        if !is_valid_escape(e) {
+            set_err(lextok.line_of(start), lextok.col_of(start),
+                errors.lex_unknown_escape(str_char(g_src, pos)))
+            return -1
+        }
+        pos = pos + 1
+    } else {
+        pos = pos + 1   // 一个内容字符
+    }
+    if pos >= g_n {
+        set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_char_unclosed"))
+        return -1
+    }
+    if g_codes[pos] == 39 {            // 闭引号 '\''
+        pos = pos + 1
+        var lid = interner.intern(cp_slice(start, pos))
+        lextok.push_token_at(lex_charlit, start, lid)
+        return pos
+    }
+    set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_char_multi"))
+    return -1
+}
+
+
+// 数字：整数（十进制/0x/0b/0o/0t）或浮点（小数点与指数）。边界对齐 Rust
+// scan_number（1..10 的 .. 不被误吃；0xFF 等进制前缀只在恰好单个 "0" 时触发）。
+pub func scan_number(pos: i64) -> i64 {
+    var start = pos
+    var is_float = false
+    var saw_e = false
+    var digits_consumed: i64 = 0
+    var scanning = true
+    while scanning {
+        var c: i64 = 0
+        if pos < g_n {              // 防护：消费完即终止（防 OOB 读）
+            c = g_codes[pos]
+        }
+        if lextok.is_digit(c) {
+            pos = pos + 1
+            digits_consumed = digits_consumed + 1
+        } else if c == 95 {         // '_' 数字分隔符（p.9.11.19）：仅当下一位
+            // 是数字时跳过（`1_000` / `1_000.5`）；否则停止——`1_` 尾分隔、
+            // `_x` 标识符起始都不在此路径（本函数只处理数字 token 内部）。
+            if pos + 1 < g_n && lextok.is_digit(g_codes[pos + 1]) {
+                pos = pos + 1
+            } else {
+                scanning = false
+            }
+        } else if c == 46 {         // '.'
+            if is_float {
+                scanning = false
+            } else if pos + 1 < g_n {
+                if lextok.is_digit(g_codes[pos + 1]) {   // 下一位是数字才视作小数
+                    is_float = true
+                    pos = pos + 1
+                } else {
+                    scanning = false
+                }
+            } else {
+                scanning = false
+            }
+        } else if c == 101 || c == 69 {   // 'e' / 'E' 指数
+            if saw_e {
+                scanning = false
+            } else {
+                var eend = scan_exponent(pos)
+                if eend > 0 {
+                    saw_e = true
+                    is_float = true
+                    pos = eend
+                }
+                scanning = false
+            }
+        } else {
+            scanning = false
+        }
+    }
+    // 进制前缀：恰好单个 '0' 且未成浮点 → 查 0x/0b/0o/0t（大小写均可）
+    if digits_consumed == 1 {
+        if !is_float {
+            if g_codes[start] == 48 {
+                if pos < g_n {
+                    var r = g_codes[pos]
+                    if r == 120 || r == 88 {          // x/X → 十六进制
+                        pos = scan_hex_digits(pos + 1)
+                    } else if r == 98 || r == 66 {    // b/B → 二进制
+                        pos = scan_digit_range(pos + 1, 48, 49)
+                    } else if r == 111 || r == 79 {   // o/O → 八进制
+                        pos = scan_digit_range(pos + 1, 48, 55)
+                    } else if r == 116 || r == 84 {   // t/T → 三进制
+                        // 仅当后随 0-2 数字才作三进制前缀（否则让位给 trit 后缀
+                        // 0t —— 数字部分为纯十进制的 trit 字面量，见下 suffix 块）
+                        if pos + 1 < g_n && g_codes[pos + 1] >= 48 && g_codes[pos + 1] <= 50 {
+                            pos = scan_digit_range(pos + 1, 48, 50)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    var tag = lex_int
+    if is_float {
+        tag = lex_float
+    }
+    // S1.3 L3 后缀字面量：数字后紧跟类型后缀（i8/i16/i32/i64/u8/u16/u32/u64/
+    // f32/f64，无空白）→ 吞并进 lexeme（如 "42i32" / "0x80u16" / "1.5f32"）。
+    // 浮点后缀（f32/f64）把 token 标记为 lex_float（parser 按后缀定类型）。
+    // 只吞精确后缀串：非后缀字母序列不吞（"42abc" 保持 42 + abc，parser 报错）。
+    if pos < g_n {
+        var c = g_codes[pos]
+        if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) {
+            var j = pos
+            var suf: string = ""
+            while j < g_n {
+                // 后缀串 = 字母开头 + 字母数字混合（i32/u8/f64）：
+                // 收集 is_ident_cont（字母/数字/_）再精确匹配
+                if lextok.is_ident_cont(g_codes[j]) {
+                    suf = suf + str_char(g_src, j)
+                    j = j + 1
+                } else {
+                    break
+                }
+            }
+            if suf == "i8" || suf == "i16" || suf == "i32" || suf == "i64" ||
+                suf == "u8" || suf == "u16" || suf == "u32" || suf == "u64" ||
+                suf == "i128" || suf == "u128" {
+                pos = j
+            } else if suf == "f32" || suf == "f64" {
+                tag = lex_float
+                pos = j
+            } else if suf == "t" || suf == "T" {
+                // trit 字面量后缀：数字部分是纯十进制（-1t/0t/1t；-1 由一元
+                // 负号 + 1t 表达）。2t/99t 等越界值也吞并（值域检查在 pexpr
+                // 报「trit 字面量越界」）。进制前缀数字（0x1t / 0b1t）保留 +
+                // 独立 t——非纯十进制不吞。
+                var pre = cp_slice(start, pos)
+                var is_dec = str_len(pre) >= 1
+                var pi: i64 = 0
+                while pi < str_len(pre) {
+                    var pc = str_char(g_src, start + pi)
+                    if pc < "0" || pc > "9" {
+                        is_dec = false
+                        break
+                    }
+                    pi = pi + 1
+                }
+                if is_dec {
+                    tag = lex_int
+                    pos = j
+                }
+            }
+        }
+    }
+    var lid = interner.intern(cp_slice(start, pos))
+    lextok.push_token_at(tag, start, lid)
+    return pos
+}
+
+// 标识符 / 关键字：切片 intern 后查关键字表转 tag。
+// p.9.11.19：标识符恰为 "r" 且下一字符是 '"' → raw 字符串 r"..."（转发
+// scan_raw_string，pos 已指向开引号）；否则普通标识符/关键字。
+pub func scan_ident(pos: i64) -> i64 {
+    var start = pos
+    while pos < g_n {
+        if lextok.is_ident_cont(g_codes[pos]) {
+            pos = pos + 1
+        } else {
+            break
+        }
+    }
+    var lex = cp_slice(start, pos)
+    if lex == "r" {
+        if pos < g_n && g_codes[pos] == 34 {
+            return scan_raw_string(pos)
+        }
+    }
+    var lid = interner.intern(lex)
+    var tag = lexsym.kw_lookup(lex)
+    if tag < 0 {
+        tag = lex_ident
+    }
+    lextok.push_token_at(tag, start, lid)
+    return pos
+}
+
+// 符号：3→2→1 字符最长匹配查符号表；未命中报「无法识别的字符」
+pub func scan_symbol(pos: i64) -> i64 {
+    var start = pos
+    // p.9.13.1 单箭头统一：`=>` 已移除。在最长匹配之前显式判定「`=` 后紧跟 `>`」，
+    // 提前报精确诊断（避免退化成 `=` `>` 两个 token 的隐性误配误指）。相邻 `>=`
+    //（首字符 `>`）、`==`、`=` 因首字符/第二字符不同不受影响。
+    if pos + 1 < g_n && g_codes[pos] == 61 && g_codes[pos + 1] == 62 {
+        set_err(lextok.line_of(start), lextok.col_of(start), errors.lex_fatarrow_removed())
+        return -1
+    }
+    var want: i64 = 3
+    while want >= 1 {
+        if pos + want <= g_n {
+            var lex = cp_slice(pos, pos + want)
+            var tag = lexsym.sym_lookup(lex)
+            if tag >= 0 {
+                var lid = interner.intern(lex)
+                lextok.push_token_at(tag, start, lid)
+                return pos + want
+            }
+        }
+        want = want - 1
+    }
+    set_err(lextok.line_of(start), lextok.col_of(start), errors.lex_unrecognized(str_char(g_src, pos)))
+    return -1
+}
+
+// ---------- 主循环 '/' 分派 ----------
+// '/' 分派：行注释 / doc 行 / 块注释 / doc 块 / 除号符号（返回新位置，-1 出错）。
+// doc 块判定：'/**' 且第三字符不是 '/'——'/**/' 的空闭合按普通块注释。
+pub func scan_slash(pos: i64) -> i64 {
+    var n1: i64 = 0
+    if pos + 1 < g_n {
+        n1 = g_codes[pos + 1]
+    }
+    if n1 == 47 {                // '//'
+        if pos + 2 < g_n {
+            if g_codes[pos + 2] == 47 {   // '///'
+                return scan_doc_line(pos)
+            }
+        }
+        return scan_line_comment(pos)
+    }
+    if n1 == 42 {                // '/*'
+        var is_doc: bool = false
+        if pos + 2 < g_n {
+            if g_codes[pos + 2] == 42 {   // '/**'
+                if pos + 3 >= g_n {
+                    is_doc = true
+                } else if g_codes[pos + 3] != 47 {
+                    is_doc = true
+                }
+            }
+        }
+        if is_doc {
+            return scan_doc_block(pos)
+        }
+        return scan_block_comment(pos)
+    }
+    return scan_symbol(pos)      // '/' 单字符或 '/=' 等符号
+}
+
+}
+
+import "./lex_scan_p1.tie"

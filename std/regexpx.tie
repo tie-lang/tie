@@ -1,0 +1,59 @@
+type tie<class>
+// regexpx.tie：标准库——正则表达式 Pro 扩展（命名空间 regexpx），p.9.1.1.9。
+// ============================================================
+// 定位：在 std/regex（regex 命名空间，既有纯 tie 回溯引擎）之上，为
+// 高级特性提供稳定的「Pro」命名空间入口。**共享同一引擎**：本文件不重复
+// 实现匹配逻辑，而是把 regex 引擎的既有五函数逐层透传（is_match/find/
+// find_all/group/replace），并补充 Pro 别名（regex_replace）。引擎扩展
+// （前瞻/回引用/\p{L}/惰性量词）落在 std/regex.tie 内部（保持向后兼容，
+// 既有 pattern 不受影响），故 regexpx 与 regex 行为一致——见 std/regex.tie
+// 的 RX_LA/RX_BACKREF/RX_ULEL/RX_SPLITL。
+//
+// Pro 语法（透传 pattern 即生效，不需额外参数）：
+//   - 正向前瞻 (?= ...)；
+//   - 回引用 \1..\9（引用已出现的捕获组；ForwardRef 不支持）；
+//   - Unicode 字母类 \p{L} / \p{Letter}（子集）；
+//   - 惰性量词 *? +? ??；
+//   - 既有：交替 |、分组 ()、字符类、锚点、替换 $N。
+//
+// 说明：与 regex 相比，regexpx 仅新增 regex_replace 别名（经典三参名），
+// 以及"明确 Pro 语义"的文档边界；五函数本体与 regex 完全同一实现。
+//
+// 调用：import 后 regexpx.is_match(...) 等，等价格式与 regex 相同。
+// 命名规范：pub func 显式导出；无 rx_/rg_ 私有前缀（复用 regex 的）。
+// ============================================================
+
+import "./regex.tie" as regex
+
+namespace regexpx {
+// 是否匹配（pattern 含 Pro 语法时同样生效）。与 regex.is_match 一致。
+pub func is_match(s: string, pattern: string) -> bool {
+    return regex.is_match(s, pattern)
+}
+
+// 首次匹配的子串。与 regex.find 一致。
+pub func find(s: string, pattern: string) -> string {
+    return regex.find(s, pattern)
+}
+
+// 全部匹配子串表。与 regex.find_all 一致。
+pub func find_all(s: string, pattern: string) -> table<string> {
+    return regex.find_all(s, pattern)
+}
+
+// 捕获组文本（i=0 整体，1..n 各组）。与 regex.group 一致。
+pub func group(s: string, pattern: string, i: i64) -> string {
+    return regex.group(s, pattern, i)
+}
+
+// 替换（$N/$0 捕获引用）。与 regex.replace 一致。
+pub func replace(s: string, pattern: string, repl: string) -> string {
+    return regex.replace(s, pattern, repl)
+}
+
+// 经典别名：regex_replace(s, pattern, fmt)。与 replace 完全一致，提供
+// 与 regex_replace 内置同名语义记忆点（命名空间内为 regexpx.regex_replace）。
+pub func regex_replace(s: string, pattern: string, fmt: string) -> string {
+    return regex.replace(s, pattern, fmt)
+}
+}

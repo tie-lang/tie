@@ -1,0 +1,102 @@
+type tie<logic>
+// closure_agg_capture.tie —— 闭包捕获聚合值的回归探针（2026-10-02）
+// ============================================================================
+// 背景：闭包 env 的字段访问走 `agg_gep`（getelementptr T, ptr, i32 0, i32 j，
+// **按 LLVM 聚合布局**算偏移），而 env 原先按「每字段 8 字节」分配
+// （`malloc(8 * ncap)`）——聚合字段（struct / tuple / 数组）大于 8 字节时
+// **堆越界写**。实测捕获 `struct Point { i64, i64 }` 的闭包段错误，
+// IR 证据：`%9 = call ptr @malloc(i64 8)` 后紧跟 `store %struct.Point`（16 字节）。
+//
+// 修复：env 尺寸改按真实 LLVM 布局尺寸计算（`agg_ty_size`，对齐 LangRef
+// 默认 DataLayout；实现见 backend/irgen_closure.tie，规则经 15 种聚合形状
+// 与 LLVM 常量折叠值逐一对照一致）。
+//
+// 本探针覆盖含**填充**与**多字段**的字段布局，断言捕获值在闭包内精确读回，
+// 并覆盖「聚合 + 标量混合捕获」（env 多字段、字段间有填充）。
+
+struct P2 {
+    var x: i64 = 0
+    var y: i64 = 0
+}
+
+struct Mixed {
+    var a: i8 = 0        // i8 + 7 字节填充 + i64 ⇒ 布局 16
+    var b: i64 = 0
+}
+
+struct T3 {
+    var a: i32 = 0       // 4 + 4 = 8，再 i64 ⇒ 布局 16
+    var b: i32 = 0
+    var c: i64 = 0
+}
+
+// ---- ① 双 i64 字段 ----
+func make_p2() -> fn() -> i64 {
+    var p = P2(10, 20)
+    return func() -> i64 { return p.x + p.y }
+}
+
+// ---- ② 含填充的混合宽度 ----
+func make_mixed() -> fn() -> i64 {
+    var m = Mixed(3, 40)
+    return func() -> i64 { return to_i64(m.a) + m.b }
+}
+
+// ---- ③ 三字段（i32/i32/i64）----
+func make_t3() -> fn() -> i64 {
+    var t = T3(1, 2, 100)
+    return func() -> i64 { return to_i64(t.a) + to_i64(t.b) + t.c }
+}
+
+// ---- ④ 聚合 + 标量混合捕获（env 多字段）----
+func make_mix() -> fn() -> i64 {
+    var p = P2(11, 22)
+    var n: i64 = 33
+    return func() -> i64 { return p.x + p.y + n }
+}
+
+// ---- ⑤ 定长数组捕获 ----
+func make_arr() -> fn() -> i64 {
+    var a: array<i64, 3> = [1, 2, 3]
+    return func() -> i64 { return a[0] + a[1] + a[2] }
+}
+
+// ---- ⑥ 表捕获（引用类型，仍走 8 字节槽）----
+func make_tbl() -> fn() -> i64 {
+    var t: table<i64> = [4, 5]
+    return func() -> i64 { return t[0] + t[1] }
+}
+
+// ---- ⑦ 嵌套闭包捕获聚合（内层再捕获外层捕获的 struct）----
+func make_nested() -> fn() -> fn() -> i64 {
+    var p = P2(7, 8)
+    return func() -> fn() -> i64 {
+        var k: i64 = 2
+        return func() -> i64 { return p.x + p.y + k }
+    }
+}
+
+func main() {
+    var total: i64 = 0
+    var f1 = make_p2()
+    var f2 = make_mixed()
+    var f3 = make_t3()
+    var f4 = make_mix()
+    var f5 = make_arr()
+    var f6 = make_tbl()
+    total = total + f1()
+    total = total + f2()
+    total = total + f3()
+    total = total + f4()
+    total = total + f5()
+    total = total + f6()
+    var nf = make_nested()
+    var f7 = nf()
+    total = total + f7()
+    // 期望：30 + 43 + 103 + 66 + 6 + 9 + 17 = 274
+    if total == 274 {
+        println("PASS closure-agg-capture total=" + to_string(total))
+    } else {
+        println("FAIL closure-agg-capture total=" + to_string(total) + " 期望 274")
+    }
+}

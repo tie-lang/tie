@@ -1,0 +1,628 @@
+type tie<class>
+// compiler/frontend/pstmt_top_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 pstmt_top.tie。
+namespace pstmt_top {
+// S3.3：交替处理延迟闭包与延迟准引用块（parse_program 末尾调用）。
+// 闭包体里可含准引用块、准引用块里可含闭包——两张延迟表互相登记，
+// 单遍处理会漏：交替扫描直到两表长度都稳定（新增登记在解析过程中追加
+// 到表尾，动态 count 循环处理到队尾；外层再检查另一张表是否有新增）。
+func parse_deferred_all() -> i64 {
+    var done = false
+    while !done {
+        var c1 = putil.defer_closure_count()
+        var c2 = putil.defer_code_count()
+        if pstmt_flow.parse_deferred_closures() < 0 {
+            return -1
+        }
+        if pstmt_flow.parse_deferred_code_blocks() < 0 {
+            return -1
+        }
+        if putil.defer_closure_count() == c1 {
+            if putil.defer_code_count() == c2 {
+                done = true
+            }
+        }
+    }
+    return 0
+}
+
+// S3.3 宏定义：`macro name(p1: code, ...) -> code { 函数体 }`。
+// 布局与 N_FN_DEF 一致但**无泛型槽**：children = [返回类型, 参数..., 函数体]；
+// name = 宏名，aux = 参数个数，val = 0。
+// 参数/返回类型必须是 code（准引用/插值载体）；宏体是普通 tie 语句
+// （编译期由 interp 执行，宏体错误在展开时报"宏执行错误"）。
+//
+// p.8.2.12 分支：**声明式宏**（裸形参 + 块体，无 `->`）走 N_DECL_MACRO_DEF：
+//   `macro swap(a, b) { var __t = $a; $a = $b; $b = __t }`
+// 形参名/`$名` 在体内 = 代换槽（替换为实参克隆）；`__` 前缀 = 卫生临时名，
+// 每次展开唯一化。分派依据：`)` 后是 `->`=函数式宏，是 `{`=声明式宏。
+func parse_macro_def() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // macro
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    var param_kind: i64 = 0   // 0=未定（无参或首个待定） 1=函数式(: code) 2=声明式(裸形参)
+    if !putil.eat(lex_rparen) {
+        var d = false
+        while !d {
+            var pname = putil.expect_ident()
+            if pname < 0 {
+                return -1
+            }
+            if putil.peek_tag() == lex_colon {
+                // 函数式宏参数：必须是 code 类型
+                if param_kind == 2 {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "宏 '" + interner.lookup(name) + "' 形参类型不一致：声明式宏形参为裸标识符，不能混用 `: type`（请统一为裸形参或加 `: code` 全部转函数式宏）")
+                    return -1
+                }
+                param_kind = 1
+                putil.advance()
+                var pty = pexpr_type.parse_type()
+                if pty < 0 {
+                    return -1
+                }
+                // 宏参数必须显式标注 code 类型（宏 = 编译期 AST → AST 函数）
+                if !is_code_type_node(pty) {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "宏参数 '" + interner.lookup(pname) + "' 必须是 code 类型（宏 = 编译期 AST→AST 函数）")
+                    return -1
+                }
+                var p = ast.new_node(N_PARAM, pname, 0, 0, putil.peek_line(), putil.peek_col())
+                var pkids: table<i64> = table_new_i64()
+                table_push(pkids, pty)
+                table_push(pkids, -1)
+                ast.set_children(p, pkids)
+                table_push(params, p)
+            } else {
+                // 声明式宏裸形参（p.8.2.12，模板代换槽）
+                if param_kind == 1 {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "宏 '" + interner.lookup(name) + "' 形参类型不一致：函数式宏形参须带 `: code`，不能混用裸标识符")
+                    return -1
+                }
+                param_kind = 2
+                var p = ast.new_node(N_PARAM, pname, 0, 0, putil.peek_line(), putil.peek_col())
+                var pkids: table<i64> = table_new_i64()
+                table_push(pkids, -1)
+                ast.set_children(p, pkids)
+                table_push(params, p)
+            }
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    // 分派：`)` 后 `->` = 函数式宏；`{` = 声明式宏（p.8.2.12）
+    if putil.peek_tag() == lex_arrow {
+        if param_kind == 2 {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "声明式宏 '" + interner.lookup(name) + "' 是裸形参模板宏，不能有 '->' 返回类型（如需编译期函数宏请给每个形参加 `: code` 并返回 code）")
+            return -1
+        }
+        putil.advance()
+        var ret_ty = pexpr_type.parse_type()
+        if ret_ty < 0 {
+            return -1
+        }
+        if !is_code_type_node(ret_ty) {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "宏 '" + interner.lookup(name) + "' 的返回类型必须是 code（宏 = 编译期 AST→AST 函数）")
+            return -1
+        }
+        var body = pstmt_flow.parse_block()
+        if body < 0 {
+            return -1
+        }
+        var f = ast.new_node(N_MACRO_DEF, name, 0, len(params), line, col)
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, ret_ty)
+        var i: i64 = 0
+        while i < len(params) {
+            table_push(kids, params[i])
+            i = i + 1
+        }
+        table_push(kids, body)
+        ast.set_children(f, kids)
+        return f
+    }
+    // 声明式宏：裸形参 + 块体（无 `->`）
+    if param_kind == 1 {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "函数式宏 '" + interner.lookup(name) + "' 形参带 `: code`，必须跟 '-> code' 返回类型")
+        return -1
+    }
+    var body = pstmt_flow.parse_block()
+    if body < 0 {
+        return -1
+    }
+    var df = ast.new_node(N_DECL_MACRO_DEF, name, 0, len(params), line, col)
+    var dkids: table<i64> = table_new_i64()
+    table_push(dkids, body)
+    var j: i64 = 0
+    while j < len(params) {
+        table_push(dkids, params[j])
+        j = j + 1
+    }
+    ast.set_children(df, dkids)
+    return df
+}
+
+// 类型节点是否为 code 类型（N_NAMED_TYPE 且 TyKw 索引 == TK_CODE=15）。
+func is_code_type_node(ty: i64) -> bool {
+    if ty < 0 {
+        return false
+    }
+    if ast.tag(ty) == N_NAMED_TYPE {
+        if ast.val(ty) == 15 {
+            return true
+        }
+    }
+    return false
+}
+
+// M4（dev33 批次9）过程宏属性：`#[macro]` 已消费 '#'，解析 `[macro]` 后紧跟
+// macro 定义，把 N_MACRO_DEF 的 val 置 1 标记为过程宏（token 流 API 驱动：
+// mexpand 展开时把实参解引用为源码文本、绑定为字符串传给宏体）。
+func parse_proc_macro_attr() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // #
+    if !putil.expect(lex_lbracket, "'['") {
+        return -1
+    }
+    // 属性名读取 lexeme（不限定标识符：`#[macro]` 中 macro 是关键字 token）
+    var aname = interner.intern(putil.peek_lexeme())
+    putil.advance()
+    if !putil.expect(lex_rbracket, "']'") {
+        return -1
+    }
+    if aname != interner.intern("macro") {
+        putil.set_err(line, col, "未知属性 '#[" + interner.lookup(aname) +
+            "]'（当前仅支持 #[macro] 过程宏标记）")
+        return -1
+    }
+    // 属性后必须紧跟 macro 定义（`#[macro]` 行尾 ASI 可能补分号，先消费）
+    putil.eat(lex_semi)
+    if putil.peek_tag() != lex_macro {
+        putil.set_err(putil.peek_line(), putil.peek_col(),
+            "#[macro] 后必须紧跟宏定义（macro 关键字）")
+        return -1
+    }
+    var s = parse_macro_def()
+    if s < 0 {
+        return -1
+    }
+    ast.set_val(s, 1)   // val=1 标记过程宏（普通宏 val=0）
+    return s
+}
+
+// 三期通用 `#[]` 属性通道（concurrency-model.md §7.1，2026-08-23 定稿）：
+// 点号命名空间风格属性 `#[ns.sub]`（如 `#[unsafe.share]` / `#[unsafe.trm]` /
+// `#[unsafe.mem]` / `#[unsafe.ext]`），附着在声明（actor / func / 方法）前，
+// 作为 unsafe 凭据门禁标记。`#[tag.x]` goto 标签走语句位置（parse_goto_label，
+// 本处不处理）；`#[macro]` 过程宏走 parse_proc_macro_attr（本处不处理）。
+// 已消费 '#': 解析 `[` ns `.` sub `]` → 返回属性全名池 id（如 "unsafe.share"）；
+// 未知属性返回 -1 报错。属性仅作声明标记，语义层按需消费。
+func parse_generic_attr() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // #
+    if !putil.expect(lex_lbracket, "'['") {
+        return -1
+    }
+    // ns 段：读 lexeme（unsafe 是关键字 token 非 ident）
+    var ns = interner.intern(putil.peek_lexeme())
+    putil.advance()
+    if !putil.expect(lex_dot, "'.'") {
+        return -1
+    }
+    // sub 段：标识符（如 share / trm / mem / ext）
+    var sub = putil.expect_ident()
+    if sub < 0 {
+        return -1
+    }
+    if !putil.expect(lex_rbracket, "']'") {
+        return -1
+    }
+    var full = interner.lookup(ns) + "." + interner.lookup(sub)
+    // 白名单：仅 unsafe 凭据域属性（A/B/C 组标记）
+    if interner.lookup(ns) != "unsafe" {
+        putil.set_err(line, col, "未知属性 '#[" + full + "]'（属性命名空间仅支持 unsafe，如 #[unsafe.share]）")
+        return -1
+    }
+    // 域白名单与能力域归类保持一致（tie-main/docs/designs/domain-classification.md）：
+    // mem / ext / share / raw / lock 五域。`trm` 已随归类删除（无门禁承载、引擎已废弃），
+    // 故不再接受 `#[unsafe.trm]`。
+    var subn = interner.lookup(sub)
+    if subn != "share" && subn != "mem" && subn != "ext" &&
+        subn != "raw" && subn != "lock" {
+        putil.set_err(line, col, "未知 unsafe 属性 '#[" + full + "]'（支持 share/mem/ext/raw/lock 五域）")
+        return -1
+    }
+    putil.eat(lex_semi)   // 吃掉 ASI 补分号（属性后无分号语义）
+    return interner.intern(full)
+}
+
+// 解析「一个或多个 @注解 + 声明」：@name / @name(args) 可堆叠，后必须跟
+// func/struct/enum 声明（本批次边界；import/using/extern 等留后续批次）。
+// 全部注解登记进 g_ann_* 注册表（声明节点 id 回填）；返回声明节点 id。
+// 悬空注解（@ 后非声明）与同名重复注解均报诊断。
+func parse_annotated_decl() -> i64 {
+    var anns: table<i64> = table_new_i64()   // 本声明的注解注册表序号
+    while putil.peek_tag() == lex_at {
+        var ai = parse_annot_one()
+        if ai < 0 {
+            return -1
+        }
+        // ASI 会在行尾注解后补分号（`@x\n@y struct` → `@x;@y;struct`）；
+        // 注解是声明修饰，分号无语义，直接吃掉（跨行堆叠注解依赖此处理）。
+        putil.eat(lex_semi)
+        table_push(anns, ai)
+    }
+    if len(anns) == 0 {
+        // 防御：parse_program 只在 peek == lex_at 时进入本函数，理论上不空
+        putil.set_err(putil.peek_line(), putil.peek_col(), errors.syn_annot_dangling())
+        return -1
+    }
+    // 同名重复注解诊断（同一声明上）
+    var di: i64 = 0
+    while di < len(anns) {
+        var dj: i64 = di + 1
+        while dj < len(anns) {
+            if g_ann_names[anns[di]] == g_ann_names[anns[dj]] {
+                putil.set_err(g_ann_lines[anns[dj]], g_ann_cols[anns[dj]],
+                    errors.syn_annot_dup(interner.lookup(g_ann_names[anns[dj]])))
+                return -1
+            }
+            dj = dj + 1
+        }
+        di = di + 1
+    }
+    // 注解后必须跟声明：func（含 inline/const/pub/async/unsafe 前缀）、
+    // struct（含 repr(C) 前缀）、enum。extern 等其它声明暂不支持（注明）。
+    var tag = putil.peek_tag()
+    var decl: i64 = -1
+    if tag == lex_func || tag == lex_inline || tag == lex_pub ||
+        tag == lex_const || tag == lex_async {
+        decl = parse_fn_def()
+    } else if tag == lex_unsafe {
+        if putil.peek_n(1) == lex_extern {
+            putil.set_err(putil.peek_line(), putil.peek_col(), errors.syn_annot_extern())
+            return -1
+        }
+        decl = parse_fn_def()
+    } else if tag == lex_repr || tag == lex_struct {
+        decl = parse_struct()
+    } else if tag == lex_enum {
+        decl = parse_enum()
+    } else {
+        // 悬空注解：@ 后既非注解也非声明（EOF/其它语句起始）
+        putil.set_err(putil.peek_line(), putil.peek_col(), errors.syn_annot_dangling())
+        return -1
+    }
+    if decl < 0 {
+        return -1
+    }
+    // 回填声明节点 id（注册表条目 → 声明）
+    var r: i64 = 0
+    while r < len(anns) {
+        g_ann_nodes[anns[r]] = decl
+        r = r + 1
+    }
+    return decl
+}
+
+// 解析单个注解 `@name` / `@name(args)`：返回注册表序号（-1 = 失败）。
+// 参数为编译期字面量（数字/字符串/字符/布尔/表字面量，可嵌套）；
+// 非字面量参数（变量/调用/算术）报诊断。
+func parse_annot_one() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // @
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    var arg_off = len(g_ann_arg_ids)
+    var argc: i64 = 0
+    if putil.eat(lex_lparen) {
+        if !putil.eat(lex_rparen) {
+            var d = false
+            while !d {
+                var a = pexpr.parse_expr()
+                if a < 0 {
+                    return -1
+                }
+                if !is_annot_literal(a) {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), errors.syn_annot_arg_type())
+                    return -1
+                }
+                table_push(g_ann_arg_ids, a)
+                argc = argc + 1
+                if putil.eat(lex_comma) {
+                    // 继续
+                } else {
+                    if !putil.expect(lex_rparen, "')'") {
+                        return -1
+                    }
+                    d = true
+                }
+            }
+        }
+    }
+    // 登记条目（声明节点 id 由 parse_annotated_decl 回填）
+    var idx = len(g_ann_nodes)
+    table_push(g_ann_nodes, -1)
+    table_push(g_ann_names, name)
+    table_push(g_ann_arg_off, arg_off)
+    table_push(g_ann_arg_cnt, argc)
+    table_push(g_ann_lines, line)
+    table_push(g_ann_cols, col)
+    return idx
+}
+
+// 注解参数是否编译期字面量：数字/浮点/字符串/字符/布尔/trit 字面量、
+// 一元正负/取反包字面量、表字面量（cell 值递归字面量）。其余一律非字面量。
+func is_annot_literal(n: i64) -> bool {
+    if n < 0 {
+        return false
+    }
+    var tag = ast.tag(n)
+    if tag == N_INT_LIT || tag == N_FLOAT_LIT || tag == N_STR_LIT ||
+        tag == N_CHAR_LIT || tag == N_BOOL_LIT || tag == N_TRIT_LIT {
+        return true
+    }
+    if tag == N_UNARY {
+        // 一元负号/正号/取反包字面量（如 @test(-1) / @test(!true)）
+        if ast.val(n) == U_NEG || ast.val(n) == U_NOT || ast.val(n) == U_BIT_NOT {
+            return is_annot_literal(ast.child_at(n, 0))
+        }
+        return false
+    }
+    if tag == N_TABLE_LIT {
+        // 表字面量 cell children = [TableId 或 -1, 值]；值递归字面量检查
+        var k: i64 = 0
+        while k < ast.child_count(n) {
+            var cell = ast.child_at(n, k)
+            if !is_annot_literal(ast.child_at(cell, 1)) {
+                return false
+            }
+            k = k + 1
+        }
+        return true
+    }
+    return false
+}
+
+// 第 i 条注解的注册表序号（-1 = 越界/无）。
+func pann_idx(decl: i64, i: i64) -> i64 {
+    var c: i64 = 0
+    var k: i64 = 0
+    while k < len(g_ann_nodes) {
+        if g_ann_nodes[k] == decl {
+            if c == i {
+                return k
+            }
+            c = c + 1
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// 声明节点 tag 判别（可附着 doc 的声明）。
+func doc_is_decl_tag(t: i64) -> bool {
+    if t == N_FN_DEF || t == N_IMPORT || t == N_NAMESPACE || t == N_USING {
+        return true
+    }
+    if t == N_STRUCT || t == N_ENUM || t == N_EXTERN || t == N_VAR {
+        return true
+    }
+    if t == N_CLASS_FIELD || t == N_MACRO_DEF || t == N_PORT ||
+        t == N_IMPL || t == N_ACTOR {
+        return true
+    }
+    return false
+}
+
+// 容器声明 tag 判别（children 里可能有带 doc 的成员声明；walk 只进容器，
+// 不进函数/宏体——体内局部 var 不附着 doc）。
+func doc_is_container_tag(t: i64) -> bool {
+    return t == N_NAMESPACE || t == N_STRUCT || t == N_ENUM ||
+        t == N_PORT || t == N_IMPL || t == N_ACTOR
+}
+
+// 按行号匹配：第 k 条 doc 登记到节点 node（doc 与节点双向至多一次；
+// 同行多声明先到先得）。
+func doc_match_attach(k: i64, node: i64) {
+    if doc_claimed[k] == 1 {
+        return
+    }
+    var dl = lextok.doc_entry_line(k)
+    if dl != ast.line(node) {
+        return
+    }
+    var i: i64 = 0
+    while i < len(g_doc_nodes) {
+        if g_doc_nodes[i] == node {
+            return
+        }
+        i = i + 1
+    }
+    doc_claimed[k] = 1
+    table_push(g_doc_nodes, node)
+    table_push(g_doc_texts, lextok.doc_entry_text_id(k))
+    table_push(g_doc_dlines, dl)
+}
+
+// 递归 walk：StmtList 展开；声明节点尝试匹配，容器声明递归成员。
+func doc_walk(node: i64) {
+    if node < 0 {
+        return
+    }
+    if ast.is_stmt_list(node) {
+        var i: i64 = 0
+        while i < ast.child_count(node) {
+            doc_walk(ast.child_at(node, i))
+            i = i + 1
+        }
+        return
+    }
+    var t = ast.tag(node)
+    if !doc_is_decl_tag(t) {
+        return
+    }
+    var k: i64 = 0
+    while k < lextok.doc_entry_count() {
+        doc_match_attach(k, node)
+        k = k + 1
+    }
+    if doc_is_container_tag(t) {
+        var i2: i64 = 0
+        while i2 < ast.child_count(node) {
+            doc_walk(ast.child_at(node, i2))
+            i2 = i2 + 1
+        }
+    }
+}
+
+// 解析收尾：doc 归属回填入口（parse_program 在 parse_deferred_all 后调用）。
+func doc_attach_all(stmts: table<i64>) {
+    // 已消费标记重建（长度 = 本文件 doc 条数）
+    doc_claimed = table_new_i64()
+    var k: i64 = 0
+    while k < lextok.doc_entry_count() {
+        table_push(doc_claimed, 0)
+        k = k + 1
+    }
+    var i: i64 = 0
+    while i < len(stmts) {
+        doc_walk(stmts[i])
+        i = i + 1
+    }
+}
+
+// 解析一条或多条语句（var 解构可能产生多条，返回 StmtList；单条返回语句节点）
+func parse_import() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    // p.9.11.14 重导出：`pub import "path" [as 别名]`——内联模型下 import 本就
+    // 全量可见（重导出零成本），pub 仅作登记标记（N_IMPORT val bit0 = is_pub，
+    // 供后续工具/诊断显示）。非法别名 token 由下方 expect_ident 拒绝。
+    var is_pub: i64 = 0
+    if putil.eat(lex_pub) {
+        is_pub = 1
+    }
+    putil.advance()   // import
+    var path = -1
+    if putil.peek_tag() == lex_str {
+        // 路径去首尾引号（字符串 lexeme 是原始切片含引号；Rust 版 path 无引号）
+        var raw = putil.peek_lexeme()
+        var rn = str_len(raw)
+        var clean = str.clone(raw)
+        if rn >= 2 {
+            if str_char(raw, 0) == "\"" {
+                if str_char(raw, rn - 1) == "\"" {
+                    clean = str.slice(raw, 1, rn - 1)
+                }
+            }
+        }
+        path = interner.intern(clean)
+        putil.advance()
+    } else {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "import 后必须是字符串路径，实际是 " + putil.describe(putil.peek_tag()))
+        return -1
+    }
+    var alias_id = -1
+    if putil.eat(lex_as) {
+        if putil.peek_tag() == lex_ident {
+            alias_id = interner.intern(putil.peek_lexeme())
+            putil.advance()
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "as 后必须是别名标识符，实际是 " + putil.describe(putil.peek_tag()))
+            return -1
+        }
+    }
+    // p.9.11.31 选择性导入：`import "path".{a, b}`——路径后可跟 `.{` 逗号分隔
+    // 标识符列表。选中名作为 N_IMPORT 的子节点（N_VAR，name = 名字池 id）随
+    // AST 进 sstate，semantic.expand_one_import 按此过滤登记（子节点为空 =
+    // 普通 import 全量可见）。
+    var sel: table<i64> = table_new_i64()
+    if putil.eat(lex_dot) {
+        if !putil.expect(lex_lbrace, "'{'") {
+            return -1
+        }
+        var dsel = false
+        while !dsel {
+            var snm = putil.expect_ident()
+            if snm < 0 {
+                return -1
+            }
+            table_push(sel, ast.new_node(N_VAR, snm, -1, -1, putil.peek_line(), putil.peek_col()))
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rbrace, "'}'") {
+                    return -1
+                }
+                dsel = true
+            }
+        }
+    }
+    if len(sel) > 0 {
+        // 选择列表以 `}` 结尾——ASI 在 `}` 行尾不补分号（与 `>` 同类），可选消费
+        putil.eat(lex_semi)
+    } else {
+        if !putil.expect(lex_semi, "import 语句结束的分号") {
+            return -1
+        }
+    }
+    var nimp = ast.new_node(N_IMPORT, path, is_pub, alias_id, line, col)
+    if len(sel) > 0 {
+        ast.set_children(nimp, sel)
+    }
+    return nimp
+}
+
+// using 引入语句：`using fmt2;` / `using fmt.error;`（仅顶层）
+func parse_using() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // using
+    var segs: table<i64> = table_new_i64()
+    var s = putil.expect_ident()
+    if s < 0 {
+        return -1
+    }
+    table_push(segs, s)
+    while putil.eat(lex_dot) {
+        s = putil.expect_ident()
+        if s < 0 {
+            return -1
+        }
+        table_push(segs, s)
+    }
+    if !putil.expect(lex_semi, "using 语句结束的分号") {
+        return -1
+    }
+    var n = ast.new_node(N_USING, -1, -1, len(segs), line, col)
+    var kids: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < len(segs) {
+        table_push(kids, ast.new_node(N_SEGMENT, segs[i], -1, -1, line, col))
+        i = i + 1
+    }
+    ast.set_children(n, kids)
+    return n
+}
+
+}

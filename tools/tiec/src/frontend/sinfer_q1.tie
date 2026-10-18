@@ -1,0 +1,382 @@
+type tie<class>
+// compiler/frontend/sinfer_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sinfer.tie。
+// 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+namespace sinfer {
+// ==================== 作用域辅助 ====================
+// 查局部作用域（返回类型 id；-1 = 未声明）
+pub func lv_find(nid: i64) -> i64 {
+    var idx = sstate.bs_find(lv_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return lv_vals[idx]
+}
+
+pub func lv_const_of(nid: i64) -> i64 {
+    var idx = sstate.bs_find(lv_keys, nid)
+    if idx < 0 {
+        return 0
+    }
+    return lv_const[idx]
+}
+
+pub func lv_telem_of(nid: i64) -> i64 {
+    var idx = sstate.bs_find(lv_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return lv_telem[idx]
+}
+
+pub func lv_dyn_of(nid: i64) -> i64 {
+    var idx = sstate.bs_find(lv_keys, nid)
+    if idx < 0 {
+        return 0
+    }
+    return lv_dyn[idx]
+}
+
+// 局部作用域插入（五表同步；已存在覆盖，对齐 Rust scope.insert）
+pub func lv_insert(nid: i64, ty: i64, is_const: i64, telem: i64, dyn: i64) -> i64 {
+    var pos0 = sstate.bs_find(lv_keys, nid)
+    if pos0 >= 0 {
+        lv_vals[pos0] = ty
+        lv_const[pos0] = is_const
+        lv_telem[pos0] = telem
+        lv_dyn[pos0] = dyn
+        return pos0
+    }
+    var n = len(lv_keys)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if lv_keys[mid] < nid {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    table_push(lv_keys, 0)
+    table_push(lv_vals, 0)
+    table_push(lv_const, 0)
+    table_push(lv_telem, 0)
+    table_push(lv_dyn, 0)
+    var i: i64 = n
+    while i > pos {
+        lv_keys[i] = lv_keys[i - 1]
+        lv_vals[i] = lv_vals[i - 1]
+        lv_const[i] = lv_const[i - 1]
+        lv_telem[i] = lv_telem[i - 1]
+        lv_dyn[i] = lv_dyn[i - 1]
+        i = i - 1
+    }
+    lv_keys[pos] = nid
+    lv_vals[pos] = ty
+    lv_const[pos] = is_const
+    lv_telem[pos] = telem
+    lv_dyn[pos] = dyn
+    return pos
+}
+
+// 全局变量查询（返回类型 id；-1 = 未声明）
+pub func gb_find(nid: i64) -> i64 {
+    var idx = sstate.bs_find(gb_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return gb_vals[idx]
+}
+
+// p.9.12.4：全局查找带命名空间前缀补全（对齐 resolve_call_name 候选 2：
+// 裸名 → 当前命名空间逐级外层补全 "ns::name"）。返回实际命中键的池 id
+//（裸名命中返回原 nid；未命中 -1）。命名空间常量以全名登记 gb_*，函数体内
+// 裸名引用须经此前缀补全才能命中。
+pub func gb_find_ns_key(nid: i64) -> i64 {
+    if gb_find(nid) >= 0 {
+        return nid
+    }
+    if ns_top > 0 {
+        var name = intern.lookup(nid)
+        var depth: i64 = ns_top
+        while depth >= 0 {
+            var full: string = ""
+            var i: i64 = 0
+            while i < depth {
+                if i > 0 {
+                    full = full + "::"
+                }
+                full = full + intern.lookup(ns_stack[i])
+                i = i + 1
+            }
+            var cand: string = ""
+            if full != "" {
+                cand = full + "::" + name
+            } else {
+                cand = name
+            }
+            if cand != name {
+                var cid = intern.intern(cand)
+                if gb_find(cid) >= 0 {
+                    return cid
+                }
+            }
+            depth = depth - 1
+        }
+    }
+    return -1
+}
+
+// p.9.12.4：全局查找（裸名 + 命名空间前缀补全）→ 返回类型 id；-1 = 未声明
+pub func gb_find_ns(nid: i64) -> i64 {
+    var k = gb_find_ns_key(nid)
+    if k < 0 {
+        return -1
+    }
+    return gb_find(k)
+}
+
+pub func gb_const_of(nid: i64) -> i64 {
+    var k = gb_find_ns_key(nid)
+    if k < 0 {
+        return 0
+    }
+    var idx = sstate.bs_find(gb_keys, k)
+    if idx < 0 {
+        return 0
+    }
+    return gb_const[idx]
+}
+
+pub func gb_telem_of(nid: i64) -> i64 {
+    var k = gb_find_ns_key(nid)
+    if k < 0 {
+        return -1
+    }
+    var idx = sstate.bs_find(gb_keys, k)
+    if idx < 0 {
+        return -1
+    }
+    return gb_telem[idx]
+}
+
+// 表元素类型（变量名）：局部 → 全局 → -1
+// 全局查找须走 gb_find_ns_key：命名空间内的裸名（names）要补全成 ns::names，
+// 否则 gb_telem 查不到、table_push 等内建会按 i64 默认元素类型误报 E00032。
+pub func var_table_elem(nid: i64) -> i64 {
+    var i = sstate.bs_find(lv_keys, nid)
+    if i >= 0 {
+        return lv_telem[i]
+    }
+    var k = gb_find_ns_key(nid)
+    if k < 0 {
+        return -1
+    }
+    var j = sstate.bs_find(gb_keys, k)
+    if j >= 0 {
+        return gb_telem[j]
+    }
+    return -1
+}
+
+pub func var_dyn(nid: i64) -> i64 {
+    var i = sstate.bs_find(lv_keys, nid)
+    if i >= 0 {
+        return lv_dyn[i]
+    }
+    if gb_find_ns_key(nid) < 0 {
+        return 0
+    }
+    return 1
+}
+
+// p.8.1.5：Option<T> 形态判定 + payload 类型——枚举含 Some(T)（恰 1 字段）与
+// None 变体 → 返回 T；否则 -1（非 Option）。en_* 变体表为 frontend 共享全局。
+pub func option_payload_ty(ty: i64) -> i64 {
+    if types.kind(ty) != K_ENUM {
+        return -1
+    }
+    var ei = types.low(ty)
+    var varoff = en_varoff[ei]
+    var nvar = en_nvar[ei]
+    var has_some: bool = false
+    var has_none: bool = false
+    var pt: i64 = -1
+    var k: i64 = 0
+    while k < nvar {
+        var nm = intern.lookup(en_vnames[varoff + k])
+        if nm == "Some" {
+            has_some = true
+            if en_vnfld[varoff + k] != 1 {
+                return -1
+            }
+            pt = en_ftys[en_vfldoff[varoff + k]]
+        } else if nm == "None" {
+            has_none = true
+        }
+        k = k + 1
+    }
+    if has_some && has_none {
+        return pt
+    }
+    return -1
+}
+
+// p.8.1.5：Option<T> 类型 id（Option 模板实例化，幂等；失败 -1）
+pub func option_ty_of(t: i64) -> i64 {
+    var gidx = sstate.gt_find("Option")
+    if gidx < 0 {
+        return -1
+    }
+    if gty_is_struct[gidx] != 2 {
+        return -1
+    }
+    var args: table<i64> = table_new_i64()
+    table_push(args, t)
+    var ei = sgen.instantiate_enum(gidx, args)
+    if ei < 0 {
+        return -1
+    }
+    return types.enum_of(ei)
+}
+
+// 函数返回表元素类型查询（fn 名 -> 元素类型；-1 无）
+pub func table_ret_elem(fn_name: string) -> i64 {
+    var nid = intern.intern(fn_name)
+    var idx = sstate.bs_find(tre_keys, nid)
+    if idx >= 0 {
+        return tre_vals[idx]
+    }
+    var bi = sstate.bs_find(tre_bi_keys, nid)
+    if bi >= 0 {
+        return tre_bi_vals[bi]
+    }
+    return -1
+}
+
+// 从实参表达式节点推断表元素类型（对齐 Rust arg_table_elem_ty）：
+// - 表字面量 TableLit：取首单元格值类型（空表 → i64）
+// - 变量 Var：查局部/全局表的元素类型（lv_telem/gb_telem）
+// - 调用 Call：查返回表元素类型（table_ret_elem）
+// 返回元素类型 id；-1 = 无法推断（非表实参或裸表）
+pub func arg_table_elem_ty(a: i64) -> i64 {
+    var tag = s_tags[a]
+    if tag == S_N_TABLE_LIT {
+        var nc = sstate.nchild(a)
+        if nc == 0 {
+            return types.named(TK_I64)
+        }
+        // 表字面量：取首元素值类型（cell 结构 [id, 值]）
+        var first = sstate.child(a, 0)
+        var vt = infer_expr(sstate.child(first, 1))
+        if vt < 0 {
+            return -1
+        }
+        return vt
+    }
+    if tag == S_N_VAR {
+        var nm = sstate.name_str(a)
+        var nid = intern.intern(nm)
+        var te = var_table_elem(nid)
+        if te >= 0 {
+            return te
+        }
+        return -1
+    }
+    if tag == S_N_CALL {
+        var fnm = sstate.name_str(a)
+        // 动态表构造：table_new_i64 → i64 等
+        if fnm == "table_new_i64" {
+            return types.named(TK_I64)
+        }
+        if fnm == "table_new_f64" {
+            return types.named(TK_F64)
+        }
+        if fnm == "table_new_string" {
+            return types.named(TK_STR)
+        }
+        if fnm == "table_new_bool" {
+            return types.named(TK_BOOL)
+        }
+        // 返回表的函数：用解析后全名查
+        var full = resolve_call_name(fnm)
+        return table_ret_elem(full)
+    }
+    return -1
+}
+
+// ==================== 裸调用名解析（M2.1.7） ====================
+// 候选 1：顶层裸名；候选 2：当前命名空间前缀补全（逐级外层）；
+// 候选 3：using 引入的命名空间。返回实际注册键（全名）。
+// T3b 泛型扩展：候选命中判定同时覆盖普通函数（fn_sig）与泛型模板（gt_find）
+// ——模板不进入 fn_keys，裸调用名解析须能定位到 gt_* 表。
+pub func resolve_call_name(name: string) -> string {
+    var nid = intern.intern(name)
+    if sstate.fn_sig(name) >= 0 {
+        return name
+    }
+    if sstate.gt_find(name) >= 0 {
+        return name
+    }
+    // 候选 2：当前命名空间逐级外层补全
+    if ns_top > 0 {
+        var depth: i64 = ns_top
+        while depth >= 0 {
+            var full: string = ""
+            var i: i64 = 0
+            while i < depth {
+                if i > 0 {
+                    full = full + "::"
+                }
+                full = full + intern.lookup(ns_stack[i])
+                i = i + 1
+            }
+            var cand: string = ""
+            if full != "" {
+                cand = full + "::" + name
+            } else {
+                cand = name
+            }
+            if sstate.fn_sig(cand) >= 0 || sstate.gt_find(cand) >= 0 {
+                return cand
+            }
+            depth = depth - 1
+        }
+    }
+    // 候选 3：using 引入的命名空间
+    var off: i64 = 0
+    var u: i64 = 0
+    while u < len(using_lens) {
+        var ln = using_lens[u]
+        var full: string = ""
+        var i: i64 = 0
+        while i < ln {
+            if i > 0 {
+                full = full + "::"
+            }
+            full = full + intern.lookup(using_prefixes[off + i])
+            i = i + 1
+        }
+        var cand = full + "::" + name
+        if sstate.fn_sig(cand) >= 0 || sstate.gt_find(cand) >= 0 {
+            return cand
+        }
+        // 别名增名（2026-10-12）：using 记录的名称可能已被改名为别名——回退再试
+        var rn4 = sstate.ns_rename_target(full)
+        if str_len(rn4) > 0 {
+            var cand2 = rn4 + "::" + name
+            if sstate.fn_sig(cand2) >= 0 || sstate.gt_find(cand2) >= 0 {
+                return cand2
+            }
+        }
+        off = off + ln
+        u = u + 1
+    }
+    return name
+}
+
+}

@@ -1,0 +1,53 @@
+type tie<class>
+// compiler/backend/irgen_regex.tie —— 生成器 p.6.4.8：内联纯 tie 最小正则引擎
+// ============================================================
+// 把 regex_match/regex_find/regex_find_all/regex_group/regex_replace 五个语言
+// 底座原语从 Rust tie_interp.lib（底层 Rust regex crate）改为编译器内联 IR 生成
+// 的最小正则引擎（纯 tie，g_used_interp=false）。
+//
+// 设计（方案三：编译期解析 + 运行时回溯 VM）：
+//   1. 编译期（本后台 tie 函数运行期）：把 pattern 递归下降解析成一条"指令程序"
+//      （g_rx_prog：平行 i64 表）+ 字符类位集（g_rx_cls：每类 4×i64 = 256 位）。
+//      交替 | 用 SPLIT(回退点)/JMP 组织，量词 * + ? 也用 SPLIT/JMP 组织（贪婪），
+//      捕获组 () 用 SAVE(槽)。frag 按"拷贝+重定位"拼接（SPLIT/JMP 紧跟操作数 +base），
+//      彻底规避向已排放指令前插的复杂度。
+//   2. 生成期：把 g_rx_prog/g_rx_cls 原值拷进运行时表（s21_table_new + push，零
+//      Rust 桥），然后生成一个通用回溯匹配 VM（迭代式、显式回溯栈，
+//      tl_tbl$tbl_set_len 弹栈），"槽 + 回边"：pos/pc/搜索起点放 alloca，匹配
+//      循环经 cond_br 回边。
+//   3. 语义：leftmost-first 搜索（从起点 0 起逐位置试）；贪婪量词；^$ 锚点；
+//      SPLIT 压 (pos, alt) → 默认续 pc+1（贪），回退弹回 alt；find_all/replace
+//      非重叠扫描；捕获组 i=0 为整体匹配。
+//   4. 拼接纪律：匹配循环内拼接（find_all 累积、replace 前缀/替换/尾串）一律用
+//      StringBuilder（s21_sb_* / tl_tbl$*），p.6.3 教训，严禁 out += x 逐字符。
+//
+// 支持：字面量、. 、[abc] [a-z] [^...]、\d \w \s（+大写取反）、量词 * + ?、
+// 锚点 ^ $、分组 ()、转义字面量 \. \\ \* 等、交替 |。逐字节匹配。
+// 局限：{n,m}、反向引用、前瞻/后顾、Unicode 类、\b 不支持；pattern 非字符串
+// 字面量时返回空/假（编译期无法内联解析，见各函数头部）。
+
+pub const RX_CHAR: i64 = 1;
+pub const RX_CLS: i64 = 2;
+pub const RX_CLSNEG: i64 = 3;
+pub const RX_ANY: i64 = 4;
+pub const RX_ASTART: i64 = 5;
+pub const RX_AEND: i64 = 6;
+pub const RX_SAVE: i64 = 7;
+pub const RX_SPLIT: i64 = 8;
+pub const RX_JMP: i64 = 9;
+pub const RX_MATCH: i64 = 10;
+
+namespace irgen {
+// =====================================================================
+// 编译期：pattern → 指令程序（g_rx_prog / g_rx_cls / g_rx_ngroups）
+// =====================================================================
+
+
+// =====================================================================
+// 生成期：匹配 VM + 五个原语
+// =====================================================================
+
+
+}
+import "./irgen_regex_p1.tie"
+import "./irgen_regex_p2.tie"

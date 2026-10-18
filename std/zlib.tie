@@ -1,0 +1,983 @@
+type tie<class>
+// ============================================================================
+// std/zlib.tie —— zlib/gzip 压缩库（命名空间 zlib，纯 tie）p.9.1.1.1
+// RFC 1950 (zlib) / RFC 1951 (DEFLATE) / RFC 1952 (gzip) encode+decode.
+//
+// 数据平面：全链路 table<i64>（元素 0..255）承载原始字节，绝不转 string。
+// DEFLATE/Huffman 位流一律 LSB-first；Huffman 码流按规范 MSB-first 写出。
+//
+// 实现范围（满足规范优先级）：
+//   - inflate 全支持：存储块（BTYPE=00）/ 固定 Huffman（01）/ 动态 Huffman（10），
+//     Huffman 用「count[].symbol[] 规范序表单遍解码」（复用 ext/png inflate 思路，
+//     自包含于本模块，不依赖 ext）。
+//   - deflate 支持：固定 Huffman + LZ77（长度/距离回引用，naive match 查找），
+//     输出规范合法的固定块流（被外部 zlib/gzip 解码器亦能互操作）。
+//   - adler32（RFC1950 尾）/ crc32（RFC1952 尾 + IEEE 向量）。
+//   - zlib 容器：CMF/FLG 头 + deflate + adler32 尾；gzip 容器：10 字节头 + deflate
+//     + CRC32 + ISIZE 尾（可选 FEXTRA/FNAME/FCOMMENT/FHCRC 跳过）。
+//
+// 错误约定：解压类返回 (bool, table<i64>)——false = 头校验失败/位流越界/输出越限。
+// 语言约束同 ext/png：位/字节运算只接触 ≤0xFFFFFFFF 正值；行拷贝用 while+table_push。
+// ============================================================================
+
+namespace zlib {
+
+// ============================================================================
+// 一、校验和：adler32 / crc32（字节表自实现，互操作向量）
+// ============================================================================
+
+// Adler-32（RFC 1950 尾校验）。向量 adler32("Wikipedia")==0x11E60398。
+pub func adler32(b: table<i64>) -> i64 {
+    var s1: i64 = 1
+    var s2: i64 = 0
+    var n = len(b)
+    var i: i64 = 0
+    while i < n {
+        s1 = (s1 + b[i]) % 65521
+        s2 = (s2 + s1) % 65521
+        i = i + 1
+    }
+    return ((s2 << 16) | s1) & 0xFFFFFFFF
+}
+
+// CRC-32/IEEE（反射，多项式 0xEDB88320）。向量 crc32("123456789")==0xCBF43926。
+pub func crc32(immut b: table<i64>) -> i64 {
+    var cr: i64 = 0xFFFFFFFF
+    var n = len(b)
+    var i: i64 = 0
+    while i < n {
+        cr = (cr ^ b[i]) & 0xFFFFFFFF
+        var j: i64 = 0
+        while j < 8 {
+            if (cr & 1) != 0 {
+                cr = ((cr >> 1) ^ 0xEDB88320) & 0xFFFFFFFF
+            } else {
+                cr = (cr >> 1) & 0xFFFFFFFF
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return (cr ^ 0xFFFFFFFF) & 0xFFFFFFFF
+}
+
+// ============================================================================
+// 二、位读取器（i64 位累加器，LSB-first）；状态 st=[0]bitbuf,[1]bitcnt,[2]pos
+// ============================================================================
+
+// 读 n 位（LSB-first）；输入越界返回 -1（错误哨兵，合法值 ≥0）。
+func read_bits(ref st: table<i64>, raw: table<i64>, n: i64) -> i64 {
+    while st[1] < n {
+        if st[2] >= len(raw) {
+            return -1
+        }
+        var b = raw[st[2]]
+        st[2] = st[2] + 1
+        st[0] = st[0] | (b << st[1])
+        st[1] = st[1] + 8
+    }
+    var mask: i64 = 1
+    var k: i64 = 0
+    while k < n {
+        mask = mask << 1
+        k = k + 1
+    }
+    mask = mask - 1
+    var res = st[0] & mask
+    st[0] = st[0] >> n
+    st[1] = st[1] - n
+    return res
+}
+
+// 存储块前字节对齐：丢弃当前字节剩余位。
+func byte_align(ref st: table<i64>) {
+    st[0] = 0
+    st[1] = 0
+}
+
+// 新位读取器状态。
+func new_br() -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 0)
+    return t
+}
+
+// ============================================================================
+// 三、Huffman 规范树构建 + 单遍解码（def/inflate 共用，含动态码长）
+// ============================================================================
+
+// 由码长表 length（下标=符号）构建 (symbol[], count[], maxbits)。规范序：
+// 按（位长升序，符号升序）；无效（全零码长或超长）maxbits==0 由调用方判错。
+func build_tables(length: table<i64>, n: i64) -> (table<i64>, table<i64>, i64) {
+    var count = table_new_i64()
+    var i: i64 = 0
+    while i < 16 {
+        table_push(count, 0)
+        i = i + 1
+    }
+    var maxbits: i64 = 0
+    i = 0
+    while i < n {
+        var l = length[i]
+        if l > 0 {
+            count[l] = count[l] + 1
+            if l > maxbits {
+                maxbits = l
+            }
+        }
+        i = i + 1
+    }
+    var symbol = table_new_i64()
+    if maxbits > 15 {
+        return (symbol, count, 0)
+    }
+    var lx: i64 = 1
+    while lx <= maxbits {
+        i = 0
+        while i < n {
+            if length[i] == lx {
+                table_push(symbol, i)
+            }
+            i = i + 1
+        }
+        lx = lx + 1
+    }
+    return (symbol, count, maxbits)
+}
+
+// 解码一个符号：逐位推进规范码，命中即返回符号；越界/无效返回 -1（同 puff.c）。
+func hdec(ref st: table<i64>, raw: table<i64>, symbol: table<i64>,
+          count: table<i64>, maxbits: i64) -> i64 {
+    var cd: i64 = 0
+    var first: i64 = 0
+    var index: i64 = 0
+    var l: i64 = 1
+    while l <= maxbits {
+        var b = read_bits(st, raw, 1)
+        if b < 0 {
+            return -1
+        }
+        cd = cd | b
+        var cnt = count[l]
+        if cd - cnt < first {
+            return symbol[index + (cd - first)]
+        }
+        index = index + cnt
+        first = first + cnt
+        first = first << 1
+        cd = cd << 1
+        l = l + 1
+    }
+    return -1
+}
+
+// ============================================================================
+// 四、DEFLATE 固定/动态长度与距离表
+// ============================================================================
+
+// 码长符号顺序（动态块 HCLEN 用）。
+func cl_order() -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, 16)
+    table_push(t, 17)
+    table_push(t, 18)
+    table_push(t, 0)
+    table_push(t, 8)
+    table_push(t, 7)
+    table_push(t, 9)
+    table_push(t, 6)
+    table_push(t, 10)
+    table_push(t, 5)
+    table_push(t, 11)
+    table_push(t, 4)
+    table_push(t, 12)
+    table_push(t, 3)
+    table_push(t, 13)
+    table_push(t, 2)
+    table_push(t, 14)
+    table_push(t, 1)
+    table_push(t, 15)
+    return t
+}
+
+// 固定 Huffman 字面/长度码长表（288 元素）。
+func fixed_len_tab() -> table<i64> {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < 288 {
+        var L = 8
+        if i >= 144 && i <= 255 {
+            L = 9
+        } else if i >= 256 && i <= 279 {
+            L = 7
+        }
+        table_push(t, L)
+        i = i + 1
+    }
+    return t
+}
+
+// 固定 Huffman 距离码长表（32 元素全 5）。
+func fixed_dist_tab() -> table<i64> {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < 32 {
+        table_push(t, 5)
+        i = i + 1
+    }
+    return t
+}
+
+// 长度码（sym 257..285 → li=sym-257）基值表。
+func len_base_tab() -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, 3)   // 257
+    table_push(t, 4)
+    table_push(t, 5)
+    table_push(t, 6)
+    table_push(t, 7)
+    table_push(t, 8)
+    table_push(t, 9)
+    table_push(t, 10)
+    table_push(t, 11)  // 265
+    table_push(t, 13)
+    table_push(t, 15)
+    table_push(t, 17)
+    table_push(t, 19)
+    table_push(t, 23)
+    table_push(t, 27)
+    table_push(t, 31)
+    table_push(t, 35)  // 273
+    table_push(t, 43)
+    table_push(t, 51)
+    table_push(t, 59)
+    table_push(t, 67)
+    table_push(t, 83)
+    table_push(t, 99)
+    table_push(t, 115)
+    table_push(t, 131) // 281
+    table_push(t, 163)
+    table_push(t, 195)
+    table_push(t, 227)
+    table_push(t, 258) // 285
+    return t
+}
+
+// 长度码附加位表。
+func len_extra_tab() -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 1)
+    table_push(t, 1)
+    table_push(t, 1)
+    table_push(t, 1)
+    table_push(t, 2)
+    table_push(t, 2)
+    table_push(t, 2)
+    table_push(t, 2)
+    table_push(t, 3)
+    table_push(t, 3)
+    table_push(t, 3)
+    table_push(t, 3)
+    table_push(t, 4)
+    table_push(t, 4)
+    table_push(t, 4)
+    table_push(t, 4)
+    table_push(t, 5)
+    table_push(t, 5)
+    table_push(t, 5)
+    table_push(t, 5)
+    table_push(t, 0)   // 285
+    return t
+}
+
+// 距离码（0..29）基值表。
+func dist_base_tab() -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, 1)
+    table_push(t, 2)
+    table_push(t, 3)
+    table_push(t, 4)
+    table_push(t, 5)
+    table_push(t, 7)
+    table_push(t, 9)
+    table_push(t, 13)
+    table_push(t, 17)
+    table_push(t, 25)
+    table_push(t, 33)
+    table_push(t, 49)
+    table_push(t, 65)
+    table_push(t, 97)
+    table_push(t, 129)
+    table_push(t, 193)
+    table_push(t, 257)
+    table_push(t, 385)
+    table_push(t, 513)
+    table_push(t, 769)
+    table_push(t, 1025)
+    table_push(t, 1537)
+    table_push(t, 2049)
+    table_push(t, 3073)
+    table_push(t, 4097)
+    table_push(t, 6145)
+    table_push(t, 8193)
+    table_push(t, 12289)
+    table_push(t, 16385)
+    table_push(t, 24577)
+    return t
+}
+
+// 距离码附加位表。
+func dist_extra_tab() -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 0)
+    table_push(t, 1)
+    table_push(t, 1)
+    table_push(t, 2)
+    table_push(t, 2)
+    table_push(t, 3)
+    table_push(t, 3)
+    table_push(t, 4)
+    table_push(t, 4)
+    table_push(t, 5)
+    table_push(t, 5)
+    table_push(t, 6)
+    table_push(t, 6)
+    table_push(t, 7)
+    table_push(t, 7)
+    table_push(t, 8)
+    table_push(t, 8)
+    table_push(t, 9)
+    table_push(t, 9)
+    table_push(t, 10)
+    table_push(t, 10)
+    table_push(t, 11)
+    table_push(t, 11)
+    table_push(t, 12)
+    table_push(t, 12)
+    table_push(t, 13)
+    table_push(t, 13)
+    return t
+}
+
+// ============================================================================
+// 五、DEFLATE 主流程：运行 LZ 直到本块结束（sym 256）
+// ============================================================================
+
+// 字面/长度-距离 LZ 循环直到 sym 256。返回 false = 位流越界/非法/输出越限。
+func run_lz(ref st: table<i64>, raw: table<i64>, ref out: table<i64>,
+            syms: table<i64>, cnts: table<i64>, litmb: i64,
+            dsyms: table<i64>, dcnts: table<i64>, dmb: i64) -> bool {
+    var lb = len_base_tab()
+    var le = len_extra_tab()
+    var db = dist_base_tab()
+    var de = dist_extra_tab()
+    var g: i64 = 0
+    while g < 100000000 {
+        g = g + 1
+        var sym = hdec(st, raw, syms, cnts, litmb)
+        if sym < 0 {
+            return false
+        }
+        if sym < 256 {
+            table_push(out, sym & 0xFF)
+            if len(out) > 134217728 {
+                return false
+            }
+        } else if sym == 256 {
+            return true
+        } else {
+            var li = sym - 257
+            if li < 0 || li > 28 {
+                return false
+            }
+            var ex = read_bits(st, raw, le[li])
+            if ex < 0 {
+                return false
+            }
+            var lrun = lb[li] + ex
+            var dsym = hdec(st, raw, dsyms, dcnts, dmb)
+            if dsym < 0 || dsym > 29 {
+                return false
+            }
+            var dex = read_bits(st, raw, de[dsym])
+            if dex < 0 {
+                return false
+            }
+            var dist = db[dsym] + dex
+            if dist < 1 || dist > 65536 {
+                return false
+            }
+            if lrun < 3 || lrun > 260 {
+                return false
+            }
+            var base = len(out)
+            var k: i64 = 0
+            while k < lrun {
+                table_push(out, out[base - dist + k])
+                k = k + 1
+            }
+            if len(out) > 134217728 {
+                return false
+            }
+        }
+        if len(out) > 134217728 {
+            return false
+        }
+    }
+    return false
+}
+
+// 动态块：读码长序列并解析出 lit/dist 码长表，再跑 LZ。
+func block_dynamic(ref st: table<i64>, raw: table<i64>, ref out: table<i64>) -> bool {
+    var hlit = read_bits(st, raw, 5) + 257
+    var hdist = read_bits(st, raw, 5) + 1
+    var hclen = read_bits(st, raw, 4) + 4
+    if hlit > 288 || hdist > 32 || hclen > 19 {
+        return false
+    }
+    var cllen = table_new_i64()
+    var i: i64 = 0
+    while i < 19 {
+        table_push(cllen, 0)
+        i = i + 1
+    }
+    var ord = cl_order()
+    i = 0
+    while i < hclen {
+        var l = read_bits(st, raw, 3)
+        if l < 0 {
+            return false
+        }
+        if ord[i] < 19 {
+            cllen[ord[i]] = l
+        }
+        i = i + 1
+    }
+    var r = build_tables(cllen, 19)
+    var clsym = r.0
+    var clcnt = r.1
+    var clmb = r.2
+    if clmb <= 0 {
+        return false
+    }
+    var tot = hlit + hdist
+    var cl = table_new_i64()
+    i = 0
+    while i < tot {
+        table_push(cl, 0)
+        i = i + 1
+    }
+    var pos: i64 = 0
+    var prev: i64 = 0
+    while pos < tot {
+        var s = hdec(st, raw, clsym, clcnt, clmb)
+        if s < 0 {
+            return false
+        }
+        if s <= 15 {
+            cl[pos] = s
+            prev = s
+            pos = pos + 1
+        } else if s == 16 {
+            var rep = read_bits(st, raw, 2) + 3
+            if prev == 0 || pos + rep > tot {
+                return false
+            }
+            var k: i64 = 0
+            while k < rep {
+                cl[pos + k] = prev
+                k = k + 1
+            }
+            pos = pos + rep
+        } else if s == 17 {
+            var rep2 = read_bits(st, raw, 3) + 3
+            if pos + rep2 > tot {
+                return false
+            }
+            var k2: i64 = 0
+            while k2 < rep2 {
+                cl[pos + k2] = 0
+                k2 = k2 + 1
+            }
+            pos = pos + rep2
+        } else {
+            var rep3 = read_bits(st, raw, 7) + 11
+            if pos + rep3 > tot {
+                return false
+            }
+            var k3: i64 = 0
+            while k3 < rep3 {
+                cl[pos + k3] = 0
+                k3 = k3 + 1
+            }
+            pos = pos + rep3
+        }
+    }
+    var litlen = table_new_i64()
+    var distlen = table_new_i64()
+    i = 0
+    while i < hlit {
+        table_push(litlen, cl[i])
+        i = i + 1
+    }
+    i = 0
+    while i < hdist {
+        table_push(distlen, cl[hlit + i])
+        i = i + 1
+    }
+    var rl = build_tables(litlen, hlit)
+    var ls = rl.0
+    var lcc = rl.1
+    var lmb = rl.2
+    var rd = build_tables(distlen, hdist)
+    var ds = rd.0
+    var dcc = rd.1
+    var dmb = rd.2
+    if lmb <= 0 || dmb <= 0 {
+        return false
+    }
+    return run_lz(st, raw, out, ls, lcc, lmb, ds, dcc, dmb)
+}
+
+// 固定块：直接内置长度表跑 LZ。
+func block_fixed(ref st: table<i64>, raw: table<i64>, ref out: table<i64>) -> bool {
+    var rl = build_tables(fixed_len_tab(), 288)
+    var rd = build_tables(fixed_dist_tab(), 32)
+    return run_lz(st, raw, out, rl.0, rl.1, rl.2, rd.0, rd.1, rd.2)
+}
+
+// 存储块：字节对齐读 LEN/NLEN 校验补码，直接拷贝 len 字节。
+func block_stored(ref st: table<i64>, raw: table<i64>, ref out: table<i64>) -> bool {
+    byte_align(st)
+    var pos = st[2]
+    if pos + 4 > len(raw) {
+        return false
+    }
+    var L = raw[pos] | (raw[pos + 1] << 8)
+    var NL = raw[pos + 2] | (raw[pos + 3] << 8)
+    if L + NL != 65535 {
+        return false
+    }
+    if pos + 4 + L > len(raw) {
+        return false
+    }
+    var i: i64 = 0
+    while i < L {
+        table_push(out, raw[pos + 4 + i])
+        i = i + 1
+    }
+    st[2] = pos + 4 + L
+    return len(out) <= 134217728
+}
+
+// 原始 DEFLATE 解压 → (ok, out)。raw 不含 zlib/gzip 头尾。
+pub func inflate(immut raw: table<i64>) -> (bool, table<i64>) {
+    var out = table_new_i64()
+    var st = new_br()
+    var bfinal: i64 = 0
+    var g: i64 = 0
+    while bfinal == 0 && g < 1000000 {
+        g = g + 1
+        var f2 = read_bits(st, raw, 1)
+        if f2 < 0 {
+            return (false, out)
+        }
+        bfinal = f2
+        var btype = read_bits(st, raw, 2)
+        if btype < 0 {
+            return (false, out)
+        }
+        var ok: bool = false
+        if btype == 0 {
+            ok = block_stored(st, raw, out)
+        } else if btype == 1 {
+            ok = block_fixed(st, raw, out)
+        } else if btype == 2 {
+            ok = block_dynamic(st, raw, out)
+        }
+        if ok == false {
+            return (false, out)
+        }
+    }
+    return (true, out)
+}
+
+// ============================================================================
+// 六、DEFLATE 编码器：固定 Huffman + LZ77（naive match 查找）
+// ============================================================================
+
+// 位写入器状态：wr=[0]acc,[1]accbits，字节追加到 out。LSB-first。
+func put_bits(ref wr: table<i64>, ref out: table<i64>, c: i64, n: i64) {
+    wr[0] = wr[0] | (c << wr[1])
+    wr[1] = wr[1] + n
+    while wr[1] >= 8 {
+        table_push(out, wr[0] & 0xFF)
+        wr[0] = wr[0] >> 8
+        wr[1] = wr[1] - 8
+    }
+}
+
+// 写一条 Huffman 码（码长 L，码值 cval）——规范码以 MSB-first 落入位流：
+// 反转 cval 的低 L 位后按 LSB 写出（解码端 read_bits 先读到的位即码 MSB）。
+func emit_code(ref wr: table<i64>, ref out: table<i64>, cval: i64, L: i64) {
+    var r: i64 = 0
+    var k: i64 = 0
+    while k < L {
+        r = (r << 1) | ((cval >> k) & 1)
+        k = k + 1
+    }
+    put_bits(wr, out, r, L)
+}
+
+// 由码长表生成规范码值表（codes[s]=符号 s 的码值；同长按符号升序）。
+// 供编码器的固定表生成：lit_len 288 / dist_len 32。
+func canonical_codes(lengths: table<i64>, nsym: i64) -> table<i64> {
+    var bl = table_new_i64()
+    var i: i64 = 0
+    while i < 16 {
+        table_push(bl, 0)
+        i = i + 1
+    }
+    var maxbits: i64 = 0
+    i = 0
+    while i < nsym {
+        var l = lengths[i]
+        if l > 0 {
+            bl[l] = bl[l] + 1
+            if l > maxbits {
+                maxbits = l
+            }
+        }
+        i = i + 1
+    }
+    var next = table_new_i64()
+    i = 0
+    while i < 16 {
+        table_push(next, 0)
+        i = i + 1
+    }
+    var cv: i64 = 0
+    var b: i64 = 1
+    while b <= maxbits {
+        cv = (cv + bl[b - 1]) << 1
+        next[b] = cv
+        b = b + 1
+    }
+    var codes = table_new_i64()
+    i = 0
+    while i < nsym {
+        var l = lengths[i]
+        if l == 0 {
+            table_push(codes, 0)
+        } else {
+            var cc = next[l]
+            next[l] = cc + 1
+            table_push(codes, cc)
+        }
+        i = i + 1
+    }
+    return codes
+}
+
+// 长度 → 长度码下标 li（lb[li]<=len<lb[li+1]）；len∈[3..258]。
+func len_to_sym(len: i64) -> i64 {
+    var lb = len_base_tab()
+    var li: i64 = 0
+    while li < 28 {
+        if len < lb[li + 1] {
+            return li
+        }
+        li = li + 1
+    }
+    return 28
+}
+
+// 距离 → 距离码下标 di。
+func dist_to_sym(dist: i64) -> i64 {
+    var db = dist_base_tab()
+    var di: i64 = 0
+    while di < 29 {
+        if dist < db[di + 1] {
+            return di
+        }
+        di = di + 1
+    }
+    return 29
+}
+
+// 在 i 之前窗口内查找最长匹配，返回 (len, dist)；无匹配 (0,0)。
+// 只找连续相同字节的最长回引（覆盖均匀数据的主要冗余），naive 向后扫描，
+// 距离 ≤32768、长度 ≤258。
+func find_match(data: table<i64>, i: i64, startback: i64) -> (i64, i64) {
+    var n = len(data)
+    var maxlen = n - i
+    if maxlen > 258 {
+        maxlen = 258
+    }
+    var best_len: i64 = 0
+    var best_dist: i64 = 0
+    var s = i - 1
+    while s >= startback {
+        // 快速失败：第一字节不同则跳过
+        if data[s] == data[i] {
+            var l: i64 = 1
+            while l < maxlen && data[s + l] == data[i + l] {
+                l = l + 1
+            }
+            if l > best_len {
+                best_len = l
+                best_dist = i - s
+            }
+        }
+        s = s - 1
+    }
+    return (best_len, best_dist)
+}
+
+// 原始 DEFLATE 压缩（固定 Huffman，单 final 块）。输出规范合法固定块流。
+pub func deflate(immut data: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var wr = table_new_i64()
+    table_push(wr, 0)
+    table_push(wr, 0)
+    var n = len(data)
+    var llen = fixed_len_tab()
+    var dlen = fixed_dist_tab()
+    var lcode = canonical_codes(llen, 288)
+    var dcode = canonical_codes(dlen, 32)
+    // 块头：BFINAL=1（bit0），BTYPE=01（bits1-2，LSB 先）
+    var hdr: i64 = 1 | (1 << 1)
+    put_bits(wr, out, hdr, 3)
+    var i: i64 = 0
+    while i < n {
+        var startback = i - 32768
+        if startback < 0 {
+            startback = 0
+        }
+        var m = find_match(data, i, startback)
+        var ml = m.0
+        if ml >= 3 {
+            var li = len_to_sym(ml)
+            var sym = 257 + li
+            emit_code(wr, out, lcode[sym], llen[sym])
+            put_bits(wr, out, ml - len_base_tab()[li], len_extra_tab()[li])
+            var di = dist_to_sym(m.1)
+            emit_code(wr, out, dcode[di], 5)
+            put_bits(wr, out, m.1 - dist_base_tab()[di], dist_extra_tab()[di])
+            i = i + ml
+        } else {
+            var by = data[i] & 0xFF
+            emit_code(wr, out, lcode[by], llen[by])
+            i = i + 1
+        }
+    }
+    // EOB sym 256
+    emit_code(wr, out, lcode[256], llen[256])
+    // flush 剩余位（高位补 0 凑整字节）
+    if wr[1] > 0 {
+        table_push(out, wr[0] & 0xFF)
+        wr[0] = 0
+        wr[1] = 0
+    }
+    return out
+}
+
+// ============================================================================
+// 七、zlib 容器（RFC1950）：compress / decompress
+// ============================================================================
+
+// zlib 头两字节（0x78 0x01：CM=8 FLEVEL=0，多字节头尾 BE）。
+func zlib_header() -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, 0x78)
+    table_push(t, 0x01)
+    return t
+}
+
+// 大端 u32 拆 4 字节 [b3..b0]。
+func be32bytes(v: i64) -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, (v >> 24) & 0xFF)
+    table_push(t, (v >> 16) & 0xFF)
+    table_push(t, (v >> 8) & 0xFF)
+    table_push(t, v & 0xFF)
+    return t
+}
+
+// zlib 压缩：0x78 0x01 + deflate + adler32(BE)。
+pub func compress(data: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var h = zlib_header()
+    table_push(out, h[0])
+    table_push(out, h[1])
+    var d = deflate(data)
+    var i: i64 = 0
+    while i < len(d) {
+        table_push(out, d[i])
+        i = i + 1
+    }
+    var ab = be32bytes(adler32(data))
+    i = 0
+    while i < 4 {
+        table_push(out, ab[i])
+        i = i + 1
+    }
+    return out
+}
+
+// zlib 解压：校验 CMF/FLG 头与 adler32 尾。
+pub func decompress(zdata: table<i64>) -> (bool, table<i64>) {
+    var empty = table_new_i64()
+    if len(zdata) < 2 {
+        return (false, empty)
+    }
+    var cmf = zdata[0]
+    var flg = zdata[1]
+    if ((cmf * 256 + flg) % 31) != 0 {
+        return (false, empty)
+    }
+    if (cmf & 0x0F) != 8 {
+        return (false, empty)
+    }
+    if len(zdata) < 7 {
+        return (false, empty)
+    }
+    var raw = table_new_i64()
+    var i: i64 = 2
+    while i + 4 < len(zdata) {
+        table_push(raw, zdata[i])
+        i = i + 1
+    }
+    var r = inflate(raw)
+    var ok = r.0
+    var out2 = r.1
+    if ok == false {
+        return (false, out2)
+    }
+    var n = len(zdata)
+    var adl = ((zdata[n - 4] & 0xFF) << 24) | ((zdata[n - 3] & 0xFF) << 16) |
+              ((zdata[n - 2] & 0xFF) << 8) | (zdata[n - 1] & 0xFF)
+    if adler32(out2) != adl {
+        return (false, out2)
+    }
+    return (true, out2)
+}
+
+// ============================================================================
+// 八、gzip 容器（RFC1952）
+// ============================================================================
+
+// gzip 压缩：10 字节头 + deflate + CRC32(LE) + ISIZE(LE)。
+pub func gzip_compress(data: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0x1F)   // ID1
+    table_push(out, 0x8B)   // ID2
+    table_push(out, 0x08)   // CM = deflate
+    table_push(out, 0x00)   // FLG = 无附加字段
+    table_push(out, 0)      // MTIME low
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0x00)   // XFL
+    table_push(out, 0xFF)   // OS
+    var d = deflate(data)
+    var i: i64 = 0
+    while i < len(d) {
+        table_push(out, d[i])
+        i = i + 1
+    }
+    // CRC32 LE
+    var crc = crc32(data)
+    table_push(out, crc & 0xFF)
+    table_push(out, (crc >> 8) & 0xFF)
+    table_push(out, (crc >> 16) & 0xFF)
+    table_push(out, (crc >> 24) & 0xFF)
+    // ISIZE LE（低 32 位）
+    var isz = len(data) & 0xFFFFFFFF
+    table_push(out, isz & 0xFF)
+    table_push(out, (isz >> 8) & 0xFF)
+    table_push(out, (isz >> 16) & 0xFF)
+    table_push(out, (isz >> 24) & 0xFF)
+    return out
+}
+
+// gzip 解压：校验魔数，按 FLG 跳过可选字段，解 deflate，校验 CRC32/ISIZE。
+pub func gzip_decompress(gz: table<i64>) -> (bool, table<i64>) {
+    var empty = table_new_i64()
+    var n = len(gz)
+    if n < 18 {
+        return (false, empty)
+    }
+    if gz[0] != 0x1F || gz[1] != 0x8B || gz[2] != 0x08 {
+        return (false, empty)
+    }
+    var flg = gz[3]
+    var pos: i64 = 10
+    if (flg & 0x04) != 0 {   // FEXTRA
+        var xl = gz[pos] | (gz[pos + 1] << 8)
+        pos = pos + 2 + xl
+        if pos > n {
+            return (false, empty)
+        }
+    }
+    if (flg & 0x08) != 0 {   // FNAME：零结尾
+        while pos < n && gz[pos] != 0 {
+            pos = pos + 1
+        }
+        pos = pos + 1
+    }
+    if (flg & 0x10) != 0 {   // FCOMMENT：零结尾
+        while pos < n && gz[pos] != 0 {
+            pos = pos + 1
+        }
+        pos = pos + 1
+    }
+    if (flg & 0x02) != 0 {   // FHCRC：2 字节（此处跳过；写端未设置）
+        pos = pos + 2
+    }
+    if pos > n {
+        return (false, empty)
+    }
+    // 剩余 = deflate + 8 字节尾
+    var ntail = n - pos
+    if ntail < 8 {
+        return (false, empty)
+    }
+    var raw = table_new_i64()
+    var i: i64 = pos
+    while i < n - 8 {
+        table_push(raw, gz[i])
+        i = i + 1
+    }
+    var r = inflate(raw)
+    var ok = r.0
+    var out2 = r.1
+    if ok == false {
+        return (false, out2)
+    }
+    var c_off = n - 8
+    var crc = gz[c_off] | (gz[c_off + 1] << 8) | (gz[c_off + 2] << 16) | (gz[c_off + 3] << 24)
+    if crc32(out2) != crc {
+        return (false, out2)
+    }
+    var isz = gz[c_off + 4] | (gz[c_off + 5] << 8) | (gz[c_off + 6] << 16) | (gz[c_off + 7] << 24)
+    if (len(out2) & 0xFFFFFFFF) != isz {
+        return (false, out2)
+    }
+    return (true, out2)
+}
+
+}   // namespace zlib

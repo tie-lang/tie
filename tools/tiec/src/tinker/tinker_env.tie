@@ -1,0 +1,174 @@
+type tie<class>
+// compiler/tinker/tinker_env.tie —— tink 信封 record 编解码（p.9.22.10）
+// ============================================================
+// 帧载荷 = 信封 record（design §5；zd 字段式，同 dbgem 字段封装）：
+//   1 kind（1=hello 2=hello-ack 3=stage 4=artifact 5=diag）
+//   2 stage（同 dbgem 阶段枚举；非 stage/diag 帧写 0）
+//   3 name（单元名/产物名/诊断渲染文本——字节串）
+//   4 payload（原始字节：zd 记录 / 产物字节；varint 长 + 原样字节）
+// 编码：varint(fno<<3|2) + varint(载荷长) + 载荷；字段升序。
+// 解码：逐字段读 tag → 号 = tag>>3；载荷按字段语义读（长度已知，逐字节）。
+
+namespace tinker {
+
+// 字段封装（tag + 长 + 载荷）。
+func env_field(fno: i64, payload: table<i64>) -> table<i64> {
+    var head = zdw.concat(zdw.varint(fno * 8 + 2), zdw.varint(len(payload)))
+    return zdw.concat(head, payload)
+}
+
+// i64 定值载荷。
+func env_i64(v: i64) -> table<i64> {
+    return zdw.enc_i64(v)
+}
+
+// 字节串载荷（原始字节，逐元素入数组；读侧按长度精确取回）。
+func env_bytes(t: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var n = len(t)
+    var i: i64 = 0
+    while i < n {
+        table_push(out, t[i])
+        i = i + 1
+    }
+    return out
+}
+
+// 信封编码：kind + stage + name + payload → 帧载荷字节。
+pub func env_encode(kind: i64, stage: i64, name: string, payload: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    out = byte_concat(out, env_field(1, env_i64(kind)))
+    out = byte_concat(out, env_field(2, env_i64(stage)))
+    out = byte_concat(out, env_field(3, zdw.enc_string(name)))
+    out = byte_concat(out, env_field(4, env_bytes(payload)))
+    return out
+}
+
+// ---------- 解码（结果入 tinker 全局；见 tinker.tie 主文件） ----------
+
+// varint 读取：bytes[pos..] → (值, next)；失败 (0, -1)。
+// pub：供常驻服务的请求字段解析复用（单一解码实现）。
+pub func rd_varint(bytes: table<i64>, pos: i64) -> (i64, i64) {
+    var v: i64 = 0
+    var shift: i64 = 0
+    var i = pos
+    var nb = len(bytes)
+    while i < nb {
+        var b = bytes[i]
+        if b < 0 || b > 255 {
+            return (0, -1)
+        }
+        v = v | ((b & 0x7F) << shift)
+        if (b & 0x80) == 0 {
+            return (v, i + 1)
+        }
+        shift = shift + 7
+        if shift > 63 {
+            return (0, -1)
+        }
+        i = i + 1
+    }
+    return (0, -1)
+}
+
+// 信封解码 → tk_kind/tk_stage/tk_name/tk_pl（主文件全局）。
+// 返回 0 成功 / -1 失败（格式非法）。
+pub func env_decode(bytes: table<i64>) -> i64 {
+    tk_kind = -1
+    tk_stage = 0
+    tk_name = ""
+    tk_pl = table_new_i64()
+    var nb = len(bytes)
+    var pos: i64 = 0
+    while pos < nb {
+        var tag_r = rd_varint(bytes, pos)
+        var tag = tag_r.0
+        var p1 = tag_r.1
+        if p1 < 0 {
+            return -1
+        }
+        var len_r = rd_varint(bytes, p1)
+        var flen = len_r.0
+        var p2 = len_r.1
+        if p2 < 0 || flen < 0 || p2 + flen > nb {
+            return -1
+        }
+        var fno = tag >> 3
+        if fno == 1 {
+            var v_r = rd_varint(bytes, p2)
+            if v_r.1 < 0 {
+                return -1
+            }
+            tk_kind = v_r.0
+        } else if fno == 2 {
+            var s_r = rd_varint(bytes, p2)
+            if s_r.1 < 0 {
+                return -1
+            }
+            tk_stage = s_r.0
+        } else if fno == 3 {
+            // 字符串载荷：头字节（0xA0|n / 0xD9.. 已在编码侧计入 flen）+ UTF-8 正文。
+            // 解码自正文首字节起（头字节宽 1..5 不定——按首字节判宽）。
+            if p2 >= nb {
+                return -1
+            }
+            var h0 = bytes[p2]
+            var hw: i64 = 1
+            if h0 == 0xD9 {
+                hw = 2
+            } else if h0 == 0xDA {
+                hw = 3
+            } else if h0 == 0xDB {
+                hw = 5
+            }
+            var s: string = ""
+            var sstart = p2 + hw
+            var send = p2 + flen
+            var bi = sstart
+            while bi < send {
+                var b0 = bytes[bi]
+                var cp: i64 = b0
+                var adv: i64 = 1
+                if b0 >= 0xF0 {
+                    if bi + 3 >= send {
+                        return -1
+                    }
+                    cp = ((b0 & 0x07) << 18) | ((bytes[bi + 1] & 0x3F) << 12) | ((bytes[bi + 2] & 0x3F) << 6) | (bytes[bi + 3] & 0x3F)
+                    adv = 4
+                } else if b0 >= 0xE0 {
+                    if bi + 2 >= send {
+                        return -1
+                    }
+                    cp = ((b0 & 0x0F) << 12) | ((bytes[bi + 1] & 0x3F) << 6) | (bytes[bi + 2] & 0x3F)
+                    adv = 3
+                } else if b0 >= 0xC0 {
+                    if bi + 1 >= send {
+                        return -1
+                    }
+                    cp = ((b0 & 0x1F) << 6) | (bytes[bi + 1] & 0x3F)
+                    adv = 2
+                }
+                s = s + str_from_code(cp)
+                bi = bi + adv
+            }
+            tk_name = s
+        } else if fno == 4 {
+            var pl = table_new_i64()
+            var j = p2
+            var jend = p2 + flen
+            while j < jend {
+                table_push(pl, bytes[j])
+                j = j + 1
+            }
+            tk_pl = pl
+        }
+        // 未知字段：整体跳过（前向兼容）
+        pos = p2 + flen
+    }
+    if tk_kind < 0 {
+        return -1
+    }
+    return 0
+}
+
+}   // namespace tinker

@@ -1,0 +1,201 @@
+type tie<class>
+// compiler/backend/irgen_call_p2.tie —— irgen_call 分片 2（p.9.21.3 单文件 ≤800 行）
+// ============================================================
+// 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
+// 顶层全局 var 与 import 树仍留在 irgen_call.tie。
+namespace irgen {
+// 发射 struct 运算符方法调用：接收者 = recv_node（类型 recv_ty，须为用户 struct；
+// 首参按引用则传槽地址），随后逐个 arg_nodes 实参求值压参。返回方法返回类型值。
+func tig_op_overload(full: string, recv_node: i64, recv_ty: i64, arg_nodes: table<i64>) -> i64 {
+    var sig = sstate.fn_sig(full)
+    if sig < 0 {
+        sm_err_msg = "运算符方法 '" + full + "' 无签名（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var ret_ty = fn_ret_ty(sig)
+    var nparams = fn_nparams(sig)
+    var ptys = fn_param_tys(sig)
+    var sgo = sg_off[sig]
+    var first_ref = 0
+    if sgo >= 0 && sgo < len(sp_refs) {
+        first_ref = sp_refs[sgo]
+    }
+    var sym = interner.intern(full)
+    llvmgen.call_sym_reg(sym)
+    var argvals: table<i64> = table_new_i64()
+    var argtys: table<i64> = table_new_i64()
+    var rv: i64 = -1
+    if first_ref == 1 {
+        rv = tig_agg_addr(recv_node, recv_ty)
+    } else {
+        rv = tig_expr(recv_node)
+    }
+    if rv < 0 {
+        return -1
+    }
+    table_push(argvals, rv)
+    if first_ref == 1 {
+        table_push(argtys, types.named(TK_STR))  // 引用 → ptr
+    } else {
+        table_push(argtys, recv_ty)
+    }
+    var ai: i64 = 0
+    while ai < len(arg_nodes) {
+        var av = tig_expr(arg_nodes[ai])
+        if av < 0 {
+            return -1
+        }
+        table_push(argvals, av)
+        var apty = types.named(TK_I64)
+        if ai + 1 < nparams {
+            apty = ptys[ai + 1]
+        }
+        table_push(argtys, apty)
+        ai = ai + 1
+    }
+    var ty35x: i64 = -1
+    if ret_ty != types.named(TK_VOID) {
+        ty35x = ret_ty
+    }
+    var instx = ir.new_inst(g_cur_block, 35, ty35x)  // call
+    ir.add_operand(instx, sym, 0)
+    ir.add_operand(instx, ret_ty, 2)
+    var kk: i64 = 0
+    while kk < len(argvals) {
+        ir.add_operand(instx, argtys[kk], 2)
+        ir.add_operand(instx, argvals[kk], 0)
+        kk = kk + 1
+    }
+    if ret_ty == types.named(TK_VOID) {
+        return tig_int_lit(0)
+    }
+    return ir.get_value(instx)
+}
+
+// 外部桥调用（extern_call 36）通用生成。argtys/argv 并行表（实参 LLVM 类型 id + 值 id）。
+// p.6.8.3：extern repr(C) struct 实参按引用（C ABI 传指针）取地址值。
+// Var 实参 → 直接传变量槽地址 g_lookup_alloca（callee 就地写，调用方写可见）；
+// 非变量表达式 → 求值后落临时 alloca 再传其地址（副本，写不回调——与 C 值
+// 隐式转型一致，最小集接受）。agg_ty 为 struct 类型、value 为聚合值（Var 时
+// 已按值 load，此处忽略，仅经 scope_get_global 取槽地址）。
+func tig_struct_byref(arg_node: i64, agg_ty: i64, value: i64) -> i64 {
+    if s_tags[arg_node] == 6 {
+        var nidb = interner.intern(sstate.name_str(arg_node))
+        if scope_get_global(nidb) >= 0 {
+            return g_lookup_alloca
+        }
+    }
+    var alloca_b = ir.new_inst(g_cur_block, 20, agg_ty)
+    ir.add_operand(alloca_b, agg_ty, 2)
+    var apb = ir.get_value(alloca_b)
+    var stb = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(stb, agg_ty, 2)
+    ir.add_operand(stb, value, 0)
+    ir.add_operand(stb, apb, 0)
+    return apb
+}
+
+// 返回结果值 id（void 桥返回 -1，指令 ty=-1 无结果寄存器）。
+// 操作数布局：[0]=符号池id, [1]=返回类型id(IMM), 然后每参数 [类型id(IMM), 值]。
+// is_libc：true = libc 符号（不置 g_used_interp）；false = tie_interp 桥。
+func tig_ext_call_typed(sym: string, argtys: table<i64>, argv: table<i64>, ret_ty: i64) -> i64 {
+    if !is_libc_sym(sym) {
+        g_used_interp = true
+    }
+    // 2026-10-12：用户 extern 直调 Winsock 符号 → 置位 g_used_wsock
+    // （driver 链 -lws2_32；net_* 内建路径的置位在 tig_net_* helper，判据对齐）。
+    if is_wsock_sym(sym) {
+        g_used_wsock = true
+    }
+    var sid = interner.intern(sym)
+    var inst = ir.new_inst(g_cur_block, 36, ret_ty)
+    ir.add_operand(inst, sid, 0)
+    ir.add_operand(inst, ret_ty, 2)  // 返回类型（IMM）
+    var k: i64 = 0
+    while k < len(argv) {
+        ir.add_operand(inst, argtys[k], 2)
+        ir.add_operand(inst, argv[k], 0)
+        k = k + 1
+    }
+    if ret_ty < 0 {
+        return -1
+    }
+    return ir.get_value(inst)
+}
+
+// 便捷：单参数桥（返回非 void）
+func tig_ext_call1(sym: string, v: i64, vty: i64, ret_ty: i64) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, vty)
+    table_push(avs, v)
+    return tig_ext_call_typed(sym, ats, avs, ret_ty)
+}
+
+// 便捷：双参数桥（返回非 void）
+func tig_ext_call2(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64, ret_ty: i64) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, ty1)
+    table_push(avs, v1)
+    table_push(ats, ty2)
+    table_push(avs, v2)
+    return tig_ext_call_typed(sym, ats, avs, ret_ty)
+}
+
+// 便捷：双参数 void 桥
+func tig_ext_call2v(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64) {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, ty1)
+    table_push(avs, v1)
+    table_push(ats, ty2)
+    table_push(avs, v2)
+    tig_ext_call_typed(sym, ats, avs, -1)
+}
+
+// 便捷：四参数桥（返回非 void）
+func tig_ext_call4(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64, v3: i64, ty3: i64, v4: i64, ty4: i64) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, ty1)
+    table_push(avs, v1)
+    table_push(ats, ty2)
+    table_push(avs, v2)
+    table_push(ats, ty3)
+    table_push(avs, v3)
+    table_push(ats, ty4)
+    table_push(avs, v4)
+    return tig_ext_call_typed(sym, ats, avs, types.named(TK_I64))
+}
+
+// trm-lite 静态链接库桥调用（extern_call 36 通用生成；**不置 g_used_interp**——
+// 符号由 trm_lite.a 解析，非 tie_interp Rust 桥）。argtys/argv 并行表；返回结果值 id
+//（void 桥返回 -1，指令 ty=-1 无结果寄存器）。
+func tig_trmlite_call(sym: string, argtys: table<i64>, argv: table<i64>, ret_ty: i64) -> i64 {
+    var sid = interner.intern(sym)
+    var inst = ir.new_inst(g_cur_block, 36, ret_ty)
+    ir.add_operand(inst, sid, 0)
+    ir.add_operand(inst, ret_ty, 2)
+    var k: i64 = 0
+    while k < len(argv) {
+        ir.add_operand(inst, argtys[k], 2)
+        ir.add_operand(inst, argv[k], 0)
+        k = k + 1
+    }
+    if ret_ty < 0 {
+        return -1
+    }
+    return ir.get_value(inst)
+}
+
+// 空类型/值表（trm-lite 无参桥调用便捷）。
+func tig_empty_types() -> table<i64> {
+    return table_new_i64()
+}
+
+func tig_empty_vals() -> table<i64> {
+    return table_new_i64()
+}
+
+}

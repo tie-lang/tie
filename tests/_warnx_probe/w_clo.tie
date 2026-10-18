@@ -1,0 +1,11 @@
+type tie<logic>
+// probe W00011/W00015 closure-trap 2026-09-15T15:07:00-i
+// 外层 var x 仅被闭包读写；参数 a 仅被函数体读取。
+// 期望：不误报 W00015(x) / W00011(a)；闭包变量 g 被重赋值故也不报 W00015。
+func main() {}
+func fclo(a: i64) -> i64 {
+    var x: i64 = 0
+    var g = func() -> i64 { x = x + 1; return x }
+    g = func() -> i64 { return x }
+    return g() + a
+}

@@ -1,0 +1,38 @@
+type tie<logic>
+// ============================================================
+// p.9.11.12 @注解/属性正例：声明前置注解 `@name` / `@name(args)`。
+// 注解 = 编译期元数据（解析+登记进 pann 注册表，可查询；工具链消费——
+// Keel 注册表/tieapi/tdiag——在组件层做，本批不产生运行期行为）。
+// 本探针验证：堆叠注解、参数表字面量（数字/字符串/布尔/表字面量）、
+// func/struct/enum 三种声明形态均可解析编译；运行期行为与无注解一致。
+// ============================================================
+
+@component
+@priority(3)
+struct Service {
+    var name: string = "svc"
+}
+
+@test(1, "x", true)
+@tags({k: "v", n: [1, 2]})
+func run_tests() -> i64 {
+    return 42
+}
+
+@marker
+enum Mode {
+    On
+    Off
+}
+
+func main() {
+    var s = Service("svc")
+    if s.name != "svc" {
+        panic("struct 字段错误")
+    }
+    var r = run_tests()
+    if r != 42 {
+        panic("函数调用错误")
+    }
+    println("annot 探针全过")
+}

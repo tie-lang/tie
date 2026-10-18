@@ -1,0 +1,118 @@
+type tie<logic>
+
+// ============================================================
+// p.9.11.3 try 错误聚合块验收：`try { a? b? ... }` — 块内多个 `?` 传播点聚合
+// 为纯语法分组；块内任一 `?` 求值为 Err/None 时整块短路并**传播到当前函数**
+//（与块外 `?` 完全一致，tie 无异常/捕获，try 块不捕获）。全成功时块末表达式
+// 为 try 块的值（可经 `var v = try { ... }` 使用）。
+//
+// 覆盖场景：
+//   1. 多 `?` 链成功路径（Result），try 末值经表达式使用
+//   2. 中途 Err 早退（错误传播到调用方，调用方 switch 打印）
+//   3. Option 的 `?` 链（None 早退传播到调用方）
+//   4. 嵌套 try（内层 try 末值接外层）
+//   5. try 仅作语句（无末值）
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   ok:2 / err:div0 / some:15 / none-at / nest:115 / stmt-try / p.9.11.3 try 全过
+// ============================================================
+import "/std/result.tie"
+
+// `?` 传播点：除法（b==0 → Err）
+func try_div(a: i64, b: i64) -> Result<i64, string> {
+    if b == 0 {
+        return Result.Err("div0")
+    }
+    return Result.Ok(a / b)
+}
+
+// 1. try 多 `?` 成功路径 + 末值使用
+func success(a: i64, b: i64) -> Result<i64, string> {
+    var r = try {
+        var x = try_div(a, b) ?   // Err → 传播到 success
+        var y = try_div(x, 2) ?
+        var z = try_div(y, 4) ?
+        z + 1                     // try 末值 = z+1
+    }
+    return Result.Ok(r)
+}
+
+// 2. 中途 Err 早退（错误传播到调用方，调用方打印）
+func caller(a: i64, b: i64) -> string {
+    switch success(a, b) {
+        case Ok(v): return "ok:" + to_string(v)
+        case Err(e): return "err:" + e
+    }
+}
+
+// 3. Option `?` 链（None 早退）
+func half(n: i64) -> Option<i64> {
+    if n % 2 != 0 {
+        return Option.None
+    }
+    return Option.Some(n / 2)
+}
+func opchain(n: i64) -> Option<i64> {
+    var r = try {
+        var a = half(n) ?
+        var b = half(a) ?
+        b + 5
+    }
+    return Option.Some(r)
+}
+func opcall(n: i64) -> string {
+    switch opchain(n) {
+        case Some(v): return "some:" + to_string(v)
+        case None: return "none-at"
+    }
+}
+
+// 4. 嵌套 try（内层 try 末值接外层）
+func nested(a: i64, b: i64) -> Result<i64, string> {
+    var r = try {
+        var x = try_div(a, b) ?
+        var y = try {
+            var m = try_div(x, 2) ?
+            m + 10
+        }
+        y + 100
+    }
+    return Result.Ok(r)
+}
+
+// 5. try 仅作语句（无末值；块内 `?` 仍传播，函数须返回 Result/Option）
+func stmt_try(a: i64, b: i64) -> Result<i64, string> {
+    var memo = 0
+    try {
+        var x = try_div(a, b) ?
+        memo = x + 1
+    }
+    return Result.Ok(memo)
+}
+
+func main() {
+    // 1. 成功路径：12/2=6, 6/2=3, 3/4=0, +1=1
+    println(caller(12, 2))      // ok:1
+    // 2. Err 早退：12/0 → div0 传播
+    println(caller(12, 0))      // err:div0
+    // 3. Option：40/2=20, 20/2=10, +5=15
+    println(opcall(40))         // some:15
+    //    None 早退：6/2=3（奇数）→ None 传播
+    println(opcall(6))          // none-at
+    // 4. 嵌套：20/2=10, 10/2=5, +10=15, +100=115
+    switch nested(20, 2) {
+        case Ok(v): println("nest:" + to_string(v))   // nest:115
+        case Err(e): println("nest-err:" + e)
+    }
+    // 5. 语句位 try：8/2=4, memo=5
+    switch stmt_try(8, 2) {
+        case Ok(v): println("stmt" + to_string(v))   // stmt5
+        case Err(e): println("st-err:" + e)
+    }
+    // 5b. 语句位 try Err 早退：8/0 → div0 传播到 stmt_try，再传到达 main switch
+    switch stmt_try(8, 0) {
+        case Ok(v): println("st-ok")
+        case Err(e): println("st-err:" + e)   // st-err:div0
+    }
+    println("p.9.11.3 try 全过")
+}

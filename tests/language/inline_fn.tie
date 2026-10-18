@@ -1,0 +1,25 @@
+type tie<logic>
+// ============================================================
+// p.9.11.10 inline fn 探针：`inline func name(...)` 标记内联建议。
+// 语义：LLVM 函数定义附加 `alwaysinline` 属性（编译 --emit-ir 检查 .ll 函数头
+// 形如 `define ... @hot(...) alwaysinline {`）；普通函数无该属性。运行结果与
+// 普通函数一致；对递归/自举编译器自身无副作用（未标注函数被 inlining 行为零变化）。
+// ============================================================
+inline func hot(x: i64) -> i64 {
+    return x * 2 + 1
+}
+func normal(x: i64) -> i64 {
+    return x * 3
+}
+func main() {
+    // 1. inline 函数结果正确
+    var a = hot(21)          // 21*2+1 = 43
+    if a != 43 { panic("inline 函数结果错误"); }
+    // 2. 普通函数结果正确
+    var b = normal(7)        // 21
+    if b != 21 { panic("普通函数结果错误"); }
+    // 3. 混合调用 + 多次内联点，语义不受内联影响
+    var c = hot(a) + normal(a)
+    if c != 43 * 2 + 1 + 43 * 3 { panic("组合调用错误"); }
+    println("inline_fn 探针全过")
+}

@@ -1,0 +1,169 @@
+type tie<logic>
+// compiler/config_test.tie —— tie.config 库独立自检（p.9.21 G7 库资格②）
+// ============================================================
+// 无 driver 可跑：本文件即入口（tie<logic>），只 import 被测库，
+// 覆盖构建配置模块对外契约：
+//   - parse：tie:data 表字面量 → 节点 id；失败 -1 且 err_msg 非空；
+//   - 类型判别与取值：type_of / int_val / float_val / str_val；
+//   - 容器：arr_len / arr_at / map_len / map_key / map_val / map_get；
+//   - 点分路径：path_get / get_str / get_int / get_bool / get_list；
+//   - 分层合并 merge：标量覆盖 / 深合并 / 数组追加 / "=" 重置数组；
+//   - apply_cli：点分路径写入（中间节点缺失时忽略不报错）；
+//   - dump：产生可读文本。
+// 全部通过输出「config 自检通过」exit 0；任一失败打印明细 exit 1。
+//
+// # 语言边界应用
+//   - 本库**不 import 任何库**（自包含约束，见 config.tie 文件头），
+//     本自检同样只 import 被测库；
+//   - 前缀调用（config.xxx）；断言失败累积用嵌套 if。
+//
+// 运行（repo 根）：
+//   compiler\tiec.exe compiler\config_test.tie -o <tmp>\configtest.exe
+//   <tmp>\configtest.exe     # -> 「config 自检通过」exit 0
+
+import "./config.tie"
+
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+func main() {
+    var ok: bool = true
+
+    // ---------- parse：根表 + 嵌套 + 数组 ----------
+    var src = "[ \"target\": \"win-x64\", \"opt\": 2, \"strict\": true, " +
+        "\"ratio\": 1.5, \"tiec\": [ \"backend\": \"win32\", " +
+        "\"features\": [\"async\", \"macro\"] ], \"tags\": [\"a\", \"b\"] ]"
+    var root = config.parse(src)
+    if !check(root >= 0, "合法 config 文本解析成功") {
+        ok = false
+    }
+
+    // ---------- 类型判别与取值 ----------
+    var tgt = config.path_get(root, "target")
+    if !check(config.type_of(tgt) == 4 && config.str_val(tgt) == "win-x64",
+              "字符串节点类型与取值") {
+        ok = false
+    }
+    var opt = config.path_get(root, "opt")
+    if !check(config.type_of(opt) == 2 && config.int_val(opt) == 2, "整数节点类型与取值") {
+        ok = false
+    }
+    if !check(config.get_bool(root, "strict"), "布尔节点 get_bool 为真") {
+        ok = false
+    }
+    var ratio = config.path_get(root, "ratio")
+    if !check(config.type_of(ratio) == 3, "浮点节点类型") {
+        ok = false
+    }
+
+    // ---------- 点分路径访问器 ----------
+    if !check(config.get_str(root, "target") == "win-x64", "get_str 顶层键") {
+        ok = false
+    }
+    if !check(config.get_int(root, "opt") == 2, "get_int 顶层键") {
+        ok = false
+    }
+    if !check(config.get_str(root, "tiec.backend") == "win32", "get_str 点分路径") {
+        ok = false
+    }
+    if !check(config.get_str(root, "nope.nope") == "", "缺失路径 get_str 返回空串") {
+        ok = false
+    }
+    if !check(config.path_get(root, "nope.nope") == -1, "缺失路径 path_get 返回 -1") {
+        ok = false
+    }
+
+    // ---------- 数组 ----------
+    var feats = config.path_get(root, "tiec.features")
+    if !check(config.type_of(feats) == 5 && config.arr_len(feats) == 2, "数组类型与长度") {
+        ok = false
+    }
+    if !check(config.str_val(config.arr_at(feats, 0)) == "async", "数组元素取值") {
+        ok = false
+    }
+    if !check(config.get_list(root, "tiec.features") == "async,macro", "get_list 逗号拼接") {
+        ok = false
+    }
+    if !check(config.get_list(root, "tags") == "a,b", "get_list 第二组数组") {
+        ok = false
+    }
+
+    // ---------- map 遍历 ----------
+    var tiec = config.path_get(root, "tiec")
+    if !check(config.map_len(tiec) == 2, "map 键值对个数") {
+        ok = false
+    }
+    if !check(config.map_key(tiec, 0) == "backend", "map 第一个键") {
+        ok = false
+    }
+    if !check(config.str_val(config.map_val(tiec, 0)) == "win32", "map 第一个值") {
+        ok = false
+    }
+    if !check(config.type_of(config.map_get(tiec, "backend")) == 4, "map_get 按键取节点") {
+        ok = false
+    }
+
+    // ---------- 合并：标量覆盖 / 深合并 / 数组追加 / "=" 重置 ----------
+    // 注意分层解析契约：parse 会重置节点存储，第二层起必须用 parse_append
+    // （与 load_merge 的用法一致），否则 base 的节点 id 被清空。
+    var base = config.parse("[ \"opt\": 1, \"tiec\": [ \"backend\": \"win32\", \"emit\": \"exe\" ], " +
+        "\"tags\": [\"a\"], \"list\": [\"x\"] ]")
+    var layer = config.parse_append("[ \"opt\": 3, \"tiec\": [ \"emit\": \"lib\" ], " +
+        "\"tags\": [\"b\"], \"list\": \"=\" ]")
+    if !check(base >= 0 && layer >= 0, "合并双方解析成功") {
+        ok = false
+    }
+    var m = config.merge(base, layer)
+    if !check(m >= 0, "merge 返回新根") {
+        ok = false
+    }
+    if !check(config.get_int(m, "opt") == 3, "标量键 layer 覆盖 base") {
+        ok = false
+    }
+    if !check(config.get_str(m, "tiec.backend") == "win32", "深合并保留 base 子键") {
+        ok = false
+    }
+    if !check(config.get_str(m, "tiec.emit") == "lib", "深合并 layer 子键覆盖") {
+        ok = false
+    }
+    if !check(config.get_list(m, "tags") == "a,b", "数组键追加合并") {
+        ok = false
+    }
+    if !check(config.get_list(m, "list") == "", "\"=\" 重置数组为空") {
+        ok = false
+    }
+
+    // ---------- apply_cli ----------
+    var c2 = config.apply_cli(m, "opt", "9")
+    if !check(config.get_int(c2, "opt") == 9, "apply_cli 覆盖已有路径") {
+        ok = false
+    }
+    var c3 = config.apply_cli(c2, "no.such.path", "1")
+    if !check(c3 >= 0, "中间节点缺失时忽略不报错") {
+        ok = false
+    }
+
+    // ---------- dump ----------
+    if !check(str_len(config.dump(root)) > 0, "dump 产生可读文本") {
+        ok = false
+    }
+
+    // ---------- 错误契约 ----------
+    var bad = config.parse("[ \"a\": ]")
+    if !check(bad == -1, "非法文本解析返回 -1") {
+        ok = false
+    }
+    if !check(str_len(config.err_msg()) > 0, "失败时 err_msg 非空") {
+        ok = false
+    }
+
+    // ---------- 汇总 ----------
+    if !ok {
+        exit(1)
+    }
+    println("config 自检通过")
+}

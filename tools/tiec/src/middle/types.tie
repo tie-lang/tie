@@ -1,0 +1,210 @@
+type tie<class>
+// compiler/middle/types.tie —— 自举 v2 T2.1：类型系统（type id 自编码）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.1 模块化地基。从阶段 1 原型
+// compiler/proto/semantic.tie 提炼（文件头注释的类型编码方案 +
+// ty_named/ty_table/ty_map/ty_struct_idx/ty_tuple_idx/ty_kind/
+// ty_low/判据族/type_name + S_T_*/S_K_* 常量）。
+//
+// # 类型编码（type id 自编码，O(1) 构造/比较，高位分离防冲突）
+//   Named 类型：id = TyKw 索引（0=i8 1=i16 2=i32 3=i64 4=u8 5=u16
+//     6=u32 7=u64 8=f32 9=f64 10=bool 11=trit 12=char 13=string
+//     14=void 15=code 16=num 17=text 18=misc 19=table 20=map）
+//   table<T> ：id = 1<<40 | T
+//   map<V>   ：id = 2<<40 | V
+//   struct S ：id = 3<<40 | struct_索引（struct 表行号）
+//   tuple    ：id = 4<<40 | tuple_索引（tuple 表行号）
+//   TypeVar  ：id = 5<<40 | intern 池 id（泛型类型参数，名字即身份——
+//     同名类型参数全局同 id、跨函数稳定，mangling 友好；intern 池 id
+//     < 2^40 保证不碰撞。语义层登记泛型形参时调用 var_of 获取）。
+//   enum E  ：id = 6<<40 | enum_索引（enum 表行号，最高段）
+//   高位分离保证任意嵌套组合不冲突（负载 < 2^40）。
+//   解码：kind(id) 判类别（0=Named 1=Table 2=Map 3=Struct 4=Tuple
+//   5=TypeVar 6=Enum），low(id) 取负载（元素类型/索引/intern 池 id）。
+//   TypeVar 兼容性：table<TypeVar>/map<TypeVar> 走嵌套聚合序号表路径
+//   （var_of 结果恒 ≥ NEST_SLOT_OFF，table_of 查/登记 nest_tbl_elems），
+//   table_elem 可完整还原回 TypeVar id；判据族（is_int/is_float/
+//   is_number/is_bool_like/is_wide/is_table/is_map）对 TypeVar 均 false
+//   ——TypeVar 不是任何具体类型，须在单态化时替换为具体类型后再判定。
+//
+// # 判据族（语义检查/IR 生成共用，从 semantic 提炼）
+//   is_int / is_float / is_number / is_bool_like / is_wide
+//   （num/text/misc 宽类型框）/ is_table / is_map / table_elem
+//   注意：裸关键字 table(19)/map(20) 与参数化 table<T>/map<V>
+//   都算 is_table / is_map（与 semantic 行为一致）。
+//
+// # struct 名登记（type_name 递归还原用）
+//   struct 名表（st_names，索引 -> 名字）由本模块维护，语义阶段
+//   登记 struct 后调用 set_struct_name(idx, name)，type_name 即可
+//   还原完整名字（无该登记时回退 "struct"）。
+//   tuple 类型名固定 "tuple"（semantic 同款，无字段名表）。
+//
+// 调用：import 后 types.named(...) / types.type_name(...)
+// 命名规范：命名空间内函数不加 types_ 前缀；内部工具私有（非 pub）。
+//
+// # pub 方法全集（组件契约，p.9.21 G7 库资格①；增删须同步此处与 ROAD）
+//   构造（O(1) 编码）：named table_of map_of struct_of tuple_of var_of
+//     enum_of ptr_of slice_of atomic_of array_of fn_of fn_of2
+//     port_of actor_of guard_of
+//   判别（kind / 判据族）：kind low is_array array_elem array_len
+//     fn_ret_ty fn_nparams_of fn_param_of fn_param_ref fn_has_var_of
+//     is_port is_actor guard_cap guard_cap_name is_guard
+//     is_int is_float is_number is_bool_like is_wide is_table is_map
+//     is_enum is_typevar is_ptr is_slice is_atomic is_fn is_unsafe_ty
+//     table_elem
+//   登记（名字回填，语义阶段调用）：set_struct_name set_enum_name
+//     set_port_name set_actor_name
+//   文本：type_name
+//   自检：middle/types_test.tie（无 driver 可跑）。
+
+import "../lib/interner.tie"
+
+// ---------- 类型类别常量（kind(id) 返回值）----------
+pub const K_NAMED: i64 = 0;
+pub const K_TABLE: i64 = 1;
+pub const K_MAP: i64 = 2;
+pub const K_STRUCT: i64 = 3;
+pub const K_TUPLE: i64 = 4;
+pub const K_TYPEVAR: i64 = 5;
+pub const K_ENUM: i64 = 6;
+pub const K_PTR: i64 = 7;        // ptr<T> 类型化指针（S1.2）
+pub const K_SLICE: i64 = 8;      // slice<T> 切片（指针+长度，S1.2）
+pub const K_ATOMIC: i64 = 9;     // atomic<T> 原子类型（S1.2）
+pub const K_FN: i64 = 10;        // fn 函数值类型（S2.2，闭包/函数指针）
+pub const K_PORT: i64 = 11;      // port 对象类型（S2.4：接口对象，LLVM 表示 = ptr 指向堆打包 {data,vtable}）
+pub const K_ACTOR: i64 = 12;     // actor 句柄类型（一期并发：运行期一张 actor 表管所有权，LLVM 表示 = i64 句柄槽）
+pub const K_GUARD: i64 = 13;     // guard<cap> 凭据类型（三期 A 组：跨 actor 共享内存逃生口凭据，LLVM 表示 = i64 占位）
+pub const K_ARRAY: i64 = 14;     // array<T, N> 稠密定长数组（L1 定长数组：值类型，LLVM 布局 [N x T]）
+pub const K_FUTURE: i64 = 15;    // future<T> 凭据（p.9.11 async 返回值，规范 §10.6：LLVM 表示 = i64
+                             // —— actor record 句柄；await 时等 done@104/读 result@96）
+const K_SHIFT: i64 = 40;           // 高位分离位移量（负载 < 2^40）
+
+// ---------- TyKw 索引常量（0..22，对齐 Rust TyKw 变体顺序）----------
+pub const TK_I8: i64 = 0;
+pub const TK_I16: i64 = 1;
+pub const TK_I32: i64 = 2;
+pub const TK_I64: i64 = 3;
+pub const TK_U8: i64 = 4;
+pub const TK_U16: i64 = 5;
+pub const TK_U32: i64 = 6;
+pub const TK_U64: i64 = 7;
+pub const TK_F32: i64 = 8;
+pub const TK_F64: i64 = 9;
+pub const TK_BOOL: i64 = 10;
+pub const TK_TRIT: i64 = 11;
+pub const TK_CHAR: i64 = 12;
+pub const TK_STR: i64 = 13;
+pub const TK_VOID: i64 = 14;
+pub const TK_CODE: i64 = 15;
+pub const TK_NUM: i64 = 16;
+pub const TK_TEXT: i64 = 17;
+pub const TK_MISC: i64 = 18;
+pub const TK_TABLE: i64 = 19;
+pub const TK_MAP: i64 = 20;
+// 批次 2（i128/u128）：128 位整数（2026-08-19，dev33 计划任务 3-6）。
+// 注：Named 类型 id = TyKw 索引（0..22），kind(id) 用 id < 100 判 Named，
+// 新类型索引 < 100 不破坏编码；tykw_names 按索引对齐（见 ensure_tykw_names）。
+pub const TK_I128: i64 = 21;
+pub const TK_U128: i64 = 22;
+// P2b（2026-08-30）异构表动态元素类型：`any` = {tag, payload} 16 字节值类型。
+// LLVM 表示 = {i64, i64}（tag + payload）；标量 ≤8B 存 payload，复合堆装箱。
+pub const TK_ANY: i64 = 23;
+
+// 高位基数常量（= 1<<40 / 2<<40 / 3<<40 / 4<<40 / 5<<40 / 6<<40，
+// 写死字面量避免运行期位移）
+// 6<<40 = 6597069766656，i64 有符号下远小于 2^63 无溢出。
+// S1.2 新增 ptr/slice/atomic 段：7/8/9 << 40。
+pub const BASE_TABLE: i64 = 1099511627776;
+pub const BASE_MAP: i64 = 2199023255552;
+pub const BASE_STRUCT: i64 = 3298534883328;
+pub const BASE_TUPLE: i64 = 4398046511104;
+pub const BASE_TYPEVAR: i64 = 5497558138880;
+pub const BASE_ENUM: i64 = 6597069766656;
+pub const BASE_PTR: i64 = 7696581394432;
+pub const BASE_SLICE: i64 = 8796093022208;
+pub const BASE_ATOMIC: i64 = 9895604649984;
+// S2.2 fn 函数值类型段：id = 10<<40 | fn 签名索引（签名表行号）。
+// 签名 = 返回类型 + 参数类型列表，查 fn 签名表编码（低负载为索引）。
+// 10<<40 = 10995116277760，i64 有符号下远小于 2^63 无溢出。
+pub const BASE_FN: i64 = 10995116277760;
+// S2.4 port 对象类型段：id = 11<<40 | port 索引（port 表行号）。
+// 11<<40 = 12094627905536，i64 有符号下远小于 2^63 无溢出。
+// port 对象语义 = {data: ptr, vtable: ptr}（docs/plans/port-model.md §4.1），
+// LLVM 表示 = 单个 ptr（指向堆上打包对象 {data,vtable}）——表/传参/字段
+// 天然支持（探针异构 table<Drawable> 依赖此表示，见 S2.4 注释）。
+pub const BASE_PORT: i64 = 12094627905536;
+// 一期并发 actor 句柄类型段：id = 12<<40 | actor 索引（actor 表行号）。
+// 12<<40 = 13194139533312，i64 有符号下远小于 2^63 无溢出。
+pub const BASE_ACTOR: i64 = 13194139533312;
+// 三期 A 组 guard<cap> 凭据类型段：id = 13<<40 | 能力域索引
+//（0=share 1=mem 2=ext；guard<share> 即 13<<40+0）。LLVM 表示 = i64 占位
+//（凭据值本身运行期无操作，门禁在编译期语义层强制）。
+pub const BASE_GUARD: i64 = 14293651161088;
+// L1 定长数组段：id = 14<<40 | NEST_SLOT_OFF + 序号（元素 + 长度经序号表登记，
+// 低负载恒 ≥ NEST_SLOT_OFF——长度是独立整数参数，无法内联进含嵌套聚合的元素编码）。
+// 14<<40 = 15393162788864，i64 有符号下远小于 2^63 无溢出。
+pub const BASE_ARRAY: i64 = 15393162788864;
+// p.9.11 future<T> 凭据段：id = 15<<40 | T（T 为方法返回类型 id；嵌套聚合负载
+// 经 nest_future_elems 序号表防进位，同 ptr_of 方案）。LLVM 表示 = i64
+//（actor record 句柄；同一 actor 至多一个未 await 凭据 = mq_sync 门闩语义）。
+pub const BASE_FUTURE: i64 = 16492674416640;
+
+// ---------- 全局状态（懒构建）----------
+pub var tykw_names: table<string>;   // TyKw 索引 -> 类型名（错误消息用）
+pub var st_names: table<string>;     // struct 名表（索引 -> 名字；type_name 还原用）
+pub var en_names: table<string>;     // enum 名表（索引 -> 名字；type_name 还原用）
+// 一期并发 actor 名表（索引 -> 名字；type_name 还原用，由语义层 set_actor_name 登记）
+pub var act_names: table<string>;
+// 嵌套聚合登记表（序号 → 元素/值类型 id）：table<table<T>> / map<聚合> 的编码载体。
+// 背景：table_of(聚合) 若直接 BASE_TABLE + 聚合，会因聚合 id ≥ 2^40 进位撞入
+// map 段（table<table<i64>> = 2^41+3 == map<i64>）——嵌套类型必须查表编码。
+pub var nest_tbl_elems: table<i64>;  // 嵌套表元素段（序号 → 元素类型 id）
+pub var nest_map_vals: table<i64>;   // 嵌套 map 值段（序号 → 值类型 id）
+// S1.2 不安全类型嵌套负载段（序号 → 元素类型 id；同 table_of 防进位方案）
+pub var nest_ptr_elems: table<i64>;    // 嵌套 ptr 元素段
+pub var nest_slice_elems: table<i64>;  // 嵌套 slice 元素段
+pub var nest_atomic_elems: table<i64>; // 嵌套 atomic 元素段
+pub var nest_future_elems: table<i64>; // 嵌套 future 负载段（p.9.11 future<T>，同 ptr 防进位方案）
+// L1 定长数组登记段（序号 → 元素类型 id / 元素个数 N）：
+// array<f32, 64> → 登记 (f32, 64)，低负载 = NEST_SLOT_OFF + 序号
+pub var nest_arr_elems: table<i64>;   // 嵌套定长数组元素段（序号 → 元素类型 id）
+pub var nest_arr_lens: table<i64>;    // 嵌套定长数组长度段（序号 → 元素个数 N）
+// S2.2 fn 函数值类型签名表（段式，索引即 fn 类型低负载）：
+// fn_ret    签名索引 -> 返回类型 id
+// fn_nparams 签名索引 -> 参数个数
+// fn_params 参数类型扁平段（前缀和由 fn_paroff 记录偏移）
+// fn_param_refs 参数 ref 标志扁平段（与 fn_params 平行；1 = 按引用传递）
+// fn_has_var 签名索引 -> 变参标志（0/1；参数列表末位为 table<T>）
+pub var fn_ret: table<i64>;      // fn 签名索引 -> 返回类型 id
+pub var fn_nparams: table<i64>;  // fn 签名索引 -> 参数个数
+pub var fn_paroff: table<i64>;   // fn 签名索引 -> fn_params 段起始偏移
+pub var fn_params: table<i64>;   // 参数类型扁平段（前缀和式）
+pub var fn_param_refs: table<i64>; // 参数 ref 标志扁平段（p.6.2.4）
+pub var fn_has_var: table<i64>;  // 签名变参标志（p.6.2.4）
+// S2.4 port 名表（索引 -> 名字；type_name 还原用，由语义层 set_port_name 登记）
+pub var pt_names: table<string>;
+
+// 嵌套负载序号偏移（避开 named 负载段 0..99；named 仅 0..20 安全余量）
+pub const NEST_SLOT_OFF: i64 = 100;
+
+namespace types {
+
+// ---------- 类型 id 构造（编码，O(1)）----------
+
+
+// ---------- 类型 id 解码 ----------
+
+
+// ---------- 判据族（语义检查/IR 生成共用）----------
+
+
+// ---------- struct / enum 名登记（type_name 还原用）----------
+
+
+// ---------- 类型名字（错误消息用；递归还原）----------
+
+
+}   // namespace types
+
+import "./types_q1.tie"
+import "./types_q2.tie"

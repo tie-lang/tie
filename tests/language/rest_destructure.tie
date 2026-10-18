@@ -1,0 +1,86 @@
+type tie<logic>
+
+// ============================================================
+// p.9.11.8 剩余解构 `var (a, ...rest) = t` 验收（源=数组/序列）：
+//   - 基本：var (a, ...rest) = [1,2,3,4] → a=1, rest=[2,3,4]（剩余为新表）
+//   - 零前导：var (...all) = t → all = t 全拷贝
+//   - 单元素：var (a, ...r) = [5] → a=5, r=[]（空剩余表）
+//   - 与既有元组解构并存：var (b, c) = (7, 8)
+//   - 与既有 for..in 解构并存（p.8.2.2）
+//   - 与切片/记录/表操作组合
+//
+// 实现裁决（见 pstmt.parse_tuple_destructure 脱糖）：
+//   - ...rest 仅末位合法（非末位 → 解析诊断 E；多重 rest 拒绝）
+//   - 脱糖复用既有 N_INDEX/N_SLICE：前导名 = tmp[i]，rest = tmp[k..]（零新增运行时）
+//   - rest 形态走数组索引/切片；无 rest 走既有 ItemN 元组字段脱糖（两路径共存）
+//   - 记录/map（按位置取键）形态零成本不可得，留待（裁决注明）
+// 期望输出：
+//   PASS basic / PASS zero_lead / PASS single / PASS tuple_co / PASS forin / PASS args
+// ============================================================
+
+func sum_i(t: table<i64>) -> i64 {
+    var s: i64 = 0
+    var i: i64 = 0
+    while i < len(t) {
+        s = s + t[i]
+        i = i + 1
+    }
+    return s
+}
+
+func main() {
+    // 1. 基本
+    var (a, ...rest) = [1, 2, 3, 4]
+    if a == 1 && len(rest) == 3 && rest[0] == 2 && rest[2] == 4 {
+        println("PASS basic")
+    } else {
+        println("FAIL basic a=" + to_string(a) + " len=" + to_string(len(rest)))
+        exit(1)
+    }
+    // 2. 零前导：rest 全收
+    var t0 = [5, 6, 7]
+    var (...all) = t0
+    if len(all) == 3 && all[0] == 5 && all[2] == 7 {
+        println("PASS zero_lead")
+    } else {
+        println("FAIL zero_lead")
+        exit(1)
+    }
+    // 3. 单元素：rest 为空表
+    var (x, ...r) = [9]
+    if x == 9 && len(r) == 0 {
+        println("PASS single")
+    } else {
+        println("FAIL single")
+        exit(1)
+    }
+    // 4. 与既有元组解构并存（无 rest 路径不受影响）
+    var (b, c) = (7, 8)
+    if b == 7 && c == 8 {
+        println("PASS tuple_co")
+    } else {
+        println("FAIL tuple_co")
+        exit(1)
+    }
+    // 5. 与既有 for..in 解构并存
+    var pairs = [(1, 2), (3, 4)]
+    var sump: i64 = 0
+    for (p, q) in pairs {
+        sump = sump + p + q
+    }
+    if sump == 10 {
+        println("PASS forin")
+    } else {
+        println("FAIL forin")
+        exit(1)
+    }
+    // 6. rest 作实参 / 与普通表操作组合
+    var (h, ...tail) = [10, 20, 30]
+    var s = sum_i(tail)
+    if h == 10 && s == 50 {
+        println("PASS args")
+    } else {
+        println("FAIL args")
+        exit(1)
+    }
+}

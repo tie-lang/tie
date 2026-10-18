@@ -1,0 +1,73 @@
+type tie<logic>
+// tests/_p91130_triple_probe/lex_probe.tie —— 三引号词法快速验证（秒级编译）
+// parse_ast 内嵌样例 → 遍历 AST 找 N_STR_LIT → 比对解码值。
+
+import "../../compiler/frontend/parser.tie"
+
+var g_found: i64 = -1
+
+func walk(id: i64) {
+    if id < 0 || g_found >= 0 {
+        return
+    }
+    if ast.tag(id) == N_STR_LIT {
+        g_found = id
+        return
+    }
+    var i: i64 = 0
+    while i < ast.child_count(id) {
+        walk(ast.child_at(id, i))
+        i = i + 1
+    }
+}
+
+func check(src: string, want: string, what: string) -> bool {
+    g_found = -1
+    var rc = parser.parse_ast(src)
+    if rc < 0 {
+        println("FAIL(parse) " + what + ": " + parser.ast_err_protocol())
+        return false
+    }
+    // parse_ast 只返回状态码；根 = 节点池最后一个节点（N_STMTLIST）
+    walk(ast.count() - 1)
+    if g_found < 0 {
+        println("FAIL " + what + ": 未找到字符串字面量")
+        return false
+    }
+    // ast.name(字面量) = 原始合成 lexeme（带引号、未反转义）——剥引号后比对
+    var got = interner.name_str(ast.name(g_found))
+    var gn = str_len(got)
+    if gn >= 2 && str_char(got, 0) == "\"" {
+        got = str.slice(got, 1, gn - 1)
+    }
+    if got == want {
+        println("OK " + what)
+        return true
+    }
+    println("FAIL " + what + ": got [" + got + "] want [" + want + "]")
+    return false
+}
+
+func main() {
+    var ok: bool = true
+    // ① 跨行 + 闭引号行缩进剥离
+    ok = check("func f() {\n    var s = \"\"\"\n    line one\n    line two\n    \"\"\"\n}\n",
+        "line one\nline two", "跨行+margin") && ok
+    // ② raw：`\n` 在 lexeme 层双写（后端反转义后为字面 backslash+n）
+    ok = check("func f() {\n    var s = \"\"\"\n    a\\nb\n    \"\"\"\n}\n",
+        "a\\\\nb", "raw 语义") && ok
+    // ③ 插值（首段）——样例中 `{` 用拼接构造，避免探针自身字符串被插值
+    ok = check("func f() {\n    var s = \"\"\"\n    hello " + "{" + "name}!\n    \"\"\"\n}\n",
+        "hello ", "插值段 1") && ok
+    // ④ 首行紧跟内容
+    ok = check("func f() {\n    var s = \"\"\"inline\ntail\n    \"\"\"\n}\n",
+        "inline\ntail", "首行紧跟") && ok
+    // ⑤ \{ 转义（`\{` 用拼接构造：`\\` 还原 `\`，`{` 后邻引号不触发探针自身插值）
+    ok = check("func f() {\n    var s = \"\"\"\n    \\{" + "name} literal\n    \"\"\"\n}\n",
+        "{" + "name} literal", "\\{ 转义") && ok
+    if ok {
+        println("lex probe ALL PASS")
+        exit(0)
+    }
+    exit(1)
+}

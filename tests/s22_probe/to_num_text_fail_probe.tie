@@ -1,0 +1,45 @@
+type tie<tsc>
+
+// to_i64(s) / to_f64(s) 的**解析失败**语义（规范 §2.11：解析失败触发内建检查）。
+// 内建检查与越界/除零同一失败语义：处于 catch_panic 捕获域 → 打印诊断 + longjmp
+// 回跳（进程不退出）；否则 exit(1)。本探针全部用 catch_panic 捕获，故 rc=0；
+// 未受捕的 exit(1) 路径由「无 catch 时运行 rc=1 且有诊断」手工复核。
+func main() -> i64 {
+    var ok: i64 = 0
+    // 1. 空串 / 仅符号 / 含非数字字节 / 空白 —— 一律失败
+    var f1 = func() -> i64 { return to_i64("") };
+    if catch_panic(f1) { ok = ok + 1 } else { println("F1 空串应失败") }
+    var f2 = func() -> i64 { return to_i64("-") };
+    if catch_panic(f2) { ok = ok + 1 } else { println("F2 仅符号应失败") }
+    var f3 = func() -> i64 { return to_i64("12x") };
+    if catch_panic(f3) { ok = ok + 1 } else { println("F3 尾随非数字应失败") }
+    var f4 = func() -> i64 { return to_i64(" 12") };
+    if catch_panic(f4) { ok = ok + 1 } else { println("F4 前导空白应失败") }
+    var f5 = func() -> f64 { return to_f64("1.2.3") };
+    if catch_panic(f5) { ok = ok + 1 } else { println("F5 双小数点应失败") }
+    var f6 = func() -> f64 { return to_f64("e5") };
+    if catch_panic(f6) { ok = ok + 1 } else { println("F6 缺尾数应失败") }
+    // 2. 捕获后状态不受影响：随后合法解析仍得到正确值
+    var after = to_i64("42")
+    if after == 42 { ok = ok + 1 } else { println("F7 after=" + to_string(after)) }
+    var g1 = func() -> f64 { return to_f64("2.5") };
+    if !catch_panic(g1) { ok = ok + 1 } else { println("F8 合法输入不应 panic") }
+    // 3. 十进制上界（规范 §2.11 的「解析失败」含溢出；此前静默回绕）
+    //    i64 max = 9223372036854775807、min = -9223372036854775808 必须能解析；
+    //    越界一位即失败（负侧上界比正侧多一位，判据不能只看正数）。
+    if to_i64("9223372036854775807") == 9223372036854775807 { ok = ok + 1 } else { println("F9 max") }
+    if to_i64("-9223372036854775808") == 0 - 9223372036854775807 - 1 { ok = ok + 1 } else { println("F10 min") }
+    var f11 = func() -> i64 { return to_i64("9223372036854775808") };
+    if catch_panic(f11) { ok = ok + 1 } else { println("F11 max+1 应失败") }
+    var f12 = func() -> i64 { return to_i64("-9223372036854775809") };
+    if catch_panic(f12) { ok = ok + 1 } else { println("F12 min-1 应失败") }
+    var f13 = func() -> i64 { return to_i64("99999999999999999999") };
+    if catch_panic(f13) { ok = ok + 1 } else { println("F13 20 位应失败") }
+    if ok == 13 {
+        println("VERDICT OK")
+        return 0
+    }
+    println("VERDICT FAIL ok=" + to_string(ok) + "/13")
+    exit(1)
+    return 0
+}

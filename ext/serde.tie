@@ -1,0 +1,101 @@
+type tie<class>
+// std/serde.tie —— L3 权重/checkpoint 序列化库 serde（命名空间 serde）
+// ============================================================
+// 用途：微型扩散定调器权重池 ↔ 文件 的存取，及含 step 元数据的 checkpoint 存取。
+// 纯 tie 实现，std 层；底层复用 buffer<u8>（buf）的字节缓冲与 byte_write/byte_read 底座。
+//
+// 【字节布局】
+//   save_weights:           连续 n 个 f32，每个为 4 字节小端 IEEE-754（buf.push_f32）。
+//   save_checkpoint:        前 8 字节为 i64 step（小端，buf.push_i64），随后紧跟 n 个
+//                            f32 权重（小端 4 字节）。读回按同一布局解析。
+//   全部 f32 由 f64→as_f32 一致写（buffer 内部即 f64→f32 位模式舍位）。
+// EN: f32 weights serialized as 4-byte little-endian IEEE-754; checkpoint = 8B little-endian
+// i64 step + weights. All through buf (byte_write/byte_read).
+
+import "/ext/buffer.tie";
+import "/std/fs.tie";
+
+namespace serde {
+
+// ---- 权重池 → 文件（仅 f32 权重，小端 4 字节）；成功返回 true ----
+// EN: write n f32 (little-endian) to file; true on success.
+pub func save_weights<CAP: i64 = 1024>(ws: ref array<f32, CAP>, n: i64, path: string) -> bool {
+    var b = buf.new()
+    var i: i64 = 0
+    while i < n {
+        b = buf.push_f32(b, to_f64(ws[i]))
+        i = i + 1
+    }
+    return buf.write_bytes(b, path)
+}
+
+// ---- 文件 → 权重池；返回实际读入元素数（min(n, 文件f32数)），不足补 0，无文件则 0 ----
+// EN: read f32 stream into pool; returns count read (pad zeros when file short).
+pub func load_weights<CAP: i64 = 1024>(me: ref array<f32, CAP>, n: i64, path: string) -> i64 {
+    var b = buf.load(path)
+    var avail = buf.length(b) / 4
+    var cnt = avail
+    if cnt > n {
+        cnt = n
+    }
+    if cnt < 0 {
+        cnt = 0
+    }
+    var i: i64 = 0
+    while i < cnt {
+        me[i] = to_f32(buf.f32_at(b, i * 4))
+        i = i + 1
+    }
+    var j: i64 = cnt
+    while j < n {
+        me[j] = 0.0
+        j = j + 1
+    }
+    return cnt
+}
+
+// ---- checkpoint 落盘：i64 step + n 个 f32 权重；成功返回 true ----
+// EN: write [i64 step][weights] ; true on success.
+pub func save_checkpoint<CAP: i64 = 1024>(step: i64, ws: ref array<f32, CAP>, n: i64, path: string) -> bool {
+    var b = buf.new()
+    b = buf.push_i64(b, step)
+    var i: i64 = 0
+    while i < n {
+        b = buf.push_f32(b, to_f64(ws[i]))
+        i = i + 1
+    }
+    return buf.write_bytes(b, path)
+}
+
+// ---- checkpoint 载入：读回 step，并把后续权重入池；损坏（不足 8 字节）返回 -1 ----
+// 返回值为 step（可 >0 或 0）；读取异常/文件过短（<8 字节）返回 -1 表示损坏/不可用。
+// EN: load checkpoint; returns step, or -1 when file is corrupt (<8 bytes).
+pub func load_checkpoint<CAP: i64 = 1024>(ws: ref array<f32, CAP>, n: i64, path: string) -> i64 {
+    var b = buf.load(path)
+    var total = buf.length(b)
+    if total < 8 {
+        return -1
+    }
+    var step = buf.i64_at(b, 0)
+    var avail = (total - 8) / 4
+    var cnt = avail
+    if cnt > n {
+        cnt = n
+    }
+    if cnt < 0 {
+        cnt = 0
+    }
+    var i: i64 = 0
+    while i < cnt {
+        ws[i] = to_f32(buf.f32_at(b, 8 + i * 4))
+        i = i + 1
+    }
+    var j: i64 = cnt
+    while j < n {
+        ws[j] = 0.0
+        j = j + 1
+    }
+    return step
+}
+
+}   // namespace serde

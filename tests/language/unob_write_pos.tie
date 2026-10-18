@@ -1,0 +1,55 @@
+type tie<logic>
+// ============================================================
+// 规范 §13.1「不可观测写入」正例：合法写回与安全模式全部放行。
+//   ref 形参写回 / move 形参自治 / 局部合并返回 / 全局表写入 / 只读访问。
+// 本文件应编译并运行成功（回归第 4 段：正例编译+运行）。
+// ============================================================
+var g_xs: table<i64> = []
+var g_bad: i64 = 0
+
+func chk(cond: bool, tag: string) {
+    if !cond {
+        g_bad = g_bad + 1
+        println("FAIL " + tag)
+    }
+}
+
+func fill_ref(ref t: table<i64>) {
+    table_push(t, 7)
+}
+func take(move t: table<i64>) -> i64 {
+    table_push(t, 9)
+    return len(t)
+}
+func merge(dst: table<i64>, src: table<i64>) -> table<i64> {
+    var m = dst
+    for x in src {
+        table_push(m, x)
+    }
+    return m
+}
+func add_global(v: i64) {
+    table_push(g_xs, v)
+}
+func size(t: table<i64>) -> i64 {
+    var s = 0
+    for x in t {
+        s = s + x
+    }
+    return s
+}
+
+func main() {
+    var a = table_new_i64()
+    fill_ref(a)
+    chk(len(a) == 1, "ref-fill")
+    var b: table<i64> = [2, 3]
+    var c = merge(b, [4])
+    chk(len(c) == 3, "merge")
+    add_global(5)
+    chk(len(g_xs) == 1, "global")
+    chk(take([1, 2]) == 3, "move")
+    chk(size([1, 2, 3]) == 6, "readonly")
+    chk(g_bad == 0, "no-fail")
+    println("unob_write_pos OK")
+}
