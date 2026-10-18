@@ -1,0 +1,70 @@
+type tie<logic, unsafe:mem, unsafe:ext>
+import "../../lib/jit/llvmc.tie"
+using tie.jit
+namespace tie.tool.tiej;
+// main.tie —— tiej 命令行入口（首个切片：LLVM 层自检）
+// ============================================================
+// 用法（仓根）：
+//   tiec tools/tiej/main.tie -o _local_only/bin/tiej.exe
+//   _local_only/bin/tiej.exe            # 自检
+//   _local_only/bin/tiej.exe --selftest # 同上
+// 后续批次：tiej run <file.tir>（tieir → 后端 → LLJIT）。
+// 解耦：不 import 编译器源码；LLVM 交互只经 lib/jit/llvmc.tie。
+
+var IR: string = "define i64 @jadd(i64 %a, i64 %b) {\nentry:\n  %r = add i64 %a, %b\n  ret i64 %r\n}\n"
+
+func chk(ok: bool, tag: string) -> bool {
+    if ok {
+        println("[PASS] " + tag)
+    } else {
+        println("[FAIL] " + tag)
+    }
+    return ok
+}
+
+func selftest() -> i64 {
+    if !chk(available(), "tiej_llvm.dll available") {
+        println("构建垫片：clang -shared -O2 lib/jit/tiej_llvm.c -I D:/LLVM/include -L D:/LLVM/lib -lLLVM-C -o _local_only/bin/tiej_llvm.dll")
+        return 1
+    }
+    var j = open()
+    if !chk(j != 0, "open") {
+        println("[jit] " + last_error())
+        return 1
+    }
+    var rc = add_ir(j, IR)
+    if rc != 0 {
+        println("[jit] " + last_error())
+    }
+    if !chk(rc == 0, "add_ir") {
+        close(j)
+        return 1
+    }
+    var a = lookup(j, "jadd")
+    if !chk(a != 0, "lookup jadd") {
+        close(j)
+        return 1
+    }
+    unsafe {
+        var r = dyn_call_p(a, 3, 4, 0, 0, 0)
+        chk(r == 7, "jadd(3,4) = " + to_string(r))
+    }
+    close(j)
+    println("tiej selftest: PASS")
+    return 0
+}
+
+func main() {
+    var n = arg_count()
+    if n > 1 {
+        var a = arg_string(1)
+        if a == "--selftest" {
+            selftest()
+            return
+        }
+        println("tiej 0.1.0 —— 尚未实现: " + a)
+        println("用法: tiej [--selftest]")
+        return
+    }
+    selftest()
+}
