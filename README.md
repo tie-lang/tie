@@ -21,12 +21,12 @@ tie 语言核心：库 + 薄工具的单主体仓。
 每个库只暴露 `pub` 面；文件首部用 `namespace <库名>;` 声明归属，导入写在它之前。
 工具只做装配，不复制库逻辑。
 
-## 当前切片
+## 当前能力
 
 `lib/ir` + `lib/backend` + `lib/jit` + `tools/tiej`：
 
 tieir（函数 / 参数 / add·sub·mul / ret）→ LLVM 文本 → LLJIT → 查符号 → 调用。
-`tests/jit_probe`（手写 `.ll`，P1 9/9）与 `tests/backend_probe`（模型 → 文本 → JIT，P2 9/9）。
+`tests/jit_probe`（手写 `.ll`）与 `tests/backend_probe`（模型 → 文本 → JIT）均全绿。
 
 ```bash
 # 1. LLVM-C 薄垫片（C ABI）
