@@ -1,0 +1,75 @@
+type tie<class>
+import "../ir/model.tie"
+namespace tie.backend;
+// llvm_text.tie —— tieir → LLVM IR 文本（v0）
+// ============================================================
+// 指令面：add / sub / mul / ret。操作数以数字或 '-' 开头视为字面量，
+// 否则视为寄存器（输出 %name）。v0 不做类型检查，类型由 tieir 侧保证。
+// 跨库引用一律写全名 `tie.ir::x`（点分命名空间 + :: 成员）。
+
+func is_lit(s: string) -> bool {
+    if len(s) == 0 {
+        return false
+    }
+    var c = str_char(s, 0)
+    if c == "-" {
+        return true
+    }
+    return c >= "0" && c <= "9"
+}
+
+func opnd(s: string) -> string {
+    if is_lit(s) {
+        return s
+    }
+    return "%" + s
+}
+
+func mnemonic(op: i64) -> string {
+    if op == tie.ir::OP_ADD {
+        return "add"
+    }
+    if op == tie.ir::OP_SUB {
+        return "sub"
+    }
+    if op == tie.ir::OP_MUL {
+        return "mul"
+    }
+    return "?"
+}
+
+pub func emit_module() -> string {
+    var sb = string_builder()
+    var f: i64 = 0
+    while f < tie.ir::func_count() {
+        var rty = tie.ir::func_ret(f)
+        var params: string = ""
+        var off = tie.ir::param_off(f)
+        var pn = tie.ir::param_count(f)
+        var k: i64 = 0
+        while k < pn {
+            if k > 0 {
+                params = params + ", "
+            }
+            params = params + tie.ir::param_ty(off + k) + " %" + tie.ir::param_name(off + k)
+            k = k + 1
+        }
+        sb_append(sb, "define " + rty + " @" + tie.ir::func_name(f) + "(" + params + ") {\nentry:\n")
+        var io = tie.ir::instr_off(f)
+        var n = tie.ir::instr_count(f)
+        var j: i64 = 0
+        while j < n {
+            var idx = io + j
+            var op = tie.ir::instr_op(idx)
+            if op == tie.ir::OP_RET {
+                sb_append(sb, "  ret " + rty + " " + opnd(tie.ir::instr_a(idx)) + "\n")
+            } else {
+                sb_append(sb, "  %" + tie.ir::instr_dst(idx) + " = " + mnemonic(op) + " " + tie.ir::instr_ty(idx) + " " + opnd(tie.ir::instr_a(idx)) + ", " + opnd(tie.ir::instr_b(idx)) + "\n")
+            }
+            j = j + 1
+        }
+        sb_append(sb, "}\n\n")
+        f = f + 1
+    }
+    return sb_build(sb)
+}

@@ -1,0 +1,98 @@
+type tie<logic, unsafe:mem, unsafe:ext>
+import "../lib/ir/model.tie"
+import "../lib/backend/llvm_text.tie"
+import "../lib/jit/llvmc.tie"
+namespace tie.tests.backend;
+// backend_probe.tie —— tieir → LLVM 文本 → LLJIT 的整条垂直切片
+// ============================================================
+// 运行（仓根）：
+//   tiec tests/backend_probe.tie -o _local_only/bin/backend_probe.exe
+//   _local_only/bin/backend_probe.exe
+// 前置：_local_only/bin/tiej_llvm.dll。
+
+var g_fail: i64 = 0
+
+func chk(ok: bool, tag: string) {
+    if ok {
+        println("[PASS] " + tag)
+    } else {
+        println("[FAIL] " + tag)
+        g_fail = g_fail + 1
+    }
+}
+
+func build_add() {
+    tie.ir::reset()
+    var f = tie.ir::new_func("jadd", "i64")
+    tie.ir::add_param(f, "a", "i64")
+    tie.ir::add_param(f, "b", "i64")
+    tie.ir::add(f, "r", "a", "b", "i64")
+    tie.ir::ret_val(f, "r")
+}
+
+func build_mul() {
+    tie.ir::reset()
+    var f = tie.ir::new_func("jmul", "i64")
+    tie.ir::add_param(f, "a", "i64")
+    tie.ir::add_param(f, "b", "i64")
+    tie.ir::mul(f, "r", "a", "b", "i64")
+    tie.ir::ret_val(f, "r")
+}
+
+func main() {
+    build_add()
+    chk(tie.ir::func_count() == 1, "func_count = 1")
+    var ll = tie.backend::emit_module()
+    println("--- LLVM IR ---")
+    println(ll)
+    chk(tie.jit::available(), "tiej_llvm.dll available")
+    if !tie.jit::available() {
+        return
+    }
+    var j = tie.jit::open()
+    chk(j != 0, "jit open")
+    if j == 0 {
+        println("[jit] " + tie.jit::last_error())
+        return
+    }
+    var rc = tie.jit::add_ir(j, ll)
+    if rc != 0 {
+        println("[jit] " + tie.jit::last_error())
+    }
+    chk(rc == 0, "add_ir")
+    var a = tie.jit::lookup(j, "jadd")
+    chk(a != 0, "lookup jadd")
+    if a != 0 {
+        unsafe {
+            var r = dyn_call_p(a, 3, 4, 0, 0, 0)
+            chk(r == 7, "jadd(3,4) = " + to_string(r))
+            var r2 = dyn_call_p(a, 0 - 5, 5, 0, 0, 0)
+            chk(r2 == 0, "jadd(-5,5) = " + to_string(r2))
+        }
+    }
+    tie.jit::close(j)
+
+    build_mul()
+    var ll2 = tie.backend::emit_module()
+    var j2 = tie.jit::open()
+    var rc2 = tie.jit::add_ir(j2, ll2)
+    if rc2 != 0 {
+        println("[jit] " + tie.jit::last_error())
+    }
+    chk(rc2 == 0, "add_ir (mul)")
+    var m = tie.jit::lookup(j2, "jmul")
+    chk(m != 0, "lookup jmul")
+    if m != 0 {
+        unsafe {
+            var r3 = dyn_call_p(m, 6, 7, 0, 0, 0)
+            chk(r3 == 42, "jmul(6,7) = " + to_string(r3))
+        }
+    }
+    tie.jit::close(j2)
+
+    if g_fail == 0 {
+        println("P2 ALL:PASS")
+    } else {
+        println("P2 FAIL:" + to_string(g_fail))
+    }
+}

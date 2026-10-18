@@ -1,17 +1,15 @@
 type tie<logic, unsafe:mem, unsafe:ext>
+import "../../lib/ir/model.tie"
+import "../../lib/backend/llvm_text.tie"
 import "../../lib/jit/llvmc.tie"
-using tie.jit
 namespace tie.tool.tiej;
-// main.tie —— tiej 命令行入口（首个切片：LLVM 层自检）
+// main.tie —— tiej 命令行入口（当前切片：tieir → LLVM → LLJIT 自检）
 // ============================================================
 // 用法（仓根）：
 //   tiec tools/tiej/main.tie -o _local_only/bin/tiej.exe
 //   _local_only/bin/tiej.exe            # 自检
 //   _local_only/bin/tiej.exe --selftest # 同上
-// 后续批次：tiej run <file.tir>（tieir → 后端 → LLJIT）。
-// 解耦：不 import 编译器源码；LLVM 交互只经 lib/jit/llvmc.tie。
-
-var IR: string = "define i64 @jadd(i64 %a, i64 %b) {\nentry:\n  %r = add i64 %a, %b\n  ret i64 %r\n}\n"
+// 后续批次：tiej run <file.tir>（tieir 文件加载 + 后端 + 执行）。
 
 func chk(ok: bool, tag: string) -> bool {
     if ok {
@@ -22,34 +20,45 @@ func chk(ok: bool, tag: string) -> bool {
     return ok
 }
 
+func build_add() {
+    tie.ir::reset()
+    var f = tie.ir::new_func("jadd", "i64")
+    tie.ir::add_param(f, "a", "i64")
+    tie.ir::add_param(f, "b", "i64")
+    tie.ir::add(f, "r", "a", "b", "i64")
+    tie.ir::ret_val(f, "r")
+}
+
 func selftest() -> i64 {
-    if !chk(available(), "tiej_llvm.dll available") {
+    build_add()
+    var ll = tie.backend::emit_module()
+    if !chk(tie.jit::available(), "tiej_llvm.dll available") {
         println("构建垫片：clang -shared -O2 lib/jit/tiej_llvm.c -I D:/LLVM/include -L D:/LLVM/lib -lLLVM-C -o _local_only/bin/tiej_llvm.dll")
         return 1
     }
-    var j = open()
+    var j = tie.jit::open()
     if !chk(j != 0, "open") {
-        println("[jit] " + last_error())
+        println("[jit] " + tie.jit::last_error())
         return 1
     }
-    var rc = add_ir(j, IR)
+    var rc = tie.jit::add_ir(j, ll)
     if rc != 0 {
-        println("[jit] " + last_error())
+        println("[jit] " + tie.jit::last_error())
     }
     if !chk(rc == 0, "add_ir") {
-        close(j)
+        tie.jit::close(j)
         return 1
     }
-    var a = lookup(j, "jadd")
+    var a = tie.jit::lookup(j, "jadd")
     if !chk(a != 0, "lookup jadd") {
-        close(j)
+        tie.jit::close(j)
         return 1
     }
     unsafe {
         var r = dyn_call_p(a, 3, 4, 0, 0, 0)
         chk(r == 7, "jadd(3,4) = " + to_string(r))
     }
-    close(j)
+    tie.jit::close(j)
     println("tiej selftest: PASS")
     return 0
 }

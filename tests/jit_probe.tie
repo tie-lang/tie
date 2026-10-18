@@ -1,6 +1,5 @@
 type tie<logic, unsafe:mem, unsafe:ext>
 import "../lib/jit/llvmc.tie"
-using tie.jit
 namespace tie.tests.jit;
 // jit_probe.tie —— LLVM 层第一档（纯函数）：手写 .ll → LLJIT → 查符号 → 调用
 // ============================================================
@@ -23,22 +22,22 @@ func chk(ok: bool, tag: string) {
 }
 
 func main() {
-    chk(available(), "tiej_llvm.dll available")
-    if !available() {
+    chk(tie.jit::available(), "tiej_llvm.dll available")
+    if !tie.jit::available() {
         return
     }
-    var j = open()
+    var j = tie.jit::open()
     chk(j != 0, "open")
     if j == 0 {
-        println("[jit] " + last_error())
+        println("[jit] " + tie.jit::last_error())
         return
     }
-    var rc = add_ir(j, IR)
+    var rc = tie.jit::add_ir(j, IR)
     if rc != 0 {
-        println("[jit] " + last_error())
+        println("[jit] " + tie.jit::last_error())
     }
     chk(rc == 0, "add_ir")
-    var a = lookup(j, "jadd")
+    var a = tie.jit::lookup(j, "jadd")
     chk(a != 0, "lookup jadd")
     if a != 0 {
         unsafe {
@@ -48,7 +47,7 @@ func main() {
             chk(r2 == 0, "jadd(-5,5) = " + to_string(r2))
         }
     }
-    var m = lookup(j, "jmul")
+    var m = tie.jit::lookup(j, "jmul")
     chk(m != 0, "lookup jmul")
     if m != 0 {
         unsafe {
@@ -56,7 +55,7 @@ func main() {
             chk(r3 == 42, "jmul(6,7) = " + to_string(r3))
         }
     }
-    close(j)
+    tie.jit::close(j)
     if g_fail == 0 {
         println("P1 ALL:PASS")
     } else {

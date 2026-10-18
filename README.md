@@ -23,7 +23,10 @@ tie 语言核心：库 + 薄工具的单主体仓。
 
 ## 当前切片
 
-`lib/jit` + `tools/tiej`：手写 `.ll` → LLJIT → 查符号 → 调用（P1）。
+`lib/ir` + `lib/backend` + `lib/jit` + `tools/tiej`：
+
+tieir（函数 / 参数 / add·sub·mul / ret）→ LLVM 文本 → LLJIT → 查符号 → 调用。
+`tests/jit_probe`（手写 `.ll`，P1 9/9）与 `tests/backend_probe`（模型 → 文本 → JIT，P2 9/9）。
 
 ```bash
 # 1. LLVM-C 薄垫片（C ABI）
@@ -31,13 +34,13 @@ clang -shared -O2 lib/jit/tiej_llvm.c \
       -I D:/LLVM/include -L D:/LLVM/lib -lLLVM-C \
       -o _local_only/bin/tiej_llvm.dll
 
-# 2. JIT 驱动
+# 2. JIT 驱动（tieir → backend → JIT 自检）
 ../tiec/compiler/tiec.exe tools/tiej/main.tie -o _local_only/bin/tiej.exe --no-warn
 _local_only/bin/tiej.exe
 
 # 3. 探针
-../tiec/compiler/tiec.exe tests/jit_probe.tie -o _local_only/bin/jit_probe.exe --no-warn
-_local_only/bin/jit_probe.exe
+../tiec/compiler/tiec.exe tests/backend_probe.tie -o _local_only/bin/backend_probe.exe --no-warn
+_local_only/bin/backend_probe.exe
 ```
 
 ## 许可
