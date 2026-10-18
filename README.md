@@ -29,22 +29,25 @@ tie 语言核心：编译器、标准库、运行时与薄工具的单主体仓�
 
 ```bash
 export TIE_LIB_ROOT=$PWD
-export TIE_TRM_LITE_LIB=<trm-lite>/target/trm_lite.a
 
 # 0. 引导：用 stage0 编译仓内编译器源码
 <stage0>/tiec.exe tools/tiec/src/driver.tie -l2 -t0 --no-warn --no-cache \
       -o _local_only/bin/tiec.exe
 
-# 1. LLVM-C 薄垫片（C ABI）
+# 1. 运行时（编译器链接用）
+_local_only/bin/tiec.exe lib/rt/src/runtime/tl_runtime.tie -o lib/rt/trm_lite.a --no-warn
+export TIE_TRM_LITE_LIB=$PWD/lib/rt/trm_lite.a
+
+# 2. LLVM-C 薄垫片（C ABI）
 clang -shared -O2 lib/jit/tiej_llvm.c \
       -I D:/LLVM/include -L D:/LLVM/lib -lLLVM-C \
       -o _local_only/bin/tiej_llvm.dll
 
-# 2. JIT 驱动
+# 3. JIT 驱动
 _local_only/bin/tiec.exe tools/tiej/main.tie -o _local_only/bin/tiej.exe --no-warn
 _local_only/bin/tiej.exe
 
-# 3. 语言层探针
+# 4. 语言层探针
 _local_only/bin/tiec.exe tests/backend_probe.tie -o _local_only/bin/backend_probe.exe --no-warn
 _local_only/bin/backend_probe.exe
 ```

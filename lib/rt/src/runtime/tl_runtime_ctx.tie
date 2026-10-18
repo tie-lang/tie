@@ -1,0 +1,170 @@
+type tie<class>
+// src/runtime/tl_runtime_ctx.tie —— trm-lite 复杂形态汇总库（p.6.5.1 外壳 / p.6.5.2 work-stealing）
+// 复杂形态 = Go 式静态内置 runtime：用户 import 本库（相对路径指向 trm-lite
+// 仓库）即选择复杂形态（import 即选择）；tiec 编译期拒绝与简单形态内置混用
+//（spawn/yield/collect × 复杂形态汇总 → 明确报错）。
+// 独立命名空间 tl_runtime_ctx：把复杂执行层（trm_lite_ws 调度 / trm_lite_tgc GC）
+// 收敛为语言层入口 ctx_spawn/ctx_drain/ctx_collect，用户零配置使用。
+// p.6.5.2：ctx_drain 升级为并行 run（work-stealing：多 OS 线程池 + 双端队列 +
+// 任务窃取 + M:N）；ctx_set_workers/ctx_stolen/ctx_completed 供控制与验收。
+// 后续切片同文件不拆 API、只换执行层实现（p.6.5.3 并发三色 / p.6.5.7 channel）。
+import "../../src/mnn/sched_ws.tie"
+import "../../src/mnn/wg.tie"
+import "../../src/gc/gc_tri.tie"
+import "../../src/chan/tl_chan.tie"
+
+namespace tl_runtime_ctx {
+
+pub func ctx_version() -> string {
+    return "0.3.0"
+}
+
+// 复杂形态运行时惰性初始化（幂等）。
+pub func ctx_ensure() {
+    trm_lite_ws.ensure_state()
+    trm_lite_tgc.ensure()
+}
+
+// 设置调度池大小（须在首个 drain 前设置；仅影响后续轮）。
+pub func ctx_set_workers(m: i64) {
+    trm_lite_ws.set_workers(m)
+}
+pub func ctx_workers() -> i64 {
+    return trm_lite_ws.workers()
+}
+
+// 入队一个函数值执行体（含捕获闭包；任务内在再 spawn 安全）。返回任务序号。
+pub func ctx_spawn(f: fn() -> i64) -> i64 {
+    return trm_lite_ws.spawn(f)
+}
+
+// 未完成任务数（排队 + 运行中）。
+pub func ctx_queued() -> i64 {
+    return trm_lite_ws.queued_count()
+}
+
+// 并行 run（work-stealing）：起 P worker 并发执行全部就绪任务（含任务内
+// 再 spawn 的子任务），全部完成后回收池。返回本轮执行任务数。
+pub func ctx_drain() -> i64 {
+    return trm_lite_ws.drain()
+}
+
+// 回收：并发三色 GC 已回收对象总数（跨轮累计，p.6.5.3）。
+// minor（后台/同步）与 major 回收都计入——后台回收器随 drain 与 worker 真并发
+// 推进；sweep 在无任务窗口执行。
+pub func ctx_collect() -> i64 {
+    return trm_lite_tgc.freed_total() + trm_lite_tgc.minor_freed_total()
+}
+
+// GC 观察量（探针断言）
+pub func ctx_live_objs() -> i64 {
+    return trm_lite_tgc.live_count()
+}
+pub func ctx_gc_steps() -> i64 {
+    return trm_lite_tgc.steps_total()
+}
+pub func ctx_gc_rounds() -> i64 {
+    return trm_lite_tgc.sweep_rounds()
+}
+// p.6.5.4 分代观察量
+pub func ctx_minor_runs() -> i64 {
+    return trm_lite_tgc.minor_runs()
+}
+pub func ctx_major_runs() -> i64 {
+    return trm_lite_tgc.major_runs()
+}
+pub func ctx_minor_freed() -> i64 {
+    return trm_lite_tgc.minor_freed_total()
+}
+pub func ctx_compacted() -> i64 {
+    return trm_lite_tgc.compacted_total()
+}
+// 触发同步 minor / major（探针直控代际回收）
+pub func ctx_gc_minor() -> i64 {
+    return trm_lite_tgc.gc_minor_sync()
+}
+pub func ctx_gc_major() -> i64 {
+    return trm_lite_tgc.gc_collect_sync()
+}
+// 最近一次 major 整理的 old→new 映射（-1=已回收）
+pub func ctx_remapped(old: i64) -> i64 {
+    return trm_lite_tgc.remapped(old)
+}
+pub func ctx_obj_alive(id: i64) -> bool {
+    return trm_lite_tgc.obj_alive(id)
+}
+pub func ctx_obj_age(id: i64) -> i64 {
+    return trm_lite_tgc.obj_age(id)
+}
+
+// 观察量（验收断言）
+pub func ctx_stolen() -> i64 {
+    return trm_lite_ws.stolen_count()
+}
+pub func ctx_completed() -> i64 {
+    return trm_lite_ws.completed_count()
+}
+// p.6.5.5 可迁移栈观察量：迁移计数 + 任务注册表执行 worker（id=regid）
+pub func ctx_migrated() -> i64 {
+    return trm_lite_ws.migrated_count()
+}
+pub func ctx_task_exec_w(id: i64) -> i64 {
+    return trm_lite_ws.exec_worker(id)
+}
+// p.6.7.8 常驻池观察量：线程句柄表长度（多轮 drain 恒定，不随轮数增长）
+pub func ctx_pool_threads() -> i64 {
+    return trm_lite_ws.thread_count()
+}
+// p.6.7.10 协作抢占：显式让出点（不等待；任务体可调用，worker 在调度点让出 pop）
+pub func ctx_gosched() {
+    trm_lite_ws.gosched()
+}
+// 进程收尾清理（探针退出前调用）
+pub func ctx_shutdown() {
+    trm_lite_ws.shutdown()
+    trm_lite_chan.shutdown()
+}
+
+// ---------- channel 语言入口（p.6.5.7：mailbox 承载）----------
+// 复杂形态下 ch_* 与内置原语是替代路径：tiec 内置 ch_send/ch_recv/ch_close
+// 直接链接 trm_lite.a 同名符号；import 本库后可用 ctx_ch_open/ctx_ch_send 等。
+pub func ctx_ch_open() -> i64 {
+    return trm_lite_chan.ch_open()
+}
+pub func ctx_ch_send(ch: i64, v: i64) -> i64 {
+    return trm_lite_chan.ch_send(ch, v)
+}
+pub func ctx_ch_recv(ch: i64) -> i64 {
+    return trm_lite_chan.ch_recv(ch)
+}
+pub func ctx_ch_close(ch: i64) {
+    trm_lite_chan.ch_close(ch)
+}
+pub func ctx_ch_len(ch: i64) -> i64 {
+    return trm_lite_chan.ch_len(ch)
+}
+pub func ctx_ch_count() -> i64 {
+    return trm_lite_chan.ch_count()
+}
+// p.6.7.12 多路收发：ch_select(handles, actions, values) -> i64（命中分支下标/-1）
+pub func ctx_ch_select(hp: i64, ap: i64, vp: i64) -> i64 {
+    return trm_lite_chan.ch_select(hp, ap, vp)
+}
+
+// ---------- WaitGroup 语言入口（p.6.7.11：Go sync.WaitGroup 语义） ----------
+pub func ctx_wg_new() -> i64 {
+    return trm_lite_wg.wg_new()
+}
+pub func ctx_wg_add(h: i64, n: i64) {
+    trm_lite_wg.wg_add(h, n)
+}
+pub func ctx_wg_done(h: i64) {
+    trm_lite_wg.wg_done(h)
+}
+pub func ctx_wg_wait(h: i64) {
+    trm_lite_wg.wg_wait(h)
+}
+pub func ctx_wg_count(h: i64) -> i64 {
+    return trm_lite_wg.wg_count(h)
+}
+}

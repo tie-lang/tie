@@ -1,0 +1,752 @@
+type tie<class, unsafe:mem>
+// core/tbl/tl_tbl.tie —— trm-lite 字节层表容器（命名空间 tl_tbl）。
+// ============================================================
+// 供 tiec 表运行时内置（table<T>）**静态链接**：容器 = 48 字节句柄
+//   {cap@0, len@8, data@16, esz@24, lock@32, refcount@40}（cap/len/esz/refcount
+//   为 i64，data 为原始字节缓冲指针，lock 为 kernel32 CRITICAL_SECTION 缓冲指针，
+//   均以 i64 承载）。tiec 以 extern 符号调用 tl_tbl$tbl_*。
+// 纯 unsafe/ptr 裸内存实现（**零 table<T> 依赖**）——保证 trm_lite.a 可被
+// 任意表 codegen 的 tiec 重建而无自引用环（tbl_at 若用 table<i64> 记账会
+// 在「新表 codegen」下自调自身形成无限递归）。
+// 用户程序无需 import 本库——tiec 检测到表内置时自动链接。
+// 扩容语义对齐编译器旧内联 s21_table_grow：newcap = cap==0 ? max(8,need)
+//   : max(cap+cap/2, need)；新缓冲 alloc(newcap*esz) + memcpy 旧 len*esz 字节。
+// p.6.7.2 并发安全：句柄携带每表锁（kernel32 CS，本文件自持单一声明源，
+//   不 import tl_sync——tl_sync 会被复杂形态内联进调用方，tl_tbl 再 import 会
+//   使 tl_runtime.o 捆绑 tl_sync$* 与内联方链接期多重定义；自持后 tl_tbl.o
+//   仅含 tl_tbl$*，可被任意形态按需提取）；
+//   `tbl_push` 单步锁内完成 len/ensure/memcpy/set_len（表追加的并发竞态根治，
+//   对齐 Go「容器并发不安全，append 由运行时锁保护」）；tbl_at/tbl_set 持锁
+//   防与扩容 realloc 并发；tbl_ensure 保留（编译器编译期路径，同线程）。
+// p.6.10.2 引用计数：句柄 @40 refcount——tbl_new 置 1；tbl_retain 增（拷贝句柄
+//   到新槽）；tbl_release 减（归零 → free data+lock+句柄）。编译器在表变量
+//   赋值/返回/作用域出口插桩 retain/release，使表内存可回收（tie 无自动回收）。
+
+// p.6.7.2：锁原语自持 kernel32 extern（不 import tl_sync）——tl_sync 会被
+// 复杂形态（sched_ws/chan）内联进调用方，若 tl_tbl 再 import，tl_runtime.o
+// 将捆绑 tl_sync$* 与内联方链接期多重定义；自持后 tl_tbl.o 仅含 tl_tbl$*，
+// 可被任意形态程序按需提取而不撞符号。x64 ABI：CS 缓冲地址以 i64 传。
+// p.6.7.6：extern 声明改为共用 tl_k32 纯声明源（同单元不重名；不产生符号）。
+import "../mnn/tl_k32.tie"
+
+// r.1.1.4 深表标记：esz 高比特位（bit 62；bit 63 已被 map 哈希模式占用）。
+// 深表 = 元素为表句柄（table<T> 嵌套表，元素宽 8）——tbl_release 对深表
+// 逐元素释放（元素自身是表，递归处理嵌套深度）；元素为标量/字符串/any 盒的
+// 普通表保持既有行为（数据缓冲整体释放，不逐元素）。标记随元素宽存 esz 字段，
+// 分配/拷贝尺寸一律按掩码后的纯 esz 计算。
+const TBL_DEEP: i64 = 4611686018427387904   // 1 << 62
+const TBL_MASK: i64 = 4611686018427387903   // 掩掉 bit62 保留低位尺寸
+
+namespace tl_tbl {
+
+// ---------- 句柄 i64 字段逐字节读写 ----------
+// deref/deref_write 对 ptr<u8> 是单字节存取，i64 字段须 8 字节组装。
+unsafe fn w_i64(p: ptr<u8>, off: i64, v: i64) {
+    var k: i64 = 0
+    while k < 8 {
+        deref_write(int_to_ptr(ptr_to_int(p) + off + k), (v >> (k * 8)) & 255)
+        k = k + 1
+    }
+}
+
+unsafe fn r_i64(p: ptr<u8>, off: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        var b = deref(int_to_ptr(ptr_to_int(p) + off + k))
+        v = v | (b << (k * 8))
+        k = k + 1
+    }
+    return v
+}
+
+// 每表锁：句柄 @32 存 CRITICAL_SECTION 缓冲地址（tbl_new 时 alloc+init）。
+// 自持 extern 后 tl_tbl.o 仅含 tl_tbl$*，任意形态程序按需提取不撞符号。
+unsafe fn lock_of(h: i64) -> i64 {
+    return r_i64(int_to_ptr(h), 32)
+}
+unsafe fn lock_enter(h: i64) {
+    unsafe {
+        EnterCriticalSection(lock_of(h));
+    }
+}
+unsafe fn lock_leave(h: i64) {
+    unsafe {
+        LeaveCriticalSection(lock_of(h));
+    }
+}
+
+// 建空表：esz = 元素字节大小。返回句柄（i64 = 48 字节块指针）。
+pub unsafe fn tbl_new(esz: i64) -> i64 {
+    var h = alloc(48)
+    w_i64(h, 0, 0)     // cap = 0
+    w_i64(h, 8, 0)     // len = 0
+    w_i64(h, 16, 0)    // data = null
+    w_i64(h, 24, esz)  // esz = 元素字节大小
+    w_i64(h, 40, 1)    // refcount = 1（新建表由创建者持有）
+    var lk = alloc(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk));
+    }
+    w_i64(h, 32, ptr_to_int(lk))   // lock = CS 缓冲地址
+    return ptr_to_int(h)
+}
+
+// r.1.1.4 建深表：元素为表句柄（table<T> 嵌套表，元素宽 8）——tbl_release
+// 释放时逐元素释放内层表。esz 字段写入深表标记位（分配尺寸按掩码后计算）。
+pub unsafe fn tbl_new_deep(esz: i64) -> i64 {
+    var hp = alloc(48)
+    w_i64(hp, 0, 0)
+    w_i64(hp, 8, 0)
+    w_i64(hp, 16, 0)
+    w_i64(hp, 24, esz | TBL_DEEP)
+    w_i64(hp, 40, 1)
+    var lk = alloc(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk));
+    }
+    w_i64(hp, 32, ptr_to_int(lk))
+    return ptr_to_int(hp)
+}
+
+// 引用计数 +1：句柄被拷贝到新槽（变量赋值/参数传递/返回值接管）时调用。
+pub unsafe fn tbl_retain(h: i64) {
+    var p = int_to_ptr(h)
+    var rc = r_i64(p, 40)
+    w_i64(p, 40, rc + 1)
+}
+
+// 引用计数 -1：归零则释放表内存（深表先逐元素释放内层表句柄，再释放
+// data 缓冲 + lock CS + 句柄块）。空句柄（0/null 槽未初始化）安全跳过——
+// 编译器插桩的旧值释放前无需判空。释放前不再加锁（归零 = 唯一所有权已断，
+// 无并发读者；并发场景由调用方保证同一句柄的最后 release 不再被其它线程
+// 使用——与 Go 容器并发不安全同纪律）。
+pub unsafe fn tbl_release(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    var p = int_to_ptr(h)
+    var rc = r_i64(p, 40)
+    if rc <= 1 {
+        // r.1.1.4：深表逐元素释放——元素为 8 字节表句柄，递归释放（嵌套深度
+        // 任意层）；元素表由容器 release 与各自引用方 release 守恒（push 时
+        // 瞬态值已转移所有权 / 别名值已 retain）。
+        var esz = r_i64(p, 24)
+        if (esz & TBL_DEEP) != 0 {
+            var n = r_i64(p, 8)
+            var data = r_i64(p, 16)
+            var i: i64 = 0
+            while i < n {
+                var eh = r_i64(int_to_ptr(data + i * 8), 0)
+                if eh != 0 {
+                    tbl_release(eh)
+                }
+                i = i + 1
+            }
+        }
+        var data = r_i64(p, 16)
+        if data != 0 {
+            free(int_to_ptr(data))
+        }
+        var lk = r_i64(p, 32)
+        if lk != 0 {
+            unsafe {
+                DeleteCriticalSection(lk);
+            }
+            free(int_to_ptr(lk))
+        }
+        free(p)
+        return 0
+    }
+    w_i64(p, 40, rc - 1)
+    return rc - 1
+}
+
+// 表长度：len(t) = [h+8]（无锁读；并发 push 场景下 len 由 tbl_push 锁内提交）。
+pub unsafe fn tbl_len(h: i64) -> i64 {
+    return r_i64(int_to_ptr(h), 8)
+}
+
+// 元素字节大小（容器内部 at/set/ensure 用；tiec 侧用编译期尺寸）。
+pub unsafe fn tbl_esz(h: i64) -> i64 {
+    return r_i64(int_to_ptr(h), 24)
+}
+
+// 扩容核心（调用方**已持锁**，且把 cap/len/data/esz 读入并传入）：need > cap 时
+// 增长（cap=0→8，否则 1.5x，至少 need），返回新 data（i64）；缓冲可能换址。
+// **不重读句柄字段**——句柄字段走 r_i64 = 8 次逐字节读，热路径上重复读纯属浪费。
+// r.1.6.6：原 ensure_locked 内部重读 cap/len/data/esz（32 次字节访问），而
+// tbl_push 每元素调一次 → 冗余显著；抽出参数化版本供 push/append/reserve 复用。
+unsafe fn grow(p: ptr<u8>, cap: i64, len: i64, data: i64, esz: i64, need: i64) -> i64 {
+    if need <= cap {
+        return data
+    }
+    var newcap: i64 = 8
+    if cap > 0 {
+        newcap = cap + cap / 2
+    }
+    if newcap < need {
+        newcap = need
+    }
+    var nd = alloc(newcap * esz)
+    if data != 0 {
+        memcpy(nd, int_to_ptr(data), len * esz)   // nd 已是 ptr；data 为 i64
+        free(int_to_ptr(data))
+    }
+    w_i64(p, 16, ptr_to_int(nd))
+    w_i64(p, 0, newcap)
+    return ptr_to_int(nd)
+}
+
+// 扩容（调用方已持锁）：读字段后委托 grow。保留给 tbl_ensure 等非热路径。
+unsafe fn ensure_locked(h: i64, need: i64) -> i64 {
+    var p = int_to_ptr(h)
+    return grow(p, r_i64(p, 0), r_i64(p, 8), r_i64(p, 16), r_i64(p, 24) & TBL_MASK, need)
+}
+
+// 公共扩容：持锁调用 ensure_locked（编译器编译期路径；对用户并发路径安全）。
+pub unsafe fn tbl_ensure(h: i64, need: i64) -> i64 {
+    lock_enter(h)
+    var d = ensure_locked(h, need)
+    lock_leave(h)
+    return d
+}
+
+// 提交新长度（push 后调用）。公共路径持锁；tbl_push 锁内直写。
+pub unsafe fn tbl_set_len(h: i64, n: i64) {
+    lock_enter(h)
+    w_i64(int_to_ptr(h), 8, n)
+    lock_leave(h)
+}
+
+// 表追加（单步原子，p.6.7.2）：len/ensure/memcpy/set_len 全程持锁——多线程并发
+// push 不会互相覆盖/丢元素。src = 元素字节指针（esz 字节）。
+// r.1.6.6 热路径优化：锁地址**只读一次**（原 lock_enter + lock_leave 各调一次
+// lock_of = 每次 push 白读 16 次字节）；扩容改用已读字段调 grow，不再重读句柄。
+// **并发语义完全不变**——同一临界区、同一 len 提交、同一扩容规则。
+pub unsafe fn tbl_push(h: i64, src: i64) {
+    var p = int_to_ptr(h)
+    var lk = r_i64(p, 32)
+    unsafe {
+        EnterCriticalSection(lk);
+    }
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK   // 掩掉深表标记位（拷贝宽度用纯 esz）
+    var need = len + 1
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), esz)
+    w_i64(p, 8, need)
+    unsafe {
+        LeaveCriticalSection(lk);
+    }
+}
+
+// 批量追加（r.1.6.6）：**一次锁内**追加 n 个元素——src 为连续 n 个元素（n*esz 字节），
+// 元素宽度取容器 esz。语义与「连续调用 n 次 tbl_push」**完全等价**（同一临界区、
+// 同一顺序、同一扩容规则、同一 len 提交），但把 N 次加锁粗化为 1 次，并省去 N-1 次
+// 字段重读。这是**不改变任何并发语义**的优化路径：原语层只是把 N 次操作放进同一个
+// 临界区。返回追加后的新长度。
+pub unsafe fn tbl_append_nl(h: i64, src: i64, n: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    if n <= 0 {
+        return len
+    }
+    var esz = r_i64(p, 24) & TBL_MASK
+    var need = len + n
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), n * esz)
+    w_i64(p, 8, need)
+    return need
+}
+
+pub unsafe fn tbl_append(h: i64, src: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return r_i64(int_to_ptr(h), 8)
+    }
+    var p = int_to_ptr(h)
+    var lk = r_i64(p, 32)
+    unsafe {
+        EnterCriticalSection(lk);
+    }
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var need = len + n
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), n * esz)
+    w_i64(p, 8, need)
+    unsafe {
+        LeaveCriticalSection(lk);
+    }
+    return need
+}
+
+// 预留容量（r.1.6.6）：一次锁内把 cap 提到至少 need（不改变 len）。批量构造前
+// 调用可避免中途多次 realloc（配合 tbl_append 构成「一次分配 + 一次锁」的批量路径）。
+pub unsafe fn tbl_reserve(h: i64, need: i64) {
+    var p = int_to_ptr(h)
+    var lk = r_i64(p, 32)
+    unsafe {
+        EnterCriticalSection(lk);
+    }
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var d = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    unsafe {
+        LeaveCriticalSection(lk);
+    }
+}
+
+// 表下标读：越界 → 写零 out（esz 字节）返回 0；否则拷 data+i*esz → out 返回 1。
+// 持锁（防与并发扩容 realloc 冲突）。r.1.6.6：锁地址只读一次。
+pub unsafe fn tbl_at(h: i64, i: i64, out: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var lk = r_i64(p, 32)
+    unsafe {
+        EnterCriticalSection(lk);
+    }
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK   // 掩掉深表标记位
+    var data = r_i64(p, 16)
+    var ok: i64 = 0
+    if i < len {
+        memcpy(int_to_ptr(out), int_to_ptr(data + i * esz), esz)
+        ok = 1
+    } else {
+        memset(int_to_ptr(out), 0, esz)
+    }
+    unsafe {
+        LeaveCriticalSection(lk);
+    }
+    return ok
+}
+
+// 表下标写：越界静默返回 0；否则拷 src → data+i*esz 返回 1。持锁。
+// r.1.6.6：锁地址只读一次。
+pub unsafe fn tbl_set(h: i64, i: i64, src: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var lk = r_i64(p, 32)
+    unsafe {
+        EnterCriticalSection(lk);
+    }
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK   // 掩掉深表标记位
+    var data = r_i64(p, 16)
+    var ok: i64 = 0
+    if i < len {
+        memcpy(int_to_ptr(data + i * esz), int_to_ptr(src), esz)
+        ok = 1
+    }
+    unsafe {
+        LeaveCriticalSection(lk);
+    }
+    return ok
+}
+
+
+// ==================== 免锁入口（r.1.6.7，仅供编译器静态证明独占时使用） ====================
+// **调用方契约**：仅当 tiec 的**编译期独占分析**（`compiler/backend/irgen_esc.tie`）
+// 证得「该表句柄在整个访问点上从未离开本次函数调用」——即该表不可能是全局变量、
+// 函数参数、被闭包捕获、被存入别的容器或被返回——才可调用本组入口。此时全程序
+// 只有当前执行流持有该句柄，**不存在并发访问者**，故跳过每表 CRITICAL_SECTION。
+//
+// 为什么必须是**编译期**证明而不是运行期标志：运行期「未逃逸」标志（esc@48）已被
+// 实测证伪——表可经全局变量/堆槽被多线程共享而**不触发任何 retain**，标志恒为
+// 「未逃逸」⇒ 漏锁 ⇒ 真实数据竞争。见 `compiler/backend/irgen_esc.tie` 头注释与
+// trm-lite `docs/2026-09-29-tie-perf-safety-and-startup.md` §3.3。
+//
+// 三个入口与加锁版**逐指令等价**，唯一差别是不取锁。误用（表实际被并发访问）会
+// 造成与加锁版被绕过时同样后果的数据竞争 —— 故 irgen 侧一律「宁可少优化」：
+// 判据存疑时不生成 _nl 调用。
+
+// 免锁下标读：语义与 tbl_at 完全一致（越界写零 out 并返回 0）。
+pub unsafe fn tbl_at_nl(h: i64, i: i64, out: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var data = r_i64(p, 16)
+    var ok: i64 = 0
+    if i < len {
+        memcpy(int_to_ptr(out), int_to_ptr(data + i * esz), esz)
+        ok = 1
+    } else {
+        memset(int_to_ptr(out), 0, esz)
+    }
+    return ok
+}
+
+// 免锁下标写：语义与 tbl_set 完全一致（越界静默返回 0）。
+pub unsafe fn tbl_set_nl(h: i64, i: i64, src: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var data = r_i64(p, 16)
+    var ok: i64 = 0
+    if i < len {
+        memcpy(int_to_ptr(data + i * esz), int_to_ptr(src), esz)
+        ok = 1
+    }
+    return ok
+}
+
+// 免锁追加：语义与 tbl_push 完全一致（同扩容规则、同 len 提交）。
+pub unsafe fn tbl_push_nl(h: i64, src: i64) {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var need = len + 1
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), esz)
+    w_i64(p, 8, need)
+}
+
+// ==================== 批量追加（appfuse 融合 pass 与 `table_append` 内置的底座） ====================
+// 语义：把 src 前 n 个元素批量追加到 dst 尾（n 钳制 [0, len(src)]；元素宽以 dst 的
+// esz 为准，调用方/编译器保证两侧元素类型一致）。与「连续 n 次 tbl_push」（同扩容
+// 规则、同 len 提交）逐元素等价，但把 N 次加锁/字段重读/调用粗化成 1 次 + 一段 memcpy。
+//
+// 自追加守卫（hd == hs）：逐元素循环在 dst==src 时会因 len 增长而**永不终止**
+// （调用方侧本已是死循环缺陷）；批量形态不做同款死循环——以「进入时刻的 len」为
+// 源快照，单次定容后在单缓冲内**后向**逐元素拷贝（目标恒在源之后，后向序不会覆盖
+// 尚未读取的源元素）。
+//
+// 加锁族对 (dst, src) 双锁：按**句柄地址序**获取（各双锁站点顺序一致 ⇒ 无死锁环；
+// 持锁期不调用外部、不重入）；免锁族（_nl）与加锁族共用同一拷贝骨架，选择权在
+// 编译器（独占分析 / lock 持证作用域）。
+pub unsafe fn tbl_append_tbl(hd: i64, hs: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return r_i64(int_to_ptr(hd), 8)
+    }
+    if hd == hs {
+        lock_enter(hd)
+        var r0 = append_tbl_body(hd, hs, n)
+        lock_leave(hd)
+        return r0
+    }
+    var l1 = hd
+    var l2 = hs
+    if l1 > l2 {
+        l1 = hs
+        l2 = hd
+    }
+    lock_enter(l1)
+    lock_enter(l2)
+    var r = append_tbl_body(hd, hs, n)
+    lock_leave(l2)
+    lock_leave(l1)
+    return r
+}
+
+pub unsafe fn tbl_append_tbl_nl(hd: i64, hs: i64, n: i64) -> i64 {
+    return append_tbl_body(hd, hs, n)
+}
+
+// 拷贝骨架（调用方已按需持锁；自追加守卫在此）。
+unsafe fn append_tbl_body(hd: i64, hs: i64, n: i64) -> i64 {
+    var pd = int_to_ptr(hd)
+    var ps = int_to_ptr(hs)
+    var len_s = r_i64(ps, 8)
+    if n > len_s {
+        n = len_s
+    }
+    if n <= 0 {
+        return r_i64(pd, 8)
+    }
+    var esz = r_i64(pd, 24) & TBL_MASK
+    if hd == hs {
+        var len0 = r_i64(pd, 8)
+        var need0 = len0 + n
+        var data0 = grow(pd, r_i64(pd, 0), len0, r_i64(pd, 16), esz, need0)
+        var k = n
+        while k > 0 {
+            k = k - 1
+            memcpy(int_to_ptr(data0 + (len0 + k) * esz), int_to_ptr(data0 + k * esz), esz)
+        }
+        w_i64(pd, 8, need0)
+        return need0
+    }
+    var data_s = r_i64(ps, 16)
+    var len_d = r_i64(pd, 8)
+    var need = len_d + n
+    var data_d = grow(pd, r_i64(pd, 0), len_d, r_i64(pd, 16), esz, need)
+    memcpy(int_to_ptr(data_d + len_d * esz), int_to_ptr(data_s), n * esz)
+    w_i64(pd, 8, need)
+    return need
+}
+
+// 批量零填充：追加 n 个「全零字节」元素。语义同 n 次「push 零元素」，一次定容 +
+// memset。调用方保证元素类型零值 = 全零字节（string 表禁用——string 的零值须为
+// 合法 "" 指针，由编译器侧把关）。
+pub unsafe fn tbl_append_zeros(h: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return r_i64(int_to_ptr(h), 8)
+    }
+    lock_enter(h)
+    var r = append_zeros_body(h, n)
+    lock_leave(h)
+    return r
+}
+
+pub unsafe fn tbl_append_zeros_nl(h: i64, n: i64) -> i64 {
+    return append_zeros_body(h, n)
+}
+
+unsafe fn append_zeros_body(h: i64, n: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var need = len + n
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    memset(int_to_ptr(data + len * esz), 0, n * esz)
+    w_i64(p, 8, need)
+    return need
+}
+
+// ---------- 批量追加常量（tbl_append_repeat）：src 指向的元素值重复 n 次 ----------
+// 用途：appfuse 的"常量填充循环"形状（`while i<n { table_push(dst, K) }`，K≠0 时
+// 无法用 zeros 入口）。宽度取 dst 的 esz；src 须指向合法元素槽（调用方备好）。
+pub unsafe fn tbl_append_repeat(h: i64, src: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return r_i64(int_to_ptr(h), 8)
+    }
+    lock_enter(h)
+    var r = append_repeat_body(h, src, n)
+    lock_leave(h)
+    return r
+}
+
+pub unsafe fn tbl_append_repeat_nl(h: i64, src: i64, n: i64) -> i64 {
+    return append_repeat_body(h, src, n)
+}
+
+unsafe fn append_repeat_body(h: i64, src: i64, n: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var need = len + n
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    var k: i64 = 0
+    while k < n {
+        memcpy(int_to_ptr(data + (len + k) * esz), int_to_ptr(src), esz)
+        k = k + 1
+    }
+    w_i64(p, 8, need)
+    return need
+}
+
+// ---------- 批量追加常量（值在寄存器/立即数形态）：val 的 esz 字节重复 n 次 ----------
+// 与 tbl_append_repeat 同语义，但值**按值传入**（低 esz 字节即元素字节序）——供
+// appfuse 的常量填充形状直接改写（无需为值另建槽位）。
+pub unsafe fn tbl_append_repeat_v(h: i64, val: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return r_i64(int_to_ptr(h), 8)
+    }
+    lock_enter(h)
+    var r = append_repeat_v_body(h, val, n)
+    lock_leave(h)
+    return r
+}
+
+pub unsafe fn tbl_append_repeat_v_nl(h: i64, val: i64, n: i64) -> i64 {
+    return append_repeat_v_body(h, val, n)
+}
+
+unsafe fn append_repeat_v_body(h: i64, val: i64, n: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var need = len + n
+    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    var k: i64 = 0
+    while k < n {
+        memcpy(int_to_ptr(data + (len + k) * esz), int_to_ptr(ptr_to_int(addr_of(val))), esz)
+        k = k + 1
+    }
+    w_i64(p, 8, need)
+    return need
+}
+
+// ---------- 区间复制（tbl_copy_from）：dst[off .. off+n) = src[0 .. n) ----------
+// 语义与"逐元素 dst[off+i] = src[i]"的**独占表**路径等价：
+//   * n 钳到 len(src)；off < 0 钳 0；n<=0 为 no-op；
+//   * dst 需扩到 off+n；中间空隙（off > len_d 时）按**零值**填充——非字符串元素
+//     下与写路径的元素零值一致（字符串的 "" 语义由调用方把关，见 appfuse 门）；
+//   * 自复制（hd == hs）且 off>0：倒序拷贝（写高位不覆盖未读低位）。
+pub unsafe fn tbl_copy_from(hd: i64, off: i64, hs: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return r_i64(int_to_ptr(hd), 8)
+    }
+    if hd == hs {
+        lock_enter(hd)
+        var r0 = copy_from_body(hd, off, hs, n)
+        lock_leave(hd)
+        return r0
+    }
+    var l1 = hd
+    var l2 = hs
+    if l1 > l2 {
+        l1 = hs
+        l2 = hd
+    }
+    lock_enter(l1)
+    lock_enter(l2)
+    var r = copy_from_body(hd, off, hs, n)
+    lock_leave(l2)
+    lock_leave(l1)
+    return r
+}
+
+pub unsafe fn tbl_copy_from_nl(hd: i64, off: i64, hs: i64, n: i64) -> i64 {
+    return copy_from_body(hd, off, hs, n)
+}
+
+unsafe fn copy_from_body(hd: i64, off: i64, hs: i64, n: i64) -> i64 {
+    var pd = int_to_ptr(hd)
+    var ps = int_to_ptr(hs)
+    var len_s = r_i64(ps, 8)
+    if n > len_s {
+        n = len_s
+    }
+    if off < 0 {
+        off = 0
+    }
+    if n <= 0 {
+        return r_i64(pd, 8)
+    }
+    var esz = r_i64(pd, 24) & TBL_MASK
+    var len_d = r_i64(pd, 8)
+    var need = off + n
+    var data_d = grow(pd, r_i64(pd, 0), len_d, r_i64(pd, 16), esz, need)
+    if off > len_d {
+        memset(int_to_ptr(data_d + len_d * esz), 0, (off - len_d) * esz)
+    }
+    if hd == hs {
+        // 同表：grow 后源数据即新缓冲；上移用倒序
+        var k = n
+        while k > 0 {
+            k = k - 1
+            memcpy(int_to_ptr(data_d + (off + k) * esz), int_to_ptr(data_d + k * esz), esz)
+        }
+    } else {
+        memcpy(int_to_ptr(data_d + off * esz), int_to_ptr(r_i64(ps, 16)), n * esz)
+    }
+    if need > len_d {
+        w_i64(pd, 8, need)
+    }
+    return r_i64(pd, 8)
+}
+
+// ==================== 写时复制（r.1.6.8，非 unsafe 区的默认写入前提） ====================
+// **解决什么**：共享句柄的两个别名（`var b = a`，rc=2）在写入时互相可见——
+// 更严重的是**越界写自动扩容（p.9.12.2）会改写共享的 len/cap**，于是
+// `var a=[1,2,3]; var b=a; b[100]=42` 会让 `len(a)` 也变成 101（实测）。写 b
+// 静默改变了 a 的形状——这正是「非 unsafe 区写不出危险代码」要杜绝的。
+//
+// **做法**：写入前先分离——rc > 1 说明还有别的别名，此刻克隆表体得到独占副本
+// （rc=1），把写落在副本上；rc == 1 说明独占，直接原地写（零额外成本）。
+// 返回**可能已更新的句柄**，调用方负责写回自己的槽：
+//     t = tbl_cow(t)      // 分离（独占时原样返回）
+//     t = tbl_set_cow(t, i, v)
+//
+// **为何前置分离而不是在 tbl_set 内部判断**：越界扩容发生在 tbl_set **之前**
+// （编译器 s21_table_set_ex 先 push 零值把 len 撑到 need）。若只在 tbl_set 里
+// 分离，扩容早已污染共享的旧表。分离必须早于任何字段改写。
+//
+// **为何不用运行期「独占标志」**：与免锁入口同一理由（r.1.6.7）——表可经全局槽
+// 被多线程共享而不触发 retain，标志会恒为「独占」。refcount 是**已存在的真实
+// 计数**（tbl_retain/tbl_release 维护），不引入新状态。
+//
+// **成本**：独占路径 = 一次 r_i64(rc) 读（8 次字节访问）后直接返回；共享路径 =
+// 首次写付一次 O(len) 克隆，此后副本 rc=1 恢复独占。相较「每次赋值深拷贝」
+// （每次 O(len)），只在真正发生共享写时才付费。
+
+// 克隆表体：返回全新句柄（rc=1，数据为 len*esz 字节的独立副本）。
+// 深表逐元素 retain（新表与旧表各自持有一份元素引用；旧表最终 release 时会
+// 逐元素 release，两侧守恒）。普通表的元素按字节拷贝——元素若是 string，
+// 两个表得到各自独立的 (ptr,len) 副本而**共享同一字节缓冲**：string 无
+// refcount 且不可变（见 smove.is_owned 注释），共享只读缓冲没有别名写风险。
+unsafe fn tbl_clone_body(h: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24)             // 含深表标记位
+    var pure = esz & TBL_MASK
+    var isdeep = (esz & TBL_DEEP) != 0
+    var nh = alloc(48)                 // nh 已是 ptr（同 tbl_new 的 h）
+    var ncap: i64 = 0
+    var ndata: i64 = 0
+    if len > 0 {
+        var ndp = alloc(len * pure)
+        ndata = ptr_to_int(ndp)
+        memcpy(ndp, int_to_ptr(r_i64(p, 16)), len * pure)
+        ncap = len
+    }
+    w_i64(nh, 0, ncap)
+    w_i64(nh, 8, len)
+    w_i64(nh, 16, ndata)
+    w_i64(nh, 24, esz)                 // 原样保留深表标记
+    w_i64(nh, 40, 1)
+    var lk = alloc(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk));
+    }
+    w_i64(nh, 32, ptr_to_int(lk))
+    if isdeep {
+        var i: i64 = 0
+        while i < len {
+            var eh = r_i64(int_to_ptr(ndata + i * 8), 0)
+            if eh != 0 {
+                tbl_retain(eh)
+            }
+            i = i + 1
+        }
+    }
+    return ptr_to_int(nh)
+}
+
+// 无条件克隆（r.1.6.11）：返回全新句柄，与源**完全独立**（独立 data 缓冲 + 独立锁）。
+// 与 tbl_cow 的区别：**不读引用计数**。原因：struct 按值拷贝**不会 retain 其表字段**
+//（实测：按值传参发射的是整 struct 的 `store`，不含逐字段 retain），故 rc ≠ 别名数，
+// 靠它判「是否共享」会漏判。`deep` 形参的语义是「无条件独立」，所以用它。
+// 深表逐元素 retain（两侧各自持有元素引用，守恒）。
+pub unsafe fn tbl_clone(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    return tbl_clone_body(h)
+}
+
+// 分离：共享（rc>1）→ 克隆并放弃对旧表的一次引用；独占 → 原样返回。
+// 返回值即调用方应当写回自己槽的句柄。
+// ⚠ 依赖 rc 准确；见 tbl_clone 关于「struct 拷贝不 retain 表字段」的说明——在那种
+//   形态下 rc 偏低，本函数会误判为独占。仅用于**已确认 rc 可信**的场景（同函数内
+//   由 tiec 插桩 retain/release 的表变量）。
+pub unsafe fn tbl_cow(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    if r_i64(int_to_ptr(h), 40) <= 1 {
+        return h                      // 独占：无需分离
+    }
+    var nh = tbl_clone_body(h)
+    tbl_release(h)                    // 让出对旧表的一份引用（其它别名仍在）
+    return nh
+}
+
+// COW 下标写（非 unsafe 区的默认路径）：必要时先分离再写，返回应写回的句柄。
+// 越界语义与 tbl_set 一致（静默返回 0，不写）。扩容由编译器侧先行处理——
+// 故本入口收到的 i 必然 < len；此处仍保留越界守卫以防直接调用。
+pub unsafe fn tbl_set_cow(h: i64, i: i64, src: i64) -> i64 {
+    var nh = tbl_cow(h)
+    tbl_set(nh, i, src)
+    return nh
+}
+
+// COW 追加（非 unsafe 区的默认路径）：必要时先分离再 push，返回应写回的句柄。
+pub unsafe fn tbl_push_cow(h: i64, src: i64) -> i64 {
+    var nh = tbl_cow(h)
+    tbl_push(nh, src)
+    return nh
+}
+
+}
+

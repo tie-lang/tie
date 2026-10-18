@@ -1,0 +1,34 @@
+type tie<class>
+// src/runtime/tl_runtime.tie —— trm-lite 静态链接运行时汇总库（阶段1块2）
+// 供 tiec 内置原语（spawn/yield/collect）**静态链接**：导入 sched/gc 两个内核
+// 模块，编译为单一 trm_lite.a。内置 codegen 以 extern 符号调用
+// trm_lite_sched$spawn_task / trm_lite_sched$queued_* / trm_lite_gc$collect。
+// 用户程序无需 import 本库——tiec 检测到 spawn/yield/collect 内置时自动链接。
+// P2a（2026-08-30）：新增 tl_tbl 字节层表容器（tl_tbl$tbl_*），tiec 检测到
+// 表内置时自动链接；tl_tbl 零 table 依赖（纯 unsafe/ptr），自举无环。
+// p.6.7.2：tl_chan 不入本汇总（独立切片 tl_chan_lib.o，避免 tl_runtime.o 单对象
+// 捆绑 chan 与复杂形态模块内联的同名 trm_lite_chan$* 链接期多重定义）；
+// 编译 tip：本库不含 chan 时，chan 由独立构建的 tl_chan_lib.o 提供。
+import "../../src/mnn/sched.tie"
+import "../../src/gc/gc.tie"
+import "../../src/tbl/tl_tbl.tie"
+// 2026-03-03：补 tl_sync —— tiec 的 actor 消息投递会**主动生成** `tl_sync$sleep(1)`
+// 背压轮询调用（见 compiler/backend/irgen_rt_p2.tie 的 actor 背压段），而本文件是
+// trm-lite 的**唯一构建入口**（`tiec src/runtime/tl_runtime.tie -o trm_lite.a`）。
+// 缺 tl_sync ⇒ 库不含 `tl_sync$sleep` ⇒ **任何 actor 程序链接必然失败**
+// （实测 LNK2019 undefined `tl_sync$sleep`）。tl_sync 只依赖 tl_k32（纯 extern 声明），
+// 无循环风险。
+//
+// r.1.7 改多成员归档：**不再在此内联 import tl_sync**，改由归档的独立成员
+// `tl_sync.o` 提供（构建式见 README）。理由：tl_chan_lib.o 同样内联 tl_sync，两者
+// 同档共存会**多重定义**（COFF 链接期 LNK2005；tl_tbl.tie 头注释早已记录同一条
+// 纪律——"库成员不内联 tl_sync"）。rt 自身的 tl_sync 引用由归档成员解析。
+// 单成员用法（只 `-o x.a` 本文件）需自行补 `tl_sync.o`。
+
+namespace tl_runtime {
+
+// 汇总库版本（占位，供库自检/探针；内置本身不依赖本函数）。
+pub func runtime_version() -> string {
+    return "0.1.0"
+}
+}
