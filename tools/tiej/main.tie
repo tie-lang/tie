@@ -1,15 +1,16 @@
 type tie<logic, unsafe:mem, unsafe:ext>
-import "../../lib/ir/model.tie"
-import "../../lib/backend/llvm_text.tie"
+import "../../lib/ir/ir.tie"
+import "../../lib/ir/types.tie"
+import "../../lib/support/interner.tie"
+import "../../lib/backend/render.tie"
 import "../../lib/jit/llvmc.tie"
 namespace tie.tool.tiej;
-// main.tie —— tiej 命令行入口（tieir → LLVM → LLJIT 自检）
+// main.tie —— tiej 命令行入口（真实 IR → 后端 → LLJIT 自检）
 // ============================================================
 // 用法（仓根）：
 //   tiec tools/tiej/main.tie -o _local_only/bin/tiej.exe
-//   _local_only/bin/tiej.exe            # 自检
-//   _local_only/bin/tiej.exe --selftest # 同上
-// 后续批次：tiej run <file.tir>（tieir 文件加载 + 后端 + 执行）。
+//   _local_only/bin/tiej.exe [--selftest]
+// 构造 jadd(a,b) 使用 lib/ir 的公开构造面，后端只经 tie.backend::render。
 
 func chk(ok: bool, tag: string) -> bool {
     if ok {
@@ -21,24 +22,32 @@ func chk(ok: bool, tag: string) -> bool {
 }
 
 func build_add() {
-    tie.ir::reset()
-    var f = tie.ir::new_func("jadd", "i64")
-    tie.ir::add_param(f, "a", "i64")
-    tie.ir::add_param(f, "b", "i64")
-    tie.ir::add(f, "r", "a", "b", "i64")
-    tie.ir::ret_val(f, "r")
+    types.init_tup()
+    types.init_sym()
+    var t64 = types.named(3)
+    var params: table<i64> = [t64, t64]
+    var f = ir.new_func(interner.intern("jadd"), t64, params)
+    var blk = ir.new_block(f, interner.intern("entry"))
+    var i = ir.new_inst(blk, 0, t64)
+    ir.add_operand(i, 0, 0)
+    ir.add_operand(i, 1, 0)
+    var r = ir.new_inst(blk, 32, -1)
+    ir.add_operand(r, ir.get_value(i), 0)
 }
 
 func selftest() -> i64 {
     build_add()
-    var ll = tie.backend::emit_module()
+    var ll = tie.backend::render(ir.ctx_current())
+    if !chk(str_len(ll) > 0, "render") {
+        println("[backend] " + tie.backend::last_error())
+        return 1
+    }
     if !chk(tie.jit::available(), "tiej_llvm.dll available") {
         println("构建垫片：clang -shared -O2 lib/jit/tiej_llvm.c -I D:/LLVM/include -L D:/LLVM/lib -lLLVM-C -o _local_only/bin/tiej_llvm.dll")
         return 1
     }
     var j = tie.jit::open()
     if !chk(j != 0, "open") {
-        println("[jit] " + tie.jit::last_error())
         return 1
     }
     var rc = tie.jit::add_ir(j, ll)

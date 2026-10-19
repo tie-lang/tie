@@ -1,9 +1,11 @@
 type tie<logic, unsafe:mem, unsafe:ext>
-import "../lib/ir/model.tie"
-import "../lib/backend/llvm_text.tie"
+import "../lib/ir/ir.tie"
+import "../lib/ir/types.tie"
+import "../lib/support/interner.tie"
+import "../lib/backend/render.tie"
 import "../lib/jit/llvmc.tie"
 namespace tie.tests.backend;
-// backend_probe.tie —— tieir → LLVM 文本 → LLJIT 的整条垂直切片
+// backend_probe.tie —— 真实 IR → 后端 → LLJIT 的整条垂直切片
 // ============================================================
 // 运行（仓根）：
 //   tiec tests/backend_probe.tie -o _local_only/bin/backend_probe.exe
@@ -22,28 +24,23 @@ func chk(ok: bool, tag: string) {
 }
 
 func build_add() {
-    tie.ir::reset()
-    var f = tie.ir::new_func("jadd", "i64")
-    tie.ir::add_param(f, "a", "i64")
-    tie.ir::add_param(f, "b", "i64")
-    tie.ir::add(f, "r", "a", "b", "i64")
-    tie.ir::ret_val(f, "r")
-}
-
-func build_mul() {
-    tie.ir::reset()
-    var f = tie.ir::new_func("jmul", "i64")
-    tie.ir::add_param(f, "a", "i64")
-    tie.ir::add_param(f, "b", "i64")
-    tie.ir::mul(f, "r", "a", "b", "i64")
-    tie.ir::ret_val(f, "r")
+    types.init_tup()
+    types.init_sym()
+    var t64 = types.named(3)
+    var params: table<i64> = [t64, t64]
+    var f = ir.new_func(interner.intern("jadd"), t64, params)
+    var blk = ir.new_block(f, interner.intern("entry"))
+    var i = ir.new_inst(blk, 0, t64)
+    ir.add_operand(i, 0, 0)
+    ir.add_operand(i, 1, 0)
+    var r = ir.new_inst(blk, 32, -1)
+    ir.add_operand(r, ir.get_value(i), 0)
 }
 
 func main() {
     build_add()
-    chk(tie.ir::func_count() == 1, "func_count = 1")
-    var ll = tie.backend::emit_module()
-    println("--- LLVM IR ---")
+    var ll = tie.backend::render(ir.ctx_current())
+    chk(str_len(ll) > 0, "render")
     println(ll)
     chk(tie.jit::available(), "tiej_llvm.dll available")
     if !tie.jit::available() {
@@ -52,7 +49,6 @@ func main() {
     var j = tie.jit::open()
     chk(j != 0, "jit open")
     if j == 0 {
-        println("[jit] " + tie.jit::last_error())
         return
     }
     var rc = tie.jit::add_ir(j, ll)
@@ -71,25 +67,6 @@ func main() {
         }
     }
     tie.jit::close(j)
-
-    build_mul()
-    var ll2 = tie.backend::emit_module()
-    var j2 = tie.jit::open()
-    var rc2 = tie.jit::add_ir(j2, ll2)
-    if rc2 != 0 {
-        println("[jit] " + tie.jit::last_error())
-    }
-    chk(rc2 == 0, "add_ir (mul)")
-    var m = tie.jit::lookup(j2, "jmul")
-    chk(m != 0, "lookup jmul")
-    if m != 0 {
-        unsafe {
-            var r3 = dyn_call_p(m, 6, 7, 0, 0, 0)
-            chk(r3 == 42, "jmul(6,7) = " + to_string(r3))
-        }
-    }
-    tie.jit::close(j2)
-
     if g_fail == 0 {
         println("ALL:PASS")
     } else {

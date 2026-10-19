@@ -80,10 +80,10 @@ func normalize_path(p: string) -> string {
 
 // p.9.13.7-B：判定 import 是否为内置库根别名（/std、/ext、/rdu、/sys 前缀）。
 func is_lib_alias(path: string) -> bool {
-    if sstate.has_prefix_str(path, "/std/") { return true }
-    if sstate.has_prefix_str(path, "/ext/") { return true }
-    if sstate.has_prefix_str(path, "/rdu/") { return true }
-    if sstate.has_prefix_str(path, "/sys/") { return true }
+    if tie.support::has_prefix(path, "/std/") { return true }
+    if tie.support::has_prefix(path, "/ext/") { return true }
+    if tie.support::has_prefix(path, "/rdu/") { return true }
+    if tie.support::has_prefix(path, "/sys/") { return true }
     return false
 }
 
@@ -153,7 +153,7 @@ func strip_type_decl(src: string) -> string {
         if str_len(t) == 0 {
             // 头部区空行：保留（占位，行号不变）
             out = out + str_sub_bytes(src, ln_s, next_i)
-        } else if sstate.has_prefix_str(t, "type tie") {
+        } else if tie.support::has_prefix(t, "type tie") {
             var rest = str.trim(str.slice(t, 8, str_len(t)))
             // 合法声明：`type tie` 或 `type tie<X>`（无尾随内容）→ 空行占位
             if str_len(rest) == 0 || (str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">") {
@@ -294,7 +294,7 @@ func expand_one_import(imp_node: i64) -> i64 {
     // 文件过预处理，库文件中的 #cfg 行会被词法器当作 `#[` 属性误判（E00449）。
     // 先于一切状态变更（defer 之前），错误路径直接返回、无需恢复。
     var src_c = cfgpre.preprocess(src, g_cfg_env_target, g_cfg_env_profile)
-    if sstate.has_prefix_str(src_c, "ERR:") {
+    if tie.support::has_prefix(src_c, "ERR:") {
         sm_err_line = s_lines[imp_node]
         sm_err_col = s_cols[imp_node]
         sm_err_msg = "导入文件 '" + full + "' 的 #cfg 预处理失败: " + src_c

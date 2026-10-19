@@ -1039,22 +1039,6 @@ pub func is_addressable(id: i64) -> bool {
 }
 
 // 字符串前缀判定（s 是否以 pre 开头）
-pub func has_prefix_str(s: string, pre: string) -> bool {
-    var n = str_len(s)
-    var m = str_len(pre)
-    if n < m {
-        return false
-    }
-    var i: i64 = 0
-    while i < m {
-        if str_char(s, i) != str_char(pre, i) {
-            return false
-        }
-        i = i + 1
-    }
-    return true
-}
-
 // 查找最后一个 "::" 的位置（命名空间分隔；返回 ':' 下标，-1 = 无）
 // ---------- 别名改名映射（2026-10-12「增名不除名」缺陷修复） ----------
 // 别名把被导入库的顶层命名空间改名（内联模型 M2.1.7）；同单元的其他消费方
@@ -1212,7 +1196,7 @@ pub func check_visibility(full_name: string, sig: i64, call_node: i64) -> i64 {
     if cur == prefix {
         return 0
     }
-    if has_prefix_str(cur, prefix + "::") {
+    if tie.support::has_prefix(cur, prefix + "::") {
         if g_vis_level <= 2 {
             return 0
         }
@@ -1270,7 +1254,7 @@ pub func check_const_visibility_nid(nid: i64, node: i64) -> i64 {
     if cur == prefix {
         return 0
     }
-    if has_prefix_str(cur, prefix + "::") {
+    if tie.support::has_prefix(cur, prefix + "::") {
         if g_vis_level <= 2 {
             return 0
         }

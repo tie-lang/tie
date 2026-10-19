@@ -55,10 +55,10 @@ pub func set_cfg_env(target: string, profile: string) {
 // 解析 import 路径：相对当前文件目录（处理 "./" 与 "../"）；
 // 结果统一经 normalize_path 归一化（去重键一致，见 normalize_path 注释）。
 pub func resolve_import_path(path: string) -> string {
-    if sstate.has_prefix_str(path, "./") {
+    if tie.support::has_prefix(path, "./") {
         return normalize_path(g_cur_dir + str.slice(path, 2, str_len(path)))
     }
-    if sstate.has_prefix_str(path, "../") {
+    if tie.support::has_prefix(path, "../") {
         // g_cur_dir 形如 "examples/"：去掉最后一个非空目录段得 "…/"，
         // 再拼去掉 ../ 的剩余路径（/ext/x → ext/x）
         var d = g_cur_dir
@@ -99,7 +99,7 @@ pub func check_debug_src(src: string, base_dir: string) -> string {
     // 剥离文件类型声明头部（type tie / type tie<X>）——真实管线由预处理完成，
     // check 路径须等效（否则头部声明被当顶层标识符报错）
     var ast_text = parser.parse_src(strip_type_decl(src))
-    if sstate.has_prefix_str(ast_text, "ERR:") {
+    if tie.support::has_prefix(ast_text, "ERR:") {
         return ast_text
     }
     return check_debug(ast_text)
@@ -124,9 +124,6 @@ func reset_sem_state() {
     s_children = table_new_i64()
     s_lines = table_new_i64()
     s_cols = table_new_i64()
-    fn_keys = table_new_i64()
-    fn_vals = table_new_i64()
-    fn_def_nodes = table_new_i64()
     afn_keys = table_new_i64()
     afn_actor = table_new_i64()
     sg_nparams = table_new_i64()
@@ -140,22 +137,7 @@ func reset_sem_state() {
     sp_defs = table_new_i64()
     sp_vars = table_new_i64()
     types.init_sym()
-    cls_parent = table_new_i64()
-    cls_fldoff = table_new_i64()
-    cls_nfld = table_new_i64()
-    cls_done = table_new_i64()
-    fld_names = table_new_i64()
-    fld_tys = table_new_i64()
     // enum 状态表重置（2026-08-15 enum 语言特性；每次编译清零）
-    en_done = table_new_i64()
-    en_nvar = table_new_i64()
-    en_varoff = table_new_i64()
-    en_nslot = table_new_i64()
-    en_vnames = table_new_i64()
-    en_vtags = table_new_i64()
-    en_vfldoff = table_new_i64()
-    en_vnfld = table_new_i64()
-    en_ftys = table_new_i64()
     // p.9.11.32 类型别名注册表重置
     alias_keys = table_new_i64()
     alias_vals = table_new_i64()
@@ -279,7 +261,7 @@ pub func check_src(src: string, base_dir: string) -> string {
     // check 路径须等效（否则头部声明被当顶层标识符报错；strip_type_decl 与
     // 展开 import 时同规则，行号占位保一致）
     var ast_text = parser.parse_src(strip_type_decl(src))
-    if sstate.has_prefix_str(ast_text, "ERR:") {
+    if tie.support::has_prefix(ast_text, "ERR:") {
         return ast_text
     }
     return check_impl(ast_text, base_dir)

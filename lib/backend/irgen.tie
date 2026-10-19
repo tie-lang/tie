@@ -129,14 +129,10 @@ pub var g_rng_reg_done: i64 = 0;
 // M5 动态库模式（dev33 批次 12）：driver 在 tig_ast 前经 set_dynlib 注入。
 // 置位后 irgen 登记导出面（ir.func_exported）供 llvmgen 输出 dllexport，
 // 并对导出函数做边界检查（表/struct 不跨动态库边界）。
-pub var g_dynlib: bool = false;
 // --dll-export 导出白名单（driver 经 set_dll_export 注入；空 = 不过滤）。
-pub var g_dll_export: string = "";
 // S1.4 --check-bounds：数组越界检查（默认关；driver 经 set_check_bounds 注入）。
-pub var g_check_bounds: bool = false;
 // 当前编译目标三元组（driver 在 tig_ast 前经 set_target 注入；空 = 未设置）。
 // 任务17 asm! 平台条件编译：target("arch") 按此目标匹配。
-pub var g_asm_target: string = "";
 // 当前函数的**全名**（命名空间函数含 "::"，如 sstate::child）——调用名解析
 // 需要当前命名空间前缀补全（对齐 sinfer.resolve_call_name 的候选 2）。
 pub var g_cur_fn_name: string = "";
@@ -308,6 +304,7 @@ pub var g_sb_hv: table<i64>;
 pub var g_cbs_keys: table<i64>;   // 提升中变量名池 id（字节表变量）
 pub var g_cbs_acc: table<i64>;    // 平行：私有累积表句柄
 
+import "./config.tie"
 namespace irgen {
 
 

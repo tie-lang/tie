@@ -67,9 +67,6 @@ pub var g_file_idle_auth: table<i64> = []
 pub var g_file_idle_used: table<i64> = []
 
 // ==================== 符号表全局 ====================
-pub var fn_keys: table<i64>;      // 函数全名 id（升序）
-pub var fn_vals: table<i64>;      // 签名 id
-pub var fn_def_nodes: table<i64>; // 函数定义 AST 节点 id（与 fn_keys 平行；性能重构：
                               // check_fn_walk 查表 O(log n) 定位，替代每函数线性
                               // 扫全部顶层 + ns_full_name 拼串比较的 O(N×M) 平方）
 pub var sg_nparams: table<i64>;   // 签名表：参数总数
@@ -109,28 +106,12 @@ pub var g_uwt_keys: table<i64>;
 // p.9.11.32 类型别名注册表（名 id 升序；val = S_N_TYPE_ALIAS 节点 id）
 pub var alias_keys: table<i64>;
 pub var alias_vals: table<i64>;
-pub var cls_parent: table<i64>;   // struct 父名 id（-1=无）
-pub var cls_fldoff: table<i64>;   // 字段段偏移（fld_names/fld_tys）
-pub var cls_nfld: table<i64>;     // 字段数（含继承拍平）
-pub var cls_done: table<i64>;     // struct 字段收集完成标志（0/1，拍平递归防重）
 pub var st_reprc: table<i64>;     // struct 索引 -> repr(C) 显式 C ABI 布局标志（1=repr(C)/0=默认；p.6.8.2）
-pub var fld_names: table<i64>;    // 拍平字段名 id
-pub var fld_tys: table<i64>;      // 拍平字段类型 id
-pub var fld_defs: table<i64>;     // 拍平字段默认值表达式节点 id（-1 = 无；Point.y = 10）
 
 // ==================== enum 状态表（2026-08-15 enum 语言特性）====================
 // enum 表按「名 id（升序）→ 索引」登记，索引行号 = types.enum_of 的负载。
 // 变体信息拍平段（en_vnames/en_vtags/en_vfldoff/en_vnfld 共用 en_varoff 段偏移；
 // payload 类型单独拍平进 en_ftys，变体经 en_vfldoff 定位其字段段）。
-pub var en_done: table<i64>;      // 变体收集完成标志（0/1，防重复收集）
-pub var en_nvar: table<i64>;      // 变体数
-pub var en_varoff: table<i64>;    // 变体段偏移（en_vnames/en_vtags/en_vfldoff/en_vnfld 共用段）
-pub var en_nslot: table<i64>;     // 槽数 K（所有变体 payload 字段数最大值；后端聚合布局用）
-pub var en_vnames: table<i64>;    // 变体名 id（拍平段）
-pub var en_vtags: table<i64>;     // 变体 tag 值（0..nvar-1，拍平段）
-pub var en_vfldoff: table<i64>;   // 变体 payload 字段段偏移（en_ftys）
-pub var en_vnfld: table<i64>;     // 变体 payload 字段数
-pub var en_ftys: table<i64>;      // 变体 payload 字段类型 id（拍平段）
 
 pub var gb_keys: table<i64>;      // 全局变量名 id（升序）
 pub var gb_vals: table<i64>;      // 类型 id
