@@ -807,7 +807,7 @@ func gn_split_nl(immut s: string) -> table<string> {
 func gn_load_prev() {
     g_prev_keys = table_new_string()
     g_prev_codes = table_new_string()
-    var p = g_root + "\\compiler\\frontend\\diagcode_cat.gen.tie"
+    var p = g_root + "\\lib\\support\\diag\\diagcode_cat.gen.tie"
     if !file_exists(p) {
         return
     }
@@ -953,7 +953,7 @@ func gn_esc_td(immut s: string) -> string {
 func gn_write_cat() {
     var sb = string_builder()
     sb_append(sb, "type tie<class>\n")
-    sb_append(sb, "// compiler/frontend/diagcode_cat.gen.tie —— 诊断标号目录（p.6.9.15 生成文件，勿手改）\n")
+    sb_append(sb, "// lib/support/diag/diagcode_cat.gen.tie —— 诊断标号目录（p.6.9.15 生成文件，勿手改）\n")
     sb_append(sb, "// 生成：scripts/gen-diagcodes.tie（tie 生成器）；exact " + to_string(len(g_key)) + " 条 + prefix " + to_string(len(g_pk)) + " 条。\n")
     sb_append(sb, "// 标号规范：五位纯序号 E+5 位（E00001 起全局连续）；家族仅记 JSON/td family 字段，不编码进标号。\n")
     sb_append(sb, "var cat_keys: table<string>;\n")
@@ -999,7 +999,7 @@ func gn_write_cat() {
     sb_append(sb, "pub func pfx_key(i: i64) -> string { return pfx_keys[i] }\n")
     sb_append(sb, "pub func pfx_code(i: i64) -> string { return pfx_codes[i] }\n")
     sb_append(sb, "}\n")
-    file_write(compiler_dir() + "\\frontend\\diagcode_cat.gen.tie", sb_build(sb))
+    file_write(compiler_dir() + "\\diagcode_cat.gen.tie", sb_build(sb))
 }
 
 func gn_write_td() {
@@ -1021,7 +1021,7 @@ func gn_write_td() {
 
 // compiler 目录相对路径。
 func compiler_dir() -> string {
-    return g_root + "\\compiler"
+    return g_root + "\\lib\\support\\diag"
 }
 
 // 文件列表按字节序原地排序（去重「先到先得」依赖确定扫描序：frontend 先于
@@ -1080,7 +1080,12 @@ func main() -> i64 {
 
     // 收集文件：compiler/**/*.tie + prep/pkg/repl
     var dirs: table<string> = table_new_string()
-    table_push(dirs, g_root + "\\compiler")
+    table_push(dirs, g_root + "\\lib\\front")
+    table_push(dirs, g_root + "\\lib\\backend")
+    table_push(dirs, g_root + "\\lib\\ir")
+    table_push(dirs, g_root + "\\lib\\support")
+    table_push(dirs, g_root + "\\lib\\diag")
+    table_push(dirs, g_root + "\\tools\\tiec\\src")
     if fs.exists(g_root + "\\prep") {
         table_push(dirs, g_root + "\\prep")
     }
