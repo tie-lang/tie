@@ -214,19 +214,6 @@ pub func reg_enum(name_id: i64) -> i64 {
     return idx
 }
 
-// enum 索引 -> 名字（en_keys 按名字排序，须经 en_vals 反查索引位置）
-pub func enum_name_of(idx: i64) -> string {
-    var n = len(en_keys)
-    var i: i64 = 0
-    while i < n {
-        if en_vals[i] == idx {
-            return intern.lookup(en_keys[i])
-        }
-        i = i + 1
-    }
-    return "?"
-}
-
 // 泛型模板索引查询（全名 -> 模板索引；-1 = 未登记）。
 // 模板名与普通函数/struct 名分表存储：同一全名只可能在 gty_keys 或
 // fn_keys/st_keys 之一（collect 阶段分派，重复定义在各自登记处报错）。
@@ -589,7 +576,7 @@ pub func impl_key(port_name: string, struct_name: string) -> string {
 // impl 记录查询（port 索引 + struct 索引 -> impl 索引；-1 = 未实现）
 pub func impl_find(pi: i64, si: i64) -> i64 {
     var pname = intern.lookup(pt_keys[pi])
-    var sname = sstate.struct_name_of(si)
+    var sname = types.struct_name_of(si)
     var nid = intern.intern(impl_key(pname, sname))
     var idx = bs_find(im_keys, nid)
     if idx < 0 {
@@ -602,7 +589,7 @@ pub func impl_find(pi: i64, si: i64) -> i64 {
 // （按 port 方法声明顺序）。返回 impl 索引；-1 错误（sm_err_* 已置）。
 pub func reg_impl(pi: i64, si: i64, mnames: table<i64>) -> i64 {
     var pname = intern.lookup(pt_keys[pi])
-    var sname = sstate.struct_name_of(si)
+    var sname = types.struct_name_of(si)
     var key = intern.intern(impl_key(pname, sname))
     if bs_find(im_keys, key) >= 0 {
         sm_err_msg = "port '" + pname + "' 对 struct '" + sname + "' 的 impl 重复定义"

@@ -58,6 +58,7 @@ type tie<class>
 //   自检：middle/types_test.tie（无 driver 可跑）。
 
 import "../support/interner.tie"
+import "/std/intern.tie"
 
 // ---------- 类型类别常量（kind(id) 返回值）----------
 pub const K_NAMED: i64 = 0;
@@ -194,7 +195,45 @@ pub var tup_tys: table<i64>;      // tuple 字段类型 id（扁平段）
 pub var tup_offs: table<i64>;     // tuple 字段段偏移
 pub var tup_n: table<i64>;        // tuple 字段数
 
+// struct/enum 符号表（前端与后端共用；原居 sstate，迁至类型库）
+pub var st_keys: table<i64>;
+pub var st_vals: table<i64>;
+pub var en_keys: table<i64>;
+pub var en_vals: table<i64>;
+
 namespace types {
+pub func init_sym() {
+    st_keys = table_new_i64()
+    st_vals = table_new_i64()
+    en_keys = table_new_i64()
+    en_vals = table_new_i64()
+}
+
+// struct 索引 -> 名字（st_keys 按名字排序，须经 st_vals 反查索引位置）
+pub func struct_name_of(idx: i64) -> string {
+    var n = len(st_keys)
+    var i: i64 = 0
+    while i < n {
+        if st_vals[i] == idx {
+            return intern.lookup(st_keys[i])
+        }
+        i = i + 1
+    }
+    return "?"
+}
+
+// enum 索引 -> 名字（en_keys 按名字排序，须经 en_vals 反查索引位置）
+pub func enum_name_of(idx: i64) -> string {
+    var n = len(en_keys)
+    var i: i64 = 0
+    while i < n {
+        if en_vals[i] == idx {
+            return intern.lookup(en_keys[i])
+        }
+        i = i + 1
+    }
+    return "?"
+}
 pub func init_tup() {
     tuple_tys = table_new_i64()
     tup_names = table_new_i64()

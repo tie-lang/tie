@@ -10,7 +10,7 @@ func check_arm_patterns_enum(c: i64, subj_ty: i64) -> i64 {
     var plist = sstate.child(c, 0)
     var when_n = sstate.child(c, 1)
     var ei = types.low(subj_ty)
-    var ename = sstate.enum_name_of(ei)
+    var ename = types.enum_name_of(ei)
     var np = sstate.nchild(plist)
     var i: i64 = 0
     while i < np {
@@ -43,7 +43,7 @@ func check_arm_patterns_enum(c: i64, subj_ty: i64) -> i64 {
             vname = sstate.name_str(vr)
         } else {
             // 裸变体名（`case Ok(v)`）：枚举名取 switch 对象类型
-            bname = sstate.enum_name_of(ei)
+            bname = types.enum_name_of(ei)
             vname = sstate.name_str(vr)
         }
         var eidx = sstate.bs_find(en_keys, intern.intern(bname))
@@ -58,7 +58,7 @@ func check_arm_patterns_enum(c: i64, subj_ty: i64) -> i64 {
                 sm_err_msg = "case 值 '" + bname + "' 与 switch 对象枚举类型 " + types.type_name(subj_ty) + " 不匹配"
                 return -1
             }
-            var rec = sstate.gin_find(sstate.enum_name_of(ei))
+            var rec = sstate.gin_find(types.enum_name_of(ei))
             if rec < 0 || gin_tmpl[rec] != gidx {
                 sm_err_line = s_lines[c]
                 sm_err_col = s_cols[c]

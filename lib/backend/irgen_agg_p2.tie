@@ -56,7 +56,7 @@ func enum_case_tag(pat: i64, subj_ty: i64) -> i64 {
         }
         bname = sstate.name_str(base)
     } else {
-        bname = sstate.enum_name_of(ei)
+        bname = types.enum_name_of(ei)
     }
     var eidx = sstate.bs_find(en_keys, interner.intern(bname))
     var ei2: i64 = -1
@@ -66,7 +66,7 @@ func enum_case_tag(pat: i64, subj_ty: i64) -> i64 {
         // 泛型 enum 模板：subject 必须是对应模板的实例化
         var gidx = sstate.gt_find(bname)
         if gidx >= 0 && gty_is_struct[gidx] == 2 {
-            var rec = sstate.gin_find(sstate.enum_name_of(ei))
+            var rec = sstate.gin_find(types.enum_name_of(ei))
             if rec >= 0 && gin_tmpl[rec] == gidx {
                 ei2 = ei
             }
@@ -559,7 +559,7 @@ func tig_slice(id: i64) -> i64 {
 // 限整数系；string payload 无现成 ptr↔i64 桥 → 报"暂不支持"）。
 func tig_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i64 {
     var ei = en_vals[eidx]
-    var ename = sstate.enum_name_of(ei)
+    var ename = types.enum_name_of(ei)
     var tag = enum_variant_tag(ei, vname)
     if tag < 0 {
         sm_err_line = s_lines[id]

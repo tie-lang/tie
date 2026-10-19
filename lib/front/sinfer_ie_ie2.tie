@@ -606,7 +606,7 @@ pub func infer_expr_field_access(id: i64) -> i64 {
                 if !sstate.is_addressable(base_node) && s_tags[base_node] != 13 {
                     var is_fnf: bool = types.is_fn(fld_tys[off + i])
                     if !is_fnf {
-                        var cls_name = sstate.struct_name_of(si)
+                        var cls_name = types.struct_name_of(si)
                         sm_err_line = s_lines[id]
                         sm_err_col = s_cols[id]
                         sm_err_msg = "struct 实例 '" + cls_name + "' 的字段访问需要可寻址对象（变量/字段链），"
@@ -618,7 +618,7 @@ pub func infer_expr_field_access(id: i64) -> i64 {
                 return fld_tys[off + i]
             }
             // 计算属性 getter：<Struct>::<field名>，零额外参数（仅接收者），返回属性类型。
-            var gfull = sstate.struct_name_of(si) + "::" + fnm
+            var gfull = types.struct_name_of(si) + "::" + fnm
             var gsig = sstate.fn_sig(gfull)
             if gsig >= 0 {
                 var grec = sp_tys[sg_off[gsig]]
@@ -642,7 +642,7 @@ pub func infer_expr_field_access(id: i64) -> i64 {
             }
             sm_err_line = s_lines[id]
             sm_err_col = s_cols[id]
-            sm_err_msg = "类 '" + sstate.struct_name_of(si) + "' 没有字段 '" + fnm + "'"
+            sm_err_msg = "类 '" + types.struct_name_of(si) + "' 没有字段 '" + fnm + "'"
             return -1
         }
         if bk == K_MAP {

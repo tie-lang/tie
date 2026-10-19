@@ -128,14 +128,14 @@ func llvm_ty(t: i64) -> string {
     }
     if agg_k == K_STRUCT {
         var sidx2 = t - BASE_STRUCT
-        return "%struct." + sstate.struct_name_of(sidx2)
+        return "%struct." + types.struct_name_of(sidx2)
     }
     // enum 聚合类型（2026-08-15 enum 语言特性）：命名结构体 %enum.<名字>，
     // emit_agg_types 输出 `%enum.<名> = type { i64, i64, ..., i64 }`
     //（槽 0 = tag，槽 1..K = payload；K = en_nslot 见 emit_agg_types）。
     if agg_k == K_ENUM {
         var eidx2 = t - BASE_ENUM
-        return "%enum." + sstate.enum_name_of(eidx2)
+        return "%enum." + types.enum_name_of(eidx2)
     }
     // S1.2 不安全类型：
     //   ptr<T>  → LLVM opaque ptr（元素类型仅语义信息）

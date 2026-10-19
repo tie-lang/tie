@@ -306,7 +306,7 @@ func tig_method_call(id: i64) -> i64 {
             }
             if types.kind(g_lookup_ty) == K_STRUCT {
                 var si = g_lookup_ty - BASE_STRUCT
-                var full = sstate.struct_name_of(si) + "::" + mname
+                var full = types.struct_name_of(si) + "::" + mname
                 if sstate.fn_sig(full) >= 0 {
                     return tig_struct_method_call(full, id, recv, g_lookup_ty)
                 }
@@ -316,7 +316,7 @@ func tig_method_call(id: i64) -> i64 {
                 // <enum 名>::<方法>（语义层已校验签名与参数；发射同 struct
                 // 方法转发——首参 ref 传槽地址，else 按值传聚合）
                 var ei9 = g_lookup_ty - BASE_ENUM
-                var full9 = sstate.enum_name_of(ei9) + "::" + mname
+                var full9 = types.enum_name_of(ei9) + "::" + mname
                 if sstate.fn_sig(full9) >= 0 {
                     return tig_struct_method_call(full9, id, recv, g_lookup_ty)
                 }
@@ -701,7 +701,7 @@ func tig_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
 // （"<Struct>::op_X"），未声明则返回 ""。is_bin=1 二元（0..10），否则一元 op_neg。
 func op_method_full_ir(ty: i64, op: i64, is_bin: i64) -> string {
     var si = types.low(ty)
-    var sname = sstate.struct_name_of(si)
+    var sname = types.struct_name_of(si)
     var nm = ""
     if is_bin == 1 {
         if op == 0 {

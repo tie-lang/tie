@@ -138,7 +138,7 @@ pub func collect_struct_fields(si: i64) -> i64 {
         guard = guard + 1
     }
     if has_cycle {
-        var nm = sstate.struct_name_of(si)
+        var nm = types.struct_name_of(si)
         sm_err_line = s_lines[find_struct_node(nm)]
         sm_err_col = s_cols[find_struct_node(nm)]
         sm_err_msg = "struct 继承形成环（含 '" + nm + "'）"
@@ -164,7 +164,7 @@ pub func collect_struct_fields(si: i64) -> i64 {
     // struct 名按索引反查（st_keys 按名排序，不能直接用 si 下标取——排序序
     // 与登记序不一致时（如 import 文件 struct 名先被主文件 intern）会取到
     // 别的 struct 名，导致字段收集错位/继承环误报）
-    var nm = sstate.struct_name_of(si)
+    var nm = types.struct_name_of(si)
     var snode = find_struct_node(nm)
     if snode < 0 {
         sm_err_line = 1
@@ -271,7 +271,7 @@ pub func collect_enum_variants(ei: i64) -> i64 {
         return 0
     }
     en_done[ei] = 1
-    var nm = sstate.enum_name_of(ei)
+    var nm = types.enum_name_of(ei)
     var enode = find_enum_node(nm)
     if enode < 0 {
         sm_err_line = 1

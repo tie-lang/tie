@@ -4,19 +4,6 @@ type tie<class>
 // 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sstate.tie。
 // 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
 namespace sstate {
-// struct 索引 -> 名字（st_keys 按名字排序，须经 st_vals 反查索引位置）
-pub func struct_name_of(idx: i64) -> string {
-    var n = len(st_keys)
-    var i: i64 = 0
-    while i < n {
-        if st_vals[i] == idx {
-            return intern.lookup(st_keys[i])
-        }
-        i = i + 1
-    }
-    return "?"
-}
-
 // p.9.15.1 依赖感知缓存：返回已展开的 import 依赖路径集合副本（driver 经
 // semantic 命名空间调用本访问器，规避跨命名空间变量访问限制）。
 pub func imported_paths() -> table<string> {

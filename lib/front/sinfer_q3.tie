@@ -509,7 +509,7 @@ pub func try_enum_construct_hinted(expr: i64, hint_ty: i64) -> i64 {
         return -1
     }
     var hei = types.low(hint_ty)
-    var hmangled = sstate.enum_name_of(hei)
+    var hmangled = types.enum_name_of(hei)
     var rec = sstate.gin_find(hmangled)
     if rec < 0 || gin_tmpl[rec] != gidx {
         return -1  // hint 不是该模板的实例化
@@ -649,7 +649,7 @@ pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, ref args: t
         sname = intern.lookup(st_keys[si])
     } else if bk == K_ENUM {
         si = types.low(recv_ty)
-        sname = sstate.enum_name_of(si)
+        sname = types.enum_name_of(si)
         if str_len(sname) == 0 {
             sm_err_line = s_lines[id]
             sm_err_col = s_cols[id]
@@ -803,7 +803,7 @@ pub func fn_opt_elem(ty: i64) -> i64 {
     }
     var ei = types.low(rt)
     // 枚举实例以 mangled 名登记（Option$i64）——按前缀判形
-    var enm = sstate.enum_name_of(ei)
+    var enm = types.enum_name_of(ei)
     if enm != "Option" && !sstate.has_prefix_str(enm, "Option$") {
         return -1
     }
@@ -822,7 +822,7 @@ pub func iter_proto_elem(ty: i64) -> i64 {
         return -1
     }
     var si = types.low(ty)
-    var sname = sstate.struct_name_of(si)
+    var sname = types.struct_name_of(si)
     var sig_hn = sstate.fn_sig(sname + "::has_next")
     var sig_nx = sstate.fn_sig(sname + "::next")
     if sig_hn < 0 || sig_nx < 0 {

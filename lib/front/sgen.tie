@@ -87,7 +87,7 @@ pub func type_node_from_id(t: i64) -> i64 {
         return nd
     }
     if k == K_STRUCT {
-        var sname = sstate.struct_name_of(types.low(t))
+        var sname = types.struct_name_of(types.low(t))
         var kids: table<i64> = table_new_i64()
         table_push(kids, -1)
         var nd = push_node(S_N_STRUCT_TYPE, intern.intern(sname), -1, -1, 0, 0)
@@ -98,7 +98,7 @@ pub func type_node_from_id(t: i64) -> i64 {
         // 枚举类型实参（2026-08-15 泛型 enum）：复用 N_STRUCT_TYPE 承载标识符
         // 类型，name = 枚举名（mangled）。语义层按名分派：st_keys 未命中查
         // en_keys（枚举实例已 reg_enum 登记 mangled 名）。
-        var ename = sstate.enum_name_of(types.low(t))
+        var ename = types.enum_name_of(types.low(t))
         var kids: table<i64> = table_new_i64()
         table_push(kids, -1)
         var nd = push_node(S_N_STRUCT_TYPE, intern.intern(ename), -1, -1, 0, 0)
@@ -585,9 +585,9 @@ pub func match_type_node(tnode: i64, arg_ty: i64, tp_names: table<i64>, bk: ref 
         }
         var sname = ""
         if types.kind(arg_ty) == K_STRUCT {
-            sname = sstate.struct_name_of(types.low(arg_ty))
+            sname = types.struct_name_of(types.low(arg_ty))
         } else {
-            sname = sstate.enum_name_of(types.low(arg_ty))
+            sname = types.enum_name_of(types.low(arg_ty))
         }
         if sidx >= 0 && gidx < 0 {
             // 普通 struct：精确名匹配
