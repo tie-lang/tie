@@ -1,0 +1,56 @@
+type tie<logic, unsafe:mem, unsafe:ext>
+import "../lib/ir/ir.tie"
+import "../lib/ir/types.tie"
+import "../lib/support/interner.tie"
+import "../lib/backend/render.tie"
+namespace tie.tests.ctx;
+
+func has(immut s: string, immut sub: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(sub)
+    var i: i64 = 0
+    while i + m <= n {
+        var j: i64 = 0
+        var ok = true
+        while j < m {
+            if str_char(s, i + j) != str_char(sub, j) {
+                ok = false
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+func build(fname: string, op: i64) {
+    var t64 = types.named(3)
+    var params: table<i64> = [t64, t64]
+    var f = ir.new_func(interner.intern(fname), t64, params)
+    var blk = ir.new_block(f, interner.intern("entry"))
+    var i = ir.new_inst(blk, op, t64)
+    ir.add_operand(i, 0, 0)
+    ir.add_operand(i, 1, 0)
+    var r = ir.new_inst(blk, 32, -1)
+    ir.add_operand(r, ir.get_value(i), 0)
+}
+
+func main() {
+    types.init_tup()
+    types.init_sym()
+    var a = ir.ctx_new()
+    build("jadd", 0)
+    var b = ir.ctx_new()
+    build("jmul", 2)
+    var la = tie.backend::render(a)
+    var lb = tie.backend::render(b)
+    println("=== ctx A ===")
+    println(la)
+    println("=== ctx B ===")
+    println(lb)
+    println("A: jadd=" + to_string(has(la, "jadd")) + " jmul=" + to_string(has(la, "jmul")))
+    println("B: jmul=" + to_string(has(lb, "jmul")) + " jadd=" + to_string(has(lb, "jadd")))
+}

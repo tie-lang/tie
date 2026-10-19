@@ -1,15 +1,234 @@
 type tie<class>
 namespace ir;
-// context.tie —— 编译上下文接口
-// ============================================================
-// 第一步：接口先立，单实例语义不变（IR 表仍由库内单例承载）。
-// 第二步再把 g_* 表按 context 分桶，ctx_new 才真正创建独立状态。
-// 约束：同一时刻只允许一个活跃上下文；ctx_bind 只接受当前 id。
+// context.tie —— 多上下文：每个 ctx 一套 IR + 类型/符号表（表装表 + 引用切换）
+// ctx 0 = 当前默认表（惰性登记）；ctx_new 建新套并绑定。
 
-var g_ctx_cur: i64 = 1
+var g_ctx_cur: i64 = 0
+var g_ctx_ready: i64 = 0
+
+var c_ir_funcs_names: table<table<i64>> = []
+var c_ir_funcs_rets: table<table<i64>> = []
+var c_ir_funcs_params_off: table<table<i64>> = []
+var c_ir_funcs_params_cnt: table<table<i64>> = []
+var c_ir_funcs_params_tys_off: table<table<i64>> = []
+var c_ir_funcs_param_tys: table<table<i64>> = []
+var c_ir_funcs_entry: table<table<i64>> = []
+var c_ir_funcs_inst_total: table<table<i64>> = []
+var c_ir_funcs_exported: table<table<i64>> = []
+var c_ir_funcs_inline: table<table<i64>> = []
+var c_ir_blocks_func: table<table<i64>> = []
+var c_ir_blocks_name: table<table<i64>> = []
+var c_ir_blocks_start: table<table<i64>> = []
+var c_ir_blocks_end: table<table<i64>> = []
+var c_ir_insts_op: table<table<i64>> = []
+var c_ir_insts_ty: table<table<i64>> = []
+var c_ir_insts_val: table<table<i64>> = []
+var c_ir_insts_ops_off: table<table<i64>> = []
+var c_ir_insts_ops_cnt: table<table<i64>> = []
+var c_ir_ops: table<table<i64>> = []
+var c_ir_ops_kind: table<table<i64>> = []
+var c_t_nest_tbl_elems: table<table<i64>> = []
+var c_t_nest_map_vals: table<table<i64>> = []
+var c_t_nest_ptr_elems: table<table<i64>> = []
+var c_t_nest_slice_elems: table<table<i64>> = []
+var c_t_nest_atomic_elems: table<table<i64>> = []
+var c_t_nest_future_elems: table<table<i64>> = []
+var c_t_nest_arr_elems: table<table<i64>> = []
+var c_t_nest_arr_lens: table<table<i64>> = []
+var c_t_fn_ret: table<table<i64>> = []
+var c_t_fn_nparams: table<table<i64>> = []
+var c_t_fn_paroff: table<table<i64>> = []
+var c_t_fn_params: table<table<i64>> = []
+var c_t_fn_param_refs: table<table<i64>> = []
+var c_t_fn_has_var: table<table<i64>> = []
+var c_t_tuple_tys: table<table<i64>> = []
+var c_t_tup_names: table<table<i64>> = []
+var c_t_tup_tys: table<table<i64>> = []
+var c_t_tup_offs: table<table<i64>> = []
+var c_t_tup_n: table<table<i64>> = []
+var c_t_st_keys: table<table<i64>> = []
+var c_t_st_vals: table<table<i64>> = []
+var c_t_en_keys: table<table<i64>> = []
+var c_t_en_vals: table<table<i64>> = []
+var c_t_cls_parent: table<table<i64>> = []
+var c_t_cls_fldoff: table<table<i64>> = []
+var c_t_cls_nfld: table<table<i64>> = []
+var c_t_cls_done: table<table<i64>> = []
+var c_t_fld_names: table<table<i64>> = []
+var c_t_fld_tys: table<table<i64>> = []
+var c_t_fld_defs: table<table<i64>> = []
+var c_t_fn_keys: table<table<i64>> = []
+var c_t_fn_vals: table<table<i64>> = []
+var c_t_fn_def_nodes: table<table<i64>> = []
+var c_t_en_done: table<table<i64>> = []
+var c_t_en_nvar: table<table<i64>> = []
+var c_t_en_varoff: table<table<i64>> = []
+var c_t_en_nslot: table<table<i64>> = []
+var c_t_en_vnames: table<table<i64>> = []
+var c_t_en_vtags: table<table<i64>> = []
+var c_t_en_vfldoff: table<table<i64>> = []
+var c_t_en_vnfld: table<table<i64>> = []
+var c_t_en_ftys: table<table<i64>> = []
+var c_s_tykw_names: table<table<string>> = []
+var c_s_st_names: table<table<string>> = []
+var c_s_en_names: table<table<string>> = []
+var c_s_act_names: table<table<string>> = []
+var c_s_pt_names: table<table<string>> = []
+var c_val_cnt: table<i64> = []
+var c_cur_fn: table<string> = []
+
+func ensure_ctx0() {
+    if g_ctx_ready == 1 {
+        return
+    }
+    table_push(c_ir_funcs_names, ir_funcs_names)
+    table_push(c_ir_funcs_rets, ir_funcs_rets)
+    table_push(c_ir_funcs_params_off, ir_funcs_params_off)
+    table_push(c_ir_funcs_params_cnt, ir_funcs_params_cnt)
+    table_push(c_ir_funcs_params_tys_off, ir_funcs_params_tys_off)
+    table_push(c_ir_funcs_param_tys, ir_funcs_param_tys)
+    table_push(c_ir_funcs_entry, ir_funcs_entry)
+    table_push(c_ir_funcs_inst_total, ir_funcs_inst_total)
+    table_push(c_ir_funcs_exported, ir_funcs_exported)
+    table_push(c_ir_funcs_inline, ir_funcs_inline)
+    table_push(c_ir_blocks_func, ir_blocks_func)
+    table_push(c_ir_blocks_name, ir_blocks_name)
+    table_push(c_ir_blocks_start, ir_blocks_start)
+    table_push(c_ir_blocks_end, ir_blocks_end)
+    table_push(c_ir_insts_op, ir_insts_op)
+    table_push(c_ir_insts_ty, ir_insts_ty)
+    table_push(c_ir_insts_val, ir_insts_val)
+    table_push(c_ir_insts_ops_off, ir_insts_ops_off)
+    table_push(c_ir_insts_ops_cnt, ir_insts_ops_cnt)
+    table_push(c_ir_ops, ir_ops)
+    table_push(c_ir_ops_kind, ir_ops_kind)
+    table_push(c_t_nest_tbl_elems, nest_tbl_elems)
+    table_push(c_t_nest_map_vals, nest_map_vals)
+    table_push(c_t_nest_ptr_elems, nest_ptr_elems)
+    table_push(c_t_nest_slice_elems, nest_slice_elems)
+    table_push(c_t_nest_atomic_elems, nest_atomic_elems)
+    table_push(c_t_nest_future_elems, nest_future_elems)
+    table_push(c_t_nest_arr_elems, nest_arr_elems)
+    table_push(c_t_nest_arr_lens, nest_arr_lens)
+    table_push(c_t_fn_ret, fn_ret)
+    table_push(c_t_fn_nparams, fn_nparams)
+    table_push(c_t_fn_paroff, fn_paroff)
+    table_push(c_t_fn_params, fn_params)
+    table_push(c_t_fn_param_refs, fn_param_refs)
+    table_push(c_t_fn_has_var, fn_has_var)
+    table_push(c_t_tuple_tys, tuple_tys)
+    table_push(c_t_tup_names, tup_names)
+    table_push(c_t_tup_tys, tup_tys)
+    table_push(c_t_tup_offs, tup_offs)
+    table_push(c_t_tup_n, tup_n)
+    table_push(c_t_st_keys, st_keys)
+    table_push(c_t_st_vals, st_vals)
+    table_push(c_t_en_keys, en_keys)
+    table_push(c_t_en_vals, en_vals)
+    table_push(c_t_cls_parent, cls_parent)
+    table_push(c_t_cls_fldoff, cls_fldoff)
+    table_push(c_t_cls_nfld, cls_nfld)
+    table_push(c_t_cls_done, cls_done)
+    table_push(c_t_fld_names, fld_names)
+    table_push(c_t_fld_tys, fld_tys)
+    table_push(c_t_fld_defs, fld_defs)
+    table_push(c_t_fn_keys, fn_keys)
+    table_push(c_t_fn_vals, fn_vals)
+    table_push(c_t_fn_def_nodes, fn_def_nodes)
+    table_push(c_t_en_done, en_done)
+    table_push(c_t_en_nvar, en_nvar)
+    table_push(c_t_en_varoff, en_varoff)
+    table_push(c_t_en_nslot, en_nslot)
+    table_push(c_t_en_vnames, en_vnames)
+    table_push(c_t_en_vtags, en_vtags)
+    table_push(c_t_en_vfldoff, en_vfldoff)
+    table_push(c_t_en_vnfld, en_vnfld)
+    table_push(c_t_en_ftys, en_ftys)
+    table_push(c_s_tykw_names, tykw_names)
+    table_push(c_s_st_names, st_names)
+    table_push(c_s_en_names, en_names)
+    table_push(c_s_act_names, act_names)
+    table_push(c_s_pt_names, pt_names)
+    table_push(c_val_cnt, ir_val_cnt)
+    table_push(c_cur_fn, ir_cur_fn)
+    g_ctx_ready = 1
+}
 
 pub func ctx_new() -> i64 {
-    return g_ctx_cur
+    ensure_ctx0()
+    table_push(c_ir_funcs_names, table_new_i64())
+    table_push(c_ir_funcs_rets, table_new_i64())
+    table_push(c_ir_funcs_params_off, table_new_i64())
+    table_push(c_ir_funcs_params_cnt, table_new_i64())
+    table_push(c_ir_funcs_params_tys_off, table_new_i64())
+    table_push(c_ir_funcs_param_tys, table_new_i64())
+    table_push(c_ir_funcs_entry, table_new_i64())
+    table_push(c_ir_funcs_inst_total, table_new_i64())
+    table_push(c_ir_funcs_exported, table_new_i64())
+    table_push(c_ir_funcs_inline, table_new_i64())
+    table_push(c_ir_blocks_func, table_new_i64())
+    table_push(c_ir_blocks_name, table_new_i64())
+    table_push(c_ir_blocks_start, table_new_i64())
+    table_push(c_ir_blocks_end, table_new_i64())
+    table_push(c_ir_insts_op, table_new_i64())
+    table_push(c_ir_insts_ty, table_new_i64())
+    table_push(c_ir_insts_val, table_new_i64())
+    table_push(c_ir_insts_ops_off, table_new_i64())
+    table_push(c_ir_insts_ops_cnt, table_new_i64())
+    table_push(c_ir_ops, table_new_i64())
+    table_push(c_ir_ops_kind, table_new_i64())
+    table_push(c_t_nest_tbl_elems, table_new_i64())
+    table_push(c_t_nest_map_vals, table_new_i64())
+    table_push(c_t_nest_ptr_elems, table_new_i64())
+    table_push(c_t_nest_slice_elems, table_new_i64())
+    table_push(c_t_nest_atomic_elems, table_new_i64())
+    table_push(c_t_nest_future_elems, table_new_i64())
+    table_push(c_t_nest_arr_elems, table_new_i64())
+    table_push(c_t_nest_arr_lens, table_new_i64())
+    table_push(c_t_fn_ret, table_new_i64())
+    table_push(c_t_fn_nparams, table_new_i64())
+    table_push(c_t_fn_paroff, table_new_i64())
+    table_push(c_t_fn_params, table_new_i64())
+    table_push(c_t_fn_param_refs, table_new_i64())
+    table_push(c_t_fn_has_var, table_new_i64())
+    table_push(c_t_tuple_tys, table_new_i64())
+    table_push(c_t_tup_names, table_new_i64())
+    table_push(c_t_tup_tys, table_new_i64())
+    table_push(c_t_tup_offs, table_new_i64())
+    table_push(c_t_tup_n, table_new_i64())
+    table_push(c_t_st_keys, table_new_i64())
+    table_push(c_t_st_vals, table_new_i64())
+    table_push(c_t_en_keys, table_new_i64())
+    table_push(c_t_en_vals, table_new_i64())
+    table_push(c_t_cls_parent, table_new_i64())
+    table_push(c_t_cls_fldoff, table_new_i64())
+    table_push(c_t_cls_nfld, table_new_i64())
+    table_push(c_t_cls_done, table_new_i64())
+    table_push(c_t_fld_names, table_new_i64())
+    table_push(c_t_fld_tys, table_new_i64())
+    table_push(c_t_fld_defs, table_new_i64())
+    table_push(c_t_fn_keys, table_new_i64())
+    table_push(c_t_fn_vals, table_new_i64())
+    table_push(c_t_fn_def_nodes, table_new_i64())
+    table_push(c_t_en_done, table_new_i64())
+    table_push(c_t_en_nvar, table_new_i64())
+    table_push(c_t_en_varoff, table_new_i64())
+    table_push(c_t_en_nslot, table_new_i64())
+    table_push(c_t_en_vnames, table_new_i64())
+    table_push(c_t_en_vtags, table_new_i64())
+    table_push(c_t_en_vfldoff, table_new_i64())
+    table_push(c_t_en_vnfld, table_new_i64())
+    table_push(c_t_en_ftys, table_new_i64())
+    table_push(c_s_tykw_names, table_new_string())
+    table_push(c_s_st_names, table_new_string())
+    table_push(c_s_en_names, table_new_string())
+    table_push(c_s_act_names, table_new_string())
+    table_push(c_s_pt_names, table_new_string())
+    table_push(c_val_cnt, 0)
+    table_push(c_cur_fn, "")
+    var id = len(c_cur_fn) - 1
+    ctx_bind(id)
+    return id
 }
 
 pub func ctx_current() -> i64 {
@@ -17,17 +236,92 @@ pub func ctx_current() -> i64 {
 }
 
 pub func ctx_bind(id: i64) -> i64 {
-    if id <= 0 {
+    if g_ctx_ready == 0 {
+        if id == 0 {
+            g_ctx_cur = 0
+            return 0
+        }
         return -1
     }
-    if id != g_ctx_cur {
+    if id < 0 || id >= len(c_cur_fn) {
         return -1
     }
+    ir_funcs_names = c_ir_funcs_names[id]
+    ir_funcs_rets = c_ir_funcs_rets[id]
+    ir_funcs_params_off = c_ir_funcs_params_off[id]
+    ir_funcs_params_cnt = c_ir_funcs_params_cnt[id]
+    ir_funcs_params_tys_off = c_ir_funcs_params_tys_off[id]
+    ir_funcs_param_tys = c_ir_funcs_param_tys[id]
+    ir_funcs_entry = c_ir_funcs_entry[id]
+    ir_funcs_inst_total = c_ir_funcs_inst_total[id]
+    ir_funcs_exported = c_ir_funcs_exported[id]
+    ir_funcs_inline = c_ir_funcs_inline[id]
+    ir_blocks_func = c_ir_blocks_func[id]
+    ir_blocks_name = c_ir_blocks_name[id]
+    ir_blocks_start = c_ir_blocks_start[id]
+    ir_blocks_end = c_ir_blocks_end[id]
+    ir_insts_op = c_ir_insts_op[id]
+    ir_insts_ty = c_ir_insts_ty[id]
+    ir_insts_val = c_ir_insts_val[id]
+    ir_insts_ops_off = c_ir_insts_ops_off[id]
+    ir_insts_ops_cnt = c_ir_insts_ops_cnt[id]
+    ir_ops = c_ir_ops[id]
+    ir_ops_kind = c_ir_ops_kind[id]
+    nest_tbl_elems = c_t_nest_tbl_elems[id]
+    nest_map_vals = c_t_nest_map_vals[id]
+    nest_ptr_elems = c_t_nest_ptr_elems[id]
+    nest_slice_elems = c_t_nest_slice_elems[id]
+    nest_atomic_elems = c_t_nest_atomic_elems[id]
+    nest_future_elems = c_t_nest_future_elems[id]
+    nest_arr_elems = c_t_nest_arr_elems[id]
+    nest_arr_lens = c_t_nest_arr_lens[id]
+    fn_ret = c_t_fn_ret[id]
+    fn_nparams = c_t_fn_nparams[id]
+    fn_paroff = c_t_fn_paroff[id]
+    fn_params = c_t_fn_params[id]
+    fn_param_refs = c_t_fn_param_refs[id]
+    fn_has_var = c_t_fn_has_var[id]
+    tuple_tys = c_t_tuple_tys[id]
+    tup_names = c_t_tup_names[id]
+    tup_tys = c_t_tup_tys[id]
+    tup_offs = c_t_tup_offs[id]
+    tup_n = c_t_tup_n[id]
+    st_keys = c_t_st_keys[id]
+    st_vals = c_t_st_vals[id]
+    en_keys = c_t_en_keys[id]
+    en_vals = c_t_en_vals[id]
+    cls_parent = c_t_cls_parent[id]
+    cls_fldoff = c_t_cls_fldoff[id]
+    cls_nfld = c_t_cls_nfld[id]
+    cls_done = c_t_cls_done[id]
+    fld_names = c_t_fld_names[id]
+    fld_tys = c_t_fld_tys[id]
+    fld_defs = c_t_fld_defs[id]
+    fn_keys = c_t_fn_keys[id]
+    fn_vals = c_t_fn_vals[id]
+    fn_def_nodes = c_t_fn_def_nodes[id]
+    en_done = c_t_en_done[id]
+    en_nvar = c_t_en_nvar[id]
+    en_varoff = c_t_en_varoff[id]
+    en_nslot = c_t_en_nslot[id]
+    en_vnames = c_t_en_vnames[id]
+    en_vtags = c_t_en_vtags[id]
+    en_vfldoff = c_t_en_vfldoff[id]
+    en_vnfld = c_t_en_vnfld[id]
+    en_ftys = c_t_en_ftys[id]
+    tykw_names = c_s_tykw_names[id]
+    st_names = c_s_st_names[id]
+    en_names = c_s_en_names[id]
+    act_names = c_s_act_names[id]
+    pt_names = c_s_pt_names[id]
+    ir_val_cnt = c_val_cnt[id]
+    ir_cur_fn = c_cur_fn[id]
+    g_ctx_cur = id
     return 0
 }
 
 pub func ctx_free(id: i64) -> i64 {
-    if id != g_ctx_cur {
+    if id <= 0 || id >= len(c_cur_fn) {
         return -1
     }
     return 0
