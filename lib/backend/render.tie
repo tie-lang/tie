@@ -1,13 +1,25 @@
 type tie<class>
 import "./llvmgen.tie"
+import "../ir/context.tie"
 namespace tie.backend;
 // render.tie —— 后端公共面：IR → LLVM IR 文本。
 // 工具只经此入口使用后端；llvmgen 的内部符号不外泄。
+// 上下文：第一步为单实例，ctx_bind 只校验当前 id；第二步再分桶。
 
-pub func render() -> string {
+var g_err: string = ""
+
+pub func render(ctx: i64) -> string {
+    if ir.ctx_bind(ctx) != 0 {
+        g_err = "无效的 IR 上下文"
+        return ""
+    }
+    g_err = ""
     return llvmgen.emit()
 }
 
 pub func last_error() -> string {
+    if str_len(g_err) > 0 {
+        return g_err
+    }
     return llvmgen.err_msg()
 }
