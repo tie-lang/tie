@@ -1,4 +1,5 @@
 type tie<class>
+import "../../../../lib/backend/render.tie"
 // compiler/driver/pipeline.tie —— driver 编译管线（kpass 序列 / 后端驱动）子模块
 // ============================================================
 // 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
@@ -432,14 +433,14 @@ pub func kpass_emit() -> i64 {
         var t3 = clock()
     }
     llvmgen.set_entry(sstate.g_entry_name)
-    var ll_text = llvmgen.emit()
+    var ll_text = tie.backend::render()
     unsafe {
         var t3e = clock()
     }
     g_t_emit = t3e - t3
     // r.1.4.4：未支持指令硬错误——不再静默降级为占位注释继续链接
-    if str_len(llvmgen.err_msg()) > 0 {
-        dbg_txt(diagcode.render_error(-1, -1, "代码生成失败: " + llvmgen.err_msg()))
+    if str_len(tie.backend::last_error()) > 0 {
+        dbg_txt(diagcode.render_error(-1, -1, "代码生成失败: " + tie.backend::last_error()))
         return 1
     }
     // IR 文件路径（p.9.15.4：统一由 driver.ir_path 给；--emit-ir 落用户路径，
