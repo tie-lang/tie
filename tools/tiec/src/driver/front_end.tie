@@ -6,6 +6,7 @@ type tie<class>
 // 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
 // 风格 ns：函数在 `namespace driver` 内，一律 pub（driver 库 API 面）；
 // 主文件顶层 main() 以 driver.<名>() 调用。
+import "../../../../lib/front/api.tie"
 namespace driver {
 pub func frontend(src: string, base_dir: string) -> i64 {
     // T5.3 内存版：parse_ast 返回 0/-1（成功时 AST 在 ast 节点池内存），
@@ -17,12 +18,9 @@ pub func frontend(src: string, base_dir: string) -> i64 {
     // 告知 parser —— 只有 parser 知道「本文件」的边界（`parse_ast` 仅对主输入文件
     // 调用；import 的模块走语义层另一条路径），故文件级授权在 parser 内展开为
     // 「本文件每个函数隐式持 lock 域」，范围天然精确、不会波及 import 的模块。
-    sstate.compile_unit_reset()
-    sstate.set_file_caps(driver.role_unsafe_caps())
     // 2026-10-07：文件级不安全上下文（`type tie<角色, unsafe>`）与域凭据并行登记。
     // 由 cap_apply_file 落到**本文件**的每个函数上 ⇒ 范围精确，不波及 import 的模块。
-    sstate.set_file_uctx(driver.role_has_bare_unsafe())
-    var prc = parser.parse_ast(src)
+    var prc = tie.front::parse(src, driver.role_unsafe_caps(), driver.role_has_bare_unsafe())
     unsafe {
         var t0e = clock()
     }
@@ -43,11 +41,9 @@ pub func frontend(src: string, base_dir: string) -> i64 {
     diagcode.warn_unreg_reset()
     // p.9.14.2 独立警告 pass：把前端警告开关传给 semantic（-w 开启、默认只报错）。
     // 必须在 check_ast 之前设置——语义侧警告收集/遍历全程由该开关门控。
-    semantic.set_warn_enabled(g_front_warn)
     // p.9.21.4 II1 可见性梯度：把 CLI 档位传给语义层（默认 1 = A1b = 历史行为）。
     // 必须在 check_ast 之前设置——check_visibility 在调用解析点全程消费该档位。
-    sstate.set_visibility(g_cli_visibility)
-    var sem = semantic.check_ast(base_dir)
+    var sem = tie.front::check(base_dir, g_front_warn, g_cli_visibility)
     unsafe {
         var t1e = clock()
     }

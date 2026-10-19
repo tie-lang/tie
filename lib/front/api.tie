@@ -1,0 +1,20 @@
+type tie<class>
+import "./parser.tie"
+import "./semantic.tie"
+import "./sstate.tie"
+namespace tie.front;
+// api.tie —— 前端库公共面：单元复位 + 解析 + 语义检查。
+// 调用方只传参数，不再直接触碰 parser/semantic/sstate 的入口状态。
+
+pub func parse(src: string, caps: i64, uctx: i64) -> i64 {
+    sstate.compile_unit_reset()
+    sstate.set_file_caps(caps)
+    sstate.set_file_uctx(uctx)
+    return parser.parse_ast(src)
+}
+
+pub func check(base_dir: string, warn: bool, visibility: i64) -> string {
+    semantic.set_warn_enabled(warn)
+    sstate.set_visibility(visibility)
+    return semantic.check_ast(base_dir)
+}
