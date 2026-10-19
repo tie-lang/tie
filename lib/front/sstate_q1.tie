@@ -842,12 +842,12 @@ pub func scan_file_unsafe(src: string) -> i64 {
         }
         var ln = trim(str.slice(src, pos, ln_e))
         if str_len(ln) > 0 {
-            if has_prefix(str.clone(ln), "type tie") {
-                var lt = find_char(str.clone(ln), "<")
-                var gt = find_char(str.clone(ln), ">")
+            if tie.support::has_prefix(str.clone(ln), "type tie") {
+                var lt = tie.support::find_char(str.clone(ln), "<")
+                var gt = tie.support::find_char(str.clone(ln), ">")
                 if lt >= 0 && gt > lt {
-                    var inner = slice(str.clone(ln), lt + 1, gt)
-                    var parts = split_char(inner, ",")
+                    var inner = tie.support::slice(str.clone(ln), lt + 1, gt)
+                    var parts = tie.support::split_char(inner, ",")
                     var i: i64 = 0
                     while i < len(parts) {
                         // 只认**恰好** `unsafe` 的项；`unsafe:域` 是另一回事（域凭据，
@@ -897,18 +897,18 @@ pub func scan_file_caps(src: string) -> i64 {
         }
         var ln = trim(str.slice(src, pos, ln_e))
         if str_len(ln) > 0 {
-            if has_prefix(str.clone(ln), "type tie") {
+            if tie.support::has_prefix(str.clone(ln), "type tie") {
                 // 取尖括号内的角色列表
-                var lt = find_char(str.clone(ln), "<")
-                var gt = find_char(str.clone(ln), ">")
+                var lt = tie.support::find_char(str.clone(ln), "<")
+                var gt = tie.support::find_char(str.clone(ln), ">")
                 if lt >= 0 && gt > lt {
-                    var inner = slice(str.clone(ln), lt + 1, gt)
-                    var parts = split_char(inner, ",")
+                    var inner = tie.support::slice(str.clone(ln), lt + 1, gt)
+                    var parts = tie.support::split_char(inner, ",")
                     var i: i64 = 0
                     while i < len(parts) {
                         var it = trim(parts[i])
-                        if has_prefix(str.clone(it), "unsafe:") && str_len(it) > 7 {
-                            out = out | types.cap_bit_of(slice(str.clone(it), 7, str_len(it)))
+                        if tie.support::has_prefix(str.clone(it), "unsafe:") && str_len(it) > 7 {
+                            out = out | types.cap_bit_of(tie.support::slice(str.clone(it), 7, str_len(it)))
                         }
                         i = i + 1
                     }

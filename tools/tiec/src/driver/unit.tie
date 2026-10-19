@@ -77,7 +77,7 @@ pub func run_unit() -> i64 {
     // 必须在 file_read（文本读取）之前按文件名后缀预判并直接短接——二进制
     // 内容文本解码必然失败/乱码。zd 文件由 tiedb compact/decompress 原语处理。
     var zd_len: i64 = str_len(g_input)
-    if zd_len >= 7 && slice(str.clone(g_input), zd_len - 7, zd_len) == ".zd.tie" {
+    if zd_len >= 7 && tie.support::slice(str.clone(g_input), zd_len - 7, zd_len) == ".zd.tie" {
         dbg_txt("[预处理] 识别为 zd 压缩数据文件（头: " + g_input + "），tie:data 压缩格式，用 tiedb compact/decompress 处理")
         return 0
     }
@@ -85,7 +85,7 @@ pub func run_unit() -> i64 {
     // 运行）。不短接（须走 file_read + 头部扫描验证 type tie<tsh>）；此处按扩展名
     // 预写角色，保证在头部缺失/不一致时仍按 tsh 分派，也满足 R3 文件名-头部一致性。
     var tsh_len: i64 = str_len(g_input)
-    if tsh_len >= 8 && slice(str.clone(g_input), tsh_len - 8, tsh_len) == ".tsh.tie" {
+    if tsh_len >= 8 && tie.support::slice(str.clone(g_input), tsh_len - 8, tsh_len) == ".tsh.tie" {
         g_role = "tsh"
     }
     var src = file_read(g_input)
@@ -127,7 +127,7 @@ pub func run_unit() -> i64 {
     // 文件的预处理（expand_one_import）复用同一 target/profile 判据。
     semantic.set_cfg_env(cfg_target, cfg_profile)
     var pruned = cfgpre.preprocess(src, cfg_target, cfg_profile)
-    if has_prefix(str.clone(pruned), "ERR:") {
+    if tie.support::has_prefix(str.clone(pruned), "ERR:") {
         dbg_txt(diagcode.render_err_proto(pruned))
         return 1
     }
@@ -143,7 +143,7 @@ pub func run_unit() -> i64 {
 
     // 剥离头部声明行（`type tie` / `type tie<X>` 是真语法行，须从正文移除；
     // 旧 `// tie:` 是注释由 lexer 跳过，无需处理）
-    var clean = strip_type_header(src)
+    var clean = tie.support::strip_type_header(src)
     // p.9.11.29：--dump-docs 短路——解析后输出 doc 注释注册表摘要（不编译）。
     // 修复 2026-09-29：原短路置于头部剥离之前，对任何含规范 §1.1 头部的文件
     // （`type tie<X>` 为真语法行、必须位于文件最前）一律 E00000 解析失败，故

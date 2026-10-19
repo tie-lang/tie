@@ -67,7 +67,7 @@ pub func base_dir_of(p: string) -> string {
     while i >= 0 {
         var c = str_char(p, i)
         if c == "/" || c == "\\" {
-            return slice(p, 0, i)
+            return tie.support::slice(p, 0, i)
         }
         i = i - 1
     }
@@ -90,7 +90,7 @@ pub func dir_of(path: string) -> string {
     if last < 0 {
         return ""
     }
-    var d = slice(path, 0, last + 1)
+    var d = tie.support::slice(path, 0, last + 1)
     var sb = string_builder()
     var j: i64 = 0
     while j < str_len(d) {
@@ -119,7 +119,7 @@ pub func replace_ext(path: string, new_ext: string) -> string {
     }
     var base: string = str.clone(path)
     if last_dot > 0 {
-        base = slice(path, 0, last_dot)
+        base = tie.support::slice(path, 0, last_dot)
     }
     // r.1.6.1：空后缀（Linux 可执行文件无扩展名）→ 返回去扩展名的基名，不带尾点
     if str_len(new_ext) == 0 {
@@ -143,7 +143,7 @@ pub func file_name_of(path: string) -> string {
     if last < 0 {
         return path
     }
-    return slice(path, last + 1, n)
+    return tie.support::slice(path, last + 1, n)
 }
 
 pub func role_from_filename(name: string) -> string {
@@ -166,13 +166,13 @@ pub func role_from_filename(name: string) -> string {
     if first_dot < 0 || last_dot <= first_dot {
         return ""
     }
-    if slice(str.clone(name), last_dot + 1, n) != "tie" {
+    if tie.support::slice(str.clone(name), last_dot + 1, n) != "tie" {
         return ""
     }
-    var role = slice(name, first_dot + 1, last_dot)
+    var role = tie.support::slice(name, first_dot + 1, last_dot)
     // F1 连字符拆分：第一段（或从后往前找到的角色段）= 基础角色；
     // 其后的连字符段 = 参数（紧跟基础）或修饰（与头部 parse_role_decl 对齐）
-    var segs = split_char(role, "-")
+    var segs = tie.support::split_char(role, "-")
     var base = segs[0]
     var base_idx: i64 = 0
     if !driver.is_valid_base_role(str.clone(base)) {
@@ -228,13 +228,13 @@ pub func detect_shared_mode() -> bool {
 func has_dll_so_ext(path: string) -> bool {
     var n: i64 = str_len(path)
     if n >= 4 {
-        var tail4 = slice(str.clone(path), n - 4, n)
+        var tail4 = tie.support::slice(str.clone(path), n - 4, n)
         if tail4 == ".dll" || tail4 == ".DLL" {
             return true
         }
     }
     if n >= 3 {
-        var tail3 = slice(str.clone(path), n - 3, n)
+        var tail3 = tie.support::slice(str.clone(path), n - 3, n)
         if tail3 == ".so" || tail3 == ".SO" {
             return true
         }
@@ -247,7 +247,7 @@ pub func is_linux_target(target: string) -> bool {
     var n: i64 = str_len(target)
     var i: i64 = 0
     while i <= n - 5 {
-        if slice(str.clone(target), i, i + 5) == "linux" {
+        if tie.support::slice(str.clone(target), i, i + 5) == "linux" {
             return true
         }
         i = i + 1
