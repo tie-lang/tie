@@ -157,18 +157,18 @@ pub func load_ast(ast_text: string) -> i64 {
     var cnt = parse_dec(str.slice(head, 0, str_len(head) - 1))
     s_n = cnt
     // 预分配 9 列（push -1 占位，避免后续超界）
-    s_tags = table_new_i64()
-    s_names = table_new_i64()
-    s_vals = table_new_i64()
-    s_aux = table_new_i64()
-    s_coff = table_new_i64()
-    s_nchild = table_new_i64()
-    s_children = table_new_i64()
-    s_lines = table_new_i64()
-    s_cols = table_new_i64()
-    node_types = table_new_i64()
-    g_cmp_getter = table_new_i64()
-    g_cmp_setter = table_new_i64()
+    table_trunc(s_tags, 0)
+    table_trunc(s_names, 0)
+    table_trunc(s_vals, 0)
+    table_trunc(s_aux, 0)
+    table_trunc(s_coff, 0)
+    table_trunc(s_nchild, 0)
+    table_trunc(s_children, 0)
+    table_trunc(s_lines, 0)
+    table_trunc(s_cols, 0)
+    table_trunc(node_types, 0)
+    table_trunc(g_cmp_getter, 0)
+    table_trunc(g_cmp_setter, 0)
     var k: i64 = 0
     while k < cnt {
         table_push(s_tags, 0)
@@ -217,7 +217,7 @@ pub func load_ast(ast_text: string) -> i64 {
         j = j + 1
     }
     // 二次扫描：填充 s_children
-    s_children = table_new_i64()
+    table_trunc(s_children, 0)
     var z: i64 = 0
     while z < off {
         table_push(s_children, 0)
@@ -448,8 +448,8 @@ pub func name_str(id: i64) -> string {
 // 每函数（scheck.check_fn）重置——清空集合；check_fn 参数循环对 immut 形参
 // 逐一 im_insert 登记其变量名池 id。赋值/自增自减/字段&下标写经 im_is 拒绝。
 pub func im_reset() {
-    g_im_keys = table_new_i64()
-    g_im_vals = table_new_i64()
+    table_trunc(g_im_keys, 0)
+    table_trunc(g_im_vals, 0)
 }
 
 pub func im_insert(nid: i64) {
@@ -491,7 +491,7 @@ pub func im_name(nid: i64) -> string {
 // 为什么单列而不复用 im_*：immut 形参在主检查路径已被拒绝（写它直接报错），
 // 走到告警 pass 的只有**非 immut** 的普通按值形参——正是本告警的目标。
 pub func vp_reset() {
-    g_vp_keys = table_new_i64()
+    table_trunc(g_vp_keys, 0)
 }
 
 pub func vp_insert(nid: i64) {
@@ -526,7 +526,7 @@ pub func vp_is(nid: i64) -> bool {
 // 与 irgen r.1.6.14 retain 条件同源；move 形参被调方已取得所有权，其写入是
 // 对自己值的正常使用，不登记。
 pub func uwt_reset() {
-    g_uwt_keys = table_new_i64()
+    table_trunc(g_uwt_keys, 0)
 }
 
 pub func uwt_insert(nid: i64) {
@@ -949,74 +949,74 @@ pub func compile_unit_reset() {
     // 实测 149 个语言用例连编时出现假 E00903（行号指向本文件第 9 行）与
     // `irgen 未支持的表达式（tag=…）`（旧节点的 tag 撞进本单元节点空间）。
     // 对齐纪律：今后新增「单元级累加」的全局表，必须同时挂到这里。
-    cl_grefs = table_new_i64()
-    g_spawn_nodes = table_new_i64()
-    g_spawn_args = table_new_i64()
-    g_spawn_caps = table_new_i64()
-    g_spawn_unsafe = table_new_i64()
-    g_spawn_force = table_new_i64()
+    table_trunc(cl_grefs, 0)
+    table_trunc(g_spawn_nodes, 0)
+    table_trunc(g_spawn_args, 0)
+    table_trunc(g_spawn_caps, 0)
+    table_trunc(g_spawn_unsafe, 0)
+    table_trunc(g_spawn_force, 0)
     // actor 表（ac_*：方法/字段段式登记，索引与 types.BASE_ACTOR 行号对应）
-    ac_keys = table_new_i64()
-    ac_vals = table_new_i64()
-    ac_mnames = table_new_i64()
-    ac_fnames = table_new_i64()
-    ac_mpar = table_new_i64()
-    ac_mptys = table_new_i64()
-    ac_mret = table_new_i64()
-    ac_mrets = table_new_i64()
-    ac_fdefs = table_new_i64()
-    ac_ftys = table_new_i64()
-    ac_masync = table_new_i64()
-    ac_mreent = table_new_i64()
-    ac_mn = table_new_i64()
-    ac_fncnt = table_new_i64()
-    ac_foffs = table_new_i64()
-    ac_ftyoff = table_new_i64()
-    ac_fvoff = table_new_i64()
-    ac_moff = table_new_i64()
-    ac_mnpars = table_new_i64()
-    ac_paroff = table_new_i64()
-    ac_fnoff = table_new_i64()
+    table_trunc(ac_keys, 0)
+    table_trunc(ac_vals, 0)
+    table_trunc(ac_mnames, 0)
+    table_trunc(ac_fnames, 0)
+    table_trunc(ac_mpar, 0)
+    table_trunc(ac_mptys, 0)
+    table_trunc(ac_mret, 0)
+    table_trunc(ac_mrets, 0)
+    table_trunc(ac_fdefs, 0)
+    table_trunc(ac_ftys, 0)
+    table_trunc(ac_masync, 0)
+    table_trunc(ac_mreent, 0)
+    table_trunc(ac_mn, 0)
+    table_trunc(ac_fncnt, 0)
+    table_trunc(ac_foffs, 0)
+    table_trunc(ac_ftyoff, 0)
+    table_trunc(ac_fvoff, 0)
+    table_trunc(ac_moff, 0)
+    table_trunc(ac_mnpars, 0)
+    table_trunc(ac_paroff, 0)
+    table_trunc(ac_fnoff, 0)
     // struct 形状/表示类、泛型登记、move 分析、属性与凭据登记
-    struct_tys = table_new_i64()
-    st_reprc = table_new_i64()
-    gtyp_kinds = table_new_i64()
-    gtyp_kindoff = table_new_i64()
-    gval_kkeys = table_new_i64()
-    gval_kvals = table_new_i64()
-    lv_moved = table_new_i64()
-    g_uwt_keys = table_new_i64()
-    g_vp_keys = table_new_i64()
-    gen_marks = table_new_i64()
-    gr_dead = table_new_i64()
-    gr_rel = table_new_i64()
-    s_fn_attr_nodes = table_new_i64()
-    s_fn_attr_vals = table_new_i64()
-    s_fn_cap_nodes = table_new_i64()
-    s_fn_cap_vals = table_new_i64()
-    s_fn_uctx_nodes = table_new_i64()
-    s_fn_uctx_vals = table_new_i64()
-    s_imp_cap_nodes = table_new_i64()
-    s_imp_cap_vals = table_new_i64()
-    g_im_keys = table_new_i64()
-    g_im_vals = table_new_i64()
+    table_trunc(struct_tys, 0)
+    table_trunc(st_reprc, 0)
+    table_trunc(gtyp_kinds, 0)
+    table_trunc(gtyp_kindoff, 0)
+    table_trunc(gval_kkeys, 0)
+    table_trunc(gval_kvals, 0)
+    table_trunc(lv_moved, 0)
+    table_trunc(g_uwt_keys, 0)
+    table_trunc(g_vp_keys, 0)
+    table_trunc(gen_marks, 0)
+    table_trunc(gr_dead, 0)
+    table_trunc(gr_rel, 0)
+    table_trunc(s_fn_attr_nodes, 0)
+    table_trunc(s_fn_attr_vals, 0)
+    table_trunc(s_fn_cap_nodes, 0)
+    table_trunc(s_fn_cap_vals, 0)
+    table_trunc(s_fn_uctx_nodes, 0)
+    table_trunc(s_fn_uctx_vals, 0)
+    table_trunc(s_imp_cap_nodes, 0)
+    table_trunc(s_imp_cap_vals, 0)
+    table_trunc(g_im_keys, 0)
+    table_trunc(g_im_vals, 0)
     // 警告 pass 的行号/位置累加（w16 未修改绑定、w19 越界常量下标）
     // goto 标签/块表（scheck 侧登记）
-    g_cmp_getter = table_new_i64()
-    g_cmp_setter = table_new_i64()
+    table_trunc(g_cmp_getter, 0)
+    table_trunc(g_cmp_setter, 0)
     // 注解 / doc 注释登记
     // 文件级登记（import 展开 / idle 凭据 / 命名空间改名）
-    g_file_idle_auth = table_new_i64()
-    g_file_idle_used = table_new_i64()
-    g_file_stem = table_new_string()
-    g_ns_rename_old = table_new_string()
-    g_ns_rename_new = table_new_string()
-    g_extra_tops = table_new_i64()
-    g_imported = table_new_string()
-    g_file_roots = table_new_i64()
-    g_imp_alias_names = table_new_string()
-    g_imp_alias_paths = table_new_string()
-    tre_bi_vals = table_new_i64()
+    table_trunc(g_file_idle_auth, 0)
+    table_trunc(g_file_idle_used, 0)
+    table_trunc(g_file_stem, 0)
+    table_trunc(g_ns_rename_old, 0)
+    table_trunc(g_ns_rename_new, 0)
+    table_trunc(g_extra_tops, 0)
+    table_trunc(g_imported, 0)
+    table_trunc(g_file_roots, 0)
+    table_trunc(g_imp_alias_names, 0)
+    table_trunc(g_imp_alias_paths, 0)
+    table_trunc(tre_bi_vals, 0)
     fld_defs = table_new_i64()
 }
 
@@ -1045,8 +1045,8 @@ pub func is_addressable(id: i64) -> bool {
 // （如 datetime 内部裸引 time.now()）会因此断链。此处登记 旧名→新名，
 // 解析未命中时回退把旧名替换为新名再试——旧名与别名同时可解析。
 pub func ns_rename_reset() {
-    g_ns_rename_old = table_new_string()
-    g_ns_rename_new = table_new_string()
+    table_trunc(g_ns_rename_old, 0)
+    table_trunc(g_ns_rename_new, 0)
 }
 
 pub func ns_rename_add(old_nm: string, new_nm: string) {
@@ -1322,7 +1322,7 @@ pub func seg_has(seg: table<i64>, off: i64, n: i64, k: i64) -> i64 {
 
 // 重置 moved 状态（每函数开始时调用）
 pub func lv_moved_reset() {
-    lv_moved = table_new_i64()
+    table_trunc(lv_moved, 0)
     // r.1.6.7：凭据层级/撤销状态与 moved 状态同属函数级语义状态，生命周期一致，
     // 故共用本重置点（所有既有 moved 重置调用处自动覆盖，无需另开调用链）。
     gr_reset()

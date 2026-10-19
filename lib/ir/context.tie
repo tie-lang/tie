@@ -1,6 +1,6 @@
 type tie<class>
 namespace ir;
-// context.tie —— 多上下文：每个 ctx 一套 IR + 类型/符号表（表装表 + 引用切换）
+// context.tie —— 多上下文：每个 ctx 一套 IR + 类型/符号 + sstate 表（表装表 + 引用切换）
 // ctx 0 = 当前默认表（惰性登记）；ctx_new 建新套并绑定。
 
 var g_ctx_cur: i64 = 0
@@ -74,6 +74,174 @@ var c_s_st_names: table<table<string>> = []
 var c_s_en_names: table<table<string>> = []
 var c_s_act_names: table<table<string>> = []
 var c_s_pt_names: table<table<string>> = []
+var c_f_s_tags: table<table<i64>> = []
+var c_f_s_names: table<table<i64>> = []
+var c_f_s_vals: table<table<i64>> = []
+var c_f_s_aux: table<table<i64>> = []
+var c_f_s_coff: table<table<i64>> = []
+var c_f_s_nchild: table<table<i64>> = []
+var c_f_s_children: table<table<i64>> = []
+var c_f_s_lines: table<table<i64>> = []
+var c_f_s_cols: table<table<i64>> = []
+var c_f_s_fn_cap_nodes: table<table<i64>> = []
+var c_f_s_fn_cap_vals: table<table<i64>> = []
+var c_f_s_imp_cap_nodes: table<table<i64>> = []
+var c_f_s_imp_cap_vals: table<table<i64>> = []
+var c_f_s_fn_uctx_nodes: table<table<i64>> = []
+var c_f_s_fn_uctx_vals: table<table<i64>> = []
+var c_f_s_fn_attr_nodes: table<table<i64>> = []
+var c_f_s_fn_attr_vals: table<table<i64>> = []
+var c_f_g_file_idle_auth: table<table<i64>> = []
+var c_f_g_file_idle_used: table<table<i64>> = []
+var c_f_sg_nparams: table<table<i64>> = []
+var c_f_sg_required: table<table<i64>> = []
+var c_f_sg_ret: table<table<i64>> = []
+var c_f_sg_pub: table<table<i64>> = []
+var c_f_sg_off: table<table<i64>> = []
+var c_f_sg_defnode: table<table<i64>> = []
+var c_f_sp_tys: table<table<i64>> = []
+var c_f_sp_refs: table<table<i64>> = []
+var c_f_sp_defs: table<table<i64>> = []
+var c_f_sp_vars: table<table<i64>> = []
+var c_f_gen_marks: table<table<i64>> = []
+var c_f_g_im_keys: table<table<i64>> = []
+var c_f_g_im_vals: table<table<i64>> = []
+var c_f_g_vp_keys: table<table<i64>> = []
+var c_f_g_uwt_keys: table<table<i64>> = []
+var c_f_alias_keys: table<table<i64>> = []
+var c_f_alias_vals: table<table<i64>> = []
+var c_f_st_reprc: table<table<i64>> = []
+var c_f_gb_keys: table<table<i64>> = []
+var c_f_gb_vals: table<table<i64>> = []
+var c_f_gb_const: table<table<i64>> = []
+var c_f_gb_telem: table<table<i64>> = []
+var c_f_ext_keys: table<table<i64>> = []
+var c_f_tre_keys: table<table<i64>> = []
+var c_f_tre_vals: table<table<i64>> = []
+var c_f_node_types: table<table<i64>> = []
+var c_f_g_cmp_getter: table<table<i64>> = []
+var c_f_g_cmp_setter: table<table<i64>> = []
+var c_f_lv_keys: table<table<i64>> = []
+var c_f_lv_vals: table<table<i64>> = []
+var c_f_lv_const: table<table<i64>> = []
+var c_f_lv_telem: table<table<i64>> = []
+var c_f_lv_dyn: table<table<i64>> = []
+var c_f_lv_moved: table<table<i64>> = []
+var c_f_gr_rel: table<table<i64>> = []
+var c_f_gr_dead: table<table<i64>> = []
+var c_f_lp_stack: table<table<i64>> = []
+var c_f_ns_stack: table<table<i64>> = []
+var c_f_using_prefixes: table<table<i64>> = []
+var c_f_using_lens: table<table<i64>> = []
+var c_f_tre_bi_keys: table<table<i64>> = []
+var c_f_tre_bi_vals: table<table<i64>> = []
+var c_f_struct_tys: table<table<i64>> = []
+var c_f_gty_keys: table<table<i64>> = []
+var c_f_gty_vals: table<table<i64>> = []
+var c_f_gty_full: table<table<i64>> = []
+var c_f_gtyp_nparams: table<table<i64>> = []
+var c_f_gtyp_off: table<table<i64>> = []
+var c_f_gtyp_names: table<table<i64>> = []
+var c_f_gty_node: table<table<i64>> = []
+var c_f_gty_is_struct: table<table<i64>> = []
+var c_f_gtyp_conoff: table<table<i64>> = []
+var c_f_gtyp_cons: table<table<i64>> = []
+var c_f_gtyp_kindoff: table<table<i64>> = []
+var c_f_gtyp_kinds: table<table<i64>> = []
+var c_f_gval_kkeys: table<table<i64>> = []
+var c_f_gval_kvals: table<table<i64>> = []
+var c_f_gtyp_defoff: table<table<i64>> = []
+var c_f_gtyp_defs: table<table<i64>> = []
+var c_f_gin_keys: table<table<i64>> = []
+var c_f_gin_vals: table<table<i64>> = []
+var c_f_gin_tmpl: table<table<i64>> = []
+var c_f_gin_off: table<table<i64>> = []
+var c_f_gin_nargs: table<table<i64>> = []
+var c_f_gin_is_struct: table<table<i64>> = []
+var c_f_garg_vals: table<table<i64>> = []
+var c_f_g_clo_pending: table<table<i64>> = []
+var c_f_cl_owner_sig: table<table<i64>> = []
+var c_f_cl_owner_unsafe: table<table<i64>> = []
+var c_f_cl_ret: table<table<i64>> = []
+var c_f_cl_nparams: table<table<i64>> = []
+var c_f_cl_paroff: table<table<i64>> = []
+var c_f_cl_ptys: table<table<i64>> = []
+var c_f_cl_off: table<table<i64>> = []
+var c_f_cl_nouter: table<table<i64>> = []
+var c_f_cl_okeys: table<table<i64>> = []
+var c_f_cl_ovals: table<table<i64>> = []
+var c_f_cl_oconst: table<table<i64>> = []
+var c_f_cl_otelem: table<table<i64>> = []
+var c_f_cl_odyn: table<table<i64>> = []
+var c_f_cl_paramoff: table<table<i64>> = []
+var c_f_cl_params: table<table<i64>> = []
+var c_f_cl_locloff: table<table<i64>> = []
+var c_f_cl_locals: table<table<i64>> = []
+var c_f_cl_capoff: table<table<i64>> = []
+var c_f_cl_grefs: table<table<i64>> = []
+var c_f_g_spawn_nodes: table<table<i64>> = []
+var c_f_g_spawn_args: table<table<i64>> = []
+var c_f_g_spawn_caps: table<table<i64>> = []
+var c_f_g_spawn_unsafe: table<table<i64>> = []
+var c_f_g_spawn_force: table<table<i64>> = []
+var c_f_cl_capkeys: table<table<i64>> = []
+var c_f_cl_capvals: table<table<i64>> = []
+var c_f_g_clo_ret_stack: table<table<i64>> = []
+var c_f_cl_parent: table<table<i64>> = []
+var c_f_ac_keys: table<table<i64>> = []
+var c_f_ac_vals: table<table<i64>> = []
+var c_f_ac_moff: table<table<i64>> = []
+var c_f_ac_mn: table<table<i64>> = []
+var c_f_ac_mpar: table<table<i64>> = []
+var c_f_ac_paroff: table<table<i64>> = []
+var c_f_ac_mret: table<table<i64>> = []
+var c_f_ac_mnames: table<table<i64>> = []
+var c_f_ac_mnpars: table<table<i64>> = []
+var c_f_ac_mptys: table<table<i64>> = []
+var c_f_ac_mrets: table<table<i64>> = []
+var c_f_ac_masync: table<table<i64>> = []
+var c_f_ac_mreent: table<table<i64>> = []
+var c_f_ac_fnoff: table<table<i64>> = []
+var c_f_ac_fncnt: table<table<i64>> = []
+var c_f_ac_ftyoff: table<table<i64>> = []
+var c_f_ac_fvoff: table<table<i64>> = []
+var c_f_ac_fnames: table<table<i64>> = []
+var c_f_ac_ftys: table<table<i64>> = []
+var c_f_ac_fdefs: table<table<i64>> = []
+var c_f_ac_foffs: table<table<i64>> = []
+var c_f_afn_keys: table<table<i64>> = []
+var c_f_afn_actor: table<table<i64>> = []
+var c_f_pt_keys: table<table<i64>> = []
+var c_f_pt_vals: table<table<i64>> = []
+var c_f_pm_off: table<table<i64>> = []
+var c_f_pm_n: table<table<i64>> = []
+var c_f_pm_npar: table<table<i64>> = []
+var c_f_pm_paroff: table<table<i64>> = []
+var c_f_pm_ret: table<table<i64>> = []
+var c_f_pm_names: table<table<i64>> = []
+var c_f_pm_npars: table<table<i64>> = []
+var c_f_pm_ptys: table<table<i64>> = []
+var c_f_pm_rets: table<table<i64>> = []
+var c_f_pm_iface: table<table<i64>> = []
+var c_f_im_keys: table<table<i64>> = []
+var c_f_im_vals: table<table<i64>> = []
+var c_f_im_port: table<table<i64>> = []
+var c_f_im_struct: table<table<i64>> = []
+var c_f_im_poff: table<table<i64>> = []
+var c_f_im_n: table<table<i64>> = []
+var c_f_im_mnames: table<table<i64>> = []
+var c_f_g_extra_tops: table<table<i64>> = []
+var c_f_g_file_roots: table<table<i64>> = []
+var c_f_g_file_base: table<table<i64>> = []
+var c_f_sg_mod: table<table<i64>> = []
+var c_f_gb_mod: table<table<i64>> = []
+var c_f_st_mod: table<table<i64>> = []
+var c_fs_g_imported: table<table<string>> = []
+var c_fs_g_imp_alias_names: table<table<string>> = []
+var c_fs_g_ns_rename_old: table<table<string>> = []
+var c_fs_g_ns_rename_new: table<table<string>> = []
+var c_fs_g_imp_alias_paths: table<table<string>> = []
+var c_fs_g_file_stem: table<table<string>> = []
 var c_val_cnt: table<i64> = []
 var c_cur_fn: table<string> = []
 
@@ -149,6 +317,174 @@ func ensure_ctx0() {
     table_push(c_s_en_names, en_names)
     table_push(c_s_act_names, act_names)
     table_push(c_s_pt_names, pt_names)
+    table_push(c_f_s_tags, s_tags)
+    table_push(c_f_s_names, s_names)
+    table_push(c_f_s_vals, s_vals)
+    table_push(c_f_s_aux, s_aux)
+    table_push(c_f_s_coff, s_coff)
+    table_push(c_f_s_nchild, s_nchild)
+    table_push(c_f_s_children, s_children)
+    table_push(c_f_s_lines, s_lines)
+    table_push(c_f_s_cols, s_cols)
+    table_push(c_f_s_fn_cap_nodes, s_fn_cap_nodes)
+    table_push(c_f_s_fn_cap_vals, s_fn_cap_vals)
+    table_push(c_f_s_imp_cap_nodes, s_imp_cap_nodes)
+    table_push(c_f_s_imp_cap_vals, s_imp_cap_vals)
+    table_push(c_f_s_fn_uctx_nodes, s_fn_uctx_nodes)
+    table_push(c_f_s_fn_uctx_vals, s_fn_uctx_vals)
+    table_push(c_f_s_fn_attr_nodes, s_fn_attr_nodes)
+    table_push(c_f_s_fn_attr_vals, s_fn_attr_vals)
+    table_push(c_f_g_file_idle_auth, g_file_idle_auth)
+    table_push(c_f_g_file_idle_used, g_file_idle_used)
+    table_push(c_f_sg_nparams, sg_nparams)
+    table_push(c_f_sg_required, sg_required)
+    table_push(c_f_sg_ret, sg_ret)
+    table_push(c_f_sg_pub, sg_pub)
+    table_push(c_f_sg_off, sg_off)
+    table_push(c_f_sg_defnode, sg_defnode)
+    table_push(c_f_sp_tys, sp_tys)
+    table_push(c_f_sp_refs, sp_refs)
+    table_push(c_f_sp_defs, sp_defs)
+    table_push(c_f_sp_vars, sp_vars)
+    table_push(c_f_gen_marks, gen_marks)
+    table_push(c_f_g_im_keys, g_im_keys)
+    table_push(c_f_g_im_vals, g_im_vals)
+    table_push(c_f_g_vp_keys, g_vp_keys)
+    table_push(c_f_g_uwt_keys, g_uwt_keys)
+    table_push(c_f_alias_keys, alias_keys)
+    table_push(c_f_alias_vals, alias_vals)
+    table_push(c_f_st_reprc, st_reprc)
+    table_push(c_f_gb_keys, gb_keys)
+    table_push(c_f_gb_vals, gb_vals)
+    table_push(c_f_gb_const, gb_const)
+    table_push(c_f_gb_telem, gb_telem)
+    table_push(c_f_ext_keys, ext_keys)
+    table_push(c_f_tre_keys, tre_keys)
+    table_push(c_f_tre_vals, tre_vals)
+    table_push(c_f_node_types, node_types)
+    table_push(c_f_g_cmp_getter, g_cmp_getter)
+    table_push(c_f_g_cmp_setter, g_cmp_setter)
+    table_push(c_f_lv_keys, lv_keys)
+    table_push(c_f_lv_vals, lv_vals)
+    table_push(c_f_lv_const, lv_const)
+    table_push(c_f_lv_telem, lv_telem)
+    table_push(c_f_lv_dyn, lv_dyn)
+    table_push(c_f_lv_moved, lv_moved)
+    table_push(c_f_gr_rel, gr_rel)
+    table_push(c_f_gr_dead, gr_dead)
+    table_push(c_f_lp_stack, lp_stack)
+    table_push(c_f_ns_stack, ns_stack)
+    table_push(c_f_using_prefixes, using_prefixes)
+    table_push(c_f_using_lens, using_lens)
+    table_push(c_f_tre_bi_keys, tre_bi_keys)
+    table_push(c_f_tre_bi_vals, tre_bi_vals)
+    table_push(c_f_struct_tys, struct_tys)
+    table_push(c_f_gty_keys, gty_keys)
+    table_push(c_f_gty_vals, gty_vals)
+    table_push(c_f_gty_full, gty_full)
+    table_push(c_f_gtyp_nparams, gtyp_nparams)
+    table_push(c_f_gtyp_off, gtyp_off)
+    table_push(c_f_gtyp_names, gtyp_names)
+    table_push(c_f_gty_node, gty_node)
+    table_push(c_f_gty_is_struct, gty_is_struct)
+    table_push(c_f_gtyp_conoff, gtyp_conoff)
+    table_push(c_f_gtyp_cons, gtyp_cons)
+    table_push(c_f_gtyp_kindoff, gtyp_kindoff)
+    table_push(c_f_gtyp_kinds, gtyp_kinds)
+    table_push(c_f_gval_kkeys, gval_kkeys)
+    table_push(c_f_gval_kvals, gval_kvals)
+    table_push(c_f_gtyp_defoff, gtyp_defoff)
+    table_push(c_f_gtyp_defs, gtyp_defs)
+    table_push(c_f_gin_keys, gin_keys)
+    table_push(c_f_gin_vals, gin_vals)
+    table_push(c_f_gin_tmpl, gin_tmpl)
+    table_push(c_f_gin_off, gin_off)
+    table_push(c_f_gin_nargs, gin_nargs)
+    table_push(c_f_gin_is_struct, gin_is_struct)
+    table_push(c_f_garg_vals, garg_vals)
+    table_push(c_f_g_clo_pending, g_clo_pending)
+    table_push(c_f_cl_owner_sig, cl_owner_sig)
+    table_push(c_f_cl_owner_unsafe, cl_owner_unsafe)
+    table_push(c_f_cl_ret, cl_ret)
+    table_push(c_f_cl_nparams, cl_nparams)
+    table_push(c_f_cl_paroff, cl_paroff)
+    table_push(c_f_cl_ptys, cl_ptys)
+    table_push(c_f_cl_off, cl_off)
+    table_push(c_f_cl_nouter, cl_nouter)
+    table_push(c_f_cl_okeys, cl_okeys)
+    table_push(c_f_cl_ovals, cl_ovals)
+    table_push(c_f_cl_oconst, cl_oconst)
+    table_push(c_f_cl_otelem, cl_otelem)
+    table_push(c_f_cl_odyn, cl_odyn)
+    table_push(c_f_cl_paramoff, cl_paramoff)
+    table_push(c_f_cl_params, cl_params)
+    table_push(c_f_cl_locloff, cl_locloff)
+    table_push(c_f_cl_locals, cl_locals)
+    table_push(c_f_cl_capoff, cl_capoff)
+    table_push(c_f_cl_grefs, cl_grefs)
+    table_push(c_f_g_spawn_nodes, g_spawn_nodes)
+    table_push(c_f_g_spawn_args, g_spawn_args)
+    table_push(c_f_g_spawn_caps, g_spawn_caps)
+    table_push(c_f_g_spawn_unsafe, g_spawn_unsafe)
+    table_push(c_f_g_spawn_force, g_spawn_force)
+    table_push(c_f_cl_capkeys, cl_capkeys)
+    table_push(c_f_cl_capvals, cl_capvals)
+    table_push(c_f_g_clo_ret_stack, g_clo_ret_stack)
+    table_push(c_f_cl_parent, cl_parent)
+    table_push(c_f_ac_keys, ac_keys)
+    table_push(c_f_ac_vals, ac_vals)
+    table_push(c_f_ac_moff, ac_moff)
+    table_push(c_f_ac_mn, ac_mn)
+    table_push(c_f_ac_mpar, ac_mpar)
+    table_push(c_f_ac_paroff, ac_paroff)
+    table_push(c_f_ac_mret, ac_mret)
+    table_push(c_f_ac_mnames, ac_mnames)
+    table_push(c_f_ac_mnpars, ac_mnpars)
+    table_push(c_f_ac_mptys, ac_mptys)
+    table_push(c_f_ac_mrets, ac_mrets)
+    table_push(c_f_ac_masync, ac_masync)
+    table_push(c_f_ac_mreent, ac_mreent)
+    table_push(c_f_ac_fnoff, ac_fnoff)
+    table_push(c_f_ac_fncnt, ac_fncnt)
+    table_push(c_f_ac_ftyoff, ac_ftyoff)
+    table_push(c_f_ac_fvoff, ac_fvoff)
+    table_push(c_f_ac_fnames, ac_fnames)
+    table_push(c_f_ac_ftys, ac_ftys)
+    table_push(c_f_ac_fdefs, ac_fdefs)
+    table_push(c_f_ac_foffs, ac_foffs)
+    table_push(c_f_afn_keys, afn_keys)
+    table_push(c_f_afn_actor, afn_actor)
+    table_push(c_f_pt_keys, pt_keys)
+    table_push(c_f_pt_vals, pt_vals)
+    table_push(c_f_pm_off, pm_off)
+    table_push(c_f_pm_n, pm_n)
+    table_push(c_f_pm_npar, pm_npar)
+    table_push(c_f_pm_paroff, pm_paroff)
+    table_push(c_f_pm_ret, pm_ret)
+    table_push(c_f_pm_names, pm_names)
+    table_push(c_f_pm_npars, pm_npars)
+    table_push(c_f_pm_ptys, pm_ptys)
+    table_push(c_f_pm_rets, pm_rets)
+    table_push(c_f_pm_iface, pm_iface)
+    table_push(c_f_im_keys, im_keys)
+    table_push(c_f_im_vals, im_vals)
+    table_push(c_f_im_port, im_port)
+    table_push(c_f_im_struct, im_struct)
+    table_push(c_f_im_poff, im_poff)
+    table_push(c_f_im_n, im_n)
+    table_push(c_f_im_mnames, im_mnames)
+    table_push(c_f_g_extra_tops, g_extra_tops)
+    table_push(c_f_g_file_roots, g_file_roots)
+    table_push(c_f_g_file_base, g_file_base)
+    table_push(c_f_sg_mod, sg_mod)
+    table_push(c_f_gb_mod, gb_mod)
+    table_push(c_f_st_mod, st_mod)
+    table_push(c_fs_g_imported, g_imported)
+    table_push(c_fs_g_imp_alias_names, g_imp_alias_names)
+    table_push(c_fs_g_ns_rename_old, g_ns_rename_old)
+    table_push(c_fs_g_ns_rename_new, g_ns_rename_new)
+    table_push(c_fs_g_imp_alias_paths, g_imp_alias_paths)
+    table_push(c_fs_g_file_stem, g_file_stem)
     table_push(c_val_cnt, ir_val_cnt)
     table_push(c_cur_fn, ir_cur_fn)
     g_ctx_ready = 1
@@ -224,6 +560,174 @@ pub func ctx_new() -> i64 {
     table_push(c_s_en_names, table_new_string())
     table_push(c_s_act_names, table_new_string())
     table_push(c_s_pt_names, table_new_string())
+    table_push(c_f_s_tags, table_new_i64())
+    table_push(c_f_s_names, table_new_i64())
+    table_push(c_f_s_vals, table_new_i64())
+    table_push(c_f_s_aux, table_new_i64())
+    table_push(c_f_s_coff, table_new_i64())
+    table_push(c_f_s_nchild, table_new_i64())
+    table_push(c_f_s_children, table_new_i64())
+    table_push(c_f_s_lines, table_new_i64())
+    table_push(c_f_s_cols, table_new_i64())
+    table_push(c_f_s_fn_cap_nodes, table_new_i64())
+    table_push(c_f_s_fn_cap_vals, table_new_i64())
+    table_push(c_f_s_imp_cap_nodes, table_new_i64())
+    table_push(c_f_s_imp_cap_vals, table_new_i64())
+    table_push(c_f_s_fn_uctx_nodes, table_new_i64())
+    table_push(c_f_s_fn_uctx_vals, table_new_i64())
+    table_push(c_f_s_fn_attr_nodes, table_new_i64())
+    table_push(c_f_s_fn_attr_vals, table_new_i64())
+    table_push(c_f_g_file_idle_auth, table_new_i64())
+    table_push(c_f_g_file_idle_used, table_new_i64())
+    table_push(c_f_sg_nparams, table_new_i64())
+    table_push(c_f_sg_required, table_new_i64())
+    table_push(c_f_sg_ret, table_new_i64())
+    table_push(c_f_sg_pub, table_new_i64())
+    table_push(c_f_sg_off, table_new_i64())
+    table_push(c_f_sg_defnode, table_new_i64())
+    table_push(c_f_sp_tys, table_new_i64())
+    table_push(c_f_sp_refs, table_new_i64())
+    table_push(c_f_sp_defs, table_new_i64())
+    table_push(c_f_sp_vars, table_new_i64())
+    table_push(c_f_gen_marks, table_new_i64())
+    table_push(c_f_g_im_keys, table_new_i64())
+    table_push(c_f_g_im_vals, table_new_i64())
+    table_push(c_f_g_vp_keys, table_new_i64())
+    table_push(c_f_g_uwt_keys, table_new_i64())
+    table_push(c_f_alias_keys, table_new_i64())
+    table_push(c_f_alias_vals, table_new_i64())
+    table_push(c_f_st_reprc, table_new_i64())
+    table_push(c_f_gb_keys, table_new_i64())
+    table_push(c_f_gb_vals, table_new_i64())
+    table_push(c_f_gb_const, table_new_i64())
+    table_push(c_f_gb_telem, table_new_i64())
+    table_push(c_f_ext_keys, table_new_i64())
+    table_push(c_f_tre_keys, table_new_i64())
+    table_push(c_f_tre_vals, table_new_i64())
+    table_push(c_f_node_types, table_new_i64())
+    table_push(c_f_g_cmp_getter, table_new_i64())
+    table_push(c_f_g_cmp_setter, table_new_i64())
+    table_push(c_f_lv_keys, table_new_i64())
+    table_push(c_f_lv_vals, table_new_i64())
+    table_push(c_f_lv_const, table_new_i64())
+    table_push(c_f_lv_telem, table_new_i64())
+    table_push(c_f_lv_dyn, table_new_i64())
+    table_push(c_f_lv_moved, table_new_i64())
+    table_push(c_f_gr_rel, table_new_i64())
+    table_push(c_f_gr_dead, table_new_i64())
+    table_push(c_f_lp_stack, table_new_i64())
+    table_push(c_f_ns_stack, table_new_i64())
+    table_push(c_f_using_prefixes, table_new_i64())
+    table_push(c_f_using_lens, table_new_i64())
+    table_push(c_f_tre_bi_keys, table_new_i64())
+    table_push(c_f_tre_bi_vals, table_new_i64())
+    table_push(c_f_struct_tys, table_new_i64())
+    table_push(c_f_gty_keys, table_new_i64())
+    table_push(c_f_gty_vals, table_new_i64())
+    table_push(c_f_gty_full, table_new_i64())
+    table_push(c_f_gtyp_nparams, table_new_i64())
+    table_push(c_f_gtyp_off, table_new_i64())
+    table_push(c_f_gtyp_names, table_new_i64())
+    table_push(c_f_gty_node, table_new_i64())
+    table_push(c_f_gty_is_struct, table_new_i64())
+    table_push(c_f_gtyp_conoff, table_new_i64())
+    table_push(c_f_gtyp_cons, table_new_i64())
+    table_push(c_f_gtyp_kindoff, table_new_i64())
+    table_push(c_f_gtyp_kinds, table_new_i64())
+    table_push(c_f_gval_kkeys, table_new_i64())
+    table_push(c_f_gval_kvals, table_new_i64())
+    table_push(c_f_gtyp_defoff, table_new_i64())
+    table_push(c_f_gtyp_defs, table_new_i64())
+    table_push(c_f_gin_keys, table_new_i64())
+    table_push(c_f_gin_vals, table_new_i64())
+    table_push(c_f_gin_tmpl, table_new_i64())
+    table_push(c_f_gin_off, table_new_i64())
+    table_push(c_f_gin_nargs, table_new_i64())
+    table_push(c_f_gin_is_struct, table_new_i64())
+    table_push(c_f_garg_vals, table_new_i64())
+    table_push(c_f_g_clo_pending, table_new_i64())
+    table_push(c_f_cl_owner_sig, table_new_i64())
+    table_push(c_f_cl_owner_unsafe, table_new_i64())
+    table_push(c_f_cl_ret, table_new_i64())
+    table_push(c_f_cl_nparams, table_new_i64())
+    table_push(c_f_cl_paroff, table_new_i64())
+    table_push(c_f_cl_ptys, table_new_i64())
+    table_push(c_f_cl_off, table_new_i64())
+    table_push(c_f_cl_nouter, table_new_i64())
+    table_push(c_f_cl_okeys, table_new_i64())
+    table_push(c_f_cl_ovals, table_new_i64())
+    table_push(c_f_cl_oconst, table_new_i64())
+    table_push(c_f_cl_otelem, table_new_i64())
+    table_push(c_f_cl_odyn, table_new_i64())
+    table_push(c_f_cl_paramoff, table_new_i64())
+    table_push(c_f_cl_params, table_new_i64())
+    table_push(c_f_cl_locloff, table_new_i64())
+    table_push(c_f_cl_locals, table_new_i64())
+    table_push(c_f_cl_capoff, table_new_i64())
+    table_push(c_f_cl_grefs, table_new_i64())
+    table_push(c_f_g_spawn_nodes, table_new_i64())
+    table_push(c_f_g_spawn_args, table_new_i64())
+    table_push(c_f_g_spawn_caps, table_new_i64())
+    table_push(c_f_g_spawn_unsafe, table_new_i64())
+    table_push(c_f_g_spawn_force, table_new_i64())
+    table_push(c_f_cl_capkeys, table_new_i64())
+    table_push(c_f_cl_capvals, table_new_i64())
+    table_push(c_f_g_clo_ret_stack, table_new_i64())
+    table_push(c_f_cl_parent, table_new_i64())
+    table_push(c_f_ac_keys, table_new_i64())
+    table_push(c_f_ac_vals, table_new_i64())
+    table_push(c_f_ac_moff, table_new_i64())
+    table_push(c_f_ac_mn, table_new_i64())
+    table_push(c_f_ac_mpar, table_new_i64())
+    table_push(c_f_ac_paroff, table_new_i64())
+    table_push(c_f_ac_mret, table_new_i64())
+    table_push(c_f_ac_mnames, table_new_i64())
+    table_push(c_f_ac_mnpars, table_new_i64())
+    table_push(c_f_ac_mptys, table_new_i64())
+    table_push(c_f_ac_mrets, table_new_i64())
+    table_push(c_f_ac_masync, table_new_i64())
+    table_push(c_f_ac_mreent, table_new_i64())
+    table_push(c_f_ac_fnoff, table_new_i64())
+    table_push(c_f_ac_fncnt, table_new_i64())
+    table_push(c_f_ac_ftyoff, table_new_i64())
+    table_push(c_f_ac_fvoff, table_new_i64())
+    table_push(c_f_ac_fnames, table_new_i64())
+    table_push(c_f_ac_ftys, table_new_i64())
+    table_push(c_f_ac_fdefs, table_new_i64())
+    table_push(c_f_ac_foffs, table_new_i64())
+    table_push(c_f_afn_keys, table_new_i64())
+    table_push(c_f_afn_actor, table_new_i64())
+    table_push(c_f_pt_keys, table_new_i64())
+    table_push(c_f_pt_vals, table_new_i64())
+    table_push(c_f_pm_off, table_new_i64())
+    table_push(c_f_pm_n, table_new_i64())
+    table_push(c_f_pm_npar, table_new_i64())
+    table_push(c_f_pm_paroff, table_new_i64())
+    table_push(c_f_pm_ret, table_new_i64())
+    table_push(c_f_pm_names, table_new_i64())
+    table_push(c_f_pm_npars, table_new_i64())
+    table_push(c_f_pm_ptys, table_new_i64())
+    table_push(c_f_pm_rets, table_new_i64())
+    table_push(c_f_pm_iface, table_new_i64())
+    table_push(c_f_im_keys, table_new_i64())
+    table_push(c_f_im_vals, table_new_i64())
+    table_push(c_f_im_port, table_new_i64())
+    table_push(c_f_im_struct, table_new_i64())
+    table_push(c_f_im_poff, table_new_i64())
+    table_push(c_f_im_n, table_new_i64())
+    table_push(c_f_im_mnames, table_new_i64())
+    table_push(c_f_g_extra_tops, table_new_i64())
+    table_push(c_f_g_file_roots, table_new_i64())
+    table_push(c_f_g_file_base, table_new_i64())
+    table_push(c_f_sg_mod, table_new_i64())
+    table_push(c_f_gb_mod, table_new_i64())
+    table_push(c_f_st_mod, table_new_i64())
+    table_push(c_fs_g_imported, table_new_string())
+    table_push(c_fs_g_imp_alias_names, table_new_string())
+    table_push(c_fs_g_ns_rename_old, table_new_string())
+    table_push(c_fs_g_ns_rename_new, table_new_string())
+    table_push(c_fs_g_imp_alias_paths, table_new_string())
+    table_push(c_fs_g_file_stem, table_new_string())
     table_push(c_val_cnt, 0)
     table_push(c_cur_fn, "")
     var id = len(c_cur_fn) - 1
@@ -314,6 +818,174 @@ pub func ctx_bind(id: i64) -> i64 {
     en_names = c_s_en_names[id]
     act_names = c_s_act_names[id]
     pt_names = c_s_pt_names[id]
+    s_tags = c_f_s_tags[id]
+    s_names = c_f_s_names[id]
+    s_vals = c_f_s_vals[id]
+    s_aux = c_f_s_aux[id]
+    s_coff = c_f_s_coff[id]
+    s_nchild = c_f_s_nchild[id]
+    s_children = c_f_s_children[id]
+    s_lines = c_f_s_lines[id]
+    s_cols = c_f_s_cols[id]
+    s_fn_cap_nodes = c_f_s_fn_cap_nodes[id]
+    s_fn_cap_vals = c_f_s_fn_cap_vals[id]
+    s_imp_cap_nodes = c_f_s_imp_cap_nodes[id]
+    s_imp_cap_vals = c_f_s_imp_cap_vals[id]
+    s_fn_uctx_nodes = c_f_s_fn_uctx_nodes[id]
+    s_fn_uctx_vals = c_f_s_fn_uctx_vals[id]
+    s_fn_attr_nodes = c_f_s_fn_attr_nodes[id]
+    s_fn_attr_vals = c_f_s_fn_attr_vals[id]
+    g_file_idle_auth = c_f_g_file_idle_auth[id]
+    g_file_idle_used = c_f_g_file_idle_used[id]
+    sg_nparams = c_f_sg_nparams[id]
+    sg_required = c_f_sg_required[id]
+    sg_ret = c_f_sg_ret[id]
+    sg_pub = c_f_sg_pub[id]
+    sg_off = c_f_sg_off[id]
+    sg_defnode = c_f_sg_defnode[id]
+    sp_tys = c_f_sp_tys[id]
+    sp_refs = c_f_sp_refs[id]
+    sp_defs = c_f_sp_defs[id]
+    sp_vars = c_f_sp_vars[id]
+    gen_marks = c_f_gen_marks[id]
+    g_im_keys = c_f_g_im_keys[id]
+    g_im_vals = c_f_g_im_vals[id]
+    g_vp_keys = c_f_g_vp_keys[id]
+    g_uwt_keys = c_f_g_uwt_keys[id]
+    alias_keys = c_f_alias_keys[id]
+    alias_vals = c_f_alias_vals[id]
+    st_reprc = c_f_st_reprc[id]
+    gb_keys = c_f_gb_keys[id]
+    gb_vals = c_f_gb_vals[id]
+    gb_const = c_f_gb_const[id]
+    gb_telem = c_f_gb_telem[id]
+    ext_keys = c_f_ext_keys[id]
+    tre_keys = c_f_tre_keys[id]
+    tre_vals = c_f_tre_vals[id]
+    node_types = c_f_node_types[id]
+    g_cmp_getter = c_f_g_cmp_getter[id]
+    g_cmp_setter = c_f_g_cmp_setter[id]
+    lv_keys = c_f_lv_keys[id]
+    lv_vals = c_f_lv_vals[id]
+    lv_const = c_f_lv_const[id]
+    lv_telem = c_f_lv_telem[id]
+    lv_dyn = c_f_lv_dyn[id]
+    lv_moved = c_f_lv_moved[id]
+    gr_rel = c_f_gr_rel[id]
+    gr_dead = c_f_gr_dead[id]
+    lp_stack = c_f_lp_stack[id]
+    ns_stack = c_f_ns_stack[id]
+    using_prefixes = c_f_using_prefixes[id]
+    using_lens = c_f_using_lens[id]
+    tre_bi_keys = c_f_tre_bi_keys[id]
+    tre_bi_vals = c_f_tre_bi_vals[id]
+    struct_tys = c_f_struct_tys[id]
+    gty_keys = c_f_gty_keys[id]
+    gty_vals = c_f_gty_vals[id]
+    gty_full = c_f_gty_full[id]
+    gtyp_nparams = c_f_gtyp_nparams[id]
+    gtyp_off = c_f_gtyp_off[id]
+    gtyp_names = c_f_gtyp_names[id]
+    gty_node = c_f_gty_node[id]
+    gty_is_struct = c_f_gty_is_struct[id]
+    gtyp_conoff = c_f_gtyp_conoff[id]
+    gtyp_cons = c_f_gtyp_cons[id]
+    gtyp_kindoff = c_f_gtyp_kindoff[id]
+    gtyp_kinds = c_f_gtyp_kinds[id]
+    gval_kkeys = c_f_gval_kkeys[id]
+    gval_kvals = c_f_gval_kvals[id]
+    gtyp_defoff = c_f_gtyp_defoff[id]
+    gtyp_defs = c_f_gtyp_defs[id]
+    gin_keys = c_f_gin_keys[id]
+    gin_vals = c_f_gin_vals[id]
+    gin_tmpl = c_f_gin_tmpl[id]
+    gin_off = c_f_gin_off[id]
+    gin_nargs = c_f_gin_nargs[id]
+    gin_is_struct = c_f_gin_is_struct[id]
+    garg_vals = c_f_garg_vals[id]
+    g_clo_pending = c_f_g_clo_pending[id]
+    cl_owner_sig = c_f_cl_owner_sig[id]
+    cl_owner_unsafe = c_f_cl_owner_unsafe[id]
+    cl_ret = c_f_cl_ret[id]
+    cl_nparams = c_f_cl_nparams[id]
+    cl_paroff = c_f_cl_paroff[id]
+    cl_ptys = c_f_cl_ptys[id]
+    cl_off = c_f_cl_off[id]
+    cl_nouter = c_f_cl_nouter[id]
+    cl_okeys = c_f_cl_okeys[id]
+    cl_ovals = c_f_cl_ovals[id]
+    cl_oconst = c_f_cl_oconst[id]
+    cl_otelem = c_f_cl_otelem[id]
+    cl_odyn = c_f_cl_odyn[id]
+    cl_paramoff = c_f_cl_paramoff[id]
+    cl_params = c_f_cl_params[id]
+    cl_locloff = c_f_cl_locloff[id]
+    cl_locals = c_f_cl_locals[id]
+    cl_capoff = c_f_cl_capoff[id]
+    cl_grefs = c_f_cl_grefs[id]
+    g_spawn_nodes = c_f_g_spawn_nodes[id]
+    g_spawn_args = c_f_g_spawn_args[id]
+    g_spawn_caps = c_f_g_spawn_caps[id]
+    g_spawn_unsafe = c_f_g_spawn_unsafe[id]
+    g_spawn_force = c_f_g_spawn_force[id]
+    cl_capkeys = c_f_cl_capkeys[id]
+    cl_capvals = c_f_cl_capvals[id]
+    g_clo_ret_stack = c_f_g_clo_ret_stack[id]
+    cl_parent = c_f_cl_parent[id]
+    ac_keys = c_f_ac_keys[id]
+    ac_vals = c_f_ac_vals[id]
+    ac_moff = c_f_ac_moff[id]
+    ac_mn = c_f_ac_mn[id]
+    ac_mpar = c_f_ac_mpar[id]
+    ac_paroff = c_f_ac_paroff[id]
+    ac_mret = c_f_ac_mret[id]
+    ac_mnames = c_f_ac_mnames[id]
+    ac_mnpars = c_f_ac_mnpars[id]
+    ac_mptys = c_f_ac_mptys[id]
+    ac_mrets = c_f_ac_mrets[id]
+    ac_masync = c_f_ac_masync[id]
+    ac_mreent = c_f_ac_mreent[id]
+    ac_fnoff = c_f_ac_fnoff[id]
+    ac_fncnt = c_f_ac_fncnt[id]
+    ac_ftyoff = c_f_ac_ftyoff[id]
+    ac_fvoff = c_f_ac_fvoff[id]
+    ac_fnames = c_f_ac_fnames[id]
+    ac_ftys = c_f_ac_ftys[id]
+    ac_fdefs = c_f_ac_fdefs[id]
+    ac_foffs = c_f_ac_foffs[id]
+    afn_keys = c_f_afn_keys[id]
+    afn_actor = c_f_afn_actor[id]
+    pt_keys = c_f_pt_keys[id]
+    pt_vals = c_f_pt_vals[id]
+    pm_off = c_f_pm_off[id]
+    pm_n = c_f_pm_n[id]
+    pm_npar = c_f_pm_npar[id]
+    pm_paroff = c_f_pm_paroff[id]
+    pm_ret = c_f_pm_ret[id]
+    pm_names = c_f_pm_names[id]
+    pm_npars = c_f_pm_npars[id]
+    pm_ptys = c_f_pm_ptys[id]
+    pm_rets = c_f_pm_rets[id]
+    pm_iface = c_f_pm_iface[id]
+    im_keys = c_f_im_keys[id]
+    im_vals = c_f_im_vals[id]
+    im_port = c_f_im_port[id]
+    im_struct = c_f_im_struct[id]
+    im_poff = c_f_im_poff[id]
+    im_n = c_f_im_n[id]
+    im_mnames = c_f_im_mnames[id]
+    g_extra_tops = c_f_g_extra_tops[id]
+    g_file_roots = c_f_g_file_roots[id]
+    g_file_base = c_f_g_file_base[id]
+    sg_mod = c_f_sg_mod[id]
+    gb_mod = c_f_gb_mod[id]
+    st_mod = c_f_st_mod[id]
+    g_imported = c_fs_g_imported[id]
+    g_imp_alias_names = c_fs_g_imp_alias_names[id]
+    g_ns_rename_old = c_fs_g_ns_rename_old[id]
+    g_ns_rename_new = c_fs_g_ns_rename_new[id]
+    g_imp_alias_paths = c_fs_g_imp_alias_paths[id]
+    g_file_stem = c_fs_g_file_stem[id]
     ir_val_cnt = c_val_cnt[id]
     ir_cur_fn = c_cur_fn[id]
     g_ctx_cur = id
