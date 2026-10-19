@@ -110,7 +110,10 @@ func global_ref(v: i64) -> string {
 // 值 id → 定义指令 id 索引表构建（懒执行：首次 value_def 调用时一次性构建）。
 // 值 id 从 0 连续分配（ir.value_count 返回总数），直接作表下标。
 // 语义：每个值恰好被一条指令定义（SSA），后写的覆盖先写（同值不会重复定义）。
+var vdef_epoch: i64 = -1
+
 func build_vdef_cache() {
+    vdef_epoch = ir.module_epoch()
     vdef_cache = table_new_i64()
     var nv = ir.value_count()
     var i: i64 = 0
@@ -132,7 +135,7 @@ func build_vdef_cache() {
 
 // 值 id → 定义指令 id（O(1) 索引；无定义/越界返回 -1）
 func value_def(v: i64) -> i64 {
-    if vdef_cache_ready == 0 {
+    if vdef_cache_ready == 0 || vdef_epoch != ir.module_epoch() {
         build_vdef_cache()
     }
     if v < 0 || v >= len(vdef_cache) {

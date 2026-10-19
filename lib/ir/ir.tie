@@ -225,7 +225,14 @@ pub func op_desc(op: i64) -> string {
 }
 // ---------- 新建/复位 ----------
 // ir_meta.reset_meta 配套复位（避免循环依赖）。
+var g_module_epoch: i64 = 0
+
+pub func module_epoch() -> i64 {
+    return g_module_epoch
+}
+
 pub func new_module() -> i64 {
+    g_module_epoch = g_module_epoch + 1
     table_trunc(ir_funcs_names, 0)
     table_trunc(ir_funcs_rets, 0)
     table_trunc(ir_funcs_params_off, 0)
