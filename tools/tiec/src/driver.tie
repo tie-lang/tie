@@ -39,6 +39,7 @@ import "../../../lib/ir/ir_meta.tie"
 import "./tdzd.tie"
 // p.6.9.15 诊断标号：error[E#####]/warning[W#####] 渲染（driver 打印入口）
 import "../../../lib/support/diag/diagcode.tie"
+import "../../../lib/front/context.tie"
 // p.9.11.13 #cfg 条件编译预处理（词法前按行裁剪；driver 读文件后、头部扫描/
 // 词法之前调用；条件求值源 = --target/配置 target 与 --profile/配置 profile）
 import "../../../lib/front/cfg_preproc.tie"
@@ -235,6 +236,8 @@ pub var g_t_sem: i64 = 0;     // check_ast 耗时（ms）
 
 // 入口：解析参数 → 读文件 → 头部扫描 → 角色分派。返回退出码。
 func main() -> i64 {
+    sstate.ctx_new()
+    ir.ctx_new()
     // p.7.1.6 tie 工具链 CLI 子命令注册化：先就绪 CLI 注册表（幂等、轻量；
     // 独立于 boot 的 pass/pipeline 登记，因子命令分派须先于编译引导可用），
     // 命中已登记 cli:xxx 时走注册表分派；否则原样走既有 tiec 参数解析（token

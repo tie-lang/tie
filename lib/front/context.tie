@@ -1,0 +1,1956 @@
+type tie<class>
+import "/std/collection.tie"
+namespace sstate;
+// context.tie —— 前端单元上下文（深拷贝；load 内联复制，避免返回值的额外 retain）
+
+var g_ctx_cur: i64 = 0
+var g_ctx_ready: i64 = 0
+
+var c_s_tags: table<table<i64>> = []
+var c_s_names: table<table<i64>> = []
+var c_s_vals: table<table<i64>> = []
+var c_s_aux: table<table<i64>> = []
+var c_s_coff: table<table<i64>> = []
+var c_s_nchild: table<table<i64>> = []
+var c_s_children: table<table<i64>> = []
+var c_s_lines: table<table<i64>> = []
+var c_s_cols: table<table<i64>> = []
+var c_s_fn_cap_nodes: table<table<i64>> = []
+var c_s_fn_cap_vals: table<table<i64>> = []
+var c_s_imp_cap_nodes: table<table<i64>> = []
+var c_s_imp_cap_vals: table<table<i64>> = []
+var c_s_fn_uctx_nodes: table<table<i64>> = []
+var c_s_fn_uctx_vals: table<table<i64>> = []
+var c_s_fn_attr_nodes: table<table<i64>> = []
+var c_s_fn_attr_vals: table<table<i64>> = []
+var c_g_file_idle_auth: table<table<i64>> = []
+var c_g_file_idle_used: table<table<i64>> = []
+var c_sg_nparams: table<table<i64>> = []
+var c_sg_required: table<table<i64>> = []
+var c_sg_ret: table<table<i64>> = []
+var c_sg_pub: table<table<i64>> = []
+var c_sg_off: table<table<i64>> = []
+var c_sg_defnode: table<table<i64>> = []
+var c_sp_tys: table<table<i64>> = []
+var c_sp_refs: table<table<i64>> = []
+var c_sp_defs: table<table<i64>> = []
+var c_sp_vars: table<table<i64>> = []
+var c_gen_marks: table<table<i64>> = []
+var c_g_im_keys: table<table<i64>> = []
+var c_g_im_vals: table<table<i64>> = []
+var c_g_vp_keys: table<table<i64>> = []
+var c_g_uwt_keys: table<table<i64>> = []
+var c_alias_keys: table<table<i64>> = []
+var c_alias_vals: table<table<i64>> = []
+var c_st_reprc: table<table<i64>> = []
+var c_gb_keys: table<table<i64>> = []
+var c_gb_vals: table<table<i64>> = []
+var c_gb_const: table<table<i64>> = []
+var c_gb_telem: table<table<i64>> = []
+var c_ext_keys: table<table<i64>> = []
+var c_tre_keys: table<table<i64>> = []
+var c_tre_vals: table<table<i64>> = []
+var c_node_types: table<table<i64>> = []
+var c_g_cmp_getter: table<table<i64>> = []
+var c_g_cmp_setter: table<table<i64>> = []
+var c_lv_keys: table<table<i64>> = []
+var c_lv_vals: table<table<i64>> = []
+var c_lv_const: table<table<i64>> = []
+var c_lv_telem: table<table<i64>> = []
+var c_lv_dyn: table<table<i64>> = []
+var c_lv_moved: table<table<i64>> = []
+var c_gr_rel: table<table<i64>> = []
+var c_gr_dead: table<table<i64>> = []
+var c_lp_stack: table<table<i64>> = []
+var c_ns_stack: table<table<i64>> = []
+var c_using_prefixes: table<table<i64>> = []
+var c_using_lens: table<table<i64>> = []
+var c_tre_bi_keys: table<table<i64>> = []
+var c_tre_bi_vals: table<table<i64>> = []
+var c_struct_tys: table<table<i64>> = []
+var c_gty_keys: table<table<i64>> = []
+var c_gty_vals: table<table<i64>> = []
+var c_gty_full: table<table<i64>> = []
+var c_gtyp_nparams: table<table<i64>> = []
+var c_gtyp_off: table<table<i64>> = []
+var c_gtyp_names: table<table<i64>> = []
+var c_gty_node: table<table<i64>> = []
+var c_gty_is_struct: table<table<i64>> = []
+var c_gtyp_conoff: table<table<i64>> = []
+var c_gtyp_cons: table<table<i64>> = []
+var c_gtyp_kindoff: table<table<i64>> = []
+var c_gtyp_kinds: table<table<i64>> = []
+var c_gval_kkeys: table<table<i64>> = []
+var c_gval_kvals: table<table<i64>> = []
+var c_gtyp_defoff: table<table<i64>> = []
+var c_gtyp_defs: table<table<i64>> = []
+var c_gin_keys: table<table<i64>> = []
+var c_gin_vals: table<table<i64>> = []
+var c_gin_tmpl: table<table<i64>> = []
+var c_gin_off: table<table<i64>> = []
+var c_gin_nargs: table<table<i64>> = []
+var c_gin_is_struct: table<table<i64>> = []
+var c_garg_vals: table<table<i64>> = []
+var c_g_clo_pending: table<table<i64>> = []
+var c_cl_owner_sig: table<table<i64>> = []
+var c_cl_owner_unsafe: table<table<i64>> = []
+var c_cl_ret: table<table<i64>> = []
+var c_cl_nparams: table<table<i64>> = []
+var c_cl_paroff: table<table<i64>> = []
+var c_cl_ptys: table<table<i64>> = []
+var c_cl_off: table<table<i64>> = []
+var c_cl_nouter: table<table<i64>> = []
+var c_cl_okeys: table<table<i64>> = []
+var c_cl_ovals: table<table<i64>> = []
+var c_cl_oconst: table<table<i64>> = []
+var c_cl_otelem: table<table<i64>> = []
+var c_cl_odyn: table<table<i64>> = []
+var c_cl_paramoff: table<table<i64>> = []
+var c_cl_params: table<table<i64>> = []
+var c_cl_locloff: table<table<i64>> = []
+var c_cl_locals: table<table<i64>> = []
+var c_cl_capoff: table<table<i64>> = []
+var c_cl_grefs: table<table<i64>> = []
+var c_g_spawn_nodes: table<table<i64>> = []
+var c_g_spawn_args: table<table<i64>> = []
+var c_g_spawn_caps: table<table<i64>> = []
+var c_g_spawn_unsafe: table<table<i64>> = []
+var c_g_spawn_force: table<table<i64>> = []
+var c_cl_capkeys: table<table<i64>> = []
+var c_cl_capvals: table<table<i64>> = []
+var c_g_clo_ret_stack: table<table<i64>> = []
+var c_cl_parent: table<table<i64>> = []
+var c_ac_keys: table<table<i64>> = []
+var c_ac_vals: table<table<i64>> = []
+var c_ac_moff: table<table<i64>> = []
+var c_ac_mn: table<table<i64>> = []
+var c_ac_mpar: table<table<i64>> = []
+var c_ac_paroff: table<table<i64>> = []
+var c_ac_mret: table<table<i64>> = []
+var c_ac_mnames: table<table<i64>> = []
+var c_ac_mnpars: table<table<i64>> = []
+var c_ac_mptys: table<table<i64>> = []
+var c_ac_mrets: table<table<i64>> = []
+var c_ac_masync: table<table<i64>> = []
+var c_ac_mreent: table<table<i64>> = []
+var c_ac_fnoff: table<table<i64>> = []
+var c_ac_fncnt: table<table<i64>> = []
+var c_ac_ftyoff: table<table<i64>> = []
+var c_ac_fvoff: table<table<i64>> = []
+var c_ac_fnames: table<table<i64>> = []
+var c_ac_ftys: table<table<i64>> = []
+var c_ac_fdefs: table<table<i64>> = []
+var c_ac_foffs: table<table<i64>> = []
+var c_afn_keys: table<table<i64>> = []
+var c_afn_actor: table<table<i64>> = []
+var c_pt_keys: table<table<i64>> = []
+var c_pt_vals: table<table<i64>> = []
+var c_pm_off: table<table<i64>> = []
+var c_pm_n: table<table<i64>> = []
+var c_pm_npar: table<table<i64>> = []
+var c_pm_paroff: table<table<i64>> = []
+var c_pm_ret: table<table<i64>> = []
+var c_pm_names: table<table<i64>> = []
+var c_pm_npars: table<table<i64>> = []
+var c_pm_ptys: table<table<i64>> = []
+var c_pm_rets: table<table<i64>> = []
+var c_pm_iface: table<table<i64>> = []
+var c_im_keys: table<table<i64>> = []
+var c_im_vals: table<table<i64>> = []
+var c_im_port: table<table<i64>> = []
+var c_im_struct: table<table<i64>> = []
+var c_im_poff: table<table<i64>> = []
+var c_im_n: table<table<i64>> = []
+var c_im_mnames: table<table<i64>> = []
+var c_g_extra_tops: table<table<i64>> = []
+var c_g_file_roots: table<table<i64>> = []
+var c_g_file_base: table<table<i64>> = []
+var c_sg_mod: table<table<i64>> = []
+var c_gb_mod: table<table<i64>> = []
+var c_st_mod: table<table<i64>> = []
+var c_g_imported: table<table<string>> = []
+var c_g_imp_alias_names: table<table<string>> = []
+var c_g_ns_rename_old: table<table<string>> = []
+var c_g_ns_rename_new: table<table<string>> = []
+var c_g_imp_alias_paths: table<table<string>> = []
+var c_g_file_stem: table<table<string>> = []
+
+func push_0() {
+    table_push(c_s_tags, table_new_i64())
+    table_push(c_s_names, table_new_i64())
+    table_push(c_s_vals, table_new_i64())
+    table_push(c_s_aux, table_new_i64())
+    table_push(c_s_coff, table_new_i64())
+    table_push(c_s_nchild, table_new_i64())
+    table_push(c_s_children, table_new_i64())
+    table_push(c_s_lines, table_new_i64())
+    table_push(c_s_cols, table_new_i64())
+    table_push(c_s_fn_cap_nodes, table_new_i64())
+    table_push(c_s_fn_cap_vals, table_new_i64())
+    table_push(c_s_imp_cap_nodes, table_new_i64())
+    table_push(c_s_imp_cap_vals, table_new_i64())
+    table_push(c_s_fn_uctx_nodes, table_new_i64())
+    table_push(c_s_fn_uctx_vals, table_new_i64())
+    table_push(c_s_fn_attr_nodes, table_new_i64())
+    table_push(c_s_fn_attr_vals, table_new_i64())
+    table_push(c_g_file_idle_auth, table_new_i64())
+    table_push(c_g_file_idle_used, table_new_i64())
+    table_push(c_sg_nparams, table_new_i64())
+    table_push(c_sg_required, table_new_i64())
+    table_push(c_sg_ret, table_new_i64())
+    table_push(c_sg_pub, table_new_i64())
+    table_push(c_sg_off, table_new_i64())
+    table_push(c_sg_defnode, table_new_i64())
+    table_push(c_sp_tys, table_new_i64())
+    table_push(c_sp_refs, table_new_i64())
+    table_push(c_sp_defs, table_new_i64())
+    table_push(c_sp_vars, table_new_i64())
+    table_push(c_gen_marks, table_new_i64())
+    table_push(c_g_im_keys, table_new_i64())
+    table_push(c_g_im_vals, table_new_i64())
+}
+func cap_0() {
+    table_push(c_s_tags, s_tags)
+    table_push(c_s_names, s_names)
+    table_push(c_s_vals, s_vals)
+    table_push(c_s_aux, s_aux)
+    table_push(c_s_coff, s_coff)
+    table_push(c_s_nchild, s_nchild)
+    table_push(c_s_children, s_children)
+    table_push(c_s_lines, s_lines)
+    table_push(c_s_cols, s_cols)
+    table_push(c_s_fn_cap_nodes, s_fn_cap_nodes)
+    table_push(c_s_fn_cap_vals, s_fn_cap_vals)
+    table_push(c_s_imp_cap_nodes, s_imp_cap_nodes)
+    table_push(c_s_imp_cap_vals, s_imp_cap_vals)
+    table_push(c_s_fn_uctx_nodes, s_fn_uctx_nodes)
+    table_push(c_s_fn_uctx_vals, s_fn_uctx_vals)
+    table_push(c_s_fn_attr_nodes, s_fn_attr_nodes)
+    table_push(c_s_fn_attr_vals, s_fn_attr_vals)
+    table_push(c_g_file_idle_auth, g_file_idle_auth)
+    table_push(c_g_file_idle_used, g_file_idle_used)
+    table_push(c_sg_nparams, sg_nparams)
+    table_push(c_sg_required, sg_required)
+    table_push(c_sg_ret, sg_ret)
+    table_push(c_sg_pub, sg_pub)
+    table_push(c_sg_off, sg_off)
+    table_push(c_sg_defnode, sg_defnode)
+    table_push(c_sp_tys, sp_tys)
+    table_push(c_sp_refs, sp_refs)
+    table_push(c_sp_defs, sp_defs)
+    table_push(c_sp_vars, sp_vars)
+    table_push(c_gen_marks, gen_marks)
+    table_push(c_g_im_keys, g_im_keys)
+    table_push(c_g_im_vals, g_im_vals)
+}
+func save_0() {
+    c_s_tags[g_ctx_cur] = coll.copy_i64(s_tags)
+    c_s_names[g_ctx_cur] = coll.copy_i64(s_names)
+    c_s_vals[g_ctx_cur] = coll.copy_i64(s_vals)
+    c_s_aux[g_ctx_cur] = coll.copy_i64(s_aux)
+    c_s_coff[g_ctx_cur] = coll.copy_i64(s_coff)
+    c_s_nchild[g_ctx_cur] = coll.copy_i64(s_nchild)
+    c_s_children[g_ctx_cur] = coll.copy_i64(s_children)
+    c_s_lines[g_ctx_cur] = coll.copy_i64(s_lines)
+    c_s_cols[g_ctx_cur] = coll.copy_i64(s_cols)
+    c_s_fn_cap_nodes[g_ctx_cur] = coll.copy_i64(s_fn_cap_nodes)
+    c_s_fn_cap_vals[g_ctx_cur] = coll.copy_i64(s_fn_cap_vals)
+    c_s_imp_cap_nodes[g_ctx_cur] = coll.copy_i64(s_imp_cap_nodes)
+    c_s_imp_cap_vals[g_ctx_cur] = coll.copy_i64(s_imp_cap_vals)
+    c_s_fn_uctx_nodes[g_ctx_cur] = coll.copy_i64(s_fn_uctx_nodes)
+    c_s_fn_uctx_vals[g_ctx_cur] = coll.copy_i64(s_fn_uctx_vals)
+    c_s_fn_attr_nodes[g_ctx_cur] = coll.copy_i64(s_fn_attr_nodes)
+    c_s_fn_attr_vals[g_ctx_cur] = coll.copy_i64(s_fn_attr_vals)
+    c_g_file_idle_auth[g_ctx_cur] = coll.copy_i64(g_file_idle_auth)
+    c_g_file_idle_used[g_ctx_cur] = coll.copy_i64(g_file_idle_used)
+    c_sg_nparams[g_ctx_cur] = coll.copy_i64(sg_nparams)
+    c_sg_required[g_ctx_cur] = coll.copy_i64(sg_required)
+    c_sg_ret[g_ctx_cur] = coll.copy_i64(sg_ret)
+    c_sg_pub[g_ctx_cur] = coll.copy_i64(sg_pub)
+    c_sg_off[g_ctx_cur] = coll.copy_i64(sg_off)
+    c_sg_defnode[g_ctx_cur] = coll.copy_i64(sg_defnode)
+    c_sp_tys[g_ctx_cur] = coll.copy_i64(sp_tys)
+    c_sp_refs[g_ctx_cur] = coll.copy_i64(sp_refs)
+    c_sp_defs[g_ctx_cur] = coll.copy_i64(sp_defs)
+    c_sp_vars[g_ctx_cur] = coll.copy_i64(sp_vars)
+    c_gen_marks[g_ctx_cur] = coll.copy_i64(gen_marks)
+    c_g_im_keys[g_ctx_cur] = coll.copy_i64(g_im_keys)
+    c_g_im_vals[g_ctx_cur] = coll.copy_i64(g_im_vals)
+}
+func load_0(id: i64) {
+    var lt0 = table_new_i64()
+    var li0: i64 = 0
+    while li0 < len(c_s_tags[id]) {
+        table_push(lt0, c_s_tags[id][li0])
+        li0 = li0 + 1
+    }
+    s_tags = lt0
+    var lt1 = table_new_i64()
+    var li1: i64 = 0
+    while li1 < len(c_s_names[id]) {
+        table_push(lt1, c_s_names[id][li1])
+        li1 = li1 + 1
+    }
+    s_names = lt1
+    var lt2 = table_new_i64()
+    var li2: i64 = 0
+    while li2 < len(c_s_vals[id]) {
+        table_push(lt2, c_s_vals[id][li2])
+        li2 = li2 + 1
+    }
+    s_vals = lt2
+    var lt3 = table_new_i64()
+    var li3: i64 = 0
+    while li3 < len(c_s_aux[id]) {
+        table_push(lt3, c_s_aux[id][li3])
+        li3 = li3 + 1
+    }
+    s_aux = lt3
+    var lt4 = table_new_i64()
+    var li4: i64 = 0
+    while li4 < len(c_s_coff[id]) {
+        table_push(lt4, c_s_coff[id][li4])
+        li4 = li4 + 1
+    }
+    s_coff = lt4
+    var lt5 = table_new_i64()
+    var li5: i64 = 0
+    while li5 < len(c_s_nchild[id]) {
+        table_push(lt5, c_s_nchild[id][li5])
+        li5 = li5 + 1
+    }
+    s_nchild = lt5
+    var lt6 = table_new_i64()
+    var li6: i64 = 0
+    while li6 < len(c_s_children[id]) {
+        table_push(lt6, c_s_children[id][li6])
+        li6 = li6 + 1
+    }
+    s_children = lt6
+    var lt7 = table_new_i64()
+    var li7: i64 = 0
+    while li7 < len(c_s_lines[id]) {
+        table_push(lt7, c_s_lines[id][li7])
+        li7 = li7 + 1
+    }
+    s_lines = lt7
+    var lt8 = table_new_i64()
+    var li8: i64 = 0
+    while li8 < len(c_s_cols[id]) {
+        table_push(lt8, c_s_cols[id][li8])
+        li8 = li8 + 1
+    }
+    s_cols = lt8
+    var lt9 = table_new_i64()
+    var li9: i64 = 0
+    while li9 < len(c_s_fn_cap_nodes[id]) {
+        table_push(lt9, c_s_fn_cap_nodes[id][li9])
+        li9 = li9 + 1
+    }
+    s_fn_cap_nodes = lt9
+    var lt10 = table_new_i64()
+    var li10: i64 = 0
+    while li10 < len(c_s_fn_cap_vals[id]) {
+        table_push(lt10, c_s_fn_cap_vals[id][li10])
+        li10 = li10 + 1
+    }
+    s_fn_cap_vals = lt10
+    var lt11 = table_new_i64()
+    var li11: i64 = 0
+    while li11 < len(c_s_imp_cap_nodes[id]) {
+        table_push(lt11, c_s_imp_cap_nodes[id][li11])
+        li11 = li11 + 1
+    }
+    s_imp_cap_nodes = lt11
+    var lt12 = table_new_i64()
+    var li12: i64 = 0
+    while li12 < len(c_s_imp_cap_vals[id]) {
+        table_push(lt12, c_s_imp_cap_vals[id][li12])
+        li12 = li12 + 1
+    }
+    s_imp_cap_vals = lt12
+    var lt13 = table_new_i64()
+    var li13: i64 = 0
+    while li13 < len(c_s_fn_uctx_nodes[id]) {
+        table_push(lt13, c_s_fn_uctx_nodes[id][li13])
+        li13 = li13 + 1
+    }
+    s_fn_uctx_nodes = lt13
+    var lt14 = table_new_i64()
+    var li14: i64 = 0
+    while li14 < len(c_s_fn_uctx_vals[id]) {
+        table_push(lt14, c_s_fn_uctx_vals[id][li14])
+        li14 = li14 + 1
+    }
+    s_fn_uctx_vals = lt14
+    var lt15 = table_new_i64()
+    var li15: i64 = 0
+    while li15 < len(c_s_fn_attr_nodes[id]) {
+        table_push(lt15, c_s_fn_attr_nodes[id][li15])
+        li15 = li15 + 1
+    }
+    s_fn_attr_nodes = lt15
+    var lt16 = table_new_i64()
+    var li16: i64 = 0
+    while li16 < len(c_s_fn_attr_vals[id]) {
+        table_push(lt16, c_s_fn_attr_vals[id][li16])
+        li16 = li16 + 1
+    }
+    s_fn_attr_vals = lt16
+    var lt17 = table_new_i64()
+    var li17: i64 = 0
+    while li17 < len(c_g_file_idle_auth[id]) {
+        table_push(lt17, c_g_file_idle_auth[id][li17])
+        li17 = li17 + 1
+    }
+    g_file_idle_auth = lt17
+    var lt18 = table_new_i64()
+    var li18: i64 = 0
+    while li18 < len(c_g_file_idle_used[id]) {
+        table_push(lt18, c_g_file_idle_used[id][li18])
+        li18 = li18 + 1
+    }
+    g_file_idle_used = lt18
+    var lt19 = table_new_i64()
+    var li19: i64 = 0
+    while li19 < len(c_sg_nparams[id]) {
+        table_push(lt19, c_sg_nparams[id][li19])
+        li19 = li19 + 1
+    }
+    sg_nparams = lt19
+    var lt20 = table_new_i64()
+    var li20: i64 = 0
+    while li20 < len(c_sg_required[id]) {
+        table_push(lt20, c_sg_required[id][li20])
+        li20 = li20 + 1
+    }
+    sg_required = lt20
+    var lt21 = table_new_i64()
+    var li21: i64 = 0
+    while li21 < len(c_sg_ret[id]) {
+        table_push(lt21, c_sg_ret[id][li21])
+        li21 = li21 + 1
+    }
+    sg_ret = lt21
+    var lt22 = table_new_i64()
+    var li22: i64 = 0
+    while li22 < len(c_sg_pub[id]) {
+        table_push(lt22, c_sg_pub[id][li22])
+        li22 = li22 + 1
+    }
+    sg_pub = lt22
+    var lt23 = table_new_i64()
+    var li23: i64 = 0
+    while li23 < len(c_sg_off[id]) {
+        table_push(lt23, c_sg_off[id][li23])
+        li23 = li23 + 1
+    }
+    sg_off = lt23
+    var lt24 = table_new_i64()
+    var li24: i64 = 0
+    while li24 < len(c_sg_defnode[id]) {
+        table_push(lt24, c_sg_defnode[id][li24])
+        li24 = li24 + 1
+    }
+    sg_defnode = lt24
+    var lt25 = table_new_i64()
+    var li25: i64 = 0
+    while li25 < len(c_sp_tys[id]) {
+        table_push(lt25, c_sp_tys[id][li25])
+        li25 = li25 + 1
+    }
+    sp_tys = lt25
+    var lt26 = table_new_i64()
+    var li26: i64 = 0
+    while li26 < len(c_sp_refs[id]) {
+        table_push(lt26, c_sp_refs[id][li26])
+        li26 = li26 + 1
+    }
+    sp_refs = lt26
+    var lt27 = table_new_i64()
+    var li27: i64 = 0
+    while li27 < len(c_sp_defs[id]) {
+        table_push(lt27, c_sp_defs[id][li27])
+        li27 = li27 + 1
+    }
+    sp_defs = lt27
+    var lt28 = table_new_i64()
+    var li28: i64 = 0
+    while li28 < len(c_sp_vars[id]) {
+        table_push(lt28, c_sp_vars[id][li28])
+        li28 = li28 + 1
+    }
+    sp_vars = lt28
+    var lt29 = table_new_i64()
+    var li29: i64 = 0
+    while li29 < len(c_gen_marks[id]) {
+        table_push(lt29, c_gen_marks[id][li29])
+        li29 = li29 + 1
+    }
+    gen_marks = lt29
+    var lt30 = table_new_i64()
+    var li30: i64 = 0
+    while li30 < len(c_g_im_keys[id]) {
+        table_push(lt30, c_g_im_keys[id][li30])
+        li30 = li30 + 1
+    }
+    g_im_keys = lt30
+    var lt31 = table_new_i64()
+    var li31: i64 = 0
+    while li31 < len(c_g_im_vals[id]) {
+        table_push(lt31, c_g_im_vals[id][li31])
+        li31 = li31 + 1
+    }
+    g_im_vals = lt31
+}
+func push_1() {
+    table_push(c_g_vp_keys, table_new_i64())
+    table_push(c_g_uwt_keys, table_new_i64())
+    table_push(c_alias_keys, table_new_i64())
+    table_push(c_alias_vals, table_new_i64())
+    table_push(c_st_reprc, table_new_i64())
+    table_push(c_gb_keys, table_new_i64())
+    table_push(c_gb_vals, table_new_i64())
+    table_push(c_gb_const, table_new_i64())
+    table_push(c_gb_telem, table_new_i64())
+    table_push(c_ext_keys, table_new_i64())
+    table_push(c_tre_keys, table_new_i64())
+    table_push(c_tre_vals, table_new_i64())
+    table_push(c_node_types, table_new_i64())
+    table_push(c_g_cmp_getter, table_new_i64())
+    table_push(c_g_cmp_setter, table_new_i64())
+    table_push(c_lv_keys, table_new_i64())
+    table_push(c_lv_vals, table_new_i64())
+    table_push(c_lv_const, table_new_i64())
+    table_push(c_lv_telem, table_new_i64())
+    table_push(c_lv_dyn, table_new_i64())
+    table_push(c_lv_moved, table_new_i64())
+    table_push(c_gr_rel, table_new_i64())
+    table_push(c_gr_dead, table_new_i64())
+    table_push(c_lp_stack, table_new_i64())
+    table_push(c_ns_stack, table_new_i64())
+    table_push(c_using_prefixes, table_new_i64())
+    table_push(c_using_lens, table_new_i64())
+    table_push(c_tre_bi_keys, table_new_i64())
+    table_push(c_tre_bi_vals, table_new_i64())
+    table_push(c_struct_tys, table_new_i64())
+    table_push(c_gty_keys, table_new_i64())
+    table_push(c_gty_vals, table_new_i64())
+}
+func cap_1() {
+    table_push(c_g_vp_keys, g_vp_keys)
+    table_push(c_g_uwt_keys, g_uwt_keys)
+    table_push(c_alias_keys, alias_keys)
+    table_push(c_alias_vals, alias_vals)
+    table_push(c_st_reprc, st_reprc)
+    table_push(c_gb_keys, gb_keys)
+    table_push(c_gb_vals, gb_vals)
+    table_push(c_gb_const, gb_const)
+    table_push(c_gb_telem, gb_telem)
+    table_push(c_ext_keys, ext_keys)
+    table_push(c_tre_keys, tre_keys)
+    table_push(c_tre_vals, tre_vals)
+    table_push(c_node_types, node_types)
+    table_push(c_g_cmp_getter, g_cmp_getter)
+    table_push(c_g_cmp_setter, g_cmp_setter)
+    table_push(c_lv_keys, lv_keys)
+    table_push(c_lv_vals, lv_vals)
+    table_push(c_lv_const, lv_const)
+    table_push(c_lv_telem, lv_telem)
+    table_push(c_lv_dyn, lv_dyn)
+    table_push(c_lv_moved, lv_moved)
+    table_push(c_gr_rel, gr_rel)
+    table_push(c_gr_dead, gr_dead)
+    table_push(c_lp_stack, lp_stack)
+    table_push(c_ns_stack, ns_stack)
+    table_push(c_using_prefixes, using_prefixes)
+    table_push(c_using_lens, using_lens)
+    table_push(c_tre_bi_keys, tre_bi_keys)
+    table_push(c_tre_bi_vals, tre_bi_vals)
+    table_push(c_struct_tys, struct_tys)
+    table_push(c_gty_keys, gty_keys)
+    table_push(c_gty_vals, gty_vals)
+}
+func save_1() {
+    c_g_vp_keys[g_ctx_cur] = coll.copy_i64(g_vp_keys)
+    c_g_uwt_keys[g_ctx_cur] = coll.copy_i64(g_uwt_keys)
+    c_alias_keys[g_ctx_cur] = coll.copy_i64(alias_keys)
+    c_alias_vals[g_ctx_cur] = coll.copy_i64(alias_vals)
+    c_st_reprc[g_ctx_cur] = coll.copy_i64(st_reprc)
+    c_gb_keys[g_ctx_cur] = coll.copy_i64(gb_keys)
+    c_gb_vals[g_ctx_cur] = coll.copy_i64(gb_vals)
+    c_gb_const[g_ctx_cur] = coll.copy_i64(gb_const)
+    c_gb_telem[g_ctx_cur] = coll.copy_i64(gb_telem)
+    c_ext_keys[g_ctx_cur] = coll.copy_i64(ext_keys)
+    c_tre_keys[g_ctx_cur] = coll.copy_i64(tre_keys)
+    c_tre_vals[g_ctx_cur] = coll.copy_i64(tre_vals)
+    c_node_types[g_ctx_cur] = coll.copy_i64(node_types)
+    c_g_cmp_getter[g_ctx_cur] = coll.copy_i64(g_cmp_getter)
+    c_g_cmp_setter[g_ctx_cur] = coll.copy_i64(g_cmp_setter)
+    c_lv_keys[g_ctx_cur] = coll.copy_i64(lv_keys)
+    c_lv_vals[g_ctx_cur] = coll.copy_i64(lv_vals)
+    c_lv_const[g_ctx_cur] = coll.copy_i64(lv_const)
+    c_lv_telem[g_ctx_cur] = coll.copy_i64(lv_telem)
+    c_lv_dyn[g_ctx_cur] = coll.copy_i64(lv_dyn)
+    c_lv_moved[g_ctx_cur] = coll.copy_i64(lv_moved)
+    c_gr_rel[g_ctx_cur] = coll.copy_i64(gr_rel)
+    c_gr_dead[g_ctx_cur] = coll.copy_i64(gr_dead)
+    c_lp_stack[g_ctx_cur] = coll.copy_i64(lp_stack)
+    c_ns_stack[g_ctx_cur] = coll.copy_i64(ns_stack)
+    c_using_prefixes[g_ctx_cur] = coll.copy_i64(using_prefixes)
+    c_using_lens[g_ctx_cur] = coll.copy_i64(using_lens)
+    c_tre_bi_keys[g_ctx_cur] = coll.copy_i64(tre_bi_keys)
+    c_tre_bi_vals[g_ctx_cur] = coll.copy_i64(tre_bi_vals)
+    c_struct_tys[g_ctx_cur] = coll.copy_i64(struct_tys)
+    c_gty_keys[g_ctx_cur] = coll.copy_i64(gty_keys)
+    c_gty_vals[g_ctx_cur] = coll.copy_i64(gty_vals)
+}
+func load_1(id: i64) {
+    var lt0 = table_new_i64()
+    var li0: i64 = 0
+    while li0 < len(c_g_vp_keys[id]) {
+        table_push(lt0, c_g_vp_keys[id][li0])
+        li0 = li0 + 1
+    }
+    g_vp_keys = lt0
+    var lt1 = table_new_i64()
+    var li1: i64 = 0
+    while li1 < len(c_g_uwt_keys[id]) {
+        table_push(lt1, c_g_uwt_keys[id][li1])
+        li1 = li1 + 1
+    }
+    g_uwt_keys = lt1
+    var lt2 = table_new_i64()
+    var li2: i64 = 0
+    while li2 < len(c_alias_keys[id]) {
+        table_push(lt2, c_alias_keys[id][li2])
+        li2 = li2 + 1
+    }
+    alias_keys = lt2
+    var lt3 = table_new_i64()
+    var li3: i64 = 0
+    while li3 < len(c_alias_vals[id]) {
+        table_push(lt3, c_alias_vals[id][li3])
+        li3 = li3 + 1
+    }
+    alias_vals = lt3
+    var lt4 = table_new_i64()
+    var li4: i64 = 0
+    while li4 < len(c_st_reprc[id]) {
+        table_push(lt4, c_st_reprc[id][li4])
+        li4 = li4 + 1
+    }
+    st_reprc = lt4
+    var lt5 = table_new_i64()
+    var li5: i64 = 0
+    while li5 < len(c_gb_keys[id]) {
+        table_push(lt5, c_gb_keys[id][li5])
+        li5 = li5 + 1
+    }
+    gb_keys = lt5
+    var lt6 = table_new_i64()
+    var li6: i64 = 0
+    while li6 < len(c_gb_vals[id]) {
+        table_push(lt6, c_gb_vals[id][li6])
+        li6 = li6 + 1
+    }
+    gb_vals = lt6
+    var lt7 = table_new_i64()
+    var li7: i64 = 0
+    while li7 < len(c_gb_const[id]) {
+        table_push(lt7, c_gb_const[id][li7])
+        li7 = li7 + 1
+    }
+    gb_const = lt7
+    var lt8 = table_new_i64()
+    var li8: i64 = 0
+    while li8 < len(c_gb_telem[id]) {
+        table_push(lt8, c_gb_telem[id][li8])
+        li8 = li8 + 1
+    }
+    gb_telem = lt8
+    var lt9 = table_new_i64()
+    var li9: i64 = 0
+    while li9 < len(c_ext_keys[id]) {
+        table_push(lt9, c_ext_keys[id][li9])
+        li9 = li9 + 1
+    }
+    ext_keys = lt9
+    var lt10 = table_new_i64()
+    var li10: i64 = 0
+    while li10 < len(c_tre_keys[id]) {
+        table_push(lt10, c_tre_keys[id][li10])
+        li10 = li10 + 1
+    }
+    tre_keys = lt10
+    var lt11 = table_new_i64()
+    var li11: i64 = 0
+    while li11 < len(c_tre_vals[id]) {
+        table_push(lt11, c_tre_vals[id][li11])
+        li11 = li11 + 1
+    }
+    tre_vals = lt11
+    var lt12 = table_new_i64()
+    var li12: i64 = 0
+    while li12 < len(c_node_types[id]) {
+        table_push(lt12, c_node_types[id][li12])
+        li12 = li12 + 1
+    }
+    node_types = lt12
+    var lt13 = table_new_i64()
+    var li13: i64 = 0
+    while li13 < len(c_g_cmp_getter[id]) {
+        table_push(lt13, c_g_cmp_getter[id][li13])
+        li13 = li13 + 1
+    }
+    g_cmp_getter = lt13
+    var lt14 = table_new_i64()
+    var li14: i64 = 0
+    while li14 < len(c_g_cmp_setter[id]) {
+        table_push(lt14, c_g_cmp_setter[id][li14])
+        li14 = li14 + 1
+    }
+    g_cmp_setter = lt14
+    var lt15 = table_new_i64()
+    var li15: i64 = 0
+    while li15 < len(c_lv_keys[id]) {
+        table_push(lt15, c_lv_keys[id][li15])
+        li15 = li15 + 1
+    }
+    lv_keys = lt15
+    var lt16 = table_new_i64()
+    var li16: i64 = 0
+    while li16 < len(c_lv_vals[id]) {
+        table_push(lt16, c_lv_vals[id][li16])
+        li16 = li16 + 1
+    }
+    lv_vals = lt16
+    var lt17 = table_new_i64()
+    var li17: i64 = 0
+    while li17 < len(c_lv_const[id]) {
+        table_push(lt17, c_lv_const[id][li17])
+        li17 = li17 + 1
+    }
+    lv_const = lt17
+    var lt18 = table_new_i64()
+    var li18: i64 = 0
+    while li18 < len(c_lv_telem[id]) {
+        table_push(lt18, c_lv_telem[id][li18])
+        li18 = li18 + 1
+    }
+    lv_telem = lt18
+    var lt19 = table_new_i64()
+    var li19: i64 = 0
+    while li19 < len(c_lv_dyn[id]) {
+        table_push(lt19, c_lv_dyn[id][li19])
+        li19 = li19 + 1
+    }
+    lv_dyn = lt19
+    var lt20 = table_new_i64()
+    var li20: i64 = 0
+    while li20 < len(c_lv_moved[id]) {
+        table_push(lt20, c_lv_moved[id][li20])
+        li20 = li20 + 1
+    }
+    lv_moved = lt20
+    var lt21 = table_new_i64()
+    var li21: i64 = 0
+    while li21 < len(c_gr_rel[id]) {
+        table_push(lt21, c_gr_rel[id][li21])
+        li21 = li21 + 1
+    }
+    gr_rel = lt21
+    var lt22 = table_new_i64()
+    var li22: i64 = 0
+    while li22 < len(c_gr_dead[id]) {
+        table_push(lt22, c_gr_dead[id][li22])
+        li22 = li22 + 1
+    }
+    gr_dead = lt22
+    var lt23 = table_new_i64()
+    var li23: i64 = 0
+    while li23 < len(c_lp_stack[id]) {
+        table_push(lt23, c_lp_stack[id][li23])
+        li23 = li23 + 1
+    }
+    lp_stack = lt23
+    var lt24 = table_new_i64()
+    var li24: i64 = 0
+    while li24 < len(c_ns_stack[id]) {
+        table_push(lt24, c_ns_stack[id][li24])
+        li24 = li24 + 1
+    }
+    ns_stack = lt24
+    var lt25 = table_new_i64()
+    var li25: i64 = 0
+    while li25 < len(c_using_prefixes[id]) {
+        table_push(lt25, c_using_prefixes[id][li25])
+        li25 = li25 + 1
+    }
+    using_prefixes = lt25
+    var lt26 = table_new_i64()
+    var li26: i64 = 0
+    while li26 < len(c_using_lens[id]) {
+        table_push(lt26, c_using_lens[id][li26])
+        li26 = li26 + 1
+    }
+    using_lens = lt26
+    var lt27 = table_new_i64()
+    var li27: i64 = 0
+    while li27 < len(c_tre_bi_keys[id]) {
+        table_push(lt27, c_tre_bi_keys[id][li27])
+        li27 = li27 + 1
+    }
+    tre_bi_keys = lt27
+    var lt28 = table_new_i64()
+    var li28: i64 = 0
+    while li28 < len(c_tre_bi_vals[id]) {
+        table_push(lt28, c_tre_bi_vals[id][li28])
+        li28 = li28 + 1
+    }
+    tre_bi_vals = lt28
+    var lt29 = table_new_i64()
+    var li29: i64 = 0
+    while li29 < len(c_struct_tys[id]) {
+        table_push(lt29, c_struct_tys[id][li29])
+        li29 = li29 + 1
+    }
+    struct_tys = lt29
+    var lt30 = table_new_i64()
+    var li30: i64 = 0
+    while li30 < len(c_gty_keys[id]) {
+        table_push(lt30, c_gty_keys[id][li30])
+        li30 = li30 + 1
+    }
+    gty_keys = lt30
+    var lt31 = table_new_i64()
+    var li31: i64 = 0
+    while li31 < len(c_gty_vals[id]) {
+        table_push(lt31, c_gty_vals[id][li31])
+        li31 = li31 + 1
+    }
+    gty_vals = lt31
+}
+func push_2() {
+    table_push(c_gty_full, table_new_i64())
+    table_push(c_gtyp_nparams, table_new_i64())
+    table_push(c_gtyp_off, table_new_i64())
+    table_push(c_gtyp_names, table_new_i64())
+    table_push(c_gty_node, table_new_i64())
+    table_push(c_gty_is_struct, table_new_i64())
+    table_push(c_gtyp_conoff, table_new_i64())
+    table_push(c_gtyp_cons, table_new_i64())
+    table_push(c_gtyp_kindoff, table_new_i64())
+    table_push(c_gtyp_kinds, table_new_i64())
+    table_push(c_gval_kkeys, table_new_i64())
+    table_push(c_gval_kvals, table_new_i64())
+    table_push(c_gtyp_defoff, table_new_i64())
+    table_push(c_gtyp_defs, table_new_i64())
+    table_push(c_gin_keys, table_new_i64())
+    table_push(c_gin_vals, table_new_i64())
+    table_push(c_gin_tmpl, table_new_i64())
+    table_push(c_gin_off, table_new_i64())
+    table_push(c_gin_nargs, table_new_i64())
+    table_push(c_gin_is_struct, table_new_i64())
+    table_push(c_garg_vals, table_new_i64())
+    table_push(c_g_clo_pending, table_new_i64())
+    table_push(c_cl_owner_sig, table_new_i64())
+    table_push(c_cl_owner_unsafe, table_new_i64())
+    table_push(c_cl_ret, table_new_i64())
+    table_push(c_cl_nparams, table_new_i64())
+    table_push(c_cl_paroff, table_new_i64())
+    table_push(c_cl_ptys, table_new_i64())
+    table_push(c_cl_off, table_new_i64())
+    table_push(c_cl_nouter, table_new_i64())
+    table_push(c_cl_okeys, table_new_i64())
+    table_push(c_cl_ovals, table_new_i64())
+}
+func cap_2() {
+    table_push(c_gty_full, gty_full)
+    table_push(c_gtyp_nparams, gtyp_nparams)
+    table_push(c_gtyp_off, gtyp_off)
+    table_push(c_gtyp_names, gtyp_names)
+    table_push(c_gty_node, gty_node)
+    table_push(c_gty_is_struct, gty_is_struct)
+    table_push(c_gtyp_conoff, gtyp_conoff)
+    table_push(c_gtyp_cons, gtyp_cons)
+    table_push(c_gtyp_kindoff, gtyp_kindoff)
+    table_push(c_gtyp_kinds, gtyp_kinds)
+    table_push(c_gval_kkeys, gval_kkeys)
+    table_push(c_gval_kvals, gval_kvals)
+    table_push(c_gtyp_defoff, gtyp_defoff)
+    table_push(c_gtyp_defs, gtyp_defs)
+    table_push(c_gin_keys, gin_keys)
+    table_push(c_gin_vals, gin_vals)
+    table_push(c_gin_tmpl, gin_tmpl)
+    table_push(c_gin_off, gin_off)
+    table_push(c_gin_nargs, gin_nargs)
+    table_push(c_gin_is_struct, gin_is_struct)
+    table_push(c_garg_vals, garg_vals)
+    table_push(c_g_clo_pending, g_clo_pending)
+    table_push(c_cl_owner_sig, cl_owner_sig)
+    table_push(c_cl_owner_unsafe, cl_owner_unsafe)
+    table_push(c_cl_ret, cl_ret)
+    table_push(c_cl_nparams, cl_nparams)
+    table_push(c_cl_paroff, cl_paroff)
+    table_push(c_cl_ptys, cl_ptys)
+    table_push(c_cl_off, cl_off)
+    table_push(c_cl_nouter, cl_nouter)
+    table_push(c_cl_okeys, cl_okeys)
+    table_push(c_cl_ovals, cl_ovals)
+}
+func save_2() {
+    c_gty_full[g_ctx_cur] = coll.copy_i64(gty_full)
+    c_gtyp_nparams[g_ctx_cur] = coll.copy_i64(gtyp_nparams)
+    c_gtyp_off[g_ctx_cur] = coll.copy_i64(gtyp_off)
+    c_gtyp_names[g_ctx_cur] = coll.copy_i64(gtyp_names)
+    c_gty_node[g_ctx_cur] = coll.copy_i64(gty_node)
+    c_gty_is_struct[g_ctx_cur] = coll.copy_i64(gty_is_struct)
+    c_gtyp_conoff[g_ctx_cur] = coll.copy_i64(gtyp_conoff)
+    c_gtyp_cons[g_ctx_cur] = coll.copy_i64(gtyp_cons)
+    c_gtyp_kindoff[g_ctx_cur] = coll.copy_i64(gtyp_kindoff)
+    c_gtyp_kinds[g_ctx_cur] = coll.copy_i64(gtyp_kinds)
+    c_gval_kkeys[g_ctx_cur] = coll.copy_i64(gval_kkeys)
+    c_gval_kvals[g_ctx_cur] = coll.copy_i64(gval_kvals)
+    c_gtyp_defoff[g_ctx_cur] = coll.copy_i64(gtyp_defoff)
+    c_gtyp_defs[g_ctx_cur] = coll.copy_i64(gtyp_defs)
+    c_gin_keys[g_ctx_cur] = coll.copy_i64(gin_keys)
+    c_gin_vals[g_ctx_cur] = coll.copy_i64(gin_vals)
+    c_gin_tmpl[g_ctx_cur] = coll.copy_i64(gin_tmpl)
+    c_gin_off[g_ctx_cur] = coll.copy_i64(gin_off)
+    c_gin_nargs[g_ctx_cur] = coll.copy_i64(gin_nargs)
+    c_gin_is_struct[g_ctx_cur] = coll.copy_i64(gin_is_struct)
+    c_garg_vals[g_ctx_cur] = coll.copy_i64(garg_vals)
+    c_g_clo_pending[g_ctx_cur] = coll.copy_i64(g_clo_pending)
+    c_cl_owner_sig[g_ctx_cur] = coll.copy_i64(cl_owner_sig)
+    c_cl_owner_unsafe[g_ctx_cur] = coll.copy_i64(cl_owner_unsafe)
+    c_cl_ret[g_ctx_cur] = coll.copy_i64(cl_ret)
+    c_cl_nparams[g_ctx_cur] = coll.copy_i64(cl_nparams)
+    c_cl_paroff[g_ctx_cur] = coll.copy_i64(cl_paroff)
+    c_cl_ptys[g_ctx_cur] = coll.copy_i64(cl_ptys)
+    c_cl_off[g_ctx_cur] = coll.copy_i64(cl_off)
+    c_cl_nouter[g_ctx_cur] = coll.copy_i64(cl_nouter)
+    c_cl_okeys[g_ctx_cur] = coll.copy_i64(cl_okeys)
+    c_cl_ovals[g_ctx_cur] = coll.copy_i64(cl_ovals)
+}
+func load_2(id: i64) {
+    var lt0 = table_new_i64()
+    var li0: i64 = 0
+    while li0 < len(c_gty_full[id]) {
+        table_push(lt0, c_gty_full[id][li0])
+        li0 = li0 + 1
+    }
+    gty_full = lt0
+    var lt1 = table_new_i64()
+    var li1: i64 = 0
+    while li1 < len(c_gtyp_nparams[id]) {
+        table_push(lt1, c_gtyp_nparams[id][li1])
+        li1 = li1 + 1
+    }
+    gtyp_nparams = lt1
+    var lt2 = table_new_i64()
+    var li2: i64 = 0
+    while li2 < len(c_gtyp_off[id]) {
+        table_push(lt2, c_gtyp_off[id][li2])
+        li2 = li2 + 1
+    }
+    gtyp_off = lt2
+    var lt3 = table_new_i64()
+    var li3: i64 = 0
+    while li3 < len(c_gtyp_names[id]) {
+        table_push(lt3, c_gtyp_names[id][li3])
+        li3 = li3 + 1
+    }
+    gtyp_names = lt3
+    var lt4 = table_new_i64()
+    var li4: i64 = 0
+    while li4 < len(c_gty_node[id]) {
+        table_push(lt4, c_gty_node[id][li4])
+        li4 = li4 + 1
+    }
+    gty_node = lt4
+    var lt5 = table_new_i64()
+    var li5: i64 = 0
+    while li5 < len(c_gty_is_struct[id]) {
+        table_push(lt5, c_gty_is_struct[id][li5])
+        li5 = li5 + 1
+    }
+    gty_is_struct = lt5
+    var lt6 = table_new_i64()
+    var li6: i64 = 0
+    while li6 < len(c_gtyp_conoff[id]) {
+        table_push(lt6, c_gtyp_conoff[id][li6])
+        li6 = li6 + 1
+    }
+    gtyp_conoff = lt6
+    var lt7 = table_new_i64()
+    var li7: i64 = 0
+    while li7 < len(c_gtyp_cons[id]) {
+        table_push(lt7, c_gtyp_cons[id][li7])
+        li7 = li7 + 1
+    }
+    gtyp_cons = lt7
+    var lt8 = table_new_i64()
+    var li8: i64 = 0
+    while li8 < len(c_gtyp_kindoff[id]) {
+        table_push(lt8, c_gtyp_kindoff[id][li8])
+        li8 = li8 + 1
+    }
+    gtyp_kindoff = lt8
+    var lt9 = table_new_i64()
+    var li9: i64 = 0
+    while li9 < len(c_gtyp_kinds[id]) {
+        table_push(lt9, c_gtyp_kinds[id][li9])
+        li9 = li9 + 1
+    }
+    gtyp_kinds = lt9
+    var lt10 = table_new_i64()
+    var li10: i64 = 0
+    while li10 < len(c_gval_kkeys[id]) {
+        table_push(lt10, c_gval_kkeys[id][li10])
+        li10 = li10 + 1
+    }
+    gval_kkeys = lt10
+    var lt11 = table_new_i64()
+    var li11: i64 = 0
+    while li11 < len(c_gval_kvals[id]) {
+        table_push(lt11, c_gval_kvals[id][li11])
+        li11 = li11 + 1
+    }
+    gval_kvals = lt11
+    var lt12 = table_new_i64()
+    var li12: i64 = 0
+    while li12 < len(c_gtyp_defoff[id]) {
+        table_push(lt12, c_gtyp_defoff[id][li12])
+        li12 = li12 + 1
+    }
+    gtyp_defoff = lt12
+    var lt13 = table_new_i64()
+    var li13: i64 = 0
+    while li13 < len(c_gtyp_defs[id]) {
+        table_push(lt13, c_gtyp_defs[id][li13])
+        li13 = li13 + 1
+    }
+    gtyp_defs = lt13
+    var lt14 = table_new_i64()
+    var li14: i64 = 0
+    while li14 < len(c_gin_keys[id]) {
+        table_push(lt14, c_gin_keys[id][li14])
+        li14 = li14 + 1
+    }
+    gin_keys = lt14
+    var lt15 = table_new_i64()
+    var li15: i64 = 0
+    while li15 < len(c_gin_vals[id]) {
+        table_push(lt15, c_gin_vals[id][li15])
+        li15 = li15 + 1
+    }
+    gin_vals = lt15
+    var lt16 = table_new_i64()
+    var li16: i64 = 0
+    while li16 < len(c_gin_tmpl[id]) {
+        table_push(lt16, c_gin_tmpl[id][li16])
+        li16 = li16 + 1
+    }
+    gin_tmpl = lt16
+    var lt17 = table_new_i64()
+    var li17: i64 = 0
+    while li17 < len(c_gin_off[id]) {
+        table_push(lt17, c_gin_off[id][li17])
+        li17 = li17 + 1
+    }
+    gin_off = lt17
+    var lt18 = table_new_i64()
+    var li18: i64 = 0
+    while li18 < len(c_gin_nargs[id]) {
+        table_push(lt18, c_gin_nargs[id][li18])
+        li18 = li18 + 1
+    }
+    gin_nargs = lt18
+    var lt19 = table_new_i64()
+    var li19: i64 = 0
+    while li19 < len(c_gin_is_struct[id]) {
+        table_push(lt19, c_gin_is_struct[id][li19])
+        li19 = li19 + 1
+    }
+    gin_is_struct = lt19
+    var lt20 = table_new_i64()
+    var li20: i64 = 0
+    while li20 < len(c_garg_vals[id]) {
+        table_push(lt20, c_garg_vals[id][li20])
+        li20 = li20 + 1
+    }
+    garg_vals = lt20
+    var lt21 = table_new_i64()
+    var li21: i64 = 0
+    while li21 < len(c_g_clo_pending[id]) {
+        table_push(lt21, c_g_clo_pending[id][li21])
+        li21 = li21 + 1
+    }
+    g_clo_pending = lt21
+    var lt22 = table_new_i64()
+    var li22: i64 = 0
+    while li22 < len(c_cl_owner_sig[id]) {
+        table_push(lt22, c_cl_owner_sig[id][li22])
+        li22 = li22 + 1
+    }
+    cl_owner_sig = lt22
+    var lt23 = table_new_i64()
+    var li23: i64 = 0
+    while li23 < len(c_cl_owner_unsafe[id]) {
+        table_push(lt23, c_cl_owner_unsafe[id][li23])
+        li23 = li23 + 1
+    }
+    cl_owner_unsafe = lt23
+    var lt24 = table_new_i64()
+    var li24: i64 = 0
+    while li24 < len(c_cl_ret[id]) {
+        table_push(lt24, c_cl_ret[id][li24])
+        li24 = li24 + 1
+    }
+    cl_ret = lt24
+    var lt25 = table_new_i64()
+    var li25: i64 = 0
+    while li25 < len(c_cl_nparams[id]) {
+        table_push(lt25, c_cl_nparams[id][li25])
+        li25 = li25 + 1
+    }
+    cl_nparams = lt25
+    var lt26 = table_new_i64()
+    var li26: i64 = 0
+    while li26 < len(c_cl_paroff[id]) {
+        table_push(lt26, c_cl_paroff[id][li26])
+        li26 = li26 + 1
+    }
+    cl_paroff = lt26
+    var lt27 = table_new_i64()
+    var li27: i64 = 0
+    while li27 < len(c_cl_ptys[id]) {
+        table_push(lt27, c_cl_ptys[id][li27])
+        li27 = li27 + 1
+    }
+    cl_ptys = lt27
+    var lt28 = table_new_i64()
+    var li28: i64 = 0
+    while li28 < len(c_cl_off[id]) {
+        table_push(lt28, c_cl_off[id][li28])
+        li28 = li28 + 1
+    }
+    cl_off = lt28
+    var lt29 = table_new_i64()
+    var li29: i64 = 0
+    while li29 < len(c_cl_nouter[id]) {
+        table_push(lt29, c_cl_nouter[id][li29])
+        li29 = li29 + 1
+    }
+    cl_nouter = lt29
+    var lt30 = table_new_i64()
+    var li30: i64 = 0
+    while li30 < len(c_cl_okeys[id]) {
+        table_push(lt30, c_cl_okeys[id][li30])
+        li30 = li30 + 1
+    }
+    cl_okeys = lt30
+    var lt31 = table_new_i64()
+    var li31: i64 = 0
+    while li31 < len(c_cl_ovals[id]) {
+        table_push(lt31, c_cl_ovals[id][li31])
+        li31 = li31 + 1
+    }
+    cl_ovals = lt31
+}
+func push_3() {
+    table_push(c_cl_oconst, table_new_i64())
+    table_push(c_cl_otelem, table_new_i64())
+    table_push(c_cl_odyn, table_new_i64())
+    table_push(c_cl_paramoff, table_new_i64())
+    table_push(c_cl_params, table_new_i64())
+    table_push(c_cl_locloff, table_new_i64())
+    table_push(c_cl_locals, table_new_i64())
+    table_push(c_cl_capoff, table_new_i64())
+    table_push(c_cl_grefs, table_new_i64())
+    table_push(c_g_spawn_nodes, table_new_i64())
+    table_push(c_g_spawn_args, table_new_i64())
+    table_push(c_g_spawn_caps, table_new_i64())
+    table_push(c_g_spawn_unsafe, table_new_i64())
+    table_push(c_g_spawn_force, table_new_i64())
+    table_push(c_cl_capkeys, table_new_i64())
+    table_push(c_cl_capvals, table_new_i64())
+    table_push(c_g_clo_ret_stack, table_new_i64())
+    table_push(c_cl_parent, table_new_i64())
+    table_push(c_ac_keys, table_new_i64())
+    table_push(c_ac_vals, table_new_i64())
+    table_push(c_ac_moff, table_new_i64())
+    table_push(c_ac_mn, table_new_i64())
+    table_push(c_ac_mpar, table_new_i64())
+    table_push(c_ac_paroff, table_new_i64())
+    table_push(c_ac_mret, table_new_i64())
+    table_push(c_ac_mnames, table_new_i64())
+    table_push(c_ac_mnpars, table_new_i64())
+    table_push(c_ac_mptys, table_new_i64())
+    table_push(c_ac_mrets, table_new_i64())
+    table_push(c_ac_masync, table_new_i64())
+    table_push(c_ac_mreent, table_new_i64())
+    table_push(c_ac_fnoff, table_new_i64())
+}
+func cap_3() {
+    table_push(c_cl_oconst, cl_oconst)
+    table_push(c_cl_otelem, cl_otelem)
+    table_push(c_cl_odyn, cl_odyn)
+    table_push(c_cl_paramoff, cl_paramoff)
+    table_push(c_cl_params, cl_params)
+    table_push(c_cl_locloff, cl_locloff)
+    table_push(c_cl_locals, cl_locals)
+    table_push(c_cl_capoff, cl_capoff)
+    table_push(c_cl_grefs, cl_grefs)
+    table_push(c_g_spawn_nodes, g_spawn_nodes)
+    table_push(c_g_spawn_args, g_spawn_args)
+    table_push(c_g_spawn_caps, g_spawn_caps)
+    table_push(c_g_spawn_unsafe, g_spawn_unsafe)
+    table_push(c_g_spawn_force, g_spawn_force)
+    table_push(c_cl_capkeys, cl_capkeys)
+    table_push(c_cl_capvals, cl_capvals)
+    table_push(c_g_clo_ret_stack, g_clo_ret_stack)
+    table_push(c_cl_parent, cl_parent)
+    table_push(c_ac_keys, ac_keys)
+    table_push(c_ac_vals, ac_vals)
+    table_push(c_ac_moff, ac_moff)
+    table_push(c_ac_mn, ac_mn)
+    table_push(c_ac_mpar, ac_mpar)
+    table_push(c_ac_paroff, ac_paroff)
+    table_push(c_ac_mret, ac_mret)
+    table_push(c_ac_mnames, ac_mnames)
+    table_push(c_ac_mnpars, ac_mnpars)
+    table_push(c_ac_mptys, ac_mptys)
+    table_push(c_ac_mrets, ac_mrets)
+    table_push(c_ac_masync, ac_masync)
+    table_push(c_ac_mreent, ac_mreent)
+    table_push(c_ac_fnoff, ac_fnoff)
+}
+func save_3() {
+    c_cl_oconst[g_ctx_cur] = coll.copy_i64(cl_oconst)
+    c_cl_otelem[g_ctx_cur] = coll.copy_i64(cl_otelem)
+    c_cl_odyn[g_ctx_cur] = coll.copy_i64(cl_odyn)
+    c_cl_paramoff[g_ctx_cur] = coll.copy_i64(cl_paramoff)
+    c_cl_params[g_ctx_cur] = coll.copy_i64(cl_params)
+    c_cl_locloff[g_ctx_cur] = coll.copy_i64(cl_locloff)
+    c_cl_locals[g_ctx_cur] = coll.copy_i64(cl_locals)
+    c_cl_capoff[g_ctx_cur] = coll.copy_i64(cl_capoff)
+    c_cl_grefs[g_ctx_cur] = coll.copy_i64(cl_grefs)
+    c_g_spawn_nodes[g_ctx_cur] = coll.copy_i64(g_spawn_nodes)
+    c_g_spawn_args[g_ctx_cur] = coll.copy_i64(g_spawn_args)
+    c_g_spawn_caps[g_ctx_cur] = coll.copy_i64(g_spawn_caps)
+    c_g_spawn_unsafe[g_ctx_cur] = coll.copy_i64(g_spawn_unsafe)
+    c_g_spawn_force[g_ctx_cur] = coll.copy_i64(g_spawn_force)
+    c_cl_capkeys[g_ctx_cur] = coll.copy_i64(cl_capkeys)
+    c_cl_capvals[g_ctx_cur] = coll.copy_i64(cl_capvals)
+    c_g_clo_ret_stack[g_ctx_cur] = coll.copy_i64(g_clo_ret_stack)
+    c_cl_parent[g_ctx_cur] = coll.copy_i64(cl_parent)
+    c_ac_keys[g_ctx_cur] = coll.copy_i64(ac_keys)
+    c_ac_vals[g_ctx_cur] = coll.copy_i64(ac_vals)
+    c_ac_moff[g_ctx_cur] = coll.copy_i64(ac_moff)
+    c_ac_mn[g_ctx_cur] = coll.copy_i64(ac_mn)
+    c_ac_mpar[g_ctx_cur] = coll.copy_i64(ac_mpar)
+    c_ac_paroff[g_ctx_cur] = coll.copy_i64(ac_paroff)
+    c_ac_mret[g_ctx_cur] = coll.copy_i64(ac_mret)
+    c_ac_mnames[g_ctx_cur] = coll.copy_i64(ac_mnames)
+    c_ac_mnpars[g_ctx_cur] = coll.copy_i64(ac_mnpars)
+    c_ac_mptys[g_ctx_cur] = coll.copy_i64(ac_mptys)
+    c_ac_mrets[g_ctx_cur] = coll.copy_i64(ac_mrets)
+    c_ac_masync[g_ctx_cur] = coll.copy_i64(ac_masync)
+    c_ac_mreent[g_ctx_cur] = coll.copy_i64(ac_mreent)
+    c_ac_fnoff[g_ctx_cur] = coll.copy_i64(ac_fnoff)
+}
+func load_3(id: i64) {
+    var lt0 = table_new_i64()
+    var li0: i64 = 0
+    while li0 < len(c_cl_oconst[id]) {
+        table_push(lt0, c_cl_oconst[id][li0])
+        li0 = li0 + 1
+    }
+    cl_oconst = lt0
+    var lt1 = table_new_i64()
+    var li1: i64 = 0
+    while li1 < len(c_cl_otelem[id]) {
+        table_push(lt1, c_cl_otelem[id][li1])
+        li1 = li1 + 1
+    }
+    cl_otelem = lt1
+    var lt2 = table_new_i64()
+    var li2: i64 = 0
+    while li2 < len(c_cl_odyn[id]) {
+        table_push(lt2, c_cl_odyn[id][li2])
+        li2 = li2 + 1
+    }
+    cl_odyn = lt2
+    var lt3 = table_new_i64()
+    var li3: i64 = 0
+    while li3 < len(c_cl_paramoff[id]) {
+        table_push(lt3, c_cl_paramoff[id][li3])
+        li3 = li3 + 1
+    }
+    cl_paramoff = lt3
+    var lt4 = table_new_i64()
+    var li4: i64 = 0
+    while li4 < len(c_cl_params[id]) {
+        table_push(lt4, c_cl_params[id][li4])
+        li4 = li4 + 1
+    }
+    cl_params = lt4
+    var lt5 = table_new_i64()
+    var li5: i64 = 0
+    while li5 < len(c_cl_locloff[id]) {
+        table_push(lt5, c_cl_locloff[id][li5])
+        li5 = li5 + 1
+    }
+    cl_locloff = lt5
+    var lt6 = table_new_i64()
+    var li6: i64 = 0
+    while li6 < len(c_cl_locals[id]) {
+        table_push(lt6, c_cl_locals[id][li6])
+        li6 = li6 + 1
+    }
+    cl_locals = lt6
+    var lt7 = table_new_i64()
+    var li7: i64 = 0
+    while li7 < len(c_cl_capoff[id]) {
+        table_push(lt7, c_cl_capoff[id][li7])
+        li7 = li7 + 1
+    }
+    cl_capoff = lt7
+    var lt8 = table_new_i64()
+    var li8: i64 = 0
+    while li8 < len(c_cl_grefs[id]) {
+        table_push(lt8, c_cl_grefs[id][li8])
+        li8 = li8 + 1
+    }
+    cl_grefs = lt8
+    var lt9 = table_new_i64()
+    var li9: i64 = 0
+    while li9 < len(c_g_spawn_nodes[id]) {
+        table_push(lt9, c_g_spawn_nodes[id][li9])
+        li9 = li9 + 1
+    }
+    g_spawn_nodes = lt9
+    var lt10 = table_new_i64()
+    var li10: i64 = 0
+    while li10 < len(c_g_spawn_args[id]) {
+        table_push(lt10, c_g_spawn_args[id][li10])
+        li10 = li10 + 1
+    }
+    g_spawn_args = lt10
+    var lt11 = table_new_i64()
+    var li11: i64 = 0
+    while li11 < len(c_g_spawn_caps[id]) {
+        table_push(lt11, c_g_spawn_caps[id][li11])
+        li11 = li11 + 1
+    }
+    g_spawn_caps = lt11
+    var lt12 = table_new_i64()
+    var li12: i64 = 0
+    while li12 < len(c_g_spawn_unsafe[id]) {
+        table_push(lt12, c_g_spawn_unsafe[id][li12])
+        li12 = li12 + 1
+    }
+    g_spawn_unsafe = lt12
+    var lt13 = table_new_i64()
+    var li13: i64 = 0
+    while li13 < len(c_g_spawn_force[id]) {
+        table_push(lt13, c_g_spawn_force[id][li13])
+        li13 = li13 + 1
+    }
+    g_spawn_force = lt13
+    var lt14 = table_new_i64()
+    var li14: i64 = 0
+    while li14 < len(c_cl_capkeys[id]) {
+        table_push(lt14, c_cl_capkeys[id][li14])
+        li14 = li14 + 1
+    }
+    cl_capkeys = lt14
+    var lt15 = table_new_i64()
+    var li15: i64 = 0
+    while li15 < len(c_cl_capvals[id]) {
+        table_push(lt15, c_cl_capvals[id][li15])
+        li15 = li15 + 1
+    }
+    cl_capvals = lt15
+    var lt16 = table_new_i64()
+    var li16: i64 = 0
+    while li16 < len(c_g_clo_ret_stack[id]) {
+        table_push(lt16, c_g_clo_ret_stack[id][li16])
+        li16 = li16 + 1
+    }
+    g_clo_ret_stack = lt16
+    var lt17 = table_new_i64()
+    var li17: i64 = 0
+    while li17 < len(c_cl_parent[id]) {
+        table_push(lt17, c_cl_parent[id][li17])
+        li17 = li17 + 1
+    }
+    cl_parent = lt17
+    var lt18 = table_new_i64()
+    var li18: i64 = 0
+    while li18 < len(c_ac_keys[id]) {
+        table_push(lt18, c_ac_keys[id][li18])
+        li18 = li18 + 1
+    }
+    ac_keys = lt18
+    var lt19 = table_new_i64()
+    var li19: i64 = 0
+    while li19 < len(c_ac_vals[id]) {
+        table_push(lt19, c_ac_vals[id][li19])
+        li19 = li19 + 1
+    }
+    ac_vals = lt19
+    var lt20 = table_new_i64()
+    var li20: i64 = 0
+    while li20 < len(c_ac_moff[id]) {
+        table_push(lt20, c_ac_moff[id][li20])
+        li20 = li20 + 1
+    }
+    ac_moff = lt20
+    var lt21 = table_new_i64()
+    var li21: i64 = 0
+    while li21 < len(c_ac_mn[id]) {
+        table_push(lt21, c_ac_mn[id][li21])
+        li21 = li21 + 1
+    }
+    ac_mn = lt21
+    var lt22 = table_new_i64()
+    var li22: i64 = 0
+    while li22 < len(c_ac_mpar[id]) {
+        table_push(lt22, c_ac_mpar[id][li22])
+        li22 = li22 + 1
+    }
+    ac_mpar = lt22
+    var lt23 = table_new_i64()
+    var li23: i64 = 0
+    while li23 < len(c_ac_paroff[id]) {
+        table_push(lt23, c_ac_paroff[id][li23])
+        li23 = li23 + 1
+    }
+    ac_paroff = lt23
+    var lt24 = table_new_i64()
+    var li24: i64 = 0
+    while li24 < len(c_ac_mret[id]) {
+        table_push(lt24, c_ac_mret[id][li24])
+        li24 = li24 + 1
+    }
+    ac_mret = lt24
+    var lt25 = table_new_i64()
+    var li25: i64 = 0
+    while li25 < len(c_ac_mnames[id]) {
+        table_push(lt25, c_ac_mnames[id][li25])
+        li25 = li25 + 1
+    }
+    ac_mnames = lt25
+    var lt26 = table_new_i64()
+    var li26: i64 = 0
+    while li26 < len(c_ac_mnpars[id]) {
+        table_push(lt26, c_ac_mnpars[id][li26])
+        li26 = li26 + 1
+    }
+    ac_mnpars = lt26
+    var lt27 = table_new_i64()
+    var li27: i64 = 0
+    while li27 < len(c_ac_mptys[id]) {
+        table_push(lt27, c_ac_mptys[id][li27])
+        li27 = li27 + 1
+    }
+    ac_mptys = lt27
+    var lt28 = table_new_i64()
+    var li28: i64 = 0
+    while li28 < len(c_ac_mrets[id]) {
+        table_push(lt28, c_ac_mrets[id][li28])
+        li28 = li28 + 1
+    }
+    ac_mrets = lt28
+    var lt29 = table_new_i64()
+    var li29: i64 = 0
+    while li29 < len(c_ac_masync[id]) {
+        table_push(lt29, c_ac_masync[id][li29])
+        li29 = li29 + 1
+    }
+    ac_masync = lt29
+    var lt30 = table_new_i64()
+    var li30: i64 = 0
+    while li30 < len(c_ac_mreent[id]) {
+        table_push(lt30, c_ac_mreent[id][li30])
+        li30 = li30 + 1
+    }
+    ac_mreent = lt30
+    var lt31 = table_new_i64()
+    var li31: i64 = 0
+    while li31 < len(c_ac_fnoff[id]) {
+        table_push(lt31, c_ac_fnoff[id][li31])
+        li31 = li31 + 1
+    }
+    ac_fnoff = lt31
+}
+func push_4() {
+    table_push(c_ac_fncnt, table_new_i64())
+    table_push(c_ac_ftyoff, table_new_i64())
+    table_push(c_ac_fvoff, table_new_i64())
+    table_push(c_ac_fnames, table_new_i64())
+    table_push(c_ac_ftys, table_new_i64())
+    table_push(c_ac_fdefs, table_new_i64())
+    table_push(c_ac_foffs, table_new_i64())
+    table_push(c_afn_keys, table_new_i64())
+    table_push(c_afn_actor, table_new_i64())
+    table_push(c_pt_keys, table_new_i64())
+    table_push(c_pt_vals, table_new_i64())
+    table_push(c_pm_off, table_new_i64())
+    table_push(c_pm_n, table_new_i64())
+    table_push(c_pm_npar, table_new_i64())
+    table_push(c_pm_paroff, table_new_i64())
+    table_push(c_pm_ret, table_new_i64())
+    table_push(c_pm_names, table_new_i64())
+    table_push(c_pm_npars, table_new_i64())
+    table_push(c_pm_ptys, table_new_i64())
+    table_push(c_pm_rets, table_new_i64())
+    table_push(c_pm_iface, table_new_i64())
+    table_push(c_im_keys, table_new_i64())
+    table_push(c_im_vals, table_new_i64())
+    table_push(c_im_port, table_new_i64())
+    table_push(c_im_struct, table_new_i64())
+    table_push(c_im_poff, table_new_i64())
+    table_push(c_im_n, table_new_i64())
+    table_push(c_im_mnames, table_new_i64())
+    table_push(c_g_extra_tops, table_new_i64())
+    table_push(c_g_file_roots, table_new_i64())
+    table_push(c_g_file_base, table_new_i64())
+    table_push(c_sg_mod, table_new_i64())
+}
+func cap_4() {
+    table_push(c_ac_fncnt, ac_fncnt)
+    table_push(c_ac_ftyoff, ac_ftyoff)
+    table_push(c_ac_fvoff, ac_fvoff)
+    table_push(c_ac_fnames, ac_fnames)
+    table_push(c_ac_ftys, ac_ftys)
+    table_push(c_ac_fdefs, ac_fdefs)
+    table_push(c_ac_foffs, ac_foffs)
+    table_push(c_afn_keys, afn_keys)
+    table_push(c_afn_actor, afn_actor)
+    table_push(c_pt_keys, pt_keys)
+    table_push(c_pt_vals, pt_vals)
+    table_push(c_pm_off, pm_off)
+    table_push(c_pm_n, pm_n)
+    table_push(c_pm_npar, pm_npar)
+    table_push(c_pm_paroff, pm_paroff)
+    table_push(c_pm_ret, pm_ret)
+    table_push(c_pm_names, pm_names)
+    table_push(c_pm_npars, pm_npars)
+    table_push(c_pm_ptys, pm_ptys)
+    table_push(c_pm_rets, pm_rets)
+    table_push(c_pm_iface, pm_iface)
+    table_push(c_im_keys, im_keys)
+    table_push(c_im_vals, im_vals)
+    table_push(c_im_port, im_port)
+    table_push(c_im_struct, im_struct)
+    table_push(c_im_poff, im_poff)
+    table_push(c_im_n, im_n)
+    table_push(c_im_mnames, im_mnames)
+    table_push(c_g_extra_tops, g_extra_tops)
+    table_push(c_g_file_roots, g_file_roots)
+    table_push(c_g_file_base, g_file_base)
+    table_push(c_sg_mod, sg_mod)
+}
+func save_4() {
+    c_ac_fncnt[g_ctx_cur] = coll.copy_i64(ac_fncnt)
+    c_ac_ftyoff[g_ctx_cur] = coll.copy_i64(ac_ftyoff)
+    c_ac_fvoff[g_ctx_cur] = coll.copy_i64(ac_fvoff)
+    c_ac_fnames[g_ctx_cur] = coll.copy_i64(ac_fnames)
+    c_ac_ftys[g_ctx_cur] = coll.copy_i64(ac_ftys)
+    c_ac_fdefs[g_ctx_cur] = coll.copy_i64(ac_fdefs)
+    c_ac_foffs[g_ctx_cur] = coll.copy_i64(ac_foffs)
+    c_afn_keys[g_ctx_cur] = coll.copy_i64(afn_keys)
+    c_afn_actor[g_ctx_cur] = coll.copy_i64(afn_actor)
+    c_pt_keys[g_ctx_cur] = coll.copy_i64(pt_keys)
+    c_pt_vals[g_ctx_cur] = coll.copy_i64(pt_vals)
+    c_pm_off[g_ctx_cur] = coll.copy_i64(pm_off)
+    c_pm_n[g_ctx_cur] = coll.copy_i64(pm_n)
+    c_pm_npar[g_ctx_cur] = coll.copy_i64(pm_npar)
+    c_pm_paroff[g_ctx_cur] = coll.copy_i64(pm_paroff)
+    c_pm_ret[g_ctx_cur] = coll.copy_i64(pm_ret)
+    c_pm_names[g_ctx_cur] = coll.copy_i64(pm_names)
+    c_pm_npars[g_ctx_cur] = coll.copy_i64(pm_npars)
+    c_pm_ptys[g_ctx_cur] = coll.copy_i64(pm_ptys)
+    c_pm_rets[g_ctx_cur] = coll.copy_i64(pm_rets)
+    c_pm_iface[g_ctx_cur] = coll.copy_i64(pm_iface)
+    c_im_keys[g_ctx_cur] = coll.copy_i64(im_keys)
+    c_im_vals[g_ctx_cur] = coll.copy_i64(im_vals)
+    c_im_port[g_ctx_cur] = coll.copy_i64(im_port)
+    c_im_struct[g_ctx_cur] = coll.copy_i64(im_struct)
+    c_im_poff[g_ctx_cur] = coll.copy_i64(im_poff)
+    c_im_n[g_ctx_cur] = coll.copy_i64(im_n)
+    c_im_mnames[g_ctx_cur] = coll.copy_i64(im_mnames)
+    c_g_extra_tops[g_ctx_cur] = coll.copy_i64(g_extra_tops)
+    c_g_file_roots[g_ctx_cur] = coll.copy_i64(g_file_roots)
+    c_g_file_base[g_ctx_cur] = coll.copy_i64(g_file_base)
+    c_sg_mod[g_ctx_cur] = coll.copy_i64(sg_mod)
+}
+func load_4(id: i64) {
+    var lt0 = table_new_i64()
+    var li0: i64 = 0
+    while li0 < len(c_ac_fncnt[id]) {
+        table_push(lt0, c_ac_fncnt[id][li0])
+        li0 = li0 + 1
+    }
+    ac_fncnt = lt0
+    var lt1 = table_new_i64()
+    var li1: i64 = 0
+    while li1 < len(c_ac_ftyoff[id]) {
+        table_push(lt1, c_ac_ftyoff[id][li1])
+        li1 = li1 + 1
+    }
+    ac_ftyoff = lt1
+    var lt2 = table_new_i64()
+    var li2: i64 = 0
+    while li2 < len(c_ac_fvoff[id]) {
+        table_push(lt2, c_ac_fvoff[id][li2])
+        li2 = li2 + 1
+    }
+    ac_fvoff = lt2
+    var lt3 = table_new_i64()
+    var li3: i64 = 0
+    while li3 < len(c_ac_fnames[id]) {
+        table_push(lt3, c_ac_fnames[id][li3])
+        li3 = li3 + 1
+    }
+    ac_fnames = lt3
+    var lt4 = table_new_i64()
+    var li4: i64 = 0
+    while li4 < len(c_ac_ftys[id]) {
+        table_push(lt4, c_ac_ftys[id][li4])
+        li4 = li4 + 1
+    }
+    ac_ftys = lt4
+    var lt5 = table_new_i64()
+    var li5: i64 = 0
+    while li5 < len(c_ac_fdefs[id]) {
+        table_push(lt5, c_ac_fdefs[id][li5])
+        li5 = li5 + 1
+    }
+    ac_fdefs = lt5
+    var lt6 = table_new_i64()
+    var li6: i64 = 0
+    while li6 < len(c_ac_foffs[id]) {
+        table_push(lt6, c_ac_foffs[id][li6])
+        li6 = li6 + 1
+    }
+    ac_foffs = lt6
+    var lt7 = table_new_i64()
+    var li7: i64 = 0
+    while li7 < len(c_afn_keys[id]) {
+        table_push(lt7, c_afn_keys[id][li7])
+        li7 = li7 + 1
+    }
+    afn_keys = lt7
+    var lt8 = table_new_i64()
+    var li8: i64 = 0
+    while li8 < len(c_afn_actor[id]) {
+        table_push(lt8, c_afn_actor[id][li8])
+        li8 = li8 + 1
+    }
+    afn_actor = lt8
+    var lt9 = table_new_i64()
+    var li9: i64 = 0
+    while li9 < len(c_pt_keys[id]) {
+        table_push(lt9, c_pt_keys[id][li9])
+        li9 = li9 + 1
+    }
+    pt_keys = lt9
+    var lt10 = table_new_i64()
+    var li10: i64 = 0
+    while li10 < len(c_pt_vals[id]) {
+        table_push(lt10, c_pt_vals[id][li10])
+        li10 = li10 + 1
+    }
+    pt_vals = lt10
+    var lt11 = table_new_i64()
+    var li11: i64 = 0
+    while li11 < len(c_pm_off[id]) {
+        table_push(lt11, c_pm_off[id][li11])
+        li11 = li11 + 1
+    }
+    pm_off = lt11
+    var lt12 = table_new_i64()
+    var li12: i64 = 0
+    while li12 < len(c_pm_n[id]) {
+        table_push(lt12, c_pm_n[id][li12])
+        li12 = li12 + 1
+    }
+    pm_n = lt12
+    var lt13 = table_new_i64()
+    var li13: i64 = 0
+    while li13 < len(c_pm_npar[id]) {
+        table_push(lt13, c_pm_npar[id][li13])
+        li13 = li13 + 1
+    }
+    pm_npar = lt13
+    var lt14 = table_new_i64()
+    var li14: i64 = 0
+    while li14 < len(c_pm_paroff[id]) {
+        table_push(lt14, c_pm_paroff[id][li14])
+        li14 = li14 + 1
+    }
+    pm_paroff = lt14
+    var lt15 = table_new_i64()
+    var li15: i64 = 0
+    while li15 < len(c_pm_ret[id]) {
+        table_push(lt15, c_pm_ret[id][li15])
+        li15 = li15 + 1
+    }
+    pm_ret = lt15
+    var lt16 = table_new_i64()
+    var li16: i64 = 0
+    while li16 < len(c_pm_names[id]) {
+        table_push(lt16, c_pm_names[id][li16])
+        li16 = li16 + 1
+    }
+    pm_names = lt16
+    var lt17 = table_new_i64()
+    var li17: i64 = 0
+    while li17 < len(c_pm_npars[id]) {
+        table_push(lt17, c_pm_npars[id][li17])
+        li17 = li17 + 1
+    }
+    pm_npars = lt17
+    var lt18 = table_new_i64()
+    var li18: i64 = 0
+    while li18 < len(c_pm_ptys[id]) {
+        table_push(lt18, c_pm_ptys[id][li18])
+        li18 = li18 + 1
+    }
+    pm_ptys = lt18
+    var lt19 = table_new_i64()
+    var li19: i64 = 0
+    while li19 < len(c_pm_rets[id]) {
+        table_push(lt19, c_pm_rets[id][li19])
+        li19 = li19 + 1
+    }
+    pm_rets = lt19
+    var lt20 = table_new_i64()
+    var li20: i64 = 0
+    while li20 < len(c_pm_iface[id]) {
+        table_push(lt20, c_pm_iface[id][li20])
+        li20 = li20 + 1
+    }
+    pm_iface = lt20
+    var lt21 = table_new_i64()
+    var li21: i64 = 0
+    while li21 < len(c_im_keys[id]) {
+        table_push(lt21, c_im_keys[id][li21])
+        li21 = li21 + 1
+    }
+    im_keys = lt21
+    var lt22 = table_new_i64()
+    var li22: i64 = 0
+    while li22 < len(c_im_vals[id]) {
+        table_push(lt22, c_im_vals[id][li22])
+        li22 = li22 + 1
+    }
+    im_vals = lt22
+    var lt23 = table_new_i64()
+    var li23: i64 = 0
+    while li23 < len(c_im_port[id]) {
+        table_push(lt23, c_im_port[id][li23])
+        li23 = li23 + 1
+    }
+    im_port = lt23
+    var lt24 = table_new_i64()
+    var li24: i64 = 0
+    while li24 < len(c_im_struct[id]) {
+        table_push(lt24, c_im_struct[id][li24])
+        li24 = li24 + 1
+    }
+    im_struct = lt24
+    var lt25 = table_new_i64()
+    var li25: i64 = 0
+    while li25 < len(c_im_poff[id]) {
+        table_push(lt25, c_im_poff[id][li25])
+        li25 = li25 + 1
+    }
+    im_poff = lt25
+    var lt26 = table_new_i64()
+    var li26: i64 = 0
+    while li26 < len(c_im_n[id]) {
+        table_push(lt26, c_im_n[id][li26])
+        li26 = li26 + 1
+    }
+    im_n = lt26
+    var lt27 = table_new_i64()
+    var li27: i64 = 0
+    while li27 < len(c_im_mnames[id]) {
+        table_push(lt27, c_im_mnames[id][li27])
+        li27 = li27 + 1
+    }
+    im_mnames = lt27
+    var lt28 = table_new_i64()
+    var li28: i64 = 0
+    while li28 < len(c_g_extra_tops[id]) {
+        table_push(lt28, c_g_extra_tops[id][li28])
+        li28 = li28 + 1
+    }
+    g_extra_tops = lt28
+    var lt29 = table_new_i64()
+    var li29: i64 = 0
+    while li29 < len(c_g_file_roots[id]) {
+        table_push(lt29, c_g_file_roots[id][li29])
+        li29 = li29 + 1
+    }
+    g_file_roots = lt29
+    var lt30 = table_new_i64()
+    var li30: i64 = 0
+    while li30 < len(c_g_file_base[id]) {
+        table_push(lt30, c_g_file_base[id][li30])
+        li30 = li30 + 1
+    }
+    g_file_base = lt30
+    var lt31 = table_new_i64()
+    var li31: i64 = 0
+    while li31 < len(c_sg_mod[id]) {
+        table_push(lt31, c_sg_mod[id][li31])
+        li31 = li31 + 1
+    }
+    sg_mod = lt31
+}
+func push_5() {
+    table_push(c_gb_mod, table_new_i64())
+    table_push(c_st_mod, table_new_i64())
+    table_push(c_g_imported, table_new_string())
+    table_push(c_g_imp_alias_names, table_new_string())
+    table_push(c_g_ns_rename_old, table_new_string())
+    table_push(c_g_ns_rename_new, table_new_string())
+    table_push(c_g_imp_alias_paths, table_new_string())
+    table_push(c_g_file_stem, table_new_string())
+}
+func cap_5() {
+    table_push(c_gb_mod, gb_mod)
+    table_push(c_st_mod, st_mod)
+    table_push(c_g_imported, g_imported)
+    table_push(c_g_imp_alias_names, g_imp_alias_names)
+    table_push(c_g_ns_rename_old, g_ns_rename_old)
+    table_push(c_g_ns_rename_new, g_ns_rename_new)
+    table_push(c_g_imp_alias_paths, g_imp_alias_paths)
+    table_push(c_g_file_stem, g_file_stem)
+}
+func save_5() {
+    c_gb_mod[g_ctx_cur] = coll.copy_i64(gb_mod)
+    c_st_mod[g_ctx_cur] = coll.copy_i64(st_mod)
+    c_g_imported[g_ctx_cur] = coll.copy_string(g_imported)
+    c_g_imp_alias_names[g_ctx_cur] = coll.copy_string(g_imp_alias_names)
+    c_g_ns_rename_old[g_ctx_cur] = coll.copy_string(g_ns_rename_old)
+    c_g_ns_rename_new[g_ctx_cur] = coll.copy_string(g_ns_rename_new)
+    c_g_imp_alias_paths[g_ctx_cur] = coll.copy_string(g_imp_alias_paths)
+    c_g_file_stem[g_ctx_cur] = coll.copy_string(g_file_stem)
+}
+func load_5(id: i64) {
+    var lt0 = table_new_i64()
+    var li0: i64 = 0
+    while li0 < len(c_gb_mod[id]) {
+        table_push(lt0, c_gb_mod[id][li0])
+        li0 = li0 + 1
+    }
+    gb_mod = lt0
+    var lt1 = table_new_i64()
+    var li1: i64 = 0
+    while li1 < len(c_st_mod[id]) {
+        table_push(lt1, c_st_mod[id][li1])
+        li1 = li1 + 1
+    }
+    st_mod = lt1
+    var lt2 = table_new_string()
+    var li2: i64 = 0
+    while li2 < len(c_g_imported[id]) {
+        table_push(lt2, c_g_imported[id][li2])
+        li2 = li2 + 1
+    }
+    g_imported = lt2
+    var lt3 = table_new_string()
+    var li3: i64 = 0
+    while li3 < len(c_g_imp_alias_names[id]) {
+        table_push(lt3, c_g_imp_alias_names[id][li3])
+        li3 = li3 + 1
+    }
+    g_imp_alias_names = lt3
+    var lt4 = table_new_string()
+    var li4: i64 = 0
+    while li4 < len(c_g_ns_rename_old[id]) {
+        table_push(lt4, c_g_ns_rename_old[id][li4])
+        li4 = li4 + 1
+    }
+    g_ns_rename_old = lt4
+    var lt5 = table_new_string()
+    var li5: i64 = 0
+    while li5 < len(c_g_ns_rename_new[id]) {
+        table_push(lt5, c_g_ns_rename_new[id][li5])
+        li5 = li5 + 1
+    }
+    g_ns_rename_new = lt5
+    var lt6 = table_new_string()
+    var li6: i64 = 0
+    while li6 < len(c_g_imp_alias_paths[id]) {
+        table_push(lt6, c_g_imp_alias_paths[id][li6])
+        li6 = li6 + 1
+    }
+    g_imp_alias_paths = lt6
+    var lt7 = table_new_string()
+    var li7: i64 = 0
+    while li7 < len(c_g_file_stem[id]) {
+        table_push(lt7, c_g_file_stem[id][li7])
+        li7 = li7 + 1
+    }
+    g_file_stem = lt7
+}
+pub func ctx_current() -> i64 {
+    return g_ctx_cur
+}
+
+pub func ctx_new() -> i64 {
+    if g_ctx_ready == 0 {
+        cap_0()
+        cap_1()
+        cap_2()
+        cap_3()
+        cap_4()
+        cap_5()
+        g_ctx_ready = 1
+    }
+    push_0()
+    push_1()
+    push_2()
+    push_3()
+    push_4()
+    push_5()
+    var id = len(c_s_tags) - 1
+    ctx_bind(id)
+    return id
+}
+
+pub func ctx_bind(id: i64) -> i64 {
+    if g_ctx_ready == 0 {
+        if id == 0 {
+            g_ctx_cur = 0
+            return 0
+        }
+        return -1
+    }
+    if id < 0 || id >= len(c_s_tags) {
+        return -1
+    }
+    save_0()
+    save_1()
+    save_2()
+    save_3()
+    save_4()
+    save_5()
+    load_0(id)
+    load_1(id)
+    load_2(id)
+    load_3(id)
+    load_4(id)
+    load_5(id)
+    g_ctx_cur = id
+    return 0
+}
