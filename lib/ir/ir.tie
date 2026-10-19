@@ -60,27 +60,27 @@ const CMP_GE: i64 = 5;         // 比较码：>=（sge / oge）
 // 校验，或本地定义常量——常量跨文件不可见，勿与顶层重名）。
 
 // ---------- 全局列式表（id = 下标；显式分号）----------
-pub var ir_funcs_names: table<i64>;        // 函数名（字符串池 id）
-pub var ir_funcs_rets: table<i64>;         // 返回类型（types 自编码 id）
-pub var ir_funcs_params_off: table<i64>;   // 参数段偏移（ir_ops 内）
-pub var ir_funcs_params_cnt: table<i64>;   // 参数个数（0 = 无参）
-pub var ir_funcs_params_tys_off: table<i64>;  // 参数类型段偏移（ir_funcs_param_tys 内）
-pub var ir_funcs_param_tys: table<i64>;    // 参数类型段（扁平；函数顺序）
-pub var ir_funcs_entry: table<i64>;        // 入口块 id（-1 = 未建块）
-pub var ir_funcs_inst_total: table<i64>;   // 函数内指令总数（llvmgen 统计）
-pub var ir_funcs_exported: table<i64>;     // 导出标记（0 私有 / 1 导出）
-pub var ir_funcs_inline: table<i64>;       // 内联标记（p.9.11.10；0 普通 / 1 inline fn）
-pub var ir_blocks_func: table<i64>;        // 块表：所属函数 id
-pub var ir_blocks_name: table<i64>;        // 块表：块名（池 id；-1 = 无名字）
-pub var ir_blocks_start: table<i64>;       // 块表：指令段起始（含）
-pub var ir_blocks_end: table<i64>;         // 块表：指令段结束（不含）
-pub var ir_insts_op: table<i64>;           // 指令表：opcode
-pub var ir_insts_ty: table<i64>;           // 指令表：结果类型（无结果 -1）
-pub var ir_insts_val: table<i64>;          // 指令表：结果值 id（单调；无结果 -1）
-pub var ir_insts_ops_off: table<i64>;      // 指令表：操作数段偏移
-pub var ir_insts_ops_cnt: table<i64>;      // 指令表：操作数个数
-pub var ir_ops: table<i64>;                // 操作数段：扁平 i64
-pub var ir_ops_kind: table<i64>;           // 操作数段：类别（OK_*）
+pub var ir_funcs_names: table<i64> = [];        // 函数名（字符串池 id）
+pub var ir_funcs_rets: table<i64> = [];         // 返回类型（types 自编码 id）
+pub var ir_funcs_params_off: table<i64> = [];   // 参数段偏移（ir_ops 内）
+pub var ir_funcs_params_cnt: table<i64> = [];   // 参数个数（0 = 无参）
+pub var ir_funcs_params_tys_off: table<i64> = [];  // 参数类型段偏移（ir_funcs_param_tys 内）
+pub var ir_funcs_param_tys: table<i64> = [];    // 参数类型段（扁平；函数顺序）
+pub var ir_funcs_entry: table<i64> = [];        // 入口块 id（-1 = 未建块）
+pub var ir_funcs_inst_total: table<i64> = [];   // 函数内指令总数（llvmgen 统计）
+pub var ir_funcs_exported: table<i64> = [];     // 导出标记（0 私有 / 1 导出）
+pub var ir_funcs_inline: table<i64> = [];       // 内联标记（p.9.11.10；0 普通 / 1 inline fn）
+pub var ir_blocks_func: table<i64> = [];        // 块表：所属函数 id
+pub var ir_blocks_name: table<i64> = [];        // 块表：块名（池 id；-1 = 无名字）
+pub var ir_blocks_start: table<i64> = [];       // 块表：指令段起始（含）
+pub var ir_blocks_end: table<i64> = [];         // 块表：指令段结束（不含）
+pub var ir_insts_op: table<i64> = [];           // 指令表：opcode
+pub var ir_insts_ty: table<i64> = [];           // 指令表：结果类型（无结果 -1）
+pub var ir_insts_val: table<i64> = [];          // 指令表：结果值 id（单调；无结果 -1）
+pub var ir_insts_ops_off: table<i64> = [];      // 指令表：操作数段偏移
+pub var ir_insts_ops_cnt: table<i64> = [];      // 指令表：操作数个数
+pub var ir_ops: table<i64> = [];                // 操作数段：扁平 i64
+pub var ir_ops_kind: table<i64> = [];           // 操作数段：类别（OK_*）
 pub var ir_val_cnt: i64 = 0;               // 值计数器（new_value 后置自增）
 pub var ir_cur_fn: string = "";            // 当前生成函数名（irgen 每函数登记；p.6.1.4 诊断用）
 var op_keys: table<i64>;               // opcode 表：码（升序）
@@ -226,27 +226,27 @@ pub func op_desc(op: i64) -> string {
 // ---------- 新建/复位 ----------
 // ir_meta.reset_meta 配套复位（避免循环依赖）。
 pub func new_module() -> i64 {
-    ir_funcs_names = table_new_i64()
-    ir_funcs_rets = table_new_i64()
-    ir_funcs_params_off = table_new_i64()
-    ir_funcs_params_cnt = table_new_i64()
-    ir_funcs_entry = table_new_i64()
-    ir_funcs_inst_total = table_new_i64()
-    ir_funcs_exported = table_new_i64()
-    ir_funcs_inline = table_new_i64()
-    ir_blocks_func = table_new_i64()
-    ir_blocks_name = table_new_i64()
-    ir_blocks_start = table_new_i64()
-    ir_blocks_end = table_new_i64()
-    ir_insts_op = table_new_i64()
-    ir_insts_ty = table_new_i64()
-    ir_insts_val = table_new_i64()
-    ir_insts_ops_off = table_new_i64()
-    ir_insts_ops_cnt = table_new_i64()
-    ir_ops = table_new_i64()
-    ir_ops_kind = table_new_i64()
-    ir_funcs_params_tys_off = table_new_i64()
-    ir_funcs_param_tys = table_new_i64()
+    table_trunc(ir_funcs_names, 0)
+    table_trunc(ir_funcs_rets, 0)
+    table_trunc(ir_funcs_params_off, 0)
+    table_trunc(ir_funcs_params_cnt, 0)
+    table_trunc(ir_funcs_entry, 0)
+    table_trunc(ir_funcs_inst_total, 0)
+    table_trunc(ir_funcs_exported, 0)
+    table_trunc(ir_funcs_inline, 0)
+    table_trunc(ir_blocks_func, 0)
+    table_trunc(ir_blocks_name, 0)
+    table_trunc(ir_blocks_start, 0)
+    table_trunc(ir_blocks_end, 0)
+    table_trunc(ir_insts_op, 0)
+    table_trunc(ir_insts_ty, 0)
+    table_trunc(ir_insts_val, 0)
+    table_trunc(ir_insts_ops_off, 0)
+    table_trunc(ir_insts_ops_cnt, 0)
+    table_trunc(ir_ops, 0)
+    table_trunc(ir_ops_kind, 0)
+    table_trunc(ir_funcs_params_tys_off, 0)
+    table_trunc(ir_funcs_param_tys, 0)
     ir_val_cnt = 0
     return 0
 }

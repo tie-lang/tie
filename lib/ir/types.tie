@@ -151,104 +151,104 @@ pub const BASE_ARRAY: i64 = 15393162788864;
 pub const BASE_FUTURE: i64 = 16492674416640;
 
 // ---------- 全局状态（懒构建）----------
-pub var tykw_names: table<string>;   // TyKw 索引 -> 类型名（错误消息用）
-pub var st_names: table<string>;     // struct 名表（索引 -> 名字；type_name 还原用）
-pub var en_names: table<string>;     // enum 名表（索引 -> 名字；type_name 还原用）
+pub var tykw_names: table<string> = [];   // TyKw 索引 -> 类型名（错误消息用）
+pub var st_names: table<string> = [];     // struct 名表（索引 -> 名字；type_name 还原用）
+pub var en_names: table<string> = [];     // enum 名表（索引 -> 名字；type_name 还原用）
 // 一期并发 actor 名表（索引 -> 名字；type_name 还原用，由语义层 set_actor_name 登记）
-pub var act_names: table<string>;
+pub var act_names: table<string> = [];
 // 嵌套聚合登记表（序号 → 元素/值类型 id）：table<table<T>> / map<聚合> 的编码载体。
 // 背景：table_of(聚合) 若直接 BASE_TABLE + 聚合，会因聚合 id ≥ 2^40 进位撞入
 // map 段（table<table<i64>> = 2^41+3 == map<i64>）——嵌套类型必须查表编码。
-pub var nest_tbl_elems: table<i64>;  // 嵌套表元素段（序号 → 元素类型 id）
-pub var nest_map_vals: table<i64>;   // 嵌套 map 值段（序号 → 值类型 id）
+pub var nest_tbl_elems: table<i64> = [];  // 嵌套表元素段（序号 → 元素类型 id）
+pub var nest_map_vals: table<i64> = [];   // 嵌套 map 值段（序号 → 值类型 id）
 // S1.2 不安全类型嵌套负载段（序号 → 元素类型 id；同 table_of 防进位方案）
-pub var nest_ptr_elems: table<i64>;    // 嵌套 ptr 元素段
-pub var nest_slice_elems: table<i64>;  // 嵌套 slice 元素段
-pub var nest_atomic_elems: table<i64>; // 嵌套 atomic 元素段
-pub var nest_future_elems: table<i64>; // 嵌套 future 负载段（p.9.11 future<T>，同 ptr 防进位方案）
+pub var nest_ptr_elems: table<i64> = [];    // 嵌套 ptr 元素段
+pub var nest_slice_elems: table<i64> = [];  // 嵌套 slice 元素段
+pub var nest_atomic_elems: table<i64> = []; // 嵌套 atomic 元素段
+pub var nest_future_elems: table<i64> = []; // 嵌套 future 负载段（p.9.11 future<T>，同 ptr 防进位方案）
 // L1 定长数组登记段（序号 → 元素类型 id / 元素个数 N）：
 // array<f32, 64> → 登记 (f32, 64)，低负载 = NEST_SLOT_OFF + 序号
-pub var nest_arr_elems: table<i64>;   // 嵌套定长数组元素段（序号 → 元素类型 id）
-pub var nest_arr_lens: table<i64>;    // 嵌套定长数组长度段（序号 → 元素个数 N）
+pub var nest_arr_elems: table<i64> = [];   // 嵌套定长数组元素段（序号 → 元素类型 id）
+pub var nest_arr_lens: table<i64> = [];    // 嵌套定长数组长度段（序号 → 元素个数 N）
 // S2.2 fn 函数值类型签名表（段式，索引即 fn 类型低负载）：
 // fn_ret    签名索引 -> 返回类型 id
 // fn_nparams 签名索引 -> 参数个数
 // fn_params 参数类型扁平段（前缀和由 fn_paroff 记录偏移）
 // fn_param_refs 参数 ref 标志扁平段（与 fn_params 平行；1 = 按引用传递）
 // fn_has_var 签名索引 -> 变参标志（0/1；参数列表末位为 table<T>）
-pub var fn_ret: table<i64>;      // fn 签名索引 -> 返回类型 id
-pub var fn_nparams: table<i64>;  // fn 签名索引 -> 参数个数
-pub var fn_paroff: table<i64>;   // fn 签名索引 -> fn_params 段起始偏移
-pub var fn_params: table<i64>;   // 参数类型扁平段（前缀和式）
-pub var fn_param_refs: table<i64>; // 参数 ref 标志扁平段（p.6.2.4）
-pub var fn_has_var: table<i64>;  // 签名变参标志（p.6.2.4）
+pub var fn_ret: table<i64> = [];      // fn 签名索引 -> 返回类型 id
+pub var fn_nparams: table<i64> = [];  // fn 签名索引 -> 参数个数
+pub var fn_paroff: table<i64> = [];   // fn 签名索引 -> fn_params 段起始偏移
+pub var fn_params: table<i64> = [];   // 参数类型扁平段（前缀和式）
+pub var fn_param_refs: table<i64> = []; // 参数 ref 标志扁平段（p.6.2.4）
+pub var fn_has_var: table<i64> = [];  // 签名变参标志（p.6.2.4）
 // S2.4 port 名表（索引 -> 名字；type_name 还原用，由语义层 set_port_name 登记）
-pub var pt_names: table<string>;
+pub var pt_names: table<string> = [];
 
 // 嵌套负载序号偏移（避开 named 负载段 0..99；named 仅 0..20 安全余量）
 pub const NEST_SLOT_OFF: i64 = 100;
 
 // tuple 元数据（前端与后端共用；原居 sstate，迁至类型库避免后端依赖前端）
-pub var tuple_tys: table<i64>;    // tuple 索引 -> 4<<40|idx
-pub var tup_names: table<i64>;    // tuple 字段名 id（扁平段）
-pub var tup_tys: table<i64>;      // tuple 字段类型 id（扁平段）
-pub var tup_offs: table<i64>;     // tuple 字段段偏移
-pub var tup_n: table<i64>;        // tuple 字段数
+pub var tuple_tys: table<i64> = [];    // tuple 索引 -> 4<<40|idx
+pub var tup_names: table<i64> = [];    // tuple 字段名 id（扁平段）
+pub var tup_tys: table<i64> = [];      // tuple 字段类型 id（扁平段）
+pub var tup_offs: table<i64> = [];     // tuple 字段段偏移
+pub var tup_n: table<i64> = [];        // tuple 字段数
 
 // struct/enum 符号表（前端与后端共用；原居 sstate，迁至类型库）
-pub var st_keys: table<i64>;
-pub var st_vals: table<i64>;
-pub var en_keys: table<i64>;
-pub var en_vals: table<i64>;
+pub var st_keys: table<i64> = [];
+pub var st_vals: table<i64> = [];
+pub var en_keys: table<i64> = [];
+pub var en_vals: table<i64> = [];
 
 // class 字段布局表（前端与后端共用；原居 sstate）
-pub var cls_parent: table<i64>;
-pub var cls_fldoff: table<i64>;
-pub var cls_nfld: table<i64>;
-pub var cls_done: table<i64>;
-pub var fld_names: table<i64>;
-pub var fld_tys: table<i64>;
-pub var fld_defs: table<i64>;
+pub var cls_parent: table<i64> = [];
+pub var cls_fldoff: table<i64> = [];
+pub var cls_nfld: table<i64> = [];
+pub var cls_done: table<i64> = [];
+pub var fld_names: table<i64> = [];
+pub var fld_tys: table<i64> = [];
+pub var fld_defs: table<i64> = [];
 
 // 函数/enum 符号与布局表（前端与后端共用；原居 sstate）
-pub var fn_keys: table<i64>;
-pub var fn_vals: table<i64>;
-pub var fn_def_nodes: table<i64>;
-pub var en_done: table<i64>;
-pub var en_nvar: table<i64>;
-pub var en_varoff: table<i64>;
-pub var en_nslot: table<i64>;
-pub var en_vnames: table<i64>;
-pub var en_vtags: table<i64>;
-pub var en_vfldoff: table<i64>;
-pub var en_vnfld: table<i64>;
-pub var en_ftys: table<i64>;
+pub var fn_keys: table<i64> = [];
+pub var fn_vals: table<i64> = [];
+pub var fn_def_nodes: table<i64> = [];
+pub var en_done: table<i64> = [];
+pub var en_nvar: table<i64> = [];
+pub var en_varoff: table<i64> = [];
+pub var en_nslot: table<i64> = [];
+pub var en_vnames: table<i64> = [];
+pub var en_vtags: table<i64> = [];
+pub var en_vfldoff: table<i64> = [];
+pub var en_vnfld: table<i64> = [];
+pub var en_ftys: table<i64> = [];
 
 namespace types {
 pub func init_sym() {
-    st_keys = table_new_i64()
-    st_vals = table_new_i64()
-    en_keys = table_new_i64()
-    en_vals = table_new_i64()
-    cls_parent = table_new_i64()
-    cls_fldoff = table_new_i64()
-    cls_nfld = table_new_i64()
-    cls_done = table_new_i64()
-    fld_names = table_new_i64()
-    fld_tys = table_new_i64()
-    fld_defs = table_new_i64()
-    fn_keys = table_new_i64()
-    fn_vals = table_new_i64()
-    fn_def_nodes = table_new_i64()
-    en_done = table_new_i64()
-    en_nvar = table_new_i64()
-    en_varoff = table_new_i64()
-    en_nslot = table_new_i64()
-    en_vnames = table_new_i64()
-    en_vtags = table_new_i64()
-    en_vfldoff = table_new_i64()
-    en_vnfld = table_new_i64()
-    en_ftys = table_new_i64()
+    table_trunc(st_keys, 0)
+    table_trunc(st_vals, 0)
+    table_trunc(en_keys, 0)
+    table_trunc(en_vals, 0)
+    table_trunc(cls_parent, 0)
+    table_trunc(cls_fldoff, 0)
+    table_trunc(cls_nfld, 0)
+    table_trunc(cls_done, 0)
+    table_trunc(fld_names, 0)
+    table_trunc(fld_tys, 0)
+    table_trunc(fld_defs, 0)
+    table_trunc(fn_keys, 0)
+    table_trunc(fn_vals, 0)
+    table_trunc(fn_def_nodes, 0)
+    table_trunc(en_done, 0)
+    table_trunc(en_nvar, 0)
+    table_trunc(en_varoff, 0)
+    table_trunc(en_nslot, 0)
+    table_trunc(en_vnames, 0)
+    table_trunc(en_vtags, 0)
+    table_trunc(en_vfldoff, 0)
+    table_trunc(en_vnfld, 0)
+    table_trunc(en_ftys, 0)
 }
 
 // struct 索引 -> 名字（st_keys 按名字排序，须经 st_vals 反查索引位置）
@@ -277,11 +277,11 @@ pub func enum_name_of(idx: i64) -> string {
     return "?"
 }
 pub func init_tup() {
-    tuple_tys = table_new_i64()
-    tup_names = table_new_i64()
-    tup_tys = table_new_i64()
-    tup_offs = table_new_i64()
-    tup_n = table_new_i64()
+    table_trunc(tuple_tys, 0)
+    table_trunc(tup_names, 0)
+    table_trunc(tup_tys, 0)
+    table_trunc(tup_offs, 0)
+    table_trunc(tup_n, 0)
 }
 
 // ---------- 类型 id 构造（编码，O(1)）----------
