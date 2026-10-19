@@ -187,7 +187,21 @@ pub var pt_names: table<string>;
 // 嵌套负载序号偏移（避开 named 负载段 0..99；named 仅 0..20 安全余量）
 pub const NEST_SLOT_OFF: i64 = 100;
 
+// tuple 元数据（前端与后端共用；原居 sstate，迁至类型库避免后端依赖前端）
+pub var tuple_tys: table<i64>;    // tuple 索引 -> 4<<40|idx
+pub var tup_names: table<i64>;    // tuple 字段名 id（扁平段）
+pub var tup_tys: table<i64>;      // tuple 字段类型 id（扁平段）
+pub var tup_offs: table<i64>;     // tuple 字段段偏移
+pub var tup_n: table<i64>;        // tuple 字段数
+
 namespace types {
+pub func init_tup() {
+    tuple_tys = table_new_i64()
+    tup_names = table_new_i64()
+    tup_tys = table_new_i64()
+    tup_offs = table_new_i64()
+    tup_n = table_new_i64()
+}
 
 // ---------- 类型 id 构造（编码，O(1)）----------
 
