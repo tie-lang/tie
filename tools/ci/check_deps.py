@@ -24,7 +24,16 @@ ALLOWED = {
 }
 
 # 存量例外（只减不增）：修完即删。当前为零——codegen 层建立后，irgen 对前端的
-# 依赖（semantic / consteval）已成为合法的向下依赖，不再需要放行。
+# 依赖已成为合法的向下依赖，不再需要放行。
+#
+# codegen -> front 的依赖面（与 LLVM 的 CodeGen 消费 Sema 产物同构，显式登记于此，
+# 避免后来者误以为是遗漏）：
+#   * lib/codegen/irgen.tie  import ../front/semantic.tie  —— tig_src 的语义检查入口
+#   * lib/codegen/irgen.tie  import ../front/consteval.tie —— 全局初值里的 const fn 折叠
+#   * sstate 的语义查询（child / nchild / name_str / slot_off / fn_sig / fn_def_node /
+#     bs_find）在 codegen 中约五百处，经上面的 import 链传递可见。这条隐式可见性是
+#     本守卫的已知盲区：它只读显式 import 行，看不见裸标识符引用。lib/ast 契约层把
+#     节点字段的裸表访问收成了访问器，语义查询的同等收敛需要单独的 lib/sema 层。
 EXCEPTIONS = {}
 
 def layer_of(path):
