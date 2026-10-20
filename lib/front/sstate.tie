@@ -12,19 +12,12 @@ type tie<class>
 // middle（../middle/types.tie），须显式 import（interp_eval 等独立场景
 // 的 import 链不保证传递可见；s24 分支曾因缺 import 报未定义）。
 import "../ir/types.tie"
+import "../ast/ast.tie"
 // 由 stype.tie import（传递可达上层全部）。
 
-// ==================== AST 全局列式表（协议解析结果）====================
-pub var s_tags: table<i64> = [];       // 节点 tag
-pub var s_names: table<i64> = [];      // 字符串池 id（-1=无）
-pub var s_vals: table<i64> = [];       // 主整数值（字面量值/运算符/标志）
-pub var s_aux: table<i64> = [];        // 次整数值（nparams/nsegs/ncases/label）
-pub var s_coff: table<i64> = [];       // 子节点偏移（s_children 段起点）
-pub var s_nchild: table<i64> = [];     // 子节点数
-pub var s_children: table<i64> = [];   // 扁平子节点 id 段
-pub var s_lines: table<i64> = [];      // 起始行（1-based）
-pub var s_cols: table<i64> = [];       // 起始列（1-based）
-pub var s_n: i64 = 0;             // 节点总数
+// ==================== AST 全局列式表 ====================
+// 10 张列式表与节点总数已下沉到 lib/ast/ast.tie（import 见文件头）。
+// 本文件保留的都是编译器自身状态：凭据、符号表、运行时标记。
 // r.1.6.7 → 2026-10-01 泛化：带 `#[unsafe.<域>]` 属性的函数节点及其**域位集**。
 // 为什么需要：属性附着原先**只置 val bit3 = has_attr 并丢弃属性名**，故各域无法区分。
 // 两个并行表（节点 id → 域位集）保留「哪些函数持哪些域」，供两处消费：
@@ -141,7 +134,7 @@ pub var g_used_caps: i64 = 0;
 pub var tre_keys: table<i64> = [];     // 返回表的函数名 id（升序）
 pub var tre_vals: table<i64> = [];     // 元素类型 id
 
-pub var node_types: table<i64> = [];   // 节点 id -> 类型 id（-1=未推断）
+// node_types 已下沉到 lib/ast/ast.tie（节点 id -> 类型 id，-1=未推断）。
 
 // p.8.2.7 计算属性（computed property）：成员访问节点 id -> getter/setter 方法全名
 //（intern id）。读取 `obj.attr` 命中 getter（<Struct>::attr）或写入 `obj.attr=v`
