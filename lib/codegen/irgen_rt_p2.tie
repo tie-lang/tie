@@ -12,10 +12,10 @@ namespace irgen {
 // extern 函数指针参数按 string/ptr 槽消费，llvmgen to_ptr 直引 @sym）。
 func tig_cb_ptr(id: i64) -> i64 {
     var fn_node = call_arg(id, 0)
-    var fty = node_types[fn_node]
+    var fty = ast.node_type(fn_node)
     if fty < 0 || !types.is_fn(fty) {
-        sm_err_line = s_lines[fn_node]
-        sm_err_col = s_cols[fn_node]
+        sm_err_line = ast.s_line(fn_node)
+        sm_err_col = ast.s_col(fn_node)
         sm_err_msg = "cb_ptr 参数必须是函数值（fn(A) -> R），函数 " + g_cur_fn_name
         return -1
     }
@@ -25,7 +25,7 @@ func tig_cb_ptr(id: i64) -> i64 {
     // with_env=0 → 命名函数（call @func(...)）
     var target: string = ""
     var with_env: i64 = 0
-    var tag = s_tags[fn_node]
+    var tag = ast.s_tag(fn_node)
     if tag == 132 {   // N_FN_LIT 闭包字面量
         // 捕获非空 → 无法作 C 回调（环境无处置）
         var ci = closure_index(fn_node)
@@ -35,8 +35,8 @@ func tig_cb_ptr(id: i64) -> i64 {
                 c_end = cl_capoff[ci + 1]
             }
             if c_end - cl_capoff[ci] > 0 {
-                sm_err_line = s_lines[fn_node]
-                sm_err_col = s_cols[fn_node]
+                sm_err_line = ast.s_line(fn_node)
+                sm_err_col = ast.s_col(fn_node)
                 sm_err_msg = "cb_ptr 参数闭包含捕获变量（C 回调函数指针不携带环境），函数 " + g_cur_fn_name
                 return -1
             }
@@ -53,16 +53,16 @@ func tig_cb_ptr(id: i64) -> i64 {
         var full_nm = resolve_call_name(sstate.name_str(fn_node))
         var fsig = sstate.fn_sig(full_nm)
         if fsig < 0 {
-            sm_err_line = s_lines[fn_node]
-            sm_err_col = s_cols[fn_node]
+            sm_err_line = ast.s_line(fn_node)
+            sm_err_col = ast.s_col(fn_node)
             sm_err_msg = "cb_ptr 参数 '" + sstate.name_str(fn_node) + "' 不是命名函数（函数 " + g_cur_fn_name + "）"
             return -1
         }
         target = full_nm
         with_env = 0
     } else {
-        sm_err_line = s_lines[fn_node]
-        sm_err_col = s_cols[fn_node]
+        sm_err_line = ast.s_line(fn_node)
+        sm_err_col = ast.s_col(fn_node)
         sm_err_msg = "cb_ptr 参数必须是无捕获闭包字面量或命名函数（函数 " + g_cur_fn_name + "）"
         return -1
     }
@@ -976,7 +976,7 @@ func actor_method_node(anode: i64, mi: i64) -> i64 {
     var k2: i64 = 0
     while k2 < nc {
         var c = sstate.child(anode, k2)
-        if s_tags[c] == S_N_FN_DEF {
+        if ast.s_tag(c) == S_N_FN_DEF {
             if mcount == mi {
                 return c
             }

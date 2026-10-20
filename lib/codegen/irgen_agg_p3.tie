@@ -31,10 +31,10 @@ func tig_struct_construct(id: i64, nm: string) -> i64 {
         var vt: i64 = -1  // v 的来源类型：窄整数字段按 fty 收窄的依据
         if i < nc {
             var an = sstate.child(id, soff + i)
-            if types.is_array(fty) && s_tags[an] == 12 {
+            if types.is_array(fty) && ast.s_tag(an) == 12 {
                 // L1 定长数组字段：按字段类型构造字面量
                 v = tig_array_lit_typed(an, fty)
-            } else if types.is_array(fty) && s_tags[an] == 7 && sstate.name_str(an) == "array_init" {
+            } else if types.is_array(fty) && ast.s_tag(an) == 7 && sstate.name_str(an) == "array_init" {
                 // L1 定长数组字段：array_init 广播填充
                 v = tig_array_init_typed(an, fty)
             } else {
@@ -43,7 +43,7 @@ func tig_struct_construct(id: i64, nm: string) -> i64 {
             if v < 0 {
                 return -1
             }
-            vt = node_types[an]
+            vt = ast.node_type(an)
         } else if off + i < len(fld_defs) && fld_defs[off + i] >= 0 {
             // 字段默认值（`var y: i64 = 10` → Point(5) 缺省 y 用 10）
             var dn = fld_defs[off + i]
@@ -61,14 +61,14 @@ func tig_struct_construct(id: i64, nm: string) -> i64 {
             //     double 槽 → opt 崩溃（%2 defined i64 but expected double）。
             //   · FloatLit（tag 1）：恒定 f64。
             //   其余表达式按语义节点类型 fty 记。
-            var dn_ty = node_types[dn]
-            if s_tags[dn] == 0 {
+            var dn_ty = ast.node_type(dn)
+            if ast.s_tag(dn) == 0 {
                 if dn_ty >= 0 && dn_ty != types.named(TK_I64) && types.is_int(dn_ty) {
                     vt = dn_ty
                 } else {
                     vt = types.named(TK_I64)
                 }
-            } else if s_tags[dn] == 1 {
+            } else if ast.s_tag(dn) == 1 {
                 vt = types.named(TK_F64)
             } else {
                 vt = fty
@@ -165,15 +165,15 @@ func rp_fld_default_val(si: i64, fi: i64, fty: i64) -> i64 {
         if v < 0 {
             return -1
         }
-        var nt = node_types[dn]
-        if s_tags[dn] == 0 {
+        var nt = ast.node_type(dn)
+        if ast.s_tag(dn) == 0 {
             // IntLit：f64/f32 字段的整数字面量默认（`var w: f64 = 5`）发射 i64；窄整数收窄
             if nt >= 0 && nt != types.named(TK_I64) && types.is_int(nt) {
                 vt = nt
             } else {
                 vt = types.named(TK_I64)
             }
-        } else if s_tags[dn] == 1 {
+        } else if ast.s_tag(dn) == 1 {
             vt = types.named(TK_F64)
         } else {
             vt = fty
@@ -476,7 +476,7 @@ func tig_lit_elem_prep(elem: i64, val: i64, v: i64) -> (i64, i64) {
         suffix = "string"
         pty = types.named(TK_STR)
     } else {
-        var vt = node_types[val]
+        var vt = ast.node_type(val)
         if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR) || types.kind(vt) == K_PORT) {
             suffix = "string"
             pty = types.named(TK_STR)
@@ -491,7 +491,7 @@ func tig_lit_elem_prep(elem: i64, val: i64, v: i64) -> (i64, i64) {
     }
     if pty == types.named(TK_ANY) {
         // P2b 异构元素装箱：元素值 → any {tag, payload}
-        var vt2 = node_types[val]
+        var vt2 = ast.node_type(val)
         if vt2 >= 0 && vt2 != types.named(TK_ANY) {
             var bx = tig_box_any(v, vt2)
             if bx < 0 {
@@ -507,8 +507,8 @@ func tig_lit_elem_prep(elem: i64, val: i64, v: i64) -> (i64, i64) {
     //（rc 不变）——与 table_push 内建路径同纪律。仅深容器（元素为表）需要；
     // 元素为 any 盒（flat 容器）不 retain（盒本就不由容器释放）。
     if types.is_table(elem) && pty != types.named(TK_ANY) {
-        var vte = node_types[val]
-        var vte_tag = s_tags[val]
+        var vte = ast.node_type(val)
+        var vte_tag = ast.s_tag(val)
         if vte >= 0 && types.is_table(vte) && vte_tag != 7 && vte_tag != 12 {
             tig_tbl_retain_call(v)
         }
@@ -533,16 +533,16 @@ func tig_table_lit(id: i64) -> i64 {
     while ci < nc {
         var ccell = sstate.child(id, ci)
         var cid = sstate.child(ccell, 0)
-        if cid >= 0 && s_names[cid] >= 0 {
+        if cid >= 0 && ast.s_name(cid) >= 0 {
             has_str_key = true
         }
         ci = ci + 1
     }
     if has_str_key {
-        // map 值类型：node_types[id] = map<V> → low 解码 V；裸 map 兜底 i64；
+        // map 值类型：ast.node_type(id) = map<V> → low 解码 V；裸 map 兜底 i64；
         // 值为 string → tie_map_set_string（对齐 tig_index_read/assign 的 map 分支）。
         var mval_ty: i64 = types.named(TK_I64)
-        var lit_ty = node_types[id]
+        var lit_ty = ast.node_type(id)
         if types.is_map(lit_ty) {
             var lv = types.low(lit_ty)
             if lv > 0 {
@@ -560,13 +560,13 @@ func tig_table_lit(id: i64) -> i64 {
         while i < nc {
             var cell = sstate.child(id, i)
             var cid2 = sstate.child(cell, 0)
-            if cid2 < 0 || s_names[cid2] < 0 {
+            if cid2 < 0 || ast.s_name(cid2) < 0 {
                 sm_err_msg = "键值表字面量元素缺少字符串键（函数 " + g_cur_fn_name + "）"
                 return -1
             }
             // 键字符串 → @.str.N 全局（tig_str_lit 去引号 + 登记常量；键借用约定：
             // 字符串字面量是全局常量，比表存活更久——对齐 Rust string_global）
-            var k = tig_str_lit(s_names[cid2])
+            var k = tig_str_lit(ast.s_name(cid2))
             var val = sstate.child(cell, 1)
             var v = tig_expr(val)
             if v < 0 {
@@ -575,7 +575,7 @@ func tig_table_lit(id: i64) -> i64 {
             // P2c：map<any> 值——装箱 + 堆拷贝，值槽存堆指针（any 16 字节
             // 放不进 8 字节值槽；容器布局不变）。值已是 any → 直接堆拷贝。
             if mval_ty == types.named(TK_ANY) {
-                var vt3 = node_types[val]
+                var vt3 = ast.node_type(val)
                 var src3: i64 = v
                 if vt3 >= 0 && vt3 != types.named(TK_ANY) {
                     var bx3 = tig_box_any(v, vt3)
@@ -600,19 +600,19 @@ func tig_table_lit(id: i64) -> i64 {
     }
     // 普通表字面量（元素类型推断）
     // 空表/空 map `[]`：无 cell，has_str_key=false 落本分支。由语义层
-    // node_types[id]（标注类型引导，见 scheck.check_var_decl）区分：
+    // ast.node_type(id)（标注类型引导，见 scheck.check_var_decl）区分：
     // map → 生成 map 句柄（esz=16，复用表基座）；否则普通空表（esz 按元素
     // 类型，空表兜底 i64=8）。
-    if nc == 0 && types.is_map(node_types[id]) {
+    if nc == 0 && types.is_map(ast.node_type(id)) {
         return s21_map_new()
     }
     var elem: i64 = types.named(TK_I64)
-    // P2b 异构表：字面量语义类型（sinfer 已登记 node_types[id] = table<elem>）
+    // P2b 异构表：字面量语义类型（sinfer 已登记 ast.node_type(id) = table<elem>）
     // 是元素类型的权威来源——`[1,"a",true]` → table<any>，取 elem=any 使逐
     // 元素装箱分支命中；若只按首元素推断会取 i64，bool/string 元素跳过装箱
     //（`store i64 %i1` 类型错）。空表 `[]` 的 esz 也由此获得（曾 i64=8 兜底，
     // 复合元素多字 esz 不匹配 → 越界写崩溃）。未登记/非参数化才回退首元素。
-    var lit_ty2 = node_types[id]
+    var lit_ty2 = ast.node_type(id)
     if types.is_table(lit_ty2) {
         var le2 = types.table_elem(lit_ty2)
         if le2 > 0 {
@@ -622,7 +622,7 @@ func tig_table_lit(id: i64) -> i64 {
     if elem == types.named(TK_I64) && nc > 0 {
         var cell0 = sstate.child(id, 0)
         var val0 = sstate.child(cell0, 1)
-        var vt0 = node_types[val0]
+        var vt0 = ast.node_type(val0)
         if vt0 >= 0 {
             elem = vt0
         }

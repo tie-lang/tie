@@ -279,7 +279,7 @@ func tig_func_addr(name: string) -> i64 {
 // 逐字段 store 外层捕获值；捕获为空 → env = null。返回 %fn.X 聚合值。
 func tig_closure_lit(id: i64) -> i64 {
     var slot = sstate.slot_off(id)
-    var nparams = s_aux[id]
+    var nparams = ast.s_aux(id)
     // 返回类型：children[slot]（泛型槽占 0，返回类型 = children[slot]）
     var ret_node = sstate.child(id, slot)
     var ret_ty = sgen.parse_generic_type_node(ret_node)
@@ -298,18 +298,18 @@ func tig_closure_lit(id: i64) -> i64 {
     var k: i64 = 0
     while k < nparams {
         var p = sstate.child(id, slot + 1 + k)
-        if s_aux[p] == 1 {
+        if ast.s_aux(p) == 1 {
             has_var = 1
         }
         var pty = sgen.parse_generic_type_node(sstate.child(p, 0))
         if pty < 0 {
             return -1
         }
-        if s_aux[p] == 1 {
+        if ast.s_aux(p) == 1 {
             pty = types.table_of(pty)   // 变参 → table<T>
         }
         table_push(ptys, pty)
-        table_push(p_refs, s_vals[p])
+        table_push(p_refs, ast.s_val(p))
         k = k + 1
     }
     // fn 类型（types.fn_of2 查重：与 sinfer 登记的签名 id 一致，含 ref/变参）
@@ -563,7 +563,7 @@ func clo_exit_release() {
     while i < len(g_clov_nids) {
         if esc_is_live(g_clov_nids[i]) {
             var cid_i = g_clov_cids[i]
-            tig_closure_release_slot(g_clov_slots[i], node_types[cid_i])
+            tig_closure_release_slot(g_clov_slots[i], ast.node_type(cid_i))
         }
         i = i + 1
     }
@@ -848,7 +848,7 @@ func tig_call_indirect(id: i64, nm: string) -> i64 {
         var arg_kind: i64 = 0
         // ref 实参：Var → 传实参槽地址（对齐 tig_user_call_from T0.3 by_ref）
         if arg_idx < nparams && types.fn_param_ref(fv_ty, arg_idx) == 1 {
-            if s_tags[arg_node] == 6 {
+            if ast.s_tag(arg_node) == 6 {
                 var anm = interner.intern(sstate.name_str(arg_node))
                 if scope_get_global(anm) >= 0 {
                     av = g_lookup_alloca
@@ -863,7 +863,7 @@ func tig_call_indirect(id: i64, nm: string) -> i64 {
         }
         // P2c any 形参装箱（对齐 tig_user_call_from）
         if arg_idx < nparams && types.fn_param_of(fv_ty, arg_idx) == types.named(TK_ANY) {
-            var ant = node_types[arg_node]
+            var ant = ast.node_type(arg_node)
             if ant >= 0 && ant != types.named(TK_ANY) {
                 var abx2 = tig_box_any(av, ant)
                 if abx2 < 0 {
@@ -1024,7 +1024,7 @@ func tig_call_fn_value(fv: i64, fty: i64, argvals: table<i64>, argkinds: table<i
 
 func tig_call_expr(id: i64) -> i64 {
     var cal = sstate.child(id, 0)
-    var fty = node_types[cal]
+    var fty = ast.node_type(cal)
     if fty < 0 || !types.is_fn(fty) {
         sm_err_msg = "调用表达式要求被调者为函数类型（函数 " + g_cur_fn_name + "）"
         return -1
@@ -1060,7 +1060,7 @@ func tig_call_expr(id: i64) -> i64 {
         var av: i64 = -1
         var arg_kind: i64 = 0
         if arg_idx < nparams && types.fn_param_ref(fty, arg_idx) == 1 {
-            if s_tags[arg_node] == 6 {
+            if ast.s_tag(arg_node) == 6 {
                 var anm = interner.intern(sstate.name_str(arg_node))
                 if scope_get_global(anm) >= 0 {
                     av = g_lookup_alloca
@@ -1095,8 +1095,8 @@ func tig_call_expr(id: i64) -> i64 {
 func tig_named_fn_value(id: i64, full: string, fnty: i64) -> i64 {
     var sig = sstate.fn_sig(full)
     if sig < 0 {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "命名函数提升：函数 '" + full + "' 无签名（函数 " + g_cur_fn_name + "）"
         return -1
     }

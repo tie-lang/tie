@@ -17,7 +17,7 @@ func tig_comprehension(id: i64) -> i64 {
     // p.9.11.16 迭代器协议源：`[e for x in it]`（it 为 struct 实现 has_next/next）
     // → 循环形态 = 方法调用循环（接收者求值一次落槽），其余（筛选/push）复用
     // 表模式逻辑。协议未命中 → 表/范围源（既有路径）。
-    var src_ty = node_types[src_n]
+    var src_ty = ast.node_type(src_n)
     var is_iter: i64 = 0
     var it_ptr: i64 = -1
     if src_ty >= 0 && sinfer.iter_proto_elem(src_ty) >= 0 {
@@ -51,7 +51,7 @@ func tig_comprehension(id: i64) -> i64 {
             matched = true
         }
     }
-    var bt2 = node_types[src_n]
+    var bt2 = ast.node_type(src_n)
     if !matched && types.is_table(bt2) {
         var le2 = types.table_elem(bt2)
         if le2 > 0 {
@@ -60,7 +60,7 @@ func tig_comprehension(id: i64) -> i64 {
         }
     }
     if !matched {
-        if s_tags[src_n] == 6 {
+        if ast.s_tag(src_n) == 6 {
             var bname = interner.intern(sstate.name_str(src_n))
             var te = sinfer.var_table_elem(bname)
             if te >= 0 {
@@ -86,7 +86,7 @@ func tig_comprehension(id: i64) -> i64 {
     }
     // ---- 结果表元素类型（推导式结果的权威来源）----
     var res_elem: i64 = types.named(TK_I64)
-    var lit_ty2 = node_types[id]
+    var lit_ty2 = ast.node_type(id)
     if types.is_table(lit_ty2) {
         var re = types.table_elem(lit_ty2)
         if re > 0 {
@@ -94,7 +94,7 @@ func tig_comprehension(id: i64) -> i64 {
         }
     }
     if res_elem == types.named(TK_I64) {
-        var vt0 = node_types[elem_n]
+        var vt0 = ast.node_type(elem_n)
         if vt0 >= 0 {
             res_elem = vt0
         }
@@ -196,7 +196,7 @@ func tig_comprehension(id: i64) -> i64 {
     ir.add_operand(ist, elem_llvm_ty, 2)
     ir.add_operand(ist, iv, 0)
     ir.add_operand(ist, item_ptr, 0)
-    scope_put(s_names[id], item_ptr, elem_llvm_ty)
+    scope_put(ast.s_name(id), item_ptr, elem_llvm_ty)
     // 有筛选：cond 为假 → 跳过 push（推 push_blk / skip_blk，最后汇入 step）
     var have_cond = cond_n >= 0
     var push_blk: i64 = -1
@@ -221,7 +221,7 @@ func tig_comprehension(id: i64) -> i64 {
         }
         var pv = ev
         if pty == types.named(TK_ANY) {
-            var vt2 = node_types[elem_n]
+            var vt2 = ast.node_type(elem_n)
             if vt2 >= 0 && vt2 != types.named(TK_ANY) {
                 var bx = tig_box_any(ev, vt2)
                 if bx < 0 {
@@ -246,7 +246,7 @@ func tig_comprehension(id: i64) -> i64 {
         }
         var pv2 = ev2
         if pty == types.named(TK_ANY) {
-            var vt3 = node_types[elem_n]
+            var vt3 = ast.node_type(elem_n)
             if vt3 >= 0 && vt3 != types.named(TK_ANY) {
                 var bx2 = tig_box_any(ev2, vt3)
                 if bx2 < 0 {

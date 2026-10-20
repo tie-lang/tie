@@ -417,12 +417,12 @@ func rx_empty_str() -> i64 {
 // 取 arg1 字面量 pattern；非字面量置 g_rx_ok=false（调用方返回空/假）
 func rex_pattern_or_err(id: i64) -> string {
     var pn = call_arg(id, 1)
-    if s_tags[pn] != 2 {
+    if ast.s_tag(pn) != 2 {
         g_rx_ok = false
         return ""
     }
     g_rx_ok = true
-    return intern.lookup(str_unescape_quoted(s_names[pn]))
+    return intern.lookup(str_unescape_quoted(ast.s_name(pn)))
 }
 
 // 把编译期表原值拷进运行时表 + 登记生成上下文
@@ -673,7 +673,7 @@ func rex_cls_handler(h: i64, neg: bool, vm_head: i64, btrack: i64) {
 // 原 Rust tie_regex_* 桥（g_used_interp=true），保证 std_net_text 等包装用例
 // 语义完整；字面量 pattern（regex_demo / 直接原语调用）走上方纯 tie 内联引擎。
 func rex_lit_pat(id: i64) -> bool {
-    return s_tags[call_arg(id, 1)] == 2
+    return ast.s_tag(call_arg(id, 1)) == 2
 }
 
 func rex_bridge_match(id: i64) -> i64 {

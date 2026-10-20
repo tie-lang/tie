@@ -113,7 +113,7 @@ func tig_ternary(id: i64) -> i64 {
         return -1
     }
     // p.6.5.2：条件归一化 i1（整型字面量条件同 while/if 缺陷，统一修）
-    cond = tig_cond_to_bool(cond, node_types[cond_nid])
+    cond = tig_cond_to_bool(cond, ast.node_type(cond_nid))
     var then_blk = ir.new_block(g_cur_func, interner.intern("tern.then"))
     var else_blk = ir.new_block(g_cur_func, interner.intern("tern.else"))
     var merge_blk = ir.new_block(g_cur_func, interner.intern("tern.merge"))
@@ -124,9 +124,9 @@ func tig_ternary(id: i64) -> i64 {
     // phi 类型：语义层统一的公共类型（sinfer 已按隐式拓宽方向定好；混宽两臂
     // 在**各自分支块内**（br 之前）tig_coerce 对齐——phi 入边值必须定义于前驱
     // 块，放 merge 块会破坏支配性）。
-    var pty = node_types[id]
+    var pty = ast.node_type(id)
     if pty < 0 {
-        pty = node_types[sstate.child(id, 1)]
+        pty = ast.node_type(sstate.child(id, 1))
     }
     if pty < 0 {
         pty = types.named(TK_I64)
@@ -137,7 +137,7 @@ func tig_ternary(id: i64) -> i64 {
     if tv < 0 {
         return -1
     }
-    tv = tig_coerce(tv, node_types[sstate.child(id, 1)], pty)
+    tv = tig_coerce(tv, ast.node_type(sstate.child(id, 1)), pty)
     var tv_blk = g_cur_block  // 嵌套短路时值实际产生块
     var br1 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(br1, merge_blk, 1)
@@ -147,7 +147,7 @@ func tig_ternary(id: i64) -> i64 {
     if ev < 0 {
         return -1
     }
-    ev = tig_coerce(ev, node_types[sstate.child(id, 2)], pty)
+    ev = tig_coerce(ev, ast.node_type(sstate.child(id, 2)), pty)
     var ev_blk = g_cur_block
     var br2 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(br2, merge_blk, 1)

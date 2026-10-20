@@ -440,7 +440,7 @@ pub func tig_ast() -> i64 {
     var i: i64 = 0
     while i < n {
         var s = g_extra_tops[i]
-        if s_tags[s] == 100 {
+        if ast.s_tag(s) == 100 {
             tig_global_var(s, sstate.name_str(s))
         }
         i = i + 1
@@ -449,7 +449,7 @@ pub func tig_ast() -> i64 {
     i = 0
     while i < n {
         var s = g_extra_tops[i]
-        if s_tags[s] == 101 {
+        if ast.s_tag(s) == 101 {
             // 顶层函数：全名 = 裸名
             var r = tig_fn_def(s, "")
             if r < 0 {
@@ -458,7 +458,7 @@ pub func tig_ast() -> i64 {
                 }
                 return -1
             }
-        } else if s_tags[s] == 112 {
+        } else if ast.s_tag(s) == 112 {
             // 命名空间：递归生成体内函数（全名 = ns 段::函数名）
             var nr = tig_ns(s, "")
             if nr < 0 {
@@ -494,7 +494,7 @@ pub func asm_reg_globals() -> i64 {
     var i: i64 = 0
     while i < n {
         var s = g_extra_tops[i]
-        if s_tags[s] == 100 {
+        if ast.s_tag(s) == 100 {
             if tig_global_var(s, sstate.name_str(s)) < 0 {
                 return -1
             }
@@ -504,7 +504,7 @@ pub func asm_reg_globals() -> i64 {
     i = 0
     while i < n {
         var s = g_extra_tops[i]
-        if s_tags[s] == 112 {
+        if ast.s_tag(s) == 112 {
             if asm_reg_ns_globals(s, "") < 0 {
                 return -1
             }
@@ -516,7 +516,7 @@ pub func asm_reg_globals() -> i64 {
 
 // 命名空间内 const（tag 100）登记（与 tig_ns 同款前缀拼接：段以 :: 连接）。
 func asm_reg_ns_globals(ns_node: i64, prefix: string) -> i64 {
-    var nseg = s_aux[ns_node]
+    var nseg = ast.s_aux(ns_node)
     var full_pre: string = prefix
     var k: i64 = 0
     while k < nseg {
@@ -532,7 +532,7 @@ func asm_reg_ns_globals(ns_node: i64, prefix: string) -> i64 {
     var i: i64 = 0
     while i < nb {
         var st = sstate.child(body, i)
-        var tag = s_tags[st]
+        var tag = ast.s_tag(st)
         if tag == 100 {
             if tig_global_var(st, full_pre + "::" + sstate.name_str(st)) < 0 {
                 return -1
@@ -605,7 +605,7 @@ pub func tig_src(src: string, base_dir: string) -> i64 {
     var i: i64 = 0
     while i < n {
         var s = g_extra_tops[i]
-        if s_tags[s] == 100 {
+        if ast.s_tag(s) == 100 {
             tig_global_var(s, sstate.name_str(s))
         }
         i = i + 1
@@ -614,7 +614,7 @@ pub func tig_src(src: string, base_dir: string) -> i64 {
     i = 0
     while i < n {
         var s = g_extra_tops[i]
-        if s_tags[s] == 101 {
+        if ast.s_tag(s) == 101 {
             // 顶层函数：全名 = 裸名
             var r = tig_fn_def(s, "")
             if r < 0 {
@@ -623,7 +623,7 @@ pub func tig_src(src: string, base_dir: string) -> i64 {
                 }
                 return -1
             }
-        } else if s_tags[s] == 112 {
+        } else if ast.s_tag(s) == 112 {
             // 命名空间：递归生成体内函数（全名 = ns 段::函数名）
             var nr = tig_ns(s, "")
             if nr < 0 {

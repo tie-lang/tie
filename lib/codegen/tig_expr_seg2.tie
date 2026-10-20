@@ -14,11 +14,11 @@ namespace irgen {
 // （符号引用）—— 种类由 llvmgen 的 opnd_ref 渲染成 `%N` / `@name`，
 // 与 irgen_arith_p2 的 load/store 处同约定。
 func asm_mem_addr(e: i64) -> (a: i64, k: i64) {
-    var et = node_types[e]
+    var et = ast.node_type(e)
     if et < 0 {
         et = types.named(TK_I64)
     }
-    if s_tags[e] == 6 {   // Var
+    if ast.s_tag(e) == 6 {   // Var
         var nid = interner.intern(sstate.name_str(e))
         if scope_get_global(nid) >= 0 {
             if g_lookup_is_global > 0 {
@@ -42,7 +42,7 @@ func asm_mem_addr(e: i64) -> (a: i64, k: i64) {
 }
 
 func tig_expr_seg2(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
     if tag == 131 {
         // S1.2 I1 asm!：生成 inline_asm 指令（模板池 id + 操作数方向/值对）。
         // 第一个 out 操作数 → 结果类型（call 返回值）；其余 out 第一版忽略。
@@ -57,10 +57,10 @@ func tig_expr_seg2(id: i64) -> i64 {
         var kt: i64 = 0
         while kt < nc {
             var opx = sstate.child(id, kt)
-            if s_vals[opx] == 3 {
+            if ast.s_val(opx) == 3 {
                 has_target = true
                 // 平台名（带引号 lexeme 池 id）→ 去引号纯文本
-                var arch = interner.lookup(str_unescape_quoted(s_names[opx]))
+                var arch = interner.lookup(str_unescape_quoted(ast.s_name(opx)))
                 if str_len(listed) > 0 {
                     listed = listed + "/"
                 }
@@ -72,8 +72,8 @@ func tig_expr_seg2(id: i64) -> i64 {
             kt = kt + 1
         }
         if has_target && !matched {
-            sm_err_line = s_lines[id]
-            sm_err_col = s_cols[id]
+            sm_err_line = ast.s_line(id)
+            sm_err_col = ast.s_col(id)
             var cur_t = g_asm_target
             if str_len(cur_t) == 0 {
                 cur_t = "（未设置）"
@@ -81,7 +81,7 @@ func tig_expr_seg2(id: i64) -> i64 {
             sm_err_msg = "asm! 平台 target(" + listed + ") 与当前编译目标 " + cur_t + " 不匹配（无目标平台分支可编译）"
             return -1
         }
-        var tmpl = s_names[id]
+        var tmpl = ast.s_name(id)
         var out_slot: i64 = -1
         var out_ty: i64 = -1
         var k: i64 = 0
@@ -93,9 +93,9 @@ func tig_expr_seg2(id: i64) -> i64 {
             // LLVM 端类型不匹配 ⇒ 生成坏代码 ⇒ 运行时段错误（实测退出码 139）。
             // 只有 **reg** 约束的 out/inout 由 call 返回值承载；mem 约束的
             // out/inout 直接写内存（指针经参数传入），不占返回值。
-            if s_vals[op0] < 4 && (s_vals[op0] == 1 || s_vals[op0] == 2) {
+            if ast.s_val(op0) < 4 && (ast.s_val(op0) == 1 || ast.s_val(op0) == 2) {
                 var e0 = sstate.child(op0, 0)
-                if s_tags[e0] == 6 {  // Var
+                if ast.s_tag(e0) == 6 {  // Var
                     var nid0 = interner.intern(sstate.name_str(e0))
                     if scope_get_global(nid0) >= 0 {
                         out_slot = g_lookup_alloca
@@ -126,7 +126,7 @@ func tig_expr_seg2(id: i64) -> i64 {
         k = 0
         while k < nc {
             var opv = sstate.child(id, k)
-            var dirv = s_vals[opv]
+            var dirv = ast.s_val(opv)
             if dirv == 3 {
                 // target("arch") 平台标注（任务17）：不占 asm 操作数，跳过
                 k = k + 1
@@ -150,7 +150,7 @@ func tig_expr_seg2(id: i64) -> i64 {
                 if am < 0 {
                     return -1
                 }
-                var etm = node_types[em]
+                var etm = ast.node_type(em)
                 if etm < 0 {
                     etm = types.named(TK_I64)
                 }
@@ -169,7 +169,7 @@ func tig_expr_seg2(id: i64) -> i64 {
                 if ev0 < 0 {
                     return -1
                 }
-                var et0 = node_types[ein]
+                var et0 = ast.node_type(ein)
                 if et0 < 0 {
                     et0 = types.named(TK_I64)
                 }

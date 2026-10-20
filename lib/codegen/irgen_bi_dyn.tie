@@ -32,7 +32,7 @@ if nm == "get_proc" {
     if nmv < 0 {
         return -1
     }
-    var hty = node_types[call_arg(id, 0)]
+    var hty = ast.node_type(call_arg(id, 0))
     if hty != types.named(TK_I64) && hty != types.named(TK_U64) && hty >= 0 {
         var sh = tig_sext(hnd, hty, types.named(TK_I64))
         if sh < 0 {
@@ -103,7 +103,7 @@ if nm == "to_string" {
     }
     // 实参类型：f64 → 用 i128 内联除数换成「浮点暂保留 Rust 桥」见下；
     // i64/u64 → tig_i64_to_str（去 Rust）；窄整数 sext → i64 后再内联。
-    var vt = node_types[call_arg(id, 0)]
+    var vt = ast.node_type(call_arg(id, 0))
     if vt == types.named(TK_STR) {
         // p.8.2.3 字符串插值：to_string(string) 返回自身（插值拼接链
         // 统一包 to_string——string 段直通，数字/布尔段走数值转换）
@@ -258,7 +258,7 @@ if nm == "len" {
     // 桥返回自动补头 / StringBuilder build 头）。行为与旧 strlen 一致（字节数）。
     // L1：len(定长数组) → 编译期常量 N。
     var a = call_arg(id, 0)
-    var at = node_types[a]
+    var at = ast.node_type(a)
     if at >= 0 && types.is_array(at) {
         g_builtin_res = tig_int_lit_ty(types.array_len(at), types.named(TK_I64))
         return 0
@@ -360,7 +360,7 @@ if nm == "table_push" {
     // 误选 string 桥生成 `store ptr <i64值>` → opt 类型错）。裸 table（
     // table_new_* 返回）node_types 无元素类型，自然落空继续走 sinfer 兜底。
     if te < 0 {
-        var aty = node_types[tname_node]
+        var aty = ast.node_type(tname_node)
         if types.is_table(aty) && !types.is_map(aty) && aty != types.named(TK_TABLE) {
             var ale = types.table_elem(aty)
             if ale > 0 {
@@ -391,8 +391,8 @@ if nm == "table_push" {
     // 转移给容器（rc 不变）——否则字面量 rc=1 + retain=2，容器 release 只 -1 剩
     // 1 份无人释放 → 每 push 泄漏 1 引用（嵌套表/扁平表重绑定内存无界增长）。
     // 在桥选/装箱之前对原始表句柄 retain（x 可能是后续装箱产物，非表句柄）。
-    var pv_t = node_types[call_arg(id, 1)]
-    var pv_tag = s_tags[call_arg(id, 1)]
+    var pv_t = ast.node_type(call_arg(id, 1))
+    var pv_tag = ast.s_tag(call_arg(id, 1))
     if pv_t >= 0 && types.is_table(pv_t) && pv_tag != 7 && pv_tag != 12 {
         tig_tbl_retain_call(x)
     }
@@ -401,7 +401,7 @@ if nm == "table_push" {
     // 结果 push 进 i64 表会 push_i64(double) 类型错，Rust 按值类型选桥）
     var suffix = bridge_suffix(elem)
     var pty = types.named(TK_I64)
-    var vt = node_types[call_arg(id, 1)]
+    var vt = ast.node_type(call_arg(id, 1))
     var ek = types.kind(elem)
     if ek == K_STRUCT || ek == K_ENUM || ek == K_FN || ek == K_TUPLE || elem == types.named(TK_ANY) {
         // P2a/P2b 复合元素：槽类型 = 元素类型 id（多字元素类型化 store）
@@ -419,7 +419,7 @@ if nm == "table_push" {
     }
     if pty == types.named(TK_ANY) {
         // P2b 异构元素装箱：推入值 → any {tag, payload}
-        var vt4 = node_types[call_arg(id, 1)]
+        var vt4 = ast.node_type(call_arg(id, 1))
         if vt4 >= 0 && vt4 != types.named(TK_ANY) {
             var bx = tig_box_any(x, vt4)
             if bx < 0 {
@@ -466,7 +466,7 @@ if nm == "table_append" {
         }
     }
     if te < 0 {
-        var aty = node_types[tname_node]
+        var aty = ast.node_type(tname_node)
         if types.is_table(aty) && !types.is_map(aty) && aty != types.named(TK_TABLE) {
             var ale = types.table_elem(aty)
             if ale > 0 {
@@ -484,22 +484,22 @@ if nm == "table_append" {
     var ek = types.kind(elem)
     if types.is_table(elem) || types.is_map(elem) || elem == types.named(TK_ANY) ||
         ek == K_STRUCT || ek == K_ENUM || ek == K_FN || ek == K_TUPLE {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "table_append 暂不支持该元素类型（深表/复合/any 须逐元素处理，函数 " + g_cur_fn_name + "）"
         return -1
     }
     // 源元素类型（尽力解析：两侧皆可知且不一致 ⇒ 拒绝；不可知则信任调用方）
     var s_node = call_arg(id, 1)
     var se: i64 = -1
-    var sty = node_types[s_node]
+    var sty = ast.node_type(s_node)
     if sty >= 0 && types.is_table(sty) && !types.is_map(sty) && sty != types.named(TK_TABLE) {
         var sle = types.table_elem(sty)
         if sle > 0 {
             se = sle
         }
     }
-    if se < 0 && s_tags[s_node] == 6 {   // 6 = S_N_VAR
+    if se < 0 && ast.s_tag(s_node) == 6 {   // 6 = S_N_VAR
         var sid = interner.intern(sstate.name_str(s_node))
         var sv_own = tblvar_get(sid)
         if sv_own >= 0 {
@@ -512,8 +512,8 @@ if nm == "table_append" {
         }
     }
     if se >= 0 && te >= 0 && se != te {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "table_append 两侧元素类型不一致：目标 " + types.type_name(te) + " ← 源 " + types.type_name(se)
         return -1
     }
@@ -590,7 +590,7 @@ if nm == "table_append_raw" {
         }
     }
     if te < 0 {
-        var aty = node_types[tname_node]
+        var aty = ast.node_type(tname_node)
         if types.is_table(aty) && !types.is_map(aty) && aty != types.named(TK_TABLE) {
             var ale = types.table_elem(aty)
             if ale > 0 {
@@ -607,8 +607,8 @@ if nm == "table_append_raw" {
     var ek = types.kind(elem)
     if types.is_table(elem) || types.is_map(elem) || elem == types.named(TK_ANY) ||
         ek == K_STRUCT || ek == K_ENUM || ek == K_FN || ek == K_TUPLE {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "table_append_raw 暂不支持该元素类型（深表/复合/any 须逐元素处理，函数 " + g_cur_fn_name + "）"
         return -1
     }

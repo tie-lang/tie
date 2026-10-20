@@ -39,28 +39,28 @@ func tig_array_lit_typed(id: i64, aty: i64) -> i64 {
         var cell = sstate.child(id, i)
         var vnode = sstate.child(cell, 1)
         var v: i64 = -1
-        if s_tags[vnode] == 0 {
+        if ast.s_tag(vnode) == 0 {
             // IntLit：按元素类型生成常量（f32/f64 槽转浮点文本）
             if elem == types.named(TK_F32) {
-                v = tig_float_lit_ty(interner.intern(to_string(s_vals[vnode]) + ".0"), types.named(TK_F32))
+                v = tig_float_lit_ty(interner.intern(to_string(ast.s_val(vnode)) + ".0"), types.named(TK_F32))
             } else if elem == types.named(TK_F64) {
-                v = tig_float_lit(interner.intern(to_string(s_vals[vnode]) + ".0"))
+                v = tig_float_lit(interner.intern(to_string(ast.s_val(vnode)) + ".0"))
             } else {
-                v = tig_int_lit_ty(s_vals[vnode], elem)
+                v = tig_int_lit_ty(ast.s_val(vnode), elem)
             }
-        } else if s_tags[vnode] == 1 && elem == types.named(TK_F32) {
+        } else if ast.s_tag(vnode) == 1 && elem == types.named(TK_F32) {
             // FloatLit 适配 f32 元素
-            v = tig_float_lit_ty(s_names[vnode], types.named(TK_F32))
-        } else if types.is_array(elem) && s_tags[vnode] == 12 {
+            v = tig_float_lit_ty(ast.s_name(vnode), types.named(TK_F32))
+        } else if types.is_array(elem) && ast.s_tag(vnode) == 12 {
             // 嵌套数组字面量元素：以 elem（数组类型）递归构造
             v = tig_array_lit_typed(vnode, elem)
-        } else if types.is_array(elem) && s_tags[vnode] == 7 && sstate.name_str(vnode) == "array_init" {
+        } else if types.is_array(elem) && ast.s_tag(vnode) == 7 && sstate.name_str(vnode) == "array_init" {
             // 嵌套 array_init 元素
             v = tig_array_init_typed(vnode, elem)
         } else {
             v = tig_expr(vnode)
             if v >= 0 {
-                var vt = node_types[vnode]
+                var vt = ast.node_type(vnode)
                 if vt >= 0 && vt != elem && (types.is_int(vt) || types.is_float(vt)) &&
                     (types.is_int(elem) || types.is_float(elem)) {
                     var cvv = tig_coerce(v, vt, elem)
@@ -96,11 +96,11 @@ func tig_array_init_typed(id: i64, aty: i64) -> i64 {
     var elem = types.array_elem(aty)
     var arg0 = sstate.child(id, sstate.slot_off(id))
     var v: i64 = -1
-    if types.is_array(elem) && s_tags[arg0] == 7 && sstate.name_str(arg0) == "array_init" {
+    if types.is_array(elem) && ast.s_tag(arg0) == 7 && sstate.name_str(arg0) == "array_init" {
         // 嵌套广播：array<array<f32,4>,4> = array_init(array_init(0.0))——
         // 内层 array_init 以 elem（数组类型）为目标递归构建
         v = tig_array_init_typed(arg0, elem)
-    } else if types.is_array(elem) && s_tags[arg0] == 12 {
+    } else if types.is_array(elem) && ast.s_tag(arg0) == 12 {
         // 嵌套字面量：array<array<f32,4>,4> = [[..],[..],...]
         v = tig_array_lit_typed(arg0, elem)
     } else {
@@ -109,7 +109,7 @@ func tig_array_init_typed(id: i64, aty: i64) -> i64 {
     if v < 0 {
         return -1
     }
-    var vt = node_types[arg0]
+    var vt = ast.node_type(arg0)
     if vt >= 0 && vt != elem && (types.is_int(vt) || types.is_float(vt)) &&
         (types.is_int(elem) || types.is_float(elem)) {
         var cvv = tig_coerce(v, vt, elem)
@@ -144,7 +144,7 @@ func tig_array_init_typed(id: i64, aty: i64) -> i64 {
 // 返回 (元素地址, 数组类型)：地址指向 base 表示的数组（内层），由调用方
 // 再按 own index GEP；不命中返回 (-1, -1)。
 func tig_array_root(base: i64) -> (addr: i64, aty: i64) {
-    if s_tags[base] == 6 {
+    if ast.s_tag(base) == 6 {
         var bn = interner.intern(sstate.name_str(base))
         if scope_get_global(bn) >= 0 && types.is_array(g_lookup_ty) {
             return (g_lookup_alloca, g_lookup_ty)
@@ -153,7 +153,7 @@ func tig_array_root(base: i64) -> (addr: i64, aty: i64) {
             return (g_lookup_alloca, g_lookup_ty)
         }
     }
-    if s_tags[base] == S_N_INDEX {
+    if ast.s_tag(base) == S_N_INDEX {
         var ib = sstate.child(base, 0)
         var ix = sstate.child(base, 1)
         var (ra, raty) = tig_array_root(ib)
@@ -170,7 +170,7 @@ func tig_array_root(base: i64) -> (addr: i64, aty: i64) {
         }
         return (-1, -1)
     }
-    var bty = node_types[base]
+    var bty = ast.node_type(base)
     if types.is_array(bty) {
         var addr2 = tig_agg_addr(base, bty)
         if addr2 < 0 {
@@ -184,7 +184,7 @@ func tig_array_root(base: i64) -> (addr: i64, aty: i64) {
 // 取聚合 base 的地址（alloca 指针）：Var → 作用域槽地址；表达式 → 求聚合值
 // 后 alloca + store（寄存器聚合值落内存，供 GEP 寻址）。
 func tig_agg_addr(base: i64, agg: i64) -> i64 {
-    if s_tags[base] == 6 {
+    if ast.s_tag(base) == 6 {
         var nm = interner.intern(sstate.name_str(base))
         if scope_get_global(nm) >= 0 && g_lookup_is_global == 0 {
             return g_lookup_alloca  // 局部聚合变量槽
@@ -206,9 +206,9 @@ func tig_agg_addr(base: i64, agg: i64) -> i64 {
 }
 
 // 元组字面量 (a, b) → 聚合值：alloca 聚合 → 逐字段 agg_gep + store → load。
-// 字段类型取自语义层 tup_tys（node_types[id] 已登记元组类型）。
+// 字段类型取自语义层 tup_tys（ast.node_type(id) 已登记元组类型）。
 func tig_tuple_lit(id: i64) -> i64 {
-    var agg = node_types[id]
+    var agg = ast.node_type(id)
     if agg < 0 {
         sm_err_msg = "元组字面量缺少语义类型（函数 " + g_cur_fn_name + "）"
         return -1
@@ -230,12 +230,12 @@ func tig_tuple_lit_typed(id: i64, agg: i64) -> i64 {
         var vnode = sstate.child(f, 0)
         var fty = agg_field_ty(agg, i)
         var v: i64 = -1
-        if s_tags[vnode] == 0 {
+        if ast.s_tag(vnode) == 0 {
             // IntLit：按目标字段类型生成常量（i32 槽 i32 值 / f64 槽浮点文本）
             if fty == types.named(TK_F64) || fty == types.named(TK_F32) {
-                v = tig_float_lit(interner.intern(to_string(s_vals[vnode]) + ".0"))
+                v = tig_float_lit(interner.intern(to_string(ast.s_val(vnode)) + ".0"))
             } else {
-                v = tig_int_lit_ty(s_vals[vnode], fty)
+                v = tig_int_lit_ty(ast.s_val(vnode), fty)
             }
         } else {
             v = tig_expr(vnode)
@@ -256,7 +256,7 @@ func tig_tuple_lit_typed(id: i64, agg: i64) -> i64 {
         // 会释放的本地槽，如 point_add 的 return (x3,y3)）：retain 给调用方、出口减回。
         // 元素是表达式/调用（tag==7，如 divrem 的 return (trim(q),trim(r0))）→ 返回的
         // 是全新临时表，非被析构槽，不 retain（否则调用方多持 +1 → 循环内孤儿泄漏）。
-        if g_ret_tup_tbl == 1 && types.is_table(fty) && s_tags[vnode] == 6 {
+        if g_ret_tup_tbl == 1 && types.is_table(fty) && ast.s_tag(vnode) == 6 {
             tig_tbl_retain_call(v)
         }
         i = i + 1
@@ -303,7 +303,7 @@ func tig_computed_getter(id: i64, base: i64, base_ty: i64, fname: string) -> i64
 func tig_field_access(id: i64) -> i64 {
     var base = sstate.child(id, 0)
     var fname = sstate.name_str(id)
-    var base_ty = node_types[base]
+    var base_ty = ast.node_type(base)
     var bk = types.kind(base_ty)
     if base_ty < 0 || (bk != K_TUPLE && bk != K_STRUCT && bk != K_MAP) {
         sm_err_msg = "字段访问 '.' 的对象不是元组/struct/映射记录（类型 " + types.type_name(base_ty) + "，函数 " + g_cur_fn_name + "）"
@@ -355,8 +355,8 @@ func tig_field_assign(id: i64) -> i64 {
     var fname = sstate.name_str(id)
     var base = sstate.child(id, 0)
     var val = sstate.child(id, 1)
-    var op = s_vals[id]
-    var base_ty = node_types[base]
+    var op = ast.s_val(id)
+    var base_ty = ast.node_type(base)
     var bk = types.kind(base_ty)
     if base_ty < 0 || (bk != K_TUPLE && bk != K_STRUCT) {
         sm_err_msg = "字段赋值的目标不是元组/struct（类型 " + types.type_name(base_ty) + "，函数 " + g_cur_fn_name + "）"
@@ -397,7 +397,7 @@ func tig_field_assign(id: i64) -> i64 {
         return -1
     }
     var fty = agg_field_ty(base_ty, fidx)
-    var is_idx = s_tags[base] == 13  // t[i] 下标 base
+    var is_idx = ast.s_tag(base) == 13  // t[i] 下标 base
     var tbl_v: i64 = -1
     var idx_v: i64 = -1
     var copy_slot: i64 = -1
@@ -459,7 +459,7 @@ func tig_field_assign(id: i64) -> i64 {
             return -1
         }
         // S1.3 窄整数字段：赋值值按字段类型转换（i64 值 → i32 字段）
-        var vt = node_types[val]
+        var vt = ast.node_type(val)
         if vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
             (types.is_int(fty) || types.is_float(fty)) && vt != fty {
             var cv = tig_coerce(vv, vt, fty)
@@ -491,9 +491,9 @@ func tig_field_assign(id: i64) -> i64 {
             fld_is_tbl = true
             // r.1.1.4：表字面量（tag 12）同 table_new_* 构造是瞬态新表 → 免 retain
             //（所有权随存储转移给字段；字段不 release 旧值，设计已接受）。
-            if s_tags[val] == 12 {
+            if ast.s_tag(val) == 12 {
                 fld_new_tbl = true
-            } else if s_tags[val] == 7 {
+            } else if ast.s_tag(val) == 7 {
                 var cnmf2 = sstate.name_str(val)
                 if cnmf2 == "table_new_i64" || cnmf2 == "table_new_f64" ||
                     cnmf2 == "table_new_string" || cnmf2 == "table_new_bool" {

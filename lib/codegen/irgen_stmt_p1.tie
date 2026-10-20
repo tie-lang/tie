@@ -60,7 +60,7 @@ func tig_table_bounds_check(ok_addr: i64, iv: i64, t: i64, idx_node: i64, target
     // ★ 所有会发射指令的求值必须排在任何 add_operand 之前（否则「操作数段交错」）
     var linev = tig_int_lit(0)
     if idx_node >= 0 && idx_node < len(s_lines) {
-        linev = tig_int_lit(s_lines[idx_node])
+        linev = tig_int_lit(ast.s_line(idx_node))
     }
     var okv = s21_load(ok_addr, types.named(TK_I8))
     var lenv = s21_table_len(t)
@@ -117,11 +117,11 @@ func tig_index_ty(idx: i64) -> i64 {
     // ★ 判据必须用 `< 0` 表示「未登记」：**TK_I8 = 0 是合法类型 id**，
     //   而 node_types 的未登记哨兵是 -1（见 sstate_q1 的 table_push(node_types, -1)）。
     //   曾用 `<= 0` 判定 ⇒ 把 i8 当成「未知」⇒ i8 下标不拓宽（本 bug 的根因）。
-    var ty = node_types[idx]
+    var ty = ast.node_type(idx)
     if ty >= 0 && types.is_int(ty) {
         return ty
     }
-    if s_tags[idx] == 6 {
+    if ast.s_tag(idx) == 6 {
         var nm = interner.intern(sstate.name_str(idx))
         if scope_get(nm) >= 0 && g_lookup_ty >= 0 && types.is_int(g_lookup_ty) {
             return g_lookup_ty
@@ -167,7 +167,7 @@ func tig_index_read(id: i64) -> i64 {
         return ir.get_value(ld0)
     }
     // p.9.12.6 行池读：base 是登记过行池变量 → 逐字段取 + 聚合构造（rp_read）
-    if s_tags[base] == 6 {
+    if ast.s_tag(base) == 6 {
         var rpn = interner.intern(sstate.name_str(base))
         if rp_is(rpn) {
             var iv0 = tig_index_iv(idx)
@@ -190,7 +190,7 @@ func tig_index_read(id: i64) -> i64 {
     // 与 Rust 基线 ir.rs tig_index_assign 的 map 分支同构（tie_map_* 专用桥）。
     var base_is_map: bool = false
     var map_val_ty: i64 = types.named(TK_I64)
-    if s_tags[base] == 6 {
+    if ast.s_tag(base) == 6 {
         var bn_rd = interner.intern(sstate.name_str(base))
         if scope_get(bn_rd) >= 0 && types.is_map(g_lookup_ty) {
             base_is_map = true
@@ -198,7 +198,7 @@ func tig_index_read(id: i64) -> i64 {
         }
     }
     if !base_is_map {
-        var bt_m = node_types[base]
+        var bt_m = ast.node_type(base)
         if types.is_map(bt_m) {
             base_is_map = true
             map_val_ty = types.low(bt_m)
@@ -228,7 +228,7 @@ func tig_index_read(id: i64) -> i64 {
     // 其次 node_types（semantic 持久节点类型），最后 var_table_elem
     //（sinfer.lv_telem 每函数重置，irgen 阶段只能查到最后一个函数——不可靠）
     var elem: i64 = types.named(TK_I64)
-    if s_tags[base] == 6 {
+    if ast.s_tag(base) == 6 {
         var bname = interner.intern(sstate.name_str(base))
         var matched: bool = false
         // irgen 自维护表变量元素类型（table_new_f64() 变量；语义层 lv_telem
@@ -246,7 +246,7 @@ func tig_index_read(id: i64) -> i64 {
             }
         }
         if !matched {
-            var bt2 = node_types[base]
+            var bt2 = ast.node_type(base)
             if types.is_table(bt2) {
                 var le2 = types.table_elem(bt2)
                 if le2 > 0 {
@@ -265,14 +265,14 @@ func tig_index_read(id: i64) -> i64 {
         if !matched {
             // 最后 fallback：索引表达式的语义推断类型（裸 table 元素未知时，
             // semantic 按上下文推断——join 里 parts[i] 用于拼接 → TK_STR）
-            var nt = node_types[id]
+            var nt = ast.node_type(id)
             if nt >= 0 && (nt == types.named(TK_STR) || types.is_int(nt) ||
                 types.is_float(nt) || types.is_bool_like(nt)) {
                 elem = nt
             }
         }
     } else {
-        var bt = node_types[base]
+        var bt = ast.node_type(base)
         if types.is_table(bt) {
             var te2 = types.table_elem(bt)
             if te2 > 0 {
@@ -498,12 +498,12 @@ func tig_loopvar_crelease(av: i64, fv_ty: i64) {
 func tig_index_assign(id: i64) -> i64 {
     var target = sstate.child(id, 0)
     var val = sstate.child(id, 1)
-    var op = s_vals[id]  // 复合赋值码（-1 普通；0..17，对齐 B_*）
+    var op = ast.s_val(id)  // 复合赋值码（-1 普通；0..17，对齐 B_*）
     // 目标必须是 Index：children=[base, index]
     var base = sstate.child(target, 0)
     var idx = sstate.child(target, 1)
     // p.9.12.6 行池写：base 是登记过行池变量 → 负下标诊断 + 多列同步扩 + 逐字段写
-    if s_tags[base] == 6 {
+    if ast.s_tag(base) == 6 {
         var rpn2 = interner.intern(sstate.name_str(base))
         if rp_is(rpn2) {
             if op >= 0 {
@@ -556,7 +556,7 @@ func tig_index_assign(id: i64) -> i64 {
             if v2 < 0 {
                 return -1
             }
-            var vt2 = node_types[val]
+            var vt2 = ast.node_type(val)
             if vt2 >= 0 && vt2 != elem2 && (types.is_int(vt2) || types.is_float(vt2)) &&
                 (types.is_int(elem2) || types.is_float(elem2)) {
                 var cv2b = tig_coerce(v2, vt2, elem2)
@@ -589,7 +589,7 @@ func tig_index_assign(id: i64) -> i64 {
     // 与 Rust 基线 ir.rs tig_index_assign 的 map 分支同构（含复合赋值读写回写）。
     var base_is_map: bool = false
     var map_val_ty: i64 = types.named(TK_I64)
-    if s_tags[base] == 6 {
+    if ast.s_tag(base) == 6 {
         var bn_as = interner.intern(sstate.name_str(base))
         if scope_get(bn_as) >= 0 && types.is_map(g_lookup_ty) {
             base_is_map = true
@@ -597,7 +597,7 @@ func tig_index_assign(id: i64) -> i64 {
         }
     }
     if !base_is_map {
-        var bt_m2 = node_types[base]
+        var bt_m2 = ast.node_type(base)
         if types.is_map(bt_m2) {
             base_is_map = true
             map_val_ty = types.low(bt_m2)
@@ -644,7 +644,7 @@ func tig_index_assign(id: i64) -> i64 {
         }
         // P2c：map<any> 值写入——装箱 + 堆拷贝，值槽存堆指针
         if map_val_ty == types.named(TK_ANY) {
-            var vtm = node_types[val]
+            var vtm = ast.node_type(val)
             var src_m: i64 = v_m
             if vtm >= 0 && vtm != types.named(TK_ANY) {
                 var bxm = tig_box_any(v_m, vtm)
@@ -670,7 +670,7 @@ func tig_index_assign(id: i64) -> i64 {
     // node_types，导致 table<string> 等变量（存 string）元素类型推断为 i64，
     // 生成 tie_table_set_i64 传 string 值 → opt 类型错（pkg 编译失败根因）。
     var elem: i64 = types.named(TK_I64)
-    if s_tags[base] == 6 {
+    if ast.s_tag(base) == 6 {
         var bname = interner.intern(sstate.name_str(base))
         var matched: bool = false
         // irgen 自维护表变量元素类型（table_new_f64() 变量；语义层 lv_telem 已过期）
@@ -687,7 +687,7 @@ func tig_index_assign(id: i64) -> i64 {
             }
         }
         if !matched {
-            var bt2 = node_types[base]
+            var bt2 = ast.node_type(base)
             if types.is_table(bt2) {
                 var le2 = types.table_elem(bt2)
                 if le2 > 0 {
@@ -705,14 +705,14 @@ func tig_index_assign(id: i64) -> i64 {
         }
         if !matched {
             // 最后 fallback：索引表达式节点的语义推断类型（裸 table 元素未知时）
-            var nt = node_types[id]
+            var nt = ast.node_type(id)
             if nt >= 0 && (nt == types.named(TK_STR) || types.is_int(nt) ||
                 types.is_float(nt) || types.is_bool_like(nt)) {
                 elem = nt
             }
         }
     } else {
-        var bt = node_types[base]
+        var bt = ast.node_type(base)
         if types.is_table(bt) {
             var te2 = types.table_elem(bt)
             if te2 > 0 {
@@ -783,13 +783,13 @@ func tig_index_assign(id: i64) -> i64 {
     // any 聚合盒，非表句柄——code 30，与 table_push 的 p.6.10.4 同构）。
     // r.1.1.4：瞬态值（调用 tag 7 / 表字面量 tag 12）免 retain（所有权转移给
     // 容器），仅别名值（变量/下标/字段读）retain——与 table_push 同纪律。
-    var ivt = node_types[val]
-    if op < 0 && ivt >= 0 && types.is_table(ivt) && s_tags[val] != 7 && s_tags[val] != 12 {
+    var ivt = ast.node_type(val)
+    if op < 0 && ivt >= 0 && types.is_table(ivt) && ast.s_tag(val) != 7 && ast.s_tag(val) != 12 {
         tig_tbl_retain_call(v)
     }
     // P2b 异构元素装箱：表<any> 下标写，值须 box 为 any
     if pty == types.named(TK_ANY) {
-        var vt6 = node_types[val]
+        var vt6 = ast.node_type(val)
         if vt6 >= 0 && vt6 != types.named(TK_ANY) {
             var bx = tig_box_any(v, vt6)
             if bx < 0 {
@@ -799,7 +799,7 @@ func tig_index_assign(id: i64) -> i64 {
         }
     }
     // r.1.6.14：值语义模式下先分离（裸变量目标；默认关 ⇒ no-op）
-    if s_tags[base] == 6 {
+    if ast.s_tag(base) == 6 {
         t = tig_cow_before_write(t, interner.intern(sstate.name_str(base)))
     }
     // r.1.6.7 独占免锁：写路径同样按独占判定选免锁入口（越界静默跳过语义不变）

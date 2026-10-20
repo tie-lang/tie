@@ -188,7 +188,7 @@ pub func set_file_lock(v: bool) {
 
 // 便利：AST 节点若是「裸变量」→ 返回其名池 id；否则 -1。
 func esc_var_id(n: i64) -> i64 {
-    if n < 0 || s_tags[n] != S_N_VAR {
+    if n < 0 || ast.s_tag(n) != S_N_VAR {
         return 0 - 1
     }
     return interner.intern(sstate.name_str(n))
@@ -214,7 +214,7 @@ func esc_take(n: i64, site: string) -> bool {
         if g_esc_audit {
             var ln2: i64 = 0
             if n >= 0 && n < len(s_lines) {
-                ln2 = s_lines[n]
+                ln2 = ast.s_line(n)
             }
             var vn = ""
             if esc_var_id(n) >= 0 {
@@ -237,7 +237,7 @@ func esc_take(n: i64, site: string) -> bool {
     if g_esc_audit {
         var ln: i64 = 0
         if n >= 0 && n < len(s_lines) {
-            ln = s_lines[n]
+            ln = ast.s_line(n)
         }
         println("[esc] 独占免锁 " + site + " 变量=" + sstate.name_str(n) +
             " 函数=" + g_cur_fn_name + " 行=" + to_string(ln))
@@ -258,7 +258,7 @@ func esc_is_fresh(e: i64) -> bool {
     if e < 0 {
         return false
     }
-    var tg = s_tags[e]
+    var tg = ast.s_tag(e)
     if tg == S_N_TABLE_LIT {
         return true          // 表/键值表字面量：编译器新建容器
     }
@@ -309,7 +309,7 @@ func esc_scan(n: i64, mode: i64) {
 }
 
 func esc_scan_dispatch(n: i64, mode: i64) -> i64 {
-    var tg = s_tags[n]
+    var tg = ast.s_tag(n)
     // N_CASE_BIND（`case Ok(v)` 解构，tag 140）：children = [变体引用**节点**,
     // 绑定名 intern id, 绑定名 intern id, ...]（见 pstmt_flow_p2 的 bkids 构造）。
     // ★ 第 1 个之后的槽**不是 AST 节点**——必须只扫 child(0)。此前缺本分支，
@@ -417,7 +417,7 @@ func esc_kill_vars_in(n: i64) {
         return
     }
     g_esc_depth = g_esc_depth + 1
-    if s_tags[n] == S_N_VAR {
+    if ast.s_tag(n) == S_N_VAR {
         esc_kill(interner.intern(sstate.name_str(n)))
     }
     var nc = sstate.nchild(n)

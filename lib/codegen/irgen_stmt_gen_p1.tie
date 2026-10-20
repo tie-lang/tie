@@ -5,9 +5,9 @@ type tie<class>
 // 顶层全局 var 与 import 树仍留在 irgen_stmt_gen.tie。
 namespace irgen {
 pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // VarDecl：children=[ty 或 -1, init]
-        var nm = s_names[id]
+        var nm = ast.s_name(id)
         var ty_node = sstate.child(id, 0)
         var init = sstate.child(id, 1)
         var ty: i64 = types.named(3)  // 默认 i64
@@ -22,7 +22,7 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             //   misc + bool → i1
             if init >= 0 && (ty == types.named(TK_NUM) || ty == types.named(TK_TEXT) ||
                 ty == types.named(TK_MISC)) {
-                var wt = node_types[init]
+                var wt = ast.node_type(init)
                 if wt >= 0 {
                     ty = wt
                 }
@@ -34,7 +34,7 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             // icmp 结果是 i1——曾默认 i64 槽导致 store i64 %i1 类型错）；
             // 元组/struct → 聚合类型 id（alloca {..} 聚合槽）；
             // 其余默认 i64。
-            var it = node_types[init]
+            var it = ast.node_type(init)
             if it >= 0 && (types.is_table(it) || types.is_map(it) || it == types.named(TK_STR)) {
                 ty = types.named(TK_STR)
             } else if it == types.named(TK_TRIT) {
@@ -95,7 +95,7 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             // S2.4：port 对象变量初始化——提升（struct → port 打包）或
             // port 拷贝（ptr 复制）。见 tig_port_coerce 注释。
             if types.kind(ty) == K_PORT {
-                var it4 = node_types[init]
+                var it4 = ast.node_type(init)
                 var pv: i64 = -1
                 if it4 >= 0 && types.kind(it4) == K_STRUCT {
                     pv = tig_port_coerce(init, ty)
@@ -118,34 +118,34 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             // 其余表达式走 tig_expr（结果恒 i64，与 llvmgen store 的 vty 匹配
             // 需初始化类型为 i64——非 i64 初始化目前仅支持整数常量）。
             var iv: i64 = -1
-            if s_tags[init] == 4 && ty == types.named(TK_TRIT) {
+            if ast.s_tag(init) == 4 && ty == types.named(TK_TRIT) {
                 // BoolLit 适配 trit（语义层 node_types 仍标 TK_BOOL，但标注类型
                 // trit 需生成 i8 值：true→1 / false→-1——否则 store i8 %i1 类型错）
                 var tv: i64 = -1
-                if s_vals[init] == 1 {
+                if ast.s_val(init) == 1 {
                     tv = 1
                 }
                 iv = tig_trit_lit(tv)
-            } else if s_tags[init] == 1 && ty == types.named(TK_F32) {
+            } else if ast.s_tag(init) == 1 && ty == types.named(TK_F32) {
                 // FloatLit 适配 f32 声明：按 f32 生成常量（S1.3，默认 f64）
-                iv = tig_float_lit_ty(s_names[init], types.named(TK_F32))
-            } else if s_tags[init] == 0 {
+                iv = tig_float_lit_ty(ast.s_name(init), types.named(TK_F32))
+            } else if ast.s_tag(init) == 0 {
                 // P2b：any 声明的整数字面量先按 i64 生成，装箱在后续统一处理
                 var lit_ty = ty
                 if lit_ty == types.named(TK_ANY) {
                     lit_ty = types.named(TK_I64)
                 }
-                iv = tig_int_lit_ty(s_vals[init], lit_ty)
-            } else if s_tags[init] == 14 && types.kind(ty) == K_TUPLE {
+                iv = tig_int_lit_ty(ast.s_val(init), lit_ty)
+            } else if ast.s_tag(init) == 14 && types.kind(ty) == K_TUPLE {
                 // 元组字面量 + 元组类型标注：按目标类型构造（(i32,i64) 标注 +
                 // (7,8) 字面量——语义层推断字面量为 (i64,i64)，不按目标类型
                 // 构造会 store {i64,i64} 到 {i32,i64} 槽，LLVM 类型不匹配）
                 iv = tig_tuple_lit_typed(init, ty)
-            } else if s_tags[init] == 12 && types.is_array(ty) {
+            } else if ast.s_tag(init) == 12 && types.is_array(ty) {
                 // L1 定长数组：`var b: array<f32, 3> = [1.0, 2.0, 3.0]`——
                 // 按目标数组类型构造 [N x T] 聚合值（语义层已校验元素个数/类型）
                 iv = tig_array_lit_typed(init, ty)
-            } else if s_tags[init] == 7 && types.is_array(ty) && sstate.name_str(init) == "array_init" {
+            } else if ast.s_tag(init) == 7 && types.is_array(ty) && sstate.name_str(init) == "array_init" {
                 // L1 定长数组：`var z: array<f32, 64> = array_init(0.0)`——
                 // 广播填充 [N x T]（编译期展开 N 次 store）
                 iv = tig_array_init_typed(init, ty)
@@ -155,7 +155,7 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
                 // IntLit/FloatLit 已按类型生成（tig_int_lit_ty / 浮点常量），
                 // 变量/运算结果按语义层拓宽规则转换（i16 变量 → i64 声明）。
                 if iv >= 0 {
-                    var it3 = node_types[init]
+                    var it3 = ast.node_type(init)
                     if it3 >= 0 && (types.is_int(it3) || types.is_float(it3)) &&
                         (types.is_int(ty) || types.is_float(ty)) && it3 != ty {
                         var cv2 = tig_coerce(iv, it3, ty)
@@ -177,21 +177,21 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             // r.1.1.4：表字面量（tag 12）同调用一样是**瞬态值**（新表 rc=1，仅本槽
             // 持有）→ 免 retain（否则 rc=2、出口析构只 -1 → 每处字面量初始化泄漏 1）。
             if init >= 0 {
-                var iv4 = node_types[init]
+                var iv4 = ast.node_type(init)
                 // ★ r.1.6.15：`share(x)` 虽形如调用（tag 7），但语义是**别名**而非
                 // 瞬态新值 ⇒ 必须 retain（否则调用方与绑定方各 release 一次、
                 // 而 rc 只有 1 ⇒ 出口双释放崩溃，实测 rc=127）。
-                var is_shr = s_tags[init] == 7 && s_names[init] == interner.intern("share")
-                if iv4 >= 0 && types.is_table(iv4) && (is_shr || (s_tags[init] != 7 && s_tags[init] != 12)) {
+                var is_shr = ast.s_tag(init) == 7 && ast.s_name(init) == interner.intern("share")
+                if iv4 >= 0 && types.is_table(iv4) && (is_shr || (ast.s_tag(init) != 7 && ast.s_tag(init) != 12)) {
                     // p.6.1.7-RCA-3【2026-09-06】：元组**解构**字段读（var (a,b)=f() 由
                     // 解析器降级为 `var a = _tmp.Item1`，tag 15）——元素表所有权已随被调
                     // 函数返回转移给调用方，此处再 retain(+1) 会与 loopvar 的 -1 不对等，
                     // 剩 base 孤儿每欧几里得步泄漏（invmod 的 qx/rem/mag）。跳过：解构
                     // 槽直接持有那单份引用；结构体字段（K_STRUCT）仍 retain。
                     var skip_ret: bool = false
-                    if s_tags[init] == 15 {
+                    if ast.s_tag(init) == 15 {
                         var bnode = sstate.child(init, 0)
-                        if bnode >= 0 && node_types[bnode] >= 0 && types.kind(node_types[bnode]) == K_TUPLE {
+                        if bnode >= 0 && ast.node_type(bnode) >= 0 && types.kind(ast.node_type(bnode)) == K_TUPLE {
                             skip_ret = true
                         }
                     }
@@ -202,7 +202,7 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             }
             // P2b any 装箱：声明类型 any 且初始化值是具体类型 → box 为 {tag,payload}
             if ty == types.named(TK_ANY) {
-                var it5 = node_types[init]
+                var it5 = ast.node_type(init)
                 if it5 >= 0 && it5 != types.named(TK_ANY) {
                     var bx = tig_box_any(iv, it5)
                     if bx < 0 {
@@ -222,9 +222,9 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             // load ptr 会对聚合槽类型错，且盒不由容器/出口释放（与 table<any> 元素
             // 约定一致；盒内表的引用在装箱前 retain 守恒，生命周期随函数出口）。
             var cand_tbl: bool = (types.is_table(ty) || types.is_map(ty)) && ty != types.named(TK_ANY)
-            if !cand_tbl && init >= 0 && node_types[init] >= 0 && ty != types.named(TK_ANY) &&
+            if !cand_tbl && init >= 0 && ast.node_type(init) >= 0 && ty != types.named(TK_ANY) &&
                !types.is_array(ty) &&
-               (types.is_table(node_types[init]) || types.is_map(node_types[init])) {
+               (types.is_table(ast.node_type(init)) || types.is_map(ast.node_type(init))) {
                 cand_tbl = true
             }
             // p.6.1.7-RCA-5【2026-09-06】：登记**全部**表/map 局部（含非 entry 块）到出口
@@ -248,7 +248,7 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             // 释放点从 env 首字段读析构入口，无需知道是哪个闭包。
             // env 恒有效（无捕获 ⇒ 静态空 env，析构 no-op）⇒ 无需判空。
             // 逃逸者由 esc 分析排除（含 `var g = f` 的复制——裸变量读会 kill 源）。
-            if init >= 0 && types.is_fn(node_types[init]) {
+            if init >= 0 && types.is_fn(ast.node_type(init)) {
                 var cnid_c = interner.intern(sstate.name_str(id))
                 esc_cand(cnid_c)
                 table_push(g_clov_nids, cnid_c)
@@ -262,15 +262,15 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             // 表），内存有界且安全。entry 级表变量由 p.6.10.3 出口析构覆盖，不在此列。
             // r.1.4.2：槽类型为 any（盒值）不入回边 release——load ptr 对聚合槽类型
             // 错；盒内表引用在装箱前 retain 守恒（与出口不析构的约定一致）。
-            var ivla = node_types[init]
+            var ivla = ast.node_type(init)
             // 闭包值的回边释放（(b) 方案）：与表变量同构——非 entry 块声明 +
             // 初值是 **fn 类型**（不再限闭包字面量，故工厂形态 `var f = mk()` 也被
             // 覆盖）⇒ 覆盖前释放上一轮的 env。释放点从 env 首字段读析构入口，
             // 无需知道是哪个闭包。
             // 哨兵语义：首次进入槽为零值 ⇒ select 成**静态空 env**（析构 no-op），
             // 故无需判空（env 恒有效）。
-            if g_cur_block != g_entry_block && init >= 0 && types.is_fn(node_types[init]) {
-                tig_loopvar_crelease(av, node_types[init])
+            if g_cur_block != g_entry_block && init >= 0 && types.is_fn(ast.node_type(init)) {
+                tig_loopvar_crelease(av, ast.node_type(init))
             }
             if g_cur_block != g_entry_block && ivla >= 0 && types.is_table(ivla) && ty != types.named(TK_ANY) && !types.is_array(ty) {
                 // p.6.1.7-RCA-6【2026-09-06】：回边重写前 **release 旧值**（原 p.6.10.4
@@ -314,10 +314,10 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
         // r.1.6.15 `var b = share(a)`：把 b（以及裸变量实参 a）登记为**显式共享名**
         // ⇒ 写路径跳过 COW ⇒ 就地改、别名互见。这正是 `share` 的语义。
         // 实参不是裸变量（如 `s.t`）时只能标 b —— 记入文档的已知不对称。
-        if init >= 0 && s_tags[init] == 7 && s_names[init] == interner.intern("share") {
+        if init >= 0 && ast.s_tag(init) == 7 && ast.s_name(init) == interner.intern("share") {
             table_push(g_shared_param_nids, interner.intern(sstate.name_str(id)))
             var shr_arg = sstate.child(init, sstate.slot_off(init))
-            if shr_arg >= 0 && s_tags[shr_arg] == 6 {
+            if shr_arg >= 0 && ast.s_tag(shr_arg) == 6 {
                 table_push(g_shared_param_nids, interner.intern(sstate.name_str(shr_arg)))
             }
         }
@@ -335,10 +335,10 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
         // 无法从 node_types 得知元素类型。
         if init >= 0 {
             var tv_te: i64 = -1
-            var it2 = node_types[init]
+            var it2 = ast.node_type(init)
             if types.is_table(it2) && types.table_elem(it2) > 0 {
                 tv_te = types.table_elem(it2)
-            } else if s_tags[init] == 7 {
+            } else if ast.s_tag(init) == 7 {
                 var init_nm = sstate.name_str(init)
                 if init_nm == "table_new_f64" {
                     tv_te = types.named(TK_F64)
@@ -351,7 +351,7 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
                 }
             }
             if tv_te >= 0 {
-                // 键统一用 interner.intern（s_names[id] 是 parser 的 intern 池，
+                // 键统一用 interner.intern（ast.s_name(id) 是 parser 的 intern 池，
                 // 与 table_push 的 interner.intern(tname) 不同池，id 不可比）
                 tblvar_put(interner.intern(sstate.name_str(id)), tv_te)
 
@@ -361,14 +361,14 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_102_ExprStmt(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // ExprStmt。语句级宏（dev33 批次10 任务28）：`$body` 插值块形式 code
         // 值后，子节点可能是块形式 N_CODE_LIT（val=1）/嵌套 StmtList——
         // 按语句序列生成而非表达式。
         var e = sstate.child(id, 0)
         if e >= 0 {
-            var et = s_tags[e]
-            if et == 136 && s_vals[e] == 1 {
+            var et = ast.s_tag(e)
+            if et == 136 && ast.s_val(e) == 1 {
                 var inner = sstate.child(e, 0)
                 if inner >= 0 {
                     return tig_stmtlist_as_stmt(inner)
@@ -382,7 +382,7 @@ pub func tig_stmt_b_102_ExprStmt(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_130_S1(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // S1.2 U3 unsafe 块：语义层已校验块内操作合法（unsafe 上下文），
         // irgen 只遍历子 StmtList 生成（无额外安全检查）
         var blk = sstate.child(id, 0)
@@ -402,7 +402,7 @@ pub func tig_stmt_b_130_S1(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_104_Return(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // Return：children=[expr 或 -1]。ret 类型 = 表达式语义类型（i64/f64/
         // 聚合/字符串 ptr——曾硬编码 i64，元组/浮点返回会类型不匹配）。
         // BoolLit 适配 trit：返回 trit 的函数里 `return false/true` → i8
@@ -410,7 +410,7 @@ pub func tig_stmt_b_104_Return(id: i64) -> i64 {
         if v >= 0 {
             // p.6.1.7-RCA-2【2026-09-06】：tuple 返回含表元素 → 构造时对表元素 retain
             //（交给调用方），出口析构减回；先判 tuple 再求值（rty 须在 tig_expr 前）。
-            var vty = node_types[v]
+            var vty = ast.node_type(v)
         // p.9.12.6 边界：行池 table<R> 不能作函数返回值（无运行期值形态）
         if vty >= 0 && types.is_table(vty) {
             var tev = types.table_elem(vty)
@@ -424,9 +424,9 @@ pub func tig_stmt_b_104_Return(id: i64) -> i64 {
                 g_ret_tup_tbl = 1
             }
             var rv: i64 = -1
-            if s_tags[v] == 4 && g_cur_ret_ty == types.named(TK_TRIT) {
+            if ast.s_tag(v) == 4 && g_cur_ret_ty == types.named(TK_TRIT) {
                 var tv: i64 = -1
-                if s_vals[v] == 1 {
+                if ast.s_val(v) == 1 {
                     tv = 1
                 }
                 rv = tig_trit_lit(tv)
@@ -437,7 +437,7 @@ pub func tig_stmt_b_104_Return(id: i64) -> i64 {
             if rv < 0 {
                 return -1
             }
-            var rty = node_types[v]
+            var rty = ast.node_type(v)
             if rty < 0 {
                 rty = types.named(TK_I64)
             }
@@ -476,12 +476,12 @@ pub func tig_stmt_b_104_Return(id: i64) -> i64 {
             //  （ed25519 阶梯：divrem/mul/sub 各 ~200 次/步的 trim 结果全漏 → invmod
             //  120KB/次 → keygen 阶梯 800MB+ 主源）。
             var ret_needs_retain: bool = false
-            if s_tags[v] == 6 {
+            if ast.s_tag(v) == 6 {
                 ret_needs_retain = true
             }
-            if s_tags[v] == 15 {
+            if ast.s_tag(v) == 15 {
                 var bnode_v = sstate.child(v, 0)
-                if bnode_v >= 0 && node_types[bnode_v] >= 0 && types.kind(node_types[bnode_v]) == K_STRUCT {
+                if bnode_v >= 0 && ast.node_type(bnode_v) >= 0 && types.kind(ast.node_type(bnode_v)) == K_STRUCT {
                     ret_needs_retain = true
                 }
             }
@@ -539,7 +539,7 @@ pub func tig_stmt_b_104_Return(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_161(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         if g_gen_tbl < 0 {
             sm_err_msg = "yield 出现在非生成器上下文（函数 " + g_cur_fn_name + "）"
             return -1
@@ -555,7 +555,7 @@ pub func tig_stmt_b_161(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_105_If(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // If：children=[cond, then, else]
         var cond_nid = sstate.child(id, 0)
         var cond = tig_expr(cond_nid)
@@ -563,7 +563,7 @@ pub func tig_stmt_b_105_If(id: i64) -> i64 {
             return -1
         }
         // p.6.5.2：条件归一化 i1（`if x` x:i64 / 整型字面量 → icmp ne 0）
-        cond = tig_cond_to_bool(cond, node_types[cond_nid])
+        cond = tig_cond_to_bool(cond, ast.node_type(cond_nid))
         var then_blk = ir.new_block(g_cur_func, interner.intern("if.then"))
         var else_blk = ir.new_block(g_cur_func, interner.intern("if.else"))
         var merge_blk = ir.new_block(g_cur_func, interner.intern("if.merge"))
@@ -602,7 +602,7 @@ pub func tig_stmt_b_105_If(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_153_p(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // p.8.2.11 guard else 早退：children=[cond, else_list]，等价 if not(cond)
         // { else_list }。条件为真 → 继续（merge）；为假 → 进入 else 块（scheck
         // 已约束块尾为跳转，不会向 merge 落回）。
@@ -611,7 +611,7 @@ pub func tig_stmt_b_153_p(id: i64) -> i64 {
         if gcond < 0 {
             return -1
         }
-        gcond = tig_cond_to_bool(gcond, node_types[gcond_nid])
+        gcond = tig_cond_to_bool(gcond, ast.node_type(gcond_nid))
         var body_blk = ir.new_block(g_cur_func, interner.intern("guard.body"))
         var merge_blk = ir.new_block(g_cur_func, interner.intern("guard.merge"))
         var cbr = ir.new_inst(g_cur_block, 31, -1)
@@ -629,7 +629,7 @@ pub func tig_stmt_b_153_p(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_158_p(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // p.9.11.4 defer 资源释放：注册（非立即执行）。分配运行时标志 alloca 并
         // 立即置 true（= 已武装，仅当本 defer 语句所在路径执行时才为 true；被
         // 条件跳过/零迭代循环跳过的路径其标志未写入——边界裁决见报告），按
@@ -651,17 +651,17 @@ pub func tig_stmt_b_158_p(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_107_For(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // For：name=迭代变量, children=[iter, body]
         // 范围 0..N 最小集；表遍历 `for item in arr`（iter 为 Var 表变量）；
         // 字符串码点迭代 `for c in s.chars()`（dev33 批次4，iter 为 MethodCall）。
         var iter = sstate.child(id, 0)
         var body = sstate.child(id, 1)
         var iter_inclusive: bool = false
-        if s_tags[iter] == 11 && s_vals[iter] == 1 {
+        if ast.s_tag(iter) == 11 && ast.s_val(iter) == 1 {
             iter_inclusive = true
         }
-        var iter_tag = s_tags[iter]
+        var iter_tag = ast.s_tag(iter)
         if iter_tag == 18 {
             // 字符串码点迭代器 `.chars()`：走 UTF-8 码点步进循环
             if is_chars_method(iter) {
@@ -674,7 +674,7 @@ pub func tig_stmt_b_107_For(id: i64) -> i64 {
         }
         if iter_tag != 11 {
             // 拉取协议（2026-10-13 惰性流）：`fn() -> Option<T>` → 拉取循环
-            var itf = node_types[iter]
+            var itf = ast.node_type(iter)
             if itf >= 0 && types.is_fn(itf) && sinfer.fn_opt_elem(itf) >= 0 {
                 var fpp = tig_for_pull(id, iter, body, sinfer.fn_opt_elem(itf))
                 if fpp < 0 {
@@ -683,8 +683,8 @@ pub func tig_stmt_b_107_For(id: i64) -> i64 {
                 return 0
             }
             // p.9.11.16 迭代器协议对象（struct 实现 has_next/next）：先于表迭代
-            // 探测（语义层已登记 node_types[iter]；协议命中 → 方法调用循环）。
-            var itp = node_types[iter]
+            // 探测（语义层已登记 ast.node_type(iter)；协议命中 → 方法调用循环）。
+            var itp = ast.node_type(iter)
             if itp >= 0 && sinfer.iter_proto_elem(itp) >= 0 {
                 var fp = tig_for_iter(id, iter, body, itp)
                 if fp < 0 {
@@ -715,14 +715,14 @@ pub func tig_stmt_b_107_For(id: i64) -> i64 {
         ir.add_operand(sv, types.named(3), 2)
         ir.add_operand(sv, start, 0)
         ir.add_operand(sv, va, 0)
-        scope_put(s_names[id], va, types.named(3))
+        scope_put(ast.s_name(id), va, types.named(3))
         // cond/body/step/exit 块
         var cond_blk = ir.new_block(g_cur_func, interner.intern("for.cond"))
         var body_blk = ir.new_block(g_cur_func, interner.intern("for.body"))
         var step_blk = ir.new_block(g_cur_func, interner.intern("for.step"))
         var exit_blk = ir.new_block(g_cur_func, interner.intern("for.exit"))
         // 循环上下文：continue → step（自增后），break → exit
-        loop_push(s_aux[id], exit_blk, step_blk)
+        loop_push(ast.s_aux(id), exit_blk, step_blk)
         var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
         ir.add_operand(b0, cond_blk, 1)
         // cond 块：cur < end → body，否则 exit

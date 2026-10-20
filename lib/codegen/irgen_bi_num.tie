@@ -140,7 +140,7 @@ if nm == "char_code" {
     // r.1 复查修复：char_code(<char> 值) —— char 是 i32 标量码点，
     // 直接 zext i32→i64 返回；仅 string（ptr）走 UTF-8 首码点解码。
     // 此前把 char 值当 ptr 交给 s21_utf8_char_at → opt "i32 used as ptr"。
-    if node_types[cc_arg] == types.named(TK_CHAR) {
+    if ast.node_type(cc_arg) == types.named(TK_CHAR) {
         g_builtin_res = s21_zext(v, types.named(TK_CHAR))
         return 0
     }
@@ -231,7 +231,7 @@ if nm == "str_from_code" {
         return -1
     }
     // 窄整数（trit/char/i8/i16/i32 等）先 sext 到 i64（s21 编码期望 i64）
-    var vt = node_types[call_arg(id, 0)]
+    var vt = ast.node_type(call_arg(id, 0))
     var sv = v
     if vt >= 0 && vt != types.named(TK_I64) && vt != types.named(TK_U64) {
         var se = tig_sext(v, vt, types.named(TK_I64))

@@ -35,7 +35,7 @@ func tig_for_chars(id: i64, iter: i64, body: i64) -> i64 {
     var body_blk = ir.new_block(g_cur_func, interner.intern("for.body"))
     var step_blk = ir.new_block(g_cur_func, interner.intern("for.step"))
     var exit_blk = ir.new_block(g_cur_func, interner.intern("for.exit"))
-    loop_push(s_aux[id], exit_blk, step_blk)
+    loop_push(ast.s_aux(id), exit_blk, step_blk)
     var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
     ir.add_operand(b0, cond_blk, 1)
     // cond 块：pos < byte_len(s) → body，否则 exit
@@ -66,7 +66,7 @@ func tig_for_chars(id: i64, iter: i64, body: i64) -> i64 {
     ir.add_operand(ist, types.named(TK_STR), 2)
     ir.add_operand(ist, ch, 0)
     ir.add_operand(ist, item_ptr, 0)
-    scope_put(s_names[id], item_ptr, types.named(TK_STR))
+    scope_put(ast.s_name(id), item_ptr, types.named(TK_STR))
     var bb = tig_block_stmts(body)
     if bb < 0 {
         return -1
@@ -197,7 +197,7 @@ func tig_for_iter(id: i64, iter: i64, body: i64, it_ty: i64) -> i64 {
     var cond_blk = ir.new_block(g_cur_func, interner.intern("for.cond"))
     var body_blk = ir.new_block(g_cur_func, interner.intern("for.body"))
     var exit_blk = ir.new_block(g_cur_func, interner.intern("for.exit"))
-    loop_push(s_aux[id], exit_blk, cond_blk)   // continue → cond（重查 has_next）
+    loop_push(ast.s_aux(id), exit_blk, cond_blk)   // continue → cond（重查 has_next）
     var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
     ir.add_operand(b0, cond_blk, 1)
     // cond 块：has_next() → body，否则 exit
@@ -220,7 +220,7 @@ func tig_for_iter(id: i64, iter: i64, body: i64, it_ty: i64) -> i64 {
     ir.add_operand(ist, elem_llvm, 2)
     ir.add_operand(ist, nx, 0)
     ir.add_operand(ist, item_ptr, 0)
-    scope_put(s_names[id], item_ptr, elem_llvm)
+    scope_put(ast.s_name(id), item_ptr, elem_llvm)
     var bb = tig_block_stmts(body)
     if bb < 0 {
         return -1
@@ -247,7 +247,7 @@ func tig_for_iter(id: i64, iter: i64, body: i64, it_ty: i64) -> i64 {
 // 骨架对齐 tig_for_iter；间接调用（opcode 70）发射对齐 tig_call_indirect。
 func tig_for_pull(id: i64, iter: i64, body: i64, elem_ty: i64) -> i64 {
     var T64 = types.named(TK_I64)
-    var fty = node_types[iter]
+    var fty = ast.node_type(iter)
     var fv = tig_expr(iter)
     if fv < 0 {
         return -1
@@ -278,7 +278,7 @@ func tig_for_pull(id: i64, iter: i64, body: i64, elem_ty: i64) -> i64 {
     var cond_blk = ir.new_block(g_cur_func, interner.intern("fp.cond"))
     var body_blk = ir.new_block(g_cur_func, interner.intern("fp.body"))
     var exit_blk = ir.new_block(g_cur_func, interner.intern("fp.exit"))
-    loop_push(s_aux[id], exit_blk, cond_blk)
+    loop_push(ast.s_aux(id), exit_blk, cond_blk)
     var b0 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b0, cond_blk, 1)
     g_cur_block = cond_blk
@@ -369,13 +369,13 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
     }
     // 元素类型判定优先级：
     //   1. iter 变量的作用域完整类型（table<T> → table_elem）
-    //   2. node_types[iter] 的表元素类型（语义推导）
+    //   2. ast.node_type(iter) 的表元素类型（语义推导）
     //   3. sinfer.var_table_elem（语义层动态表登记）
     //   4. body 中循环变量引用节点的语义类型（for f in entries 里 println(f) 推断）
     //   5. 兜底 i64
     var elem: i64 = types.named(TK_I64)
     var matched: bool = false
-    if s_tags[iter] == 6 {
+    if ast.s_tag(iter) == 6 {
         var bname = interner.intern(sstate.name_str(iter))
         if scope_get(bname) >= 0 && types.is_table(g_lookup_ty) {
             var le = types.table_elem(g_lookup_ty)
@@ -385,7 +385,7 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
             }
         }
         if !matched {
-            var bt2 = node_types[iter]
+            var bt2 = ast.node_type(iter)
             if types.is_table(bt2) {
                 var le2 = types.table_elem(bt2)
                 if le2 > 0 {
@@ -402,7 +402,7 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
             }
         }
     } else {
-        var bt = node_types[iter]
+        var bt = ast.node_type(iter)
         if types.is_table(bt) {
             var le2 = types.table_elem(bt)
             if le2 > 0 {
@@ -422,7 +422,7 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
             var refs = find_var_refs(st0, var_nm)
             var ri: i64 = 0
             while ri < len(refs) {
-                var rt = node_types[refs[ri]]
+                var rt = ast.node_type(refs[ri])
                 if rt >= 0 && (rt == types.named(TK_STR) || types.is_int(rt) ||
                     types.is_float(rt) || types.is_bool_like(rt)) {
                     elem = rt
@@ -471,7 +471,7 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
     var body_blk = ir.new_block(g_cur_func, interner.intern("for.body"))
     var step_blk = ir.new_block(g_cur_func, interner.intern("for.step"))
     var exit_blk = ir.new_block(g_cur_func, interner.intern("for.exit"))
-    loop_push(s_aux[id], exit_blk, step_blk)
+    loop_push(ast.s_aux(id), exit_blk, step_blk)
     var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
     ir.add_operand(b0, cond_blk, 1)
     // cond 块：cur >= len(t) → exit
@@ -507,7 +507,7 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
     ir.add_operand(ist, elem_llvm_ty, 2)
     ir.add_operand(ist, iv, 0)
     ir.add_operand(ist, item_ptr, 0)
-    scope_put(s_names[id], item_ptr, elem_llvm_ty)
+    scope_put(ast.s_name(id), item_ptr, elem_llvm_ty)
     var bb = tig_block_stmts(body)
     if bb < 0 {
         return -1
@@ -544,7 +544,7 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
 }
 
 // 语句树中查找变量引用节点（tag 6，名池 id == target）：返回节点 id 表。
-// tig_for_table 用它推断循环变量元素类型（body 里 println(f) → node_types[f]）
+// tig_for_table 用它推断循环变量元素类型（body 里 println(f) → ast.node_type(f)）
 func find_var_refs(st: i64, target: i64) -> table<i64> {
     var out = table_new_i64()
     collect_var_refs(st, target, out)
@@ -556,7 +556,7 @@ func collect_var_refs(st: i64, target: i64, ref out: table<i64>) {
     if st < 0 {
         return
     }
-    if s_tags[st] == 6 && s_names[st] == target {
+    if ast.s_tag(st) == 6 && ast.s_name(st) == target {
         table_push(out, st)
         return  // 变量节点是叶子
     }
@@ -612,20 +612,20 @@ func sb_remove(nid: i64) {
 }
 
 // val 是否为 `out + ...` 自加形态：B_ADD(0) 左链，最左叶子 = Var(out)，
-// node_types[val] == TK_STR（字符串拼接）。
+// ast.node_type(val) == TK_STR（字符串拼接）。
 func sb_is_self_add(val: i64, nid: i64) -> bool {
     if val < 0 {
         return false
     }
-    if node_types[val] != types.named(TK_STR) {
+    if ast.node_type(val) != types.named(TK_STR) {
         return false
     }
     var cur = val
-    while s_tags[cur] == 9 && s_vals[cur] == 0 {  // N_BINARY + B_ADD
+    while ast.s_tag(cur) == 9 && ast.s_val(cur) == 0 {  // N_BINARY + B_ADD
         var lhs = sstate.child(cur, 0)
         cur = lhs
     }
-    return s_tags[cur] == 6 && s_names[cur] == nid
+    return ast.s_tag(cur) == 6 && ast.s_name(cur) == nid
 }
 
 // 提取自加 RHS 的段节点（`out + a + b + c` → [a, b, c]，顺序正序；
@@ -634,14 +634,14 @@ func sb_split_segs(val: i64, nid: i64) -> table<i64> {
     var rev = table_new_i64()
     var cur = val
     var depth: i64 = 0
-    while s_tags[cur] == 9 && s_vals[cur] == 0 && depth < 64 {
+    while ast.s_tag(cur) == 9 && ast.s_val(cur) == 0 && depth < 64 {
         var lhs = sstate.child(cur, 0)
         var rhs = sstate.child(cur, 1)
         table_push(rev, rhs)
         depth = depth + 1
         cur = lhs
     }
-    if s_tags[cur] != 6 || s_names[cur] != nid {
+    if ast.s_tag(cur) != 6 || ast.s_name(cur) != nid {
         var empty = table_new_i64()
         return empty
     }
@@ -659,10 +659,10 @@ func sb_collect(st: i64, ref legal: table<i64>, ref nids: table<i64>) {
     if st < 0 {
         return
     }
-    if s_tags[st] == 144 {  // goto：逃出循环 → 全局禁提升（调用方查 goflag）
+    if ast.s_tag(st) == 144 {  // goto：逃出循环 → 全局禁提升（调用方查 goflag）
         return
     }
-    if s_tags[st] == 103 {  // N_ASSIGN
+    if ast.s_tag(st) == 103 {  // N_ASSIGN
         var nm = sstate.name_str(st)
         if str_len(nm) > 0 {
             var nid = interner.intern(nm)
@@ -693,10 +693,10 @@ func sb_left_leaf(val: i64) -> i64 {
         return -1
     }
     var cur = val
-    while s_tags[cur] == 9 && s_vals[cur] == 0 {
+    while ast.s_tag(cur) == 9 && ast.s_val(cur) == 0 {
         cur = sstate.child(cur, 0)
     }
-    if s_tags[cur] == 6 {
+    if ast.s_tag(cur) == 6 {
         return cur
     }
     return -1
@@ -766,10 +766,10 @@ func collect_other_writes(st: i64, ref w_nid: table<i64>, ref w_has: table<i64>)
     if st < 0 {
         return
     }
-    if s_tags[st] == 144 {
+    if ast.s_tag(st) == 144 {
         return
     }
-    if s_tags[st] == 103 {
+    if ast.s_tag(st) == 103 {
         var nm = sstate.name_str(st)
         if str_len(nm) > 0 {
             var nid = interner.intern(nm)
@@ -787,16 +787,16 @@ func collect_other_writes(st: i64, ref w_nid: table<i64>, ref w_has: table<i64>)
         return
     }
     // 其它写目标：下标赋值 N_INDEX_ASSIGN / 字段赋值 N_FIELD_ASSIGN 也归为写
-    if s_tags[st] == 104 || s_tags[st] == 115 {  // N_INDEX_ASSIGN / N_FIELD_ASSIGN
+    if ast.s_tag(st) == 104 || ast.s_tag(st) == 115 {  // N_INDEX_ASSIGN / N_FIELD_ASSIGN
         var wbase = sstate.child(st, 0)
-        // ★ 显式守卫：`child()` 缺子节点时会给 **-1**，而 `s_tags[-1]`/`s_names[-1]`
+        // ★ 显式守卫：`child()` 缺子节点时会给 **-1**，而 `ast.s_tag(-1)`/`ast.s_name(-1)`
         //   会读到表头前的分配器元数据（`tbl_at` 的 `i < len` 对负数恒真 ⇒ 堆下读）。
         //   实测 `--check-bounds` 在此处报 `OOB irgen::collect_other_writes
         //   [s_tags] line 677 idx -1`，**一个编译过程触发 76 次**（每次编译都要走
         //   全函数写目标收集）。原先靠越界读返回「某个值」——若该值恰为 6
         //   （N_VAR），本分支会被**误判为真**并把垃圾 nid 当成写目标登记。
-        if wbase >= 0 && s_tags[wbase] == 6 {
-            var nid2 = s_names[wbase]
+        if wbase >= 0 && ast.s_tag(wbase) == 6 {
+            var nid2 = ast.s_name(wbase)
             var wi2 = linear_find(w_nid, nid2)
             if wi2 < 0 {
                 table_push(w_nid, nid2)
@@ -830,7 +830,7 @@ func scan_goto(st: i64) -> bool {
     if st < 0 {
         return false
     }
-    if s_tags[st] == 144 {
+    if ast.s_tag(st) == 144 {
         return true
     }
     var n = sstate.nchild(st)

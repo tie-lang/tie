@@ -10,7 +10,7 @@ func tig_checked(nm: string, id: i64) -> i64 {
     if a < 0 {
         return -1
     }
-    var at = node_types[call_arg(id, 0)]
+    var at = ast.node_type(call_arg(id, 0))
     if !types.is_int(at) {
         sm_err_msg = nm + "() 参数必须是整数（函数 " + g_cur_fn_name + "）"
         return -1
@@ -23,13 +23,13 @@ func tig_checked(nm: string, id: i64) -> i64 {
         if b < 0 {
             return -1
         }
-        var bty = node_types[call_arg(id, 1)]
+        var bty = ast.node_type(call_arg(id, 1))
         if stype.int_width(bty) > stype.int_width(at) {
             bt = bty
         }
     }
     var signed = stype.is_signed(at)
-    var agg = node_types[id]  // 语义层已登记 (T, bool)
+    var agg = ast.node_type(id)  // 语义层已登记 (T, bool)
     var ovf: i64 = -1
     var val: i64 = -1
     if nm == "checked_add" {
@@ -376,7 +376,7 @@ func tig_tuple_compare(op: i64, lhs: i64, rhs: i64, lv: i64, rv: i64) -> i64 {
         sm_err_msg = "元组仅支持 ==/!= 比较（函数 " + g_cur_fn_name + "）"
         return -1
     }
-    var agg = node_types[lhs]
+    var agg = ast.node_type(lhs)
     if types.kind(agg) != K_TUPLE {
         sm_err_msg = "元组比较目标不是元组（函数 " + g_cur_fn_name + "）"
         return -1
@@ -406,7 +406,7 @@ func tig_tuple_compare(op: i64, lhs: i64, rhs: i64, lv: i64, rv: i64) -> i64 {
 // 聚合比较操作数地址：Var → 槽地址（tig_agg_addr，不重复求值）；
 // 表达式 → 已求值值落内存（agg_val_to_addr）。
 func tig_agg_operand_addr(node: i64, pre_val: i64, agg: i64) -> i64 {
-    if s_tags[node] == 6 {
+    if ast.s_tag(node) == 6 {
         return tig_agg_addr(node, agg)
     }
     return agg_val_to_addr(pre_val, agg)

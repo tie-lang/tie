@@ -122,7 +122,7 @@ func global_init_fold(id: i64) -> (bool, bool, bool, i64, i64) {
     if id < 0 {
         return (false, false, false, 0, -1)
     }
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
     if tag == S_N_VAR {
         // p.9.12.1：跨全局引用折叠。`var B = A + "..."/A` 中 A 是先前定义的
         // 标量全局（字符串/整型/浮点）——解析其已折叠初值，使 B 正确继承而非
@@ -142,27 +142,27 @@ func global_init_fold(id: i64) -> (bool, bool, bool, i64, i64) {
     }
     if tag == 0 {
         // INT_LIT
-        return (true, false, false, s_vals[id], -1)
+        return (true, false, false, ast.s_val(id), -1)
     }
     if tag == 1 {
         // FLOAT_LIT（r.1.1.2）：浮点字面量原文（lexeme 存池，无引号）
-        return (true, false, true, 0, s_names[id])
+        return (true, false, true, 0, ast.s_name(id))
     }
     if tag == 2 {
         // STR_LIT：名称 id 存 s_names，先解码（去引号 + 反转义，与 tig_str_lit 一致）
-        return (true, true, false, 0, str_unescape_quoted(s_names[id]))
+        return (true, true, false, 0, str_unescape_quoted(ast.s_name(id)))
     }
     if tag == 3 {
         // CHAR_LIT（r.1.1.2）：码点
-        return (true, false, false, fold_char_code(s_names[id]), -1)
+        return (true, false, false, fold_char_code(ast.s_name(id)), -1)
     }
     if tag == 4 {
         // BOOL_LIT（r.1.1.2）：0/1
-        return (true, false, false, s_vals[id], -1)
+        return (true, false, false, ast.s_val(id), -1)
     }
     if tag == 8 {
         // UNARY：取负（op=0）与整数按位取反（U_BIT_NOT=6）。
-        var op = s_vals[id]
+        var op = ast.s_val(id)
         if op == 0 {
             var (h, hs, hf, iv, sid2) = global_init_fold(sstate.child(id, 0))
             if h && hs == false {
@@ -182,7 +182,7 @@ func global_init_fold(id: i64) -> (bool, bool, bool, i64, i64) {
     }
     if tag == 9 {
         // BINARY：op 在 s_vals；string 加法（B_ADD=0）双目折叠
-        var op2 = s_vals[id]
+        var op2 = ast.s_val(id)
         var (l1, ls1, lf1, li1, lsd1) = global_init_fold(sstate.child(id, 0))
         var (l2, ls2, lf2, li2, lsd2) = global_init_fold(sstate.child(id, 1))
         if l1 && l2 {
@@ -389,7 +389,7 @@ func tig_global_var(s: i64, full: string) -> i64 {
         llvmgen.global_table_reg(nm)
         // r.1.1.3：非空表字面量初值 → 记录，main 入口创建后整体构造（逐元素 push）
         var ginit = sstate.child(s, 1)
-        if ginit >= 0 && s_tags[ginit] == S_N_TABLE_LIT && sstate.nchild(ginit) > 0 {
+        if ginit >= 0 && ast.s_tag(ginit) == S_N_TABLE_LIT && sstate.nchild(ginit) > 0 {
             table_push(g_ginit_names, intern.intern(nm))
             table_push(g_ginit_nodes, ginit)
         }
@@ -429,7 +429,7 @@ func tig_global_var(s: i64, full: string) -> i64 {
 // ns_node 为 N_NAMESPACE 节点：children=[Segment...]+[体 StmtList]。
 func tig_ns(ns_node: i64, prefix: string) -> i64 {
     var segs: table<string> = table_new_string()
-    var nseg = s_aux[ns_node]
+    var nseg = ast.s_aux(ns_node)
     var k: i64 = 0
     while k < nseg {
         var seg = sstate.child(ns_node, k)
@@ -452,7 +452,7 @@ func tig_ns(ns_node: i64, prefix: string) -> i64 {
     var i: i64 = 0
     while i < nb {
         var st = sstate.child(body, i)
-        var tag = s_tags[st]
+        var tag = ast.s_tag(st)
         if tag == 101 {
             var r = tig_fn_def(st, full_pre)
             if r < 0 {
@@ -531,7 +531,7 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
     // 语义层已把模板登记进 gt_* 表并跳过普通函数检查；此处对称跳过生成。
     if sstate.nchild(fn_node) > 0 {
         var slot0 = sstate.child(fn_node, 0)
-        if slot0 >= 0 && s_tags[slot0] == S_N_TYPE_PARAMS {
+        if slot0 >= 0 && ast.s_tag(slot0) == S_N_TYPE_PARAMS {
             return 0
         }
     }
@@ -586,7 +586,7 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
     g_sb_hv = table_new_i64()
     g_cbs_keys = table_new_i64()
     g_cbs_acc = table_new_i64()
-    var nparams = s_aux[fn_node]
+    var nparams = ast.s_aux(fn_node)
     // 返回类型：children[slot_off]（新布局 children[0]=泛型槽→偏移 1；
     // 旧布局无槽→children[0]=返回类型。slot_off 统一判定保证自举双兼容）
     var ret_ty = sgen.parse_generic_type_node(sstate.child(fn_node, sstate.slot_off(fn_node)))
@@ -612,7 +612,7 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
     // 供 llvmgen 在动态库模式输出 dllexport；动态库模式下对导出函数做边界检查。
     var is_pub: i64 = 1
     if prefix != "" {
-        is_pub = s_vals[fn_node] & 1
+        is_pub = ast.s_val(fn_node) & 1
     }
     // --dll-export 白名单（空 = 不过滤）：只导出名单内的函数（导出名 "ns$fn" 精确匹配）
     if g_dynlib && is_pub == 1 && str_len(g_dll_export) > 0 {
@@ -680,7 +680,7 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
     ir.func_export_set(fid, is_pub)
     // p.9.11.10 inline fn：N_FN_DEF val bit5 = is_inline（parser 已登记）。llvmgen
     // gen_func 读 ir.func_inline 在 define 头附加 alwaysinline 属性。
-    ir.func_inline_set(fid, (s_vals[fn_node] >> 5) & 1)
+    ir.func_inline_set(fid, (ast.s_val(fn_node) >> 5) & 1)
     g_cur_func = fid
     var entry = ir.new_block(fid, interner.intern("entry"))
     g_entry_block = entry     // p.6.10.3：entry 级表变量析构候选登记用
@@ -740,13 +740,13 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
         //   · `ref` 形参（bit0）——可写借用的定义就是「写回调用方」⇒ 必须跳过，
         //     否则分离后写只落在本地副本，借用语义失效。
         //   · `shared` 形参（bit5）——显式共享、零拷贝就地改。
-        if (s_vals[p] & 1) != 0 || (s_vals[p] & 32) != 0 {
+        if (ast.s_val(p) & 1) != 0 || (ast.s_val(p) & 32) != 0 {
             table_push(g_shared_param_nids, interner.intern(pname))
         }
         // r.1.6.11 `deep` 形参：入口对表字段做值语义分离（rc>1 才克隆，rc=1 零成本）。
         // N_PARAM val bit4 = deep（parser 登记）。by_ref 形参的 av 是**实参槽地址**，
         // 对它 seal 会改到调用方，故只对按值形参做（deep 与 ref 本应互斥）。
-        if (s_vals[p] & 16) != 0 && is_ref == 0 {
+        if (ast.s_val(p) & 16) != 0 && is_ref == 0 {
             var sev = tig_deep_param_seal(av, pty)
             if sev < 0 {
                 return -1
@@ -757,7 +757,7 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
         // 于是 callee 内的写触发 COW 分离（rc=2 ⇒ 克隆），调用方不受影响；
         // `shared` 形参跳过（纯借用 + 就地改，这就是它的高性能语义）。
         // 默认（开关关）整段不发射 ⇒ 逐指令等价。
-        if tbl_value_on() && is_ref == 0 && (s_vals[p] & 32) == 0 &&
+        if tbl_value_on() && is_ref == 0 && (ast.s_val(p) & 32) == 0 &&
             types.is_table(pty) && pty != types.named(TK_ANY) {
             var pv0 = s21_load(av, types.named(TK_STR))
             tig_tbl_retain_call(pv0)
@@ -840,13 +840,13 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
         tig_tbl_exit_release()
     }
     // 末尾补 ret：main → ret i32 0（void main）；其余 void → ret void
-    if s_tags[body] == 122 {
+    if ast.s_tag(body) == 122 {
         var has_ret = false
         // 简化：检查最后一条语句是否 Return
         var nb = sstate.nchild(body)
         if nb > 0 {
             var last = sstate.child(body, nb - 1)
-            if s_tags[last] == 104 {
+            if ast.s_tag(last) == 104 {
                 has_ret = true
             }
         }

@@ -57,7 +57,7 @@ namespace irgen {
             if av < 0 {
                 return -1
             }
-            var at = node_types[call_arg(id, 0)]
+            var at = ast.node_type(call_arg(id, 0))
             // p.9.0-S.8 三族职责收口（对齐规范 §2.11）：
             //   to_* 只做**数值类型转换**（参数必须是数值）；
             //   as_* 只做**从 any 解包**（参数必须是 any）。
@@ -69,8 +69,8 @@ namespace irgen {
                 nm == "to_f32" || nm == "to_f64"
             if at == types.named(TK_ANY) {
                 if is_num_conv {
-                    sm_err_line = s_lines[id]
-                    sm_err_col = s_cols[id]
+                    sm_err_line = ast.s_line(id)
+                    sm_err_col = ast.s_col(id)
                     sm_err_msg = nm + "() 是数值类型转换，不接受 any；从 any 解包请用 as_ 族"
                     return -1
                 }
@@ -89,22 +89,22 @@ namespace irgen {
             // IR 非法，opt 报 `defined with type 'ptr' but expected 'i64'`（E00883）。
             if at == types.named(TK_STR) {
                 if nm == "to_i64" || nm == "to_f64" {
-                    var pv = tig_str_num_checked(av, nm == "to_f64", nm, s_lines[id])
+                    var pv = tig_str_num_checked(av, nm == "to_f64", nm, ast.s_line(id))
                     if pv < 0 {
                         return -1
                     }
                     g_builtin_res = pv
                     return 0
                 }
-                sm_err_line = s_lines[id]
-                sm_err_col = s_cols[id]
+                sm_err_line = ast.s_line(id)
+                sm_err_col = ast.s_col(id)
                 sm_err_msg = nm + "() 不接受文本实参；文本解析只有 to_i64 / to_f64，窄化请显式嵌套"
                 return -1
             }
             if at >= 0 && (types.is_int(at) || types.is_float(at)) {
                 if !is_num_conv {
-                    sm_err_line = s_lines[id]
-                    sm_err_col = s_cols[id]
+                    sm_err_line = ast.s_line(id)
+                    sm_err_col = ast.s_col(id)
                     sm_err_msg = nm + "() 只做从 any 解包；数值类型转换请用 to_ 族（如 to_i64）"
                     return -1
                 }
@@ -134,8 +134,8 @@ namespace irgen {
             // 其余具体类型（bool/char/trit/struct/table/slice/fn/…）：表示宽度不是
             // i64/f64，直通必然产出宽度不匹配的 store。此前正是静默直通 ⇒ 用户只
             // 看到 clang 的 E00883，指不到源码行；这里改为明确诊断。
-            sm_err_line = s_lines[id]
-            sm_err_col = s_cols[id]
+            sm_err_line = ast.s_line(id)
+            sm_err_col = ast.s_col(id)
             sm_err_msg = nm + "() 的参数必须是数值，实际为 " + types.type_name(at)
             return -1
         }
@@ -200,7 +200,7 @@ namespace irgen {
                 if h < 0 {
                     return -1
                 }
-                var ht = node_types[call_arg(id, 0)]
+                var ht = ast.node_type(call_arg(id, 0))
                 if ht != types.named(TK_I64) && ht != types.named(TK_U64) && ht >= 0 {
                     var sh = tig_sext(h, ht, types.named(TK_I64))
                     if sh < 0 {
@@ -241,7 +241,7 @@ namespace irgen {
                     return -1
                 }
                 if pat[k] == "i" {
-                    var vt = node_types[a]
+                    var vt = ast.node_type(a)
                     if vt != types.named(TK_I64) && vt != types.named(TK_U64) && vt >= 0 {
                         var sv = tig_sext(v, vt, types.named(TK_I64))
                         if sv < 0 {
@@ -309,7 +309,7 @@ namespace irgen {
                 if av < 0 {
                     return -1
                 }
-                var at = node_types[anode]
+                var at = ast.node_type(anode)
                 if at == types.named(TK_STR) {
                     // 字符串实参：按 TK_STR 传（llvmgen 渲染 ptr <ref> = const char*），
                     // 零拷贝直传 tie 字符串数据指针（{ptr,len} 布局 + 尾 NUL 兼容 C）

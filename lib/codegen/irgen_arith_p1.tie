@@ -15,7 +15,7 @@ func tig_arrow(op: i64, lhs: i64, rhs: i64) -> i64 {
         data_n = rhs
         tgt_n = lhs
     }
-    var tgt_ty = node_types[tgt_n]
+    var tgt_ty = ast.node_type(tgt_n)
     if tgt_ty >= 0 && types.is_fn(tgt_ty) {
         // 传参：f(data)
         var fv = tig_expr(tgt_n)
@@ -48,7 +48,7 @@ func tig_arrow(op: i64, lhs: i64, rhs: i64) -> i64 {
         return -1
     }
     // S1.3 数字族转换（对齐 N_ASSIGN 的 C2/C3）
-    var vty = node_types[data_n]
+    var vty = ast.node_type(data_n)
     if vty >= 0 && (types.is_int(vty) || types.is_float(vty)) &&
         (types.is_int(tgt_ty2) || types.is_float(tgt_ty2)) && vty != tgt_ty2 {
         var cv = tig_coerce(dv2, vty, tgt_ty2)
@@ -116,8 +116,8 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     // p.8.2.4 运算符重载：任一操作数为用户 struct 且声明对应 op_ 方法 → 发射方法调用
     //（调度规则与 sinfer.try_op_overload_binary 一致：左 struct 优先，其次右，两侧内置绝不）。
     if op >= 0 && op <= 10 {
-        var olhs_t = node_types[lhs]
-        var orhs_t = node_types[rhs]
+        var olhs_t = ast.node_type(lhs)
+        var orhs_t = ast.node_type(rhs)
         if olhs_t >= 0 && types.kind(olhs_t) == K_STRUCT {
             var of = op_method_full_ir(olhs_t, op, 1)
             if of != "" {
@@ -137,8 +137,8 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     }
     // trit 判定先行（对齐 Rust tig_binary 分派顺序）：trit 的 &&/|| 是 Kleene
     // min/max（非短路），混合 trit×i64 走 gen_binary_trit——短路分支只服务 bool
-    var lhs_t = node_types[lhs]
-    var rhs_t = node_types[rhs]
+    var lhs_t = ast.node_type(lhs)
+    var rhs_t = ast.node_type(rhs)
     if lhs_t == types.named(TK_TRIT) || rhs_t == types.named(TK_TRIT) {
         var lv0 = tig_expr(lhs)
         if lv0 < 0 {
@@ -171,7 +171,7 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     //   （不是崩溃也不是陷阱：rc=124 超时）⇒ 比崩溃更难排查。`10 / 2` 正常。
     //   判据「除数 == 0」对有无符号一致；放这里可同时覆盖窄整数与 i64 两条路径。
     if (op == 3 || op == 4 || op == 24 || op == 26) && tig_cb_target() == 1 {
-        if tig_div_zero_check(rv, node_types[rhs]) < 0 {
+        if tig_div_zero_check(rv, ast.node_type(rhs)) < 0 {
             return -1
         }
     }
@@ -285,10 +285,10 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     if types.is_int(lhs_t) && types.is_int(rhs_t) &&
         (lhs_t != types.named(TK_I64) || rhs_t != types.named(TK_I64)) {
         var common = lhs_t
-        var l_lit = s_tags[lhs] == 0
-        var r_lit = s_tags[rhs] == 0
+        var l_lit = ast.s_tag(lhs) == 0
+        var r_lit = ast.s_tag(rhs) == 0
         if l_lit && !r_lit {
-            if lit_in_range_irgen(s_vals[lhs], rhs_t) {
+            if lit_in_range_irgen(ast.s_val(lhs), rhs_t) {
                 common = rhs_t
             } else if stype.int_width(rhs_t) > stype.int_width(lhs_t) {
                 common = rhs_t
@@ -296,7 +296,7 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
                 common = lhs_t
             }
         } else if r_lit && !l_lit {
-            if lit_in_range_irgen(s_vals[rhs], lhs_t) {
+            if lit_in_range_irgen(ast.s_val(rhs), lhs_t) {
                 common = lhs_t
             } else if stype.int_width(lhs_t) > stype.int_width(rhs_t) {
                 common = lhs_t

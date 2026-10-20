@@ -80,9 +80,9 @@ func tig_ptr_tuple_ty(n: i64) -> i64 {
 //   vtable = 全局常量 @vt.<port>.<struct>（llvmgen 已登记）
 //   打包 = malloc(16) + 两字段 store；返回打包对象指针（port 对象 = ptr）。
 // 生命周期归 arena/unsafe（调用方保证：被提升对象存活 ≥ 接口对象使用时间）。
-// init 为 struct 类型表达式（node_types[init] = K_STRUCT，语义层已校验 impl）。
+// init 为 struct 类型表达式（ast.node_type(init) = K_STRUCT，语义层已校验 impl）。
 func tig_port_coerce(init: i64, port_ty: i64) -> i64 {
-    var s_ty = node_types[init]
+    var s_ty = ast.node_type(init)
     if s_ty < 0 {
         sm_err_msg = "提升操作数类型缺失（函数 " + g_cur_fn_name + "）"
         return -1

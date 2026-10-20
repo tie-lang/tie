@@ -41,17 +41,17 @@ func enum_variant_tag(ei: i64, vname: string) -> i64 {
 func enum_case_tag(pat: i64, subj_ty: i64) -> i64 {
     var ei = types.low(subj_ty)
     // 批次 7：N_CASE_BIND（`case Ok(v)` 解构）→ 取其变体引用子节点
-    if s_tags[pat] == N_CASE_BIND {
+    if ast.s_tag(pat) == N_CASE_BIND {
         pat = sstate.child(pat, 0)
     }
     // 变体引用：FieldAccess（Enum.Variant）或裸 Var（Variant，枚举名取 subject）
-    if s_tags[pat] != 15 && s_tags[pat] != 6 {
+    if ast.s_tag(pat) != 15 && ast.s_tag(pat) != 6 {
         return -1  // 非变体引用（scheck 已拦截，防御）
     }
     var bname = ""
-    if s_tags[pat] == 15 {
+    if ast.s_tag(pat) == 15 {
         var base = sstate.child(pat, 0)
-        if s_tags[base] != 6 {
+        if ast.s_tag(base) != 6 {
             return -1  // base 非 Var（scheck 已拦截，防御）
         }
         bname = sstate.name_str(base)
@@ -200,7 +200,7 @@ func tig_with(id: i64) -> i64 {
     var T64 = types.named(TK_I64)
     // p.9.11.33：基为 struct → 结构体不可变更新（须在 tig_expr(base) 之前
     // 分派——struct 路径走 tig_agg_addr 取槽，避免非 Var 基表达式双重发射）
-    var bt0 = node_types[base]
+    var bt0 = ast.node_type(base)
     if types.kind(bt0) == K_STRUCT {
         return tig_with_struct(id, base, upd, bt0)
     }
@@ -210,7 +210,7 @@ func tig_with(id: i64) -> i64 {
     }
     // 值类型与槽类型：map 值类型（table_elem）；字符串/表/映射/端口 → ptr 槽
     var vty: i64 = types.named(TK_I64)
-    var bt = node_types[base]
+    var bt = ast.node_type(base)
     if types.is_map(bt) || types.is_table(bt) {
         var le = types.table_elem(bt)
         if le > 0 {
@@ -302,7 +302,7 @@ func tig_with(id: i64) -> i64 {
             return -1
         }
         if is_any {
-            var vt3 = node_types[val]
+            var vt3 = ast.node_type(val)
             var sv: i64 = vv
             if vt3 >= 0 && vt3 != types.named(TK_ANY) {
                 var bx = tig_box_any(vv, vt3)
@@ -371,8 +371,8 @@ func tig_with_struct(id: i64, base: i64, upd: i64, bt: i64) -> i64 {
         var fname = sstate.name_str(cid)
         var fidx = agg_field_index(bt, fname)
         if fidx < 0 {
-            sm_err_line = s_lines[id]
-            sm_err_col = s_cols[id]
+            sm_err_line = ast.s_line(id)
+            sm_err_col = ast.s_col(id)
             sm_err_msg = "struct 字段 '" + fname + "' 未定义（with 覆盖，函数 " + g_cur_fn_name + "）"
             return -1
         }
@@ -382,7 +382,7 @@ func tig_with_struct(id: i64, base: i64, upd: i64, bt: i64) -> i64 {
         if vv < 0 {
             return -1
         }
-        var vt = node_types[val]
+        var vt = ast.node_type(val)
         if vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
             (types.is_int(fty) || types.is_float(fty)) && vt != fty {
             var cv = tig_coerce(vv, vt, fty)
@@ -447,7 +447,7 @@ func tig_slice(id: i64) -> i64 {
     var s1 = sstate.child(id, 1)
     var s2 = sstate.child(id, 2)
     var T64 = types.named(TK_I64)
-    var base_ty = node_types[base]
+    var base_ty = ast.node_type(base)
     if base_ty == types.named(TK_STR) {
         // 字符串字节子串（str_sub_bytes 已内建 clamp；end 缺省 + 大数钳到 len）
         var vs = tig_expr(base)
@@ -562,8 +562,8 @@ func tig_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
     var ename = types.enum_name_of(ei)
     var tag = enum_variant_tag(ei, vname)
     if tag < 0 {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "枚举 '" + ename + "' 没有变体 '" + vname + "'（函数 " + g_cur_fn_name + "）"
         return -1
     }
@@ -608,8 +608,8 @@ func tig_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
                 }
                 // 跳过转换：字面量（S_N_STR_LIT=2）或字符串拼接（S_N_BINARY=9
                 // 且语义类型为 string——比较类二元返回 bool 不会命中）
-                var is_i64_ptrval = s_tags[arg] == 2 ||
-                    (s_tags[arg] == 9 && node_types[arg] == types.named(TK_STR))
+                var is_i64_ptrval = ast.s_tag(arg) == 2 ||
+                    (ast.s_tag(arg) == 9 && ast.node_type(arg) == types.named(TK_STR))
                 if !is_i64_ptrval {
                     var pi = ir.new_inst(g_cur_block, 24, types.named(TK_I64))  // ptrtoint
                     ir.add_operand(pi, v, 0)
@@ -638,8 +638,8 @@ func tig_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
                 // 否则字面量走 tig_expr 恒 i64，sext i32 %i64 类型不匹配。
                 // 非字面量（变量/表达式）tig_expr 产出天然窄类型（i32 变量 load i32、
                 // 字符/布尔字面量 i32/i1），sext 源类型与 fty 一致。
-                if fty != types.named(TK_I64) && fty != types.named(TK_U64) && s_tags[arg] == 0 {
-                    v = tig_int_lit_ty(s_vals[arg], fty)
+                if fty != types.named(TK_I64) && fty != types.named(TK_U64) && ast.s_tag(arg) == 0 {
+                    v = tig_int_lit_ty(ast.s_val(arg), fty)
                 } else {
                     v = tig_expr(arg)
                 }

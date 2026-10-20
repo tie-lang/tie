@@ -5,11 +5,11 @@ type tie<class>
 // 顶层全局 var 与 import 树仍留在 irgen_stmt_gen.tie。
 namespace irgen {
 pub func tig_stmt_b_106_While(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // While：children=[cond, body]。cond_br 回边 + 循环上下文
         var cond = sstate.child(id, 0)
         var body = sstate.child(id, 1)
-        var label = s_names[id]
+        var label = ast.s_name(id)
         // p.6.1.4：预扫循环体找可提升的字符串自加变量（静态核对后挂 sb）。
         // sb 以「out 循环前值」为起始段——提升从空 sb 开始，若循环前 out
         // 已有值（前一循环结果/初始精），必须保留（否则多循环链丢结果）。
@@ -55,7 +55,7 @@ pub func tig_stmt_b_106_While(id: i64) -> i64 {
         }
         // p.6.5.2：条件归一化 i1（`while 1` / 整型条件 → icmp ne 0；
         // 旧实现把 i64 直接喂 cond_br，LLVM 校验失败）
-        cv = tig_cond_to_bool(cv, node_types[cond])
+        cv = tig_cond_to_bool(cv, ast.node_type(cond))
         var cb = ir.new_inst(g_cur_block, 31, -1)
         ir.add_operand(cb, cv, 0)
         ir.add_operand(cb, body_blk, 1)
@@ -113,9 +113,9 @@ pub func tig_stmt_b_106_While(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_108_Break(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // Break：br 到循环 exit 块
-        var tgt = loop_find_break(s_names[id])
+        var tgt = loop_find_break(ast.s_name(id))
         if tgt < 0 {
             return -1
         }
@@ -125,9 +125,9 @@ pub func tig_stmt_b_108_Break(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_109_Continue(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // Continue：br 到循环 cond/step 块
-        var tgt = loop_find_cont(s_names[id])
+        var tgt = loop_find_cont(ast.s_name(id))
         if tgt < 0 {
             return -1
         }
@@ -137,12 +137,12 @@ pub func tig_stmt_b_109_Continue(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_143(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // 三期 goto 标签（§7.1.5）：`#[tag.x]` → 目标基本块起点。
         // 标签块 = 跳转目标：创建（或复用 goto 预登记的占位块）并作为当前块
         // 的「新起点」——标签后的语句落入该块。前一条语句自然流到标签处，
         // 若当前块未 terminated，补 br 到标签块（标签 = 块内跳转点）。
-        var lname = s_names[id]
+        var lname = ast.s_name(id)
         var lblk = goto_label_block(g_cur_func, lname)
         // 当前块未 terminated（有前置语句/空块首）→ br 到标签块；已 terminated
         // （如 goto/return 后）则标签块仅由 goto br 可达，无需补 br
@@ -155,12 +155,12 @@ pub func tig_stmt_b_143(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_144_LLVM(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // 三期 goto（§7.1.5）：`unsafe goto #x` → 无条件 br 到目标标签块。
         // 语义层已做 R1/R2/R3；标签块可能在前（已登记）或后（预登记占位——
         // LLVM 允许 br 引用后文标签）。goto 后的语句是死代码（opt DCE 清），
         // 由 tig_block_stmts 的 block_terminated 承接新块。
-        var gname = s_names[id]
+        var gname = ast.s_name(id)
         var gblk = goto_label_block(g_cur_func, gname)
         var b = ir.new_inst(g_cur_block, 30, -1)
         ir.add_operand(b, gblk, 1)
@@ -168,7 +168,7 @@ pub func tig_stmt_b_144_LLVM(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_146(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // 三期 A 组 `unsafe use g { ... }` 持证越界块（§7.1.1 + unsafe-model §13.4）：
         // 凭据运行期无操作（编译期门禁已由语义层强制），块体正常生成。
         // r.1.6.7：若 g 的类型是 `guard<lock>` ⇒ 块内表访问走**免锁**入口（显式凭据
@@ -188,7 +188,7 @@ pub func tig_stmt_b_146(id: i64) -> i64 {
 // `unsafe use g` 的 g 类型：N_GUARD_USE 的 name 槽已是 intern 池 id（parser 侧约定）。
 // 先查局部作用域，再查全局（凭据可来自文件级/全局声明）。
 func esc_guard_use_ty(id: i64) -> i64 {
-    var gnid = s_names[id]
+    var gnid = ast.s_name(id)
     if scope_get(gnid) >= 0 {
         return g_lookup_ty
     }
@@ -200,7 +200,7 @@ func esc_guard_use_ty(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_147(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // 三期 A 组 `unsafe with(share) { ... }` 临时凭据块：同上，块体正常生成。
         // r.1.6.7：`unsafe with(lock) { ... }` ⇒ 块内表访问走**免锁**入口。
         // 能力域名在 children[0]（N_NAMED_TYPE，name = 域名词池 id）。
@@ -217,7 +217,7 @@ pub func tig_stmt_b_147(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // Assign：name=目标名, val=op（-1 普通；0..17 复合赋值码，对齐 B_*），
         // children=[值]。复合赋值：load 旧值 → 运算 → store（对齐 Rust 同路径）。
         // 注意：目标槽（g_lookup_alloca）必须**先保存**——tig_expr(val) 求值会
@@ -225,7 +225,7 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
         // store 存错目标（a &= b 把结果存进 b）。
         var nm = sstate.name_str(id)
         var val = sstate.child(id, 0)
-        var op = s_vals[id]
+        var op = ast.s_val(id)
         var nid = interner.intern(nm)
         // p.6.1.4：循环内字符串自加提升——sb 挂起中且为 `out = out + seg...` 形态
         // → 段表达式逐个 sb_append（跳过 str_cat 全拷贝与 store；循环出口统一 build）。
@@ -285,10 +285,10 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
                 return -1
             }
         } else {
-            if s_tags[val] == 4 && tgt_ty == types.named(TK_TRIT) {
+            if ast.s_tag(val) == 4 && tgt_ty == types.named(TK_TRIT) {
                 // BoolLit 适配 trit（t = true 且 t 是 trit 变量 → i8 1）
                 var tv: i64 = -1
-                if s_vals[val] == 1 {
+                if ast.s_val(val) == 1 {
                     tv = 1
                 }
                 vv = tig_trit_lit(tv)
@@ -300,7 +300,7 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
             }
         }
         // S1.3 C2/C3：赋值值类型 ≠ 目标槽类型（数字族）→ 转换（拓宽/缩窄）
-        var vt = node_types[val]
+        var vt = ast.node_type(val)
         if op < 0 && vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
             (types.is_int(tgt_ty) || types.is_float(tgt_ty)) && vt != tgt_ty {
             var cv = tig_coerce(vv, vt, tgt_ty)
@@ -337,7 +337,7 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
         var assign_new_tbl: bool = false
         var assign_old_v: i64 = -1
         if op < 0 {
-            var vt3 = node_types[val]
+            var vt3 = ast.node_type(val)
             if vt3 >= 0 && types.is_table(vt3) {
                 assign_is_tbl = true
                 // p.6.1.7-RCA-3【2026-09-06】：RHS 是**函数调用**（tag 7）→ 被调方
@@ -348,7 +348,7 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
                 // 槽共享同一表，需各自持引用）。
                 // r.1.1.4：表字面量 RHS（tag 12）同调用是瞬态值（新表 rc=1）→ 免
                 // retain（否则每轮 `t = [..]` 重绑定泄漏 1 引用 → 循环内无界增长）。
-                if s_tags[val] == 7 || s_tags[val] == 12 {
+                if ast.s_tag(val) == 7 || ast.s_tag(val) == 12 {
                     assign_new_tbl = true
                 }
             }
@@ -364,7 +364,7 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
         // 计数（与 VarDecl 出口析构排除 any 槽同款约定），故下方旧值 load/release
         // 对 any 目标跳过（盒按借用约定随函数生命周期，不回收）。
         if op < 0 && tgt_ty == types.named(TK_ANY) {
-            var vt5 = node_types[val]
+            var vt5 = ast.node_type(val)
             if vt5 >= 0 && vt5 != types.named(TK_ANY) {
                 var bx5 = tig_box_any(vv, vt5)
                 if bx5 < 0 {
@@ -397,48 +397,48 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
 }
 
 pub func tig_stmt_b_110_Switch(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // Switch：字符串比较链（driver 树仅 typekw_index 一处，字符串 subject）
         return tig_switch(id)
 }
 
 pub func tig_stmt_b_116_IndexAssign(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // IndexAssign：t[i] = v → tie_table_set 桥
         return tig_index_assign(id)
 }
 
 pub func tig_stmt_b_115_FieldAssign(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // FieldAssign：obj.field = v（元组/struct 字段赋值；复合赋值 op ≥ 0）
         return tig_field_assign(id)
 }
 
 pub func tig_stmt_b_134_S2(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // S2.3：`panic("消息")` 不可恢复错误语句（N_PANIC）→ printf + exit(1)
         return tig_panic(id)
 }
 
 pub func tig_stmt_b_122_N_STMTLIST(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // N_STMTLIST 作语句：逐子语句生成（语句位置宏 `$body` 插值块后残留的
         // 嵌套语句列表——dev33 批次10 任务28 语句级宏）。
         return tig_stmtlist_as_stmt(id)
 }
 
 pub func tig_stmt_b_136_N_CODE_LIT(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
         // N_CODE_LIT 块形式（val=1）作语句：展开内部 StmtList（`$body` 插值
         // 块形式 code 值后残留；表达式形式 val=0 在表达式层报错）。
-        if s_vals[id] == 1 {
+        if ast.s_val(id) == 1 {
             var inner = sstate.child(id, 0)
             if inner >= 0 {
                 return tig_stmtlist_as_stmt(inner)
             }
         }
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "irgen 不支持 code 字面量作语句（tag=136，函数 " + g_cur_fn_name + "）"
         return -1
 }

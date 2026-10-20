@@ -17,8 +17,8 @@ func tig_switch(id: i64) -> i64 {
     // subject 类型分派：字符串 → strcmp 比较链；整数/char → icmp 比较链；
     // 枚举 → 提取 tag（槽 0）后与 case 的 tag 常量 icmp 比较；
     // any → 提取 tag（槽 0）后与 case 类型的装箱 tag icmp 比较（P2b-T4）
-    var subj_is_str = node_types[subject] == types.named(TK_STR)
-    var subj_ty = node_types[subject]
+    var subj_is_str = ast.node_type(subject) == types.named(TK_STR)
+    var subj_ty = ast.node_type(subject)
     var subj_is_enum = types.kind(subj_ty) == K_ENUM
     var subj_is_any = subj_ty == types.named(TK_ANY)
     var enum_tag_v: i64 = -1
@@ -51,7 +51,7 @@ func tig_switch(id: i64) -> i64 {
         ir.add_operand(ald, agpp, 0)
         any_tag_v = ir.get_value(ald)
     }
-    var ncases = s_aux[id]
+    var ncases = ast.s_aux(id)
     var exit_blk = ir.new_block(g_cur_func, interner.intern("sw.exit"))
     // 逐个 case：PatternList 多模式（任一命中 → body；含 Range 范围模式）
     var k: i64 = 0
@@ -78,12 +78,12 @@ func tig_switch(id: i64) -> i64 {
             var eq_v: i64 = -1
             // P2c：struct 绑定标记（case Point(p): → 命中后提取 payload 绑定）
             var pat_is_bind: bool = false
-            if subj_is_any && s_tags[pat] == S_N_TYPE_LIT {
+            if subj_is_any && ast.s_tag(pat) == S_N_TYPE_LIT {
                 // P2b-T4：any 主体类型匹配——case 类型 → 装箱 tag 常量，与提取的
                 // subject tag icmp eq（scheck 已校验可装箱）。body 内用 as_<T>(x)
                 // 取用（tag 已匹配，as_* 不会触发运行时错误）
                 var tynode = sstate.child(pat, 0)
-                var cmt = types.named(s_vals[tynode])  // N_NAMED_TYPE val = typekw 索引
+                var cmt = types.named(ast.s_val(tynode))  // N_NAMED_TYPE val = typekw 索引
                 var exp_tag2: i64 = -1
                 if types.is_int(cmt) {
                     exp_tag2 = 0  // 整数族统一 tag 0（窄整数装箱已 zext 进 i64）
@@ -106,11 +106,11 @@ func tig_switch(id: i64) -> i64 {
                 ir.add_operand(is_eq3, pv3, 0)
                 ir.add_operand(is_eq3, 0, 2)  // eq
                 eq_v = ir.get_value(is_eq3)
-            } else if subj_is_any && (s_tags[pat] == S_N_VAR || s_tags[pat] == N_CASE_BIND) {
+            } else if subj_is_any && (ast.s_tag(pat) == S_N_VAR || ast.s_tag(pat) == N_CASE_BIND) {
                 // P2c：struct 匹配/绑定——case Point: / case Point(p):
                 //（scheck 已校验是 struct 名）。tag = struct 类型 id 常量。
                 var sref = pat
-                if s_tags[pat] == N_CASE_BIND {
+                if ast.s_tag(pat) == N_CASE_BIND {
                     sref = sstate.child(pat, 0)
                     pat_is_bind = true
                 }
@@ -133,8 +133,8 @@ func tig_switch(id: i64) -> i64 {
                 // 不可用 tig_expr(pat)——FieldAccess 枚举分支会构造聚合值。
                 var ptag = enum_case_tag(pat, subj_ty)
                 if ptag < 0 {
-                    sm_err_line = s_lines[id]
-                    sm_err_col = s_cols[id]
+                    sm_err_line = ast.s_line(id)
+                    sm_err_col = ast.s_col(id)
                     sm_err_msg = "case 值不是枚举 '" + types.type_name(subj_ty) + "' 的变体引用（函数 " + g_cur_fn_name + "）"
                     return -1
                 }
@@ -144,7 +144,7 @@ func tig_switch(id: i64) -> i64 {
                 ir.add_operand(is_eq2, pv2, 0)
                 ir.add_operand(is_eq2, 0, 2)  // eq
                 eq_v = ir.get_value(is_eq2)
-            } else if s_tags[pat] == 11 {
+            } else if ast.s_tag(pat) == 11 {
                 // Range 模式（case 3..7 → sv >= 3 && sv < 7）
                 var rs = tig_expr(sstate.child(pat, 0))
                 if rs < 0 {
@@ -162,7 +162,7 @@ func tig_switch(id: i64) -> i64 {
                 var lt = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp slt/sle
                 ir.add_operand(lt, sv, 0)
                 ir.add_operand(lt, re, 0)
-                if s_vals[pat] == 1 {
+                if ast.s_val(pat) == 1 {
                     ir.add_operand(lt, 4, 2)  // sle
                 } else {
                     ir.add_operand(lt, 2, 2)  // slt
@@ -199,7 +199,7 @@ func tig_switch(id: i64) -> i64 {
                 }
             }
             var np_blk = ir.new_block(g_cur_func, interner.intern("sw.np"))
-            if subj_is_enum && s_tags[pat] == N_CASE_BIND {
+            if subj_is_enum && ast.s_tag(pat) == N_CASE_BIND {
                 // 批次 7：枚举变体解构——命中 → 绑定块（提取 payload → 绑定变量）→ body
                 var bind_blk = ir.new_block(g_cur_func, interner.intern("sw.bind"))
                 var cb = ir.new_inst(g_cur_block, 31, -1)
@@ -253,7 +253,7 @@ func tig_switch(id: i64) -> i64 {
             if gv < 0 {
                 return -1
             }
-            var gty = node_types[when_n]
+            var gty = ast.node_type(when_n)
             var gcond = tig_cond_to_bool(gv, gty)
             var cbg = ir.new_inst(g_cur_block, 31, -1)
             ir.add_operand(cbg, gcond, 0)
@@ -311,15 +311,15 @@ func tig_println(id: i64, newline: bool) -> i64 {
     }
     // 实参 = children[slot_off]（children[0] 是泛型槽）
     var arg = sstate.child(id, sstate.slot_off(id))
-    var atag = s_tags[arg]
+    var atag = ast.s_tag(arg)
     if atag == 2 {
         // 字符串参数：控制台编码契约分派（控制台宽写 / 管道文件原 printf）
-        var sval = tig_str_lit(s_names[arg])
+        var sval = tig_str_lit(ast.s_name(arg))
         return tig_print_str_line(sval, newline)
     }
-    if atag == 6 && scope_get(s_names[arg]) >= 0 && g_lookup_ty == types.named(TK_STR) {
+    if atag == 6 && scope_get(ast.s_name(arg)) >= 0 && g_lookup_ty == types.named(TK_STR) {
         // T4.5：字符串类型变量（如 `var p: string = get_env("PATH")`）→ 分派
-        var sval = tig_var_ref(s_names[arg])
+        var sval = tig_var_ref(ast.s_name(arg))
         if sval < 0 {
             return -1
         }
@@ -327,7 +327,7 @@ func tig_println(id: i64, newline: bool) -> i64 {
     }
     // 字符串表达式（str_cat 拼接 / 返回 string 的调用等）：node_types 推断为
     // TK_STR → 分派。曾漏此分支：拼接结果走 %lld 打印指针值（乱码）
-    if node_types[arg] == types.named(TK_STR) {
+    if ast.node_type(arg) == types.named(TK_STR) {
         var sval2 = tig_expr(arg)
         if sval2 < 0 {
             return -1
@@ -335,7 +335,7 @@ func tig_println(id: i64, newline: bool) -> i64 {
         return tig_print_str_line(sval2, newline)
     }
     // P2c：any 参数 → 运行时分派打印（tig_print_any 按 tag 逐分支）
-    if node_types[arg] == types.named(TK_ANY) {
+    if ast.node_type(arg) == types.named(TK_ANY) {
         var av3 = tig_expr(arg)
         if av3 < 0 {
             return -1
@@ -355,7 +355,7 @@ func tig_println(id: i64, newline: bool) -> i64 {
         }
     }
     if !m_is_map {
-        var mt = node_types[arg]
+        var mt = ast.node_type(arg)
         if types.is_map(mt) {
             m_is_map = true
             m_vty = types.low(mt)
@@ -376,8 +376,8 @@ func tig_println(id: i64, newline: bool) -> i64 {
     // 语义层 f32 场景罕见，按 f64 处理；f32 值经 fpext 指令提升）
     // num 宽类型变量（语义 node_types=TK_NUM）按槽类型补判——`var b: num = 3.14`
     // 归约后槽是 f64，node_types 仍是 TK_NUM（曾误走 %lld 打印指针值）
-    var f_is_f = node_types[arg] == types.named(TK_F64) || node_types[arg] == types.named(TK_F32)
-    if !f_is_f && node_types[arg] == types.named(TK_NUM) && s_tags[arg] == 6 {
+    var f_is_f = ast.node_type(arg) == types.named(TK_F64) || ast.node_type(arg) == types.named(TK_F32)
+    if !f_is_f && ast.node_type(arg) == types.named(TK_NUM) && ast.s_tag(arg) == 6 {
         var fnid = interner.intern(sstate.name_str(arg))
         if scope_get(fnid) >= 0 && types.is_float(g_lookup_ty) {
             f_is_f = true
@@ -389,7 +389,7 @@ func tig_println(id: i64, newline: bool) -> i64 {
             return -1
         }
         var fref: i64 = fv
-        if node_types[arg] == types.named(TK_F32) {
+        if ast.node_type(arg) == types.named(TK_F32) {
             // f32 → f64 提升（printf 变参提升规则；fpext 无专用 opcode，
             // 用 fsub 0.0 保留值不可行——f32 值作为 f64 操作数需转换指令。
             // 简化：tie 语义层 f32 推断均落 f64，防御性按 double 直传）
@@ -401,7 +401,7 @@ func tig_println(id: i64, newline: bool) -> i64 {
         return ir.get_value(inst)
     }
     // 字符参数（char）：格式 "%c"（i32 值，直传）
-    if node_types[arg] == types.named(TK_CHAR) {
+    if ast.node_type(arg) == types.named(TK_CHAR) {
         var cv = tig_expr(arg)
         if cv < 0 {
             return -1
@@ -413,7 +413,7 @@ func tig_println(id: i64, newline: bool) -> i64 {
         return ir.get_value(inst)
     }
     // trit 参数：格式 "%d"（i8 → sext i32，printf 变参提升；对齐 Rust i8/i16 分支）
-    if node_types[arg] == types.named(TK_TRIT) {
+    if ast.node_type(arg) == types.named(TK_TRIT) {
         var tv = tig_expr(arg)
         if tv < 0 {
             return -1
@@ -430,12 +430,12 @@ func tig_println(id: i64, newline: bool) -> i64 {
     }
     // i128/u128 参数（批次 2）：内联除法循环生成十进制字符串 → "%s\n" + ptr。
     // 不能直传 printf（变参 i128 与 %lld 类型不匹配，opt 报类型错）。
-    if node_types[arg] == types.named(TK_I128) || node_types[arg] == types.named(TK_U128) {
+    if ast.node_type(arg) == types.named(TK_I128) || ast.node_type(arg) == types.named(TK_U128) {
         var av = tig_expr(arg)
         if av < 0 {
             return -1
         }
-        var sv = tig_i128_to_str(av, node_types[arg] == types.named(TK_I128))
+        var sv = tig_i128_to_str(av, ast.node_type(arg) == types.named(TK_I128))
         var fmt = interner.intern("%s" + nl)
         var inst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
         ir.add_operand(inst, fmt, 0)
@@ -591,7 +591,7 @@ func tig_print_any(v: i64, nl: string) -> i64 {
 
 // 语句生成：0 成功 / -1 错误
 func tig_stmt(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
     if tag == 100 { return tig_stmt_b_100_VarDecl(id) }
     if tag == 102 { return tig_stmt_b_102_ExprStmt(id) }
     if tag == 130 { return tig_stmt_b_130_S1(id) }
@@ -617,8 +617,8 @@ func tig_stmt(id: i64) -> i64 {
     if tag == 134 { return tig_stmt_b_134_S2(id) }
     if tag == 122 { return tig_stmt_b_122_N_STMTLIST(id) }
     if tag == 136 { return tig_stmt_b_136_N_CODE_LIT(id) }
-    sm_err_line = s_lines[id]
-    sm_err_col = s_cols[id]
+    sm_err_line = ast.s_line(id)
+    sm_err_col = ast.s_col(id)
     sm_err_msg = "irgen 未支持的语句（tag=" + to_string(tag) + "，函数 " + g_cur_fn_name + "）"
     return -1  // 其他语句后续扩展
 }
@@ -645,14 +645,14 @@ func tig_stmtlist_as_stmt(id: i64) -> i64 {
 // 结构：方法名 == "chars"，接收者（child[slot_off]）为 string 值。仅 for-in
 // 路径识别（tig_stmt tag==107 在进 tig_for_table 前探测），与 --prep 探针协调。
 func is_chars_method(iter: i64) -> bool {
-    if s_tags[iter] != 18 {
+    if ast.s_tag(iter) != 18 {
         return false
     }
     if sstate.name_str(iter) != "chars" {
         return false
     }
     var recv = sstate.child(iter, sstate.slot_off(iter))
-    var rt = node_types[recv]
+    var rt = ast.node_type(recv)
     if rt < 0 || rt != types.named(TK_STR) {
         return false
     }

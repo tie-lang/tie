@@ -235,7 +235,7 @@ func tig_variadic_table(nodes: table<i64>, elem: i64) -> i64 {
     while i < len(nodes) {
         // p.8.2.10 展开实参（N_SPREAD_ARG）：operand 是表，运行期把其全部元素
         // 依序并入变参表（tig_variadic_append_spread 发射复制循环）。
-        if s_tags[nodes[i]] == N_SPREAD_ARG {
+        if ast.s_tag(nodes[i]) == N_SPREAD_ARG {
             var sp_op = sstate.child(nodes[i], 0)
             var src = tig_expr(sp_op)
             if src < 0 {
@@ -253,7 +253,7 @@ func tig_variadic_table(nodes: table<i64>, elem: i64) -> i64 {
         }
         var suffix = bridge_suffix(elem)
         var pty = types.named(TK_I64)
-        var vt = node_types[nodes[i]]
+        var vt = ast.node_type(nodes[i])
         if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR)) {
             suffix = "string"
             pty = types.named(TK_STR)
@@ -714,7 +714,7 @@ func collect_extern_fns() {
     var i3: i64 = 0
     while i3 < n2 {
         var s3 = g_extra_tops[i3]
-        if s_tags[s3] == 117 {
+        if ast.s_tag(s3) == 117 {
             table_push(g_extern_ids, interner.intern(sstate.name_str(s3)))
         }
         i3 = i3 + 1

@@ -7,16 +7,16 @@ namespace irgen {
 // S2.3：`expr ?` 解包展开（N_TRY=133）。语义已由 sinfer.infer_try_unwrap
 // 校验：操作数必须是 Result/Option 形态枚举（含 Ok/Some 与 Err/None 变体），
 // 当前函数返回类型必须是同一枚举实例；解包类型 = Ok/Some 的 payload 类型
-// （node_types[id] 已登记）。IR 布局：tig_agg_addr 落内存 → 槽 0 读 tag →
+// （ast.node_type(id) 已登记）。IR 布局：tig_agg_addr 落内存 → 槽 0 读 tag →
 // icmp eq err_tag → cond_br；err 分支 ret 操作数聚合值本身（返回类型与
 // 操作数同实例，Err 值原样返回）；ok 分支解包槽 1（string 槽存 i64 指针值
 // → inttoptr 还原 ptr；窄整数槽存 sext 后 i64 → trunc 还原；i64/u64 直用）。
 func tig_try(id: i64) -> i64 {
     var operand = sstate.child(id, 0)
-    var oty = node_types[operand]
+    var oty = ast.node_type(operand)
     if oty < 0 || types.kind(oty) != K_ENUM {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "内部错误：'?' 解包操作数缺少枚举类型（函数 " + g_cur_fn_name + "）"
         return -1
     }
@@ -27,8 +27,8 @@ func tig_try(id: i64) -> i64 {
         err_tag = enum_variant_tag(ei, "None")
     }
     if err_tag < 0 {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "内部错误：'?' 解包枚举缺少 Err/None 变体（函数 " + g_cur_fn_name + "）"
         return -1
     }
@@ -79,7 +79,7 @@ func tig_try(id: i64) -> i64 {
     ir.add_operand(g1, eaddr, 0)
     ir.add_operand(g1, 1, 2)
     var g1p = ir.get_value(g1)
-    var uty = node_types[id]  // 解包类型（infer_try_unwrap 已登记）
+    var uty = ast.node_type(id)  // 解包类型（infer_try_unwrap 已登记）
     if uty < 0 {
         uty = types.named(TK_I64)
     }
@@ -124,18 +124,18 @@ func tig_try(id: i64) -> i64 {
 // Some(v) → v（payload 解包，还原逻辑对齐 tig_try）；None → 右侧默认值。
 // cond_br(some) → some_blk / none_blk → merge phi 汇合（类型 T）。
 func tig_elvis(lhs: i64, rhs: i64) -> i64 {
-    var oty = node_types[lhs]
+    var oty = ast.node_type(lhs)
     if oty < 0 || types.kind(oty) != K_ENUM {
-        sm_err_line = s_lines[lhs]
-        sm_err_col = s_cols[lhs]
+        sm_err_line = ast.s_line(lhs)
+        sm_err_col = ast.s_col(lhs)
         sm_err_msg = "内部错误：'?:' 左侧缺少 Option 枚举类型（函数 " + g_cur_fn_name + "）"
         return -1
     }
     var ei = types.low(oty)
     var some_tag = enum_variant_tag(ei, "Some")
     if some_tag < 0 {
-        sm_err_line = s_lines[lhs]
-        sm_err_col = s_cols[lhs]
+        sm_err_line = ast.s_line(lhs)
+        sm_err_col = ast.s_col(lhs)
         sm_err_msg = "内部错误：'?:' 左侧枚举缺少 Some 变体（函数 " + g_cur_fn_name + "）"
         return -1
     }
@@ -305,10 +305,10 @@ func tig_option_pack(oi: i64, tag: i64, pty: i64, pv: i64) -> i64 {
 //          None → none_blk（包装 None）→ merge；merge phi 汇合。
 func tig_safe_access(id: i64) -> i64 {
     var base0 = sstate.child(id, 0)
-    var oty = node_types[base0]
+    var oty = ast.node_type(base0)
     if oty < 0 || types.kind(oty) != K_ENUM {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "内部错误：'?.' 左侧缺少 Option 枚举类型（函数 " + g_cur_fn_name + "）"
         return -1
     }
@@ -316,20 +316,20 @@ func tig_safe_access(id: i64) -> i64 {
     var some_tag = enum_variant_tag(oi, "Some")
     var none_tag = enum_variant_tag(oi, "None")
     if some_tag < 0 || none_tag < 0 {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "内部错误：'?.' 左侧枚举缺少 Some/None 变体（函数 " + g_cur_fn_name + "）"
         return -1
     }
     var pt = sinfer.option_payload_ty(oty)
     if pt < 0 {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "内部错误：'?.' 左侧不是 Option 形态（函数 " + g_cur_fn_name + "）"
         return -1
     }
     var T64 = types.named(TK_I64)
-    var sname = s_names[id]
+    var sname = ast.s_name(id)
     var rty: i64 = -1
     if sname < 0 {
         // 索引形态：载荷为元素化表/映射 → 元素类型
@@ -354,8 +354,8 @@ func tig_safe_access(id: i64) -> i64 {
         }
     }
     if rty < 0 {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "内部错误：安全访问载荷类型不合法（函数 " + g_cur_fn_name + "）"
         return -1
     }
@@ -432,8 +432,8 @@ func tig_safe_access(id: i64) -> i64 {
         // 字段形态：struct 值落 alloca → agg_gep 字段 → load rty
         var fidx = agg_field_index(pt, sstate.name_str(id))
         if fidx < 0 {
-            sm_err_line = s_lines[id]
-            sm_err_col = s_cols[id]
+            sm_err_line = ast.s_line(id)
+            sm_err_col = ast.s_col(id)
             sm_err_msg = "内部错误：安全字段索引失败（函数 " + g_cur_fn_name + "）"
             return -1
         }
@@ -589,13 +589,13 @@ func tig_panic(id: i64) -> i64 {
 // jmp_buf = 256 字节 align 16（对齐 [16 x _SETJMP_FLOAT128]）。
 func tig_catch_panic(id: i64) -> i64 {
     llvmgen.catch_enable()
-    // 1. 求值闭包 f（fn 值聚合）；语义层已登记 node_types[fn_node] = fn 类型
+    // 1. 求值闭包 f（fn 值聚合）；语义层已登记 ast.node_type(fn_node) = fn 类型
     var fn_node = call_arg(id, 0)
     var fv = tig_expr(fn_node)
     if fv < 0 {
         return -1
     }
-    var fty = node_types[fn_node]
+    var fty = ast.node_type(fn_node)
     if fty < 0 || !types.is_fn(fty) {
         sm_err_msg = "catch_panic 参数必须是函数值（fn() -> T），函数 " + g_cur_fn_name
         return -1

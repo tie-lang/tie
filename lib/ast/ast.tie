@@ -555,4 +555,43 @@ pub func collect_stmt(list: ref table<i64>, s: i64) {
 //   interner.name_str(ast.name(id))——见 lib/interner.tie 的 name_str。
 // 此处仅提供池 id 读取（name(id)），文本转换统一走 interner。
 
+// ---- s_* 语义镜像访问器 ----
+// load_ast 在解析完成后把 node_* 复制成 s_* 第二套表示，供语义检查与
+// 代码生成按节点 id 直接读取（只读：写入始终走 node_* 侧，两套保持同序）。
+
+// 第 id 个节点的 tag。
+pub func s_tag(id: i64) -> i64 {
+    return s_tags[id]
+}
+
+// 第 id 个节点的名字池 id。
+pub func s_name(id: i64) -> i64 {
+    return s_names[id]
+}
+
+// 第 id 个节点的主整数值。
+pub func s_val(id: i64) -> i64 {
+    return s_vals[id]
+}
+
+// 第 id 个节点的次整数值。
+pub func s_aux(id: i64) -> i64 {
+    return s_aux[id]
+}
+
+// 第 id 个节点的起始行。
+pub func s_line(id: i64) -> i64 {
+    return s_lines[id]
+}
+
+// 第 id 个节点的起始列。
+pub func s_col(id: i64) -> i64 {
+    return s_cols[id]
+}
+
+// 第 id 个节点被推断出的语义类型 id（-1 = 尚未推断）。
+pub func node_type(id: i64) -> i64 {
+    return node_types[id]
+}
+
 }   // namespace ast

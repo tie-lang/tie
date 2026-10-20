@@ -22,7 +22,7 @@ func cbs_is_self_concat(val: i64, nid: i64) -> bool {
     if a0 < 0 {
         return false
     }
-    return s_tags[a0] == 6 && s_names[a0] == nid
+    return ast.s_tag(a0) == 6 && ast.s_name(a0) == nid
 }
 
 // 定位 cbs 状态索引（-1 未提升）
@@ -86,10 +86,10 @@ func cbs_collect(st: i64, ref legal: table<i64>, ref nids: table<i64>) {
     if st < 0 {
         return
     }
-    if s_tags[st] == 144 {
+    if ast.s_tag(st) == 144 {
         return
     }
-    if s_tags[st] == 103 {
+    if ast.s_tag(st) == 103 {
         var nm = sstate.name_str(st)
         if str_len(nm) > 0 {
             var nid = interner.intern(nm)
@@ -227,7 +227,7 @@ func tig_try_block(id: i64) -> i64 {
     while i < nb {
         var s = sstate.child(body, i)
         var is_last: bool = i == nb - 1
-        if is_last && s_tags[s] == S_N_EXPR_STMT && sstate.nchild(s) == 1 {
+        if is_last && ast.s_tag(s) == S_N_EXPR_STMT && sstate.nchild(s) == 1 {
             var ev = tig_expr(sstate.child(s, 0))
             if ev < 0 {
                 return -1

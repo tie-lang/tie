@@ -22,7 +22,7 @@ import "./tig_expr_seg2.tie"
 namespace irgen {
 // 表达式生成：返回结果值 id；-1 错误
 func tig_expr(id: i64) -> i64 {
-    var tag = s_tags[id]
+    var tag = ast.s_tag(id)
     var r: i64 = 0
     r = tig_expr_seg1(id)
     if r != -1 {
@@ -38,8 +38,8 @@ func tig_expr(id: i64) -> i64 {
     // 与 tig_expr_seg1 里 is_builtin_name 分支的既有约定一致（该处同样只在
     // sm_err_msg 为空时填默认消息）。
     if str_len(sm_err_msg) == 0 {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "irgen 未支持的表达式（tag=" + to_string(tag) + "，函数 " + g_cur_fn_name + "）"
     }
     return -1
@@ -94,9 +94,9 @@ func tig_pow(id: i64) -> i64 {
     if lhs < 0 || rhs < 0 {
         return -1
     }
-    var checked = s_vals[id] == B_CHECK_POW
-    var lt = node_types[lhs]
-    var rt = node_types[rhs]
+    var checked = ast.s_val(id) == B_CHECK_POW
+    var lt = ast.node_type(lhs)
+    var rt = ast.node_type(rhs)
     var is_f = lt == types.named(TK_F64) || lt == types.named(TK_F32) ||
         rt == types.named(TK_F64) || rt == types.named(TK_F32)
     if is_f {
@@ -135,10 +135,10 @@ func tig_is_check(id: i64) -> i64 {
     }
     var BT = types.named(TK_BOOL)
     var T64 = types.named(TK_I64)
-    var rt = node_types[tnode]
+    var rt = ast.node_type(tnode)
     if rt < 0 {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "'is' 类型节点未登记类型 id（函数 " + g_cur_fn_name + "）"
         return -1
     }
@@ -147,8 +147,8 @@ func tig_is_check(id: i64) -> i64 {
     }
     var exp_tag = stype.any_expected_tag(rt)
     if exp_tag < 0 {
-        sm_err_line = s_lines[id]
-        sm_err_col = s_cols[id]
+        sm_err_line = ast.s_line(id)
+        sm_err_col = ast.s_col(id)
         sm_err_msg = "'is' 暂不支持类型 " + types.type_name(rt) + "（该类型不能进 any 装箱）"
         return -1
     }
@@ -190,7 +190,7 @@ func tig_block_pipe(id: i64) -> i64 {
     if dv < 0 {
         return -1
     }
-    var ty = pipe_slot_ty(node_types[data])
+    var ty = pipe_slot_ty(ast.node_type(data))
     var alc = ir.new_inst(g_cur_block, 20, ty)  // alloca
     ir.add_operand(alc, ty, 2)
     var av = ir.get_value(alc)
@@ -199,7 +199,7 @@ func tig_block_pipe(id: i64) -> i64 {
     ir.add_operand(st, dv, 0)
     ir.add_operand(st, av, 0)
     scope_push()
-    scope_put(s_names[id], av, ty)
+    scope_put(ast.s_name(id), av, ty)
     var bv = tig_expr(body)
     scope_pop()
     return bv

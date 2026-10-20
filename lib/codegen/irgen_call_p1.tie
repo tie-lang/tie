@@ -62,7 +62,7 @@ func tig_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
             // M2.1.8：struct 接收者自动 ref（表 ref 原本 table→ptr 一致，
             // struct 聚合类型必须显式 ptr——形参已声明 ptr，实参须同型）
             var ref_flag = sp_refs[sg_off[sig] + arg_idx]
-            if ref_flag == 1 && s_tags[arg_node] == 6 {
+            if ref_flag == 1 && ast.s_tag(arg_node) == 6 {
                 var anm = interner.intern(sstate.name_str(arg_node))
                 if scope_get_global(anm) >= 0 {
                     av = g_lookup_alloca
@@ -83,9 +83,9 @@ func tig_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
         // L1 定长数组：按值形参接收数组字面量 / array_init → 按形参数组类型
         // 构造 [N x T] 聚合值（语义层已校验；ref 形参要求可寻址实参，不落此支）。
         if arg_idx < nparams && is_ref_arg == 0 && ptys[arg_idx] >= 0 && types.is_array(ptys[arg_idx]) {
-            if s_tags[arg_node] == 12 {
+            if ast.s_tag(arg_node) == 12 {
                 av = tig_array_lit_typed(arg_node, ptys[arg_idx])
-            } else if s_tags[arg_node] == 7 && sstate.name_str(arg_node) == "array_init" {
+            } else if ast.s_tag(arg_node) == 7 && sstate.name_str(arg_node) == "array_init" {
                 av = tig_array_init_typed(arg_node, ptys[arg_idx])
             }
             if av < 0 {
@@ -97,7 +97,7 @@ func tig_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
         // 创建前完成：tig_box_any 会新建指令（ir_ops 全局线性缓冲），若放在
         // 操作数添加循环内调用会交错进 call 的操作数切片（值/地址错位）。
         if arg_idx < nparams && ptys[arg_idx] == types.named(TK_ANY) {
-            var ant = node_types[arg_node]
+            var ant = ast.node_type(arg_node)
             if ant >= 0 && ant != types.named(TK_ANY) {
                 var abx2 = tig_box_any(av, ant)
                 if abx2 < 0 {
@@ -113,7 +113,7 @@ func tig_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
         // 实测 i64 字面量 → u32 形参触发）。
         if arg_idx < nparams && is_ref_arg == 0 {
             var ptyc = ptys[arg_idx]
-            var atc = node_types[arg_node]
+            var atc = ast.node_type(arg_node)
             if ptyc >= 0 && atc >= 0 && (types.is_int(ptyc) || types.is_float(ptyc)) &&
                 (types.is_int(atc) || types.is_float(atc)) && ptyc != atc {
                 var acv = tig_coerce(av, atc, ptyc)
@@ -163,7 +163,7 @@ func tig_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
             // 数字族缩窄/拓宽转换（对齐实参路径；默认值字面量 i64 而形参
             // u8 等时须显式转换，否则 call 操作数类型错位）
             var pty_d = ptys[pad]
-            var at_d = node_types[defn]
+            var at_d = ast.node_type(defn)
             if pty_d >= 0 && at_d >= 0 && (types.is_int(pty_d) || types.is_float(pty_d)) &&
                 (types.is_int(at_d) || types.is_float(at_d)) && pty_d != at_d {
                 var cv_d = tig_coerce(dv, at_d, pty_d)
@@ -284,7 +284,7 @@ func tig_method_call(id: i64) -> i64 {
     // en_keys → 枚举构造（仿 sinfer.infer_method_call 的枚举分支；实参从
     // children[slot_off + 1] 起）。须先于 struct 实例方法转发——枚举名不可
     // 能是已绑定实例，互不冲突。
-    if s_tags[recv] == 6 {
+    if ast.s_tag(recv) == 6 {
         var rnm = sstate.name_str(recv)
         var eidx2 = sstate.bs_find(en_keys, interner.intern(rnm))
         if eidx2 >= 0 {
@@ -293,7 +293,7 @@ func tig_method_call(id: i64) -> i64 {
     }
     // 接收者是已绑定实例（局部/全局变量）且类型为 struct → 实例方法转发：
     // 函数全名 = <struct 名>::<方法>，实参 = [receiver 值] + 显式实参
-    if s_tags[recv] == 6 {
+    if ast.s_tag(recv) == 6 {
         var rnid = interner.intern(sstate.name_str(recv))
         if scope_get_global(rnid) >= 0 {
             if types.kind(g_lookup_ty) == K_ATOMIC {
@@ -372,14 +372,14 @@ func tig_method_call(id: i64) -> i64 {
         }
     }
     // S2.4：表达式接收者（list[0] / 函数返回值 / 字段访问）——port 对象
-    // 动态分发（vtable 间接调用）。node_types[recv] 由语义层登记。
-    var rt4 = node_types[recv]
+    // 动态分发（vtable 间接调用）。ast.node_type(recv) 由语义层登记。
+    var rt4 = ast.node_type(recv)
     if rt4 >= 0 && types.kind(rt4) == K_PORT {
         return tig_port_method_call(id, recv, rt4, mname)
     }
     if rt4 >= 0 && types.kind(rt4) == K_ACTOR {
         // 一期并发 A4 Step4b-2：local/表达式接收者的 actor 方法同步 RPC。
-        // node_types[recv] 恒为句柄类型。rech = tig_expr(recv)（i64 句柄值）。
+        // ast.node_type(recv) 恒为句柄类型。rech = tig_expr(recv)（i64 句柄值）。
         var rai = rt4 - BASE_ACTOR
         var rmi = sstate.actor_method_idx(rai, mname)
         if rmi < 0 {
@@ -476,7 +476,7 @@ func tig_atomic_method(recv: i64, aty: i64, mname: string, id: i64) -> i64 {
         if v < 0 {
             return -1
         }
-        var vt = node_types[sstate.child(id, aoff)]
+        var vt = ast.node_type(sstate.child(id, aoff))
         if vt >= 0 && vt != elem && (types.is_int(vt) || types.is_float(vt)) {
             var cv = tig_coerce(v, vt, elem)
             if cv < 0 {
@@ -497,7 +497,7 @@ func tig_atomic_method(recv: i64, aty: i64, mname: string, id: i64) -> i64 {
         if v < 0 {
             return -1
         }
-        var vt = node_types[sstate.child(id, aoff)]
+        var vt = ast.node_type(sstate.child(id, aoff))
         if vt >= 0 && vt != elem && (types.is_int(vt) || types.is_float(vt)) {
             var cv = tig_coerce(v, vt, elem)
             if cv < 0 {
@@ -663,7 +663,7 @@ func tig_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
             }
             // 数字族缩窄/拓宽转换（对齐实参路径）
             var pty_d2 = ptys[pad]
-            var at_d2 = node_types[defn]
+            var at_d2 = ast.node_type(defn)
             if pty_d2 >= 0 && at_d2 >= 0 && (types.is_int(pty_d2) || types.is_float(pty_d2)) &&
                 (types.is_int(at_d2) || types.is_float(at_d2)) && pty_d2 != at_d2 {
                 var cv_d2 = tig_coerce(dv, at_d2, pty_d2)

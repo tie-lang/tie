@@ -18,7 +18,7 @@ var sv = tig_expr(subject)
 if sv < 0 {
     return -1
 }
-var subj_ty = node_types[subject]
+var subj_ty = ast.node_type(subject)
 var subj_is_str = subj_ty == types.named(TK_STR)
 var subj_is_enum = types.kind(subj_ty) == K_ENUM
 var subj_is_any = subj_ty == types.named(TK_ANY)
@@ -50,10 +50,10 @@ if subj_is_any {
     ir.add_operand(ald, agpp, 0)
     any_tag_v = ir.get_value(ald)
 }
-var ncases = s_aux[id]
+var ncases = ast.s_aux(id)
 // 表达式统一类型（sinfer 按隐式拓宽方向定好）：各臂值 phi 前 tig_coerce 对齐
 //（2026-10-09 修，与 tig_ternary 同判据——此前混宽两臂产 LLVM phi 类型不一致）。
-var rty = node_types[id]
+var rty = ast.node_type(id)
 if rty < 0 {
     rty = types.named(TK_I64)
 }
@@ -79,9 +79,9 @@ while k < ncases {
         var pat = sstate.child(pl, i)
         var eq_v: i64 = -1
         var pat_is_bind: bool = false
-        if subj_is_any && s_tags[pat] == S_N_TYPE_LIT {
+        if subj_is_any && ast.s_tag(pat) == S_N_TYPE_LIT {
             var tynode = sstate.child(pat, 0)
-            var cmt = types.named(s_vals[tynode])
+            var cmt = types.named(ast.s_val(tynode))
             var exp_tag2: i64 = -1
             if types.is_int(cmt) {
                 exp_tag2 = 0
@@ -104,9 +104,9 @@ while k < ncases {
             ir.add_operand(is_eq3, pv3, 0)
             ir.add_operand(is_eq3, 0, 2)
             eq_v = ir.get_value(is_eq3)
-        } else if subj_is_any && (s_tags[pat] == S_N_VAR || s_tags[pat] == N_CASE_BIND) {
+        } else if subj_is_any && (ast.s_tag(pat) == S_N_VAR || ast.s_tag(pat) == N_CASE_BIND) {
             var sref = pat
-            if s_tags[pat] == N_CASE_BIND {
+            if ast.s_tag(pat) == N_CASE_BIND {
                 sref = sstate.child(pat, 0)
                 pat_is_bind = true
             }
@@ -126,8 +126,8 @@ while k < ncases {
         } else if subj_is_enum {
             var ptag = enum_case_tag(pat, subj_ty)
             if ptag < 0 {
-                sm_err_line = s_lines[id]
-                sm_err_col = s_cols[id]
+                sm_err_line = ast.s_line(id)
+                sm_err_col = ast.s_col(id)
                 sm_err_msg = "case 值不是枚举 '" + types.type_name(subj_ty) + "' 的变体引用（函数 " + g_cur_fn_name + "）"
                 return -1
             }
@@ -137,7 +137,7 @@ while k < ncases {
             ir.add_operand(is_eq2, pv2, 0)
             ir.add_operand(is_eq2, 0, 2)
             eq_v = ir.get_value(is_eq2)
-        } else if s_tags[pat] == 11 {
+        } else if ast.s_tag(pat) == 11 {
             var rs = tig_expr(sstate.child(pat, 0))
             if rs < 0 {
                 return -1
@@ -154,7 +154,7 @@ while k < ncases {
             var lt = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
             ir.add_operand(lt, sv, 0)
             ir.add_operand(lt, re, 0)
-            if s_vals[pat] == 1 {
+            if ast.s_val(pat) == 1 {
                 ir.add_operand(lt, 4, 2)  // sle
             } else {
                 ir.add_operand(lt, 2, 2)  // slt
@@ -188,7 +188,7 @@ while k < ncases {
             }
         }
         var np_blk = ir.new_block(g_cur_func, interner.intern("swe.np"))
-        if subj_is_enum && s_tags[pat] == N_CASE_BIND {
+        if subj_is_enum && ast.s_tag(pat) == N_CASE_BIND {
             var bind_blk = ir.new_block(g_cur_func, interner.intern("swe.bind"))
             var cb = ir.new_inst(g_cur_block, 31, -1)
             ir.add_operand(cb, eq_v, 0)
@@ -235,7 +235,7 @@ while k < ncases {
         if gv < 0 {
             return -1
         }
-        var gty = node_types[when_n]
+        var gty = ast.node_type(when_n)
         var gcond = tig_cond_to_bool(gv, gty)
         var cbg = ir.new_inst(g_cur_block, 31, -1)
         ir.add_operand(cbg, gcond, 0)
@@ -247,7 +247,7 @@ while k < ncases {
     if bv < 0 {
         return -1
     }
-    bv = tig_coerce(bv, node_types[body_expr], rty)
+    bv = tig_coerce(bv, ast.node_type(body_expr), rty)
     var bv_blk = g_cur_block
     table_push(val_tab, bv)
     table_push(blk_tab, bv_blk)
@@ -261,7 +261,7 @@ while k < ncases {
 // 通配 `_`（default 臂）：在最后一个 next_blk（各 case 均未命中后流入的
 // 块）求值并汇入 merge。无通配臂时（非枚举/枚举已穷尽覆盖）该回退路径
 // 仍须提供 phi 入边值（零值），保证 merge 的 phi 入边与所有前驱一致。
-var has_wild = s_vals[id] == 1
+var has_wild = ast.s_val(id) == 1
 if has_wild {
     var dflt = sstate.child(id, 1 + ncases)
     if dflt >= 0 {
@@ -269,7 +269,7 @@ if has_wild {
         if dv < 0 {
             return -1
         }
-        dv = tig_coerce(dv, node_types[dflt], rty)
+        dv = tig_coerce(dv, ast.node_type(dflt), rty)
         var dv_blk = g_cur_block
         table_push(val_tab, dv)
         table_push(blk_tab, dv_blk)
@@ -285,7 +285,7 @@ if !block_terminated() {
     ir.add_operand(brd, merge_blk, 1)
 }
 g_cur_block = merge_blk
-var pty = node_types[id]
+var pty = ast.node_type(id)
 if pty < 0 {
     pty = types.named(TK_I64)
 }
