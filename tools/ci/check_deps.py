@@ -32,10 +32,10 @@ ALLOWED = {
 # 避免后来者误以为是遗漏）：
 #   * lib/codegen/irgen.tie  import ../front/semantic.tie  —— tig_src 的语义检查入口
 #   * lib/codegen/irgen.tie  import ../front/consteval.tie —— 全局初值里的 const fn 折叠
-#   * sstate 的语义查询（child / nchild / name_str / slot_off / fn_sig / fn_def_node /
-#     bs_find）在 codegen 中约五百处，经上面的 import 链传递可见。这条隐式可见性是
-#     本守卫的已知盲区：它只读显式 import 行，看不见裸标识符引用。lib/ast 契约层把
-#     节点字段的裸表访问收成了访问器，语义查询的同等收敛需要单独的 lib/sema 层。
+# sstate 的语义查询（child / nchild / name_str / slot_off / fn_sig / fn_def_node /
+# bs_find）已随 sstate 下沉到 lib/sema，codegen 对它的依赖是层间合法边。本守卫只读
+# 显式 import 行，看不见裸标识符引用；lib/ast 与 lib/sema 两层正是把这两类隐式
+# 可见性显式化的产物。
 EXCEPTIONS = {}
 
 def layer_of(path):
