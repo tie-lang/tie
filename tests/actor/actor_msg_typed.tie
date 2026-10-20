@@ -45,7 +45,7 @@ func main() {
         // 与已用参数区**重叠**：fn 参数占 16 字节（offset 0..15），第 1 个未用尾字
         // 写到 offset 8 ⇒ 覆盖闭包聚合的后半段（env 指针）⇒ env 变 null。
         // 修复：尾字起点改为「已用区末尾（8 对齐）」，并加 64 字节槽边界守卫
-        // （backend/irgen_rt_p2.tie `tig_mq_publish`）。
+        // （codegen/irgen_rt_p2.tie `tig_mq_publish`）。
         println("FAIL actor-msg-typed apply=" + to_string(r) + " 期望 115"
             + "（消息参数区尾字覆盖了 fn 聚合的 env 指针；不应再出现）")
     }
