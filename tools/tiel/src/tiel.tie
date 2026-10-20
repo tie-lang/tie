@@ -9,8 +9,12 @@ type tie<class>
 //   tiel_check(src) -> string   —— 跑一遍前端（词法→语法）；返回 CLI 形态
 //                                  错误行（error[E#####] @行:列: 消息。）；
 //                                  通过则返回空串。
+//   tiel_run(src) -> i64        —— 编译成内核字节码并执行；返回进程退出码
+//                                  （0 = 正常结束）。错误文本见 tiel_err()。
+//   tiel_err() -> string        —— 最近一次 tiel_run 的编译/运行错误（空 = 无）。
 //   （结构账直接用 em_stats()；错误槽访问器见 emit.tie。）
 // 说明：能力在各子文件——emit（表示层）/ lex（词法）/ parse（语法）/
+//   code（字节码生成）/ vm（执行核）/ ops（指令表）/
 //   emcodes（错误码表）/ render（CLI 形态拼装）；本文件只是聚合门面，
 //   不引入新状态，也不改变任何子文件的行为。
 import "./parse.tie"
@@ -18,6 +22,7 @@ import "./render.tie"
 import "./emcodes.tie"
 import "./emit.tie"
 import "./lex.tie"
+import "./code.tie"
 namespace tiel;
 
 // 校验一段源码：先全词法扫描（词法错即停），再语法解析。
@@ -39,4 +44,18 @@ pub func tiel_check(src: string) -> string {
         return rd_err_slot()
     }
     return ""
+}
+
+// 编译并执行一段源码：返回进程退出码（0 = 正常结束）。
+// 编译期拒绝与运行时错误都汇总到 tiel_err()。
+pub func tiel_run(src: string) -> i64 {
+    return cg_run(src)
+}
+
+// 最近一次 tiel_run 的编译/运行错误文本（空 = 无错）。
+pub func tiel_err() -> string {
+    if str_len(cg_err) > 0 {
+        return cg_err
+    }
+    return vm_err
 }

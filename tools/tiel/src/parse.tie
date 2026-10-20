@@ -141,6 +141,33 @@ func ps_span_eq(k: i64, lit: string) -> bool {
     return true
 }
 
+// 字符串字面量的引号前缀字节数：普通串 1、r" / h" 2、三引号 3。
+// ps_len_of 记的是含引号的完整词元区段，取内容时按这两处剥掉引号。
+func ps_str_pre(off: i64, n: i64) -> i64 {
+    if n < 1 {
+        return 0
+    }
+    var b0 = str_byte(em_src, off)
+    if b0 == 114 || b0 == 104 {
+        return 2
+    }
+    if b0 == 34 && n >= 6 && str_byte(em_src, off + 1) == 34 && str_byte(em_src, off + 2) == 34 {
+        return 3
+    }
+    return 1
+}
+
+// 字符串字面量的引号后缀字节数：三引号 3，其余 1。
+func ps_str_suf(off: i64, n: i64) -> i64 {
+    if n < 2 {
+        return 0
+    }
+    if n >= 6 && str_byte(em_src, off + n - 1) == 34 && str_byte(em_src, off + n - 2) == 34 && str_byte(em_src, off + n - 3) == 34 {
+        return 3
+    }
+    return 1
+}
+
 func ps_adv() {
     ps_ensure(0)
     ps_ll = (pq_a[pq_head] >> 24) & PQ_LC_M
@@ -753,8 +780,16 @@ func ps_primary() -> i64 {
     }
     if k == K_STR {
         var n3 = em_new(T_E_STR)
-        em_put(n3, 1, ps_off_of(0))
-        em_put(n3, 2, ps_len_of(0))
+        var o3s = ps_off_of(0)
+        var l3s = ps_len_of(0)
+        var p3s = ps_str_pre(o3s, l3s)
+        var s3s = ps_str_suf(o3s, l3s)
+        var c3s = l3s - p3s - s3s
+        if c3s < 0 {
+            c3s = 0
+        }
+        em_put(n3, 1, o3s + p3s)
+        em_put(n3, 2, c3s)
         ps_adv()
         return n3
     }
@@ -1995,12 +2030,12 @@ func ps_for_stmt(lbl: i64) -> i64 {
     }
     if em_tag(src) == T_E_RANGE {
         var n = em_new(T_S_FORRANGE)
-        em_put(n, 2, em_get(src, 1))           // lo
-        em_put(n, 3, em_get(src, 2))           // hi
-        em_put(n, 4, em_get(src, 3))           // incl
-        em_put(n, 5, body)
-        em_put(n, 6, lbl)
         ps_set_seg(n, 1, binds)
+        em_put(n, 3, em_get(src, 1))           // lo
+        em_put(n, 4, em_get(src, 2))           // hi
+        em_put(n, 5, em_get(src, 3))           // incl
+        em_put(n, 6, body)
+        em_put(n, 7, lbl)
         return n
     }
     var n2 = em_new(T_S_FORIN)

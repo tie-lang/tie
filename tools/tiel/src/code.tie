@@ -1,0 +1,666 @@
+type tie<class>
+// code.tie —— tsc 语法树 → 内核字节码
+// ============================================================
+// 职责：把 parse.tie 产出的树折叠成一维字节码（ops.tie 指令面），
+//   交给 vm.tie 执行。只覆盖 tsc 子集；子集之外在编译期明确拒绝，
+//   不静默生成错误代码。
+// 帧：函数参数占 0..n-1，局部与临时值顺延；帧槽数在编译期统计。
+// 作用域：块级作用域用「名→槽」栈的长度截断表示，退出块即丢弃；
+//   槽本身不回收（单遍编译，不做活跃分析）。
+// 函数：先收集顶层函数定义分配索引，再逐个编译函数体，最后编译
+//   顶层语句为入口函数；入口以 HALT 收尾。
+// ============================================================
+import "./ops.tie"
+import "./emit.tie"
+import "./lex.tie"
+import "./vm.tie"
+import "./parse.tie"
+import "./render.tie"
+namespace tiel;
+
+// ==================== 编译状态 ====================
+pub var cg_err: string = "";            // 编译错误（空 = 无）
+var cg_out: i64 = 0;                    // 已发射指令数（pc 游标）
+var cg_slot: i64 = 0;                   // 下一可用槽（相对当前帧）
+var cg_max: i64 = 0;                    // 当前帧最大槽数
+var cg_vn: table<string> = [];          // 变量名栈
+var cg_vs: table<i64> = [];             // 变量槽栈
+var cg_fns: table<string> = [];         // 顶层函数名池
+var cg_fid: table<i64> = [];            // 函数名 → 函数索引
+var cg_def: table<i64> = [];            // 函数名 → 定义节点
+var cg_lbr: table<i64> = [];            // break 待回填位置栈
+var cg_lbt: table<i64> = [];            // 每层循环的 break 栈起点
+var cg_lct: table<i64> = [];            // 每层循环的 continue 目标栈
+
+// ==================== 错误 ====================
+func cg_fail(msg: string) -> i64 {
+    if str_len(cg_err) == 0 { cg_err = msg }
+    return -1
+}
+
+// ==================== 发射 ====================
+func cg_emit(op: i64, a: i64, b: i64, c: i64) -> i64 {
+    table_push(vm_code, op)
+    table_push(vm_code, a)
+    table_push(vm_code, b)
+    table_push(vm_code, c)
+    cg_out = cg_out + 1
+    return cg_out - 1
+}
+
+func cg_here() -> i64 { return cg_out }
+
+func cg_patch(at: i64, target: i64) {
+    if at >= 0 { vm_code[at * OPSZ + 1] = target }
+}
+
+// ==================== 槽分配 ====================
+func cg_alloc() -> i64 {
+    var s = cg_slot
+    cg_slot = cg_slot + 1
+    if cg_slot > cg_max { cg_max = cg_slot }
+    return s
+}
+
+func cg_alloc_n(n: i64) -> i64 {
+    var s = cg_slot
+    cg_slot = cg_slot + n
+    if cg_slot > cg_max { cg_max = cg_slot }
+    return s
+}
+
+// ==================== 作用域 ====================
+func cg_bind(nm: string, sl: i64) {
+    table_push(cg_vn, nm)
+    table_push(cg_vs, sl)
+}
+
+func cg_lookup(nm: string) -> i64 {
+    var i = len(cg_vn) - 1
+    while i >= 0 {
+        if cg_vn[i] == nm { return cg_vs[i] }
+        i = i - 1
+    }
+    return -1
+}
+
+func cg_scope_mark() -> i64 { return len(cg_vn) }
+
+func cg_scope_drop(m: i64) {
+    table_trunc(cg_vn, m)
+    table_trunc(cg_vs, m)
+}
+
+// ==================== 函数表 ====================
+func cg_fid_of(nm: string) -> i64 {
+    var i = 0
+    var n = len(cg_fns)
+    while i < n {
+        if cg_fns[i] == nm { return cg_fid[i] }
+        i = i + 1
+    }
+    return -1
+}
+
+func cg_def_of(nm: string) -> i64 {
+    var i = 0
+    var n = len(cg_fns)
+    while i < n {
+        if cg_fns[i] == nm { return cg_def[i] }
+        i = i + 1
+    }
+    return -1
+}
+
+// ==================== 字面量 ====================
+func cg_seg(id: i64, so: i64, sl: i64) -> string {
+    var off = em_get(id, so)
+    var len = em_get(id, sl)
+    return str_sub_bytes(em_source(), off, off + len)
+}
+
+func cg_int_from(s: string) -> i64 {
+    var n = str_len(s)
+    var i = 0
+    var base: i64 = 10
+    var neg: i64 = 0
+    if n > 0 && str_byte(s, 0) == 45 { neg = 1; i = 1 }
+    if i + 1 < n && str_byte(s, i) == 48 {
+        var c2 = str_byte(s, i + 1)
+        if c2 == 120 || c2 == 88 { base = 16; i = i + 2 }
+        else if c2 == 98 || c2 == 66 { base = 2; i = i + 2 }
+        else if c2 == 111 || c2 == 79 { base = 8; i = i + 2 }
+    }
+    var v: i64 = 0
+    while i < n {
+        var ch = str_byte(s, i)
+        var d: i64 = -1
+        if ch >= 48 && ch <= 57 { d = ch - 48 }
+        else if ch >= 97 && ch <= 122 { d = ch - 87 }
+        else if ch >= 65 && ch <= 90 { d = ch - 55 }
+        if d < 0 || d >= base {
+            cg_fail("整数字面量非法：" + s)
+            return 0
+        }
+        v = v * base + d
+        i = i + 1
+    }
+    if neg != 0 { return 0 - v }
+    return v
+}
+
+// 字符串字面量的源区段在 parse 层已剥掉引号（含 r"/h" 前缀与三引号），这里直接入常量池。
+func cg_str_from(id: i64) -> i64 {
+    return vm_add_const(cg_seg(id, 1, 2))
+}
+
+// ==================== 运算符映射 ====================
+func cg_binop(k: i64) -> i64 {
+    if k == K_PLUS { return OP_ADD }
+    if k == K_MINUS { return OP_SUB }
+    if k == K_STAR { return OP_MUL }
+    if k == K_SLASH { return OP_DIV }
+    if k == K_PERCENT { return OP_MOD }
+    if k == K_STARSTAR { return OP_POW }
+    if k == K_AMP { return OP_BAND }
+    if k == K_PIPE { return OP_BOR }
+    if k == K_CARET { return OP_BXOR }
+    if k == K_SHL { return OP_SHL }
+    if k == K_SHR { return OP_SHR }
+    if k == K_EQEQ { return OP_EQ }
+    if k == K_NOTEQ { return OP_NE }
+    if k == K_LT { return OP_LT }
+    if k == K_LE { return OP_LE }
+    if k == K_GT { return OP_GT }
+    if k == K_GE { return OP_GE }
+    return -1
+}
+
+// ==================== 表达式 ====================
+func cg_expr(id: i64) -> i64 {
+    if id <= 0 { return -1 }
+    var tg = em_tag(id)
+    if tg == T_E_INT {
+        var v = cg_int_from(cg_seg(id, 1, 2))
+        if str_len(cg_err) > 0 { return -1 }
+        var s = cg_alloc()
+        cg_emit(OP_LOADI, s, v, 0)
+        return s
+    }
+    if tg == T_E_BOOL {
+        var s2 = cg_alloc()
+        cg_emit(OP_LOADB, s2, em_get(id, 1), 0)
+        return s2
+    }
+    if tg == T_E_TRIT {
+        var s3 = cg_alloc()
+        cg_emit(OP_LOADI, s3, em_get(id, 1), 0)
+        return s3
+    }
+    if tg == T_E_STR {
+        var ci = cg_str_from(id)
+        var s4 = cg_alloc()
+        cg_emit(OP_LOADS, s4, ci, 0)
+        return s4
+    }
+    if tg == T_E_IDENT {
+        var sl = cg_lookup(em_namestr(em_get(id, 1)))
+        if sl < 0 { return cg_fail("未声明的变量 " + em_namestr(em_get(id, 1))) }
+        return sl
+    }
+    if tg == T_E_BIN { return cg_bin(id) }
+    if tg == T_E_UN { return cg_un(id) }
+    if tg == T_E_CALL { return cg_call(id) }
+    if tg == T_E_ASSIGN { return cg_assign(id) }
+    if tg == T_E_TERNARY { return cg_ternary(id) }
+    cg_fail("暂不支持的表达式（tag " + to_string(tg) + "）")
+    return -1
+}
+
+func cg_land(id: i64) -> i64 {
+    var s = cg_alloc()
+    var ls = cg_expr(em_get(id, 2))
+    if ls < 0 { return -1 }
+    cg_emit(OP_JMPF, 0, ls, 0)
+    var jf = cg_here() - 1
+    var rs = cg_expr(em_get(id, 3))
+    if rs < 0 { return -1 }
+    cg_emit(OP_JMPF, 0, rs, 0)
+    var jf2 = cg_here() - 1
+    cg_emit(OP_LOADB, s, 1, 0)
+    cg_emit(OP_JMP, 0, 0, 0)
+    var jend = cg_here() - 1
+    var here = cg_here()
+    cg_patch(jf, here)
+    cg_patch(jf2, here)
+    cg_emit(OP_LOADB, s, 0, 0)
+    cg_patch(jend, cg_here())
+    return s
+}
+
+func cg_lor(id: i64) -> i64 {
+    var s = cg_alloc()
+    var ls = cg_expr(em_get(id, 2))
+    if ls < 0 { return -1 }
+    cg_emit(OP_JMPT, 0, ls, 0)
+    var jt = cg_here() - 1
+    var rs = cg_expr(em_get(id, 3))
+    if rs < 0 { return -1 }
+    cg_emit(OP_JMPT, 0, rs, 0)
+    var jt2 = cg_here() - 1
+    cg_emit(OP_LOADB, s, 0, 0)
+    cg_emit(OP_JMP, 0, 0, 0)
+    var jend = cg_here() - 1
+    var here = cg_here()
+    cg_patch(jt, here)
+    cg_patch(jt2, here)
+    cg_emit(OP_LOADB, s, 1, 0)
+    cg_patch(jend, cg_here())
+    return s
+}
+
+func cg_bin(id: i64) -> i64 {
+    var k = em_get(id, 1)
+    if k == K_ANDAND { return cg_land(id) }
+    if k == K_OROR { return cg_lor(id) }
+    var opc = cg_binop(k)
+    if opc < 0 {
+        cg_fail("暂不支持的运算符（kind " + to_string(k) + "）")
+        return -1
+    }
+    var ls = cg_expr(em_get(id, 2))
+    if ls < 0 { return -1 }
+    var rs = cg_expr(em_get(id, 3))
+    if rs < 0 { return -1 }
+    var s = cg_alloc()
+    cg_emit(opc, s, ls, rs)
+    return s
+}
+
+func cg_un(id: i64) -> i64 {
+    var k = em_get(id, 1)
+    if k == K_PLUS { return cg_expr(em_get(id, 2)) }
+    var e = cg_expr(em_get(id, 2))
+    if e < 0 { return -1 }
+    var s = cg_alloc()
+    if k == K_MINUS {
+        cg_emit(OP_NEG, s, e, 0)
+        return s
+    }
+    if k == K_BANG {
+        cg_emit(OP_NOT, s, e, 0)
+        return s
+    }
+    if k == K_TILDE {
+        cg_emit(OP_BNOT, s, e, 0)
+        return s
+    }
+    cg_fail("暂不支持的一元运算符（kind " + to_string(k) + "）")
+    return -1
+}
+
+func cg_call(id: i64) -> i64 {
+    var callee = em_get(id, 1)
+    if em_tag(callee) != T_E_IDENT {
+        cg_fail("暂只支持具名函数调用")
+        return -1
+    }
+    var nm = em_namestr(em_get(callee, 1))
+    var st = em_get(id, 2)
+    var n = em_get(id, 3)
+    var fid = cg_fid_of(nm)
+    if fid < 0 {
+        if nm == "println" || nm == "print" {
+            var i0 = 0
+            while i0 < n {
+                var a0 = cg_expr(em_ch[st + i0])
+                if a0 < 0 { return -1 }
+                cg_emit(OP_PRINT, a0, 0, 0)
+                i0 = i0 + 1
+            }
+            var sr = cg_alloc()
+            cg_emit(OP_LOADNIL, sr, 0, 0)
+            return sr
+        }
+        cg_fail("未定义的函数 " + nm)
+        return -1
+    }
+    var ab = cg_alloc_n(n)
+    var i = 0
+    while i < n {
+        var ai = cg_expr(em_ch[st + i])
+        if ai < 0 { return -1 }
+        if ai != ab + i { cg_emit(OP_MOV, ab + i, ai, 0) }
+        i = i + 1
+    }
+    var s = cg_alloc()
+    cg_emit(OP_CALL, s, fid, ab)
+    return s
+}
+
+func cg_assign(id: i64) -> i64 {
+    var op = em_get(id, 1)
+    var tg = em_get(id, 2)
+    var val = em_get(id, 3)
+    if em_tag(tg) != T_E_IDENT {
+        cg_fail("暂只支持变量赋值")
+        return -1
+    }
+    var nm = em_namestr(em_get(tg, 1))
+    var sl = cg_lookup(nm)
+    if sl < 0 {
+        cg_fail("未声明的变量 " + nm)
+        return -1
+    }
+    var vs = cg_expr(val)
+    if vs < 0 { return -1 }
+    if op == K_EQ {
+        cg_emit(OP_MOV, sl, vs, 0)
+        return sl
+    }
+    var bop: i64 = -1
+    if op == K_PLUSEQ { bop = OP_ADD }
+    else if op == K_MINUSEQ { bop = OP_SUB }
+    else if op == K_STAREQ { bop = OP_MUL }
+    else if op == K_SLASHEQ { bop = OP_DIV }
+    else if op == K_PERCENTEQ { bop = OP_MOD }
+    else if op == K_AMPEQ { bop = OP_BAND }
+    else if op == K_PIPEEQ { bop = OP_BOR }
+    else if op == K_CARETEQ { bop = OP_BXOR }
+    else if op == K_SHLEQ { bop = OP_SHL }
+    else if op == K_SHREQ { bop = OP_SHR }
+    if bop < 0 {
+        cg_fail("暂不支持的赋值运算符（kind " + to_string(op) + "）")
+        return -1
+    }
+    cg_emit(bop, sl, sl, vs)
+    return sl
+}
+
+func cg_ternary(id: i64) -> i64 {
+    var s = cg_alloc()
+    var c = cg_expr(em_get(id, 1))
+    if c < 0 { return -1 }
+    cg_emit(OP_JMPF, 0, c, 0)
+    var jf = cg_here() - 1
+    var a = cg_expr(em_get(id, 2))
+    if a < 0 { return -1 }
+    cg_emit(OP_MOV, s, a, 0)
+    cg_emit(OP_JMP, 0, 0, 0)
+    var jend = cg_here() - 1
+    cg_patch(jf, cg_here())
+    var b = cg_expr(em_get(id, 3))
+    if b < 0 { return -1 }
+    cg_emit(OP_MOV, s, b, 0)
+    cg_patch(jend, cg_here())
+    return s
+}
+
+// ==================== 语句 ====================
+func cg_vardecl(id: i64) -> i64 {
+    var st = em_get(id, 1)
+    var n = em_get(id, 2)
+    var init = em_get(id, 4)
+    var i = 0
+    while i < n {
+        var bind = em_ch[st + i]
+        var nm = em_namestr(em_get(bind, 1))
+        var sl = cg_alloc()
+        cg_bind(nm, sl)
+        if i == 0 && init > 0 {
+            var vs = cg_expr(init)
+            if vs < 0 { return -1 }
+            cg_emit(OP_MOV, sl, vs, 0)
+        } else {
+            cg_emit(OP_LOADNIL, sl, 0, 0)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+func cg_if(id: i64) -> i64 {
+    var c = em_get(id, 1)
+    var t = em_get(id, 2)
+    var e = em_get(id, 3)
+    var cs = cg_expr(c)
+    if cs < 0 { return -1 }
+    cg_emit(OP_JMPF, 0, cs, 0)
+    var jf = cg_here() - 1
+    if cg_stmt(t) < 0 { return -1 }
+    if e > 0 {
+        cg_emit(OP_JMP, 0, 0, 0)
+        var je = cg_here() - 1
+        cg_patch(jf, cg_here())
+        if cg_stmt(e) < 0 { return -1 }
+        cg_patch(je, cg_here())
+    } else {
+        cg_patch(jf, cg_here())
+    }
+    return 0
+}
+
+func cg_while(id: i64) -> i64 {
+    var c = em_get(id, 1)
+    var b = em_get(id, 2)
+    var top = cg_here()
+    var cs = cg_expr(c)
+    if cs < 0 { return -1 }
+    cg_emit(OP_JMPF, 0, cs, 0)
+    var jf = cg_here() - 1
+    table_push(cg_lbt, len(cg_lbr))
+    table_push(cg_lct, top)
+    if cg_stmt(b) < 0 { return -1 }
+    cg_emit(OP_JMP, top, 0, 0)
+    var end = cg_here()
+    cg_patch(jf, end)
+    var mark = cg_lbt[len(cg_lbt) - 1]
+    var i = mark
+    while i < len(cg_lbr) {
+        cg_patch(cg_lbr[i], end)
+        i = i + 1
+    }
+    table_trunc(cg_lbr, mark)
+    table_trunc(cg_lbt, len(cg_lbt) - 1)
+    table_trunc(cg_lct, len(cg_lct) - 1)
+    return 0
+}
+
+func cg_break(id: i64) -> i64 {
+    if len(cg_lbt) == 0 {
+        cg_fail("break 不在循环内")
+        return -1
+    }
+    cg_emit(OP_JMP, 0, 0, 0)
+    table_push(cg_lbr, cg_here() - 1)
+    return 0
+}
+
+func cg_continue(id: i64) -> i64 {
+    if len(cg_lct) == 0 {
+        cg_fail("continue 不在循环内")
+        return -1
+    }
+    cg_emit(OP_JMP, cg_lct[len(cg_lct) - 1], 0, 0)
+    return 0
+}
+
+func cg_return(id: i64) -> i64 {
+    var e = em_get(id, 1)
+    if e > 0 {
+        var s = cg_expr(e)
+        if s < 0 { return -1 }
+        cg_emit(OP_RET, s, 0, 0)
+    } else {
+        cg_emit(OP_RET, -1, 0, 0)
+    }
+    return 0
+}
+
+func cg_panic(id: i64) -> i64 {
+    var e = em_get(id, 1)
+    var s = cg_expr(e)
+    if s < 0 { return -1 }
+    cg_emit(OP_PRINT, s, 0, 0)
+    cg_emit(OP_RET, -1, 0, 0)
+    return 0
+}
+
+func cg_block(id: i64) -> i64 {
+    var m = cg_scope_mark()
+    var st = em_get(id, 1)
+    var n = em_get(id, 2)
+    var i = 0
+    while i < n {
+        if cg_stmt(em_ch[st + i]) < 0 { return -1 }
+        i = i + 1
+    }
+    cg_scope_drop(m)
+    return 0
+}
+
+func cg_stmt(id: i64) -> i64 {
+    if id <= 0 { return 0 }
+    var tg = em_tag(id)
+    if tg == T_S_EXPR {
+        var e = cg_expr(em_get(id, 1))
+        if e < 0 { return -1 }
+        return 0
+    }
+    if tg == T_S_BLOCK { return cg_block(id) }
+    if tg == T_E_ASSIGN {
+        var ae = cg_assign(id)
+        if ae < 0 { return -1 }
+        return 0
+    }
+    if tg == T_S_IF { return cg_if(id) }
+    if tg == T_S_WHILE { return cg_while(id) }
+    if tg == T_S_RETURN { return cg_return(id) }
+    if tg == T_S_BREAK { return cg_break(id) }
+    if tg == T_S_CONTINUE { return cg_continue(id) }
+    if tg == T_D_VAR { return cg_vardecl(id) }
+    if tg == T_S_PANIC { return cg_panic(id) }
+    if tg == T_D_FUNC {
+        cg_fail("暂不支持块内函数定义")
+        return -1
+    }
+    cg_fail("暂不支持的语句（tag " + to_string(tg) + "）")
+    return -1
+}
+
+// ==================== 函数编译 ====================
+func cg_func(fid: i64, def: i64) -> i64 {
+    var sig_st = em_get(def, 2)
+    var sig_n = em_get(def, 3)
+    var body = em_get(def, 4)
+    cg_slot = 0
+    cg_max = 0
+    table_trunc(cg_vn, 0)
+    table_trunc(cg_vs, 0)
+    table_trunc(cg_lbr, 0)
+    table_trunc(cg_lbt, 0)
+    table_trunc(cg_lct, 0)
+    var start = cg_here()
+    var np: i64 = 0
+    var i = 0
+    while i < sig_n {
+        var p = em_ch[sig_st + i]
+        if em_tag(p) == T_A_PARAM {
+            var nm = em_namestr(em_get(p, 1))
+            cg_bind(nm, cg_slot)
+            cg_slot = cg_slot + 1
+            if cg_slot > cg_max { cg_max = cg_slot }
+            np = np + 1
+        }
+        i = i + 1
+    }
+    vm_fn_nargs[fid] = np
+    if cg_stmt(body) < 0 { return -1 }
+    cg_emit(OP_RET, -1, 0, 0)
+    vm_fn_base[fid] = start
+    vm_fn_slots[fid] = cg_max
+    return 0
+}
+
+// ==================== 顶层 ====================
+pub func cg_compile(root: i64) -> i64 {
+    cg_err = ""
+    vm_reset()
+    cg_out = 0
+    cg_slot = 0
+    cg_max = 0
+    table_trunc(cg_vn, 0)
+    table_trunc(cg_vs, 0)
+    table_trunc(cg_fns, 0)
+    table_trunc(cg_fid, 0)
+    table_trunc(cg_def, 0)
+    table_trunc(cg_lbr, 0)
+    table_trunc(cg_lbt, 0)
+    table_trunc(cg_lct, 0)
+
+    var st = em_get(root, 1)
+    var n = em_get(root, 2)
+
+    var i = 0
+    while i < n {
+        var d = em_ch[st + i]
+        if em_tag(d) == T_D_FUNC {
+            var nm = em_namestr(em_get(d, 1))
+            if cg_fid_of(nm) >= 0 {
+                cg_fail("函数重复定义 " + nm)
+                return -1
+            }
+            var fid = vm_add_fn(-1, 0, 0)
+            table_push(cg_fns, nm)
+            table_push(cg_fid, fid)
+            table_push(cg_def, d)
+        }
+        i = i + 1
+    }
+
+    var entry = vm_add_fn(0, 0, 0)
+    vm_entry = entry
+
+    var j = 0
+    while j < len(cg_fns) {
+        if cg_func(cg_fid[j], cg_def[j]) < 0 { return -1 }
+        j = j + 1
+    }
+
+    cg_slot = 0
+    cg_max = 0
+    table_trunc(cg_vn, 0)
+    table_trunc(cg_vs, 0)
+    vm_fn_base[entry] = cg_here()
+
+    var k = 0
+    while k < n {
+        var d2 = em_ch[st + k]
+        if em_tag(d2) != T_D_FUNC {
+            if cg_stmt(d2) < 0 { return -1 }
+        }
+        k = k + 1
+    }
+    cg_emit(OP_HALT, 0, 0, 0)
+    vm_fn_slots[entry] = cg_max
+    return 0
+}
+
+// ==================== 门面 ====================
+pub func cg_run(src: string) -> i64 {
+    cg_err = ""
+    var root = ps_parse(src)
+    if root < 0 {
+        var e = rd_err_slot()
+        if str_len(e) > 0 {
+            cg_err = e
+        } else {
+            cg_err = "解析失败"
+        }
+        return 1
+    }
+    if cg_compile(root) < 0 { return 1 }
+    var rc = vm_run()
+    if str_len(vm_err) > 0 { return 1 }
+    return rc
+}
