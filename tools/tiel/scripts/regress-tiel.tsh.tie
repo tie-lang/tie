@@ -1,0 +1,123 @@
+type tie<tsh>
+// tools/tiel/scripts/regress-tiel.tsh.tie —— tiel 内核回归
+// ============================================================
+// 职责：把内联的 tsc 用例写成临时脚本，用 tiel.exe 执行并比对 stdout，
+//   负例则要求非零退出码且错误行含指定片段。
+// 用法（仓库根目录）：<tsh> -f tools/tiel/scripts/regress-tiel.tsh.tie
+// 前置：_local_only/bin/tiel.exe 已构建（tiec tools/tiel/src/shell.tie）。
+// 退出码 = FAIL>0 ? 1 : 0。
+
+var tiel = ".\\_local_only\\bin\\tiel.exe"
+var pass: i64 = 0
+var fail: i64 = 0
+
+func norm(s: string) -> string {
+    return replace_all(s, "\r", "")
+}
+
+// 子串包含：替换掉后长度变化即视为包含（str_len 按码点计数，两处同口径）。
+func has(s: string, sub: string) -> bool {
+    return str_len(replace_all(s, sub, "")) != str_len(s)
+}
+
+func case_path(name: string, ext: string) -> string {
+    return get_env("TEMP") + "\\tiel_reg_" + name + ext
+}
+
+// 正例：退出码 0 且 stdout 与期望逐字相等。
+func expect_out(name: string, src: string, want: string) {
+    var tmp = case_path(name, ".tsc.tie")
+    var outf = case_path(name, ".out")
+    file_write(tmp, src)
+    var rc = exec_code("cmd /c " + tiel + " " + tmp + " > " + outf + " 2>&1")
+    var got = norm(file_read(outf))
+    if rc == 0 && got == want {
+        pass = pass + 1
+    } else {
+        fail = fail + 1
+        println("FAIL " + name + " rc=" + to_string(rc) + " got=[" + got + "] want=[" + want + "]")
+    }
+}
+
+// 负例：退出码非零且输出含错误片段。
+func expect_err(name: string, src: string, needle: string) {
+    var tmp = case_path(name, ".tsc.tie")
+    var outf = case_path(name, ".out")
+    file_write(tmp, src)
+    var rc = exec_code("cmd /c " + tiel + " " + tmp + " > " + outf + " 2>&1")
+    var got = norm(file_read(outf))
+    if rc != 0 && has(got, needle) {
+        pass = pass + 1
+    } else {
+        fail = fail + 1
+        println("FAIL " + name + " rc=" + to_string(rc) + " out=[" + got + "] 期待含 [" + needle + "]")
+    }
+}
+
+println("=== tiel 内核回归 ===")
+
+// ---------- 正例：表达式与变量 ----------
+expect_out("arith",
+    "var a = 10\nvar b = 3\nprintln(a + b)\nprintln(a - b)\nprintln(a * b)\nprintln(a / b)\nprintln(a % b)\n",
+    "13\n7\n30\n3\n1\n")
+
+expect_out("cmp",
+    "println(3 > 2)\nprintln(3 == 2)\nprintln(2 >= 2)\nprintln(1 != 1)\n",
+    "true\nfalse\ntrue\nfalse\n")
+
+expect_out("unary",
+    "var a = 7\nprintln(0 - a)\nprintln(!false)\n",
+    "-7\ntrue\n")
+
+expect_out("assign",
+    "var a = 1\na = a + 41\na = a * 2\nprintln(a)\n",
+    "84\n")
+
+// ---------- 正例：控制流 ----------
+expect_out("ifelse",
+    "var a = 5\nif a > 3 {\n    println(\"big\")\n} else {\n    println(\"small\")\n}\n",
+    "big\n")
+
+expect_out("ifelse2",
+    "var a = 1\nif a > 3 {\n    println(\"big\")\n} else {\n    println(\"small\")\n}\n",
+    "small\n")
+
+expect_out("while",
+    "var i = 0\nvar s = 0\nwhile i < 5 {\n    s = s + i\n    i = i + 1\n}\nprintln(s)\n",
+    "10\n")
+
+expect_out("while_break",
+    "var i = 0\nvar s = 0\nwhile i < 10 {\n    if i == 4 { break }\n    s = s + i\n    i = i + 1\n}\nprintln(s)\n",
+    "6\n")
+
+expect_out("while_cont",
+    "var i = 0\nvar s = 0\nwhile i < 6 {\n    i = i + 1\n    if i == 3 { continue }\n    s = s + i\n}\nprintln(s)\n",
+    "18\n")
+
+// ---------- 正例：函数与递归 ----------
+expect_out("func",
+    "func add(x: i64, y: i64) -> i64 {\n    return x + y\n}\nprintln(add(3, 4))\n",
+    "7\n")
+
+expect_out("rec",
+    "func fact(n: i64) -> i64 {\n    if n <= 1 { return 1 }\n    return n * fact(n - 1)\n}\nprintln(fact(5))\n",
+    "120\n")
+
+expect_out("fib",
+    "func fib(n: i64) -> i64 {\n    if n < 2 { return n }\n    return fib(n - 1) + fib(n - 2)\n}\nprintln(fib(10))\n",
+    "55\n")
+
+// ---------- 正例：字面量 ----------
+expect_out("str",
+    "println(\"hi\")\n",
+    "hi\n")
+
+// ---------- 负例 ----------
+expect_err("syntax", "var x =\n", "error[E")
+expect_err("undef", "println(y)\n", "未声明的变量")
+
+println("=== 汇总: PASS=" + to_string(pass) + " FAIL=" + to_string(fail) + " ===")
+if fail > 0 {
+    return 1
+}
+return 0
