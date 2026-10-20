@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """库依赖方向守卫：lib/<layer> 只允许向下依赖。
+
+层序（自下而上）：support → diag → ir → front → codegen → backend；jit / rt 挂靠底层。
+codegen 是「AST → tie-IR」的中层，位于前向之后、后端之前；backend 只剩
+「tie-IR → LLVM IR 文本」的发射层。
 退出码 1 表示存在非法边。"""
 import os, re, sys
 
@@ -11,16 +15,15 @@ ALLOWED = {
     "diag":    {"diag", "support", "std", "sys", "ext"},
     "ir":      {"ir", "support", "diag", "std", "sys", "ext"},
     "front":   {"front", "ir", "support", "diag", "std", "sys", "ext"},
-    "backend": {"backend", "ir", "support", "diag", "std", "sys", "ext"},
+    "codegen": {"codegen", "front", "ir", "support", "diag", "std", "sys", "ext"},
+    "backend": {"backend", "codegen", "ir", "support", "diag", "std", "sys", "ext"},
     "jit":     {"jit", "support", "std", "sys", "ext"},
     "rt":      {"rt"},
 }
 
-# 存量例外（只减不增）：修完即删。
-EXCEPTIONS = {
-    ("lib/backend/irgen.tie", "../front/semantic.tie"): "tig_src 便捷入口，待下沉到 tools",
-    ("lib/backend/irgen.tie", "../front/consteval.tie"): "const fn 折叠依赖前端 AST，待语义层预折叠",
-}
+# 存量例外（只减不增）：修完即删。当前为零——codegen 层建立后，irgen 对前端的
+# 依赖（semantic / consteval）已成为合法的向下依赖，不再需要放行。
+EXCEPTIONS = {}
 
 def layer_of(path):
     rel = os.path.relpath(path, LIB).replace("\\", "/")
