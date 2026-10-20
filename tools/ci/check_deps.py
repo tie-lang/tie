@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """库依赖方向守卫：lib/<layer> 只允许向下依赖。
 
-层序（自下而上）：support → diag → ir → ast → front → codegen → backend；jit / rt 挂靠底层。
+层序（自下而上）：support → diag → ir → ast → sema → front → codegen → backend；jit / rt 挂靠底层。
 ast 是语法树契约层：节点标签常量、节点池、列式镜像表与访问器，零 import，供前端与
-codegen 共同依赖；codegen 是「AST → tie-IR」的中层，位于前端之后、后端之前；backend
-只剩「tie-IR → LLVM IR 文本」的发射层。
+codegen 共同依赖；sema 是语义状态层：符号表、签名表、局部变量表与查询函数，由 front
+写入、由 codegen 读取；codegen 是「AST → tie-IR」的中层，位于前端之后、后端之前；
+backend 只剩「tie-IR → LLVM IR 文本」的发射层。
 退出码 1 表示存在非法边。"""
 import os, re, sys
 
@@ -16,8 +17,9 @@ ALLOWED = {
     "diag":    {"diag", "support", "std", "sys", "ext"},
     "ir":      {"ir", "support", "diag", "std", "sys", "ext"},
     "ast":     {"ast", "support", "diag", "std", "sys", "ext"},
-    "front":   {"front", "ast", "ir", "support", "diag", "std", "sys", "ext"},
-    "codegen": {"codegen", "ast", "front", "ir", "support", "diag", "std", "sys", "ext"},
+    "sema":    {"sema", "ast", "ir", "support", "diag", "std", "sys", "ext"},
+    "front":   {"front", "sema", "ast", "ir", "support", "diag", "std", "sys", "ext"},
+    "codegen": {"codegen", "sema", "ast", "front", "ir", "support", "diag", "std", "sys", "ext"},
     "backend": {"backend", "codegen", "ast", "ir", "support", "diag", "std", "sys", "ext"},
     "jit":     {"jit", "support", "std", "sys", "ext"},
     "rt":      {"rt"},
