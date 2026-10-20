@@ -251,7 +251,14 @@ pub func preprocess(src: string, target: string, profile: string) -> string {
             next_i = ln_e + 1
         }
         var line_txt = cp_slice(src, ln_s, ln_e)
-        var t = cp_trim(line_txt)
+        // CRLF 兼容：行尾 \r 属于行终止符，不参与指令识别。否则 `#else\r` / `#end\r`
+        // 匹配不到精确分支，会落到「前缀 + 尾随内容」而误报 E00104。
+        // 注意只改「用于判断的文本」，输出行仍用原始 line_txt，被保留内容的字节不变。
+        var decl_txt = line_txt
+        if len(decl_txt) > 0 && str_byte(decl_txt, len(decl_txt) - 1) == 13 {
+            decl_txt = cp_slice(decl_txt, 0, len(decl_txt) - 1)
+        }
+        var t = cp_trim(decl_txt)
         var handled: bool = false
         if cp_starts(t, "#cfg(") {
             // ---- #cfg(条件) ----
