@@ -17,11 +17,23 @@ func split_current_gt(remainder: i64) {
         // 被跳过直接读到 RParen（语法错误 @9:34 期望 '>' 实得 RParen）。
         // p.9.14.3：覆盖前记日志（旧值 4 列），restore_pos 逆序回放撤销——
         // 免去 save_pos 整队列复制。
-        table_push(g_j_idx, g_pending_idx)
-        table_push(g_j_tag, g_pending[g_pending_idx])
-        table_push(g_j_line, g_pending_lines[g_pending_idx])
-        table_push(g_j_col, g_pending_cols[g_pending_idx])
-        table_push(g_j_lex, g_pending_lexemes[g_pending_idx])
+        // 日志必须按逻辑水位线 g_j_n 定位写入，不能无条件追加：restore_pos 只做
+        // 逻辑截断（g_j_n = g_save_j），物理表保留上次探测的旧条目；若追加写入，
+        // 物理位置与逻辑下标漂移，下一次 restore 会回放到前一批旧值而漏恢复本条，
+        // 表现为连续第二次嵌套泛型 `>>` 丢失闭合（报「实际是 LParen」）。
+        if g_j_n < len(g_j_idx) {
+            g_j_idx[g_j_n] = g_pending_idx
+            g_j_tag[g_j_n] = g_pending[g_pending_idx]
+            g_j_line[g_j_n] = g_pending_lines[g_pending_idx]
+            g_j_col[g_j_n] = g_pending_cols[g_pending_idx]
+            g_j_lex[g_j_n] = g_pending_lexemes[g_pending_idx]
+        } else {
+            table_push(g_j_idx, g_pending_idx)
+            table_push(g_j_tag, g_pending[g_pending_idx])
+            table_push(g_j_line, g_pending_lines[g_pending_idx])
+            table_push(g_j_col, g_pending_cols[g_pending_idx])
+            table_push(g_j_lex, g_pending_lexemes[g_pending_idx])
+        }
         g_j_n = g_j_n + 1
         g_pending[g_pending_idx] = remainder
     } else {
