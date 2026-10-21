@@ -1,0 +1,99 @@
+type tie<tsh>
+// tools/tiel/scripts/parity-tiel.tsh.tie —— tiel 与 tiec 的语义对拍
+// ============================================================
+// 职责：同一份 tie 源（带 main）分别交给 tiec 编译运行、tiel 直接执行，
+//   逐字节比对的 stdout 必须一致，作为内核语义的 oracle 门禁。
+// 用法（仓库根目录）：<tsh> -f tools/tiel/scripts/parity-tiel.tsh.tie
+// 前置：_local_only/bin/{tiec,tiel}.exe 已构建。
+// 退出码 = FAIL>0 ? 1 : 0。
+
+var tiec = ".\\_local_only\\bin\\tiec.exe"
+var tiel = ".\\_local_only\\bin\\tiel.exe"
+var pass: i64 = 0
+var fail: i64 = 0
+
+func norm(s: string) -> string {
+    return replace_all(s, "\r", "")
+}
+
+func case_path(name: string, ext: string) -> string {
+    return get_env("TEMP") + "\\tiel_par_" + name + ext
+}
+
+// 对拍：tiec 编译运行产物 vs tiel 直接执行产物，两者必须逐字相等。
+func parity(name: string, src: string) {
+    var tmp = case_path(name, ".tie")
+    var exe = case_path(name, ".exe")
+    var of1 = case_path(name, ".tie.out")
+    var of2 = case_path(name, ".tiel.out")
+    file_write(tmp, src)
+    var rc1 = exec_code("cmd /c " + tiec + " " + tmp + " -o " + exe + " >nul 2>&1")
+    var a = ""
+    if rc1 == 0 {
+        exec_code("cmd /c \"" + exe + "\" > \"" + of1 + "\" 2>&1")
+        a = norm(file_read(of1))
+    } else {
+        a = "<tiec 编译失败>"
+    }
+    exec_code("cmd /c " + tiel + " " + tmp + " > \"" + of2 + "\" 2>&1")
+    var b = norm(file_read(of2))
+    if a == b {
+        pass = pass + 1
+    } else {
+        fail = fail + 1
+        println("FAIL " + name)
+        println("  tiec=[" + a + "]")
+        println("  tiel=[" + b + "]")
+    }
+}
+
+// ---------- 正例：标量与运算 ----------
+parity("int_arith",
+    "func main() -> i64 {\n    var a = 7\n    var b = 3\n    println(a + b)\n    println(a - b)\n    println(a * b)\n    println(a / b)\n    println(a % b)\n    return 0\n}\n")
+
+parity("cmp_logic",
+    "func main() -> i64 {\n    var a = 1 < 2\n    var b = 2 <= 2\n    var c = 3 > 4\n    var d = 1 == 1\n    var e = 1 != 2\n    var f = true && false\n    var g = true || false\n    println(a)\n    println(b)\n    println(c)\n    println(d)\n    println(e)\n    println(f)\n    println(g)\n    return 0\n}\n")
+
+parity("bitops",
+    "func main() -> i64 {\n    println(6 & 3)\n    println(6 | 3)\n    println(6 ^ 3)\n    println(1 << 4)\n    println(16 >> 2)\n    return 0\n}\n")
+
+parity("unary",
+    "func main() -> i64 {\n    var x = 5\n    println(-x)\n    var y = -x + 3\n    println(y)\n    return 0\n}\n")
+
+// ---------- 正例：控制流 ----------
+parity("if_else",
+    "func main() -> i64 {\n    var x = 5\n    if x > 3 {\n        println(\"big\")\n    } else {\n        println(\"small\")\n    }\n    return 0\n}\n")
+
+parity("while_sum",
+    "func main() -> i64 {\n    var s = 0\n    var i = 1\n    while i <= 10 {\n        s = s + i\n        i = i + 1\n    }\n    println(s)\n    return 0\n}\n")
+
+parity("for_range",
+    "func main() -> i64 {\n    var s = 0\n    for i in 1..5 {\n        s = s + i\n    }\n    println(s)\n    return 0\n}\n")
+
+parity("for_incl",
+    "func main() -> i64 {\n    var s = 0\n    for i in 0..=3 {\n        s = s + i\n    }\n    println(s)\n    return 0\n}\n")
+
+parity("nested_break",
+    "func main() -> i64 {\n    var s = 0\n    for i in 0..3 {\n        for j in 0..3 {\n            if j == 2 {\n                break\n            }\n            s = s + 1\n        }\n    }\n    println(s)\n    return 0\n}\n")
+
+// ---------- 正例：聚合与字符串 ----------
+parity("arrays",
+    "func main() -> i64 {\n    var a = [10, 20, 30]\n    println(a[0])\n    println(a[2])\n    println(len(a))\n    a[1] = 99\n    println(a[1])\n    return 0\n}\n")
+
+parity("for_in",
+    "func main() -> i64 {\n    var a = [1, 2, 3]\n    var s = 0\n    for v in a {\n        s = s + v\n    }\n    println(s)\n    return 0\n}\n")
+
+parity("str_concat",
+    "func main() -> i64 {\n    var a = \"ab\"\n    var b = \"cd\"\n    println(a + b)\n    println(len(a + b))\n    return 0\n}\n")
+
+parity("interp",
+    "func main() -> i64 {\n    var name = \"world\"\n    var n = 3\n    println(h\"hello {name} {n + 1}\")\n    return 0\n}\n")
+
+// ---------- 正例：函数 ----------
+parity("recursion",
+    "func fact(n: i64) -> i64 {\n    if n <= 1 {\n        return 1\n    }\n    return n * fact(n - 1)\n}\n\nfunc main() -> i64 {\n    println(fact(5))\n    return 0\n}\n")
+
+println("=== 汇总: PASS=" + to_string(pass) + " FAIL=" + to_string(fail) + " ===")
+if fail > 0 {
+    exit(1)
+}

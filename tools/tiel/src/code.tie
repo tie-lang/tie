@@ -914,6 +914,14 @@ pub func cg_compile(root: i64) -> i64 {
     table_trunc(cg_vs, 0)
     vm_fn_base[entry] = cg_here()
 
+    // 同名脚本两边跑（tsc 源与 tie 源同构）：存在 main 就先调它，
+    // 无 main 的脚本维持原有顶层语句直跑语义。
+    var mf = cg_fid_of("main")
+    if mf >= 0 {
+        var mr = cg_alloc()
+        cg_emit(OP_CALL, mr, mf, 0)
+    }
+
     var k = 0
     while k < n {
         var d2 = em_ch[st + k]
