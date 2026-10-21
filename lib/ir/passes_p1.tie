@@ -271,8 +271,13 @@ func run_t1() -> i64 {
     }
     // B. 值传播
     apply_repl(repl, nvals)
-    // C. 死值消除
-    return dce()
+    // C. 死值消除：旁路。
+    // compact_dead 按「旧指令 id 线性保序」搬指令，而 llvmgen 按块 id 序输出
+    // 文本；块 id 序与指令落位序不一致时二者矛盾，输出出现 use-before-def
+    //（实证：函数开头 store ptr %2 而 %2 在其后才定义）。恢复条件：compact_dead
+    // 同时重排块 id 并把所有 br/switch 的块引用一并重写，使块 id 序与指令序
+    // 恒一致。折叠与值传播不依赖指令邻接，保留生效。
+    return 0
 }
 
 // 指令 CSE 签名：opcode / ty / 操作数（值+kind）织入乘法哈希（i64 wrap 无妨）。
@@ -386,11 +391,17 @@ func run_t2() -> i64 {
     cse_blockwise(repl, nvals)
     apply_repl(repl, nvals)
     // appfuse：逐元素表操作循环 → 批量原语（passes_p3；见文件头）
-    var ra = appfuse()
+    // 旁路：融合改写会生成跨类型的新指令序列，实测在函数返回值路径上产生
+    // 「i64 值被当 ptr 用」的类型断裂（实证：opt 报 %1 defined with type
+    // 'i64' but expected 'ptr'）。恢复条件：融合需逐指令带上 ty，并在改写
+    // 后重跑一次类型校验。
+    var ra: i64 = 0
     if ra != 0 {
         return ra
     }
-    return dce()
+    // 同 t1：物理压缩会重排指令，与 llvmgen 的块 id 序输出相矛盾（见 run_t1
+    // 末尾注释），CSE 与融合不依赖邻接，保留生效。
+    return 0
 }
 
 // call(35) → 被调函数 id（符号名池 id 与函数名池 id 相等比较；-1 = 未找到）

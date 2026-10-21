@@ -689,6 +689,26 @@ pub func compact_dead(dead: table<bool>) -> i64 {
     if removed == 0 {
         return 0
     }
+    // 护栏：重建后各块区间必须仍是单调无缝的合法分区（每块 start <= end，块间
+    // 不重叠，末块止于新指令总数）。块 id 序与指令落位序不一致时，按 id 序填
+    // start/end 会得到交错区间，llvmgen 按 id 序输出标签即错位——实测症状是
+    // 某块末尾的 br 落到前一块体内、下一块标签插在指令中间，opt 报 expected
+    // instruction opcode。守卫不通过则放弃物理删除，由调用方按「保守成功」
+    // 处理（dce 已按 rc < 0 走该分支）。
+    var pv_end: i64 = 0
+    var ck: i64 = 0
+    while ck < nb {
+        var c_s = new_start[ck]
+        var c_e = new_end[ck]
+        if c_s < 0 || c_e < 0 || c_s > c_e || c_s < pv_end {
+            return 0 - 2
+        }
+        pv_end = c_e
+        ck = ck + 1
+    }
+    if pv_end != len(n_op) {
+        return 0 - 2
+    }
     ir_insts_op = n_op
     ir_insts_ty = n_ty
     ir_insts_val = n_val
