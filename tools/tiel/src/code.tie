@@ -30,7 +30,9 @@ var cg_fid: table<i64> = [];            // 函数名 → 函数索引
 var cg_def: table<i64> = [];            // 函数名 → 定义节点
 var cg_lbr: table<i64> = [];            // break 待回填位置栈
 var cg_lbt: table<i64> = [];            // 每层循环的 break 栈起点
-var cg_lct: table<i64> = [];            // 每层循环的 continue 目标栈
+var cg_lct: table<i64> = [];            // 每层循环的 continue 目标
+var cg_llb: table<i64> = [];            // 每层循环的标签名 id（0 = 无标签）
+var cg_lbrl: table<i64> = [];           // break 补丁所属的循环层栈
 
 // ==================== 错误 ====================
 func cg_fail(msg: string) -> i64 {
@@ -440,48 +442,139 @@ func cg_if(id: i64) -> i64 {
     return 0
 }
 
+// ==================== 循环控制 ====================
+// 循环层用三张平行栈描述：cg_lbt（本层 break 栈起点）、cg_lct（continue 目标 pc）、
+// cg_llb（本层标签名 id）。break 补丁额外记一层归属，使带标签的 break 能跳过内层、
+// 由目标外层循环统一回填。
+
+// 定位 break/continue 的作用层：无标签取最内层，有标签自内向外找同名层。
+func cg_loop_layer(lbl: i64) -> i64 {
+    var n = len(cg_lbt)
+    if n == 0 { return -1 }
+    if lbl == 0 { return n - 1 }
+    var nm = em_namestr(lbl)
+    var i = n - 1
+    while i >= 0 {
+        var l2 = cg_llb[i]
+        if l2 != 0 && em_namestr(l2) == nm { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// 收层：回填本层登记的 break，把外层待回填项左移保留，然后弹出一层。
+func cg_loop_close(mark: i64, layer: i64, end: i64) {
+    var w = mark
+    var i = mark
+    while i < len(cg_lbr) {
+        if cg_lbrl[i] == layer {
+            cg_patch(cg_lbr[i], end)
+        } else {
+            cg_lbr[w] = cg_lbr[i]
+            cg_lbrl[w] = cg_lbrl[i]
+            w = w + 1
+        }
+        i = i + 1
+    }
+    table_trunc(cg_lbr, w)
+    table_trunc(cg_lbrl, w)
+    table_trunc(cg_lbt, len(cg_lbt) - 1)
+    table_trunc(cg_lct, len(cg_lct) - 1)
+    table_trunc(cg_llb, len(cg_llb) - 1)
+}
+
 func cg_while(id: i64) -> i64 {
     var c = em_get(id, 1)
     var b = em_get(id, 2)
+    var lbl = em_get(id, 3)
     var top = cg_here()
+    var mark = len(cg_lbr)
+    var layer = len(cg_lbt)
+    table_push(cg_lbt, mark)
+    table_push(cg_lct, top)
+    table_push(cg_llb, lbl)
     var cs = cg_expr(c)
     if cs < 0 { return -1 }
     cg_emit(OP_JMPF, 0, cs, 0)
     var jf = cg_here() - 1
-    table_push(cg_lbt, len(cg_lbr))
-    table_push(cg_lct, top)
     if cg_stmt(b) < 0 { return -1 }
     cg_emit(OP_JMP, top, 0, 0)
     var end = cg_here()
     cg_patch(jf, end)
-    var mark = cg_lbt[len(cg_lbt) - 1]
-    var i = mark
-    while i < len(cg_lbr) {
-        cg_patch(cg_lbr[i], end)
-        i = i + 1
+    cg_loop_close(mark, layer, end)
+    return 0
+}
+
+// range 形态：for v in lo..hi { body }。槽 3 = lo、4 = hi、5 = 是否闭区间、
+// 6 = body、7 = 标签名；1/2 是绑定区段（解构暂按单变量处理）。
+// 增量段放在条件下方、循环体之上：continue 的目标必须是增量，否则会原地
+// 重跑当前迭代。首轮迭代用一条 JMP 跳过增量。
+func cg_forrange(id: i64) -> i64 {
+    var lo = cg_expr(em_get(id, 3))
+    if lo < 0 { return -1 }
+    var hi = cg_expr(em_get(id, 4))
+    if hi < 0 { return -1 }
+    var incl = em_get(id, 5)
+    var body = em_get(id, 6)
+    var lbl = em_get(id, 7)
+    var vs = cg_alloc()
+    cg_emit(OP_MOV, vs, lo, 0)
+    var one = cg_alloc()
+    cg_emit(OP_LOADI, one, 1, 0)
+    cg_emit(OP_JMP, 0, 0, 0)
+    var jskip = cg_here() - 1
+    var top = cg_here()
+    cg_emit(OP_ADD, vs, vs, one)
+    var mark = len(cg_lbr)
+    var layer = len(cg_lbt)
+    table_push(cg_lbt, mark)
+    table_push(cg_lct, top)
+    table_push(cg_llb, lbl)
+    cg_patch(jskip, cg_here())
+    var cs = cg_alloc()
+    if incl != 0 {
+        cg_emit(OP_LE, cs, vs, hi)
+    } else {
+        cg_emit(OP_LT, cs, vs, hi)
     }
-    table_trunc(cg_lbr, mark)
-    table_trunc(cg_lbt, len(cg_lbt) - 1)
-    table_trunc(cg_lct, len(cg_lct) - 1)
+    cg_emit(OP_JMPF, 0, cs, 0)
+    var jf = cg_here() - 1
+    var m = cg_scope_mark()
+    var bs = em_get(id, 1)
+    var bn = em_get(id, 2)
+    var bi = 0
+    while bi < bn {
+        cg_bind(em_namestr(em_get(em_ch[bs + bi], 1)), vs)
+        bi = bi + 1
+    }
+    if cg_stmt(body) < 0 { return -1 }
+    cg_scope_drop(m)
+    cg_emit(OP_JMP, top, 0, 0)
+    var end = cg_here()
+    cg_patch(jf, end)
+    cg_loop_close(mark, layer, end)
     return 0
 }
 
 func cg_break(id: i64) -> i64 {
-    if len(cg_lbt) == 0 {
-        cg_fail("break 不在循环内")
+    var layer = cg_loop_layer(em_get(id, 1))
+    if layer < 0 {
+        cg_fail("break 不在循环内，或标签未找到")
         return -1
     }
     cg_emit(OP_JMP, 0, 0, 0)
     table_push(cg_lbr, cg_here() - 1)
+    table_push(cg_lbrl, layer)
     return 0
 }
 
 func cg_continue(id: i64) -> i64 {
-    if len(cg_lct) == 0 {
-        cg_fail("continue 不在循环内")
+    var layer = cg_loop_layer(em_get(id, 1))
+    if layer < 0 {
+        cg_fail("continue 不在循环内，或标签未找到")
         return -1
     }
-    cg_emit(OP_JMP, cg_lct[len(cg_lct) - 1], 0, 0)
+    cg_emit(OP_JMP, cg_lct[layer], 0, 0)
     return 0
 }
 
@@ -535,6 +628,7 @@ func cg_stmt(id: i64) -> i64 {
     }
     if tg == T_S_IF { return cg_if(id) }
     if tg == T_S_WHILE { return cg_while(id) }
+    if tg == T_S_FORRANGE { return cg_forrange(id) }
     if tg == T_S_RETURN { return cg_return(id) }
     if tg == T_S_BREAK { return cg_break(id) }
     if tg == T_S_CONTINUE { return cg_continue(id) }
