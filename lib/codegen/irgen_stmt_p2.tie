@@ -428,6 +428,21 @@ func tig_println(id: i64, newline: bool) -> i64 {
         ir.add_operand(inst, sv, 0)
         return ir.get_value(inst)
     }
+    // 布尔参数：i1 → zext i64 后按 "%lld" 打印。tie 的布尔打印为 0/1。
+    // 曾缺此分支：println(true) 与 println(1 < 2) 把 i1 直传 printf 的 %lld，
+    // opt 报 "'%0' defined with type 'i1' but expected 'i64'"。
+    if ast.node_type(arg) == types.named(TK_BOOL) {
+        var bv0 = tig_expr(arg)
+        if bv0 < 0 {
+            return -1
+        }
+        var bz = s21_zext(bv0, types.named(TK_BOOL))
+        var bfmt = interner.intern("%lld" + nl)
+        var binst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+        ir.add_operand(binst, bfmt, 0)
+        ir.add_operand(binst, bz, 0)
+        return ir.get_value(binst)
+    }
     // i128/u128 参数（批次 2）：内联除法循环生成十进制字符串 → "%s\n" + ptr。
     // 不能直传 printf（变参 i128 与 %lld 类型不匹配，opt 报类型错）。
     if ast.node_type(arg) == types.named(TK_I128) || ast.node_type(arg) == types.named(TK_U128) {
