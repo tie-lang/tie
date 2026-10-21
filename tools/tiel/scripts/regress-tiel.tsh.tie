@@ -164,6 +164,34 @@ expect_out("str_cat",
 
 expect_err("str_cat_bad", "println(\"ab\" + 1)\n", "操作数类型不支持")
 
+expect_out("interp_basic",
+    "var name = \"world\"\nprintln(h\"hello {name}\")\n",
+    "hello world\n")
+
+expect_out("interp_expr",
+    "println(h\"1+2={1 + 2}\")\n",
+    "1+2=3\n")
+
+expect_out("interp_multi",
+    "var a = 2\nvar b = 3\nprintln(h\"{a}x{b}={a * b}\")\n",
+    "2x3=6\n")
+
+expect_out("interp_escape",
+    "println(h\"{{lit}}\")\n",
+    "{lit}\n")
+
+expect_out("interp_plain",
+    "println(h\"no expr\")\n",
+    "no expr\n")
+
+expect_out("interp_index",
+    "var a = [10, 20]\nvar i = 1\nprintln(h\"v={a[i]}\")\n",
+    "v=20\n")
+
+expect_err("interp_empty", "println(h\"{}\")\n", "之间为空")
+
+expect_err("interp_bad", "println(h\"{1 +}\")\n", "无法解析")
+
 expect_out("label_break",
     "var n = 0\nouter: for a in 0..3 {\n    for b in 0..3 {\n        if b == 2 {\n            break outer\n        }\n        n = n + 1\n    }\n}\nprintln(n)\n",
     "2\n")

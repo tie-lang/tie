@@ -219,8 +219,65 @@ func cg_expr(id: i64) -> i64 {
     // 元组在本内核里按数组处理：两者都是有序异构序列，元素访问同样用下标。
     if tg == T_E_TUPLE { return cg_array(id) }
     if tg == T_E_INDEX { return cg_index(id) }
+    if tg == T_E_INTERP { return cg_interp(id) }
     cg_fail("暂不支持的表达式（tag " + to_string(tg) + "）")
     return -1
+}
+
+// 插值串的文本段里，{{ 与 }} 是字面花括号；拼接前还原成单个。
+func cg_unesc(s: string) -> string {
+    var n = len(s)
+    var i: i64 = 0
+    var out = ""
+    while i < n {
+        var b = str_byte(s, i)
+        if (b == 123 || b == 125) && i + 1 < n && str_byte(s, i + 1) == b {
+            out = out + str_sub_bytes(s, i, i + 1)
+            i = i + 2
+        } else {
+            out = out + str_sub_bytes(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// 插值串：各段依次求值，用字符串加法串起来；文本段在编译期进常量池。
+func cg_interp(id: i64) -> i64 {
+    var st = em_get(id, 1)
+    var n = em_get(id, 2)
+    var acc: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        var cid = em_ch[st + i]
+        var s: i64 = -1
+        if em_tag(cid) == T_E_STR {
+            var ci = vm_add_const(cg_unesc(cg_seg(cid, 1, 2)))
+            s = cg_alloc()
+            cg_emit(OP_LOADS, s, ci, 0)
+        } else {
+            s = cg_expr(cid)
+            if s < 0 { return -1 }
+            // 表达式段的静态类型在无类型推断的核心里不可知，统一在运行期转字符串。
+            var ts = cg_alloc()
+            cg_emit(OP_TOSTR, ts, s, 0)
+            s = ts
+        }
+        if acc < 0 {
+            acc = s
+        } else {
+            var t = cg_alloc()
+            cg_emit(OP_ADD, t, acc, s)
+            acc = t
+        }
+        i = i + 1
+    }
+    if acc < 0 {
+        var e = cg_alloc()
+        cg_emit(OP_LOADS, e, vm_add_const(""), 0)
+        return e
+    }
+    return acc
 }
 
 func cg_land(id: i64) -> i64 {

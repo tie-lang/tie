@@ -794,9 +794,10 @@ func ps_primary() -> i64 {
         return n3
     }
     if k == K_INTERP {
-        var n4 = em_new(T_E_INTERP)
-        em_put(n4, 1, ps_off_of(0))
-        em_put(n4, 2, ps_len_of(0))
+        var n4 = ps_interp_node(ps_off_of(0), ps_len_of(0))
+        if n4 < 0 {
+            return -1
+        }
         ps_adv()
         return n4
     }
@@ -2543,6 +2544,458 @@ func ps_decl_block() -> i64 {
     }
     var n = em_new(T_S_BLOCK)
     ps_set_seg(n, 1, kids)
+    return n
+}
+
+// ---------- 插值串 ----------
+// 主词法 lex.tie 是单态流（lx_pos 等为文件私有），重入会污染正在进行的解析，
+// 因此 h"…{expr}…" 里的表达式用只认字面量、标识符、字段、下标与常见运算符的
+// 独立扫描器解析；产出的节点与主解析器同构，字节码生成无需区分来源。
+
+var ip_s: string = ""
+var ip_n: i64 = 0
+var ip_p: i64 = 0
+var ip_base: i64 = 0
+var ip_k: i64 = -1
+var ip_o: i64 = 0
+var ip_l: i64 = 0
+var ip_id: i64 = 0
+var ip_bad: bool = false
+
+func ip_at(i: i64) -> i64 {
+    if i < 0 || i >= ip_n {
+        return -1
+    }
+    return str_byte(ip_s, i)
+}
+
+func ip_isdig(b: i64) -> bool {
+    return b >= 48 && b <= 57
+}
+
+func ip_isalpha(b: i64) -> bool {
+    if b >= 65 && b <= 90 {
+        return true
+    }
+    if b >= 97 && b <= 122 {
+        return true
+    }
+    if b == 95 {
+        return true
+    }
+    return b >= 128
+}
+
+func ip_isidc(b: i64) -> bool {
+    if ip_isalpha(b) {
+        return true
+    }
+    return ip_isdig(b)
+}
+
+func ip_begin(s: string, base: i64) {
+    ip_s = s
+    ip_n = len(s)
+    ip_p = 0
+    ip_base = base
+    ip_bad = false
+    ip_k = -1
+    ip_o = 0
+    ip_l = 0
+    ip_id = 0
+}
+
+// 取下一个子词元：kind 复用主词法的 K_* 值，源偏移换算回整文坐标。
+func ip_scan() {
+    if ip_bad {
+        ip_k = -1
+        return
+    }
+    while ip_p < ip_n {
+        var wb = ip_at(ip_p)
+        if wb == 32 || wb == 9 {
+            ip_p = ip_p + 1
+        } else {
+            break
+        }
+    }
+    if ip_p >= ip_n {
+        ip_k = K_EOF
+        ip_o = 0
+        ip_l = 0
+        ip_id = 0
+        return
+    }
+    var b = ip_at(ip_p)
+    var st = ip_p
+    if ip_isdig(b) {
+        while ip_p < ip_n {
+            var d = ip_at(ip_p)
+            var hex = (d >= 65 && d <= 70) || (d >= 97 && d <= 102)
+            if ip_isdig(d) || hex || d == 120 || d == 88 || d == 46 {
+                ip_p = ip_p + 1
+            } else {
+                break
+            }
+        }
+        ip_k = K_INT
+        ip_o = ip_base + st
+        ip_l = ip_p - st
+        return
+    }
+    if ip_isalpha(b) {
+        while ip_p < ip_n {
+            var c = ip_at(ip_p)
+            if ip_isidc(c) {
+                ip_p = ip_p + 1
+            } else {
+                break
+            }
+        }
+        var nm = str_sub_bytes(ip_s, st, ip_p)
+        ip_k = K_IDENT
+        ip_o = ip_base + st
+        ip_l = ip_p - st
+        ip_id = em_nameid(nm)
+        return
+    }
+    if b == 34 {
+        ip_p = ip_p + 1
+        while ip_p < ip_n {
+            var q = ip_at(ip_p)
+            if q == 92 {
+                ip_p = ip_p + 2
+            } else if q == 34 {
+                ip_p = ip_p + 1
+                break
+            } else {
+                ip_p = ip_p + 1
+            }
+        }
+        ip_k = K_STR
+        ip_o = ip_base + st
+        ip_l = ip_p - st
+        return
+    }
+    var b2 = ip_at(ip_p + 1)
+    ip_p = ip_p + 1
+    ip_o = ip_base + st
+    ip_l = 1
+    if b == 40 {
+        ip_k = K_LPAREN
+        return
+    }
+    if b == 41 {
+        ip_k = K_RPAREN
+        return
+    }
+    if b == 91 {
+        ip_k = K_LBRACKET
+        return
+    }
+    if b == 93 {
+        ip_k = K_RBRACKET
+        return
+    }
+    if b == 46 {
+        ip_k = K_DOT
+        return
+    }
+    if b == 43 {
+        ip_k = K_PLUS
+        return
+    }
+    if b == 45 {
+        ip_k = K_MINUS
+        return
+    }
+    if b == 42 {
+        ip_k = K_STAR
+        return
+    }
+    if b == 47 {
+        ip_k = K_SLASH
+        return
+    }
+    if b == 37 {
+        ip_k = K_PERCENT
+        return
+    }
+    if b == 61 && b2 == 61 {
+        ip_p = ip_p + 1
+        ip_l = 2
+        ip_k = K_EQEQ
+        return
+    }
+    if b == 33 && b2 == 61 {
+        ip_p = ip_p + 1
+        ip_l = 2
+        ip_k = K_NOTEQ
+        return
+    }
+    if b == 60 && b2 == 61 {
+        ip_p = ip_p + 1
+        ip_l = 2
+        ip_k = K_LE
+        return
+    }
+    if b == 62 && b2 == 61 {
+        ip_p = ip_p + 1
+        ip_l = 2
+        ip_k = K_GE
+        return
+    }
+    if b == 60 {
+        ip_k = K_LT
+        return
+    }
+    if b == 62 {
+        ip_k = K_GT
+        return
+    }
+    if b == 33 {
+        ip_k = K_BANG
+        return
+    }
+    ip_bad = true
+    ip_k = -1
+}
+
+func ip_atom() -> i64 {
+    if ip_k == K_INT {
+        var n = em_new(T_E_INT)
+        em_put(n, 1, ip_o)
+        em_put(n, 2, ip_l)
+        ip_scan()
+        return n
+    }
+    if ip_k == K_STR {
+        var n2 = em_new(T_E_STR)
+        var body = ip_l - 2
+        if body < 0 {
+            body = 0
+        }
+        em_put(n2, 1, ip_o + 1)
+        em_put(n2, 2, body)
+        ip_scan()
+        return n2
+    }
+    if ip_k == K_IDENT {
+        var nid = ip_id
+        ip_scan()
+        var n3 = em_new(T_E_IDENT)
+        em_put(n3, 1, nid)
+        return n3
+    }
+    if ip_k == K_LPAREN {
+        ip_scan()
+        var e = ip_expr()
+        if ip_k != K_RPAREN {
+            ip_bad = true
+            return e
+        }
+        ip_scan()
+        return e
+    }
+    ip_bad = true
+    return 0
+}
+
+func ip_post() -> i64 {
+    var l = ip_atom()
+    while true {
+        if ip_k == K_DOT {
+            ip_scan()
+            if ip_k != K_IDENT {
+                ip_bad = true
+                return l
+            }
+            var f = em_new(T_E_FIELD)
+            em_put(f, 1, l)
+            em_put(f, 2, ip_id)
+            ip_scan()
+            l = f
+        } else if ip_k == K_LBRACKET {
+            ip_scan()
+            var ix = ip_expr()
+            if ip_k != K_RBRACKET {
+                ip_bad = true
+                return l
+            }
+            ip_scan()
+            var g = em_new(T_E_INDEX)
+            em_put(g, 1, l)
+            em_put(g, 2, ix)
+            l = g
+        } else {
+            break
+        }
+    }
+    return l
+}
+
+func ip_un() -> i64 {
+    if ip_k == K_MINUS || ip_k == K_BANG {
+        var op = ip_k
+        ip_scan()
+        var e = ip_un()
+        var n = em_new(T_E_UN)
+        em_put(n, 1, op)
+        em_put(n, 2, e)
+        return n
+    }
+    return ip_post()
+}
+
+func ip_mul() -> i64 {
+    var l = ip_un()
+    while ip_k == K_STAR || ip_k == K_SLASH || ip_k == K_PERCENT {
+        var op = ip_k
+        ip_scan()
+        var r = ip_un()
+        var n = em_new(T_E_BIN)
+        em_put(n, 1, op)
+        em_put(n, 2, l)
+        em_put(n, 3, r)
+        l = n
+    }
+    return l
+}
+
+func ip_add() -> i64 {
+    var l = ip_mul()
+    while ip_k == K_PLUS || ip_k == K_MINUS {
+        var op = ip_k
+        ip_scan()
+        var r = ip_mul()
+        var n = em_new(T_E_BIN)
+        em_put(n, 1, op)
+        em_put(n, 2, l)
+        em_put(n, 3, r)
+        l = n
+    }
+    return l
+}
+
+func ip_cmp() -> i64 {
+    var l = ip_add()
+    if ip_k == K_EQEQ || ip_k == K_NOTEQ || ip_k == K_LT || ip_k == K_GT || ip_k == K_LE || ip_k == K_GE {
+        var op = ip_k
+        ip_scan()
+        var r = ip_add()
+        var n = em_new(T_E_BIN)
+        em_put(n, 1, op)
+        em_put(n, 2, l)
+        em_put(n, 3, r)
+        return n
+    }
+    return l
+}
+
+func ip_expr() -> i64 {
+    return ip_cmp()
+}
+
+func ps_interp_expr(body: string, cs: i64, a: i64, b: i64) -> i64 {
+    var sub = str_sub_bytes(body, a, b)
+    ip_begin(sub, cs + a)
+    ip_scan()
+    if ip_k == K_EOF {
+        ps_err_here("插值串里 '{}' 之间为空")
+        return -1
+    }
+    var e = ip_expr()
+    if ip_bad || ip_k != K_EOF {
+        ps_err_here("插值串里的表达式无法解析")
+        return -1
+    }
+    return e
+}
+
+// 把 h"…{expr}…" 拆成「文本段 = T_E_STR」与「表达式段 = 表达式节点」交替的子区段。
+func ps_interp_node(o: i64, l: i64) -> i64 {
+    var src = em_source()
+    // 词法层目前只把 h"…" 识别成插值串，三引号形式不会进入这里；
+    // 这段前缀探测先留着，词法层放开三引号后无需再改本函数。
+    var pre: i64 = 2
+    var suf: i64 = 1
+    if l >= 6 {
+        var q1 = str_byte(src, o + 1)
+        var q2 = str_byte(src, o + 2)
+        var q3 = str_byte(src, o + 3)
+        if q1 == 34 && q2 == 34 && q3 == 34 {
+            pre = 4
+            suf = 3
+        }
+    }
+    var cs = o + pre
+    var ce = o + l - suf
+    if ce < cs {
+        ce = cs
+    }
+    var body = str_sub_bytes(src, cs, ce)
+    var tn = len(body)
+    var segs: table<i64> = []
+    var p: i64 = 0
+    var ts: i64 = 0
+    while p < tn {
+        var b = str_byte(body, p)
+        if b == 123 {
+            if p + 1 < tn && str_byte(body, p + 1) == 123 {
+                p = p + 2
+            } else {
+                if p > ts {
+                    var sn = em_new(T_E_STR)
+                    em_put(sn, 1, cs + ts)
+                    em_put(sn, 2, p - ts)
+                    table_push(segs, sn)
+                }
+                var q = p + 1
+                var depth: i64 = 1
+                var qe: i64 = -1
+                while q < tn {
+                    var bq = str_byte(body, q)
+                    if bq == 123 {
+                        depth = depth + 1
+                    } else if bq == 125 {
+                        depth = depth - 1
+                        if depth == 0 {
+                            qe = q
+                            break
+                        }
+                    }
+                    q = q + 1
+                }
+                if qe < 0 {
+                    ps_err_here("插值串缺少配对的 '}'")
+                    return -1
+                }
+                var ex = ps_interp_expr(body, cs, p + 1, qe)
+                if ex < 0 {
+                    return -1
+                }
+                table_push(segs, ex)
+                p = qe + 1
+                ts = p
+            }
+        } else if b == 125 {
+            if p + 1 < tn && str_byte(body, p + 1) == 125 {
+                p = p + 2
+            } else {
+                p = p + 1
+            }
+        } else {
+            p = p + 1
+        }
+    }
+    if p > ts {
+        var sn2 = em_new(T_E_STR)
+        em_put(sn2, 1, cs + ts)
+        em_put(sn2, 2, p - ts)
+        table_push(segs, sn2)
+    }
+    var n = em_new(T_E_INTERP)
+    ps_set_seg(n, 1, segs)
     return n
 }
 

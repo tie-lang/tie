@@ -243,6 +243,10 @@ pub func vm_run() -> i64 {
                 vm_bad_op("加法")
                 pc = pc + 1
             }
+        } else if op == OP_TOSTR {
+            // 插值串里的非字符串值按显示形式转成字符串，与 print 的呈现一致。
+            vm_set(base + a, vm_add_const(vm_show(base + b)), VT_STR)
+            pc = pc + 1
         } else if op == OP_SUB {
             if vm_typ[base + b] == VT_INT && vm_typ[base + c] == VT_INT {
                 vm_set(base + a, vm_val[base + b] - vm_val[base + c], VT_INT)
