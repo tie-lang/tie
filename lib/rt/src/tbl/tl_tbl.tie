@@ -173,7 +173,7 @@ pub unsafe fn tbl_esz(h: i64) -> i64 {
 }
 
 // 扩容核心（调用方**已持锁**，且把 cap/len/data/esz 读入并传入）：need > cap 时
-// 增长（cap=0→8，否则 1.5x，至少 need），返回新 data（i64）；缓冲可能换址。
+// 增长（cap=0→8，否则翻倍，至少 need），返回新 data（i64）；缓冲可能换址。
 // **不重读句柄字段**——句柄字段走 r_i64 = 8 次逐字节读，热路径上重复读纯属浪费。
 // r.1.6.6：原 ensure_locked 内部重读 cap/len/data/esz（32 次字节访问），而
 // tbl_push 每元素调一次 → 冗余显著；抽出参数化版本供 push/append/reserve 复用。
@@ -183,7 +183,7 @@ unsafe fn grow(p: ptr<u8>, cap: i64, len: i64, data: i64, esz: i64, need: i64) -
     }
     var newcap: i64 = 8
     if cap > 0 {
-        newcap = cap + cap / 2
+        newcap = cap * 2
     }
     if newcap < need {
         newcap = need
