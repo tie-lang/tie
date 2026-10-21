@@ -29,6 +29,12 @@ var vm_fbase: table<i64> = [];             // 调用者帧基址栈
 var vm_fret: table<i64> = [];              // 返回 pc 栈
 var vm_fdst: table<i64> = [];              // 返回值目标槽栈
 var vm_fnsz: table<i64> = [];              // 帧槽数栈
+// 数组对象池：vm_aof[i] 是第 i 个数组在 vm_aro 里的起点，vm_aln[i] 是长度。
+// 元素值与类型分两表平行存放；不回收，进程内单调增长（草案 §6 的取舍）。
+var vm_aro: table<i64> = [];
+var vm_art: table<i64> = [];
+var vm_aof: table<i64> = [];
+var vm_aln: table<i64> = [];
 
 // ---------- 模块装载 ----------
 pub func vm_reset() {
@@ -41,6 +47,10 @@ pub func vm_reset() {
     vm_err = ""
     vm_retval = 0
     vm_rettype = 0
+    vm_aro = []
+    vm_art = []
+    vm_aof = []
+    vm_aln = []
 }
 
 pub func vm_add_const(s: string) -> i64 {
@@ -90,7 +100,36 @@ func vm_show(slot: i64) -> string {
         if idx >= 0 && idx < len(vm_consts) { return vm_consts[idx] }
         return ""
     }
+    if t == VT_ARR { return vm_show_arr(vm_val[slot]) }
     return "nil"
+}
+
+// 数组按 [e0, e1, ...] 展开；元素自身也可以是数组，递归到底。
+func vm_show_arr(ai: i64) -> string {
+    if ai < 0 || ai >= len(vm_aln) { return "[]" }
+    var off = vm_aof[ai]
+    var n = vm_aln[ai]
+    var s = "["
+    var i = 0
+    while i < n {
+        if i > 0 { s = s + ", " }
+        var p = off + i
+        var t = vm_art[p]
+        if t == VT_INT {
+            s = s + to_string(vm_aro[p])
+        } else if t == VT_BOOL {
+            if vm_aro[p] != 0 { s = s + "true" } else { s = s + "false" }
+        } else if t == VT_STR {
+            var ci = vm_aro[p]
+            if ci >= 0 && ci < len(vm_consts) { s = s + vm_consts[ci] }
+        } else if t == VT_ARR {
+            s = s + vm_show_arr(vm_aro[p])
+        } else {
+            s = s + "nil"
+        }
+        i = i + 1
+    }
+    return s + "]"
 }
 
 // ---------- 布尔与比较辅助 ----------
@@ -328,6 +367,53 @@ pub func vm_run() -> i64 {
             vm_typ[cb + cd] = rt
             base = cb
             pc = cp
+        } else if op == OP_NEWARR {
+            var n = b
+            var ai = len(vm_aln)
+            var off = len(vm_aro)
+            table_push(vm_aof, off)
+            table_push(vm_aln, n)
+            var k: i64 = 0
+            while k < n {
+                table_push(vm_aro, vm_val[base + c + k])
+                table_push(vm_art, vm_typ[base + c + k])
+                k = k + 1
+            }
+            vm_set(base + a, ai, VT_ARR)
+            pc = pc + 1
+        } else if op == OP_INDEX {
+            var ai2 = vm_val[base + b]
+            if vm_typ[base + b] != VT_ARR {
+                vm_bad_op("下标")
+            } else if ai2 < 0 || ai2 >= len(vm_aln) {
+                if str_len(vm_err) == 0 { vm_err = "运行时错误：数组对象越界" }
+            } else {
+                var ix = vm_val[base + c]
+                if ix < 0 || ix >= vm_aln[ai2] {
+                    if str_len(vm_err) == 0 { vm_err = "运行时错误：下标越界" }
+                } else {
+                    var p = vm_aof[ai2] + ix
+                    vm_set(base + a, vm_aro[p], vm_art[p])
+                }
+            }
+            pc = pc + 1
+        } else if op == OP_LEN {
+            if vm_typ[base + b] == VT_ARR {
+                var ai3 = vm_val[base + b]
+                if ai3 >= 0 && ai3 < len(vm_aln) {
+                    vm_set(base + a, vm_aln[ai3], VT_INT)
+                } else {
+                    vm_set(base + a, 0, VT_INT)
+                }
+            } else if vm_typ[base + b] == VT_STR {
+                var ci = vm_val[base + b]
+                var sl = 0
+                if ci >= 0 && ci < len(vm_consts) { sl = str_len(vm_consts[ci]) }
+                vm_set(base + a, sl, VT_INT)
+            } else {
+                vm_bad_op("取长度")
+            }
+            pc = pc + 1
         } else if op == OP_PRINT {
             println(vm_show(base + a))
             pc = pc + 1

@@ -215,6 +215,10 @@ func cg_expr(id: i64) -> i64 {
     if tg == T_E_CALL { return cg_call(id) }
     if tg == T_E_ASSIGN { return cg_assign(id) }
     if tg == T_E_TERNARY { return cg_ternary(id) }
+    if tg == T_E_TABLE { return cg_array(id) }
+    // 元组在本内核里按数组处理：两者都是有序异构序列，元素访问同样用下标。
+    if tg == T_E_TUPLE { return cg_array(id) }
+    if tg == T_E_INDEX { return cg_index(id) }
     cg_fail("暂不支持的表达式（tag " + to_string(tg) + "）")
     return -1
 }
@@ -301,6 +305,35 @@ func cg_un(id: i64) -> i64 {
     return -1
 }
 
+// 数组字面量 [e0, e1, ...]：先把各元素求值到连续槽，再一次成形。
+// 空字面量 [] 允许，此时不占用任何连续槽。
+func cg_array(id: i64) -> i64 {
+    var st = em_get(id, 1)
+    var n = em_get(id, 2)
+    var ab = cg_alloc_n(n)
+    var i = 0
+    while i < n {
+        var ei = cg_expr(em_ch[st + i])
+        if ei < 0 { return -1 }
+        if ei != ab + i { cg_emit(OP_MOV, ab + i, ei, 0) }
+        i = i + 1
+    }
+    var s = cg_alloc()
+    cg_emit(OP_NEWARR, s, n, ab)
+    return s
+}
+
+// 下标 a[i]：先求左值得到数组对象，再求下标值。
+func cg_index(id: i64) -> i64 {
+    var ls = cg_expr(em_get(id, 1))
+    if ls < 0 { return -1 }
+    var ix = cg_expr(em_get(id, 2))
+    if ix < 0 { return -1 }
+    var s = cg_alloc()
+    cg_emit(OP_INDEX, s, ls, ix)
+    return s
+}
+
 func cg_call(id: i64) -> i64 {
     var callee = em_get(id, 1)
     if em_tag(callee) != T_E_IDENT {
@@ -312,6 +345,13 @@ func cg_call(id: i64) -> i64 {
     var n = em_get(id, 3)
     var fid = cg_fid_of(nm)
     if fid < 0 {
+        if nm == "len" && n == 1 {
+            var a1 = cg_expr(em_ch[st + 0])
+            if a1 < 0 { return -1 }
+            var s1 = cg_alloc()
+            cg_emit(OP_LEN, s1, a1, 0)
+            return s1
+        }
         if nm == "println" || nm == "print" {
             var i0 = 0
             while i0 < n {
@@ -556,6 +596,55 @@ func cg_forrange(id: i64) -> i64 {
     return 0
 }
 
+// 序列形态：for v in xs { body }。槽 3 = 源序列、4 = body、5 = 标签名，
+// 1/2 是绑定区段（当前按单变量处理）。与 range 形态同构：增量段置于条件
+// 之下、循环体之上，首轮用一条 JMP 跳过，continue 正好落在增量段。
+func cg_forin(id: i64) -> i64 {
+    var src = cg_expr(em_get(id, 3))
+    if src < 0 { return -1 }
+    var body = em_get(id, 4)
+    var lbl = em_get(id, 5)
+    var st = em_get(id, 1)
+    var sn = em_get(id, 2)
+    if sn < 1 {
+        cg_fail("for-in 需要一个循环变量")
+        return -1
+    }
+    var vs = cg_alloc()
+    var ix = cg_alloc()
+    var one = cg_alloc()
+    cg_emit(OP_LOADI, ix, 0, 0)
+    cg_emit(OP_LOADI, one, 1, 0)
+    cg_emit(OP_JMP, 0, 0, 0)
+    var jskip = cg_here() - 1
+    var top = cg_here()
+    cg_emit(OP_ADD, ix, ix, one)
+    var mark = len(cg_lbr)
+    var layer = len(cg_lbt)
+    table_push(cg_lbt, mark)
+    table_push(cg_lct, top)
+    table_push(cg_llb, lbl)
+    cg_patch(jskip, cg_here())
+    var nsl = cg_alloc()
+    cg_emit(OP_LEN, nsl, src, 0)
+    var cs = cg_alloc()
+    cg_emit(OP_LT, cs, ix, nsl)
+    cg_emit(OP_JMPF, 0, cs, 0)
+    var jf = cg_here() - 1
+    var es = cg_alloc()
+    cg_emit(OP_INDEX, es, src, ix)
+    cg_emit(OP_MOV, vs, es, 0)
+    var m = cg_scope_mark()
+    cg_bind(em_namestr(em_get(em_ch[st], 1)), vs)
+    if cg_stmt(body) < 0 { return -1 }
+    cg_scope_drop(m)
+    cg_emit(OP_JMP, top, 0, 0)
+    var end = cg_here()
+    cg_patch(jf, end)
+    cg_loop_close(mark, layer, end)
+    return 0
+}
+
 func cg_break(id: i64) -> i64 {
     var layer = cg_loop_layer(em_get(id, 1))
     if layer < 0 {
@@ -629,6 +718,7 @@ func cg_stmt(id: i64) -> i64 {
     if tg == T_S_IF { return cg_if(id) }
     if tg == T_S_WHILE { return cg_while(id) }
     if tg == T_S_FORRANGE { return cg_forrange(id) }
+    if tg == T_S_FORIN { return cg_forin(id) }
     if tg == T_S_RETURN { return cg_return(id) }
     if tg == T_S_BREAK { return cg_break(id) }
     if tg == T_S_CONTINUE { return cg_continue(id) }
