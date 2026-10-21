@@ -94,6 +94,30 @@ expect_out("while_cont",
     "var i = 0\nvar s = 0\nwhile i < 6 {\n    i = i + 1\n    if i == 3 { continue }\n    s = s + i\n}\nprintln(s)\n",
     "18\n")
 
+expect_out("forrange",
+    "var s = 0\nfor i in 1..5 {\n    s = s + i\n}\nprintln(s)\n",
+    "10\n")
+
+expect_out("forrange_incl",
+    "var s = 0\nfor i in 0..=3 {\n    s = s + i\n}\nprintln(s)\n",
+    "6\n")
+
+expect_out("forrange_cont",
+    "var c = 0\nfor i in 0..10 {\n    if i % 2 == 0 {\n        continue\n    }\n    c = c + 1\n}\nprintln(c)\n",
+    "5\n")
+
+expect_out("forrange_nest_break",
+    "var n = 0\nfor a in 0..3 {\n    for b in 0..3 {\n        if b == 2 {\n            break\n        }\n        n = n + 1\n    }\n}\nprintln(n)\n",
+    "6\n")
+
+expect_out("label_break",
+    "var n = 0\nouter: for a in 0..3 {\n    for b in 0..3 {\n        if b == 2 {\n            break outer\n        }\n        n = n + 1\n    }\n}\nprintln(n)\n",
+    "2\n")
+
+expect_out("label_cont",
+    "var m = 0\nskip: for i in 0..6 {\n    if i < 3 {\n        continue skip\n    }\n    m = m + 1\n}\nprintln(m)\n",
+    "3\n")
+
 // ---------- 正例：函数与递归 ----------
 expect_out("func",
     "func add(x: i64, y: i64) -> i64 {\n    return x + y\n}\nprintln(add(3, 4))\n",
