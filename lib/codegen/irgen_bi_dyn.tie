@@ -431,8 +431,13 @@ if nm == "table_push" {
     // r.1.6.7 独占免锁：目标表是第一实参且为**裸局部变量**、静态证得独占
     // （句柄从未离开本次调用）→ tbl_push_nl。判据见 irgen_esc.tie。
     // r.1.6.14：值语义模式下先分离（默认关 ⇒ no-op，逐指令等价）
-    t = tig_cow_before_write(t, tnid)
-    s21_table_push_ex(t, pty, x, esc_take(tname_node, "table_push"))
+    var ex_p = esc_take(tname_node, "table_push")
+    // 独占（或持 lock 凭据）⇒ 句柄无别名、rc 必为 1 ⇒ COW 分离是空操作，跳过省一次调用。
+    // 非独占才需要按 rc 分流：共享表写前必须拷出私有副本，否则改到别名头上。
+    if !ex_p {
+        t = tig_cow_before_write(t, tnid)
+    }
+    s21_table_push_ex(t, pty, x, ex_p)
     g_builtin_res = tig_int_lit(0)  // void 结果：哑值（调用方丢弃）
     return 0
 }
@@ -533,7 +538,10 @@ if nm == "table_append" {
     // （只查询版本，不重复计数）。双成立才走 _nl 入口。
     var nl_ok = esc_take(tname_node, "table_append") && esc_live_or_lock(s_node)
     // r.1.6.14 值语义分离（默认关 ⇒ no-op；非全局槽目标，对齐 table_push）
-    t = tig_cow_before_write(t, tnid)
+    // 独占免锁时句柄无别名 ⇒ 分离是空操作，跳过（对齐 table_push 的判据）。
+    if !nl_ok {
+        t = tig_cow_before_write(t, tnid)
+    }
     g_used_trmlite = true
     if nl_ok {
         tl_void_3("tl_tbl$tbl_append_tbl_nl", t21_ptri(t), t21_ptri(s), nv)
@@ -625,7 +633,10 @@ if nm == "table_append_raw" {
         return -1
     }
     var nl_ok = esc_take(tname_node, "table_append_raw")
-    t = tig_cow_before_write(t, tnid)
+    // 独占免锁 ⇒ 分离是空操作，跳过（对齐 table_push 的判据）。
+    if !nl_ok {
+        t = tig_cow_before_write(t, tnid)
+    }
     var addr = t21_ptri(p)
     if nl_ok {
         tl_void_3("tl_tbl$tbl_append_nl", t21_ptri(t), addr, nv)

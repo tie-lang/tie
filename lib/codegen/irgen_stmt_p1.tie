@@ -798,12 +798,14 @@ func tig_index_assign(id: i64) -> i64 {
             v = bx
         }
     }
+    // r.1.6.7 独占免锁：写路径同样按独占判定选免锁入口（越界静默跳过语义不变）
+    var ex_w = esc_take(base, "写 t[i]")
     // r.1.6.14：值语义模式下先分离（裸变量目标；默认关 ⇒ no-op）
-    if ast.s_tag(base) == 6 {
+    // 独占免锁时句柄无别名 ⇒ 分离是空操作，跳过（对齐 table_push 的判据）。
+    if !ex_w && ast.s_tag(base) == 6 {
         t = tig_cow_before_write(t, interner.intern(sstate.name_str(base)))
     }
-    // r.1.6.7 独占免锁：写路径同样按独占判定选免锁入口（越界静默跳过语义不变）
-    s21_table_set_ex(t, iv, pty, v, esc_take(base, "写 t[i]"))
+    s21_table_set_ex(t, iv, pty, v, ex_w)
     return 0
 }
 
