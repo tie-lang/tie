@@ -384,8 +384,12 @@ func cg_assign(id: i64) -> i64 {
     var op = em_get(id, 1)
     var tg = em_get(id, 2)
     var val = em_get(id, 3)
-    if em_tag(tg) != T_E_IDENT {
-        cg_fail("暂只支持变量赋值")
+    var tgk = em_tag(tg)
+    if tgk == T_E_INDEX {
+        return cg_assign_idx(op, tg, val)
+    }
+    if tgk != T_E_IDENT {
+        cg_fail("暂只支持变量与下标赋值")
         return -1
     }
     var nm = em_namestr(em_get(tg, 1))
@@ -417,6 +421,42 @@ func cg_assign(id: i64) -> i64 {
     }
     cg_emit(bop, sl, sl, vs)
     return sl
+}
+
+// 下标赋值：a[i] = v，以及 a[i] += v 这类复合赋值（先读回旧值再算再写回）。
+// 对象与下标都只求值一次，避免重复求值带来的副作用差异。
+func cg_assign_idx(op: i64, tg: i64, val: i64) -> i64 {
+    var arr = cg_expr(em_get(tg, 1))
+    if arr < 0 { return -1 }
+    var ix = cg_expr(em_get(tg, 2))
+    if ix < 0 { return -1 }
+    var vs = cg_expr(val)
+    if vs < 0 { return -1 }
+    if op == K_EQ {
+        cg_emit(OP_SETIDX, arr, ix, vs)
+        return vs
+    }
+    var bop: i64 = -1
+    if op == K_PLUSEQ { bop = OP_ADD }
+    else if op == K_MINUSEQ { bop = OP_SUB }
+    else if op == K_STAREQ { bop = OP_MUL }
+    else if op == K_SLASHEQ { bop = OP_DIV }
+    else if op == K_PERCENTEQ { bop = OP_MOD }
+    else if op == K_AMPEQ { bop = OP_BAND }
+    else if op == K_PIPEEQ { bop = OP_BOR }
+    else if op == K_CARETEQ { bop = OP_BXOR }
+    else if op == K_SHLEQ { bop = OP_SHL }
+    else if op == K_SHREQ { bop = OP_SHR }
+    if bop < 0 {
+        cg_fail("暂不支持的下标复合赋值运算符（kind " + to_string(op) + "）")
+        return -1
+    }
+    var cur = cg_alloc()
+    cg_emit(OP_INDEX, cur, arr, ix)
+    var nv = cg_alloc()
+    cg_emit(bop, nv, cur, vs)
+    cg_emit(OP_SETIDX, arr, ix, nv)
+    return nv
 }
 
 func cg_ternary(id: i64) -> i64 {

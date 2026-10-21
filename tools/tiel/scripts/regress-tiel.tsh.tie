@@ -142,6 +142,28 @@ expect_out("forin_label",
     "var m = [[1, 2], [3]]\nvar c = 0\nout: for r in m {\n    for v in r {\n        if v == 2 { break out }\n        c = c + v\n    }\n}\nprintln(c)\n",
     "1\n")
 
+expect_out("idx_assign",
+    "var a = [1, 2, 3]\na[1] = 9\nprintln(a)\n",
+    "[1, 9, 3]\n")
+
+expect_out("idx_compound",
+    "var a = [1, 2, 3]\na[0] += 5\nprintln(a[0])\na[2] *= 3\nprintln(a[2])\n",
+    "6\n9\n")
+
+expect_out("idx_nest",
+    "var m = [[1, 2], [3]]\nm[0][1] = 8\nprintln(m)\n",
+    "[[1, 8], [3]]\n")
+
+expect_out("idx_str",
+    "var s = [\"x\", \"y\"]\ns[0] = s[1] + \"z\"\nprintln(s)\n",
+    "[yz, y]\n")
+
+expect_out("str_cat",
+    "var a = \"ab\"\nvar b = \"cd\"\nprintln(a + b)\n",
+    "abcd\n")
+
+expect_err("str_cat_bad", "println(\"ab\" + 1)\n", "操作数类型不支持")
+
 expect_out("label_break",
     "var n = 0\nouter: for a in 0..3 {\n    for b in 0..3 {\n        if b == 2 {\n            break outer\n        }\n        n = n + 1\n    }\n}\nprintln(n)\n",
     "2\n")

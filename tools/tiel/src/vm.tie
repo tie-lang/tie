@@ -232,6 +232,13 @@ pub func vm_run() -> i64 {
             if vm_typ[base + b] == VT_INT && vm_typ[base + c] == VT_INT {
                 vm_set(base + a, vm_val[base + b] + vm_val[base + c], VT_INT)
                 pc = pc + 1
+            } else if vm_typ[base + b] == VT_STR && vm_typ[base + c] == VT_STR {
+                // 字符串是不可变值，拼接结果落进常量池。无回收（草案 §6），
+                // 循环内反复拼接会持续增长常量池，属已知代价。
+                var sa = vm_consts[vm_val[base + b]]
+                var sb = vm_consts[vm_val[base + c]]
+                vm_set(base + a, vm_add_const(sa + sb), VT_STR)
+                pc = pc + 1
             } else {
                 vm_bad_op("加法")
                 pc = pc + 1
@@ -394,6 +401,25 @@ pub func vm_run() -> i64 {
                 } else {
                     var p = vm_aof[ai2] + ix
                     vm_set(base + a, vm_aro[p], vm_art[p])
+                }
+            }
+            pc = pc + 1
+        } else if op == OP_SETIDX {
+            var si = vm_val[base + a]
+            if vm_typ[base + a] != VT_ARR {
+                vm_bad_op("下标赋值")
+            } else if si < 0 || si >= len(vm_aln) {
+                if str_len(vm_err) == 0 { vm_err = "运行时错误：数组对象越界" }
+            } else {
+                var sj = vm_val[base + b]
+                if vm_typ[base + b] != VT_INT {
+                    vm_bad_op("下标赋值")
+                } else if sj < 0 || sj >= vm_aln[si] {
+                    if str_len(vm_err) == 0 { vm_err = "运行时错误：下标越界" }
+                } else {
+                    var sp = vm_aof[si] + sj
+                    vm_aro[sp] = vm_val[base + c]
+                    vm_art[sp] = vm_typ[base + c]
                 }
             }
             pc = pc + 1
