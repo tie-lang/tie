@@ -57,9 +57,18 @@ func tc_w_flag() -> string {
 
 // 机器码档状态（-c<0-2> → clang -O<n>）；namespace 体内禁 var，故置于文件顶层。
 var g_cg_opt: i64 = 0;
+// 本机 SIMD 指令集开关（-t3/-l3 档置位）。置位后 clang 追加 -march=native，
+// LLVM 自动向量化改用宿主 CPU 的最宽向量寄存器（AVX2 的 256 位等），
+// 循环向量化宽度翻倍。-march=native 生成绑定宿主 CPU 的二进制，故只在最高档开启。
+var g_native_simd: bool = false;
 
 namespace tc {
 // ---------- 工具发现 ----------
+
+// 本机 SIMD 指令集开关（driver 调用；最高优化档置位）。
+pub func set_native_simd(on: bool) {
+    g_native_simd = on
+}
 
 // S1.4：注入 --ffast-math 开关（driver 调用；置位后 opt/clang 追加 -ffast-math）。
 pub func set_fast_math(v: bool) {
@@ -197,8 +206,13 @@ pub func set_clang_opt(v: i64) {
     g_cg_opt = v
 }
 // clang 的 -O 旗标文本（前导空格；0 时显式 -O0，避免默认随 LLVM 版本漂移）
+// 置位本机 SIMD 时追加 -march=native，让自动向量化用满宿主向量宽度。
 pub func tc_cg_flag() -> string {
-    return " -O" + to_string(g_cg_opt)
+    var s = " -O" + to_string(g_cg_opt)
+    if g_native_simd {
+        s = s + " -march=native"
+    }
+    return s
 }
 
 // 中间优化：opt -O{level} -S in.ll -o out.opt.ll。level 0..2（仅 -l0/-l1 与 --opt=<n> 会调用）。

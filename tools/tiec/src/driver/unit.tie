@@ -19,9 +19,14 @@ pub func run_unit() -> i64 {
     irgen.set_check_bounds(true)
     // 机器码档（clang -O）接线：-c<0-2> / --codegen-opt / config codegen_opt
     tc.set_clang_opt(driver.effective_clang_opt())
+    // 最高优化档（-t3 或 -l3）开启本机 SIMD：clang 追加 -march=native，
+    // LLVM 自动向量化用满宿主向量宽度（AVX2/AVX-512），未置位时默认 SSE。
+    tc.set_native_simd(driver.effective_tie_opt() >= 3 || driver.effective_llvm_opt() >= 3)
     irgen.set_esc_audit(g_cli_esc_audit)
-    // p.9.20.5 tail call：t>=1 启用文本级 tail 提示（t0 保持不动点基线）
-    llvmgen.set_tail_enable(driver.effective_tie_opt() >= 1 ? 1 : 0)
+    // p.9.20.5 tail call 文本提示：-t1/-t2/-t3 下会生成缺块终结指令的非法 IR
+    // （opt 报 expected instruction opcode，bb3 标签插在循环体回边之前），
+    // 暂停用；-t 轴改为承载「-t3 最高档开启本机 SIMD 自动向量化」。
+    llvmgen.set_tail_enable(0)
     tc.set_fast_math(g_cli_fast_math)
     tc.set_no_warn(g_no_warn)
     // p.9.13.7-B：CLI 显式库根（--lib-root）注入前端 import 解析。
