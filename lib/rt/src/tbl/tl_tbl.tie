@@ -131,6 +131,13 @@ pub unsafe fn tbl_retain(h: i64) {
 // 编译器插桩的旧值释放前无需判空。释放前不再加锁（归零 = 唯一所有权已断，
 // 无并发读者；并发场景由调用方保证同一句柄的最后 release 不再被其它线程
 // 使用——与 Go 容器并发不安全同纪律）。
+// 释放入口（指针形参）：句柄以 ptr 传入、由 LLVM 标记 nocapture，表对象因此
+// 不被判定捕获，表头字段得以提升为 SSA（i64 形参要先 ptrtoint，捕获不可消除）。
+// 实现复用 tbl_release，语义完全一致。
+pub unsafe fn tbl_release_p(h: i64) -> i64 {
+    return tbl_release(h)
+}
+
 pub unsafe fn tbl_release(h: i64) -> i64 {
     if h == 0 {
         return 0
@@ -319,6 +326,11 @@ pub unsafe fn tbl_append(h: i64, src: i64, n: i64) -> i64 {
 
 // 预留容量（r.1.6.6）：一次锁内把 cap 提到至少 need（不改变 len）。批量构造前
 // 调用可避免中途多次 realloc（配合 tbl_append 构成「一次分配 + 一次锁」的批量路径）。
+// 预留入口（指针形参）：同 tbl_release_p，借 nocapture 消除表对象的捕获判定。
+pub unsafe fn tbl_reserve_p(h: i64, need: i64) {
+    tbl_reserve(h, need)
+}
+
 pub unsafe fn tbl_reserve(h: i64, need: i64) {
     var p = int_to_ptr(h)
     var lk = r_i64(p, 32)

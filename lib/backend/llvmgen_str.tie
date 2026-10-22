@@ -408,6 +408,14 @@ func ext_sort() {
 //            tie_copy_dir(ptr, ptr) / tie_byte_write(ptr, ptr)
 // 注意：返回 void 的桥在 irgen 用 ty=-1 建指令（无结果寄存器）。
 func extern_decl(sym: string) -> string {
+    // 表释放（指针形参）：显式 declare 带 nocapture，令 LLVM 认定该指针不被捕获，
+    // 表对象因此可被 SROA 拆解、表头字段提升为 SSA。codegen 侧传 ptr 而非 ptrtoint。
+    if sym == "tl_tbl$tbl_release_p" {
+        return "declare void @tl_tbl$tbl_release_p(ptr nocapture)"
+    }
+    if sym == "tl_tbl$tbl_reserve_p" {
+        return "declare void @tl_tbl$tbl_reserve_p(ptr nocapture, i64)"
+    }
     // S2.1：libc memcpy（StringBuilder 数据拷贝；clang 链接 CRT 提供）
     if sym == "memcpy" {
         return "declare void @memcpy(ptr, ptr, i64)"
