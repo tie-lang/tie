@@ -220,6 +220,7 @@ func cg_expr(id: i64) -> i64 {
     if tg == T_E_TUPLE { return cg_array(id) }
     if tg == T_E_INDEX { return cg_index(id) }
     if tg == T_E_INTERP { return cg_interp(id) }
+    if tg == T_E_SWITCHEXPR { return cg_switchexpr(id) }
     cg_fail("暂不支持的表达式（tag " + to_string(tg) + "）")
     return -1
 }
@@ -742,6 +743,33 @@ func cg_forin(id: i64) -> i64 {
     return 0
 }
 
+// 模式匹配条件：等值用 OP_EQ（字符串靠常量池按内容去重后直接比值），
+// 范围 `lo..hi` / `lo..=hi` 先用 OP_GE 卡下界、再用 OP_LE/OP_LT 卡上界，最后按位与合成布尔。
+func cg_pattern_cond(ov: i64, p: i64) -> i64 {
+    if em_tag(p) == T_E_RANGE {
+        var lo = cg_expr(em_get(p, 1))
+        if lo < 0 { return -1 }
+        var hi = cg_expr(em_get(p, 2))
+        if hi < 0 { return -1 }
+        var g = cg_alloc()
+        cg_emit(OP_GE, g, ov, lo)
+        var l = cg_alloc()
+        if em_get(p, 3) == 1 {
+            cg_emit(OP_LE, l, ov, hi)
+        } else {
+            cg_emit(OP_LT, l, ov, hi)
+        }
+        var m = cg_alloc()
+        cg_emit(OP_BAND, m, g, l)
+        return m
+    }
+    var pv = cg_expr(p)
+    if pv < 0 { return -1 }
+    var m2 = cg_alloc()
+    cg_emit(OP_EQ, m2, ov, pv)
+    return m2
+}
+
 // switch 语句：obj 只求值一次，按 case 的模式顺序比较，命中即执行该分支。
 // 分支体不落穿；default 分支（模式区段为空）在没有命中时执行。
 func cg_switch(id: i64) -> i64 {
@@ -770,28 +798,8 @@ func cg_switch(id: i64) -> i64 {
             var j: i64 = 0
             while j < pn {
                 var p = em_ch[pb + j]
-                var m: i64 = 0
-                if em_tag(p) == T_E_RANGE {
-                    var lo = cg_expr(em_get(p, 1))
-                    if lo < 0 { return -1 }
-                    var hi = cg_expr(em_get(p, 2))
-                    if hi < 0 { return -1 }
-                    var g = cg_alloc()
-                    cg_emit(OP_GE, g, ov, lo)
-                    var l = cg_alloc()
-                    if em_get(p, 3) == 1 {
-                        cg_emit(OP_LE, l, ov, hi)
-                    } else {
-                        cg_emit(OP_LT, l, ov, hi)
-                    }
-                    m = cg_alloc()
-                    cg_emit(OP_BAND, m, g, l)
-                } else {
-                    var pv = cg_expr(p)
-                    if pv < 0 { return -1 }
-                    m = cg_alloc()
-                    cg_emit(OP_EQ, m, ov, pv)
-                }
+                var m = cg_pattern_cond(ov, p)
+                if m < 0 { return -1 }
                 // 命中才跳进分支体：JMPT 为真时跳转，未命中则落到下面的 miss 跳转。
                 var jt = cg_emit(OP_JMPT, 0, m, 0)
                 table_push(hits, jt)
@@ -823,6 +831,72 @@ func cg_switch(id: i64) -> i64 {
         z = z + 1
     }
     return 0
+}
+
+// switch 表达式：obj 求值一次，分支以 `->` 书写，命中分支的表达式值即结果。
+// `_` 是通配臂（无条件命中）；分支之间没有滞落，命中即结束整个表达式。
+func cg_switchexpr(id: i64) -> i64 {
+    var ov = cg_expr(em_get(id, 1))
+    if ov < 0 { return -1 }
+    var st = em_get(id, 2)
+    var nn = em_get(id, 3)
+    var rs = cg_alloc()
+    var ends: table<i64> = []
+    var i: i64 = 0
+    while i < nn {
+        var c = em_ch[st + i]
+        var pb = em_get(c, 1)
+        var pn = em_get(c, 2)
+        var body = em_get(c, 3)
+        var wild: i64 = 0
+        if pn == 1 {
+            var p0 = em_ch[pb]
+            if em_tag(p0) == T_E_IDENT {
+                if em_namestr(em_get(p0, 1)) == "_" {
+                    wild = 1
+                }
+            }
+        }
+        if wild == 1 {
+            var bv = cg_expr(body)
+            if bv < 0 { return -1 }
+            cg_emit(OP_MOV, rs, bv, 0)
+            var je = cg_emit(OP_JMP, 0, 0, 0)
+            table_push(ends, je)
+        } else {
+            var hits: table<i64> = []
+            var j: i64 = 0
+            while j < pn {
+                var p = em_ch[pb + j]
+                var m = cg_pattern_cond(ov, p)
+                if m < 0 { return -1 }
+                var jt = cg_emit(OP_JMPT, 0, m, 0)
+                table_push(hits, jt)
+                j = j + 1
+            }
+            var miss = cg_emit(OP_JMP, 0, 0, 0)
+            var bstart = cg_here()
+            var h: i64 = 0
+            while h < len(hits) {
+                cg_patch(hits[h], bstart)
+                h = h + 1
+            }
+            var bv2 = cg_expr(body)
+            if bv2 < 0 { return -1 }
+            cg_emit(OP_MOV, rs, bv2, 0)
+            var je2 = cg_emit(OP_JMP, 0, 0, 0)
+            table_push(ends, je2)
+            cg_patch(miss, cg_here())
+        }
+        i = i + 1
+    }
+    var eend = cg_here()
+    var z: i64 = 0
+    while z < len(ends) {
+        cg_patch(ends[z], eend)
+        z = z + 1
+    }
+    return rs
 }
 
 func cg_break(id: i64) -> i64 {

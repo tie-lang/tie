@@ -170,6 +170,22 @@ expect_out("switch_in_loop",
     "var n = 0\nfor i in 0..4 {\n    switch i {\n        case 0:\n            n = n + 10\n        case 1:\n            n = n + 1\n        default:\n            n = n + 100\n    }\n}\nprintln(n)\n",
     "211\n")
 
+expect_out("switch_expr",
+    "func grade(n: i64) -> i64 {\n    return switch n {\n        1 -> 10,\n        2 -> 20,\n        _ -> 0,\n    }\n}\nprintln(grade(1))\nprintln(grade(2))\nprintln(grade(9))\n",
+    "10\n20\n0\n")
+
+expect_out("switch_expr_range",
+    "func label(n: i64) -> string {\n    return switch n {\n        0..=9 -> \"digit\",\n        10..100 -> \"two\",\n        _ -> \"many\",\n    }\n}\nprintln(label(5))\nprintln(label(42))\nprintln(label(123))\n",
+    "digit\ntwo\nmany\n")
+
+expect_out("switch_expr_value",
+    "var x = 2\nvar y = switch x { 1 -> 100, 2 -> 200, _ -> 300 }\nprintln(y)\n",
+    "200\n")
+
+expect_err("switch_expr_dup_wild",
+    "var x = 1\nvar y = switch x { _ -> 1, _ -> 2 }\nprintln(y)\n",
+    "重复的")
+
 expect_out("idx_assign",
     "var a = [1, 2, 3]\na[1] = 9\nprintln(a)\n",
     "[1, 9, 3]\n")
