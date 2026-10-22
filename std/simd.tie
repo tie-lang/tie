@@ -163,6 +163,17 @@ pub func dot_i64_1024(a: array<i64, 1024>, b: array<i64, 1024>) -> i64 {
     return s
 }
 
+// 宽度 4 的整寄存器向量内核：直接落到 LLVM 的 <4 x i64> 向量类型，
+// 一条指令完成四个通道的运算（vec_add / vec_mul 是编译器内建）。
+// 与下方 1024 元素内核的区别：这里不依赖自动向量化，产物必然是向量指令。
+pub func add_i64_4(a: array<i64, 4>, b: array<i64, 4>) -> array<i64, 4> {
+    return vec_add(a, b)
+}
+
+pub func mul_i64_4(a: array<i64, 4>, b: array<i64, 4>) -> array<i64, 4> {
+    return vec_mul(a, b)
+}
+
 pub func max_i64_1024(a: array<i64, 1024>) -> i64 {
     var m = a[0]
     var i: i64 = 1
