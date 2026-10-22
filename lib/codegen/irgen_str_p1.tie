@@ -780,6 +780,36 @@ func t21_ptri(t: i64) -> i64 {
     return ir.get_value(pi)
 }
 
+// 零参运行时调用（无实参符号），返回 i64。
+func tl_i64_0(sym: string) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    return tig_trmlite_call(sym, ats, avs, types.named(TK_I64))
+}
+
+// 内联建表：malloc(48) + 字段初始化 + 运行时建锁。
+// 动机：原先调 tl_tbl$tbl_new(esz)，调用方 LLVM 看不到里面是 malloc，
+// 表对象无法被当作新分配分析，push 循环里表头 cap/len/data 提升不成 SSA，
+// 每轮都要重新访存（对照实验量化约占 table push 的 13%）。
+// 内联后分配点对 LLVM 可见；深表仍走 tl_tbl$tbl_new_deep（形态少、非热路径）。
+func s21_table_new_inl(esz_v: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var h = s21_raw_alloc_str(tig_int_lit(48))
+    if h < 0 {
+        return -1
+    }
+    // 句柄已是 ptr 值（s21_raw_alloc_str 返回 TK_STR），无需再 inttoptr。
+    var z0 = tig_int_lit(0)
+    s21_store(s21_gep(h, RT_TBL_OFF_CAP, true), z0, T64)
+    s21_store(s21_gep(h, RT_TBL_OFF_LEN, true), z0, T64)
+    s21_store(s21_gep(h, RT_TBL_OFF_DATA, true), t21_intp(z0), types.named(TK_STR))
+    s21_store(s21_gep(h, RT_TBL_OFF_ESZ, true), esz_v, T64)
+    s21_store(s21_gep(h, RT_TBL_OFF_RC, true), tig_int_lit(1), T64)
+    var lk = tl_i64_0("tl_tbl$lock_new")
+    s21_store(s21_gep(h, 32, true), lk, T64)
+    return h
+}
+
 // i64 → ptr（inttoptr，opcode 25；结果 TK_STR ptr 值）
 func t21_intp(i: i64) -> i64 {
     var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))
@@ -790,7 +820,7 @@ func t21_intp(i: i64) -> i64 {
 // 新建空表：tl_tbl$tbl_new(esz) → i64 → inttoptr → ptr 句柄。
 func s21_table_new(esz_v: i64) -> i64 {
     g_used_trmlite = true
-    return t21_intp(tl_i64_1("tl_tbl$tbl_new", esz_v))
+    return s21_table_new_inl(esz_v)
 }
 
 // r.1.1.4 深表建表：元素为表（table<T> 嵌套表 / map 元素，句柄 8 字节）→

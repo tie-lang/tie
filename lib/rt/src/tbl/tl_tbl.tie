@@ -92,6 +92,16 @@ pub unsafe fn tbl_new(esz: i64) -> i64 {
     return ptr_to_int(h)
 }
 
+// 建表锁：只分配并初始化 CRITICAL_SECTION 缓冲，不接触表句柄。
+// codegen 内联建表时调用——句柄的 48 字节块由调用方 malloc，本函数只产锁。
+pub unsafe fn lock_new() -> i64 {
+    var lk = alloc(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk))
+    }
+    return ptr_to_int(lk)
+}
+
 // r.1.1.4 建深表：元素为表句柄（table<T> 嵌套表，元素宽 8）——tbl_release
 // 释放时逐元素释放内层表。esz 字段写入深表标记位（分配尺寸按掩码后计算）。
 pub unsafe fn tbl_new_deep(esz: i64) -> i64 {
