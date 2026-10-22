@@ -56,6 +56,13 @@ func linux_known(name: string) -> bool {
            name == "extern_s10_ptr.tie"
 }
 
+// 依赖 tie-interp 静态库（TIE_INTERP_LIB）的探针：本仓不构建该库，编译必然失败。
+func interp_known(name: string) -> bool {
+    return name == "std_httpc_probe.tie" || name == "std_net_text.tie" ||
+           name == "std_sse_probe.tie" || name == "std_net_bytes.tie" ||
+           name == "proc_createprocessw_pipe.tie"
+}
+
 // 编译+（可选）运行。返回 "COMPILE_FAIL" / "RUN_FAIL rc=N out=..." / "OK" / "OK <out>"。
 func compile_run(src: string, runIt: bool) -> string {
     var exe = replace_all(src, ".tie", ".exe")
@@ -116,10 +123,12 @@ for fn in s23 {
 println("=== 4. tests/language 正例（编译） ===")
 var lang = sort_strings(list_dir(root + "\\tests\\language"))
 var li: i64 = 0
+var li_cur: i64 = 0
 for fn in lang {
-    if li < sl_lo || li >= sl_hi { li = li + 1; continue }
-    li = li + 1
     if !has_suffix(fn, ".tie") { continue }
+    li_cur = li
+    li = li + 1
+    if li_cur < sl_lo || li_cur >= sl_hi { continue }
     if contains(fn, "_neg") || has_suffix(fn, ".ir.tie") { continue }
     if fn == "extern_decl.tie" || fn == "std_fs_path.tie" {
         println("SKIP(基线已知) " + fn); known = known + 1
@@ -127,9 +136,13 @@ for fn in lang {
         if linux_known(fn) {
             println("SKIP(Linux差异) " + fn); known = known + 1
         } else {
-            r = compile_run(root + "\\tests\\language\\" + fn, false)
-            if r == "OK" { println("PASS " + fn); pass = pass + 1 }
-            else { println("FAIL " + fn + " -> " + r); fail = fail + 1 }
+            if interp_known(fn) {
+                println("SKIP(需 tie-interp 静态库) " + fn); known = known + 1
+            } else {
+                r = compile_run(root + "\\tests\\language\\" + fn, false)
+                if r == "OK" { println("PASS " + fn); pass = pass + 1 }
+                else { println("FAIL " + fn + " -> " + r); fail = fail + 1 }
+            }
         }
     }
 }
@@ -138,10 +151,13 @@ println("=== 5. tests/language 负例（应拒绝） ===")
 var neg_tmp = root + "\\_local_only\\neg_tmp.exe"
 var rc9: i64 = 0
 var li5: i64 = 0
+var li5_cur: i64 = 0
 for fn in lang {
-    if li5 < sl_lo || li5 >= sl_hi { li5 = li5 + 1; continue }
+    if !has_suffix(fn, ".tie") { continue }
+    li5_cur = li5
     li5 = li5 + 1
-    if has_suffix(fn, ".tie") && contains(fn, "_neg") {
+    if li5_cur < sl_lo || li5_cur >= sl_hi { continue }
+    if contains(fn, "_neg") {
         rc9 = exec_code("cmd /c " + tiec + " " + root + "\\tests\\language\\" + fn + " -o " + neg_tmp + " >nul 2>&1")
         if rc9 != 0 { println("PASS(拒) " + fn); pass = pass + 1 }
         else { println("FAIL(未拒) " + fn); fail = fail + 1 }
