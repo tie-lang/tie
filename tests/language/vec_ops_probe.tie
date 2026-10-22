@@ -1,0 +1,35 @@
+type tie<logic>
+// 显式向量内建（vec_sub / vec_and / vec_or / vec_xor）机制验收探针
+// 规格：vec_*(a, b) 对 array<T, N> 做整寄存器 <N x T> 运算并返回逐元素结果；
+// 逐位算（and/or/xor）只接受整型元素数组。
+import "/std/assert.tie"
+import "/std/simd.tie"
+using assert;
+
+func main() -> i64 {
+    var a: array<i64, 4> = array_init(6)
+    var b: array<i64, 4> = array_init(2)
+    var d: array<i64, 4> = simd.sub_i64_4(a, b)
+    assert.assert_eq(d[0], 4)
+    assert.assert_eq(d[3], 4)
+
+    var l: array<i64, 4> = array_init(5)
+    var r: array<i64, 4> = array_init(3)
+    var an: array<i64, 4> = simd.and_i64_4(l, r)
+    assert.assert_eq(an[0], 1)
+    assert.assert_eq(an[3], 1)
+    var ore: array<i64, 4> = simd.or_i64_4(l, r)
+    assert.assert_eq(ore[0], 7)
+    var xr: array<i64, 4> = simd.xor_i64_4(l, r)
+    assert.assert_eq(xr[0], 6)
+
+    // 直接调内建（不经 std 包装）验证分派与类型细化；
+    // 内建结果是调用点细化的占位类型，无法直接嵌套，需先落到变量再参与下一次向量运算。
+    var direct: array<i64, 4> = vec_sub(l, r)
+    assert.assert_eq(direct[1], 2)
+    var sum: array<i64, 4> = vec_add(l, r)
+    var mix: array<i64, 4> = vec_mul(sum, r)
+    assert.assert_eq(mix[2], 24)
+    println("vec ops 探针全过")
+    return 0
+}
