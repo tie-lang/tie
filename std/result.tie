@@ -27,3 +27,131 @@ enum Option<T> {
     Some(T)
     None
 }
+
+// ---- 文本解析族：可预期失败的数值转换（规格 §2.11 的 tp_ 族）----
+// 与 to_i64 / to_f64 的区别只在失败语义：to_ 系失败触发内建检查（程序错误），
+// tp_ 系返回 Result，由调用方分支处理。接受的语言与 to_ 系完全一致——
+// 整型：[+-]? 数字+（无空白、无十六进制、无下划线；溢出 i64 判失败）；
+// 浮点：[+-]?(数字+[.数字*] | .数字+)([eE][+-]?数字+)?，且整串必须是合法数值。
+// 浮点落值复用 to_f64，保证与内建解析逐位一致。
+
+// 文本 → Result<i64, string>。累加按负数进行，天然覆盖 i64 最小值。
+pub func tp_i64(s: string) -> Result<i64, string> {
+    var n = str_len(s)
+    if n == 0 {
+        return Result.Err("空文本不是整数")
+    }
+    var i: i64 = 0
+    var neg = false
+    var c0 = str_char(s, 0)
+    if c0 == "+" {
+        i = 1
+    }
+    if c0 == "-" {
+        neg = true
+        i = 1
+    }
+    if i >= n {
+        return Result.Err("整数缺少数字")
+    }
+    var acc: i64 = 0
+    var seen: i64 = 0
+    var lim: i64 = 0 - 922337203685477580
+    while i < n {
+        var cp = char_code(str_char(s, i))
+        if cp < 48 {
+            return Result.Err("整数含有非数字字符")
+        }
+        if cp > 57 {
+            return Result.Err("整数含有非数字字符")
+        }
+        var d = cp - 48
+        if acc < lim {
+            return Result.Err("整数超出 i64 范围")
+        }
+        if acc == lim && d > 8 {
+            return Result.Err("整数超出 i64 范围")
+        }
+        acc = acc * 10 - d
+        seen = seen + 1
+        i = i + 1
+    }
+    if seen == 0 {
+        return Result.Err("整数缺少数字")
+    }
+    if neg {
+        return Result.Ok(acc)
+    }
+    // 累加按负数进行，幅值上限是 9223372036854775808（即 i64 最小值的绝对值）；
+    // 正数只有取到该幅值才算溢出，其它情形 acc 恒为负，不能据此判溢出。
+    var mn: i64 = 0 - 9223372036854775807
+    mn = mn - 1
+    if acc == mn {
+        return Result.Err("整数超出 i64 范围")
+    }
+    return Result.Ok(0 - acc)
+}
+
+// 单字符是否为 ASCII 数字（内部用）。
+func tp_is_dig(c: string) -> bool {
+    var cp = char_code(c)
+    if cp < 48 {
+        return false
+    }
+    if cp > 57 {
+        return false
+    }
+    return true
+}
+
+// 文本 → Result<f64, string>。先按 to_f64 的语法整串校验，再交给 to_f64 取值。
+pub func tp_f64(s: string) -> Result<f64, string> {
+    var n = str_len(s)
+    if n == 0 {
+        return Result.Err("空文本不是浮点数")
+    }
+    var i: i64 = 0
+    var c0 = str_char(s, 0)
+    if c0 == "+" {
+        i = 1
+    }
+    if c0 == "-" {
+        i = 1
+    }
+    var dig: i64 = 0
+    while i < n && tp_is_dig(str_char(s, i)) {
+        dig = dig + 1
+        i = i + 1
+    }
+    if i < n && str_char(s, i) == "." {
+        i = i + 1
+        while i < n && tp_is_dig(str_char(s, i)) {
+            dig = dig + 1
+            i = i + 1
+        }
+    }
+    if dig == 0 {
+        return Result.Err("浮点数缺少数字")
+    }
+    if i < n {
+        var ce = str_char(s, i)
+        if ce == "e" || ce == "E" {
+            i = i + 1
+            if i < n && (str_char(s, i) == "+" || str_char(s, i) == "-") {
+                i = i + 1
+            }
+            var ed: i64 = 0
+            while i < n && tp_is_dig(str_char(s, i)) {
+                ed = ed + 1
+                i = i + 1
+            }
+            if ed == 0 {
+                return Result.Err("浮点数指数缺少数字")
+            }
+        }
+    }
+    if i != n {
+        return Result.Err("浮点数含有非数字字符")
+    }
+    return Result.Ok(to_f64(s))
+}
