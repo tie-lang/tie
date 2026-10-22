@@ -121,21 +121,24 @@ func redundant_load(ref repl: table<i64>, nvals: i64) {
         var e = ir.block_end(bi)
         var addr = table_new_i64()
         var res = table_new_i64()
+        var rty = table_new_i64()
         var ii = s
         while ii < e {
             var op = ir.ins_op(ii)
             if op == P_STORE {
                 table_trunc(addr, 0)
                 table_trunc(res, 0)
+                table_trunc(rty, 0)
             } else if op == P_LOAD && ir.ins_ops_cnt(ii) >= 1 && ir.ins_opnd_kind(ii, 0) == P_VAL {
                 var a = ir.ins_opnd(ii, 0)
                 var rv = ir.ins_val(ii)
                 if rv >= 0 && rv < nvals {
+                var lty = ir.ins_ty(ii)
                     var n = len(addr)
                     var hit: i64 = 0 - 1
                     var k: i64 = 0
                     while k < n {
-                        if addr[k] == a {
+                        if addr[k] == a && rty[k] == lty {
                             hit = res[k]
                             break
                         }
@@ -146,6 +149,7 @@ func redundant_load(ref repl: table<i64>, nvals: i64) {
                     } else {
                         table_push(addr, a)
                         table_push(res, rv)
+                        table_push(rty, lty)
                     }
                 }
             }
@@ -156,6 +160,84 @@ func redundant_load(ref repl: table<i64>, nvals: i64) {
 }
 
 // 替代表链压缩 + 全量回写操作数（值传播）。
+// 块内辅助：查「值 → 类型」表（返回 -1 表示该值不在本块内定义）
+func blk_ty_of(ref d_val: table<i64>, ref d_ty: table<i64>, v: i64) -> i64 {
+    var k = len(d_val) - 1
+    while k >= 0 {
+        if d_val[k] == v {
+            return d_ty[k]
+        }
+        k = k - 1
+    }
+    return 0 - 1
+}
+
+// 块内辅助：查「地址 → 最近一次被存的值」
+func blk_stored(ref k_addr: table<i64>, ref k_val: table<i64>, a: i64) -> i64 {
+    var k = len(k_addr) - 1
+    while k >= 0 {
+        if k_addr[k] == a {
+            return k_val[k]
+        }
+        k = k - 1
+    }
+    return 0 - 1
+}
+
+// 块内 store→load 转发：同块内 store v, p 之后的 load p（中间没有第二次 store
+// 与内存副作用调用）直接用 v 取代，省掉一次访存。与 redundant_load 的分工：
+// 后者合并「多次读同一地址」，这里消掉「刚写又读」。类型必须一致（按 ins_ty
+// 比对），跨块定义的值一律不转发，保守优先。
+func fwd_store_load(ref repl: table<i64>, nvals: i64) {
+    var nblk = ir.block_count()
+    var bi: i64 = 0
+    while bi < nblk {
+        var a = ir.block_start(bi)
+        var e = ir.block_end(bi)
+        var k_addr = table_new_i64()
+        var k_val = table_new_i64()
+        var d_val = table_new_i64()
+        var d_ty = table_new_i64()
+        var ii = a
+        while ii < e {
+            var op = ir.ins_op(ii)
+            var rv = ir.ins_val(ii)
+            var cnt = ir.ins_ops_cnt(ii)
+            if op == P_STORE {
+                table_trunc(k_addr, 0)
+                table_trunc(k_val, 0)
+                if cnt >= 2 && ir.ins_opnd_kind(ii, 0) == P_VAL && ir.ins_opnd_kind(ii, 1) == P_VAL {
+                    var sv = ir.ins_opnd(ii, 0)
+                    var sa = ir.ins_opnd(ii, 1)
+                    var st = blk_ty_of(d_val, d_ty, sv)
+                    if st >= 0 {
+                        table_push(k_addr, sa)
+                        table_push(k_val, sv)
+                    }
+                }
+            } else if op == P_LOAD {
+                if cnt >= 1 && ir.ins_opnd_kind(ii, 0) == P_VAL && rv >= 0 {
+                    var la = ir.ins_opnd(ii, 0)
+                    var hit = blk_stored(k_addr, k_val, la)
+                    if hit >= 0 && blk_ty_of(d_val, d_ty, hit) == ir.ins_ty(ii) {
+                        repl[rv] = hit
+                    }
+                }
+            } else if op == 35 || op == 36 || op == 41 {
+                // 调用可能写内存，块内缓存全部失效
+                table_trunc(k_addr, 0)
+                table_trunc(k_val, 0)
+            }
+            if rv >= 0 {
+                table_push(d_val, rv)
+                table_push(d_ty, ir.ins_ty(ii))
+            }
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+}
+
 func apply_repl(ref repl: table<i64>, nvals: i64) {
     var v: i64 = 0
     while v < nvals {
@@ -317,8 +399,12 @@ func run_t1() -> i64 {
     }
     // B. 块内冗余 load 消除（保守：遇 store 即清缓存）
     redundant_load(repl, nvals)
-    // C. 值传播
+    // C. 块内 store→load 转发（消掉「刚写又读」）
+    fwd_store_load(repl, nvals)
+    // D. 值传播
     apply_repl(repl, nvals)
+    // E. 死指令标记（无用户的纯计算指令不再发射）
+    mark_dead_values()
     // C. 死值消除：旁路。
     // compact_dead 按「旧指令 id 线性保序」搬指令，而 llvmgen 按块 id 序输出
     // 文本；块 id 序与指令落位序不一致时二者矛盾，输出出现 use-before-def
@@ -363,6 +449,86 @@ func cse_same(a: i64, b: i64) -> bool {
         k = k + 1
     }
     return true
+}
+
+// 标记阶段的纯指令判定。与上方 dce 用的 is_pure_op 的差异：这里允许 load（21）——
+// 无使用者的 load 可以安全跳过发射（不移动指令，不存在地址重排问题）；
+// store/call/atomic/volatile/phi/br 仍然排除。
+func md_pure_op(op: i64) -> bool {
+    if op >= 0 && op <= 18 {
+        return true
+    }
+    if op == 19 {
+        return true
+    }
+    if op == 21 {
+        return true
+    }
+    if op >= 23 && op <= 29 {
+        return true
+    }
+    if op == 37 || op == 38 || op == 39 {
+        return true
+    }
+    if op == 46 || op == 47 {
+        return true
+    }
+    if op == 51 || op == 60 || op == 62 || op == 63 {
+        return true
+    }
+    return false
+}
+
+// 标记无用户的纯计算指令为 dead（后端跳过发射，指令表布局不变）。
+// 迭代到不动点：一条指令被摘掉后，它的操作数可能变成新的无用户值。
+func mark_dead_values() -> i64 {
+    var killed: i64 = 0
+    var round: i64 = 0
+    while round < 8 {
+        var nv = ir.value_count()
+        var total = ir.inst_count()
+        var use = table_new_i64()
+        var zi: i64 = 0
+        while zi < nv {
+            table_push(use, 0)
+            zi = zi + 1
+        }
+        var ii: i64 = 0
+        while ii < total {
+            if !ir.is_dead(ii) {
+                var cnt = ir.ins_ops_cnt(ii)
+                var j: i64 = 0
+                while j < cnt {
+                    if ir.ins_opnd_kind(ii, j) == P_VAL {
+                        var v = ir.ins_opnd(ii, j)
+                        if v >= 0 && v < nv {
+                            use[v] = use[v] + 1
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+            ii = ii + 1
+        }
+        var kill: i64 = 0
+        ii = 0
+        while ii < total {
+            if !ir.is_dead(ii) {
+                var rv = ir.ins_val(ii)
+                if rv >= 0 && rv < nv && use[rv] == 0 && md_pure_op(ir.ins_op(ii)) {
+                    ir.mark_dead(ii)
+                    kill = kill + 1
+                }
+            }
+            ii = ii + 1
+        }
+        killed = killed + kill
+        if kill == 0 {
+            return killed
+        }
+        round = round + 1
+    }
+    return killed
 }
 
 // 块内 CSE：重复纯指令的结果值替代为首次出现者。返回替代登记数。
@@ -438,6 +604,8 @@ func run_t2() -> i64 {
     }
     cse_blockwise(repl, nvals)
     apply_repl(repl, nvals)
+    // 同 t1：无用户的纯计算指令标记为 dead（后端跳过发射）
+    mark_dead_values()
     // appfuse：逐元素表操作循环 → 批量原语（passes_p3；见文件头）
     // 旁路：融合改写会生成跨类型的新指令序列，实测在函数返回值路径上产生
     // 「i64 值被当 ptr 用」的类型断裂（实证：opt 报 %1 defined with type

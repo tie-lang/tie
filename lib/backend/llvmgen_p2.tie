@@ -124,7 +124,7 @@ func gen_func(fid: i64) {
         if ia < len(g_inst_blk) {
             blk_a = g_inst_blk[ia]
         }
-        if blk_a >= 0 && ir.block_func(blk_a) == fid && ir.ins_op(ia) == 20 {
+        if blk_a >= 0 && ir.block_func(blk_a) == fid && ir.ins_op(ia) == 20 && !ir.is_dead(ia) {
             table_push(g_hoisted_allocas, ia)
             g_hoisted_cnt = g_hoisted_cnt + 1
         }
@@ -194,7 +194,9 @@ func gen_func(fid: i64) {
                     entry_alloca_done = 1
                 }
             }
-            gen_inst(ii)
+            if !ir.is_dead(ii) {
+                gen_inst(ii)
+            }
         }
         ii = ii + 1
     }

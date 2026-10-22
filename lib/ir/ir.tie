@@ -79,6 +79,7 @@ pub var ir_insts_ty: table<i64> = [];           // 指令表：结果类型（�
 pub var ir_insts_val: table<i64> = [];          // 指令表：结果值 id（单调；无结果 -1）
 pub var ir_insts_ops_off: table<i64> = [];      // 指令表：操作数段偏移
 pub var ir_insts_ops_cnt: table<i64> = [];      // 指令表：操作数个数
+pub var ir_insts_dead: table<bool> = [];        // 指令表：死指令标记（后端跳过发射）
 pub var ir_ops: table<i64> = [];                // 操作数段：扁平 i64
 pub var ir_ops_kind: table<i64> = [];           // 操作数段：类别（OK_*）
 pub var ir_val_cnt: i64 = 0;               // 值计数器（new_value 后置自增）
@@ -250,6 +251,7 @@ pub func new_module() -> i64 {
     table_trunc(ir_insts_val, 0)
     table_trunc(ir_insts_ops_off, 0)
     table_trunc(ir_insts_ops_cnt, 0)
+    table_trunc(ir_insts_dead, 0)
     table_trunc(ir_ops, 0)
     table_trunc(ir_ops_kind, 0)
     table_trunc(ir_funcs_params_tys_off, 0)
@@ -315,6 +317,7 @@ pub func new_inst(block_id: i64, opcode: i64, ty: i64) -> i64 {
     }
     table_push(ir_insts_ops_off, len(ir_ops))
     table_push(ir_insts_ops_cnt, 0)
+    table_push(ir_insts_dead, false)
     if ir_blocks_end[block_id] == ir_blocks_start[block_id] {
         ir_blocks_start[block_id] = iid
     }
@@ -383,6 +386,33 @@ pub func func_count() -> i64 {
 pub func block_count() -> i64 {
     return len(ir_blocks_func)
 }
+// 死指令标记：passes 标记「结果无人使用且无副作用」的指令，后端跳过发射。
+// 采用标记而不物理压缩：指令表必须按旧 id 线性保序（llvmgen 按块 id 序输出
+// 文本，块 id 序与指令落位序不一致），物理删除会破坏块区间连续性。
+pub func mark_dead(inst_id: i64) {
+    if inst_id >= 0 && inst_id < len(ir_insts_dead) {
+        ir_insts_dead[inst_id] = true
+    }
+}
+
+pub func is_dead(inst_id: i64) -> bool {
+    if inst_id < 0 || inst_id >= len(ir_insts_dead) {
+        return false
+    }
+    return ir_insts_dead[inst_id]
+}
+
+// 重建指令表后同步 dead 标记表：整表替换（内联/压缩）会让下标与新表错位，
+// 因此一律按新长度重置为 false，后续 pass 需要时重新标记。
+pub func reset_dead_flags(n: i64) {
+    table_trunc(ir_insts_dead, 0)
+    var i: i64 = 0
+    while i < n {
+        table_push(ir_insts_dead, false)
+        i = i + 1
+    }
+}
+
 pub func inst_count() -> i64 {
     return len(ir_insts_op)
 }
@@ -714,6 +744,7 @@ pub func compact_dead(dead: table<bool>) -> i64 {
     ir_insts_val = n_val
     ir_insts_ops_off = n_off
     ir_insts_ops_cnt = n_cnt
+    reset_dead_flags(len(n_op))
     ir_ops = n_ops
     ir_ops_kind = n_opsk
     bi = 0
