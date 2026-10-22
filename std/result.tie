@@ -155,3 +155,33 @@ pub func tp_f64(s: string) -> Result<f64, string> {
     }
     return Result.Ok(to_f64(s))
 }
+
+// ---- 组合子族（规格 §8.4）----
+// 管线箭头 `x -> f(...)` 把数据作末参传入，故组合子统一写成「函数在前、结果在后」，
+// 与 std/prelude.tie 的 stream_* 适配器保持同一调用形式。
+// 短闭包实参（`v -> v + 1`）传给泛型被调方时，必须显式写出类型实参：
+// `r -> map_result<i64, i64, string>(v -> v + 1)`。短闭包展开需在语义期
+// 已知道具体 fn 形参类型；无显式类型实参时泛型调用先推断实参再实例化，
+// 此时闭包形参无类型可依（具名函数实参不受此限，可省类型实参）。
+
+// 对 Ok 值做变换，Err 原样透传；成功类型可变，错误类型不变。
+pub func map_result<T, U, E>(f: fn(T) -> U, r: Result<T, E>) -> Result<U, E> {
+    switch r {
+        case Ok(v):
+            return Result.Ok(f(v))
+        case Err(e):
+            return Result.Err(e)
+    }
+    panic("map_result 不可达")
+}
+
+// Ok 值继续交给下一个返回 Result 的步骤，Err 原样透传（链式校验）。
+pub func and_then<T, U, E>(f: fn(T) -> Result<U, E>, r: Result<T, E>) -> Result<U, E> {
+    switch r {
+        case Ok(v):
+            return f(v)
+        case Err(e):
+            return Result.Err(e)
+    }
+    panic("and_then 不可达")
+}
