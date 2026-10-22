@@ -188,6 +188,23 @@ pub func check_var_decl(s: i64) -> i64 {
                         telem = types.named(TK_STR)
                     } else if fnm == "table_new_bool" {
                         telem = types.named(TK_BOOL)
+                    } else if fnm == "table_clone" {
+                        // 副本与源同元素类型：优先取标注 table<T> 的元素类型，
+                        // 无标注时取实参表变量的元素类型（与 table_new_* 名字映射同理）。
+                        var tec = types.table_elem(ty)
+                        if tec >= 0 {
+                            telem = tec
+                        }
+                        var offc = sstate.slot_off(init)
+                        if sstate.nchild(init) - offc > 0 {
+                            var a0 = sstate.child(init, offc)
+                            if s_tags[a0] == S_N_VAR {
+                                var vtc = sinfer.var_table_elem(intern.intern(sstate.name_str(a0)))
+                                if vtc >= 0 {
+                                    telem = vtc
+                                }
+                            }
+                        }
                     } else {
                         // 用解析后全名查返回表元素
                         var te2 = sinfer.table_ret_elem(sinfer.resolve_call_name(fnm))

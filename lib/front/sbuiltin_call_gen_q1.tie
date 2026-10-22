@@ -757,6 +757,19 @@ pub func builtin_call_b_table_reserve_p(fn_name: string, args: table<i64>, call_
         return types.named(TK_VOID)
 }
 
+pub func builtin_call_b_table_clone(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // 独立副本：table_clone(t) → 与 t 同内容的新表（独立数据缓冲与锁；深表连同
+    // 内层表递归深克隆）。登记元素类型由赋值点（VarDecl 标注 table<T>）细化，故返回裸 table。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "table_clone() 期望 1 个参数（表），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_TABLE)
+}
+
 pub func builtin_call_b_ch_len(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
     return builtin_call_b_arity1_i64(fn_name, args, call_node)
 }

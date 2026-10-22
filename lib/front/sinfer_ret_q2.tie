@@ -381,6 +381,19 @@ pub func infer_call(id: i64) -> i64 {
             g_typed = g_typed + 1
             return types.named(TK_VOID)
         }
+        // table_clone(t) → table：首参须为表；返回独立副本（裸 table，由赋值点细化元素类型）。
+        if fnm == "table_clone" {
+            var ta3 = infer_expr(args[0])
+            if ta3 < 0 { return -1 }
+            if !types.is_table(ta3) {
+                sm_err_line = s_lines[id]; sm_err_col = s_cols[id]
+                sm_err_msg = "table_clone() 第 1 个参数必须是表，实际是 " + types.type_name(ta3)
+                return -1
+            }
+            node_types[id] = types.named(TK_TABLE)
+            g_typed = g_typed + 1
+            return types.named(TK_TABLE)
+        }
         // table_append_raw(t, ptr, n) → void：首参须为表；指针侧与个数按通用推断。
         if fnm == "table_append_raw" {
             var ta2 = infer_expr(args[0])

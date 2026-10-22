@@ -751,6 +751,51 @@ unsafe fn tbl_clone_body(h: i64) -> i64 {
     return ptr_to_int(nh)
 }
 
+// 递归深克隆表体：用户可见的 `table_clone` 内建专用。与 tbl_clone_body 同构，
+// 差别在深表的每个元素句柄**递归克隆**——副本与源在最内层也互不影响
+//（tbl_clone_body 只 retain 元素句柄，内层对象仍共享）。
+// 为何不把 tbl_clone_body 改成递归：它服务于 `deep` 形参与 COW（写时分离），那里要的
+// 是 O(len) 增量与「缓冲/锁独立」，改成整树克隆会让每次共享写都付全树代价。
+// 终止性：tie 的类型系统不允许递归类型，嵌套深度由类型决定必然有限，递归必终止。
+unsafe fn tbl_clone_deep_body(h: i64) -> i64 {
+    var p = int_to_ptr(h)
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24)
+    var pure = esz & TBL_MASK
+    var isdeep = (esz & TBL_DEEP) != 0
+    var nh = alloc(48)
+    var ncap: i64 = 0
+    var ndata: i64 = 0
+    if len > 0 {
+        var ndp = alloc(len * pure)
+        ndata = ptr_to_int(ndp)
+        memcpy(ndp, int_to_ptr(r_i64(p, 16)), len * pure)
+        ncap = len
+    }
+    w_i64(nh, 0, ncap)
+    w_i64(nh, 8, len)
+    w_i64(nh, 16, ndata)
+    w_i64(nh, 24, esz)
+    w_i64(nh, 40, 1)
+    var lk = alloc(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk));
+    }
+    w_i64(nh, 32, ptr_to_int(lk))
+    if isdeep {
+        var i: i64 = 0
+        while i < len {
+            var slot = int_to_ptr(ndata + i * 8)
+            var eh = r_i64(slot, 0)
+            if eh != 0 {
+                w_i64(slot, 0, tbl_clone_deep_body(eh))
+            }
+            i = i + 1
+        }
+    }
+    return ptr_to_int(nh)
+}
+
 // 无条件克隆（r.1.6.11）：返回全新句柄，与源**完全独立**（独立 data 缓冲 + 独立锁）。
 // 与 tbl_cow 的区别：**不读引用计数**。原因：struct 按值拷贝**不会 retain 其表字段**
 //（实测：按值传参发射的是整 struct 的 `store`，不含逐字段 retain），故 rc ≠ 别名数，
@@ -761,6 +806,17 @@ pub unsafe fn tbl_clone(h: i64) -> i64 {
         return 0
     }
     return tbl_clone_body(h)
+}
+
+// 克隆入口（指针形参）：同 tbl_release_p/tbl_reserve_p，借 nocapture 让 LLVM 认定
+// 源表句柄不被捕获，避免「句柄交给跨模块函数」造成的表对象逃逸。
+// 走递归深克隆：`table_clone` 是用户可见的「独立副本」（规范 §13.5），深表的内层表
+// 也必须一起复制，否则 `dc[0][0] = 99` 会经由共享的内层表回写到源。
+pub unsafe fn tbl_clone_p(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    return tbl_clone_deep_body(h)
 }
 
 // 分离：共享（rc>1）→ 克隆并放弃对旧表的一次引用；独占 → 原样返回。

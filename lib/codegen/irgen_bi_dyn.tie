@@ -640,6 +640,29 @@ if nm == "table_reserve" {
 }
 }
 
+// 内置 `table_clone`（独立副本：新表 + 拷贝 len 个元素；深表连同内层表递归深克隆）
+// 语义见规范 §13.5 克隆：副本与源完全独立（数据缓冲、锁各自一份），改副本不影响源。
+// 走指针形参入口 tbl_clone_p：nocapture 使源表句柄不被判为逃逸。
+pub func bi_table_clone(nm: string, id: i64) -> i64 {
+if nm == "table_clone" {
+    g_used_trmlite = true
+    var t = tig_expr(call_arg(id, 0))
+    if t < 0 {
+        return -1
+    }
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, t)
+    var h = tig_trmlite_call("tl_tbl$tbl_clone_p", ats, avs, types.named(TK_I64))
+    if h < 0 {
+        return -1
+    }
+    g_builtin_res = t21_intp(h)
+    return 0
+}
+}
+
 // 内置 `table_append_raw`（从裸内存批量追加：table_append_raw(dst, ptr, n)）
 // 语义：与 table_append 同（元素宽度取 dst；n 个元素一次锁内拷入 dst 尾），差别在
 // 源是**原始地址**（供缓冲区/arena → 表）。元素类别门与 table_append 一致。
