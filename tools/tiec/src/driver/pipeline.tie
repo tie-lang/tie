@@ -695,7 +695,10 @@ pub func keel_run_pipeline(pid: i64, max_steps: i64) -> i64 {
             // 缓存键织入 Q 标记（cache_drv），否则「有 spawn」的产物会命中
             // 「无 spawn」时生成的免锁片段。
             irgen.set_noconc(no_concurrency())
-            if cache_enabled() {
+            // --emit-ir 要的是「当前源码」的 IR：命中缓存会跳过前端，语义期登记的
+            // tuple 类型表（tup_offs/tup_n/tup_tys）因此为空，emit 阶段取 LLVM 类型
+            // 文本时越界（interface_trait.tie / reclass_safe_probe.tie 可复现）。
+            if cache_enabled() && !g_emit_ir {
                 var hit = cache_try_hit_dep()
                 if hit == 1 {
                     return 0  // 命中：产物已复制，整条管线到此为止
