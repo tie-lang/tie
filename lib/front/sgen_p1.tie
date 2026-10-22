@@ -62,6 +62,10 @@ func push_node(tag: i64, name: i64, val: i64, aux: i64, line: i64, col: i64) -> 
     table_push(s_lines, line)
     table_push(s_cols, col)
     table_push(node_types, -1)
+    // 保持「s_n == len(s_tags) == len(node_types)」不变量：mexpand 的池快照/恢复
+    // 按该不变量重建 s_n（见 mexpand_p1.pool_restore），漏维护会让新节点在下一次
+    // 快照恢复后消失、节点 id 被复用，表现为跨实例化的子节点段错位。
+    s_n = len(s_tags)
     return len(s_tags) - 1
 }
 
