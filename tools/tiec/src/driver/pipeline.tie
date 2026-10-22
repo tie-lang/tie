@@ -67,7 +67,9 @@ pub func kpass_irgen() -> i64 {
     // p.9.21.9 片段组装消费：全部模块片段命中 → 跳过 irgen+passes（片段已含
     // pass 结果），按 g_extra_tops 装配序重放片段 IR。装配失败降级全量路径
     //（响亮打印，不静默）。
-    if cache_enabled() {
+    // --emit-ir 取的是「当前源码」的 IR：装配路径跳过 irgen，代码生成期才登记的类型
+    // （显式向量段、tuple 字段表）在当前进程中为空表 ⇒ emit 阶段取 LLVM 类型文本越界。
+    if cache_enabled() && !g_emit_ir {
         var ap = modcache_assembly_paths()
         if len(ap) > 0 {
             var order = asm_build_order()

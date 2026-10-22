@@ -42,6 +42,7 @@ import "./tieir_ser.tie"
 import "./tieir_fmt_v3.tie"
 import "./tieir_asm_parse.tie"
 import "./tieir_asm_replay.tie"
+import "./types.tie"
 
 
 // ---------- 元数据转存（v3：片段头/sym/exp 不再拒收，重放回 ir_meta） ----------
@@ -323,6 +324,31 @@ pub func asm_from_slices(paths: table<string>, order: table<string>) -> i64 {
     if ir.func_count() != total {
         set_err("asm: 重放函数数不符（" + to_string(ir.func_count()) + "/" + to_string(total) + "）")
         return -1
+    }
+    // 类型表守卫：片段只存类型 id，不存 type 表。装配路径跳过 irgen，代码
+    // 生成期才登记的类型（显式向量段等）在当前进程中是空表 ⇒ llvmgen 取
+    // 长度/元素越界，产物退化成 <-1 x ptr>。任一被引用的聚合类型无法还原
+    // 即降级全量 irgen，不静默产出坏 IR。
+    var tgi: i64 = 0
+    var tgn = ir.inst_count()
+    while tgi < tgn {
+        var tgt = ir.ins_ty(tgi)
+        if tgt >= 15393162788864 {
+            var tgk = types.kind(tgt)
+            if tgk == types.K_ARRAY {
+                if types.array_len(tgt) < 0 {
+                    set_err("asm: 片段引用了未登记的数组类型，降级全量")
+                    return -1
+                }
+            }
+            if tgk == types.K_VEC {
+                if types.vec_len(tgt) < 0 {
+                    set_err("asm: 片段引用了未登记的向量类型，降级全量")
+                    return -1
+                }
+            }
+        }
+        tgi = tgi + 1
     }
     return 0
 }
