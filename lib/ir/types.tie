@@ -75,6 +75,7 @@ pub const K_FN: i64 = 10;        // fn 函数值类型（S2.2，闭包/函数指
 pub const K_PORT: i64 = 11;      // port 对象类型（S2.4：接口对象，LLVM 表示 = ptr 指向堆打包 {data,vtable}）
 pub const K_ACTOR: i64 = 12;     // actor 句柄类型（一期并发：运行期一张 actor 表管所有权，LLVM 表示 = i64 句柄槽）
 pub const K_GUARD: i64 = 13;     // guard<cap> 凭据类型（三期 A 组：跨 actor 共享内存逃生口凭据，LLVM 表示 = i64 占位）
+pub const K_VEC: i64 = 16;       // vec<T, N> 显式向量值（LLVM 布局 <N x T>，整寄存器参与运算）
 pub const K_ARRAY: i64 = 14;     // array<T, N> 稠密定长数组（L1 定长数组：值类型，LLVM 布局 [N x T]）
 pub const K_FUTURE: i64 = 15;    // future<T> 凭据（p.9.11 async 返回值，规范 §10.6：LLVM 表示 = i64
                              // —— actor record 句柄；await 时等 done@104/读 result@96）
@@ -144,6 +145,7 @@ pub const BASE_GUARD: i64 = 14293651161088;
 // L1 定长数组段：id = 14<<40 | NEST_SLOT_OFF + 序号（元素 + 长度经序号表登记，
 // 低负载恒 ≥ NEST_SLOT_OFF——长度是独立整数参数，无法内联进含嵌套聚合的元素编码）。
 // 14<<40 = 15393162788864，i64 有符号下远小于 2^63 无溢出。
+pub const BASE_VEC: i64 = 17592186044416;
 pub const BASE_ARRAY: i64 = 15393162788864;
 // p.9.11 future<T> 凭据段：id = 15<<40 | T（T 为方法返回类型 id；嵌套聚合负载
 // 经 nest_future_elems 序号表防进位，同 ptr_of 方案）。LLVM 表示 = i64
@@ -169,6 +171,8 @@ pub var nest_future_elems: table<i64> = []; // 嵌套 future 负载段（p.9.11 
 // L1 定长数组登记段（序号 → 元素类型 id / 元素个数 N）：
 // array<f32, 64> → 登记 (f32, 64)，低负载 = NEST_SLOT_OFF + 序号
 pub var nest_arr_elems: table<i64> = [];   // 嵌套定长数组元素段（序号 → 元素类型 id）
+pub var nest_vec_elems: table<i64> = [];   // 显式向量元素段（序号 → 元素类型 id）
+pub var nest_vec_lens: table<i64> = [];    // 显式向量长度段（序号 → 元素个数 N）
 pub var nest_arr_lens: table<i64> = [];    // 嵌套定长数组长度段（序号 → 元素个数 N）
 // S2.2 fn 函数值类型签名表（段式，索引即 fn 类型低负载）：
 // fn_ret    签名索引 -> 返回类型 id

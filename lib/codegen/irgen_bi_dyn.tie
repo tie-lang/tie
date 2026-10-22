@@ -310,6 +310,48 @@ if nm == "any_tag" {
 
 // 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
 // 内置 `map_contains`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// 显式向量内建：vec_add(a, b) / vec_mul(a, b) → array<T, N>（整寄存器 <N x T> 运算）
+// 语义：返回逐元素和/积的新数组；实参为 array<T, N>，调用点决定结果类型。
+pub func bi_vec_op(nm: string, id: i64) -> i64 {
+    var an = call_arg(id, 0)
+    var bn = call_arg(id, 1)
+    var at = ast.node_type(an)
+    if types.kind(at) != types.K_ARRAY {
+        sm_err_msg = nm + "() 的实参必须是定长数组 array<T, N>（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var vty = types.vec_of(types.array_elem(at), types.array_len(at))
+    var av = tig_expr(an)
+    if av < 0 {
+        return -1
+    }
+    var bv = tig_expr(bn)
+    if bv < 0 {
+        return -1
+    }
+    // 数组值落成临时槽，才能按指针做整寄存器向量访问
+    var ta = ir.new_inst(g_cur_block, 20, at)
+    var pa = ir.get_value(ta)
+    s21_store(pa, av, at)
+    var tb = ir.new_inst(g_cur_block, 20, at)
+    var pb = ir.get_value(tb)
+    s21_store(pb, bv, at)
+    var la = s21_load(pa, vty)
+    var lb = s21_load(pb, vty)
+    var op: i64 = 0
+    if nm == "vec_mul" {
+        op = 2
+    }
+    var rs = ir.new_inst(g_cur_block, op, vty)
+    ir.add_operand(rs, la, 0)
+    ir.add_operand(rs, lb, 0)
+    var tr = ir.new_inst(g_cur_block, 20, at)
+    var pr = ir.get_value(tr)
+    s21_store(pr, ir.get_value(rs), vty)
+    g_builtin_res = s21_load(pr, at)
+    return 0
+}
+
 pub func bi_map_contains(nm: string, id: i64) -> i64 {
 if nm == "map_contains" {
     var m1 = tig_expr(call_arg(id, 0))

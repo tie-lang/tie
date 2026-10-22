@@ -4,21 +4,22 @@ tie 语言核心：编译器、标准库、运行时与薄工具的单主体仓�
 
 ## 布局
 
-| 目录 | 职责 |
-| --- | --- |
-| `std/` | 标准库（`/std/*`：prelude、string、zd、td…） |
-| `sys/` | 平台层（`/sys/*`） |
-| `ext/` | 扩展绑定（`/ext/*`：gfx、skia 等） |
-| `lib/support` | 诊断 / 内部化 / 编码 / 文件 / 参数 |
-| `lib/ir` | tieir 模型 + 类型描述 + 序列化 + 版本 |
-| `lib/front` | 前端（源码 → tieir） |
-| `lib/backend` | 后端（tieir → LLVM IR） |
-| `lib/rt` | 运行时薄核（panic 域 / 全局注册 / 版本） |
-| `lib/jit` | LLVM-C 垫片 + LLJIT 会话 |
-| `tools/tiec` | 编译器（`src/` 源码、`scripts/` 门禁脚本） |
-| `tools/tiej` | JIT 驱动（tieir → LLJIT） |
-| `tools/tiel` | 轻量解释器（前端） |
-| `tests/` | 语言/工具探针与编译器回归用例 |
+| 目录            | 职责                             |
+| ------------- | ------------------------------ |
+| `std/`        | 标准库                            |
+| `sys/`        | 平台库                            |
+| `ext/`        | 扩展库                            |
+| `rdu/`        | 嵌入式开发标准库                       |
+| `lib/support` | 诊断 / 内部化 / 编码 / 文件 / 参数        |
+| `lib/ir`      | tieir 模型 + 类型描述 + 序列化 + 版本     |
+| `lib/front`   | 前端（源码 → tieir）                 |
+| `lib/backend` | 后端（tieir → LLVM IR）            |
+| `lib/rt`      | 运行时薄核（panic 域 / 全局注册 / 版本）     |
+| `lib/jit`     | LLVM-C 垫片 + LLJIT 会话           |
+| `tools/tiec`  | 编译器（`src/` 源码、`scripts/` 门禁脚本） |
+| `tools/tiej`  | JIT 驱动（tieir → LLJIT）          |
+| `tools/tiel`  | 轻量解释器（前端）                      |
+| `tests/`      | 语言/工具探针与编译器回归用例                |
 
 跨库引用写全名（`tie.ir::x`）；文件首部 `namespace <库名>;` 写在 import 之后。
 `std/`、`sys/`、`ext/` 是 `/std/*` 等绝对导入的根，构建时令 `TIE_LIB_ROOT=<仓根>`。

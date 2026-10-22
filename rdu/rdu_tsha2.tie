@@ -1,0 +1,278 @@
+type tie<class>
+// ============================================================================
+// rdu_tsha2.tie：嵌入式基础层（rdu）——TSHA2-r 哈希（命名空间 rdu_tsha2）
+// 定位：rdu = Reusable Device Utils，嵌入式无栈纯标量基础件。本模块为
+//   std/tsha2.tie 的 rdu 版：**无查找表、无动态表、无全局可变状态、无递归**，
+//   384 位内态（r 档：4 子 lane × 64 trit，双平面 8×i64）以值类型 struct 承载。
+//   纯标量运算（位运算/移位/mod-3 加法乘法），编译产物 .a 零运行时依赖，
+//   可在 MCU/裸机 freestanding 直链；无 SIMD 依赖（嵌入式 MCU 无向量指令）。
+// 算法：与 std/tsha2.tie 的 tsha2r 完全一致（双向环 + 偶先奇后两相 + 乘→旋转→加
+//   + theta 列奇偶扩散；rate 24B；R=12 轮；Merkle-Damgard 长度编码填充；
+//   10 trit → 3 符号 48 进制 XOF），共用 KAT，探针比对两版输出逐字节一致。
+// 接口：rdu_tsha2.tsha2r(msg: string, n: i64) -> string
+//   msg：原始字符串（按字节哈希）；n：48 进制符号数（1..65536，非法返回空串）。
+//   输出符号映射 base48 字符台（同 std/base48.tie）。
+// 无栈纪律说明：str_byte/str_char/str_len 仅在消息输入与输出边界使用（与
+//   rdu_ascon_mac 同口径），核心算法为纯标量。
+// ============================================================================
+
+// 384 位内态（r 档：4 子 lane，每 lane 双平面 2×i64）。
+struct Tsha2rS {
+    var l0h: i64
+    var l0l: i64
+    var l1h: i64
+    var l1l: i64
+    var l2h: i64
+    var l2l: i64
+    var l3h: i64
+    var l3l: i64
+}
+
+namespace rdu_tsha2 {
+
+// 64 位循环左移（tie 的 >> 为算术右移，须掩码）。
+func rotl(v: i64, n: i64) -> i64 {
+    if n == 0 {
+        return v
+    }
+    return (v << n) | ((v >> (64 - n)) & ((1 << n) - 1))
+}
+
+// mod-3 加法：输入输出均为规范双平面 (h, l)。
+func add_r0(a1: i64, a0: i64, b1: i64, b0: i64) -> i64 {
+    var s0 = a0 ^ b0
+    var c0 = a0 & b0
+    var t = a1 ^ b1
+    var s1 = t ^ c0
+    var s2 = (a1 & b1) | (t & c0)
+    return s2 | ((s2 ^ (0 - 1)) & s0 & (s1 ^ (0 - 1)))
+}
+
+func add_r1(a1: i64, a0: i64, b1: i64, b0: i64) -> i64 {
+    var s0 = a0 ^ b0
+    var c0 = a0 & b0
+    var t = a1 ^ b1
+    var s1 = t ^ c0
+    var s2 = (a1 & b1) | (t & c0)
+    return (s2 ^ (0 - 1)) & s1 & (s0 ^ (0 - 1))
+}
+
+// GF(3) 乘法（mul_r0 = 低平面，mul_r1 = 高平面）。
+func mul_r0(a1: i64, a0: i64, b1: i64, b0: i64) -> i64 {
+    return ((a1 | a0) & (b1 | b0)) & ((a1 & b1) | (a0 & b0))
+}
+
+func mul_r1(a1: i64, a0: i64, b1: i64, b0: i64) -> i64 {
+    return ((a1 | a0) & (b1 | b0)) & (((a1 & b1) | (a0 & b0)) ^ (0 - 1))
+}
+
+// y + c 的三值编码（c 只取 1 或 2）。
+func tc(h: i64, l: i64, c: i64) -> (i64, i64) {
+    if c == 1 {
+        return ((h ^ (0 - 1)) & l, (h ^ (0 - 1)) & (l ^ (0 - 1)))
+    }
+    return ((h ^ (0 - 1)) & (l ^ (0 - 1)), (h ^ (0 - 1)) & l)
+}
+
+// 子 lane 混合（乘 → 旋转 → 加；自身值只经加法进入输出）。
+func mix(ih: i64, il: i64, y1h: i64, y1l: i64, y2h: i64, y2l: i64, c: i64, k1: i64, k2: i64) -> (i64, i64) {
+    var a1h: i64 = 0
+    var a1l: i64 = 0
+    var a2h: i64 = 0
+    var a2l: i64 = 0
+    if c == 1 {
+        a1h = (y1h ^ (0 - 1)) & y1l
+        a1l = (y1h ^ (0 - 1)) & (y1l ^ (0 - 1))
+        a2h = (y2h ^ (0 - 1)) & y2l
+        a2l = (y2h ^ (0 - 1)) & (y2l ^ (0 - 1))
+    } else {
+        a1h = (y1h ^ (0 - 1)) & (y1l ^ (0 - 1))
+        a1l = (y1h ^ (0 - 1)) & y1l
+        a2h = (y2h ^ (0 - 1)) & (y2l ^ (0 - 1))
+        a2l = (y2h ^ (0 - 1)) & y2l
+    }
+    var p1h = mul_r0(y1h, y1l, a1h, a1l)
+    var p1l = mul_r1(y1h, y1l, a1h, a1l)
+    var p2h = mul_r0(y2h, y2l, a2h, a2l)
+    var p2l = mul_r1(y2h, y2l, a2h, a2l)
+    var t1 = add_r0(ih, il, rotl(p1h, k1), rotl(p1l, k1))
+    var oh = add_r1(ih, il, rotl(p1h, k1), rotl(p1l, k1))
+    var t2v = add_r0(oh, t1, rotl(p2h, k2), rotl(p2l, k2))
+    var oh2 = add_r1(oh, t1, rotl(p2h, k2), rotl(p2l, k2))
+    return (oh2, t2v)
+}
+
+// 一轮：偶先奇后两相混合 + theta 列奇偶扩散（lane_i += rot(P, 3i+1)）。
+func perm_round(s: Tsha2rS) -> Tsha2rS {
+    var (e0h, e0l) = mix(s.l0h, s.l0l, s.l1h, s.l1l, s.l3h, s.l3l, 1, 5, 23)
+    var (e2h, e2l) = mix(s.l2h, s.l2l, s.l3h, s.l3l, s.l1h, s.l1l, 1, 19, 45)
+    var (o1h, o1l) = mix(s.l1h, s.l1l, e2h, e2l, e0h, e0l, 2, 12, 34)
+    var (o3h, o3l) = mix(s.l3h, s.l3l, e0h, e0l, e2h, e2l, 2, 26, 56)
+    // theta：列和 P = l0 + l1 + l2 + l3（mod 3）
+    var ph = add_r1(e0h, e0l, o1h, o1l)
+    var pl = add_r0(e0h, e0l, o1h, o1l)
+    var nh = add_r1(ph, pl, e2h, e2l)
+    var nl = add_r0(ph, pl, e2h, e2l)
+    ph = nh
+    pl = nl
+    nh = add_r1(ph, pl, o3h, o3l)
+    nl = add_r0(ph, pl, o3h, o3l)
+    ph = nh
+    pl = nl
+    return Tsha2rS(
+        add_r1(e0h, e0l, rotl(ph, 1), rotl(pl, 1)),
+        add_r0(e0h, e0l, rotl(ph, 1), rotl(pl, 1)),
+        add_r1(o1h, o1l, rotl(ph, 4), rotl(pl, 4)),
+        add_r0(o1h, o1l, rotl(ph, 4), rotl(pl, 4)),
+        add_r1(e2h, e2l, rotl(ph, 7), rotl(pl, 7)),
+        add_r0(e2h, e2l, rotl(ph, 7), rotl(pl, 7)),
+        add_r1(o3h, o3l, rotl(ph, 10), rotl(pl, 10)),
+        add_r0(o3h, o3l, rotl(ph, 10), rotl(pl, 10)))
+}
+
+// 一个吸收块（24B → lane0..2，8 字节小端成字，mod-3 加进低/高平面）。
+// g：全局字节序号；n：消息长度；plen：填充后长度。
+func absorb_blk(s: Tsha2rS, msg: string, pos: i64, mlen: i64, plen: i64) -> Tsha2rS {
+    // rdu 纪律：struct 为不可变值类型——吸收后用构造器重建（不原地改字段）。
+    var j: i64 = 0
+    var l0h = s.l0h
+    var l0l = s.l0l
+    var l1h = s.l1h
+    var l1l = s.l1l
+    var l2h = s.l2h
+    var l2l = s.l2l
+    while j < 3 {
+        var w: i64 = 0
+        var i: i64 = 0
+        while i < 8 {
+            var at = pos + j * 8 + i
+            var byte: i64 = 0
+            if at < mlen {
+                byte = str_byte(msg, at)
+            } else if at == mlen {
+                byte = 128
+            } else if at >= plen - 8 {
+                byte = (mlen >> ((at - (plen - 8)) * 8)) & 255
+            }
+            w = w | (byte << (i * 8))
+            i = i + 1
+        }
+        var hi: i64 = 0
+        var lo: i64 = 0
+        if j == 0 {
+            hi = l0h
+            lo = l0l
+        } else if j == 1 {
+            hi = l1h
+            lo = l1l
+        } else {
+            hi = l2h
+            lo = l2l
+        }
+        var t = add_r0(hi, lo, 0, w)
+        var nh = add_r1(hi, lo, 0, w)
+        if j == 0 {
+            l0h = nh
+            l0l = t
+        } else if j == 1 {
+            l1h = nh
+            l1l = t
+        } else {
+            l2h = nh
+            l2l = t
+        }
+        j = j + 1
+    }
+    return Tsha2rS(l0h, l0l, l1h, l1l, l2h, l2l, s.l3h, s.l3l)
+}
+
+// 读一个 trit（lane 优先、列次之；rate = lane0..2）。
+func trit_of(s: Tsha2rS, lane: i64, col: i64) -> i64 {
+    var h: i64 = 0
+    var l: i64 = 0
+    if lane == 0 {
+        h = (s.l0h >> col) & 1
+        l = (s.l0l >> col) & 1
+    } else if lane == 1 {
+        h = (s.l1h >> col) & 1
+        l = (s.l1l >> col) & 1
+    } else {
+        h = (s.l2h >> col) & 1
+        l = (s.l2l >> col) & 1
+    }
+    return l + 2 * h
+}
+
+pub func tsha2r(msg: string, n: i64) -> string {
+    if n < 1 || n > 65536 {
+        return ""
+    }
+    var mlen = str_len(msg)
+    var plen = ((mlen + 1 + 23) / 24) * 24
+    if plen - mlen < 9 {
+        plen = plen + 24
+    }
+    var z: i64 = 0
+    var s = Tsha2rS(z, z, z, z, z, z, z, z)
+    var pos: i64 = 0
+    while pos < plen {
+        s = absorb_blk(s, msg, pos, mlen, plen)
+        var rr: i64 = 0
+        while rr < 12 {
+            s = perm_round(s)
+            rr = rr + 1
+        }
+        pos = pos + 24
+    }
+    // 挤出：rate lane 逐列取 trit，每 10 trit → 3 个 48 进制符号
+    var charset = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL"
+    var out: string = ""
+    var lane: i64 = 0
+    var col: i64 = 0
+    var k: i64 = 0
+    while k < n {
+        var val: i64 = 0
+        var i: i64 = 0
+        while i < 10 {
+            val = val + trit_of(s, lane, col) * t2p3(i)
+            col = col + 1
+            if col == 64 {
+                col = 0
+                lane = lane + 1
+                if lane == 3 {
+                    lane = 0
+                    var rr: i64 = 0
+                    while rr < 12 {
+                        s = perm_round(s)
+                        rr = rr + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+        var sym: i64 = val / 2304
+        var sym2 = (val / 48) % 48
+        var sym3 = val % 48
+        out = out + str_char(charset, sym)
+        if k + 1 < n {
+            out = out + str_char(charset, sym2)
+        }
+        if k + 2 < n {
+            out = out + str_char(charset, sym3)
+        }
+        k = k + 3
+    }
+    return out
+}
+
+func t2p3(i: i64) -> i64 {
+    var v: i64 = 1
+    var k: i64 = 0
+    while k < i {
+        v = v * 3
+        k = k + 1
+    }
+    return v
+}
+
+} // namespace rdu_tsha2

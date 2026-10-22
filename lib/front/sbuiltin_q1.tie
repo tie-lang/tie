@@ -37,6 +37,9 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
     // 决定，调用点（scheck/stype.types_match + irgen var-decl）据此校验实参并
     // 生成 [N x T] 全等值填充。
     if fn_name == "array_init" { return builtin_call_b_array_init(fn_name, args, call_node) }
+    // ---------- 显式向量：vec_add(dst, a, b) / vec_mul(dst, a, b) ----------
+    // 三参均为 array<T, N>（dst 需可写）；逐元素运算由生成器发成交整寄存器 <N x T> 运算。
+    if fn_name == "vec_add" || fn_name == "vec_mul" { return builtin_call_b_vec_op(fn_name, args, call_node) }
     // P2b：any 拆箱转换（as_*：1 参 any → 具体类型；实参类型由调用点检查）
     // P2d：as_table_* 拆箱为元素化表（返回 table_of(元素)，tag = 精确表类型 id）
     if fn_name == "as_i64" || fn_name == "as_f64" || fn_name == "as_bool" || fn_name == "as_string" || fn_name == "as_char" || fn_name == "as_table_i64" || fn_name == "as_table_string" || fn_name == "as_table_bool" || fn_name == "as_table_f64" || fn_name == "as_table_char" || fn_name == "as_table_any" { return builtin_call_b_as_i64(fn_name, args, call_node) }

@@ -254,6 +254,18 @@ pub func builtin_call_b_array_init(fn_name: string, args: table<i64>, call_node:
         return types.named(TK_MISC)
 }
 
+// 显式向量内建：vec_add(a, b) / vec_mul(a, b) → array<T, N>（返回类型占位，由调用点按目标类型细化）
+pub func builtin_call_b_vec_op(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    if nargs != 2 {
+        sm_err_line = s_lines[call_node]
+        sm_err_col = s_cols[call_node]
+        sm_err_msg = fn_name + "() 期望 2 个参数（左数组, 右数组），实际 " + to_string(nargs) + " 个"
+        return -2
+    }
+    return types.named(TK_MISC)
+}
+
 pub func builtin_call_b_as_i64(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
     var nargs = len(args)
     // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------

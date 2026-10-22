@@ -17,6 +17,10 @@ pub func type_name(t: i64) -> string {
         }
         return "?"
     }
+    if k == K_VEC {
+        // 显式向量：vec<elem, N>（与 array 同为定长聚合，仅 LLVM 表示不同）
+        return "vec<" + type_name(vec_elem(t)) + ", " + to_string(vec_len(t)) + ">"
+    }
     if k == K_ARRAY {
         // L1 定长数组：array<elem, N>（错误消息/类型名还原用）
         return "array<" + type_name(array_elem(t)) + ", " + to_string(array_len(t)) + ">"

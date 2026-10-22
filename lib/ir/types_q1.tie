@@ -187,6 +187,55 @@ pub func future_elem(t: i64) -> i64 {
     return -1
 }
 
+// ---------- 显式向量类型构造 ----------
+// vec<T, N>：id = 16<<40 | NEST_SLOT_OFF + 序号，元素与长度登记在 nest_vec_elems / nest_vec_lens。
+// 与 array<T, N> 的区别只在 LLVM 表示：向量是 <N x T>（整寄存器值），数组是 [N x T]（内存）。
+pub func vec_of(elem: i64, len2: i64) -> i64 {
+    var n = len(nest_vec_elems)
+    var i: i64 = 0
+    while i < n {
+        if nest_vec_elems[i] == elem && nest_vec_lens[i] == len2 {
+            return BASE_VEC + NEST_SLOT_OFF + i
+        }
+        i = i + 1
+    }
+    table_push(nest_vec_elems, elem)
+    table_push(nest_vec_lens, len2)
+    return BASE_VEC + NEST_SLOT_OFF + n
+}
+
+// 显式向量判据：kind == K_VEC（16<<40 段）。
+pub func is_vec(t: i64) -> bool {
+    if kind(t) == K_VEC {
+        return true
+    }
+    return false
+}
+
+// 显式向量元素类型：K_VEC → 元素类型 id；非向量返回 -1。
+pub func vec_elem(t: i64) -> i64 {
+    if kind(t) == K_VEC {
+        var la = low(t) - NEST_SLOT_OFF
+        if la >= 0 && la < len(nest_vec_elems) {
+            return nest_vec_elems[la]
+        }
+        return -1
+    }
+    return -1
+}
+
+// 显式向量长度：K_VEC → 元素个数 N（编译期常量）；非向量返回 -1。
+pub func vec_len(t: i64) -> i64 {
+    if kind(t) == K_VEC {
+        var lb = low(t) - NEST_SLOT_OFF
+        if lb >= 0 && lb < len(nest_vec_lens) {
+            return nest_vec_lens[lb]
+        }
+        return -1
+    }
+    return -1
+}
+
 // future<T> 判据（kind 段判别）
 pub func is_future(t: i64) -> bool {
     return kind(t) == K_FUTURE
@@ -595,6 +644,10 @@ pub func kind(id: i64) -> i64 {
     if id < 100 {
         return K_NAMED
     }
+    // 显式向量段（16<<40）高于 future 段，必须最先判
+    if id >= BASE_VEC {
+        return K_VEC
+    }
     // p.9.11 future 段（15<<40）高于 array 段，必须最先判
     if id >= BASE_FUTURE {
         return K_FUTURE
@@ -645,6 +698,10 @@ pub func kind(id: i64) -> i64 {
 // 类型负载：Table/Map/Ptr/Slice/Atomic 的元素类型 id、Struct/Tuple/Enum/Port 的
 // 索引、TypeVar 的 intern 池 id；Named 类型无意义（调用方先判 kind）。
 pub func low(id: i64) -> i64 {
+    // 显式向量段（16<<40）最高，必须最先判
+    if id >= BASE_VEC {
+        return id - BASE_VEC
+    }
     // p.9.11 future 段（15<<40）最高，必须最先判
     if id >= BASE_FUTURE {
         return id - BASE_FUTURE

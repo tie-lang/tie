@@ -209,6 +209,10 @@ func tig_block_pipe(id: i64) -> i64 {
 // 命中即内置——调用失败传播错误，不降级为用户函数路径。
 func is_builtin_name(nm: string) -> bool {
     // ---------- S1.2 unsafe 指针/内存内置 ----------
+    // 显式向量内建（vec<T, N> 整寄存器运算）
+    if nm == "vec_add" || nm == "vec_mul" {
+        return true
+    }
     if nm == "addr_of" || nm == "addr_of_field" || nm == "deref" || nm == "deref_write" ||
         nm == "is_null" || nm == "ptr_add" || nm == "ptr_to_int" || nm == "int_to_ptr" ||
         nm == "alloc" || nm == "free" || nm == "memcpy" || nm == "memset" ||

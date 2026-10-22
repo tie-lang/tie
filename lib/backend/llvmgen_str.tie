@@ -82,6 +82,10 @@ func llvm_ty(t: i64) -> string {
     //   struct → 命名结构体 %struct.<名字>（emit_agg_types 输出 type 定义）。
     // 对齐 Rust llvm_ty 的 Tuple/Struct 映射（元组内联、类命名）。
     var agg_k = types.kind(t)
+    if agg_k == K_VEC {
+        // 显式向量：LLVM 原生 <N x T>（整寄存器值，内建 vec_* 直接产出向量指令）
+        return "<" + to_string(types.vec_len(t)) + " x " + llvm_ty(types.vec_elem(t)) + ">"
+    }
     if agg_k == K_ARRAY {
         // L1 定长数组：LLVM 原生数组 [N x T]（连续内存，自动对齐；循环
         // 经 LLVM auto-vectorizer 直接产出 SIMD——扩散训练热点的性能来源）。
