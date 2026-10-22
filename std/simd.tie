@@ -1,0 +1,107 @@
+type tie<class>
+// simd.tie：标准库——显式向量化原语（namespace simd），全部基于 table<i64> 与
+// 底座内建，不依赖其他 std 模块。
+//
+// 设计取向：这些内核以「单层循环、步长恒为 1、循环内无分支、不含间接寻址」的
+// 形式书写，是自动向量化器最易识别的形态；能否真正展开为 SIMD 指令，
+// 取决于生成的 IR 质量（见下方实测状态）。之所以在 API 层显式提供而不是让调用方手写循环：
+// 自动向量化对内存布局与别名关系高度敏感，手写循环一旦引入别名、跨步访问或
+// 循环内早退就会失去向量化；把这些约束固化成固定签名的内核，调用方拿到的
+// 是固定的内核形态，而不是各自碰运气的循环写法。
+//
+// 当前实测状态（如实记录，不按预期宣称）：-l3 -t3 下 add/sub/mul 内核尚未被向量化。
+// 阻碍来自 codegen 生成的 IR 形态——函数入口每个局部变量一个 alloca 栈槽（阻碍
+// mem2reg）、下标访问带边界检查分支、形参间无别名提示。本模块因此既是可向量化
+// 形态的样板，也是后续 IR 优化的验收基准：这些内核在 -l3 下能出 vpaddq/vpmullq，
+// 才说明 IR 层面的阻碍已经消除。
+//
+// 边界与前提（调用方须自行保证，内核不重复校验）：
+// * n 为正；dst/a/b 的元素个数均 >= n（仅做 n 次访问，不做越界检查）；
+// * dst 与 a、b 不重叠（重叠时向量化与标量语义都不可靠）；
+// * n 不必是向量通道数的整数倍，余数由标量尾处理，向量宽度由目标机决定。
+//
+// 调用：import 后 simd.add_i64(dst, a, b, n) / simd.sum_i64(a, n) 等。
+
+namespace simd {
+// dst[i] = a[i] + b[i]（逐元素整数加法）
+pub func add_i64(dst: ref table<i64>, a: table<i64>, b: table<i64>, n: i64) {
+    var i: i64 = 0
+    while i < n {
+        dst[i] = a[i] + b[i]
+        i = i + 1
+    }
+}
+
+// dst[i] = a[i] - b[i]（逐元素整数减法）
+pub func sub_i64(dst: ref table<i64>, a: table<i64>, b: table<i64>, n: i64) {
+    var i: i64 = 0
+    while i < n {
+        dst[i] = a[i] - b[i]
+        i = i + 1
+    }
+}
+
+// dst[i] = a[i] * b[i]（逐元素整数乘法）
+pub func mul_i64(dst: ref table<i64>, a: table<i64>, b: table<i64>, n: i64) {
+    var i: i64 = 0
+    while i < n {
+        dst[i] = a[i] * b[i]
+        i = i + 1
+    }
+}
+
+// dst[i] = v（向量填值；v 提到循环外，循环体内无标量依赖）
+pub func fill_i64(dst: ref table<i64>, v: i64, n: i64) {
+    var i: i64 = 0
+    while i < n {
+        dst[i] = v
+        i = i + 1
+    }
+}
+
+// 逐元素整体相加，返回总和（归约；为可向量化使用分块累加，避免单累加器串行依赖）
+pub func sum_i64(a: table<i64>, n: i64) -> i64 {
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i + 4 <= n {
+        acc = acc + (a[i] + a[i + 1] + a[i + 2] + a[i + 3])
+        i = i + 4
+    }
+    while i < n {
+        acc = acc + a[i]
+        i = i + 1
+    }
+    return acc
+}
+
+// 点积 a[i] * b[i] 之和（同样分块累加，保持可向量化形态）
+pub func dot_i64(a: table<i64>, b: table<i64>, n: i64) -> i64 {
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i + 4 <= n {
+        acc = acc + (a[i] * b[i] + a[i + 1] * b[i + 1] + a[i + 2] * b[i + 2] + a[i + 3] * b[i + 3])
+        i = i + 4
+    }
+    while i < n {
+        acc = acc + a[i] * b[i]
+        i = i + 1
+    }
+    return acc
+}
+
+// 求最大值（归约）
+pub func max_i64(a: table<i64>, n: i64) -> i64 {
+    if n <= 0 {
+        return 0
+    }
+    var m = a[0]
+    var i: i64 = 1
+    while i < n {
+        if a[i] > m {
+            m = a[i]
+        }
+        i = i + 1
+    }
+    return m
+}
+}
