@@ -298,4 +298,226 @@ pub func bipartite_match(adj: table<i64>, n: i64, m: i64) -> i64 {
     }
     return result
 }
+
+// ============================================================================
+// 图声明单元（§14.5）：解析期把 `graph 名字 { node 甲 … 甲 -> 乙 }` 降解为
+// 下面的普通调用；图是不可变值（构造后只读），执行语义复用本文件前面的算法。
+// ============================================================================
+var gg_name: table<string>
+var gg_node: table<string>       // 节点名（与 gg_now 平行）
+var gg_now: table<i64>           // 所属图 id
+var gg_from: table<string>
+var gg_to: table<string>
+var gg_when: table<i64>          // 条件求值结果（1/0），保序
+var gg_edge_g: table<i64>
+var gg_ready: bool = false
+
+func gg_ensure() {
+    if gg_ready {
+        return
+    }
+    gg_ready = true
+    gg_name = table_new_string()
+    gg_node = table_new_string()
+    gg_now = table_new_i64()
+    gg_from = table_new_string()
+    gg_to = table_new_string()
+    gg_when = table_new_i64()
+    gg_edge_g = table_new_i64()
+}
+
+// 新建一个图，返回图 id。
+pub func g_new(name: string) -> i64 {
+    gg_ensure()
+    table_push(gg_name, name)
+    return len(gg_name) - 1
+}
+
+
+// 当前图 id（最近一次 g_new 的结果）。供第 14 章 `graph 名 { … }` 的语法
+// 降解使用：元素语句里没有句柄变量，图声明建立隐式图栈。
+pub func g_now() -> i64 {
+    gg_ensure()
+    return len(gg_name) - 1
+}
+// 清空全部图（测试与重入）。
+pub func g_reset() {
+    gg_ready = false
+    gg_ensure()
+}
+
+// 向图追加一个节点（重名只登记一次，返回是否新增）。
+pub func g_add_node(g: i64, name: string) -> bool {
+    gg_ensure()
+    var i: i64 = 0
+    while i < len(gg_node) {
+        if gg_now[i] == g && gg_node[i] == name {
+            return false
+        }
+        i = i + 1
+    }
+    table_push(gg_node, name)
+    table_push(gg_now, g)
+    return true
+}
+
+// 向图追加一条边；when 是 `when` 守卫的求值结果（无守卫传 true）。
+pub func g_add_edge(g: i64, from: string, to: string, cond: bool) -> i64 {
+    gg_ensure()
+    table_push(gg_from, from)
+    table_push(gg_to, to)
+    if cond {
+        table_push(gg_when, 1)
+    } else {
+        table_push(gg_when, 0)
+    }
+    table_push(gg_edge_g, g)
+    return len(gg_from) - 1
+}
+
+pub func g_count() -> i64 {
+    gg_ensure()
+    return len(gg_name)
+}
+
+pub func g_name_at(g: i64) -> string {
+    gg_ensure()
+    return gg_name[g]
+}
+
+// 按名字找图，未命中返回 -1。
+pub func g_find(name: string) -> i64 {
+    gg_ensure()
+    var i: i64 = 0
+    while i < len(gg_name) {
+        if gg_name[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+pub func g_node_count(g: i64) -> i64 {
+    gg_ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(gg_node) {
+        if gg_now[i] == g {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub func g_node_at(g: i64, k: i64) -> string {
+    gg_ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(gg_node) {
+        if gg_now[i] == g {
+            if n == k {
+                return gg_node[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+pub func g_has_node(g: i64, name: string) -> bool {
+    gg_ensure()
+    var i: i64 = 0
+    while i < len(gg_node) {
+        if gg_now[i] == g && gg_node[i] == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+pub func g_edge_count(g: i64) -> i64 {
+    gg_ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(gg_from) {
+        if gg_edge_g[i] == g {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+func gg_edge_slot(g: i64, k: i64) -> i64 {
+    gg_ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(gg_from) {
+        if gg_edge_g[i] == g {
+            if n == k {
+                return i
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+pub func g_edge_from(g: i64, k: i64) -> string {
+    var s = gg_edge_slot(g, k)
+    if s < 0 {
+        return ""
+    }
+    return gg_from[s]
+}
+
+pub func g_edge_to(g: i64, k: i64) -> string {
+    var s = gg_edge_slot(g, k)
+    if s < 0 {
+        return ""
+    }
+    return gg_to[s]
+}
+
+pub func g_edge_when(g: i64, k: i64) -> bool {
+    var s = gg_edge_slot(g, k)
+    if s < 0 {
+        return false
+    }
+    return gg_when[s] != 0
+}
+
+pub func g_out_count(g: i64, from: string) -> i64 {
+    gg_ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(gg_from) {
+        if gg_edge_g[i] == g && gg_from[i] == from && gg_when[i] != 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub func g_out_at(g: i64, from: string, k: i64) -> string {
+    gg_ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(gg_from) {
+        if gg_edge_g[i] == g && gg_from[i] == from && gg_when[i] != 0 {
+            if n == k {
+                return gg_to[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
 }

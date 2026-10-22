@@ -88,6 +88,31 @@ func prelude_needs_result(immut raw: string) -> bool {
     return true
 }
 
+// 第 14 章 UI 运行时：声明式元素块/图/单元在解析期降解为裸名 `ui_*` /
+// `graph_*` 调用（见 lib/front/pstmt_ui.tie），故需把 std/ui.tie 的命名
+// 空间经 `using` 暴露为裸名。按源文本扫描判定（与 prelude_needs_result
+// 同款）：未命中零成本，命中多一次 import 解析。
+func prelude_needs_ui(immut raw: string) -> bool {
+    if str.find(raw, "@ ") >= 0 {
+        return true
+    }
+    if str.find(raw, "graph ") >= 0 {
+        return true
+    }
+    if str.find(raw, "view ") >= 0 {
+        return true
+    }
+    if str.find(raw, "component ") >= 0 {
+        return true
+    }
+    if str.find(raw, "style ") >= 0 {
+        return true
+    }
+    if str.find(raw, "theme ") >= 0 {
+        return true
+    }
+    return false
+}
 // 注入前置：命中角色且 prelude 可用时在正文首部拼入 import + using；否则原样返回。
 // 注 1：形参名不可用 `code`（tie 保留类型名：宏参类型），故用 `body`。
 // 注 2：import 的**别名必须与 prelude 内的命名空间同名**（lang），否则 `using`
@@ -106,6 +131,9 @@ pub func prelude_inject(body: string, role: string, raw: string) -> string {
     // 内建 Result/Option：无别名 import（顶层 enum 对导入方裸名可见，实测）
     if prelude_needs_result(raw) {
         head = "import \"/std/result.tie\"\n" + head
+    }
+    if prelude_needs_ui(raw) {
+        head = head + "import \"/std/graph.tie\"\nimport \"/std/ui.tie\"\n"
     }
     // ★ 追加到**末尾**，不置于首部（2026-10-07 修）：
     //   首部注入把正文整体下移注入行数，而诊断行号**没有行映射** ⇒ 主文件全部

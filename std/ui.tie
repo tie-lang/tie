@@ -1,0 +1,883 @@
+type tie<class>
+// std/ui.tie —— 第 14 章「界面元素块与图语法」的运行时支撑
+// ============================================================================
+// 设计契约（§14.1）：元素块与图不是独立语言，而是同一套表达式的书写形态。
+//   * 解析期把 `@ window "标题" { ... }` 降解为对本模块的普通调用序列
+//     （begin / attr_str / modifier / text / on_name / end）——不引入
+//     新的求值模型，走既有语义检查与代码生成。
+//   * 本模块只做「存储 + 查询」：元素树是全局合一的一棵树（父节点由压栈
+//     决定），属性/修饰/事件按节点 id 存平行表；图与样式单元按 id 存平行表。
+//   * 渲染后端不在本层（§14.9 只规定契约）；后端按查询接口取树/图/样式。
+//   * 顶层样式/图单元是声明式数据：解析期折成 `unit_decl(...)` /
+//     `graph_decl(...)` 一次调用，载荷是块体原文（"k:v;k:v"），由本模块
+//     在运行时切分成条目——保证「声明即注册」不需要额外的注册语句。
+import "./string.tie" as str
+
+namespace ui {
+
+// ---------- v2：函数值事件 / 端口 / 单元结构化属性与规则 / 主题 ----------
+var g_fnow: table<i64>
+var g_fnname: table<string>
+var g_fnfn: table<fn(i64, i64, i64, string) -> i64>
+var g_port: table<string>
+var g_pown: table<i64>
+var g_upk: table<string>
+var g_upv: table<string>
+var g_upown: table<i64>
+var g_rsel: table<string>
+var g_rprop: table<string>
+var g_rval: table<string>
+var g_urown: table<i64>
+var g_thname: table<string>
+var g_thkey: table<string>
+var g_thval: table<string>
+var g_layers: table<string>
+
+// ---------- 元素树 ----------
+var g_kind: table<string>
+var g_name: table<string>
+var g_parent: table<i64>
+var g_ak: table<string>      // 属性键（与 g_av/g_own 平行）
+var g_av: table<string>      // 属性值（已降解为字符串，含颜色/尺寸原文）
+var g_aown: table<i64>
+var g_mod: table<string>     // 修饰（无值属性）
+var g_mown: table<i64>
+var g_ev: table<string>      // 事件名（on_click 等）
+var g_evh: table<string>     // 事件处理器（函数名/端口名）
+var g_eown: table<i64>
+var g_roots: table<i64>
+var g_stack: table<i64>
+
+// ---------- 视图/组件单元 ----------
+var g_vkind: table<string>
+var g_vname: table<string>
+var g_vpn: table<string>     // 参数名/出端口名（与 g_vpt 平行）
+var g_vpt: table<string>     // 参数类型/出端口类型书写形态
+var g_vpo: table<i64>        // 所属单元节点 id
+var g_vio: table<i64>        // 0=参数 1=出端口
+
+// ---------- 图 ----------
+var g_gn: table<string>      // 图层名
+var g_gnode: table<string>   // 节点名（与 g_gnow 平行）
+var g_gnow: table<i64>
+var g_gfrom: table<string>
+var g_gto: table<string>
+var g_gwhen: table<string>
+var g_gow: table<i64>
+
+// ---------- 样式/主题/层/作用域单元 ----------
+var g_uk: table<string>
+var g_un: table<string>
+var g_ud: table<string>      // 载荷原文 "k:v;k:v"
+
+var g_ready: bool = false
+
+func ensure() {
+    if g_ready {
+        return
+    }
+    g_ready = true
+    g_kind = table_new_string()
+    g_name = table_new_string()
+    g_parent = table_new_i64()
+    g_ak = table_new_string()
+    g_av = table_new_string()
+    g_aown = table_new_i64()
+    g_mod = table_new_string()
+    g_mown = table_new_i64()
+    g_ev = table_new_string()
+    g_evh = table_new_string()
+    g_eown = table_new_i64()
+    g_roots = table_new_i64()
+    g_stack = table_new_i64()
+    g_vkind = table_new_string()
+    g_vname = table_new_string()
+    g_vpn = table_new_string()
+    g_vpt = table_new_string()
+    g_vpo = table_new_i64()
+    g_vio = table_new_i64()
+    g_gn = table_new_string()
+    g_gnode = table_new_string()
+    g_gnow = table_new_i64()
+    g_gfrom = table_new_string()
+    g_gto = table_new_string()
+    g_gwhen = table_new_string()
+    g_gow = table_new_i64()
+    g_uk = table_new_string()
+    g_un = table_new_string()
+    g_ud = table_new_string()
+    g_fnow = table_new_i64()
+    g_fnname = table_new_string()
+    g_fnfn = []
+    g_port = table_new_string()
+    g_pown = table_new_i64()
+    g_upk = table_new_string()
+    g_upv = table_new_string()
+    g_upown = table_new_i64()
+    g_rsel = table_new_string()
+    g_rprop = table_new_string()
+    g_rval = table_new_string()
+    g_urown = table_new_i64()
+    g_thname = table_new_string()
+    g_thkey = table_new_string()
+    g_thval = table_new_string()
+    g_layers = table_new_string()
+}
+
+// 清空全部 UI 数据（测试与重入场景）。
+pub func reset() {
+    g_ready = false
+    ensure()
+}
+
+// ---------- 元素构造 ----------
+
+// 开一个元素：kind 是元素名（window/panel/button…或任何未定义标识符），
+// name 是实例名（可空）。新元素挂到「当前父节点」下并成为新的当前节点。
+pub func begin(kind: string, name: string) -> i64 {
+    ensure()
+    var id = len(g_kind)
+    table_push(g_kind, kind)
+    table_push(g_name, name)
+    var parent: i64 = -1
+    if len(g_stack) > 0 {
+        parent = g_stack[len(g_stack) - 1]
+    }
+    table_push(g_parent, parent)
+    if parent < 0 {
+        table_push(g_roots, id)
+    }
+    table_push(g_stack, id)
+    return id
+}
+
+// 关当前元素（弹栈）。返回关闭的节点 id（空栈返回 -1）。
+pub func end() -> i64 {
+    ensure()
+    var n = len(g_stack)
+    if n == 0 {
+        return -1
+    }
+    var id = g_stack[n - 1]
+    table_trunc(g_stack, n - 1)
+    return id
+}
+
+// 当前节点（栈顶），无则 -1。
+pub func current() -> i64 {
+    ensure()
+    var n = len(g_stack)
+    if n == 0 {
+        return -1
+    }
+    return g_stack[n - 1]
+}
+
+// 给当前节点加属性（键值都按书写原文存字符串）。
+pub func attr_str(key: string, value: string) -> i64 {
+    ensure()
+    var id = current()
+    if id < 0 {
+        return -1
+    }
+    table_push(g_ak, key)
+    table_push(g_av, value)
+    table_push(g_aown, id)
+    return id
+}
+
+// 给当前节点加修饰（无值属性，如 accent）。
+pub func modifier(name: string) -> i64 {
+    ensure()
+    var id = current()
+    if id < 0 {
+        return -1
+    }
+    table_push(g_mod, name)
+    table_push(g_mown, id)
+    return id
+}
+
+// 给当前节点加文本内容（内容字符串=子文本元素）。
+pub func content(s: string) -> i64 {
+    var id = begin("text", "")
+    table_push(g_av, s)
+    table_push(g_ak, "content")
+    table_push(g_aown, id)
+    return end()
+}
+
+// 给当前节点绑定事件：on_click/on_submit… → 处理器（函数名或视图出端口）。
+pub func on_name(event: string, handler: string) -> i64 {
+    ensure()
+    var id = current()
+    if id < 0 {
+        return -1
+    }
+    table_push(g_ev, event)
+    table_push(g_evh, handler)
+    table_push(g_eown, id)
+    return id
+}
+
+// ---------- 元素查询 ----------
+pub func count() -> i64 {
+    ensure()
+    return len(g_kind)
+}
+
+pub func kind_at(id: i64) -> string {
+    ensure()
+    if id < 0 || id >= len(g_kind) {
+        return ""
+    }
+    return g_kind[id]
+}
+
+pub func name_at(id: i64) -> string {
+    ensure()
+    if id < 0 || id >= len(g_name) {
+        return ""
+    }
+    return g_name[id]
+}
+
+pub func parent_at(id: i64) -> i64 {
+    ensure()
+    if id < 0 || id >= len(g_parent) {
+        return -1
+    }
+    return g_parent[id]
+}
+
+pub func root_count() -> i64 {
+    ensure()
+    return len(g_roots)
+}
+
+pub func root_at(i: i64) -> i64 {
+    ensure()
+    if i < 0 || i >= len(g_roots) {
+        return -1
+    }
+    return g_roots[i]
+}
+
+// 按实例名查节点（同名取先建者）；不存在返回 -1。
+pub func find(name: string) -> i64 {
+    ensure()
+    var i: i64 = 0
+    while i < len(g_name) {
+        if g_name[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+pub func child_count(id: i64) -> i64 {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_parent) {
+        if g_parent[i] == id {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub func child_at(id: i64, k: i64) -> i64 {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_parent) {
+        if g_parent[i] == id {
+            if n == k {
+                return i
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+pub func attr_of(id: i64, key: string) -> string {
+    ensure()
+    var i: i64 = 0
+    while i < len(g_ak) {
+        if g_aown[i] == id && g_ak[i] == key {
+            return g_av[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+pub func attr_count(id: i64) -> i64 {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_ak) {
+        if g_aown[i] == id {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub func attr_key_at(id: i64, k: i64) -> string {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_ak) {
+        if g_aown[i] == id {
+            if n == k {
+                return g_ak[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+pub func attr_val_at(id: i64, k: i64) -> string {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_ak) {
+        if g_aown[i] == id {
+            if n == k {
+                return g_av[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+pub func mod_count(id: i64) -> i64 {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_mod) {
+        if g_mown[i] == id {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub func mod_at(id: i64, k: i64) -> string {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_mod) {
+        if g_mown[i] == id {
+            if n == k {
+                return g_mod[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+pub func has_mod(id: i64, name: string) -> bool {
+    ensure()
+    var i: i64 = 0
+    while i < len(g_mod) {
+        if g_mown[i] == id && g_mod[i] == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+pub func event_count(id: i64) -> i64 {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_ev) {
+        if g_eown[i] == id {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub func event_at(id: i64, k: i64) -> string {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_ev) {
+        if g_eown[i] == id {
+            if n == k {
+                return g_ev[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+pub func handler_at(id: i64, k: i64) -> string {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_ev) {
+        if g_eown[i] == id {
+            if n == k {
+                return g_evh[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ---------- 视图/组件单元 ----------
+
+// 开一个视图/组件单元（单元本身也是一个元素节点，故内部元素自动归属）。
+pub func view_begin(kind: string, name: string) -> i64 {
+    var id = begin(kind, name)
+    table_push(g_vkind, kind)
+    table_push(g_vname, name)
+    return id
+}
+
+// 登记单元形参：name 形参名，ty 类型书写形态。
+pub func view_param(name: string, ty: string) -> i64 {
+    var id = current()
+    table_push(g_vpn, name)
+    table_push(g_vpt, ty)
+    table_push(g_vpo, id)
+    table_push(g_vio, 0)
+    return id
+}
+
+// 登记单元出端口（动作契约）。
+pub func view_out(name: string, ty: string) -> i64 {
+    var id = current()
+    table_push(g_vpn, name)
+    table_push(g_vpt, ty)
+    table_push(g_vpo, id)
+    table_push(g_vio, 1)
+    return id
+}
+
+pub func view_end() -> i64 {
+    return end()
+}
+
+// 单元参数数（io=0）或出端口数（io=1）。
+pub func view_io_count(id: i64, io: i64) -> i64 {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_vpn) {
+        if g_vpo[i] == id && g_vio[i] == io {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub func view_io_name(id: i64, io: i64, k: i64) -> string {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_vpn) {
+        if g_vpo[i] == id && g_vio[i] == io {
+            if n == k {
+                return g_vpn[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+pub func view_io_type(id: i64, io: i64, k: i64) -> string {
+    ensure()
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_vpt) {
+        if g_vpo[i] == id && g_vio[i] == io {
+            if n == k {
+                return g_vpt[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ---------- 样式/主题/层/作用域单元 ----------
+
+// 声明一个样式单元：kind = style/theme/layer/scope，payload = 块体原文
+// （"k:v;k:v"——条目间 `;`，键值间 `:`）。返回单元序号（从 0 起）。
+pub func unit_decl(kind: string, name: string, payload: string) -> i64 {
+    ensure()
+    var id = len(g_uk)
+    table_push(g_uk, kind)
+    table_push(g_un, name)
+    table_push(g_ud, payload)
+    return id
+}
+
+pub func unit_count() -> i64 {
+    ensure()
+    return len(g_uk)
+}
+
+pub func unit_kind_at(i: i64) -> string {
+    ensure()
+    if i < 0 || i >= len(g_uk) {
+        return ""
+    }
+    return g_uk[i]
+}
+
+pub func unit_name_at(i: i64) -> string {
+    ensure()
+    if i < 0 || i >= len(g_un) {
+        return ""
+    }
+    return g_un[i]
+}
+
+pub func unit_payload_at(i: i64) -> string {
+    ensure()
+    if i < 0 || i >= len(g_ud) {
+        return ""
+    }
+    return g_ud[i]
+}
+
+pub func unit_find(kind: string, name: string) -> i64 {
+    ensure()
+    var i: i64 = 0
+    while i < len(g_uk) {
+        if g_uk[i] == kind && g_un[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 取样式单元的某个属性值（按 "k:v;k:v" 载荷切分）；不存在返回空串。
+pub func unit_prop(kind: string, name: string, key: string) -> string {
+    var u = unit_find(kind, name)
+    if u < 0 {
+        return ""
+    }
+    var items = str.split(g_ud[u], ";")
+    var i: i64 = 0
+    while i < len(items) {
+        var it = str.trim(items[i])
+        var c = str.find(it, ":")
+        if c > 0 {
+            var k = str.trim(str.slice(it, 0, c))
+            if k == key {
+                return str.trim(str.slice(it, c + 1, len(it)))
+            }
+        }
+        i = i + 1
+    }
+
+    return ""
+}
+// ---------- 类型化属性（§14.4：属性值是表达式，保留值类型） ----------
+
+// 整数属性。
+pub func attr_i64(key: string, value: i64) -> i64 {
+    return attr_str(key, to_string(value))
+}
+
+// 浮点属性。
+pub func attr_f64(key: string, value: f64) -> i64 {
+    return attr_str(key, to_string(value))
+}
+
+// 布尔属性。
+pub func attr_bool(key: string, value: bool) -> i64 {
+    if value {
+        return attr_str(key, "true")
+    }
+    return attr_str(key, "false")
+}
+
+// 结构化字面量的书写原文：颜色 #2d7ff9、尺寸 480 x 320、百分比 100%。
+pub func attr_raw(key: string, raw: string) -> i64 {
+    return attr_str(key, raw)
+}
+
+// 计算表达式：保留实参类型后文本化，交后端按需解析。
+pub func attr_expr<T>(key: string, value: T) -> i64 {
+    return attr_str(key, to_string(value))
+}
+
+// ---------- 事件：函数值（§14.4 on_事件名: 函数值） ----------
+
+// 在当前节点上绑定函数值事件处理器。
+pub func on(event: string, handler: fn(i64, i64, i64, string) -> i64) -> i64 {
+    ensure()
+    table_push(g_fnow, current())
+    table_push(g_fnname, event)
+    table_push(g_fnfn, handler)
+    return len(g_fnow) - 1
+}
+
+// 在指定节点上触发事件：命中函数值处理器则调用并返回其返回值。
+pub func fire_at(id: i64, event: string, x: i64, y: i64, kind: string) -> i64 {
+    ensure()
+    var i: i64 = 0
+    var n = len(g_fnow)
+    while i < n {
+        if g_fnow[i] == id && g_fnname[i] == event {
+            var h = g_fnfn[i]
+            return h(id, x, y, kind)
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 在当前节点上触发事件。
+pub func fire(event: string, x: i64, y: i64, kind: string) -> i64 {
+    return fire_at(current(), event, x, y, kind)
+}
+
+// 指定节点上是否绑定了名为 event 的函数值处理器。
+pub func has_fn_event(id: i64, event: string) -> bool {
+    ensure()
+    var i: i64 = 0
+    while i < len(g_fnow) {
+        if g_fnow[i] == id && g_fnname[i] == event {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ---------- 端口（§14.6 出端口：-> Inc） ----------
+
+// 在当前节点上登记一个出端口名。
+pub func port_add(name: string) -> i64 {
+    ensure()
+    table_push(g_port, name)
+    table_push(g_pown, current())
+    return len(g_port) - 1
+}
+
+pub func port_count(id: i64) -> i64 {
+    ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(g_port) {
+        if g_pown[i] == id {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub func port_at(id: i64, k: i64) -> string {
+    ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(g_port) {
+        if g_pown[i] == id {
+            if n == k {
+                return g_port[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ---------- 单元：结构化属性 / 规则 / 主题 / 层 ----------
+
+// 开一个声明式单元（style / theme / scope / layer）。
+pub func unit_begin(kind: string, name: string) -> i64 {
+    return unit_decl(kind, name, "")
+}
+
+// 结构化属性写入（字符串）。
+pub func unit_prop_str(u: i64, key: string, value: string) -> i64 {
+    ensure()
+    table_push(g_upk, key)
+    table_push(g_upv, value)
+    table_push(g_upown, u)
+    return len(g_upk) - 1
+}
+
+pub func unit_prop_i64(u: i64, key: string, value: i64) -> i64 {
+    return unit_prop_str(u, key, to_string(value))
+}
+
+pub func unit_prop_raw(u: i64, key: string, raw: string) -> i64 {
+    return unit_prop_str(u, key, raw)
+}
+
+// 选择器规则：@scope Card { .title { 前景: 表面色 } }。
+pub func unit_rule(u: i64, sel: string, prop: string, val: string) -> i64 {
+    ensure()
+    table_push(g_rsel, sel)
+    table_push(g_rprop, prop)
+    table_push(g_rval, val)
+    table_push(g_urown, u)
+    return len(g_rsel) - 1
+}
+
+// 主题取值：@theme dark { 表面色 = 深灰900 }。
+pub func theme_set(theme: string, key: string, val: string) -> i64 {
+    ensure()
+    table_push(g_thname, theme)
+    table_push(g_thkey, key)
+    table_push(g_thval, val)
+    return len(g_thkey) - 1
+}
+
+// 按主题名查值（未命中返回空串）。
+pub func theme_get(theme: string, key: string) -> string {
+    ensure()
+    var i: i64 = 0
+    while i < len(g_thkey) {
+        if g_thname[i] == theme && g_thkey[i] == key {
+            return g_thval[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 层的声明顺序（@layer base, components, overrides）。
+pub func layer_decl(name: string) -> i64 {
+    ensure()
+    table_push(g_layers, name)
+    return len(g_layers) - 1
+}
+
+pub func layer_count() -> i64 {
+    ensure()
+    return len(g_layers)
+}
+
+pub func layer_at(i: i64) -> string {
+    ensure()
+    return g_layers[i]
+}
+
+// 单元属性查询：先查结构化登记，未命中回退载荷形态。
+pub func unit_prop_find(kind: string, name: string, key: string) -> string {
+    ensure()
+    var u = unit_find(kind, name)
+    if u >= 0 {
+        var i: i64 = 0
+        while i < len(g_upk) {
+            if g_upown[i] == u && g_upk[i] == key {
+                return g_upv[i]
+            }
+            i = i + 1
+        }
+        return unit_prop(kind, name, key)
+    }
+    return ""
+}
+
+pub func rule_count(u: i64) -> i64 {
+    ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(g_rsel) {
+        if g_urown[i] == u {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub func rule_sel_at(u: i64, k: i64) -> string {
+    ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(g_rsel) {
+        if g_urown[i] == u {
+            if n == k {
+                return g_rsel[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+pub func rule_prop_at(u: i64, k: i64) -> string {
+    ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(g_rsel) {
+        if g_urown[i] == u {
+            if n == k {
+                return g_rprop[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+pub func rule_val_at(u: i64, k: i64) -> string {
+    ensure()
+    var i: i64 = 0
+    var n: i64 = 0
+    while i < len(g_rsel) {
+        if g_urown[i] == u {
+            if n == k {
+                return g_rval[i]
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 按名字找视图/组件单元，未命中返回 -1。
+pub func view_find(kind: string, name: string) -> i64 {
+    ensure()
+    var i: i64 = 0
+    while i < len(g_vkind) {
+        if g_vkind[i] == kind && g_vname[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+}

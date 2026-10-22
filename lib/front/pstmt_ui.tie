@@ -1,0 +1,787 @@
+type tie<class>
+// compiler/frontend/pstmt_ui.tie —— 第 14 章「界面元素块与图语法」解析
+// ============================================================
+// 职责：把声明式 UI 语法降解为对 prelude（namespace lang）里 `ui_*` /
+// `graph_*` / `unit_decl` 函数的普通调用序列。§14.1 明确：元素块与图不是
+// 独立语言，而是同一套表达式的书写形态——因此这里只做「语法糖 → 调用」
+// 的展开，不新增求值模型，产物直接进入既有语义检查与代码生成。
+//
+// 产物形态：N_STMTLIST，孩子是若干 N_EXPR_STMT(N_CALL)。语句位（函数体/
+// 控制流块里）直接由 parse_block 收进块；顶层单元（view/component/style/
+// theme/graph/@layer/@scope）登记到待注入表，parse_program 结束时注入
+// main 函数体开头——「声明即注册」，不需要额外的注册语句。
+//
+// 可见性：本文件是 pstmt_flow 的分片（同 namespace），由 pstmt_flow.tie
+// 末尾 import；因此可直接调用 parse_block/parse_if/parse_for/parse_while/
+// parse_switch/parse_return，并复用 putil/ast/interner/pexpr。
+namespace pstmt_flow {
+
+// ---------- 展开小工具 ----------
+
+func ui_strnode(s: string, line: i64, col: i64) -> i64 {
+    return ast.new_node(N_STR_LIT, interner.intern(s), -1, -1, line, col)
+}
+
+// 命名空间全限定调用：`ns.fn(args)`。第 14 章的分层约定是「解析器只做
+// 语法降解，运行时由 std/ui.tie 与 std/graph.tie 提供」，因此降解产物一律
+// 写成点形态的命名空间调用，不依赖 prelude 的 `using` 把裸名引进作用域。
+func ui_nscall(ns: string, fn: string, args: table<i64>, line: i64, col: i64) -> i64 {
+    var rv = ast.new_node(N_VAR, interner.intern(ns), -1, -1, line, col)
+    ast.set_children(rv, table_new_i64())
+    var mc = ast.new_node(N_METHOD_CALL, interner.intern(fn), -1, -1, line, col)
+    var k: table<i64> = table_new_i64()
+    table_push(k, -1)   // 泛型槽
+    table_push(k, rv)   // 接收者 = 命名空间
+    var i: i64 = 0
+    while i < len(args) {
+        table_push(k, args[i])
+        i = i + 1
+    }
+    ast.set_children(mc, k)
+    return mc
+}
+
+// 当前图 id（std/graph.tie 的隐式图栈）：供 `graph 名 { node … }` 降解使用。
+func ui_gnow(line: i64, col: i64) -> i64 {
+    var a: table<i64> = table_new_i64()
+    return ui_nscall("graph", "g_now", a, line, col)
+}
+
+func ui_call(name: string, args: table<i64>, line: i64, col: i64) -> i64 {
+    // 元素与图的运行时 API（std/ui.tie / std/graph.tie）。
+    if name == "ui_begin" { return ui_nscall("ui", "begin", args, line, col) }
+    if name == "ui_end" { return ui_nscall("ui", "end", args, line, col) }
+    if name == "ui_attr" { return ui_nscall("ui", "attr_str", args, line, col) }
+    if name == "ui_text" { return ui_nscall("ui", "content", args, line, col) }
+    if name == "ui_mod" { return ui_nscall("ui", "modifier", args, line, col) }
+    if name == "ui_on" { return ui_nscall("ui", "on_name", args, line, col) }
+    if name == "ui_view_begin" { return ui_nscall("ui", "view_begin", args, line, col) }
+    if name == "ui_view_param" { return ui_nscall("ui", "view_param", args, line, col) }
+    if name == "ui_view_out" { return ui_nscall("ui", "view_out", args, line, col) }
+    if name == "ui_view_end" { return ui_nscall("ui", "view_end", args, line, col) }
+    if name == "unit_decl" { return ui_nscall("ui", "unit_decl", args, line, col) }
+    if name == "graph_begin" { return ui_nscall("graph", "g_new", args, line, col) }
+    if name == "graph_node" {
+        var a2: table<i64> = table_new_i64()
+        table_push(a2, ui_gnow(line, col))
+        var j: i64 = 0
+        while j < len(args) {
+            table_push(a2, args[j])
+            j = j + 1
+        }
+        return ui_nscall("graph", "g_add_node", a2, line, col)
+    }
+    if name == "graph_edge" {
+        var a3: table<i64> = table_new_i64()
+        table_push(a3, ui_gnow(line, col))
+        var m: i64 = 0
+        while m < len(args) {
+            table_push(a3, args[m])
+            m = m + 1
+        }
+        return ui_nscall("graph", "g_add_edge", a3, line, col)
+    }
+    if name == "graph_end" { return -1 }
+    var c = ast.new_node(N_CALL, interner.intern(name), -1, -1, line, col)
+    var k: table<i64> = table_new_i64()
+    table_push(k, -1)   // 泛型槽
+    var i: i64 = 0
+    while i < len(args) {
+        table_push(k, args[i])
+        i = i + 1
+    }
+    ast.set_children(c, k)
+    return c
+}
+
+func ui_emit(ref stmts: table<i64>, c: i64) -> i64 {
+    if c < 0 {
+        return -1
+    }
+    var e = ast.new_node(N_EXPR_STMT, -1, -1, -1, ast.line(c), ast.col(c))
+    var k: table<i64> = table_new_i64()
+    table_push(k, c)
+    ast.set_children(e, k)
+    table_push(stmts, e)
+    return e
+}
+
+func ui_e0(ref stmts: table<i64>, name: string, line: i64, col: i64) -> i64 {
+    var args: table<i64> = table_new_i64()
+    return ui_emit(stmts, ui_call(name, args, line, col))
+}
+
+func ui_s1(ref stmts: table<i64>, name: string, a: string, line: i64, col: i64) -> i64 {
+    var args: table<i64> = table_new_i64()
+    table_push(args, ui_strnode(a, line, col))
+    return ui_emit(stmts, ui_call(name, args, line, col))
+}
+
+func ui_s2(ref stmts: table<i64>, name: string, a: string, b: string, line: i64, col: i64) -> i64 {
+    var args: table<i64> = table_new_i64()
+    table_push(args, ui_strnode(a, line, col))
+    table_push(args, ui_strnode(b, line, col))
+    return ui_emit(stmts, ui_call(name, args, line, col))
+}
+
+func ui_s3(ref stmts: table<i64>, name: string, a: string, b: string, c2: string,
+          line: i64, col: i64) -> i64 {
+    var args: table<i64> = table_new_i64()
+    table_push(args, ui_strnode(a, line, col))
+    table_push(args, ui_strnode(b, line, col))
+    table_push(args, ui_strnode(c2, line, col))
+    return ui_emit(stmts, ui_call(name, args, line, col))
+}
+
+// 原样捕获到语句末（`;` / `}` / 换行 / EOF），token 原文无空格拼接。
+// 这样颜色 `#2d7ff9`（hash + 2 + d7ff9）、尺寸 `480 x 320`、
+// 单位后缀 `12px`、百分比 `100 %` 都不需要新的字面量语法。
+func ui_capture(stop_comma: bool) -> string {
+    var acc = ""
+    var depth: i64 = 0
+    var ln = putil.peek_line()
+    while true {
+        var t = putil.peek_tag()
+        if t == lex_eof {
+            break
+        }
+        if depth == 0 {
+            if t == lex_semi || t == lex_rbrace || t == lex_rparen {
+                break
+            }
+            if stop_comma {
+                if t == lex_comma {
+                    break
+                }
+            }
+            if putil.peek_line() != ln {
+                break
+            }
+        }
+        if t == lex_lparen || t == lex_lbrace {
+            depth = depth + 1
+        }
+        if t == lex_rparen || t == lex_rbrace {
+            depth = depth - 1
+        }
+        acc = acc + putil.peek_lexeme()
+        putil.advance()
+    }
+    return acc
+}
+
+func ui_skip_semi() {
+    if putil.peek_tag() == lex_semi {
+        putil.advance()
+    }
+}
+
+// 顶层待注入调用（声明即注册）——parse_program 结束前注入 main 开头。
+var g_ui_pend: table<i64>
+var g_ui_pend_ready: bool = false
+
+func ui_pend_init() {
+    if g_ui_pend_ready {
+        return
+    }
+    g_ui_pend_ready = true
+    g_ui_pend = table_new_i64()
+}
+
+func ui_pend_add(s: i64) -> i64 {
+    ui_pend_init()
+    table_push(g_ui_pend, s)
+    return s
+}
+
+// 把顶层 UI 单元展开出的调用注入 main 函数体开头。无 main 时数据留在
+// g_ui_pend（库文件里单元仍可被显式调用触发），返回 0；注入成功返回 1。
+pub func ui_inject_pending(ref stmts: table<i64>) -> i64 {
+    ui_pend_init()
+    if len(g_ui_pend) == 0 {
+        return 0
+    }
+    var i: i64 = 0
+    while i < len(stmts) {
+        var d = stmts[i]
+        if ast.tag(d) == N_FN_DEF && interner.lookup(ast.name(d)) == "main" {
+            var nk = ast.child_count(d)
+            var body_at = 2 + ast.aux(d)
+            if body_at >= nk {
+                return 0
+            }
+            var kids: table<i64> = table_new_i64()
+            var j: i64 = 0
+            while j < nk {
+                table_push(kids, ast.child_at(d, j))
+                j = j + 1
+            }
+            var old_body = kids[body_at]
+            var b: table<i64> = table_new_i64()
+            j = 0
+            while j < len(g_ui_pend) {
+                table_push(b, g_ui_pend[j])
+                j = j + 1
+            }
+            var on = ast.child_count(old_body)
+            j = 0
+            while j < on {
+                table_push(b, ast.child_at(old_body, j))
+                j = j + 1
+            }
+            var nb = ast.new_node(N_STMTLIST, -1, -1, -1, ast.line(old_body), ast.col(old_body))
+            ast.set_children(nb, b)
+            kids[body_at] = nb
+            ast.set_children(d, kids)
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---------- 前瞻判定（供 parse_block / parse_program 分派） ----------
+
+// 语句位：`@`（元素/图层单元）或以 graph 关键字开头的图声明。
+pub func ui_stmt_ahead() -> bool {
+    var t = putil.peek_tag()
+    if t == lex_at {
+        return true
+    }
+    if t == lex_ident && putil.peek_lexeme() == "graph" && putil.peek_n(1) == lex_ident && putil.peek_n(2) == lex_lbrace {
+        return true
+    }
+    return false
+}
+
+// 顶层单元关键字：graph/view/component/style/theme + 标识符 + (`{` 或 `(`)。
+pub func ui_decl_ahead() -> bool {
+    if putil.peek_tag() != lex_ident {
+        return false
+    }
+    var lx2 = putil.peek_lexeme()
+    var is_kw = lx2 == "graph" || lx2 == "view" || lx2 == "component" || lx2 == "style" || lx2 == "theme"
+    if !is_kw {
+        return false
+    }
+    if putil.peek_n(1) != lex_ident {
+        return false
+    }
+    var t2 = putil.peek_n(2)
+    return t2 == lex_lbrace || t2 == lex_lparen || t2 == lex_arrow
+}
+
+// 顶层 `@layer name {` / `@scope name {` / `@theme Name {`（其余 @ 是注解）。
+pub func ui_at_decl_ahead() -> bool {
+    if putil.peek_tag() != lex_at {
+        return false
+    }
+    var lx2 = putil.peek_lexeme_n(1)
+    var is_kw = lx2 == "layer" || lx2 == "scope" || lx2 == "theme"
+    if !is_kw {
+        return false
+    }
+    if putil.peek_n(2) != lex_ident {
+        return false
+    }
+    return putil.peek_n(3) == lex_lbrace
+}
+
+// ---------- 元素 ----------
+
+// 元素名之后的实例名（可选字符串）与头部参数绑定。
+func ui_element_head(ref stmts: table<i64>, kind: string, line: i64, col: i64) -> i64 {
+    var nm: string = ""
+    if putil.peek_tag() == lex_str {
+        nm = putil.peek_lexeme()
+        putil.advance()
+    }
+    var is_view = kind == "view" || kind == "component"
+    if is_view {
+        ui_s2(stmts, "ui_view_begin", kind, nm, line, col)
+    } else {
+        ui_s2(stmts, "ui_begin", kind, nm, line, col)
+    }
+    // 头部绑定：`(on_click: do_login, name: value, ...)`
+    if putil.peek_tag() == lex_lparen {
+        putil.advance()
+        while putil.peek_tag() != lex_rparen && putil.peek_tag() != lex_eof {
+            // 绑定键是数据名而非标识符引用：`text` 一类类型关键字在这里与普通
+            // 标识符等价（tie 不区分保留字与标识符的数据面），故一并放行。
+            if putil.peek_tag() != lex_ident && putil.typekw_index(putil.peek_lexeme()) < 0 {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "元素属性绑定的键必须是标识符 tag=" + to_string(putil.peek_tag()) + " lex=" + putil.peek_lexeme())
+                return -1
+            }
+            var key = putil.peek_lexeme()
+            var al = putil.peek_line()
+            var ac = putil.peek_col()
+            putil.advance()
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var val = ui_capture(true)
+            if str_has(key, "on_") {
+                ui_s2(stmts, "ui_on", key, val, al, ac)
+            } else {
+                ui_s2(stmts, "ui_attr", key, val, al, ac)
+            }
+            ui_skip_semi()
+            if putil.peek_tag() == lex_comma {
+                putil.advance()
+            }
+        }
+        if !putil.expect(lex_rparen, "')'") {
+            return -1
+        }
+    }
+    // 出端口/入端口契约：`-> (Open: Post, Refresh)` 仅视图/组件有意义，
+    // 其余元素上按事件绑定降解（保持「同一套写法」）。
+    if putil.peek_tag() == lex_arrow {
+        putil.advance()
+        if putil.peek_tag() != lex_lparen {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "出端口契约写作 `-> (名字: 类型, ...)`")
+            return -1
+        }
+        putil.advance()
+        while putil.peek_tag() != lex_rparen && putil.peek_tag() != lex_eof {
+            if putil.peek_tag() != lex_ident {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "出端口名必须是标识符")
+                return -1
+            }
+            var pn = putil.peek_lexeme()
+            var pl = putil.peek_line()
+            var pc = putil.peek_col()
+            putil.advance()
+            var pt: string = ""
+            if putil.peek_tag() == lex_colon {
+                putil.advance()
+                pt = ui_capture(true)
+            }
+            ui_s2(stmts, "ui_view_out", pn, pt, pl, pc)
+            ui_skip_semi()
+            if putil.peek_tag() == lex_comma {
+                putil.advance()
+            }
+        }
+        if !putil.expect(lex_rparen, "')'") {
+            return -1
+        }
+    }
+    return 0
+}
+
+// 元素块体：属性 / 修饰 / 文本 / 子元素 / 图声明 / 控制流。
+func ui_element_body(ref stmts: table<i64>) -> i64 {
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    while true {
+        // ASI 在子元素/控制流语句换行处补分号，而元素语句本身没有结束符；
+        // 循环开头统一吃掉遗留分号。
+        ui_skip_semi()
+        var t = putil.peek_tag()
+        if t == lex_rbrace {
+            putil.advance()
+            return 0
+        }
+        if t == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            return 0
+        }
+        if t == lex_at {
+            var line = putil.peek_line()
+            var col = putil.peek_col()
+            if ui_at_decl_ahead() {
+                if ui_unit_at(stmts) < 0 {
+                    return -1
+                }
+            } else if ui_element(stmts, line, col) < 0 {
+                return -1
+            }
+        } else if t == lex_ident && putil.peek_lexeme() == "graph" && putil.peek_n(1) == lex_ident && putil.peek_n(2) == lex_lbrace {
+            var gl = putil.peek_line()
+            var gc = putil.peek_col()
+            if ui_graph(stmts, gl, gc) < 0 {
+                return -1
+            }
+        } else if t == lex_if {
+            var s = parse_if()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if t == lex_for {
+            var s2 = parse_for(-1)
+            if s2 < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s2)
+        } else if t == lex_while {
+            var s3 = parse_while(-1)
+            if s3 < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s3)
+        } else if t == lex_switch {
+            var s4 = parse_switch()
+            if s4 < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s4)
+        } else if t == lex_str {
+            var sl = putil.peek_line()
+            var sc = putil.peek_col()
+            var txt = putil.peek_lexeme()
+            putil.advance()
+            ui_s1(stmts, "ui_text", txt, sl, sc)
+            ui_skip_semi()
+        } else if t == lex_ident {
+            var al = putil.peek_line()
+            var ac = putil.peek_col()
+            var nm = putil.peek_lexeme()
+            if putil.peek_n(1) == lex_colon {
+                // 属性：`name: value;`（value 原样捕获，含颜色/尺寸/百分比）
+                putil.advance()
+                putil.advance()
+                var val = ui_capture(true)
+                ui_s2(stmts, "ui_attr", nm, val, al, ac)
+                ui_skip_semi()
+            } else if putil.peek_n(1) == lex_lparen {
+                // 简洁写法：`padding(4, 8)` / `size(480, 320)` → 同名属性
+                putil.advance()
+                var raw = ui_capture(false)
+                if putil.peek_tag() != lex_rparen {
+                    putil.set_err(al, ac, "属性简写的括号未闭合")
+                    return -1
+                }
+                putil.advance()
+                ui_s2(stmts, "ui_attr", nm, raw, al, ac)
+                ui_skip_semi()
+            } else {
+                // 修饰：`accent;`
+                putil.advance()
+                ui_s1(stmts, "ui_mod", nm, al, ac)
+                ui_skip_semi()
+            }
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(),
+                          "元素块内只允许属性、修饰、文本、子元素、图声明与控制流语句，实际是 " + putil.describe(t))
+            return -1
+        }
+    }
+}
+
+// 单个元素：`@ kind "实例名"(绑定) -> (出端口) { 体 }`。
+pub func ui_element(ref stmts: table<i64>, line: i64, col: i64) -> i64 {
+    if !putil.expect(lex_at, "'@'") {
+        return -1
+    }
+    if putil.peek_tag() != lex_ident {
+        putil.set_err(putil.peek_line(), putil.peek_col(),
+                      "元素块声明 `@` 后需要元素名（window/panel/button…或任意标识符）")
+        return -1
+    }
+    var kind = putil.peek_lexeme()
+    putil.advance()
+    if ui_element_head(stmts, kind, line, col) < 0 {
+        return -1
+    }
+    if putil.peek_tag() == lex_lbrace {
+        if ui_element_body(stmts) < 0 {
+            return -1
+        }
+    }
+    ui_e0(stmts, "ui_end", line, col)
+    return 0
+}
+
+// ---------- 图 ----------
+
+// `graph Name { node a; a -> b; b -> c when valid }`
+func ui_graph(ref stmts: table<i64>, line: i64, col: i64) -> i64 {
+    putil.advance()   // graph
+    if putil.peek_tag() != lex_ident {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "图声明需要图名")
+        return -1
+    }
+    var nm = putil.peek_lexeme()
+    putil.advance()
+    ui_s1(stmts, "graph_begin", nm, line, col)
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    while true {
+        var t = putil.peek_tag()
+        if t == lex_rbrace {
+            putil.advance()
+            ui_e0(stmts, "graph_end", line, col)
+            return 0
+        }
+        if t == lex_eof {
+            putil.set_err(line, col, "图声明缺少右花括号")
+            return -1
+        }
+        if t == lex_semi {
+            putil.advance()
+        } else if t == lex_ident && putil.peek_lexeme() == "node" {
+            var nl = putil.peek_line()
+            var nc = putil.peek_col()
+            putil.advance()
+            if putil.peek_tag() != lex_ident {
+                putil.set_err(nl, nc, "`node` 之后需要节点名")
+                return -1
+            }
+            var nn = putil.peek_lexeme()
+            putil.advance()
+            ui_s1(stmts, "graph_node", nn, nl, nc)
+            ui_skip_semi()
+        } else if t == lex_ident {
+            var fl = putil.peek_line()
+            var fc = putil.peek_col()
+            var from = putil.peek_lexeme()
+            putil.advance()
+            if !putil.expect(lex_arrow, "'->'") {
+                return -1
+            }
+            if putil.peek_tag() != lex_ident {
+                putil.set_err(fl, fc, "箭头右侧需要目标节点名")
+                return -1
+            }
+            var to = putil.peek_lexeme()
+            putil.advance()
+            var wg: string = ""
+            if putil.peek_tag() == lex_ident && putil.peek_lexeme() == "when" {
+                putil.advance()
+                wg = ui_capture(true)
+            }
+            // 守卫：空守卫等价 true；单标识符按变量取值，其余暂不支持
+            // （规范 §14.5 的守卫是布尔表达式，表达式形态留待降解器完善）。
+            var wv: i64 = 0
+            if str_len(wg) == 0 {
+                wv = ast.new_node(N_BOOL_LIT, -1, 1, -1, fl, fc)
+            } else {
+                wv = ast.new_node(N_VAR, interner.intern(wg), -1, -1, fl, fc)
+                ast.set_children(wv, table_new_i64())
+            }
+            var ea: table<i64> = table_new_i64()
+            table_push(ea, ui_strnode(from, fl, fc))
+            table_push(ea, ui_strnode(to, fl, fc))
+            table_push(ea, wv)
+            ui_emit(stmts, ui_call("graph_edge", ea, fl, fc))
+            ui_skip_semi()
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(),
+                          "图体内只允许 `node 名字`、`甲 -> 乙 [when 守卫]`，实际是 " + putil.describe(t))
+            return -1
+        }
+    }
+}
+
+// ---------- 顶层单元（样式/主题/层/作用域/视图/组件） ----------
+
+// 块体原文（保留 `;` 以便按条目切分），用于样式类单元的载荷。
+func ui_payload() -> string {
+    if !putil.expect(lex_lbrace, "'{'") {
+        return "@@UI_ERR@@"
+    }
+    var acc = ""
+    var depth: i64 = 1
+    while depth > 0 {
+        var t = putil.peek_tag()
+        if t == lex_eof {
+        return "@@UI_ERR@@"
+        }
+        if t == lex_lbrace {
+            depth = depth + 1
+        }
+        if t == lex_rbrace {
+            depth = depth - 1
+            if depth == 0 {
+                putil.advance()
+                return acc
+            }
+        }
+        acc = acc + putil.peek_lexeme()
+        putil.advance()
+    }
+    return acc
+}
+
+// `@layer 名 { ... }` / `@scope 名 { ... }` / `@theme 名 { ... }`。
+func ui_unit_at(ref stmts: table<i64>) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // '@'
+    if putil.peek_tag() != lex_ident {
+        putil.set_err(line, col, "`@` 之后需要单元关键字（layer/scope/theme）")
+        return -1
+    }
+    var kind = putil.peek_lexeme()
+    putil.advance()
+    if putil.peek_tag() != lex_ident {
+        putil.set_err(line, col, "`@" + kind + "` 之后需要名字")
+        return -1
+    }
+    var nm = putil.peek_lexeme()
+    putil.advance()
+    var pay = ui_payload()
+    if pay == "@@UI_ERR@@" {
+        return -1
+    }
+    ui_s3(stmts, "unit_decl", kind, nm, pay, line, col)
+    return 0
+}
+
+// `style 名 { ... }` / `theme 名 { ... }` 关键字形态。
+func ui_unit_kw(ref stmts: table<i64>) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var kind = putil.peek_lexeme()
+    putil.advance()
+    if putil.peek_tag() != lex_ident {
+        putil.set_err(line, col, "`" + kind + "` 之后需要名字")
+        return -1
+    }
+    var nm = putil.peek_lexeme()
+    putil.advance()
+    var pay = ui_payload()
+    if pay == "@@UI_ERR@@" {
+        return -1
+    }
+    ui_s3(stmts, "unit_decl", kind, nm, pay, line, col)
+    return 0
+}
+
+// 视图/组件单元：`view Name(形参: 类型) -> (出端口: 类型) { 元素 }`。
+func ui_view_unit(ref stmts: table<i64>) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var kind = putil.peek_lexeme()
+    putil.advance()
+    if putil.peek_tag() != lex_ident {
+        putil.set_err(line, col, "`" + kind + "` 之后需要单元名")
+        return -1
+    }
+    var nm = putil.peek_lexeme()
+    putil.advance()
+    ui_s2(stmts, "ui_view_begin", kind, nm, line, col)
+    if putil.peek_tag() == lex_lparen {
+        putil.advance()
+        while putil.peek_tag() != lex_rparen && putil.peek_tag() != lex_eof {
+            if putil.peek_tag() != lex_ident {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "形参名必须是标识符")
+                return -1
+            }
+            var pn = putil.peek_lexeme()
+            var pl = putil.peek_line()
+            var pc = putil.peek_col()
+            putil.advance()
+            var pt: string = ""
+            if putil.peek_tag() == lex_colon {
+                putil.advance()
+                pt = ui_capture(true)
+            }
+            ui_s2(stmts, "ui_view_param", pn, pt, pl, pc)
+            ui_skip_semi()
+            if putil.peek_tag() == lex_comma {
+                putil.advance()
+            }
+        }
+        if !putil.expect(lex_rparen, "')'") {
+            return -1
+        }
+    }
+    if putil.peek_tag() == lex_arrow {
+        putil.advance()
+        if putil.peek_tag() != lex_lparen {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "出端口契约写作 `-> (名字: 类型, ...)`")
+            return -1
+        }
+        putil.advance()
+        while putil.peek_tag() != lex_rparen && putil.peek_tag() != lex_eof {
+            if putil.peek_tag() != lex_ident {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "出端口名必须是标识符")
+                return -1
+            }
+            var on = putil.peek_lexeme()
+            var ol = putil.peek_line()
+            var oc = putil.peek_col()
+            putil.advance()
+            var ot: string = ""
+            if putil.peek_tag() == lex_colon {
+                putil.advance()
+                ot = ui_capture(true)
+            }
+            ui_s2(stmts, "ui_view_out", on, ot, ol, oc)
+            ui_skip_semi()
+            if putil.peek_tag() == lex_comma {
+                putil.advance()
+            }
+        }
+        if !putil.expect(lex_rparen, "')'") {
+            return -1
+        }
+    }
+    if ui_element_body(stmts) < 0 {
+        return -1
+    }
+    ui_e0(stmts, "ui_view_end", line, col)
+    return 0
+}
+
+// 语句位入口：元素 / 图声明。返回 N_STMTLIST（孩子为降解后的调用语句）。
+pub func parse_ui_stmt() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var stmts: table<i64> = table_new_i64()
+    if putil.peek_tag() == lex_at {
+        if ui_at_decl_ahead() {
+            if ui_unit_at(stmts) < 0 {
+                return -1
+            }
+        } else if ui_element(stmts, line, col) < 0 {
+            return -1
+        }
+    } else if ui_graph(stmts, line, col) < 0 {
+        return -1
+    }
+    var list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    ast.set_children(list, stmts)
+    return list
+}
+
+// 顶层入口：单元声明。展开出的调用登记为待注入（parse_program 收尾时
+// 注入 main 开头——声明即注册），返回空 N_STMTLIST 以走统一的语句收集。
+pub func parse_ui_top_decl() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var stmts: table<i64> = table_new_i64()
+    if putil.peek_tag() == lex_at {
+        if ui_unit_at(stmts) < 0 {
+            return -1
+        }
+    } else if putil.peek_lexeme() == "graph" {
+        if ui_graph(stmts, line, col) < 0 {
+            return -1
+        }
+    } else if putil.peek_lexeme() == "view" || putil.peek_lexeme() == "component" {
+        if ui_view_unit(stmts) < 0 {
+            return -1
+        }
+    } else if ui_unit_kw(stmts) < 0 {
+        return -1
+    }
+    var i: i64 = 0
+    while i < len(stmts) {
+        ui_pend_add(stmts[i])
+        i = i + 1
+    }
+    var empty: table<i64> = table_new_i64()
+    var list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    ast.set_children(list, empty)
+    return list
+}
+
+}

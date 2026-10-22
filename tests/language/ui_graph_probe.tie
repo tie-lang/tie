@@ -1,0 +1,26 @@
+type tie<logic>
+// 降解为 std/graph.tie 的 g_new/g_add_node/g_add_edge 调用序列。
+// 图是不可变值，可构造、组合、执行；本探针核对构造结果。
+import "/std/assert.tie"
+using assert;
+
+func main() -> i64 {
+    graph Pipeline {
+        node fetch
+        node parse
+        fetch -> parse
+    }
+    var g: i64 = graph.g_find("Pipeline")
+    assert.assert_eq(g, 0)
+    assert.assert_eq(graph.g_node_count(g), 2)
+    assert.assert_eq(graph.g_node_at(g, 0), "fetch")
+    assert.assert_eq(graph.g_node_at(g, 1), "parse")
+    assert.assert_eq(graph.g_edge_count(g), 1)
+    assert.assert_eq(graph.g_edge_from(g, 0), "fetch")
+    assert.assert_eq(graph.g_edge_to(g, 0), "parse")
+    assert.assert_eq(graph.g_edge_when(g, 0), true)
+    assert.assert_eq(graph.g_out_count(g, "fetch"), 1)
+    assert.assert_eq(graph.g_out_at(g, "fetch", 0), "parse")
+    println("graph ok")
+    return 0
+}

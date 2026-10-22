@@ -281,6 +281,18 @@ pub func parse_program() -> i64 {
                 }
                 g_pending_attr = attr   // 附着到下一声明（actor/func）
             }
+        } else if pstmt_flow.ui_at_decl_ahead() {
+            var su = pstmt_flow.parse_ui_top_decl()
+            if su < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, su)
+        } else if tag == lex_ident && pstmt_flow.ui_decl_ahead() {
+            var su2 = pstmt_flow.parse_ui_top_decl()
+            if su2 < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, su2)
         } else if tag == lex_at {
             // p.9.11.12 @注解/属性：`@name` / `@name(args)`（可堆叠）后跟声明
             var s2 = parse_annotated_decl()
@@ -304,6 +316,9 @@ pub func parse_program() -> i64 {
         return -1
     }
     // p.9.11.29：doc 注释归属回填（声明起始行匹配，详见 doc_attach_all）
+    if pstmt_flow.ui_inject_pending(stmts) < 0 {
+        return -1
+    }
     doc_attach_all(stmts)
     var root = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
     ast.set_children(root, stmts)
