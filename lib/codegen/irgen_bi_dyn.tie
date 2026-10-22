@@ -310,7 +310,8 @@ if nm == "any_tag" {
 
 // 动态加载原语（p.6.6.20 std/sqlite：winsqlite3.dll C ABI 桥）
 // 内置 `map_contains`（p.9.21.2 两步制①：自 builtin_expr 提取）
-// 显式向量内建：vec_add / vec_sub / vec_mul / vec_and / vec_or / vec_xor → array<T, N>（整寄存器 <N x T> 运算）
+// 显式向量内建：vec_add / vec_sub / vec_mul / vec_div / vec_and / vec_or / vec_xor / vec_shl / vec_shr
+// → array<T, N>（整寄存器 <N x T> 运算，逐元素语义）
 // 语义：返回逐元素和/积的新数组；实参为 array<T, N>，调用点决定结果类型。
 pub func bi_vec_op(nm: string, id: i64) -> i64 {
     var an = call_arg(id, 0)
@@ -320,7 +321,7 @@ pub func bi_vec_op(nm: string, id: i64) -> i64 {
         sm_err_msg = nm + "() 的实参必须是定长数组 array<T, N>（函数 " + g_cur_fn_name + "）"
         return -1
     }
-    if (nm == "vec_and" || nm == "vec_or" || nm == "vec_xor") && !types.is_int(types.array_elem(at)) {
+    if (nm == "vec_and" || nm == "vec_or" || nm == "vec_xor" || nm == "vec_shl" || nm == "vec_shr") && !types.is_int(types.array_elem(at)) {
         sm_err_msg = nm + "() 只支持整型元素数组（函数 " + g_cur_fn_name + "）"
         return -1
     }
@@ -357,6 +358,15 @@ pub func bi_vec_op(nm: string, id: i64) -> i64 {
     }
     if nm == "vec_xor" {
         op = 8
+    }
+    if nm == "vec_div" {
+        op = 3
+    }
+    if nm == "vec_shl" {
+        op = 10
+    }
+    if nm == "vec_shr" {
+        op = 11
     }
     var rs = ir.new_inst(g_cur_block, op, vty)
     ir.add_operand(rs, la, 0)

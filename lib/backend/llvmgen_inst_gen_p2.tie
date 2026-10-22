@@ -55,8 +55,24 @@ pub func gen_inst_b_6_and(inst_id: i64) {
         // count & 63（与既有的 tie 侧 `shift < 64` 护栏行为兼容：≥64 一律 0/1..）。
         var ty = llvm_ty(ir.ins_ty(inst_id))
         if op == 10 || op == 11 {
-            // 移位数类型与结果类型一致（i64/大数 i128/u 类型），掩码常量随类型。
-            line("%sm" + to_string(inst_id) + " = and " + ty + " " + opnd_ref(inst_id, 1) + ", 63")
+            // 掩码常量：标量移位用纯整数；向量移位必须是同宽同元素的向量常量
+            // （LLVM 不对二元运算做标量推广播，实测报 integer constant must have integer type）。
+            var c63 = "63"
+            if types.kind(ir.ins_ty(inst_id)) == types.K_VEC {
+                var et63 = llvm_ty(types.vec_elem(ir.ins_ty(inst_id)))
+                var nv63 = types.vec_len(ir.ins_ty(inst_id))
+                c63 = "<"
+                var vi63: i64 = 0
+                while vi63 < nv63 {
+                    if vi63 > 0 {
+                        c63 = c63 + ", "
+                    }
+                    c63 = c63 + et63 + " 63"
+                    vi63 = vi63 + 1
+                }
+                c63 = c63 + ">"
+            }
+            line("%sm" + to_string(inst_id) + " = and " + ty + " " + opnd_ref(inst_id, 1) + ", " + c63)
             line(reg + " = " + opname + " " + ty + " " + opnd_ref(inst_id, 0) + ", %sm" + to_string(inst_id))
         } else {
             line(reg + " = " + opname + " " + ty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))

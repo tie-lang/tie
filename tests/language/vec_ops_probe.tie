@@ -1,7 +1,7 @@
 type tie<logic>
-// 显式向量内建（vec_sub / vec_and / vec_or / vec_xor）机制验收探针
+// 显式向量内建（vec_sub / vec_and / vec_or / vec_xor / vec_div / vec_shl / vec_shr）机制验收探针
 // 规格：vec_*(a, b) 对 array<T, N> 做整寄存器 <N x T> 运算并返回逐元素结果；
-// 逐位算（and/or/xor）只接受整型元素数组。
+// 逐位算（and/or/xor）与位移（shl/shr）只接受整型元素数组，位移量取自第二个数组的对应元素。
 import "/std/assert.tie"
 import "/std/simd.tie"
 using assert;
@@ -30,6 +30,21 @@ func main() -> i64 {
     var sum: array<i64, 4> = vec_add(l, r)
     var mix: array<i64, 4> = vec_mul(sum, r)
     assert.assert_eq(mix[2], 24)
+
+    // 除法与位移：逐元素语义，位移量取自第二个数组的同位元素
+    var q: array<i64, 4> = simd.div_i64_4(l, r)
+    assert.assert_eq(q[0], 1)
+    var sh: array<i64, 4> = array_init(40)
+    var sl: array<i64, 4> = array_init(2)
+    var lf: array<i64, 4> = simd.shl_i64_4(sh, sl)
+    assert.assert_eq(lf[0], 160)
+    var rt: array<i64, 4> = simd.shr_i64_4(sh, sl)
+    assert.assert_eq(rt[0], 10)
+
+    // 宽度 4 的归约内核
+    assert.assert_eq(simd.sum_i64_4(sh), 160)
+    assert.assert_eq(simd.dot_i64_4(l, r), 60)
+    assert.assert_eq(simd.max_i64_4(sh), 40)
     println("vec ops 探针全过")
     return 0
 }

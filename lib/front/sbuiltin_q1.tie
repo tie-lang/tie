@@ -37,9 +37,9 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
     // 决定，调用点（scheck/stype.types_match + irgen var-decl）据此校验实参并
     // 生成 [N x T] 全等值填充。
     if fn_name == "array_init" { return builtin_call_b_array_init(fn_name, args, call_node) }
-    // ---------- 显式向量：vec_add / vec_sub / vec_mul / vec_and / vec_or / vec_xor(a, b) ----------
+    // ---------- 显式向量：vec_add / vec_sub / vec_mul / vec_div / vec_and / vec_or / vec_xor / vec_shl / vec_shr(a, b) ----------
     // 两参均为 array<T, N>；逐元素运算由生成器发成整寄存器 <N x T> 运算，逐位算只接受整型元素。
-    if fn_name == "vec_add" || fn_name == "vec_sub" || fn_name == "vec_mul" || fn_name == "vec_and" || fn_name == "vec_or" || fn_name == "vec_xor" { return builtin_call_b_vec_op(fn_name, args, call_node) }
+    if fn_name == "vec_add" || fn_name == "vec_sub" || fn_name == "vec_mul" || fn_name == "vec_and" || fn_name == "vec_or" || fn_name == "vec_xor" || fn_name == "vec_div" || fn_name == "vec_shl" || fn_name == "vec_shr" { return builtin_call_b_vec_op(fn_name, args, call_node) }
     // P2b：any 拆箱转换（as_*：1 参 any → 具体类型；实参类型由调用点检查）
     // P2d：as_table_* 拆箱为元素化表（返回 table_of(元素)，tag = 精确表类型 id）
     if fn_name == "as_i64" || fn_name == "as_f64" || fn_name == "as_bool" || fn_name == "as_string" || fn_name == "as_char" || fn_name == "as_table_i64" || fn_name == "as_table_string" || fn_name == "as_table_bool" || fn_name == "as_table_f64" || fn_name == "as_table_char" || fn_name == "as_table_any" { return builtin_call_b_as_i64(fn_name, args, call_node) }
