@@ -153,6 +153,20 @@ func inline_expand() -> i64 {
             callee = callee_of(ii)
             if callee >= 0 && callee < len(cand) && cand[callee] {
                 do_inline = true
+                // 形参类型护栏：实参类型与形参声明类型不一致时放弃本点内联。
+                // 内联是值替换，不产生类型转换指令；跨表示（i64 ↔ ptr）替换会在
+                // 产物里留下 `defined with type 'i64' but expected 'ptr'` 的非法 IR。
+                var pg: i64 = 0
+                var pcn = ir.func_params_cnt(callee)
+                while pg < pcn {
+                    if ir.ins_ops_cnt(ii) > 2 + pg * 2 {
+                        var aty = ir.ins_opnd(ii, 2 + pg * 2)
+                        if aty != ir.func_param_ty(callee, pg) {
+                            do_inline = false
+                        }
+                    }
+                    pg = pg + 1
+                }
             }
         }
         if !do_inline {

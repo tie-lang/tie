@@ -37,7 +37,7 @@ type tie<class>
 import "./ir.tie"
 import "../support/interner.tie"
 
-var g_pass_pipeline_ver: i64 = 6;   // pass 集合版本（新增/改动 pass 必须 +1；6 = 块内冗余 load 消除）
+var g_pass_pipeline_ver: i64 = 7;   // pass 集合版本（新增/改动 pass 必须 +1；7 = t3 小函数内联）
 
 // 折叠涉及 opcode（实现权威字面量）
 pub const P_ADD: i64 = 0;
@@ -82,9 +82,12 @@ pub func run(level: i64) -> i64 {
             return r2
         }
     }
-    // run_t3（小函数内联）已实现，但内联后形参 i64/ptr 表示未对齐，
-    // 产物报 `defined with type 'i64' but expected 'ptr'`；t3 继续映射 t2，
-    // 恢复条件 = 内联时按形参类型插入 inttoptr/ptrtoint 转换。
+    // run_t3（小函数内联）已实现，但内联后形参表示仍未对齐：把被调函数的
+    // 形参序段原样搬进调用者后，会出现 `store ptr %1, ptr %3`，而 %1 在调用者
+    // 里是 i64 类型的形参。已在调用点加了「实参声明类型 = 形参声明类型」护栏，
+    // 但护栏拦不住这种情况——调用点记录的实参类型与形参声明一致，错配发生在
+    // 值本身（同一个值在调用者与形参槽里被当作不同表示）。
+    // 恢复条件 = 内联时按值定义类型插入 inttoptr/ptrtoint，或在参数提升前完成内联。
     return 0
 }
 
