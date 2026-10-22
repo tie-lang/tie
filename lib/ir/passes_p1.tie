@@ -109,6 +109,52 @@ func is_sym_slot(op: i64, k: i64) -> bool {
     return op == 35 || op == 36 || op == 41 || op == 51 || op == 62 || op == 63 || op == 65
 }
 
+// 块内冗余 load 消除：同一基本块内对同一地址（同一 SSA 值）的重复 load，
+// 若中间没有任何 store，后续 load 直接复用首次结果（写 repl 由值传播统一回写）。
+// 保守策略：遇到任何 store 即清空整个缓存——不做别名分析，宁可少合并也不误合并。
+// 与 cse_blockwise 的分工：CSE 只合并纯指令（is_pure_op），load 依赖内存状态不在其列。
+func redundant_load(ref repl: table<i64>, nvals: i64) {
+    var nb = ir.block_count()
+    var bi: i64 = 0
+    while bi < nb {
+        var s = ir.block_start(bi)
+        var e = ir.block_end(bi)
+        var addr = table_new_i64()
+        var res = table_new_i64()
+        var ii = s
+        while ii < e {
+            var op = ir.ins_op(ii)
+            if op == P_STORE {
+                table_trunc(addr, 0)
+                table_trunc(res, 0)
+            } else if op == P_LOAD && ir.ins_ops_cnt(ii) >= 1 && ir.ins_opnd_kind(ii, 0) == P_VAL {
+                var a = ir.ins_opnd(ii, 0)
+                var rv = ir.ins_val(ii)
+                if rv >= 0 && rv < nvals {
+                    var n = len(addr)
+                    var hit: i64 = 0 - 1
+                    var k: i64 = 0
+                    while k < n {
+                        if addr[k] == a {
+                            hit = res[k]
+                            break
+                        }
+                        k = k + 1
+                    }
+                    if hit >= 0 {
+                        repl[rv] = hit
+                    } else {
+                        table_push(addr, a)
+                        table_push(res, rv)
+                    }
+                }
+            }
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+}
+
 // 替代表链压缩 + 全量回写操作数（值传播）。
 func apply_repl(ref repl: table<i64>, nvals: i64) {
     var v: i64 = 0
@@ -269,7 +315,9 @@ func run_t1() -> i64 {
         }
         inst = inst + 1
     }
-    // B. 值传播
+    // B. 块内冗余 load 消除（保守：遇 store 即清缓存）
+    redundant_load(repl, nvals)
+    // C. 值传播
     apply_repl(repl, nvals)
     // C. 死值消除：旁路。
     // compact_dead 按「旧指令 id 线性保序」搬指令，而 llvmgen 按块 id 序输出
