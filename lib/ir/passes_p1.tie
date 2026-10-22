@@ -397,13 +397,9 @@ func run_t1() -> i64 {
         }
         inst = inst + 1
     }
-    // B. 块内冗余 load 消除（保守：遇 store 即清缓存）
-    redundant_load(repl, nvals)
-    // C. 块内 store→load 转发（消掉「刚写又读」）
-    fwd_store_load(repl, nvals)
-    // D. 值传播
+    // B. 值传播
     apply_repl(repl, nvals)
-    // E. 死指令标记（无用户的纯计算指令不再发射）
+    // C. 死指令标记（无用户的纯计算指令不再发射）
     mark_dead_values()
     // C. 死值消除：旁路。
     // compact_dead 按「旧指令 id 线性保序」搬指令，而 llvmgen 按块 id 序输出
@@ -603,6 +599,12 @@ func run_t2() -> i64 {
         i = i + 1
     }
     cse_blockwise(repl, nvals)
+    apply_repl(repl, nvals)
+    // 访存类冗余消除：两者都要维护块内地址缓存并逐条查表（命中查找还是线性
+    // 扫描），比纯寄存器化简贵，按代价-收益分层放 t2；必须在 CSE 的值传播
+    // 之后做，才能看到已被替换的地址与值。
+    redundant_load(repl, nvals)
+    fwd_store_load(repl, nvals)
     apply_repl(repl, nvals)
     // 同 t1：无用户的纯计算指令标记为 dead（后端跳过发射）
     mark_dead_values()

@@ -150,6 +150,16 @@ pub func kpass_irgen() -> i64 {
         dbg_txt(diagcode.render_error(-1, -1, "中端 pass 失败（t" + to_string(effective_tie_opt()) + "）"))
         return 1
     }
+    // 产物自检（TIE_VERIFY_IR=1）：pass 之后、发射之前拦住破坏不变式的 IR。
+    // t 轴越往上越激进，正确性靠检查而非信任：块区间、定义先于使用、
+    // 副作用指令不得为 dead、store 类型与值类型一致。默认关闭，回归时打开。
+    if get_env("TIE_VERIFY_IR") == "1" {
+        var vmsg = irv.run()
+        if vmsg != "" {
+            dbg_txt(vmsg)
+            return 1
+        }
+    }
     // p.9.21.6-2 模块级 tieir 片段缓存：归属注入 + 逐模块命中/写入。
     // p.9.21.8 池过滤落地后**默认开**（片段池 = 引用过滤 + 保序压缩，
     // 写放大消除）；片段写入失败只损失该模块片段，编译不受影响

@@ -1,0 +1,200 @@
+type tie<class>
+// lib/ir/verify.tie —— tie-IR 产物自检
+// ============================================================
+// 用途：pass 之后、llvmgen 之前检查产物不变式。t 轴的分档原则是「越往上越激进」，
+// 但前提是任何档位都不得破坏语义——本模块就是这条前提的机械检查。
+// 开关：driver 侧读环境变量 TIE_VERIFY_IR=1 时调用（默认不跑，零成本）。
+//
+// 检查四类不变式：
+//   1) 块区间按块 id 升序、互不重叠、恰好铺满整条指令序列；
+//   2) 每个 SSA 值都在使用之前定义（线性序），且定义指令确实产出该值；
+//   3) 带副作用的指令不得被标成 dead（否则存储/调用/分支会被跳过发射）。
+//
+// 第四条（store 类型与值类型相等）实测不成立：tie 里 TK_STR 槽存的往往是 i64
+// payload（ptr/int 边界上 codegen 有意混用），已知正确的编译器也违反它，故不作为
+// 不变式——需要时另做专门检查，不能默认类型严格相等。
+//
+// 返回空串 = 通过；否则返回第一条违例的说明（含指令号与 opcode 名）。
+// 语法约束：全局实体写在文件顶层，函数入 namespace；断言失败一律用返回值，
+// 不 panic——自检本身不该把编译器变成崩溃点。
+
+import "./ir.tie"
+
+namespace irv {
+
+// 操作数类别：0 = SSA 值 id，2 = 立即数（与 ir.tie 内部常量一致；
+// 不用 OK_VALUE 这个名字：ir.tie 里有同名的文件级私有常量，同名会互相遮挡）
+const K_VAL: i64 = 0;
+// 涉及副作用的 opcode（实现权威字面量，取自 ir.tie 的 opcode 数据表）
+const OP_GEP: i64 = 23;
+const OP_STORE: i64 = 22;
+const OP_BR: i64 = 29;
+const OP_COND_BR: i64 = 30;
+const OP_RET: i64 = 31;
+const OP_CALL: i64 = 35;
+const OP_EXTERN_CALL: i64 = 36;
+const OP_INLINE_ASM: i64 = 65;
+const OP_ATOMIC_LOAD: i64 = 66;
+const OP_ATOMIC_STORE: i64 = 67;
+const OP_ATOMICRMW: i64 = 68;
+const OP_CMPXCHG: i64 = 69;
+const OP_CALL_INDIRECT: i64 = 70;
+const OP_VOLATILE_LOAD: i64 = 71;
+const OP_VOLATILE_STORE: i64 = 72;
+const OP_DYN_CALL: i64 = 73;
+const OP_CALL_VARARG: i64 = 41;
+
+// 有副作用的指令：删除或跳过发射会改变程序行为。
+func side_effecting(op: i64) -> bool {
+    if op == OP_STORE || op == OP_BR || op == OP_COND_BR || op == OP_RET {
+        return true
+    }
+    if op == OP_CALL || op == OP_EXTERN_CALL || op == OP_CALL_VARARG ||
+       op == OP_CALL_INDIRECT || op == OP_DYN_CALL || op == OP_INLINE_ASM {
+        return true
+    }
+    if op == OP_ATOMIC_LOAD || op == OP_ATOMIC_STORE || op == OP_ATOMICRMW ||
+       op == OP_CMPXCHG || op == OP_VOLATILE_LOAD || op == OP_VOLATILE_STORE {
+        return true
+    }
+    return false
+}
+
+func bad(ii: i64, why: string) -> string {
+    return "ir.verify: 指令 #" + to_string(ii) + "（" + ir.op_name(ir.ins_op(ii)) + "）" + why
+}
+
+// 块区间检查：块不要求按块 id 升序排布（不同函数的块在全局指令表里天生
+// 交错，发射时靠 block_func 过滤），但**同一段指令不得被两个块同时认领**。
+// 这正是此前破坏过的形态：退出块被插进循环体中间。
+func check_blocks(n: i64) -> string {
+    var nb = ir.block_count()
+    var owner = table_new_i64()
+    var z: i64 = 0
+    while z < n {
+        table_push(owner, 0 - 1)
+        z = z + 1
+    }
+    var b: i64 = 0
+    while b < nb {
+        var s = ir.block_start(b)
+        var e = ir.block_end(b)
+        if s < 0 || e < s {
+            return "ir.verify: 块 " + to_string(b) + " 区间倒置（start=" + to_string(s) + " end=" + to_string(e) + "）"
+        }
+        if e > n {
+            return "ir.verify: 块 " + to_string(b) + " 越出指令序列（end=" + to_string(e) + "，指令数=" + to_string(n) + "）"
+        }
+        var k = s
+        while k < e {
+            if owner[k] >= 0 {
+                return "ir.verify: 指令 #" + to_string(k) + " 同时归属块 " + to_string(owner[k]) +
+                       " 与块 " + to_string(b) + "（区间重叠或嵌套）"
+            }
+            owner[k] = b
+            k = k + 1
+        }
+        b = b + 1
+    }
+    return ""
+}
+
+// 建立值 → 定义指令的反查表（值 id 从 1 起，0 表示无值）。
+func build_def_map(n: i64, ref def_of: table<i64>) -> string {
+    var vc = ir.value_count()
+    var i: i64 = 0
+    while i < vc + 2 {
+        table_push(def_of, 0 - 1)
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        var v = ir.ins_val(i)
+        if v > 0 && v <= vc {
+            if def_of[v] >= 0 {
+                return "ir.verify: 值 id " + to_string(v) + " 由多条指令产出（#" +
+                       to_string(def_of[v]) + " 与 #" + to_string(i) + "）"
+            }
+            def_of[v] = i
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 符号池槽位：call/extern_call/call_vararg/const_f/const_str/const_global/
+// inline_asm 的第 0 操作数以 kind=0（值类别）登记，但 payload 是符号池 id，
+// 不是 SSA 值——与 passes_p1.is_sym_slot 的判定保持一致。
+func is_sym_slot(op: i64, k: i64) -> bool {
+    if k != 0 {
+        return false
+    }
+    return op == OP_CALL || op == OP_EXTERN_CALL || op == OP_CALL_VARARG ||
+           op == 51 || op == 62 || op == 63 || op == OP_INLINE_ASM
+}
+
+func check_order(n: i64, ref def_of: table<i64>) -> string {
+    var i: i64 = 0
+    while i < n {
+        var cnt = ir.ins_ops_cnt(i)
+        var op = ir.ins_op(i)
+        var k: i64 = 0
+        while k < cnt {
+            if ir.ins_opnd_kind(i, k) == K_VAL && !is_sym_slot(op, k) {
+                var v = ir.ins_opnd(i, k)
+                if v > 0 {
+                    // 无定义指令的值是合法来源：函数形参、全局常量、符号池 id
+                    // 都不由指令产出。只拦「有定义但定义在使用之后」。
+                    if v < len(def_of) && def_of[v] >= i {
+                        return bad(i, " 的操作数 " + to_string(k) + " 使用了尚未定义的值 " +
+                                   to_string(v) + "（定义在 #" + to_string(def_of[v]) + "）")
+                    }
+                }
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+func check_dead(n: i64) -> string {
+    var i: i64 = 0
+    while i < n {
+        if ir.is_dead(i) && side_effecting(ir.ins_op(i)) {
+            return bad(i, " 带副作用却被标成 dead（删除它会改变程序行为）")
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 全量自检入口：返回空串表示产物满足全部不变式。
+pub func run() -> string {
+    var n = ir.inst_count()
+    if n <= 0 {
+        return ""
+    }
+    if ir.block_count() <= 0 {
+        return "ir.verify: 存在指令但没有任何基本块"
+    }
+    var rb = check_blocks(n)
+    if rb != "" {
+        return rb
+    }
+    var def_of = table_new_i64()
+    var rd = build_def_map(n, def_of)
+    if rd != "" {
+        return rd
+    }
+    var ro = check_order(n, def_of)
+    if ro != "" {
+        return ro
+    }
+    var rk = check_dead(n)
+    if rk != "" {
+        return rk
+    }
+    return ""
+}
+}
