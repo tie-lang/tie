@@ -617,9 +617,10 @@ func run_t2() -> i64 {
     if ra != 0 {
         return ra
     }
-    // 同 t1：物理压缩会重排指令，与 llvmgen 的块 id 序输出相矛盾（见 run_t1
-    // 末尾注释），CSE 与融合不依赖邻接，保留生效。
-    return 0
+    // 物理压缩：compact_dead 已按「新指令落位序」重编块 id，并改写
+    // br/cond_br/phi 的块引用，压缩后仍满足 llvmgen 按块 id 升序输出的
+    // 前提；前置条件不满足（出现空块等）时返回负值，dce 保守成功。
+    return dce()
 }
 
 // call(35) → 被调函数 id（符号名池 id 与函数名池 id 相等比较；-1 = 未找到）

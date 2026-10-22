@@ -622,6 +622,12 @@ pub func compact_dead(dead: table<bool>) -> i64 {
     // 按块 id 序重排会颠倒块文本序、制造 use-before-def（2026-09-21 RCA ②）。
     var last_fid: i64 = 0 - 1
     var handled = table_new_bool()
+    var pnewoff = table_new_i64()
+    var pfi: i64 = 0
+    while pfi < len(ir_funcs_names) {
+        table_push(pnewoff, 0 - 1)
+        pfi = pfi + 1
+    }
     var fh: i64 = 0
     while fh < len(ir_funcs_names) {
         table_push(handled, false)
@@ -634,7 +640,7 @@ pub func compact_dead(dead: table<bool>) -> i64 {
             // 进入新函数（按指令 id 序首见）：先搬它的参数段
             var poff = ir_funcs_params_off[fid]
             var pcnt = ir_funcs_params_cnt[fid]
-            ir_funcs_params_off[fid] = len(n_ops)
+            pnewoff[fid] = len(n_ops)
             handled[fid] = true
             var pk: i64 = 0
             while pk < pcnt {
@@ -684,7 +690,7 @@ pub func compact_dead(dead: table<bool>) -> i64 {
         var fid3 = pend_f[pi2]
         var poff3 = ir_funcs_params_off[fid3]
         var pcnt3 = ir_funcs_params_cnt[fid3]
-        ir_funcs_params_off[fid3] = len(n_ops)
+        pnewoff[fid3] = len(n_ops)
         var pk3: i64 = 0
         while pk3 < pcnt3 {
             table_push(n_ops, ir_ops[poff3 + pk3])
@@ -746,6 +752,16 @@ pub func compact_dead(dead: table<bool>) -> i64 {
     ir_insts_ops_cnt = n_cnt
     reset_dead_flags(len(n_op))
     ir_ops = n_ops
+    // 提交参数段新偏移：只写回真正搬入 n_ops 的函数（-1 保持不变）。
+    // 重建期间不得提前改写——上下文快照恢复会把指令表换回旧布局，
+    // 提前改写的偏移就会指向新布局，形参查表错位。
+    var pf4: i64 = 0
+    while pf4 < len(ir_funcs_names) {
+        if pnewoff[pf4] >= 0 {
+            ir_funcs_params_off[pf4] = pnewoff[pf4]
+        }
+        pf4 = pf4 + 1
+    }
     ir_ops_kind = n_opsk
     bi = 0
     while bi < nb {
