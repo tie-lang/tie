@@ -4,6 +4,26 @@ type tie<class>
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 passes.tie。
 namespace passes {
+// 内联安全性判据：LLVM 表示与 tie 类型一一对应的标量类型。
+// 指针类（string/table/map/port/ptr）与聚合类（数组/元组/结构体/enum）的值
+// 在真实调用点由 llvmgen 按形参类型做表示桥接（i64 ↔ ptr 等）；内联是纯值
+// 替换、不产生转换指令，因此这些类型不作为可内联形参。
+func inline_scalar_ty(t: i64) -> bool {
+    if types.is_int(t) {
+        return true
+    }
+    if t == types.named(TK_F64) || t == types.named(TK_F32) {
+        return true
+    }
+    if t == types.named(TK_BOOL) || t == types.named(TK_TRIT) {
+        return true
+    }
+    if t == types.named(TK_CHAR) {
+        return true
+    }
+    return false
+}
+
 // t3 主 pass：重建式展开（复用 compact 的线性保序 + 参数段搬移模式）。
 // 返回展开的调用点数；无展开时不动任何表。
 func inline_expand() -> i64 {
@@ -93,6 +113,44 @@ func inline_expand() -> i64 {
         }
         f0 = f0 + 1
     }
+    // 值 → 类型表（内联护栏用）：形参取所属函数的声明类型，其余取定义指令的
+    // 结果类型。形参值没有定义指令，必须优先登记（调用点实参可能是透传形参）。
+    var vty = table_new_i64()
+    var vq: i64 = 0
+    while vq < nvals0 {
+        table_push(vty, 0 - 1)
+        vq = vq + 1
+    }
+    var vf: i64 = 0
+    while vf < ir.func_count() {
+        var vj: i64 = 0
+        while vj < ir.func_params_cnt(vf) {
+            var pv = psnap[psoff[vf] + vj]
+            if pv >= 0 && pv < nvals0 {
+                vty[pv] = ir.func_param_ty(vf, vj)
+            }
+            vj = vj + 1
+        }
+        vf = vf + 1
+    }
+    var vi5: i64 = 0
+    while vi5 < total {
+        var dv5 = ir.ins_val(vi5)
+        if dv5 >= 0 && dv5 < nvals0 && vty[dv5] < 0 {
+            vty[dv5] = ir.ins_ty(vi5)
+        }
+        vi5 = vi5 + 1
+    }
+    // 形参段新偏移：重建期间只登记、不写回 ir_funcs_params_off。
+    // 逐条扫描时若直接改写，会在「无调用点可展开」提前返回时把偏移指向
+    // 未提交的 n_ops，形参值被读成垃圾（实测：形参退化成普通值重新编号，
+    // 发射出未定义的 %N）。故延迟到提交阶段统一写回。
+    var pnewoff = table_new_i64()
+    var pf: i64 = 0
+    while pf < ir.func_count() {
+        table_push(pnewoff, 0 - 1)
+        pf = pf + 1
+    }
     // 重建：线性扫旧指令；候选 call 直线展开，其余原样搬移
     var n_op = table_new_i64()
     var n_ty = table_new_i64()
@@ -136,7 +194,7 @@ func inline_expand() -> i64 {
         if fid != last_fid && fid >= 0 && fid < len(ir_funcs_names) && !handled[fid] {
             var poff = ir_funcs_params_off[fid]
             var pcnt = ir_funcs_params_cnt[fid]
-            ir_funcs_params_off[fid] = len(n_ops)
+            pnewoff[fid] = len(n_ops)
             handled[fid] = true
             var pk: i64 = 0
             while pk < pcnt {
@@ -153,17 +211,28 @@ func inline_expand() -> i64 {
             callee = callee_of(ii)
             if callee >= 0 && callee < len(cand) && cand[callee] {
                 do_inline = true
-                // 形参类型护栏：实参类型与形参声明类型不一致时放弃本点内联。
-                // 内联是值替换，不产生类型转换指令；跨表示（i64 ↔ ptr）替换会在
-                // 产物里留下 `defined with type 'i64' but expected 'ptr'` 的非法 IR。
+                // 形参护栏：内联是纯值替换、不产生表示转换（真实调用点由 llvmgen
+                // 按形参类型做 i64 ↔ ptr 桥接），因此只展开「标量形参 + 实参声明
+                // 类型与实际值类型都等于形参类型」的调用点，其余保留 call 原样。
                 var pg: i64 = 0
                 var pcn = ir.func_params_cnt(callee)
                 while pg < pcn {
-                    if ir.ins_ops_cnt(ii) > 2 + pg * 2 {
+                    var pty = ir.func_param_ty(callee, pg)
+                    if !inline_scalar_ty(pty) {
+                        do_inline = false
+                    }
+                    if ir.ins_ops_cnt(ii) > 2 + pg * 2 + 1 {
                         var aty = ir.ins_opnd(ii, 2 + pg * 2)
-                        if aty != ir.func_param_ty(callee, pg) {
+                        var aval = ir.ins_opnd(ii, 2 + pg * 2 + 1)
+                        var vat: i64 = 0 - 1
+                        if aval >= 0 && aval < nvals0 {
+                            vat = vty[aval]
+                        }
+                        if aty != pty || vat != pty {
                             do_inline = false
                         }
+                    } else {
+                        do_inline = false
                     }
                     pg = pg + 1
                 }
@@ -281,78 +350,6 @@ func inline_expand() -> i64 {
         return 0
     }
     // 形参白名单（形参值入口虚拟无定义指令，(no def) 属正常）
-    var is_formal = table_new_bool()
-    var wi: i64 = 0
-    while wi < nvals0 {
-        table_push(is_formal, false)
-        wi = wi + 1
-    }
-    var f9: i64 = 0
-    while f9 < ir.func_count() {
-        var pj9: i64 = 0
-        while pj9 < ir.func_params_cnt(f9) {
-            var pv9 = psnap[psoff[f9] + pj9]
-            if pv9 >= 0 && pv9 < nvals0 {
-                is_formal[pv9] = true
-            }
-            pj9 = pj9 + 1
-        }
-        f9 = f9 + 1
-    }
-    // T3DBG 自检（提交前）：UNDEF（非形参的值无定义）/ XREF（定义跨函数）
-    var vc = ir.value_count()
-    var defpos = table_new_i64()
-    var z: i64 = 0
-    while z < vc {
-        table_push(defpos, 0 - 1)
-        z = z + 1
-    }
-    var nn = len(n_op)
-    var q: i64 = 0
-    while q < nn {
-        var dv = n_val[q]
-        if dv >= 0 && dv < vc && defpos[dv] < 0 {
-            defpos[dv] = q
-        }
-        q = q + 1
-    }
-    q = 0
-    var bad: i64 = 0
-    while q < nn && bad < 8 {
-        var qop = n_op[q]
-        if qop == 33 {
-            q = q + 1
-            continue
-        }
-        var qfn = ir.block_func(n_blk[q])
-        var qoff = n_off[q]
-        var qcnt = n_cnt[q]
-        var k: i64 = 0
-        while k < qcnt && bad < 8 {
-            if k == 0 && is_sym_slot(qop, k) {
-                k = k + 1
-                continue
-            }
-            if n_opsk[qoff + k] == P_VAL {
-                var vv = n_ops[qoff + k]
-                var dnew = 0 - 1
-                if vv >= 0 && vv < vc {
-                    dnew = defpos[vv]
-                }
-                if dnew < 0 {
-                    if !is_formal[vv] {
-                        println("T3DBG UNDEF inst=" + to_string(q) + " op=" + to_string(qop) + " host=" + interner.lookup(ir.func_name(qfn)) + " src=" + to_string(n_src[q]) + " v=" + to_string(vv))
-                        bad = bad + 1
-                    }
-                } else if ir.block_func(n_blk[dnew]) != qfn {
-                    println("T3DBG XREF inst=" + to_string(q) + " op=" + to_string(qop) + " host=" + interner.lookup(ir.func_name(qfn)) + " src=" + to_string(n_src[q]) + " v=" + to_string(vv) + " defop=" + to_string(n_op[dnew]) + " deffn=" + interner.lookup(ir.func_name(ir.block_func(n_blk[dnew]))))
-                    bad = bad + 1
-                }
-            }
-            k = k + 1
-        }
-        q = q + 1
-    }
     // 提交重建
     ir_insts_op = n_op
     ir_insts_ty = n_ty
@@ -362,6 +359,14 @@ func inline_expand() -> i64 {
     ir.reset_dead_flags(len(n_op))
     ir_ops = n_ops
     ir_ops_kind = n_opsk
+    // 提交形参段新偏移（见上方 pnewoff 的说明）：只对实际搬入 n_ops 的函数生效
+    var pf2: i64 = 0
+    while pf2 < ir.func_count() {
+        if pnewoff[pf2] >= 0 {
+            ir_funcs_params_off[pf2] = pnewoff[pf2]
+        }
+        pf2 = pf2 + 1
+    }
     // 块区间重算：直接按 n_blk（产出指令归属，与主重建一一对应）线性重放——
     // 2026-09-21 RCA：此前的重放在表提交之后用旧归属配新表内容，错位产生
     // 空块/块尾缺 terminator（LLVM: expected instruction opcode）。
@@ -428,12 +433,9 @@ func inline_expand() -> i64 {
         ir_funcs_inst_total[fi] = ftotal[fi]
         fi = fi + 1
     }
-    // call 结果值 → 被调返回值 的传播 + DCE 清理死 call
+    // call 结果值 → 被调返回值：call 指令已被删除、不再定义其返回值，必须在
+    // 此把使用者改写成被调函数的 return 值（否则发射出 use of undefined value）
     apply_repl(repl, nvals0)
-    var d = dce()
-    if d < 0 {
-        return 0
-    }
     return expanded
 }
 

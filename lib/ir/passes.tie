@@ -31,9 +31,10 @@ type tie<class>
 //      x*1 / x/1 → x，x*0 / x&0 → 0，0+x → x）登记值替代表；
 //   B. 替代表链压缩后全量回写操作数（值传播；dominance 安全——替代目标
 //      支配原结果值，使用范围只缩不扩）；
-//   C. DCE：无使用者的纯指令（NUM 组 + CONST 组 + ptrtoint/inttoptr/
-//      bitcast）标记后经 ir.compact_dead 物理压缩；compact 拒绝（孤儿指令）
-//      时保守放弃删除，折叠/传播效果保留。
+//   C. 死值标记：无使用者的纯指令（NUM 组 + CONST 组 + ptrtoint/inttoptr/
+//      bitcast，另允许 load）打上 ir.mark_dead，发射阶段跳过标记行；不做物理
+//      压缩（compact_dead 需同步重排块 id 与块引用，暂未接入）。
+//   D. 访存类消除（冗余 load、store→load 转发）成本更高，属 t2。
 //
 // opcode 字面量与 irgen/llvmgen 一致（const_i=60 等；ir.tie 元数据表已于
 // 2026-09-21 按实现权威重建，edd3eca）。
@@ -42,9 +43,10 @@ type tie<class>
 // 函数入 namespace passes（driver 以 passes.run 跨命名空间调用）。
 
 import "./ir.tie"
+import "./context.tie"
 import "../support/interner.tie"
 
-var g_pass_pipeline_ver: i64 = 9;   // pass 集合版本（新增/改动 pass 必须 +1；9 = 访存类冗余消除下沉到 t2）
+var g_pass_pipeline_ver: i64 = 10;   // pass 集合版本（新增/改动 pass 必须 +1；10 = t3 小函数内联）
 
 // 折叠涉及 opcode（实现权威字面量）
 pub const P_ADD: i64 = 0;
@@ -89,12 +91,19 @@ pub func run(level: i64) -> i64 {
             return r2
         }
     }
-    // run_t3（小函数内联）已实现，但内联后形参表示仍未对齐：把被调函数的
-    // 形参序段原样搬进调用者后，会出现 `store ptr %1, ptr %3`，而 %1 在调用者
-    // 里是 i64 类型的形参。已在调用点加了「实参声明类型 = 形参声明类型」护栏，
-    // 但护栏拦不住这种情况——调用点记录的实参类型与形参声明一致，错配发生在
-    // 值本身（同一个值在调用者与形参槽里被当作不同表示）。
-    // 恢复条件 = 内联时按值定义类型插入 inttoptr/ptrtoint，或在参数提升前完成内联。
+    // t3：过程间 pass（小函数内联）。内联是纯值替换、不产生表示转换，故只展开
+    // 「标量形参 + 实参声明类型与实际值类型都等于形参类型」的调用点。
+    if level >= 3 {
+        var r3 = run_t3()
+        if r3 < 0 {
+            return r3
+        }
+    // 重建式 pass 会把指令表换成新对象、块区间按新布局原地改写；上下文快照
+    // 若停留在 irgen 结束时的那份，render 前的 ctx_bind(当前) 就会把指令表换回
+    // 旧长度而块区间仍是新的（实测 idx 8769 len 8766），故在此把当前上下文
+    // 的快照刷成本次 pass 之后的真实状态。
+    ir.ctx_store(ir.ctx_current())
+    }
     return 0
 }
 
