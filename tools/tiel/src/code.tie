@@ -220,6 +220,7 @@ func cg_expr(id: i64) -> i64 {
     if tg == T_E_TUPLE { return cg_array(id) }
     if tg == T_E_INDEX { return cg_index(id) }
     if tg == T_E_INTERP { return cg_interp(id) }
+    if tg == T_E_CLOSURE { return cg_closure(id) }
     if tg == T_E_SWITCHEXPR { return cg_switchexpr(id) }
     cg_fail("暂不支持的表达式（tag " + to_string(tg) + "）")
     return -1
@@ -401,6 +402,21 @@ func cg_call(id: i64) -> i64 {
     var nm = em_namestr(em_get(callee, 1))
     var st = em_get(id, 2)
     var n = em_get(id, 3)
+    // 变量里存的是闭包时走间接调用：形参个数无法静态确定，交给运行期校验。
+    var lv = cg_lookup(nm)
+    if lv >= 0 {
+        var abv = cg_alloc_n(n)
+        var av: i64 = 0
+        while av < n {
+            var aiv = cg_expr(em_ch[st + av])
+            if aiv < 0 { return -1 }
+            if aiv != abv + av { cg_emit(OP_MOV, abv + av, aiv, 0) }
+            av = av + 1
+        }
+        var sv = cg_alloc()
+        cg_emit(OP_CALLV, sv, lv, abv)
+        return sv
+    }
     var fid = cg_fid_of(nm)
     if fid < 0 {
         if nm == "len" && n == 1 {
@@ -988,6 +1004,65 @@ func cg_stmt(id: i64) -> i64 {
 }
 
 // ==================== 函数编译 ====================
+// 闭包字面量：体内代码单独编成一个函数，捕获按「创建时帧前缀整段复制」实现。
+// 捕获值在闭包帧里占与原帧相同的槽号（0..ncap-1），所以体内对捕获变量的访问
+// 与在外层帧里同级；闭包内对捕获变量赋值只改自己的副本（按值捕获）。
+func cg_closure(id: i64) -> i64 {
+    var sg = em_get(id, 1)
+    var sn = em_get(id, 2)
+    var body = em_get(id, 3)
+    var ncap = cg_slot
+    var dst = cg_alloc()
+    var fid = vm_add_fn(-1, 0, 0)
+    cg_emit(OP_CLOSURE, dst, fid, ncap)
+    var over = cg_emit(OP_JMP, 0, 0, 0)
+    var body_base = cg_here()
+    var s_slot = cg_slot
+    var s_max = cg_max
+    var s_sc = cg_scope_mark()
+    var s_lb = len(cg_lbr)
+    var s_lt = len(cg_lbt)
+    var s_lc = len(cg_lct)
+    var s_ll = len(cg_llb)
+    var s_lr = len(cg_lbrl)
+    cg_slot = ncap
+    cg_max = ncap
+    var k: i64 = 0
+    while k < s_sc {
+        if cg_vs[k] < ncap { cg_bind(cg_vn[k], cg_vs[k]) }
+        k = k + 1
+    }
+    var np: i64 = 0
+    var i: i64 = 0
+    while i < sn {
+        var p = em_ch[sg + i]
+        if em_tag(p) == T_A_PARAM {
+            var nm = em_namestr(em_get(p, 1))
+            cg_bind(nm, cg_slot)
+            cg_slot = cg_slot + 1
+            if cg_slot > cg_max { cg_max = cg_slot }
+            np = np + 1
+        }
+        i = i + 1
+    }
+    if cg_stmt(body) < 0 { return -1 }
+    cg_emit(OP_RET, -1, 0, 0)
+    vm_fn_base[fid] = body_base
+    vm_fn_slots[fid] = cg_max
+    vm_fn_nargs[fid] = np
+    vm_fn_ncap[fid] = ncap
+    cg_scope_drop(s_sc)
+    table_trunc(cg_lbr, s_lb)
+    table_trunc(cg_lbt, s_lt)
+    table_trunc(cg_lct, s_lc)
+    table_trunc(cg_llb, s_ll)
+    table_trunc(cg_lbrl, s_lr)
+    cg_slot = s_slot
+    cg_max = s_max
+    cg_patch(over, cg_here())
+    return dst
+}
+
 func cg_func(fid: i64, def: i64) -> i64 {
     var sig_st = em_get(def, 2)
     var sig_n = em_get(def, 3)

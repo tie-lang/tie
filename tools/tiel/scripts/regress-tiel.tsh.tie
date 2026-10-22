@@ -262,6 +262,27 @@ expect_out("str",
     "println(\"hi\")\n",
     "hi\n")
 
+// ---------- 正例：闭包 ----------
+expect_out("closure_basic",
+    "func main() -> i64 {\n    var base = 10\n    var add = func (x: i64) -> i64 { return x + base }\n    println(add(5))\n    return 0\n}\n",
+    "15\n")
+
+expect_out("closure_by_value",
+    "func main() -> i64 {\n    var base = 10\n    var mut = func () -> i64 { base = base + 1\n        return base }\n    println(mut())\n    println(base)\n    return 0\n}\n",
+    "11\n10\n")
+
+expect_out("closure_nested",
+    "func main() -> i64 {\n    var base = 10\n    var mk = func (n: i64) -> i64 {\n        var g = func (m: i64) -> i64 { return m * n + base }\n        return g(3)\n    }\n    println(mk(4))\n    return 0\n}\n",
+    "22\n")
+
+expect_out("closure_as_arg",
+    "func apply(f: fn(i64) -> i64, v: i64) -> i64 {\n    return f(v)\n}\nfunc main() -> i64 {\n    var base = 10\n    var add = func (x: i64) -> i64 { return x + base }\n    println(apply(add, 7))\n    return 0\n}\n",
+    "17\n")
+
+expect_out("closure_loop",
+    "func inc1(x: i64) -> i64 { return x + 1 }\nfunc main() -> i64 {\n    var add = func (x: i64) -> i64 { return x + 1 }\n    var s = 0\n    var i = 0\n    while i < 1000 {\n        s = s + inc1(i)\n        s = s + add(i)\n        i = i + 1\n    }\n    println(s)\n    return 0\n}\n",
+    "1001000\n")
+
 // ---------- 负例 ----------
 expect_err("syntax", "var x =\n", "error[E")
 expect_err("undef", "println(y)\n", "未声明的变量")
