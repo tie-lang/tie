@@ -742,6 +742,89 @@ func cg_forin(id: i64) -> i64 {
     return 0
 }
 
+// switch 语句：obj 只求值一次，按 case 的模式顺序比较，命中即执行该分支。
+// 分支体不落穿；default 分支（模式区段为空）在没有命中时执行。
+func cg_switch(id: i64) -> i64 {
+    var ov = cg_expr(em_get(id, 1))
+    if ov < 0 { return -1 }
+    var st = em_get(id, 2)
+    var nn = em_get(id, 3)
+    var i: i64 = 0
+    var dbodies: table<i64> = []
+    while i < nn {
+        var c = em_ch[st + i]
+        if em_get(c, 2) == 0 {
+            table_push(dbodies, em_get(c, 3))
+        }
+        i = i + 1
+    }
+    var ends: table<i64> = []
+    i = 0
+    while i < nn {
+        var c = em_ch[st + i]
+        var pn = em_get(c, 2)
+        var body = em_get(c, 3)
+        if pn > 0 {
+            var pb = em_get(c, 1)
+            var hits: table<i64> = []
+            var j: i64 = 0
+            while j < pn {
+                var p = em_ch[pb + j]
+                var m: i64 = 0
+                if em_tag(p) == T_E_RANGE {
+                    var lo = cg_expr(em_get(p, 1))
+                    if lo < 0 { return -1 }
+                    var hi = cg_expr(em_get(p, 2))
+                    if hi < 0 { return -1 }
+                    var g = cg_alloc()
+                    cg_emit(OP_GE, g, ov, lo)
+                    var l = cg_alloc()
+                    if em_get(p, 3) == 1 {
+                        cg_emit(OP_LE, l, ov, hi)
+                    } else {
+                        cg_emit(OP_LT, l, ov, hi)
+                    }
+                    m = cg_alloc()
+                    cg_emit(OP_BAND, m, g, l)
+                } else {
+                    var pv = cg_expr(p)
+                    if pv < 0 { return -1 }
+                    m = cg_alloc()
+                    cg_emit(OP_EQ, m, ov, pv)
+                }
+                // 命中才跳进分支体：JMPT 为真时跳转，未命中则落到下面的 miss 跳转。
+                var jt = cg_emit(OP_JMPT, 0, m, 0)
+                table_push(hits, jt)
+                j = j + 1
+            }
+            var miss = cg_emit(OP_JMP, 0, 0, 0)
+            var bstart = cg_here()
+            var h: i64 = 0
+            while h < len(hits) {
+                cg_patch(hits[h], bstart)
+                h = h + 1
+            }
+            if cg_stmt(body) < 0 { return -1 }
+            var je = cg_emit(OP_JMP, 0, 0, 0)
+            table_push(ends, je)
+            cg_patch(miss, cg_here())
+        }
+        i = i + 1
+    }
+    var dz: i64 = 0
+    while dz < len(dbodies) {
+        if cg_stmt(dbodies[dz]) < 0 { return -1 }
+        dz = dz + 1
+    }
+    var eend = cg_here()
+    var z: i64 = 0
+    while z < len(ends) {
+        cg_patch(ends[z], eend)
+        z = z + 1
+    }
+    return 0
+}
+
 func cg_break(id: i64) -> i64 {
     var layer = cg_loop_layer(em_get(id, 1))
     if layer < 0 {
@@ -816,6 +899,7 @@ func cg_stmt(id: i64) -> i64 {
     if tg == T_S_WHILE { return cg_while(id) }
     if tg == T_S_FORRANGE { return cg_forrange(id) }
     if tg == T_S_FORIN { return cg_forin(id) }
+    if tg == T_S_SWITCH { return cg_switch(id) }
     if tg == T_S_RETURN { return cg_return(id) }
     if tg == T_S_BREAK { return cg_break(id) }
     if tg == T_S_CONTINUE { return cg_continue(id) }
