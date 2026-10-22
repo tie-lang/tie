@@ -51,7 +51,24 @@ func s21_table_push_nl_inl(t: i64, elem_llvm_ty: i64, v: i64, bs: i64) {
     ir.add_operand(b1, mg, 1)
     // 慢路径：原调用（增长路径不变）
     g_cur_block = sb
-    s21_table_push_slow(t, elem_llvm_ty, v)
+    // 慢路径：纯增长（不把表句柄交给外部函数，避免表对象逃逸）+ 就地提交。
+    // 原实现调 tl_tbl$tbl_push_nl(t, ...) 把 t 交给跨模块函数，LLVM 据此判定表对象
+    // 逃逸，表头 cap/len/data 无法跨循环提升；改成只传值、由本序列写回表头。
+    var cap2 = s21_load(s21_gep(t, RT_TBL_OFF_CAP, true), T64)
+    var len2 = s21_load(s21_gep(t, RT_TBL_OFF_LEN, true), T64)
+    var data2 = s21_load(s21_gep(t, RT_TBL_OFF_DATA, true), types.named(TK_STR))
+    var cslot = ir.new_inst(g_cur_block, 20, T64)  // newcap 回写槽
+    ir.add_operand(cslot, T64, 2)
+    var cptr = ir.get_value(cslot)
+    var need2 = s21_bin(0, len2, tig_int_lit(1))
+    var nd_i = tl_i64_6("tl_tbl$tbl_grow_pure", cap2, len2, t21_ptri(data2), tig_int_lit(bs), need2, t21_ptri(cptr))
+    var ncap = s21_load(cptr, T64)
+    var nd_p = t21_intp(nd_i)
+    s21_store(s21_gep(t, RT_TBL_OFF_DATA, true), nd_p, types.named(TK_STR))
+    s21_store(s21_gep(t, RT_TBL_OFF_CAP, true), ncap, T64)
+    var ioff2 = s21_bin(2, len2, tig_int_lit(bs))
+    s21_store(s21_gep(nd_p, ioff2, false), v, elem_llvm_ty)
+    s21_store(s21_gep(t, RT_TBL_OFF_LEN, true), need2, T64)
     var b2 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b2, mg, 1)
     g_cur_block = mg

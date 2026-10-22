@@ -198,6 +198,32 @@ unsafe fn grow(p: ptr<u8>, cap: i64, len: i64, data: i64, esz: i64, need: i64) -
     return ptr_to_int(nd)
 }
 
+// r.1.8：纯增长入口——**只接收值参数，不接收表句柄**。动机：inline push 的慢
+// 路径原先把表句柄整体交给 tl_tbl$tbl_push_nl，LLVM 据此判定表对象逃逸，表头
+// cap/len/data 无法跨循环提升，push 循环每轮重载三个字段（实测占 push 总耗时
+// 约 17%）。本入口把「增长」与「提交」拆开：由调用方（codegen 内联序列）负责
+// 把新 data/新 cap 写回表头，运行时侧看不到表对象。
+pub unsafe fn tbl_grow_pure(cap: i64, len: i64, data: i64, esz: i64, need: i64, out_cap: i64) -> i64 {
+    if need <= cap {
+        w_i64(int_to_ptr(out_cap), 0, cap)
+        return data
+    }
+    var newcap: i64 = 8
+    if cap > 0 {
+        newcap = cap * 2
+    }
+    if newcap < need {
+        newcap = need
+    }
+    var nd = alloc(newcap * esz)
+    if data != 0 {
+        memcpy(nd, int_to_ptr(data), len * esz)
+        free(int_to_ptr(data))
+    }
+    w_i64(int_to_ptr(out_cap), 0, newcap)
+    return ptr_to_int(nd)
+}
+
 // 扩容（调用方已持锁）：读字段后委托 grow。保留给 tbl_ensure 等非热路径。
 unsafe fn ensure_locked(h: i64, need: i64) -> i64 {
     var p = int_to_ptr(h)
