@@ -13,6 +13,193 @@ type tie<class>
 //     在运行时切分成条目——保证「声明即注册」不需要额外的注册语句。
 import "./string.tie" as str
 
+// ============================================================================
+// 布局词表（第 14 章 §9 键类型表）：尺寸 / 分布 / 溢出 / 锚点
+// ----------------------------------------------------------------------------
+// 四类值都以「词」书写，但在程序里是带类型的一等值：
+//   * Size —— 尺寸代数（hug / fill / px / pct / fr / em / pt / vw / vh / ratio）
+//   * Dist —— 轴分布词（start / center / end / space-* / stretch）
+//   * Overflow —— 溢出策略（clip / scroll / expand / error）
+//   * Anchor —— overlay 子项锚点（九点 + fill）
+// 解析器（lib/front/pstmt_ui.tie）把属性值降解为 `Size.fill()` / `Dist.center`
+// 这样的构造调用，再由 `ui.w(...)` 一类设置器写回**规范字符串**（§9 降级表）。
+// 类型化只发生在编译期：运行期属性表仍是「键 → 字符串」，`ui.attr_of(id,"w")`
+// 对 `w: fill` 仍返回 "fill"，与类型化之前的文本形态逐字节兼容。
+//
+// Size 的编码（kind/a/b 三槽，不借道浮点，避免文本往返丢精度）：
+//   * kind = SizeKind 变体序号（0..9，见 enum SizeKind）
+//   * px/pct/fr/em/pt/vw/vh：a = 数值 × 100（百分之一单位，i64 承载两位小数）
+//   * hug/fill：a = b = 0
+//   * ratio：a = 前项，b = 后项（原值）
+// 规范文本由 Size.to_attr 还原：150 → "1.5em"，200 → "2fr"，6000 → "60%"。
+// ============================================================================
+
+// 尺寸形态。
+enum SizeKind {
+    hug
+    fill
+    px
+    pct
+    fr
+    em
+    pt
+    vw
+    vh
+    ratio
+}
+
+// 尺寸值。
+struct Size {
+    var kind: i64 = 0            // SizeKind 变体序号
+    var a: i64 = 0               // 数值 × 100（ratio 时是前项）
+    var b: i64 = 0               // ratio 的后项
+}
+
+namespace Size {
+    // 百分之一单位 → 十进制文本：150 → "1.5"，200 → "2"，25 → "0.25"。
+    pub func fmt_hundredths(h: i64) -> string {
+        var neg = false
+        var v = h
+        if v < 0 {
+            neg = true
+            v = -v
+        }
+        var whole = v / 100
+        var frac = v % 100
+        var s = to_string(whole)
+        if frac != 0 {
+            if frac % 10 == 0 {
+                s = s + "." + to_string(frac / 10)
+            } else if frac < 10 {
+                s = s + ".0" + to_string(frac)
+            } else {
+                s = s + "." + to_string(frac)
+            }
+        }
+        if neg {
+            s = "-" + s
+        }
+        return s
+    }
+    // 半单位进位：×100 取整时四舍五入（0.29 不会掉成 28）。
+    pub func half_sign(x: f64) -> f64 {
+        if x < 0.0 {
+            return -0.5
+        }
+        return 0.5
+    }
+
+    // 内部统一构造。
+    pub func make(kind: i64, a: i64, b: i64) -> Size {
+        return Size(kind, a, b)
+    }
+    // 内容尺寸（默认）。
+    pub func hug() -> Size {
+        return Size.make(0, 0, 0)
+    }
+    // 占满剩余空间（等价 1fr）。
+    pub func fill() -> Size {
+        return Size.make(1, 0, 0)
+    }
+    // 逻辑像素。
+    pub func px(n: i64) -> Size {
+        return Size.make(2, n * 100, 0)
+    }
+    // 父内容盒百分比（整数）。
+    pub func pct(n: i64) -> Size {
+        return Size.make(3, n * 100, 0)
+    }
+    // 份数。
+    pub func fr(w: f64) -> Size {
+        return Size.make(4, to_i64(w * 100.0 + half_sign(w)), 0)
+    }
+    // 相对字号倍数。
+    pub func em(x: f64) -> Size {
+        return Size.make(5, to_i64(x * 100.0 + half_sign(x)), 0)
+    }
+    // 点（1pt = 4/3 逻辑像素）。
+    pub func pt(x: f64) -> Size {
+        return Size.make(6, to_i64(x * 100.0 + half_sign(x)), 0)
+    }
+    // 视口宽百分比。
+    pub func vw(n: f64) -> Size {
+        return Size.make(7, to_i64(n * 100.0 + half_sign(n)), 0)
+    }
+    // 视口高百分比。
+    pub func vh(n: f64) -> Size {
+        return Size.make(8, to_i64(n * 100.0 + half_sign(n)), 0)
+    }
+    // 宽高比。
+    pub func ratio(a: i64, b: i64) -> Size {
+        return Size.make(9, a, b)
+    }
+    // 变体序号（SizeKind 与 kind: i64 的桥）。
+    pub func tag_of(k: SizeKind) -> i64 {
+        switch k {
+        case SizeKind.hug: return 0
+        case SizeKind.fill: return 1
+        case SizeKind.px: return 2
+        case SizeKind.pct: return 3
+        case SizeKind.fr: return 4
+        case SizeKind.em: return 5
+        case SizeKind.pt: return 6
+        case SizeKind.vw: return 7
+        case SizeKind.vh: return 8
+        case SizeKind.ratio: return 9
+        }
+        return 0
+    }
+    // 规范文本（§9 降级表：属性表里存的就是这个形态）。
+    pub func to_attr(s: Size) -> string {
+        switch s.kind {
+        case 0: return "hug"
+        case 1: return "fill"
+        case 2: return fmt_hundredths(s.a)
+        case 3: return fmt_hundredths(s.a) + "%"
+        case 4: return fmt_hundredths(s.a) + "fr"
+        case 5: return fmt_hundredths(s.a) + "em"
+        case 6: return fmt_hundredths(s.a) + "pt"
+        case 7: return fmt_hundredths(s.a) + "vw"
+        case 8: return fmt_hundredths(s.a) + "vh"
+        case 9: return "ratio(" + to_string(s.a) + ":" + to_string(s.b) + ")"
+        }
+        return "hug"
+    }
+}
+
+// 轴分布词。
+enum Dist {
+    start
+    center
+    end
+    space_between
+    space_around
+    space_evenly
+    stretch
+}
+
+// 溢出策略。
+enum Overflow {
+    clip
+    scroll
+    expand
+    err
+}
+
+// overlay 子项锚点。
+enum Anchor {
+    top_start
+    top
+    top_end
+    start
+    center
+    end
+    bottom_start
+    bottom
+    bottom_end
+    fill
+}
+
 namespace ui {
 
 // ---------- v2：函数值事件 / 端口 / 单元结构化属性与规则 / 主题 ----------
@@ -634,6 +821,87 @@ pub func attr_expr<T>(key: string, value: T) -> i64 {
     return attr_str(key, to_string(value))
 }
 
+// 分布 / 溢出 / 锚点词的规范文本（枚举 → §9 降级表形态）。
+// 枚举类型不能与同名 namespace 共存（`Dist.to_attr` 会被当成变体查找），
+// 所以这三张词表放在 ui 命名空间里，只有 struct 形的 Size 用 `Size.to_attr`。
+pub func dist_attr(d: Dist) -> string {
+    switch d {
+    case Dist.start: return "start"
+    case Dist.center: return "center"
+    case Dist.end: return "end"
+    case Dist.space_between: return "space-between"
+    case Dist.space_around: return "space-around"
+    case Dist.space_evenly: return "space-evenly"
+    case Dist.stretch: return "stretch"
+    }
+    return "start"
+}
+
+pub func overflow_attr(o: Overflow) -> string {
+    switch o {
+    case Overflow.clip: return "clip"
+    case Overflow.scroll: return "scroll"
+    case Overflow.expand: return "expand"
+    case Overflow.err: return "error"
+    }
+    return "clip"
+}
+
+pub func anchor_attr(a: Anchor) -> string {
+    switch a {
+    case Anchor.top_start: return "top-start"
+    case Anchor.top: return "top"
+    case Anchor.top_end: return "top-end"
+    case Anchor.start: return "start"
+    case Anchor.center: return "center"
+    case Anchor.end: return "end"
+    case Anchor.bottom_start: return "bottom-start"
+    case Anchor.bottom: return "bottom"
+    case Anchor.bottom_end: return "bottom-end"
+    case Anchor.fill: return "fill"
+    }
+    return "center"
+}
+
+// ---------- 布局设置器（§9 键类型表：类型化键写回规范字符串） ----------
+// 这些函数是解析期降解的目标：属性值先按类型构造（Size/Dist/Overflow/Anchor），
+// 再在这里折成规范文本存进键值表——属性表形态与类型化之前逐字节一致，
+// 渲染后端与 `attr_of` 的现存契约不变。
+
+// 宽、高与轴向限制（Size）。
+pub func w(s: Size) -> i64 { return attr_str("w", Size.to_attr(s)) }
+pub func h(s: Size) -> i64 { return attr_str("h", Size.to_attr(s)) }
+pub func min_w(s: Size) -> i64 { return attr_str("min-w", Size.to_attr(s)) }
+pub func max_w(s: Size) -> i64 { return attr_str("max-w", Size.to_attr(s)) }
+pub func min_h(s: Size) -> i64 { return attr_str("min-h", Size.to_attr(s)) }
+pub func max_h(s: Size) -> i64 { return attr_str("max-h", Size.to_attr(s)) }
+
+// 轴分布（Dist）：x/y 的分布词绑定绝对轴，不随书写方向翻转。
+pub func dist_x(d: Dist) -> i64 { return attr_str("x", dist_attr(d)) }
+pub func dist_y(d: Dist) -> i64 { return attr_str("y", dist_attr(d)) }
+
+// 溢出策略与锚点。
+pub func overflow(o: Overflow) -> i64 { return attr_str("overflow", overflow_attr(o)) }
+pub func anchor(a: Anchor) -> i64 { return attr_str("anchor", anchor_attr(a)) }
+
+// 长度类（§9：i64 / 长度）。
+pub func pad(n: i64) -> i64 { return attr_str("pad", to_string(n)) }
+pub func pad_x(n: i64) -> i64 { return attr_str("pad-x", to_string(n)) }
+pub func pad_y(n: i64) -> i64 { return attr_str("pad-y", to_string(n)) }
+pub func pad_top(n: i64) -> i64 { return attr_str("pad-top", to_string(n)) }
+pub func pad_right(n: i64) -> i64 { return attr_str("pad-right", to_string(n)) }
+pub func pad_bottom(n: i64) -> i64 { return attr_str("pad-bottom", to_string(n)) }
+pub func pad_left(n: i64) -> i64 { return attr_str("pad-left", to_string(n)) }
+pub func gap(n: i64) -> i64 { return attr_str("gap", to_string(n)) }
+pub func dx(n: i64) -> i64 { return attr_str("dx", to_string(n)) }
+pub func dy(n: i64) -> i64 { return attr_str("dy", to_string(n)) }
+pub func radius(n: i64) -> i64 { return attr_str("radius", to_string(n)) }
+pub func font_size(n: i64) -> i64 { return attr_str("font-size", to_string(n)) }
+pub func border(n: i64) -> i64 { return attr_str("border", to_string(n)) }
+
+// 样式引用（§9：style → 样式名）。
+pub func style_ref(name: string) -> i64 { return attr_str("style", name) }
+
 // ---------- 事件：函数值（§14.4 on_事件名: 函数值） ----------
 
 // 在当前节点上绑定函数值事件处理器。
@@ -652,8 +920,8 @@ pub func fire_at(id: i64, event: string, x: i64, y: i64, kind: string) -> i64 {
     var n = len(g_fnow)
     while i < n {
         if g_fnow[i] == id && g_fnname[i] == event {
-            var h = g_fnfn[i]
-            return h(id, x, y, kind)
+            var fh = g_fnfn[i]
+            return fh(id, x, y, kind)
         }
         i = i + 1
     }

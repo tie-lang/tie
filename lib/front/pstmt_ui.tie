@@ -287,6 +287,483 @@ pub func ui_at_decl_ahead() -> bool {
     return putil.peek_n(3) == lex_lbrace
 }
 
+// ---------- 属性值类型化（§9 键类型表与值侧语法糖） ----------
+//
+// 元素头 `(键: 值, …)` 与元素体 `键: 值;` 两条路径共用 ui_attr_stmt：
+// 已登记键按「字面量种类 + 单位后缀」降解为 std/ui.tie 的类型化设置器，
+// 未登记键仍原样捕获成字符串走 ui.attr_str。单位后缀只在属性值位置识别
+// （同一行、紧邻数字），普通表达式的语义不受影响。
+
+// 键表成员：表串形如 `|a|b|`，判定 `|key|` 是否在其中。
+func ui_in(key: string, set: string) -> bool {
+    return str_has(set, "|" + key + "|")
+}
+
+// 键分类：0 未登记 1 Size 2 Dist 3 Overflow 4 Anchor 5 长度 6 样式名。
+func ui_key_class(key: string) -> i64 {
+    if ui_in(key, "|w|h|min-w|max-w|min-h|max-h|") {
+        return 1
+    }
+    if ui_in(key, "|x|y|") {
+        return 2
+    }
+    if key == "overflow" {
+        return 3
+    }
+    if key == "anchor" {
+        return 4
+    }
+    if ui_in(key, "|pad|pad-x|pad-y|pad-top|pad-right|pad-bottom|pad-left|gap|dx|dy|radius|font-size|border|") {
+        return 5
+    }
+    if key == "style" {
+        return 6
+    }
+    return 0
+}
+
+// 键 → 设置器名：连字符换下划线（`min-w` → `min_w`）。
+func ui_key_setter(key: string) -> string {
+    var acc = ""
+    var i: i64 = 0
+    var n = str_len(key)
+    while i < n {
+        var c = str_char(key, i)
+        if c == "-" {
+            acc = acc + "_"
+        } else {
+            acc = acc + c
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+// 属性键：可含连字符（`min-w` / `font-size` / `pad-x`），消费整条键。
+func ui_key_name() -> string {
+    if putil.peek_tag() != lex_ident && putil.typekw_index(putil.peek_lexeme()) < 0 {
+        return ""
+    }
+    var acc = putil.peek_lexeme()
+    putil.advance()
+    while putil.peek_tag() == lex_minus && putil.peek_n(1) == lex_ident {
+        acc = acc + "-" + putil.peek_lexeme_n(1)
+        putil.advance()
+        putil.advance()
+    }
+    return acc
+}
+
+// 体内路径的前瞻：`键:` 或 `连字符键:`（不改动词法位置）。
+func ui_attr_key_ahead() -> bool {
+    if putil.peek_tag() != lex_ident && putil.peek_tag() != lex_typekw {
+        return false
+    }
+    if putil.peek_n(1) == lex_colon {
+        return true
+    }
+    var k: i64 = 1
+    while putil.peek_n(k) == lex_minus && putil.peek_n(k + 1) == lex_ident {
+        k = k + 2
+    }
+    if k == 1 {
+        return false
+    }
+    return putil.peek_n(k) == lex_colon
+}
+
+// 词：`ident (- ident)*` → 连字符词（`space-between` / `top-start`）。
+func ui_word() -> string {
+    var acc = putil.peek_lexeme()
+    putil.advance()
+    while putil.peek_tag() == lex_minus && putil.peek_n(1) == lex_ident {
+        acc = acc + "-" + putil.peek_lexeme_n(1)
+        putil.advance()
+        putil.advance()
+    }
+    return acc
+}
+
+// `Type.fn(args…)` 静态调用表达式（`Size.fill()` / `Size.px(56)`）。
+func ui_static_call(type_name: string, fn: string, args: table<i64>, line: i64, col: i64) -> i64 {
+    var tv = ast.new_node(N_VAR, interner.intern(type_name), -1, -1, line, col)
+    ast.set_children(tv, table_new_i64())
+    var mc = ast.new_node(N_METHOD_CALL, interner.intern(fn), -1, -1, line, col)
+    var k: table<i64> = table_new_i64()
+    table_push(k, -1)   // 泛型槽
+    table_push(k, tv)   // 接收者 = 类型
+    var i: i64 = 0
+    while i < len(args) {
+        table_push(k, args[i])
+        i = i + 1
+    }
+    ast.set_children(mc, k)
+    return mc
+}
+
+// `Type.变体` 枚举值（`Dist.center` / `Anchor.top_start`）。
+func ui_enum_arg(type_name: string, variant: string, line: i64, col: i64) -> i64 {
+    var tv = ast.new_node(N_VAR, interner.intern(type_name), -1, -1, line, col)
+    ast.set_children(tv, table_new_i64())
+    var fa = ast.new_node(N_FIELD_ACCESS, interner.intern(variant), -1, -1, line, col)
+    var k: table<i64> = table_new_i64()
+    table_push(k, tv)
+    ast.set_children(fa, k)
+    return fa
+}
+
+// 数值字面量节点。需要 f64 形参时（fr/em/pt/vw/vh）用 N_FLOAT_LIT：
+// 文本无小数点时补 ".0"，aux=9 即 TK_F64。
+func ui_num_node(numtext: string, want_float: bool, line: i64, col: i64) -> i64 {
+    if want_float {
+        var t = numtext
+        if !str_has(t, ".") {
+            t = t + ".0"
+        }
+        return ast.new_node(N_FLOAT_LIT, interner.intern(t), -1, 9, line, col)
+    }
+    return ast.new_node(N_INT_LIT, -1, putil.parse_int_lit(numtext), -1, line, col)
+}
+
+// 发一条类型化设置器语句：`ui.<setter>(arg)`。
+func ui_typed(ref stmts: table<i64>, setter: string, arg: i64, line: i64, col: i64) -> i64 {
+    if arg < 0 {
+        return -1
+    }
+    var args: table<i64> = table_new_i64()
+    table_push(args, arg)
+    ui_emit(stmts, ui_nscall("ui", setter, args, line, col))
+    return 0
+}
+
+// Size 键的值：fill / hug / ratio(a:b) / 整数[px] / 整数% / 数 fr|em|pt|vw|vh /
+// `Size.…` 表达式。
+func ui_size_value(key: string, line: i64, col: i64) -> i64 {
+    var t = putil.peek_tag()
+    if t == lex_str {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "属性 '" + key + "' 的类型是 Size，不接受字符串字面量；可写 fill / hug / 200 / 60% / 2fr / 1.5em / 12pt / 50vw / 50vh / ratio(16:9)")
+        return -1
+    }
+    if t == lex_minus {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "尺寸不能为负：属性 '" + key + "'")
+        return -1
+    }
+    if t == lex_int || t == lex_float {
+        var ntxt = putil.peek_lexeme()
+        var nl = putil.peek_line()
+        var nc = putil.peek_col()
+        var is_f = t == lex_float
+        putil.advance()
+        var adj = putil.peek_line() == nl && putil.peek_col() == nc + str_len(ntxt)
+        if adj && putil.peek_tag() == lex_percent {
+            if is_f {
+                putil.set_err(nl, nc, "百分比必须是整数：" + ntxt + "%")
+                return -1
+            }
+            putil.advance()
+            var pa: table<i64> = table_new_i64()
+            table_push(pa, ui_num_node(ntxt, false, nl, nc))
+            return ui_static_call("Size", "pct", pa, nl, nc)
+        }
+        if adj && putil.peek_tag() == lex_ident {
+            var u = putil.peek_lexeme()
+            if u == "px" {
+                if is_f {
+                    putil.set_err(nl, nc, "像素值必须是整数：" + ntxt + "px")
+                    return -1
+                }
+                putil.advance()
+                var xa: table<i64> = table_new_i64()
+                table_push(xa, ui_num_node(ntxt, false, nl, nc))
+                return ui_static_call("Size", "px", xa, nl, nc)
+            }
+            if u == "fr" || u == "em" || u == "pt" || u == "vw" || u == "vh" {
+                putil.advance()
+                var ua: table<i64> = table_new_i64()
+                table_push(ua, ui_num_node(ntxt, true, nl, nc))
+                return ui_static_call("Size", u, ua, nl, nc)
+            }
+        }
+        if putil.peek_tag() == lex_ident && ui_in(putil.peek_lexeme(), "|px|fr|em|pt|vw|vh|") {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "单位后缀必须紧邻数字：" + ntxt + putil.peek_lexeme())
+            return -1
+        }
+        if putil.peek_tag() == lex_percent {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "百分比写法必须紧邻数字：" + ntxt + "%")
+            return -1
+        }
+        if is_f {
+            putil.set_err(nl, nc, "尺寸 " + ntxt + " 缺少单位：小数须带 fr / em / pt / vw / vh 后缀")
+            return -1
+        }
+        var ba: table<i64> = table_new_i64()
+        table_push(ba, ui_num_node(ntxt, false, nl, nc))
+        return ui_static_call("Size", "px", ba, nl, nc)
+    }
+    if t == lex_ident {
+        var w = putil.peek_lexeme()
+        var wl = putil.peek_line()
+        var wc = putil.peek_col()
+        if w == "fill" || w == "hug" {
+            putil.advance()
+            var ea: table<i64> = table_new_i64()
+            return ui_static_call("Size", w, ea, wl, wc)
+        }
+        if w == "ratio" && putil.peek_n(1) == lex_lparen {
+            putil.advance()
+            putil.advance()
+            if putil.peek_tag() != lex_int {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "ratio(a:b) 的 a 必须是整数")
+                return -1
+            }
+            var a1 = putil.parse_int_lit(putil.peek_lexeme())
+            putil.advance()
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            if putil.peek_tag() != lex_int {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "ratio(a:b) 的 b 必须是整数")
+                return -1
+            }
+            var b1 = putil.parse_int_lit(putil.peek_lexeme())
+            putil.advance()
+            if !putil.expect(lex_rparen, "')'") {
+                return -1
+            }
+            var ra: table<i64> = table_new_i64()
+            table_push(ra, ast.new_node(N_INT_LIT, -1, a1, -1, wl, wc))
+            table_push(ra, ast.new_node(N_INT_LIT, -1, b1, -1, wl, wc))
+            return ui_static_call("Size", "ratio", ra, wl, wc)
+        }
+        if w == "Size" {
+            // 逃生口：已是 Size 值，交回表达式解析。
+            return pexpr.parse_expr()
+        }
+        putil.advance()
+        putil.set_err(wl, wc, "未知的尺寸词 '" + w + "'（可用 fill / hug / 200 / 60% / 2fr / 1.5em / 12pt / 50vw / 50vh / ratio(16:9)；自定义值写 Size.px(n)）")
+        return -1
+    }
+    if t == lex_lparen {
+        return pexpr.parse_expr()
+    }
+    putil.set_err(putil.peek_line(), putil.peek_col(), "属性 '" + key + "' 的类型是 Size，实际是 " + putil.describe(t))
+    return -1
+}
+
+// 词表：Dist / Overflow / Anchor 的可选词（用于报错提示）。
+func ui_enum_words(cls: i64) -> string {
+    if cls == 2 {
+        return "start / center / end / space-between / space-around / space-evenly / stretch"
+    }
+    if cls == 3 {
+        return "clip / scroll / expand / error"
+    }
+    return "top-start / top / top-end / start / center / end / bottom-start / bottom / bottom-end / fill"
+}
+
+// 词 → 枚举变体名；不是该词表成员时返回 ""。
+func ui_enum_variant(cls: i64, w: string) -> string {
+    if cls == 2 {
+        if w == "start" {
+            return "start"
+        }
+        if w == "center" {
+            return "center"
+        }
+        if w == "end" {
+            return "end"
+        }
+        if w == "space-between" {
+            return "space_between"
+        }
+        if w == "space-around" {
+            return "space_around"
+        }
+        if w == "space-evenly" {
+            return "space_evenly"
+        }
+        if w == "stretch" {
+            return "stretch"
+        }
+        return ""
+    }
+    if cls == 3 {
+        if w == "clip" {
+            return "clip"
+        }
+        if w == "scroll" {
+            return "scroll"
+        }
+        if w == "expand" {
+            return "expand"
+        }
+        if w == "error" {
+            return "err"
+        }
+        return ""
+    }
+    if w == "top-start" {
+        return "top_start"
+    }
+    if w == "top" {
+        return "top"
+    }
+    if w == "top-end" {
+        return "top_end"
+    }
+    if w == "start" {
+        return "start"
+    }
+    if w == "center" {
+        return "center"
+    }
+    if w == "end" {
+        return "end"
+    }
+    if w == "bottom-start" {
+        return "bottom_start"
+    }
+    if w == "bottom" {
+        return "bottom"
+    }
+    if w == "bottom-end" {
+        return "bottom_end"
+    }
+    if w == "fill" {
+        return "fill"
+    }
+    return ""
+}
+
+// Dist / Overflow / Anchor 键的值：闭集词，或 `类型.…` 表达式。
+func ui_enum_value(cls: i64, key: string, line: i64, col: i64) -> i64 {
+    var tn = "Dist"
+    if cls == 3 {
+        tn = "Overflow"
+    }
+    if cls == 4 {
+        tn = "Anchor"
+    }
+    if putil.peek_tag() != lex_ident {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "属性 '" + key + "' 的类型是 " + tn + "，需要 " + ui_enum_words(cls) + " 之一")
+        return -1
+    }
+    if putil.peek_lexeme() == tn && putil.peek_n(1) == lex_dot {
+        return pexpr.parse_expr()
+    }
+    var wl = putil.peek_line()
+    var wc = putil.peek_col()
+    var w = ui_word()
+    var v = ui_enum_variant(cls, w)
+    if v == "" {
+        putil.set_err(wl, wc, "属性 '" + key + "' 不接受 '" + w + "'；可选 " + ui_enum_words(cls))
+        return -1
+    }
+    return ui_enum_arg(tn, v, wl, wc)
+}
+
+// 长度键的值：整数[px]（可为负）→ 整数节点；其余交回表达式解析。
+func ui_length_value(key: string, line: i64, col: i64) -> i64 {
+    var t = putil.peek_tag()
+    if t == lex_str {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "属性 '" + key + "' 的类型是长度（整数像素），不接受字符串字面量")
+        return -1
+    }
+    var neg = false
+    if t == lex_minus && putil.peek_n(1) == lex_int {
+        neg = true
+        putil.advance()
+        t = lex_int
+    }
+    if t == lex_int {
+        var ntxt = putil.peek_lexeme()
+        var nl = putil.peek_line()
+        var nc = putil.peek_col()
+        var v = putil.parse_int_lit(ntxt)
+        putil.advance()
+        if putil.peek_tag() == lex_ident && putil.peek_lexeme() == "px" && putil.peek_line() == nl && putil.peek_col() == nc + str_len(ntxt) {
+            putil.advance()
+        }
+        if neg {
+            v = -v
+        }
+        return ast.new_node(N_INT_LIT, -1, v, -1, nl, nc)
+    }
+    return pexpr.parse_expr()
+}
+
+// 属性值统一入口：按 §9 键类型表分派。调用方已消费 `键` 与 `:`。
+func ui_attr_stmt(ref stmts: table<i64>, key: string, line: i64, col: i64) -> i64 {
+    var cls = ui_key_class(key)
+    if cls == 1 {
+        return ui_typed(stmts, ui_key_setter(key), ui_size_value(key, line, col), line, col)
+    }
+    if cls == 2 {
+        var st = "dist_x"
+        if key == "y" {
+            st = "dist_y"
+        }
+        return ui_typed(stmts, st, ui_enum_value(2, key, line, col), line, col)
+    }
+    if cls == 3 {
+        return ui_typed(stmts, "overflow", ui_enum_value(3, key, line, col), line, col)
+    }
+    if cls == 4 {
+        return ui_typed(stmts, "anchor", ui_enum_value(4, key, line, col), line, col)
+    }
+    if cls == 5 {
+        var nv = ui_length_value(key, line, col)
+        if nv < 0 {
+            return -1
+        }
+        if ast.tag(nv) == N_INT_LIT {
+            return ui_typed(stmts, ui_key_setter(key), nv, line, col)
+        }
+        var ea: table<i64> = table_new_i64()
+        table_push(ea, ui_strnode(key, line, col))
+        table_push(ea, nv)
+        ui_emit(stmts, ui_nscall("ui", "attr_expr", ea, line, col))
+        return 0
+    }
+    if cls == 6 {
+        var sn = ""
+        if putil.peek_tag() == lex_str {
+            sn = putil.peek_lexeme()
+            putil.advance()
+        } else if putil.peek_tag() == lex_ident {
+            sn = putil.peek_lexeme()
+            putil.advance()
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "属性 'style' 需要样式名或字符串字面量")
+            return -1
+        }
+        return ui_typed(stmts, "style_ref", ui_strnode(sn, line, col), line, col)
+    }
+    // 未登记键：原样捕获（词法原文无空格拼接）→ ui.attr_str；
+    // 单 token 布尔改走 ui.attr_bool。
+    var t = putil.peek_tag()
+    if t == lex_true || t == lex_false {
+        var nxt = putil.peek_n(1)
+        if nxt == lex_comma || nxt == lex_rparen || nxt == lex_semi || nxt == lex_rbrace {
+            var bv: i64 = 0
+            if t == lex_true {
+                bv = 1
+            }
+            var tv = putil.peek_line()
+            var tc = putil.peek_col()
+            putil.advance()
+            var ba: table<i64> = table_new_i64()
+            table_push(ba, ui_strnode(key, line, col))
+            table_push(ba, ast.new_node(N_BOOL_LIT, -1, bv, -1, tv, tc))
+            ui_emit(stmts, ui_nscall("ui", "attr_bool", ba, line, col))
+            return 0
+        }
+    }
+    var raw = ui_capture(true)
+    ui_s2(stmts, "ui_attr", key, raw, line, col)
+    return 0
+}
+
 // ---------- 元素 ----------
 
 // 元素名之后的实例名（可选字符串）与头部参数绑定。
@@ -308,14 +785,13 @@ func ui_element_head(ref stmts: table<i64>, kind: string, line: i64, col: i64) -
         while putil.peek_tag() != lex_rparen && putil.peek_tag() != lex_eof {
             // 绑定键是数据名而非标识符引用：`text` 一类类型关键字在这里与普通
             // 标识符等价（tie 不区分保留字与标识符的数据面），故一并放行。
-            if putil.peek_tag() != lex_ident && putil.typekw_index(putil.peek_lexeme()) < 0 {
-                putil.set_err(putil.peek_line(), putil.peek_col(), "元素属性绑定的键必须是标识符 tag=" + to_string(putil.peek_tag()) + " lex=" + putil.peek_lexeme())
-                return -1
-            }
-            var key = putil.peek_lexeme()
             var al = putil.peek_line()
             var ac = putil.peek_col()
-            putil.advance()
+            var key = ui_key_name()
+            if key == "" {
+                putil.set_err(al, ac, "元素属性绑定的键必须是标识符 tag=" + to_string(putil.peek_tag()) + " lex=" + putil.peek_lexeme())
+                return -1
+            }
             if !putil.expect(lex_colon, "':'") {
                 return -1
             }
@@ -337,8 +813,9 @@ func ui_element_head(ref stmts: table<i64>, kind: string, line: i64, col: i64) -
                 table_push(ea, hx)
                 ui_emit(stmts, ui_nscall("ui", "on", ea, al, ac))
             } else {
-                var val = ui_capture(true)
-                ui_s2(stmts, "ui_attr", key, val, al, ac)
+                if ui_attr_stmt(stmts, key, al, ac) < 0 {
+                    return -1
+                }
             }
             ui_skip_semi()
             if putil.peek_tag() == lex_comma {
@@ -452,16 +929,31 @@ func ui_element_body(ref stmts: table<i64>) -> i64 {
             putil.advance()
             ui_s1(stmts, "ui_text", txt, sl, sc)
             ui_skip_semi()
+        } else if t == lex_typekw && ui_attr_key_ahead() {
+            // 类型关键字键（`text: "…"`）：与标识符键走同一条降解路径。
+            var tl = putil.peek_line()
+            var tc2 = putil.peek_col()
+            var tkey = ui_key_name()
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            if ui_attr_stmt(stmts, tkey, tl, tc2) < 0 {
+                return -1
+            }
+            ui_skip_semi()
         } else if t == lex_ident {
             var al = putil.peek_line()
             var ac = putil.peek_col()
             var nm = putil.peek_lexeme()
-            if putil.peek_n(1) == lex_colon {
-                // 属性：`name: value;`（value 原样捕获，含颜色/尺寸/百分比）
-                putil.advance()
-                putil.advance()
-                var val = ui_capture(true)
-                ui_s2(stmts, "ui_attr", nm, val, al, ac)
+            if ui_attr_key_ahead() {
+                // 属性：`name: value;`（§9 键类型表按字面量种类分派）
+                var key = ui_key_name()
+                if !putil.expect(lex_colon, "':'") {
+                    return -1
+                }
+                if ui_attr_stmt(stmts, key, al, ac) < 0 {
+                    return -1
+                }
                 ui_skip_semi()
             } else if putil.peek_n(1) == lex_lparen {
                 // 简洁写法：`padding(4, 8)` / `size(480, 320)` → 同名属性
