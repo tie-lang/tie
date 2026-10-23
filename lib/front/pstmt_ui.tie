@@ -326,6 +326,25 @@ func ui_key_class(key: string) -> i64 {
     return 0
 }
 
+// 别名归一：蛇形写法与设置器函数名（`max_w`、`dist_x`）折到 §9 规范键。
+// 规范键本身是连字符形（`max-w`）；`dist_x`/`dist_y` 是 `x`/`y` 分布键的同义词。
+func ui_key_alias(key: string) -> string {
+    if key == "min_w" { return "min-w" }
+    if key == "max_w" { return "max-w" }
+    if key == "min_h" { return "min-h" }
+    if key == "max_h" { return "max-h" }
+    if key == "pad_x" { return "pad-x" }
+    if key == "pad_y" { return "pad-y" }
+    if key == "pad_top" { return "pad-top" }
+    if key == "pad_right" { return "pad-right" }
+    if key == "pad_bottom" { return "pad-bottom" }
+    if key == "pad_left" { return "pad-left" }
+    if key == "font_size" { return "font-size" }
+    if key == "dist_x" { return "x" }
+    if key == "dist_y" { return "y" }
+    return key
+}
+
 // 键 → 设置器名：连字符换下划线（`min-w` → `min_w`）。
 func ui_key_setter(key: string) -> string {
     var acc = ""
@@ -697,7 +716,11 @@ func ui_length_value(key: string, line: i64, col: i64) -> i64 {
 }
 
 // 属性值统一入口：按 §9 键类型表分派。调用方已消费 `键` 与 `:`。
-func ui_attr_stmt(ref stmts: table<i64>, key: string, line: i64, col: i64) -> i64 {
+func ui_attr_stmt(ref stmts: table<i64>, key0: string, line: i64, col: i64) -> i64 {
+    return ui_attr_stmt_key(stmts, ui_key_alias(key0), line, col)
+}
+
+func ui_attr_stmt_key(ref stmts: table<i64>, key: string, line: i64, col: i64) -> i64 {
     var cls = ui_key_class(key)
     if cls == 1 {
         return ui_typed(stmts, ui_key_setter(key), ui_size_value(key, line, col), line, col)
