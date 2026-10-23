@@ -917,11 +917,15 @@ pub func on(event: string, handler: fn(i64, i64, i64, string) -> i64) -> i64 {
 pub func fire_at(id: i64, event: string, x: i64, y: i64, kind: string) -> i64 {
     ensure()
     var i: i64 = 0
-    var n = len(g_fnow)
-    while i < n {
-        if g_fnow[i] == id && g_fnname[i] == event {
-            var fh = g_fnfn[i]
-            return fh(id, x, y, kind)
+    // 处理器本身可能重建描述树（例如按钮处理里改了状态后重跑视图），
+    // 因此每轮都重新取长度，并在取处理器表前先确认下标仍有效。
+    while i < len(g_fnow) {
+        if g_fnow[i] == id && i < len(g_fnname) && g_fnname[i] == event {
+            if i < len(g_fnfn) {
+                var fh = g_fnfn[i]
+                return fh(id, x, y, kind)
+            }
+            return -1
         }
         i = i + 1
     }
@@ -938,7 +942,7 @@ pub func has_fn_event(id: i64, event: string) -> bool {
     ensure()
     var i: i64 = 0
     while i < len(g_fnow) {
-        if g_fnow[i] == id && g_fnname[i] == event {
+        if g_fnow[i] == id && i < len(g_fnname) && g_fnname[i] == event {
             return true
         }
         i = i + 1
