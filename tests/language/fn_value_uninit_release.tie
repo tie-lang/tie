@@ -1,0 +1,21 @@
+type tie<logic>
+// 回归：条件分支里声明的函数值临时量，在「该分支未被执行」的出口释放点上不得被读取。
+// 修复前：`clo_exit_release` 假设闭包槽恒有效，无条件 load drop 函数指针并 call，
+// 未初始化槽里是 memset 零 → 调用空指针，进程在 main 返回前段错误（无输出、退出码 127）。
+import "/std/assert.tie" as assert
+
+func twice(x: i64) -> i64 {
+    return x + x
+}
+
+func main() -> i64 {
+    var flag: i64 = 0
+    if flag != 0 {
+        var fh: fn(i64) -> i64 = twice
+        println("未执行分支 " + to_string(fh(3)))
+    }
+    var g: fn(i64) -> i64 = twice
+    assert.assert_eq(g(4), 8)
+    println("fn value uninit release ok")
+    return 0
+}

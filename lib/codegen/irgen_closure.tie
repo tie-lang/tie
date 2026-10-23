@@ -554,6 +554,28 @@ func tig_closure_release_slot_guarded(slot: i64, fv_ty: i64, condv: i64) -> i64 
     return 0
 }
 
+// 出口释放（判空版）：`var f = <仅在某分支里初始化>` 时，未初始化路径上的槽仍是
+// alloca 零值（env = null），而 (b) 方案下释放点不判空 ⇒ 直接 `load null[0]` 段错误。
+// 这里先把 null 折成静态空 env（其析构是 no-op），再走与加护栏回边相同的释放序列。
+// 触发缺陷的实测形状：`if i < len(fns) { var fh = fns[i]; return fh(...) }` 的未命中路径。
+func tig_closure_release_slot_nonnull(slot: i64, fv_ty: i64) -> i64 {
+    var g0 = ir.new_inst(g_cur_block, 27, fv_ty)  // agg_gep 槽字段 0 = env
+    ir.add_operand(g0, slot, 0)
+    ir.add_operand(g0, 0, 2)
+    var envl = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load env
+    ir.add_operand(envl, ir.get_value(g0), 0)
+    var isz = tig_cmp_zero(ir.get_value(envl), 0)  // env == null
+    var nvp = clo_empty_env_val()
+    var safe = tig_select_i(isz, nvp, ir.get_value(envl), types.named(TK_STR))
+    var dl2 = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load drop 入口
+    ir.add_operand(dl2, safe, 0)
+    var ci70 = ir.new_inst(g_cur_block, 70, -1)  // call_indirect（void）
+    ir.add_operand(ci70, ir.get_value(dl2), 0)
+    ir.add_operand(ci70, types.named(TK_VOID), 2)
+    ir.add_operand(ci70, safe, 0)
+    return 0
+}
+
 // 函数出口：对登记的闭包值候选，未逃逸者发射释放。
 // 不逃逸判据**复用 esc 分析**——esc 的 kill 条件覆盖全部逃逸形态（赋值给别的
 // 变量/传参/存入容器/被闭包捕获）；而 `f()` 调用的 callee 存在节点的 name 字段
@@ -563,7 +585,7 @@ func clo_exit_release() {
     while i < len(g_clov_nids) {
         if esc_is_live(g_clov_nids[i]) {
             var cid_i = g_clov_cids[i]
-            tig_closure_release_slot(g_clov_slots[i], ast.node_type(cid_i))
+            tig_closure_release_slot_nonnull(g_clov_slots[i], ast.node_type(cid_i))
         }
         i = i + 1
     }
