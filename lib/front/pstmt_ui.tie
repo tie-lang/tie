@@ -319,10 +319,25 @@ func ui_element_head(ref stmts: table<i64>, kind: string, line: i64, col: i64) -
             if !putil.expect(lex_colon, "':'") {
                 return -1
             }
-            var val = ui_capture(true)
             if str_has(key, "on_") {
-                ui_s2(stmts, "ui_on", key, val, al, ac)
+                // 事件绑定（§14）：降解为 ui.on("事件名", 处理函数值)；事件名去掉 on_ 前缀。
+                // 事件处理器是一等函数值，故此处解析表达式而非原样捕获文本。
+                var ev: string = ""
+                var ei: i64 = 3
+                while ei < str_len(key) {
+                    ev = ev + str_char(key, ei)
+                    ei = ei + 1
+                }
+                var hx = pexpr.parse_expr()
+                if hx < 0 {
+                    return -1
+                }
+                var ea: table<i64> = table_new_i64()
+                table_push(ea, ui_strnode(ev, al, ac))
+                table_push(ea, hx)
+                ui_emit(stmts, ui_nscall("ui", "on", ea, al, ac))
             } else {
+                var val = ui_capture(true)
                 ui_s2(stmts, "ui_attr", key, val, al, ac)
             }
             ui_skip_semi()
