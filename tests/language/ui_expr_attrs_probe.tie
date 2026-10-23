@@ -1,0 +1,29 @@
+type tie<logic>
+// 第 14 章内容键探针：text/label/value/title/placeholder 的值是任意表达式。
+// 元素头 `(...)` 与元素体 `键: 值;` 两条路径都按表达式求值后写回规范字符串，
+// 因此状态驱动的界面可以在每帧重新计算内容。
+import "/std/assert.tie" as assert
+
+var g_n: i64 = 3
+
+func main() -> i64 {
+    var name = "动态"
+    @ window "主窗口" (text: to_string(g_n), title: name, value: g_n * 2, placeholder: "p" + "x") {
+        @ label "提示" {
+            text: "n=" + to_string(g_n + 1);
+        }
+    }
+    @ label "尾注" (text: to_string(g_n) + "/" + name) { }
+    assert.assert_eq(ui.count(), 3)
+    // 元素头：表达式求值结果
+    assert.assert_eq(ui.attr_of(0, "text"), "3")
+    assert.assert_eq(ui.attr_of(0, "title"), "动态")
+    assert.assert_eq(ui.attr_of(0, "value"), "6")
+    assert.assert_eq(ui.attr_of(0, "placeholder"), "px")
+    // 元素体：同一条表达式通道
+    assert.assert_eq(ui.attr_of(1, "text"), "n=4")
+    // 字符串拼接表达式
+    assert.assert_eq(ui.attr_of(2, "text"), "3/动态")
+    println("ui expr attrs ok")
+    return 0
+}

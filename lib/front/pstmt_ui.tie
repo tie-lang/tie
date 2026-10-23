@@ -319,6 +319,10 @@ func ui_key_class(key: string) -> i64 {
     if key == "style" {
         return 6
     }
+    // 内容/取值键：值是任意表达式，保留计算结果（渲染期每帧重算，靠差分决定重绘）。
+    if ui_in(key, "|text|label|value|title|placeholder|") {
+        return 7
+    }
     return 0
 }
 
@@ -723,6 +727,17 @@ func ui_attr_stmt(ref stmts: table<i64>, key: string, line: i64, col: i64) -> i6
         table_push(ea, ui_strnode(key, line, col))
         table_push(ea, nv)
         ui_emit(stmts, ui_nscall("ui", "attr_expr", ea, line, col))
+        return 0
+    }
+    if cls == 7 {
+        var ev = pexpr.parse_expr()
+        if ev < 0 {
+            return -1
+        }
+        var xa: table<i64> = table_new_i64()
+        table_push(xa, ui_strnode(key, line, col))
+        table_push(xa, ev)
+        ui_emit(stmts, ui_nscall("ui", "attr_expr", xa, line, col))
         return 0
     }
     if cls == 6 {
