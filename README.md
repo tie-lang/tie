@@ -23,7 +23,7 @@ tie 语言核心：编译器、标准库、运行时与薄工具的单主体仓�
 | `tools/tiec`  | 编译器（`src/` 源码、`scripts/` 门禁脚本） |
 | `tools/tiej`  | JIT 驱动（tieir → LLJIT）          |
 | `tools/tiel`  | 轻量解释器（词法 / 语法 / 字节码内核）        |
-| `tests/`      | 语言/工具探针与编译器回归用例                |
+| `_local_only/probes/tests/`      | 语言/工具探针与编译器回归用例                |
 
 跨库引用写全名（`tie.ir::x`）；文件首部 `namespace <库名>;` 写在 import 之后。
 `std/`、`sys/`、`ext/` 是 `/std/*` 等绝对导入的根，构建时令 `TIE_LIB_ROOT=<仓根>`。
@@ -53,7 +53,7 @@ _local_only/bin/tiec.exe tools/tiej/main.tie -o _local_only/bin/tiej.exe --no-wa
 _local_only/bin/tiej.exe
 
 # 4. 语言层探针
-_local_only/bin/tiec.exe tests/backend_probe.tie -o _local_only/bin/backend_probe.exe --no-warn
+_local_only/bin/tiec.exe _local_only/probes/tests/backend_probe.tie -o _local_only/bin/backend_probe.exe --no-warn
 _local_only/bin/backend_probe.exe
 ```
 
@@ -62,7 +62,7 @@ _local_only/bin/backend_probe.exe
 `lib/ir` + `lib/backend` + `lib/jit` + `tools/tiej`：
 tieir（函数 / 参数 / add·sub·mul / ret）→ LLVM 文本 → LLJIT → 查符号 → 调用。
 
-`tools/tiec` 是完整编译器源码；`std/` 是它的标准库根；`tests/` 保留编译器回归用例。
+`tools/tiec` 是完整编译器源码；`std/` 是它的标准库根；`_local_only/probes/tests/` 保留编译器回归用例。
 
 ## 许可
 

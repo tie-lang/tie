@@ -72,7 +72,7 @@ pub func crc32_str(s: string) -> i64 {
 // ---------- 流式分块帧（r.1.6.7：**字符串载体**） ----------
 // 载体说明：payload/帧/流一律用 tie **字符串**（字节密度 1×、`str_byte` 单指令、
 // `sb_append` 按字节 memcpy），替代 `table<i64>`（8×、逐元素索引走容器锁）。
-// **线上字节格式完全不变**（迁移前后逐字节比对通过，见 tests/_golden_stream.tie）。
+// **线上字节格式完全不变**（迁移前后逐字节比对通过，见 _local_only/probes/tests/_golden_stream.tie）。
 // 一处顺带的实质改进：旧版 `chunk_encode` 把 payload **逐元素 push** 进新表
 // （每字节一次 `table_push`），现改为 `bw_put_bytes` **单次 memcpy**；
 // `chunk_next` 取 payload 也从逐元素拷贝改为 `str_sub_bytes` **单次切片拷贝**。

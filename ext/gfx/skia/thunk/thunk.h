@@ -7,7 +7,7 @@
 //   * SkPaint 不直接镜像 C++ 布局（位域脆弱），改为扁平 repr(C) 描述结构
 //     TSkPaint，由 thunk 转成 SkPaint。TSkImageInfo 同理承载像素回读信息。
 //   * 布局 = MSVC x64 自然对齐（tie repr(C) 由 p.6.8.2 保证一致），由
-//     tests/p686_probe/ref.c 对照 offsetof 核验后写死期望。
+//     _local_only/probes/tests/p686_probe/ref.c 对照 offsetof 核验后写死期望。
 
 #ifndef TIE_SKIA_THUNK_H
 #define TIE_SKIA_THUNK_H

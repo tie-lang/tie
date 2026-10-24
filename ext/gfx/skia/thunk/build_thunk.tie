@@ -7,7 +7,7 @@ type tie<logic>
 //   2) clang-cl /MT 编译 ext/gfx/skia/thunk/thunk.cpp → thunk.obj（与 skia.lib 同列 /MT 静默 CRT）
 //   3) tiec --emit-ir 编译探针 → .ll → clang -c → .obj
 //   4) clang -fuse-ld=link 链接 探针.obj + thunk.obj + skia.lib → 探针.exe
-//   5) 运行探针（cwd=仓库根，PNG 落 tests/p686_probe/out.png）；rc==0 → PASS
+//   5) 运行探针（cwd=仓库根，PNG 落 _local_only/probes/tests/p686_probe/out.png）；rc==0 → PASS
 //
 // 工具链：clang-cl（thunk）与 clang（链接）均来自 LLVM（tiec 自身依赖），MSVC 头文件
 // 由 clang 自动发现；skia.lib 为 MSVC /MT 静态库，thunk 用 /MT 对齐避免了 CRT 混链。
@@ -79,7 +79,7 @@ func main() {
     }
     logmsg("probe.exe linked")
 
-    // 5) 运行（cwd=仓库根，PNG 落 tests/p686_probe/out.png 相对路径）
+    // 5) 运行（cwd=仓库根，PNG 落 _local_only/probes/tests/p686_probe/out.png 相对路径）
     var rc = process.exec_code(g_probe_exe)
     if rc != 0 {
         fail("probe run failed rc=" + to_string(rc) + " (探针内部 FAIL / 退出非 0)")

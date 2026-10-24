@@ -17,7 +17,7 @@ if arg_count() >= 1 && !is_empty(arg_at(0)) { tiec = arg_at(0) }
 
 var root = cwd()
 
-// 分批跑（CI 单次调用有时限）：REGRESS_SLICE=0..9 只跑 tests/language 的第 N 片，
+// 分批跑（CI 单次调用有时限）：REGRESS_SLICE=0..9 只跑 _local_only/probes/tests/language 的第 N 片，
 // 每片 26 个文件（正例与负例混排在同一列表，靠索引切）；不设则全量。
 // 切片只作用于阶段 4/5（language 正例/负例，占全部用例九成），阶段 1/2/3/6 每片都跑。
 var slice_s = get_env("REGRESS_SLICE")
@@ -87,17 +87,17 @@ for fn in s21 {
     if linux_known(fn) {
         println("SKIP(Linux差异) " + fn); known = known + 1
     } else {
-        r = compile_run(root + "\\tests\\s21_probe\\" + fn, true)
+        r = compile_run(root + "\\_local_only\probes\tests\\s21_probe\\" + fn, true)
         if has_prefix(r, "OK") { println("PASS " + fn); pass = pass + 1 }
         else { println("FAIL " + fn + " -> " + r); fail = fail + 1 }
     }
 }
 
 println("=== 2. S2.2 探针（编译+运行） ===")
-var s22 = sort_strings(list_dir(root + "\\tests\\s22_probe"))
+var s22 = sort_strings(list_dir(root + "\\_local_only\probes\tests\\s22_probe"))
 for fn in s22 {
     if has_suffix(fn, ".tie") {
-        r = compile_run(root + "\\tests\\s22_probe\\" + fn, true)
+        r = compile_run(root + "\\_local_only\probes\tests\\s22_probe\\" + fn, true)
         if has_prefix(r, "OK") { println("PASS " + fn); pass = pass + 1 }
         else { println("FAIL " + fn + " -> " + r); fail = fail + 1 }
     }
@@ -105,10 +105,10 @@ for fn in s22 {
 
 println("=== 3. S2.3 探针（编译+运行） ===")
 var pmsg = "致命错误：除数不能为零"
-var s23 = sort_strings(list_dir(root + "\\tests\\s23_probe"))
+var s23 = sort_strings(list_dir(root + "\\_local_only\probes\tests\\s23_probe"))
 for fn in s23 {
     if !has_suffix(fn, ".tie") { continue }
-    r = compile_run(root + "\\tests\\s23_probe\\" + fn, true)
+    r = compile_run(root + "\\_local_only\probes\tests\\s23_probe\\" + fn, true)
     if has_prefix(r, "OK") {
         println("PASS " + fn); pass = pass + 1
     } else {
@@ -120,8 +120,8 @@ for fn in s23 {
     }
 }
 
-println("=== 4. tests/language 正例（编译） ===")
-var lang = sort_strings(list_dir(root + "\\tests\\language"))
+println("=== 4. _local_only/probes/tests/language 正例（编译） ===")
+var lang = sort_strings(list_dir(root + "\\_local_only\probes\tests\\language"))
 var li: i64 = 0
 var li_cur: i64 = 0
 for fn in lang {
@@ -139,7 +139,7 @@ for fn in lang {
             if interp_known(fn) {
                 println("SKIP(需 tie-interp 静态库) " + fn); known = known + 1
             } else {
-                r = compile_run(root + "\\tests\\language\\" + fn, false)
+                r = compile_run(root + "\\_local_only\probes\tests\\language\\" + fn, false)
                 if r == "OK" { println("PASS " + fn); pass = pass + 1 }
                 else { println("FAIL " + fn + " -> " + r); fail = fail + 1 }
             }
@@ -147,7 +147,7 @@ for fn in lang {
     }
 }
 
-println("=== 5. tests/language 负例（应拒绝） ===")
+println("=== 5. _local_only/probes/tests/language 负例（应拒绝） ===")
 var neg_tmp = root + "\\_local_only\\neg_tmp.exe"
 var rc9: i64 = 0
 var li5: i64 = 0
@@ -158,14 +158,14 @@ for fn in lang {
     li5 = li5 + 1
     if li5_cur < sl_lo || li5_cur >= sl_hi { continue }
     if contains(fn, "_neg") {
-        rc9 = exec_code("cmd /c " + tiec + " " + root + "\\tests\\language\\" + fn + " -o " + neg_tmp + " >nul 2>&1")
+        rc9 = exec_code("cmd /c " + tiec + " " + root + "\\_local_only\probes\tests\\language\\" + fn + " -o " + neg_tmp + " >nul 2>&1")
         if rc9 != 0 { println("PASS(拒) " + fn); pass = pass + 1 }
         else { println("FAIL(未拒) " + fn); fail = fail + 1 }
     }
 }
 
 println("=== 6. S3.1 config_smoke（编译+运行） ===")
-r = compile_run(root + "\\tests\\s31\\config_smoke.tie", true)
+r = compile_run(root + "\\_local_only\probes\tests\\s31\\config_smoke.tie", true)
 if has_prefix(r, "OK") { println("PASS config_smoke"); pass = pass + 1 }
 else { println("FAIL config_smoke -> " + r); fail = fail + 1 }
 
@@ -174,7 +174,7 @@ else { println("FAIL config_smoke -> " + r); fail = fail + 1 }
 //     用户按报的行号改会**改错行**。两探针的第 6 行分别是语法错误与未重赋值的 var，
 //     期望诊断精确报 @6。**行号即断言**：改动探针必须同步改这里的期望值。
 println("=== 6b. 诊断行号不变式（主文件行号须与用户所写一致） ===")
-var lf_dir = root + "\\tests\\_linefix_probe\\"
+var lf_dir = root + "\\_local_only\probes\tests\\_linefix_probe\\"
 var lf_tmp = get_env("TEMP") + "\\tsh_linefix_out.txt"
 var lf_n = ["linefix_err.tie", "linefix_warn.tie"]
 var lf_want = ["[E00832] @6:21:", "@6:5: 可变绑定未修改"]
@@ -197,7 +197,7 @@ if file_exists(root + "\\_local_only\\lf_tmp.exe") { remove_file(root + "\\_loca
 //     我连错两次的正是这条（信了「某文件自称 td」「探针注释说会失败」而不是规范与实测），
 //     故把它变成断言：合规 5 例中 3 例应成功、2 例应拒绝。
 println("=== 6c. td 合规（规范 §17.1：头可选；非 td 语法必须拒）===")
-var td_dir = root + "\\tests\\_td_probe\\"
+var td_dir = root + "\\_local_only\probes\tests\\_td_probe\\"
 var td_out = get_env("TEMP") + "\\tsh_td_out.txt"
 var td_okf = ["header.data.tie", "noheader.data.tie", "named.data.tie"]
 var td_badf = ["unclosed.data.tie", "not_td.data.tie"]
@@ -220,7 +220,7 @@ if file_exists(td_zd) { remove_file(td_zd) }
 //     ⚠ 断言用「紧凑写与带空格写结果一致」而非「必须判真」——后者平台相关。
 //     观测值 = 编译 rc（真⇒分支保留⇒有 main；假⇒分支丢弃⇒链接失败）。
 println("=== 6d. #cfg 空白不变式（紧凑写与带空格写必须同结果） ===")
-var cfg_dir = root + "\\tests\\_cfg_probe\\"
+var cfg_dir = root + "\\_local_only\probes\tests\\_cfg_probe\\"
 var cfg_tmp = get_env("TEMP") + "\\tsh_cfg_out.txt"
 var cfg_exe = get_env("TEMP") + "\\tsh_cfg_probe.exe"
 func cfg_rc(fn: string) -> i64 {
@@ -246,7 +246,7 @@ if file_exists(cfg_exe) { remove_file(cfg_exe) }
 //     ① `a %%= b` 必须等于 `a %% b`（四种符号组合）——探针内部自比较，只输出一行判定；
 //     ② `%%=` 之后的语句必须照常执行（ROAD 曾记它「吞掉紧随其后的语句」）。
 println("=== 6f. 复合赋值 %%= （与二元 %% 等价；后续语句不被吞） ===")
-var cp_dir = root + "\\tests\\_compound_probe\\"
+var cp_dir = root + "\\_local_only\probes\tests\\_compound_probe\\"
 var cp_out = get_env("TEMP") + "\\tsh_cp_out.txt"
 var cp_exe = get_env("TEMP") + "\\tsh_cp_probe.exe"
 var rc_cp1 = exec_code("cmd /c " + tiec + " " + cp_dir + "pcteq_assign.tie -o " + cp_exe + " > \"" + cp_out + "\" 2>&1")
@@ -275,7 +275,7 @@ if file_exists(cp_exe) { remove_file(cp_exe) }
 //     只修了 caps 那一半）② 语义检查在解析之后走，全局量已不代表函数所属模块。
 //     两条不变式：**模块能自证**（安全调用方无需任何改动）+ **父授权不继承**。
 println("=== 6g. 文件级 unsafe 上下文的作用域（自证 / 不继承） ===")
-var up_dir = root + "\\tests\\_unsafe_probe\\"
+var up_dir = root + "\\_local_only\probes\tests\\_unsafe_probe\\"
 var up_out = get_env("TEMP") + "\\tsh_up_out.txt"
 var up_exe = get_env("TEMP") + "\\tsh_up_probe.exe"
 // ① 模块自证：库自己声明 unsafe+凭据，**安全**调用方 import 它应直接可用

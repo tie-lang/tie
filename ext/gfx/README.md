@@ -217,7 +217,7 @@ for SkPngEncoder; HEIF is an empty stub.
 - **确定性开关**：`[args] extra_cflags=["/Brepro"]` + `extra_ldflags=["/Brepro"]`（MSVC
   确定性编译/链接）。verify：.obj 与 PE 产物中的 codeview 时间戳、绝对路径注入、
   生成的 GUID 被消除，obj 产物字节不随重建墙钟漂移；lib 体积 169329356→168338664。
-- **可复现探针**：`tests/p685_probe/p685_probe.tie`——读 manifest（断言已开 /Brepro），
+- **可复现探针**：`_local_only/probes/tests/p685_probe/p685_probe.tie`——读 manifest（断言已开 /Brepro），
   记录 skia.lib SHA256 → `build.exe --clean` + `--force` 干净重建 → 再算 SHA256 → 校验；
   再跑默认构建验幂等。hash 经系统 `certutil -hashfile <f> SHA256` 计算（tie 直接读大
   lib 有 byte_read 缺陷，见已知限制）。干净重建约 60s。
@@ -228,7 +228,7 @@ for SkPngEncoder; HEIF is an empty stub.
   lib SHA256 不变）——探针断言该下界通过（asserts=9，PASS，exit 0）。若工具链升级为可
   输出无时间戳归档，Level-1 字节一致分支会自动接过。
 
-EN: /Brepro determinism enabled; reproducibility probe sits at tests/p685_probe; whole-lib
+EN: /Brepro determinism enabled; reproducibility probe sits at _local_only/probes/tests/p685_probe; whole-lib
 byte-identity across clean rebuilds is **not** achievable because MSVC lib.exe writes each
 member's obj mtime into the archive header (no lib.exe /Brepro). Accepted lower bound:
 an incremental rebuild of identical input produces no new bytes (re-`build` is a no-op,
@@ -310,9 +310,9 @@ frees Surface/Image/Data; `sk_flush_std` flushes stdio before `ExitProcess`.
 offset 0/4/8/16，size 24，align 8）——**不镜像 SkPaint C++ 位域布局**，改传扁平描述，
 thunk 内部转 SkPaint，规避 C++ 布局脆弱面。`TSkImageInfo`（width/height/color_type/
 alpha_type/row_bytes int + pixels i64 地址，offset 0..24/32）。布局经
-`tests/p686_probe/ref.c` 对照 clang/MSVC `offsetof` 核验（探针写死期望）。
+`_local_only/probes/tests/p686_probe/ref.c` 对照 clang/MSVC `offsetof` 核验（探针写死期望）。
 EN: `TSkPaint` and `TSkImageInfo` are flat repr(C) structs mirrored in tie, verified
-against C `offsetof` by `tests/p686_probe/ref.c`.
+against C `offsetof` by `_local_only/probes/tests/p686_probe/ref.c`.
 
 ### 生成器机制 / generator（签名集中登记）
 
@@ -344,13 +344,13 @@ static /MT CRT matches skia.lib.
 
 ### 验收探针 / acceptance probe
 
-`tests/p686_probe/p686_probe.tie`：96x48 离屏 Surface → clear 白 → 红矩形 fill →
+`_local_only/probes/tests/p686_probe/p686_probe.tie`：96x48 离屏 Surface → clear 白 → 红矩形 fill →
 蓝竖粗线 + 绿对角（drawLine）→ peek 逐像素断言（背景/矩形中心/线中心纯色、对角区域
 计数）→ snapshot → PNG 编码（魔数 `89504e470d0a1a0a` + IHDR 尺寸 96x48 逐字节回读）→
-落盘 `tests/p686_probe/out.png` → 全释放 → `ExitProcess` 确定性退出。**asserts=27，PASS /
+落盘 `_local_only/probes/tests/p686_probe/out.png` → 全释放 → `ExitProcess` 确定性退出。**asserts=27，PASS /
 exit 0**，探针 exe≈2.77 MB、运行≈50 ms。像素读回与 PNG 字节校验走 **ptr 解引用**
 （不经 std `byte_read`）。
-EN: tests/p686_probe renders offscreen, validates pixels/PNG byte-level, exit 0 on full
+EN: _local_only/probes/tests/p686_probe renders offscreen, validates pixels/PNG byte-level, exit 0 on full
 PASS (27 asserts); pixel + PNG validation use direct ptr deref, not std byte_read.
 
 ### 已知链路风险与规避 / known pipeline risks & mitigations
@@ -423,7 +423,7 @@ ext\gfx\skia\thunk\build_p687.exe     # 仓库根运行：生成绑定→thunk.o
 
 ### 验收探针 / acceptance probe
 
-`tests/p687_probe/p687_probe.tie`：Surface/Canvas/Paint/两条 Path（move/line/close）→
+`_local_only/probes/tests/p687_probe/p687_probe.tie`：Surface/Canvas/Paint/两条 Path（move/line/close）→
 绘制（clear 白 / 红矩形 fill / 蓝竖线 stroke / 绿 path 折线 / 黄 path 闭合填充）→ peek 逐像素
 断言（BGRA 内存序）→ snapshot→PNG 编码（魔数 + IHDR 96x48）→ 落盘 → 显式 release + arena
 批量回收计数一致 → `ExitProcess` 确定性退出。**asserts=23，PASS / exit 0**。
@@ -496,8 +496,8 @@ EN: appended SkFont/text/image surface + gen_thunk registry entries + regenerate
 ### 构建与运行 / build & run
 
 ```
-compiler\tiec_7A6100.exe tests\p688_probe\build_p688.tie -o tests\p688_probe\build_p688.exe
-tests\p688_probe\build_p688.exe      # 仓库根运行：重生成绑定→thunk.obj→探针obj→链接→运行
+compiler\tiec_7A6100.exe _local_only\probes\tests\p688_probe\build_p688.tie -o _local_only\probes\tests\p688_probe\build_p688.exe
+_local_only\probes\tests\p688_probe\build_p688.exe      # 仓库根运行：重生成绑定→thunk.obj→探针obj→链接→运行
 ```
 与 p.6.8.7 相同链路，额外链 `..\trm-lite\trm_lite.a`。**p.6.8.8 期间 compiler/ 由另一子代理
 （std/fs 缺陷 RCA）并发修改、tiec.exe 处于中间态**，故本驱动固定用稳定现役 `tiec_7A6100.exe`
@@ -506,7 +506,7 @@ pinned to the known-good tiec_7A6100.exe while the std/fs RCA sub-agent owns com
 
 ### 验收探针 / acceptance probe
 
-`tests/p688_probe/p688_probe.tie`：font_measure 数值桥 → 命令列表（clear→fill→stroke→text
+`_local_only/probes/tests/p688_probe/p688_probe.tie`：font_measure 数值桥 → 命令列表（clear→fill→stroke→text
 「Hello」→path 折线→image(内置 8x8 合法 PNG)）→ render1 逐像素判定点断言（背景/填充/描边/
 Glyph 计数/路径/图像）→ PNG 魔数/IHDR/落盘 → **render2 相同命令列表重画 → render2 判定点 +
 区域逐像素一致 + render1/render2 PNG 字节全等（完整帧无损逐像素「哈希校验一致」）** → 生命周期
@@ -549,7 +549,7 @@ command list into an **offscreen back-buffer Surface**, blitted on-screen by `wi
   tie 无法传 WndProc 回调，故窗口状态机收敛在 C 端）。
 - `ext/gfx/window.tie` —— tie 侧封装（namespace `win`）：直透 C 面 + 标题 UTF-16LE 编码 +
   像素地址收发 + `Sleep`/`FindWindowW` 兜底。
-- `tests/p689_probe/` —— 探针（离屏部分探针化）+ 构建驱动。
+- `_local_only/probes/tests/p689_probe/` —— 探针（离屏部分探针化）+ 构建驱动。
 EN: thunk (C side owns the WndProc + state machine) + tie wrapper + probe.
 
 ### thunk 窗口面（C 入口清单）/ window C entry-point surface
@@ -583,8 +583,8 @@ present sends its peeked pixel address.
 ### 构建与运行 / build & run
 
 ```
-compiler\tiec_7A6100.exe tests\p689_probe\build_p689.tie -o tests\p689_probe\build_p689.exe
-tests\p689_probe\build_p689.exe      # 仓库根运行：thunk.obj + win.obj → 探针obj → 链接 → 运行
+compiler\tiec_7A6100.exe _local_only\probes\tests\p689_probe\build_p689.tie -o _local_only\probes\tests\p689_probe\build_p689.exe
+_local_only\probes\tests\p689_probe\build_p689.exe      # 仓库根运行：thunk.obj + win.obj → 探针obj → 链接 → 运行
 ```
 链路：`clang-cl /MT` 编 `thunk.cpp` **与** `win.cpp`（win.obj 经本驱动独立登记，未改既有 thunk
 构建）→ tiec `--emit-ir` + `clang -c` 编探针 → `clang -fuse-ld=link` 链接（探针.obj + thunk.obj
@@ -593,7 +593,7 @@ compiler-rt），无新增。EN: build pipeline extended with win.obj; same syst
 
 ### 验收探针 / acceptance probe
 
-`tests/p689_probe/p689_probe.tie`：open → show/update → 离屏 320x200 命令列表（CLEAR 白 →
+`_local_only/probes/tests/p689_probe/p689_probe.tie`：open → show/update → 离屏 320x200 命令列表（CLEAR 白 →
 FILL_RECT 红 → TEXT「p689」）→ peek 逐像素断言（背景/矩形/文本 Glyph 计数）→ **present blit
 （断言返回 0）** → pump 若干轮（每轮 sleep 兜底，WM_PAINT 置 paint_pending）→ 断言 closed==0 +
 `FindWindowW` 定位窗口存活 → destroy → 断言窗口消失 + 失效句柄 pump 安全返回 0。**asserts=14，
@@ -669,8 +669,8 @@ EN: flat 5-slot-per-event table + accessors; constants as functions.
 ### 构建与运行 / build & run
 
 ```
-compiler\tiec_7A6100.exe tests\p6810_probe\build_p6810.tie -o tests\p6810_probe\build_p6810.exe
-tests\p6810_probe\build_p6810.exe      # 仓库根运行：thunk.obj + win.obj → 探针obj → 链接 → 运行
+compiler\tiec_7A6100.exe _local_only\probes\tests\p6810_probe\build_p6810.tie -o _local_only\probes\tests\p6810_probe\build_p6810.exe
+_local_only\probes\tests\p6810_probe\build_p6810.exe      # 仓库根运行：thunk.obj + win.obj → 探针obj → 链接 → 运行
 ```
 
 链路与 p.6.8.9 相同（clang-cl /MT 编 thunk.cpp+win.cpp → tiec `--emit-ir`+clang 编探针 →
@@ -680,7 +680,7 @@ EN: same build pipeline as p.6.8.9; event APIs are all user32 — no new system 
 
 ### 验收探针 / acceptance probe
 
-`tests/p6810_probe/p6810_probe.tie`：
+`_local_only/probes/tests/p6810_probe/p6810_probe.tie`：
 1. 离屏 present（置 bmi_valid）→ pump → **paint_pending 信号成立**（沿用 6.8.9）。
 2. PostMessageW 注入 `WM_MOUSEMOVE@(30,40)` → `WM_LBUTTONDOWN@(55,66)` → `WM_KEYDOWN(VK_F1)`
    → `WM_TIMER(id=7)` → pump → `ev.take`：类型/坐标/键码逐项断言 + **顺序（move<down<key）**
@@ -750,7 +750,7 @@ both impls share the one `gfx.run_commands` render path and differ only in prese
 
 ### 验收探针 / acceptance probe
 
-`tests/p6811_probe/p6811_probe.tie`（构建驱动 `build_p6811.tie`，链 thunk.obj+win.obj）
+`_local_only/probes/tests/p6811_probe/p6811_probe.tie`（构建驱动 `build_p6811.tie`，链 thunk.obj+win.obj）
 **asserts=17，PASS / exit 0**：
 1. **脏矩形（OFFSCREEN）**：脏计划帧 0/4 渲染 2 次、其余跳过；`rendered==2==dirty 次数`、
    `skipped==4`、`rendered+skipped==frames`；每次渲染内容**颜色自增**，逐像素回读证明
@@ -836,7 +836,7 @@ demo 的 tick 闭包经 `app.ev_log()`（app 侧新增只读访问器，纯增�
 
 ### 验收探针 / acceptance probe
 
-`tests/p6812_probe/p6812_probe.tie`（纯 tie，无 FFI；`build_p6812.tie` 仅链 trm_lite.a）
+`_local_only/probes/tests/p6812_probe/p6812_probe.tie`（纯 tie，无 FFI；`build_p6812.tie` 仅链 trm_lite.a）
 **asserts=23，PASS / exit 0**：row（top/middle/bottom）、column（left/middle/right）、
 嵌套（outer column→mid 内嵌 inner row→`lay.offset` 到父盒位，坐标手算）、边界（负坐标/
 零尺寸）、`lay.cross` 单测（含负/零 extent）。坐标期望全部**手算**写死、确定性。
@@ -861,11 +861,11 @@ demo 已本机人工验收（窗口打开、首帧渲染、点击/按键响应�
 ## p.6.8.13 验收矩阵 + 软件光栅性能基线（vs GDI）
 ## Acceptance matrix + software-raster perf baseline (vs GDI)
 
-**验收矩阵驱动 / acceptance matrix driver**：`tests/ax_matrix/ax_matrix.tie`（tie 写，纯构建/
+**验收矩阵驱动 / acceptance matrix driver**：`_local_only/probes/tests/ax_matrix/ax_matrix.tie`（tie 写，纯构建/
 批处理，自身仅链 trm_lite + compiler-rt）。仓库根运行：
 
-- 构建驱动 exe：`tiec_7A6100.exe tests/ax_matrix/ax_matrix.tie -o tests/ax_matrix/ax_matrix.exe`
-- 运行：`tests\ax_matrix\ax_matrix.exe`；**全 PASS → exit 0**；任一失败 → exit 1 + 失败明细。
+- 构建驱动 exe：`tiec_7A6100.exe _local_only/probes/tests/ax_matrix/ax_matrix.tie -o _local_only/probes/tests/ax_matrix/ax_matrix.exe`
+- 运行：`_local_only\probes\tests\ax_matrix\ax_matrix.exe`；**全 PASS → exit 0**；任一失败 → exit 1 + 失败明细。
 
 矩阵分两段（共 21 项）：
 1. **验收段（p.6.8.1–13）**按依赖序把 p.6.8 全系探针用 `process.exec_code` 调 tiec 编译、
@@ -887,7 +887,7 @@ handled via exit-code, output redirected to nul to dodge the tie file_read large
 （GDI FillRect/HBRUSH 内存 DC），均 GetTickCount64 计时、返回毫秒；二者同尺寸同像素格式
 （BGRA 32bpp）离屏缓冲，公平对照。低 n 档经内部 passes 校准到可辨刻度（量化基线，参考值）。
 
-探针 `tests/p6813_probe/p6813_probe.tie`（`build_p6813.tie` 驱动）在 n=1000/10000 两档、
+探针 `_local_only/probes/tests/p6813_probe/p6813_probe.tie`（`build_p6813.tie` 驱动）在 n=1000/10000 两档、
 w=320 h=200 打印 INFO 并做温和断言（skia_ms>0、gdi_ms>=0，**禁精确时序断言**）。
 
 **本机基线数字 / representative baseline（fixed buffer 320x200，reference only）**：
@@ -901,7 +901,7 @@ EN: representative run (this host): n=10000 → skia≈50–62ms, gdi≈78ms, ra
 software raster FillRect is faster than GDI FillRect to a memory DC. ratio trend varies with
 host / machine / Skia build — recorded once, **reference only** (no precise-timing assertion).
 
-**运行命令 / Run**：`tests\ax_matrix\ax_matrix.exe`（仓库根，数分钟内；含 p685 干净重建）。
+**运行命令 / Run**：`_local_only\probes\tests\ax_matrix\ax_matrix.exe`（仓库根，数分钟内；含 p685 干净重建）。
 
 ---
 

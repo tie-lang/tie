@@ -1,7 +1,7 @@
 type tie<tsh>
 // scripts/m6_actor_regress.tsh.tie —— M6 actor 并发回归（tsh-role 移植 m6_actor_regress.ps1）
 // ============================================================================
-// 职责：编译+运行 tests/m6_actor/*.tie 探针矩阵：负例（含 _neg_）应编译拒绝；
+// 职责：编译+运行 _local_only/probes/tests/m6_actor/*.tie 探针矩阵：负例（含 _neg_）应编译拒绝；
 //   actor_a4_panic_raise 应非零退出且输出含 raise 消息；其余应清零退出且输出无「失败」。
 // 用法（仓库根目录）：<tsh> -f scripts/m6_actor_regress.tsh.tie [tiec路径]
 // 移植说明：与 regress-s21 一致——exec_code 得 rc，运行探针 stdout 重定向到 log 文件再
@@ -19,7 +19,7 @@ var _mk = mkdir_all(outdir)
 var _rd = exec_code("cmd /c rd /s /q \"" + outdir + "\" >nul 2>&1")
 var _mk2 = mkdir_all(outdir)
 
-var files = sort_strings(list_dir(root + "\\tests\\m6_actor"))
+var files = sort_strings(list_dir(root + "\\_local_only\probes\tests\\m6_actor"))
 var pass: i64 = 0
 var fail: i64 = 0
 var crc: i64 = 0
@@ -36,7 +36,7 @@ for fn in files {
     var logf = outdir + "\\" + base + ".log"
 
     // 编译（输出落 log 文件，rc 取退出码）
-    crc = exec_code("cmd /c " + tiec + " \"" + root + "\\tests\\m6_actor\\" + fn + "\" -o \"" + exe + "\" --no-cache > \"" + logf + "\" 2>&1")
+    crc = exec_code("cmd /c " + tiec + " \"" + root + "\\_local_only\probes\tests\\m6_actor\\" + fn + "\" -o \"" + exe + "\" --no-cache > \"" + logf + "\" 2>&1")
     if isNeg {
         if crc != 0 {
             println("PASS(neg-compile-reject) " + base)
