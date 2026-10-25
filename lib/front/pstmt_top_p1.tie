@@ -233,6 +233,7 @@ func parse_generic_attr() -> i64 {
                 return -1
             }
             putil.eat(lex_semi)
+            if anm == "no_mangle" { g_pending_attr_bits = g_pending_attr_bits | 1 } else { g_pending_attr_bits = g_pending_attr_bits | 2 }
             return ns
         }
         if anm == "export_name" || anm == "link_section" {
@@ -255,6 +256,12 @@ func parse_generic_attr() -> i64 {
                 }
             }
             g_pending_attr_arg = interner.intern(clean)
+            if anm == "link_section" {
+                g_pending_attr_sec = g_pending_attr_arg
+                g_pending_attr_bits = g_pending_attr_bits | 8
+            } else {
+                g_pending_attr_bits = g_pending_attr_bits | 4
+            }
             putil.advance()
             if !putil.expect(lex_rparen, "')'") {
                 return -1

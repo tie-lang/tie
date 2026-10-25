@@ -304,32 +304,29 @@ func parse_fn_def() -> i64 {
     ast.set_children(f, kids)
     // 三期通用 `#[]` 属性通道（§7.1）：`#[unsafe.share] func X` 等声明属性
     // 附着到函数节点（val bit3 = has_attr；函数级便捷 = 整函数隐式持证）
-    if g_pending_attr != 0 {
+    // 同一声明允许叠多个 `#[]`（如 #[no_mangle] + #[link_section("…")]）：
+    // 位集在 parse_generic_attr 里累积，此处一次性登记。
+    if g_pending_attr != 0 || g_pending_attr_bits != 0 {
         var full0 = interner.lookup(g_pending_attr)
-        if putil.has_prefix(str.clone(full0), "unsafe.") {
+        if g_pending_attr != 0 && putil.has_prefix(str.clone(full0), "unsafe.") {
             ast.set_val(f, ast.val(f) + 8)   // val bit3 = has_attr
         }
         // 2026-10-01 泛化：把属性里的**域**登记为该函数的持证域（不再只认 lock）。
         // `#[unsafe.mem]` ⇒ 记 mem 位；函数级持证形态 ⇒ 整个函数体在域匹配下视为
         // 持该域。irgen 另按「是否含 lock 位」决定是否把函数体置于去锁作用域。
         // 节点 id 经 proto 文本按行序传递，与语义/irgen 侧的 s_* 池一致。
-        var full = interner.lookup(g_pending_attr)
-        if putil.has_prefix(str.clone(full), "unsafe.") && str_len(full) > 7 {
-            var capn = tie.support::slice(str.clone(full), 7, str_len(full))
+        if g_pending_attr_bits != 0 {
+            sstate.decl_attr_put(f, g_pending_attr_bits, g_pending_attr_arg, g_pending_attr_sec)
+        } else if g_pending_attr != 0 && putil.has_prefix(str.clone(full0), "unsafe.") && str_len(full0) > 7 {
+            var capn = tie.support::slice(str.clone(full0), 7, str_len(full0))
             // 记**本模块局部 id**（待装载后由 cap_apply_file 按基址提交）——
             // 直接 fn_cap_put 会在 import 场景下错位（见 sstate.s_imp_cap_nodes 注释）。
             sstate.imp_cap_put(f, types.cap_bit_of(capn))
-        } else if full == "no_mangle" {
-            sstate.decl_attr_put(f, 1, 0, 0)
-        } else if full == "used" {
-            sstate.decl_attr_put(f, 2, 0, 0)
-        } else if full == "export_name" {
-            sstate.decl_attr_put(f, 4, g_pending_attr_arg, 0)
-        } else if full == "link_section" {
-            sstate.decl_attr_put(f, 8, 0, g_pending_attr_arg)
         }
         g_pending_attr = 0
         g_pending_attr_arg = 0
+        g_pending_attr_sec = 0
+        g_pending_attr_bits = 0
     }
     // 文件级授权（`type tie<角色, unsafe:mem, unsafe:ext>`）**不在此处登记**：
     // 它按文件基址统一施加（sstate.cap_apply_file），这样 import 的模块也拿得到
