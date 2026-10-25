@@ -81,6 +81,11 @@ pub var g_global_fps: table<i64>;     // 浮点初始值（浮点文本池 id；
 // 因为槽是静态的），使「无捕获闭包」也有一个有效 env，释放点因此**无需判空**。
 pub var g_global_fns: table<i64>;
 pub var g_global_strs: table<i64>;    // 顶层字符串 const 初始值（字符串池 id；-1 = 无）
+// 全局声明属性（#[link_section] / #[used]）：与 g_global_* 平行的按名去重表。
+pub var g_gattr_names: table<i64>;    // 全局名池 id
+pub var g_gattr_bits: table<i64>;     // 位集：1=no_mangle 2=used 4=export_name 8=link_section
+pub var g_gattr_args: table<i64>;     // export_name 目标名池 id（-1 = 无）
+pub var g_gattr_secs: table<i64>;     // link_section 段名池 id（-1 = 无）
 // 阶段 A：用户函数调用（call 35）的符号名池 id（去重，与 ext_syms 平行收集；
 // 命名空间函数全名经 ns_symbol 转 $，无需 declare）
 pub var call_syms: table<i64>;
@@ -208,6 +213,30 @@ pub func global_scalar_reg(nm: string, ty: i64) {
 
 // 登记一个「全局 ptr，初值 = 某函数地址」（(b) 方案：静态空闭包 env 槽）。
 // 发射形态 `@nm = global ptr @fn_nm`——函数地址作指针常量，无需运行期初始化。
+// 全局声明属性登记（按名去重，同位属性或入）。发射阶段据此改写 global 行
+// （段归属）并把 #[used] 全局收进 @llvm.used。
+pub func global_attr_put(nm: string, bits: i64, arg: i64, sec: i64) {
+    var nid = interner.intern(nm)
+    var i: i64 = 0
+    while i < len(g_gattr_names) {
+        if g_gattr_names[i] == nid {
+            g_gattr_bits[i] = g_gattr_bits[i] | bits
+            if (bits & 4) == 4 {
+                g_gattr_args[i] = arg
+            }
+            if (bits & 8) == 8 {
+                g_gattr_secs[i] = sec
+            }
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_gattr_names, nid)
+    table_push(g_gattr_bits, bits)
+    table_push(g_gattr_args, arg)
+    table_push(g_gattr_secs, sec)
+}
+
 pub func global_ptr_fn_reg(nm: string, fn_nm: string) {
     var nid = interner.intern(nm)
     table_push(g_global_names, nid)

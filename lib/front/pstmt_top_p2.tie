@@ -54,6 +54,7 @@ func parse_namespace() -> i64 {
                 if putil.peek_n(1) == lex_const {
                     putil.advance()   // pub
                     var sc = pstmt.parse_var_decl(1)
+                    decl_attr_consume(sc)
                     if sc < 0 {
                         return -1
                     }
@@ -62,6 +63,7 @@ func parse_namespace() -> i64 {
                 } else if putil.peek_n(1) == lex_var {
                     putil.advance()   // pub
                     var sv = pstmt.parse_var_decl(0)
+                    decl_attr_consume(sv)
                     if sv < 0 {
                         return -1
                     }
@@ -78,6 +80,7 @@ func parse_namespace() -> i64 {
                 // 命名空间内私有全局变量（var，不导出）；pub var 走上一个分支。
                 // collect_ns 以 ns_full_name 登记为 "ns::name"（模块私有）。
                 var sv = pstmt.parse_var_decl(0)
+                decl_attr_consume(sv)
                 if sv < 0 {
                     return -1
                 }
@@ -162,6 +165,7 @@ func parse_namespace() -> i64 {
                     table_push(body_stmts, st)
                 } else {
                     var st = pstmt.parse_var_decl(1)
+                    decl_attr_consume(st)
                     if st < 0 {
                         return -1
                     }
@@ -200,6 +204,7 @@ func parse_namespace() -> i64 {
                 } else if putil.peek_n(1) == lex_const {
                     putil.advance()   // pub
                     var sc = pstmt.parse_var_decl(1)
+                    decl_attr_consume(sc)
                     if sc < 0 {
                         return -1
                     }
@@ -208,6 +213,7 @@ func parse_namespace() -> i64 {
                 } else if putil.peek_n(1) == lex_var {
                     putil.advance()   // pub
                     var sv = pstmt.parse_var_decl(0)
+                    decl_attr_consume(sv)
                     if sv < 0 {
                         return -1
                     }
@@ -314,6 +320,7 @@ func parse_namespace() -> i64 {
                 table_push(body_stmts, st)
             } else if tag == lex_var {
                 var st = pstmt.parse_var_decl(0)
+                decl_attr_consume(st)
                 if st < 0 {
                     return -1
                 }
@@ -329,6 +336,7 @@ func parse_namespace() -> i64 {
                     table_push(body_stmts, st)
                 } else {
                     var st = pstmt.parse_var_decl(1)
+                    decl_attr_consume(st)
                     if st < 0 {
                         return -1
                     }

@@ -334,6 +334,19 @@ func parse_fn_def() -> i64 {
     return f
 }
 
+// 把待定 `#[]` 声明属性附着到变量声明节点（全局 var/const 用；函数与
+// actor 在各自解析处消费）。属性位集在 parse_generic_attr 内累积，
+// 这里一次性落库并清空暂存位，避免泄漏到下一声明。
+pub func decl_attr_consume(n: i64) {
+    if g_pending_attr_bits != 0 {
+        sstate.decl_attr_put(n, g_pending_attr_bits, g_pending_attr_arg, g_pending_attr_sec)
+    }
+    g_pending_attr = 0
+    g_pending_attr_arg = 0
+    g_pending_attr_sec = 0
+    g_pending_attr_bits = 0
+}
+
 // `[pub] func name (params) -> Ty`（S2.4 port 方法签名；无函数体 = 签名声明）
 // 与 parse_fn_def 的差异：函数体**可省略**（port 声明 = 方法签名集合；
 // 带体 = 默认实现，语义层暂不支持报错）。参数支持 self 无类型标注

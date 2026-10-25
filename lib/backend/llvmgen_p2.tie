@@ -71,6 +71,14 @@ pub func emit_llvm_used() {
         }
         i = i + 1
     }
+    var ng = len(g_gattr_names)
+    i = 0
+    while i < ng {
+        if (g_gattr_bits[i] & 2) == 2 {
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
     if cnt == 0 {
         return
     }
@@ -82,6 +90,16 @@ pub func emit_llvm_used() {
                 items = items + ", "
             }
             items = items + "ptr @" + sym_of_name(ir.func_name(i))
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < ng {
+        if (g_gattr_bits[i] & 2) == 2 {
+            if str_len(items) > 0 {
+                items = items + ", "
+            }
+            items = items + "ptr @" + ns_replace(intern.lookup(g_gattr_names[i]))
         }
         i = i + 1
     }

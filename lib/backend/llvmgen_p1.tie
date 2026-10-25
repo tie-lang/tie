@@ -259,11 +259,36 @@ func emit_globals() {
         }
         oi = oi + 1
     }
+    apply_global_sections()
     if len(g_global_names) > 0 {
         line("")
     }
     if g_uefi_mode {
         line("@_fltused = global i32 1")
+    }
+}
+
+// 全局段归属后处理：emit_globals 已把全部 global 行写入 out_lines，这里
+// 按行前缀定位（`@<sym> = global `）并追加 `, section "…"`。用于内核
+// 模块（.modinfo 等）与固件保留数据段。全局符号名唯一，前缀不会误中。
+func apply_global_sections() {
+    var i: i64 = 0
+    while i < len(g_gattr_names) {
+        if (g_gattr_bits[i] & 8) == 8 {
+            var nm = intern.lookup(g_gattr_names[i])
+            var sec = intern.lookup(g_gattr_secs[i])
+            var pre = "@" + ns_replace(nm) + " = global "
+            var j: i64 = 0
+            while j < len(out_lines) {
+                if tie.support::has_prefix(out_lines[j], pre) {
+                    out_lines[j] = out_lines[j] + ", section \"" + sec + "\""
+                    j = len(out_lines)
+                } else {
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
     }
 }
 // 输出 SSO 短串池全局段（emit_globals 之后）：仅 g_sso_enabled 时输出。

@@ -423,6 +423,11 @@ func tig_global_var(s: i64, full: string) -> i64 {
             }
         }
     }
+    // 全局声明属性（#[link_section] / #[used]）→ llvmgen 侧表，发射后处理
+    var gdk = sstate.decl_attr_kind(s)
+    if gdk != 0 {
+        llvmgen.global_attr_put(nm, gdk, sstate.decl_attr_arg(s), sstate.decl_attr_sec(s))
+    }
 }
 
 // 命名空间递归：生成体内全部函数（全名 = prefix::函数名）。
