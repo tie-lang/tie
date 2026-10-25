@@ -1,0 +1,20 @@
+type tie<logic, unsafe:raw>
+
+// 裸机（freestanding）示例：不链接 CRT 与系统库，直接写 MMIO。
+// 构建（x86_64 目标，无 OS）：
+//   tiec examples/driver/bare_serial.tie --freestanding --target x86_64-unknown-none \
+//        -o bare_serial.elf
+// 产物是 ELF 可执行文件，入口为 main；这里向 COM1（0x3F8）写 "TIE\n"，
+// 再向 VGA 文本缓冲写一个带属性字节的字符，最后原地空转（裸机没有退出路径）。
+
+func main() {
+    unsafe {
+        mmio_write8(0x3F8, 84)   // T
+        mmio_write8(0x3F8, 73)   // I
+        mmio_write8(0x3F8, 69)   // E
+        mmio_write8(0x3F8, 10)   // \n
+        mmio_write16(0xB8000, 0x1F54)  // 'T'，白底蓝字属性 0x1F
+    }
+    while true {
+    }
+}

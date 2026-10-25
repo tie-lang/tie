@@ -1,0 +1,20 @@
+type tie<logic, unsafe:raw>
+
+// UEFI 固件应用示例：`--uefi` 直接产出 PE32+（efi_application 子系统），
+// 不依赖 CRT、启动代码或导入库；入口点由镜像内 efi_main 提供（MS x64 ABI）。
+// 构建：
+//   tiec examples/driver/uefi_hello.tie --uefi -o uefi_hello.efi
+
+// 固件镜像入口：EFI_HANDLE + EFI_SYSTEM_TABLE 两个参数，返回 EFI_STATUS。
+// 这里向 COM1 写 "UEFI\n" 作为可见痕迹；返回 0 = EFI_SUCCESS。
+#[export_name("efi_main")]
+pub func efi_start(image_handle: i64, system_table: i64) -> i64 {
+    unsafe {
+        mmio_write8(0x3F8, 85)   // U
+        mmio_write8(0x3F8, 69)   // E
+        mmio_write8(0x3F8, 70)   // F
+        mmio_write8(0x3F8, 73)   // I
+        mmio_write8(0x3F8, 10)   // \n
+    }
+    return 0
+}
