@@ -167,6 +167,10 @@ pub func dep_cache_key() -> string {
     } else {
         m = m + "\nE0"
     }
+    // --cflag 额外 clang 参数直接决定目标文件内容，必须织入键（否则改参数命旧产物）
+    if str_len(g_cflags) > 0 {
+        m = m + "\nCF" + g_cflags
+    }
     if g_cli_fast_math {
         m = m + "\nF1"
     } else {
@@ -533,6 +537,10 @@ pub func cache_key_str(src: string) -> string {
         m = m + "\nE1"
     } else {
         m = m + "\nE0"
+    }
+    // --cflag 额外 clang 参数（与 dep_cache_key 逐字段对齐）
+    if str_len(g_cflags) > 0 {
+        m = m + "\nCF" + g_cflags
     }
     // S1.4：fast-math 与越界检查影响产物，织入缓存键（默认关，缺省行为不变）
     if g_cli_fast_math {
