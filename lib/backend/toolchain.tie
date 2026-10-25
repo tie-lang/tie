@@ -205,6 +205,39 @@ pub func set_clang_opt(v: i64) {
     }
     g_cg_opt = v
 }
+
+// 自由站立（裸机/固件）构建状态：--freestanding 时 driver 经下列 setter 注入。
+// 语义＝不链 CRT/系统库，按 ELF 自由站立方式链接；入口符号与链接脚本可选。
+var tc_freestanding: bool = false;
+var tc_entry_sym: string = "";
+var tc_link_script: string = "";
+var tc_link_extra: string = "";
+pub func set_freestanding(v: bool) {
+    tc_freestanding = v
+}
+pub func set_entry_sym(s: string) {
+    tc_entry_sym = s
+}
+pub func set_link_script(s: string) {
+    tc_link_script = s
+}
+pub func set_link_extra(s: string) {
+    tc_link_extra = s
+}
+// 自由站立目标归一化：裸机/固件没有宿主 C 运行期，但需要能产出 ELF 的代码
+// 生成三元组——Windows 宿主的 clang 对 *-none-* 目标会转 gcc 驱动，无法直接
+// 产出 ELF，故按架构映射到 linux-gnu 三元组，与 -nostdlib/-nostartfiles 配套。
+pub func freestanding_target(t: string) -> string {
+    if str_len(t) > 0 {
+        if has_sub(t, "linux") || has_sub(t, "windows") || has_sub(t, "darwin") {
+            return t
+        }
+    }
+    if has_sub(t, "aarch64") || has_sub(t, "arm64") {
+        return "aarch64-unknown-linux-gnu"
+    }
+    return "x86_64-unknown-linux-gnu"
+}
 // clang 的 -O 旗标文本（前导空格；0 时显式 -O0，避免默认随 LLVM 版本漂移）
 // 置位本机 SIMD 时追加 -march=native，让自动向量化用满宿主向量宽度。
 pub func tc_cg_flag() -> string {
@@ -244,6 +277,12 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         return -1
     }
     // r.1.6.1：Linux 目标用 lld 链接（clang 默认 GNU ld 在 Windows 宿主不可用）。
+    // r.1.6.1：Linux 目标用 lld 链接（clang 默认 GNU ld 在 Windows 宿主不可用）。
+    // 自由站立目标同理：*-none-* 在 Windows 宿主会被 clang 转给 gcc 驱动，
+    // 统一归一到 linux-gnu 三元组后用 lld 产出 ELF。
+    if tc_freestanding {
+        target = freestanding_target(target)
+    }
     var is_linux = str_len(target) > 0 && has_sub(target, "linux")
     // /STACK:134217728（128MB）：自举链编译器（tiec 编译的 driver）处理大文件
     // （编译 driver 自身）时递归/嵌套调用栈深，默认 1MB 栈会 0xC00000FD 溢出；
@@ -252,7 +291,7 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     // -fuse-ld=lld 仅对「vendored LLVM」生效：clang 必须来自 TIE_LLVM_HOME
     // 指定的目录（发布包场景，用户无 MSVC → 用随包 lld-link）。
     var lld_flag = ""
-    if is_linux {
+    if is_linux || tc_freestanding {
         lld_flag = " -fuse-ld=lld"
     } else {
         var home = get_env("TIE_LLVM_HOME")
@@ -272,7 +311,24 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         }
     }
     var cmd = tool + tc_cg_flag() + lld_flag + tc_fm_flag() + tc_w_flag() + " " + input_opt + " -o " + output_exe
-    if is_linux {
+    if tc_freestanding {
+        // 自由站立：不链 CRT/系统库，-static -no-pie 产出 ET_EXEC ELF。
+        // 入口符号默认由 driver 注入（main 或 --entry）；链接脚本按需追加。
+        cmd = cmd + " -nostdlib -nostartfiles -ffreestanding -static -no-pie"
+        // 独立段 + 段回收：tie 模块会把全量 std 辅助函数一起发射进 .ll，
+        // 自由站立环境下这些未引用函数会拖进 libc 未定义符号；--gc-sections
+        // 以入口为根回收不可达函数/数据，产物只留真正用到的代码。
+        cmd = cmd + " -ffunction-sections -fdata-sections -Wl,--gc-sections"
+        if str_len(tc_entry_sym) > 0 {
+            cmd = cmd + " -Wl,-e," + tc_entry_sym
+        }
+        if str_len(tc_link_script) > 0 {
+            cmd = cmd + " -Wl,-T," + tc_link_script
+        }
+        if str_len(tc_link_extra) > 0 {
+            cmd = cmd + " " + tc_link_extra
+        }
+    } else if is_linux {
         cmd = cmd + " -Wl,--build-id=none"
         // r.1.6.6：Linux 目标 LLVM libcall（floor/pow/sqrt 等浮点运算下降为
         // libm 函数）须显式 -lm——glibc 默认不链 libm，缺符号链接失败。

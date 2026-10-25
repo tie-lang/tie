@@ -803,6 +803,18 @@ pub func compile_logic(ir_path: string, opt_path: string, target: string) -> i64
     if pre_l != "" {
         link_out = pre_l + ".exe.tmp"
     }
+    // 自由站立构建：注入入口符号/链接脚本/额外链接参数（裸机与固件形态）。
+    // 未指定 --entry 时以 main 为入口（tie 主函数按 C 入口发射）。
+    if g_freestanding {
+        tc.set_freestanding(true)
+        tc.set_link_script(g_link_script)
+        tc.set_link_extra(g_link_extra)
+        if str_len(g_entry_sym) > 0 {
+            tc.set_entry_sym(g_entry_sym)
+        } else {
+            tc.set_entry_sym("main")
+        }
+    }
     var bres = tc.link_exe(opt_path, link_out, target, g_used_interp, g_used_trmlite, g_used_wsock)
     if bres != 0 {
         dbg_txt(diagcode.render_error(-1, -1, "后端失败: " + tc_err_msg))

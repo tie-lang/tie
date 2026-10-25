@@ -152,6 +152,11 @@ pub func dep_cache_key() -> string {
     var topt = effective_tie_opt()
     var copt = effective_clang_opt()
     m = m + g_input + "\n" + g_output + "\nL" + to_string(level) + "\nC" + to_string(copt) + "\nP" + to_string(g_opt_force) + "\nM" + to_string(topt) + "\nTG" + g_target + "\nR" + g_role
+    if g_freestanding {
+        m = m + "\nFS1" + g_entry_sym + "|" + g_link_script + "|" + g_link_extra
+    } else {
+        m = m + "\nFS0"
+    }
     if g_shared {
         m = m + "\nS1"
     } else {
@@ -514,6 +519,11 @@ pub func cache_key_str(src: string) -> string {
     var m = src + "\n" + g_input + "\n" + g_output + "\nL" + to_string(level) +
         "\nC" + to_string(copt) + "\nP" + to_string(g_opt_force) +
         "\nM" + to_string(topt) + "\nTG" + g_target + "\nR" + g_role
+    if g_freestanding {
+        m = m + "\nFS1" + g_entry_sym + "|" + g_link_script + "|" + g_link_extra
+    } else {
+        m = m + "\nFS0"
+    }
     if g_shared {
         m = m + "\nS1"
     } else {
