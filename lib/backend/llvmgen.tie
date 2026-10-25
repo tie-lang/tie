@@ -224,7 +224,12 @@ pub func global_ptr_fn_reg(nm: string, fn_nm: string) {
 // 驱动 main 带参签名（g_linux_target）与 entry 捕获（g_linux_args）双判定。
 // 程序入口全名（主文件 main；可能带命名空间）。emit 前由 driver 设置。
 pub var g_entry_name: string = "";
+// UEFI 模式：MSVC 目标下 clang 会引用 `_fltused`（浮点使用标记），无 CRT 时需自行定义。
+pub var g_uefi_mode: bool = false;
 
+pub func set_uefi_mode(v: bool) {
+    g_uefi_mode = v
+}
 pub func set_entry(n: string) {
     g_entry_name = n
 }
@@ -408,6 +413,7 @@ pub func catch_enable() {
 pub func unit_reset() {
     reset_global_regs()
     g_entry_name = ""
+    g_uefi_mode = false
     g_sso_enabled = 0
     g_sc_enabled = 0
     g_wsock_enabled = 0

@@ -212,8 +212,13 @@ var tc_freestanding: bool = false;
 var tc_entry_sym: string = "";
 var tc_link_script: string = "";
 var tc_link_extra: string = "";
+// UEFI 应用：PE/COFF + efi_application 子系统；与 tc_freestanding 共存，链接分支优先。
+var tc_uefi: bool = false;
 pub func set_freestanding(v: bool) {
     tc_freestanding = v
+}
+pub func set_uefi(v: bool) {
+    tc_uefi = v
 }
 pub func set_entry_sym(s: string) {
     tc_entry_sym = s
@@ -280,7 +285,9 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     // r.1.6.1：Linux 目标用 lld 链接（clang 默认 GNU ld 在 Windows 宿主不可用）。
     // 自由站立目标同理：*-none-* 在 Windows 宿主会被 clang 转给 gcc 驱动，
     // 统一归一到 linux-gnu 三元组后用 lld 产出 ELF。
-    if tc_freestanding {
+    if tc_uefi {
+        target = "x86_64-pc-windows-msvc"
+    } else if tc_freestanding {
         target = freestanding_target(target)
     }
     var is_linux = str_len(target) > 0 && has_sub(target, "linux")
@@ -291,7 +298,9 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     // -fuse-ld=lld 仅对「vendored LLVM」生效：clang 必须来自 TIE_LLVM_HOME
     // 指定的目录（发布包场景，用户无 MSVC → 用随包 lld-link）。
     var lld_flag = ""
-    if is_linux || tc_freestanding {
+    if tc_uefi {
+        lld_flag = " -fuse-ld=lld-link"
+    } else if is_linux || tc_freestanding {
         lld_flag = " -fuse-ld=lld"
     } else {
         var home = get_env("TIE_LLVM_HOME")
@@ -311,7 +320,23 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         }
     }
     var cmd = tool + tc_cg_flag() + lld_flag + tc_fm_flag() + tc_w_flag() + " " + input_opt + " -o " + output_exe
-    if tc_freestanding {
+    if tc_uefi {
+        // UEFI 固件应用：MS x64 ABI 的 PE/COFF，无 CRT、无导入库；
+        // efi_application 子系统（值 10）+ efi_main 入口，lld-link 直接产出 .efi。
+        cmd = cmd + " -nostdlib -nostartfiles -ffreestanding -fno-stack-protector"
+        cmd = cmd + " -ffunction-sections -fdata-sections"
+        cmd = cmd + " -Wl,/subsystem:efi_application -Wl,/nodefaultlib -Wl,/machine:x64 -Wl,/Brepro"
+        // UEFI 无 CRT：std 全部函数进入同一目标文件，死代码仍引用 malloc/printf
+        // 等 libc 符号。本模式先 /opt:ref 裁剪未引用 COMDAT，但 PE 链接器在
+        // 裁剪前解析符号，故用 /force:unresolved 放行死代码中的未定义引用。
+        cmd = cmd + " -Wl,/opt:ref -Wl,/opt:icf -Wl,/force:unresolved"
+        if str_len(tc_entry_sym) > 0 {
+            cmd = cmd + " -Wl,/entry:" + tc_entry_sym
+        }
+        if str_len(tc_link_extra) > 0 {
+            cmd = cmd + " " + tc_link_extra
+        }
+    } else if tc_freestanding {
         // 自由站立：不链 CRT/系统库，-static -no-pie 产出 ET_EXEC ELF。
         // 入口符号默认由 driver 注入（main 或 --entry）；链接脚本按需追加。
         cmd = cmd + " -nostdlib -nostartfiles -ffreestanding -static -no-pie"
@@ -341,7 +366,7 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     }
     // Windows 目标：链接 GDI/用户库（平台适配器 cap_win 等 extern user32/gdi32；
     // 对非 Windows 交叉目标不追加，避免 libuser32 缺失）
-    if str_len(target) == 0 || has_sub(target, "windows") {
+    if !tc_uefi && (str_len(target) == 0 || has_sub(target, "windows")) {
         // p.6.4.1：arg_count/arg_string 内联 CommandLineToArgvW（shell32）；即使
         // 程序不链 interp（无 tie_* 桥）也须解析该符号，故恒链 -lshell32。
         cmd = cmd + " -luser32 -lgdi32 -lshell32"
@@ -385,7 +410,9 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     // 调用——clang 默认不链接 builtins，缺符号（undefined symbol: __divti3）。
     // -rtlib=compiler-rt 让 clang 在资源目录自动定位 builtins 库
     // （clang 22 对 -lclang_rt.builtins-x86_64 带点参数解析错误，弃用）。
-    cmd = cmd + " -rtlib=compiler-rt"
+    if !tc_uefi {
+        cmd = cmd + " -rtlib=compiler-rt"
+    }
     return run(cmd)
 }
 

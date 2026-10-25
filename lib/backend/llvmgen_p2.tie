@@ -150,6 +150,10 @@ func gen_func(fid: i64) {
     if ir.func_inline(fid) == 1 {
         inl_kw = " alwaysinline"
     }
+    if g_uefi_mode {
+        line("$" + sym + " = comdat any")
+        sect = sect + " comdat($" + sym + ")"
+    }
     line("define " + exp_kw + ret_llvm + " @" + sym + "(" + params_llvm + ")" + inl_kw + sect + " {")
     // F1 增强：临时 alloca 提升到 entry block——本函数全部 alloca（含循环体内
     // 的 ok 槽）前置输出，再对函数体行级重编号解决编号倒挂。流程：

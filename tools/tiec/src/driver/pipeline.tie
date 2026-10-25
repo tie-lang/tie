@@ -445,6 +445,9 @@ pub func kpass_emit() -> i64 {
         var t3 = clock()
     }
     llvmgen.set_entry(sstate.g_entry_name)
+    if g_uefi {
+        llvmgen.set_uefi_mode(true)
+    }
     var ll_text = tie.backend::render(ir.ctx_current())
     unsafe {
         var t3e = clock()
@@ -825,8 +828,13 @@ pub func compile_logic(ir_path: string, opt_path: string, target: string) -> i64
         tc.set_freestanding(true)
         tc.set_link_script(g_link_script)
         tc.set_link_extra(g_link_extra)
+        if g_uefi {
+            tc.set_uefi(true)
+        }
         if str_len(g_entry_sym) > 0 {
             tc.set_entry_sym(g_entry_sym)
+        } else if g_uefi {
+            tc.set_entry_sym("efi_main")
         } else {
             tc.set_entry_sym("main")
         }
