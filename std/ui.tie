@@ -312,9 +312,17 @@ func ensure() {
 }
 
 // 清空全部 UI 数据（测试与重入场景）。
+// 单元声明（`style`/`theme`/`@layer`…）是**静态声明**：由元素语法在程序入口注册一次，
+// 每帧重建元素树时不能丢——否则样式会在第一帧后失效。这里先备份再恢复。
 pub func reset() {
+    var uk = g_uk
+    var un = g_un
+    var ud = g_ud
     g_ready = false
     ensure()
+    g_uk = uk
+    g_un = un
+    g_ud = ud
 }
 
 // ---------- 元素构造 ----------
@@ -531,6 +539,27 @@ pub func attr_key_at(id: i64, k: i64) -> string {
         i = i + 1
     }
     return ""
+}
+
+// 改写或新增某节点的属性（键已存在则覆盖，否则追加）。
+// 供样式落地把声明摊到节点上；调用方负责保证「内联优先」——先查 attr_of 再写。
+pub func attr_set(id: i64, key: string, value: string) -> i64 {
+    ensure()
+    if id < 0 {
+        return -1
+    }
+    var i: i64 = 0
+    while i < len(g_ak) {
+        if g_aown[i] == id && g_ak[i] == key {
+            g_av[i] = value
+            return id
+        }
+        i = i + 1
+    }
+    table_push(g_ak, key)
+    table_push(g_av, value)
+    table_push(g_aown, id)
+    return id
 }
 
 pub func attr_val_at(id: i64, k: i64) -> string {
