@@ -795,6 +795,22 @@ pub func compile_logic(ir_path: string, opt_path: string, target: string) -> i64
             exe_path = replace_ext(g_input, "exe")
         }
     }
+    // --emit-obj：只产出可重定位目标文件（ET_REL），不进入链接阶段。
+    // 供内核模块、固件打包与自定义链接器直接消费。
+    if g_emit_obj {
+        var obj_out = g_output
+        if str_len(obj_out) == 0 {
+            obj_out = replace_ext(g_input, "o")
+        }
+        var orc = tc.compile_object(opt_path, obj_out, target)
+        if orc != 0 {
+            dbg_txt(diagcode.render_error(-1, -1, "后端失败: " + tc_err_msg))
+            return 1
+        }
+        cleanup_ir()
+        dbg_txt("目标文件编译成功: " + obj_out)
+        return 0
+    }
     // need_interp = g_used_interp：有 Rust 桥才链 tie_interp.lib
     // p.9.15.4：链接到**私有中转名**再发布到 exe_path —— ① 防并发互锁同一输出
     //（LNK1104）② 用户路径永不出现**半写的 exe**。无私有前缀则退回直接链。
