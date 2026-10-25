@@ -214,11 +214,16 @@ var tc_link_script: string = "";
 var tc_link_extra: string = "";
 // UEFI 应用：PE/COFF + efi_application 子系统；与 tc_freestanding 共存，链接分支优先。
 var tc_uefi: bool = false;
+// 额外 clang 编译参数（--cflag，空格拼接；仅目标文件编译使用）
+var tc_extra_cflags: string = "";
 pub func set_freestanding(v: bool) {
     tc_freestanding = v
 }
 pub func set_uefi(v: bool) {
     tc_uefi = v
+}
+pub func set_extra_cflags(s: string) {
+    tc_extra_cflags = s
 }
 pub func set_entry_sym(s: string) {
     tc_entry_sym = s
@@ -540,6 +545,9 @@ pub func compile_object(input_opt: string, output_obj: string, target: string) -
     var cmd = tool + tc_cg_flag() + " -c " + input_opt + " -o " + output_obj
     if str_len(target) > 0 {
         cmd = cmd + " --target=" + target
+    }
+    if str_len(tc_extra_cflags) > 0 {
+        cmd = cmd + " " + tc_extra_cflags
     }
     return run(cmd + tc_fm_flag() + tc_w_flag())
 }

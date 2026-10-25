@@ -387,6 +387,16 @@ pub func parse_args() -> i64 {
             }
             g_link_extra = g_link_extra + arg_string(i + 1)
             i = i + 1
+        } else if a == "--cflag" {
+            // 额外 clang 参数（如内核模块的 -mcmodel=kernel -mno-red-zone）
+            if i + 1 >= n {
+                return -1
+            }
+            if str_len(g_cflags) > 0 {
+                g_cflags = g_cflags + " "
+            }
+            g_cflags = g_cflags + arg_string(i + 1)
+            i = i + 1
         } else if str_len(a) > 1 && str_char(a, 0) == "-" {
             // 未知选项
             return -1

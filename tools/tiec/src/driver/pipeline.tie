@@ -789,6 +789,8 @@ pub func compile_program(src: string) -> i64 {
 // → 链接 tie_interp.lib（Rust 桥）。exec_code/get_env/time_now 已内联到 libc，
 // std/runtime.a 退役——纯程序（无桥）不链接任何运行时库，零依赖。
 pub func compile_logic(ir_path: string, opt_path: string, target: string) -> i64 {
+    // 额外编译参数（--cflag）：目标文件与可执行两条路径共用
+    tc.set_extra_cflags(g_cflags)
     var exe_path = g_output
     if str_len(exe_path) == 0 {
         // r.1.6.1：Linux 可执行文件无扩展名（ELF）；Windows 默认 .exe
