@@ -1,0 +1,26 @@
+type tie<logic>
+// 用户态设备访问示例（Windows）：打开设备句柄并写入一行数据。
+// 构建：tiec examples/driver/serial_write.tie -o serial_write.exe
+// 行为：优先 COM1；机器无物理串口时回退到 NUL 设备，用于在任何机器上
+//       验证 dev_open / dev_write / dev_flush / dev_close 四段链路。
+import "sys/dev.tie"
+
+func main() -> i64 {
+    var h = sys_dev.dev_open("\\\\.\\COM1", 0xC0000000)
+    if h == -1 {
+        println("COM1 不可用，改用 NUL 设备验证链路")
+        h = sys_dev.dev_open("NUL", 0xC0000000)
+        if h == -1 {
+            println("打开 NUL 失败")
+            return 1
+        }
+    }
+    var n = sys_dev.dev_write(h, "tie driver demo\r\n")
+    var fl = sys_dev.dev_flush(h)
+    sys_dev.dev_close(h)
+    println("写入字节: " + to_string(n) + " flush=" + to_string(fl))
+    if n == 0 {
+        return 1
+    }
+    return 0
+}

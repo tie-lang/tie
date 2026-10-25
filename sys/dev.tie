@@ -1,0 +1,133 @@
+type tie<class, unsafe:mem>
+// ============================================================================
+// sys/dev.tie —— 用户态设备访问面（Windows 句柄 API）
+//
+// 目标：让 tie 程序直接打开并读写字符设备 / 设备接口 / 命名管道，
+//       例如串口 COM1、LPT1、命名管道 \\.\pipe\name、以及经 WinUSB 驱动
+//       暴露的设备接口路径（\\?\usb#vid_xxxx&pid_xxxx#...#{guid}）。
+//
+// 设计：只绑定 kernel32 的四个文件句柄原语，路径与访问权限由调用方给出；
+//       路径一律按 UTF-16LE 构造，避免 ANSI 代码页截断非 ASCII 名字。
+//       全部失败路径返回 INVALID_HANDLE_VALUE(-1) / 0 / false，不抛错。
+//
+// 接口契约：
+//   dev_open(path, access) -> i64      句柄；失败 -1
+//       access: GENERIC_READ=0x80000000 / GENERIC_WRITE=0x40000000 /
+//               两者或=0xC0000000；share 固定 FILE_SHARE_READ|WRITE=3。
+//   dev_write(h, s) -> i64             写入 s 的 UTF-8 字节数；失败 0
+//   dev_read(h, buf, n) -> i64         读入最多 n 字节到 buf；失败 0
+//   dev_flush(h) -> bool               冲刷设备缓冲
+//   dev_close(h) -> bool               关闭句柄
+//
+// 备注：打开设备默认 OPEN_EXISTING + FILE_ATTRIBUTE_NORMAL；串口波特率等
+//       DCB 配置属后续 GetCommState/SetCommState 面，不在本文件范围内。
+// ============================================================================
+
+unsafe extern fn CreateFileW(lpFileName: ptr<u8>, dwDesiredAccess: u32, dwShareMode: u32, lpSecurityAttributes: i64, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: i64) -> i64
+unsafe extern fn WriteFile(hFile: i64, lpBuffer: ptr<u8>, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: ptr<u32>, lpOverlapped: i64) -> i32
+unsafe extern fn ReadFile(hFile: i64, lpBuffer: ptr<u8>, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: ptr<u32>, lpOverlapped: i64) -> i32
+unsafe extern fn FlushFileBuffers(hFile: i64) -> i32
+unsafe extern fn CloseHandle(hObject: i64) -> i32
+
+namespace sys_dev {
+
+// UTF-16 码元数（含代理对展开），用于 alloc 宽度。
+unsafe fn wide_units(s: string) -> i64 {
+    var n = str_len(s)
+    var u: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var cp = char_code(str_char(s, i))
+        if cp > 0xFFFF { u = u + 2 } else { u = u + 1 }
+        i = i + 1
+    }
+    return u
+}
+
+// s → 以 0 结尾的 UTF-16LE 缓冲；调用方负责生命周期（进程内不 free）。
+unsafe fn wcstr(s: string) -> ptr<u8> {
+    var p: ptr<u8> = alloc((wide_units(s) + 1) * 2)
+    var n = str_len(s)
+    var o: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var cp = char_code(str_char(s, i))
+        if cp > 0xFFFF {
+            var v = cp - 0x10000
+            var hi = 0xD800 + (v >> 10)
+            var lo = 0xDC00 + (v & 0x3FF)
+            deref_write(ptr_add(p, o), to_u8(hi & 0xFF))
+            deref_write(ptr_add(p, o + 1), to_u8((hi >> 8) & 0xFF))
+            deref_write(ptr_add(p, o + 2), to_u8(lo & 0xFF))
+            deref_write(ptr_add(p, o + 3), to_u8((lo >> 8) & 0xFF))
+            o = o + 4
+        } else {
+            deref_write(ptr_add(p, o), to_u8(cp & 0xFF))
+            deref_write(ptr_add(p, o + 1), to_u8((cp >> 8) & 0xFF))
+            o = o + 2
+        }
+        i = i + 1
+    }
+    deref_write(ptr_add(p, o), to_u8(0))
+    deref_write(ptr_add(p, o + 1), to_u8(0))
+    return p
+}
+
+// 打开设备/管道；失败返回 -1。
+pub func dev_open(path: string, access: i64) -> i64 {
+    unsafe {
+        var p = wcstr(path)
+        return CreateFileW(p, to_u32(access), 3, 0, 3, 0x80, 0)
+    }
+}
+
+// 写入 s 的 UTF-8 字节；返回实际写入数，失败 0。
+pub func dev_write(h: i64, s: string) -> i64 {
+    unsafe {
+        var n = str_len(s)
+        if n == 0 {
+            return 0
+        }
+        var buf = alloc(n)
+        var i: i64 = 0
+        while i < n {
+            deref_write(ptr_add(buf, i), to_u8(str_byte(s, i)))
+            i = i + 1
+        }
+        var w: u32 = 0
+        if WriteFile(h, buf, to_u32(n), addr_of(w), 0) == 0 {
+            return 0
+        }
+        return to_i64(w)
+    }
+}
+
+// 读入最多 n 字节到 buf；返回实际读入数，失败 0。
+pub func dev_read(h: i64, buf: ptr<u8>, n: i64) -> i64 {
+    unsafe {
+        if n <= 0 {
+            return 0
+        }
+        var got: u32 = 0
+        if ReadFile(h, buf, to_u32(n), addr_of(got), 0) == 0 {
+            return 0
+        }
+        return to_i64(got)
+    }
+}
+
+// 冲刷设备写缓冲。
+pub func dev_flush(h: i64) -> bool {
+    unsafe {
+        return FlushFileBuffers(h) != 0
+    }
+}
+
+// 关闭句柄。
+pub func dev_close(h: i64) -> bool {
+    unsafe {
+        return CloseHandle(h) != 0
+    }
+}
+
+}

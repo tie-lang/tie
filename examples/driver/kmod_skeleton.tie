@@ -1,0 +1,27 @@
+type tie<logic>
+// Linux 内核模块骨架（x86_64）：tiec 产出 ET_REL 目标文件，交给内核构建系统
+// 链接成 .ko。
+//
+// 构建（示例）：
+//   tiec examples/driver/kmod_skeleton.tie --freestanding --emit-obj \
+//        --target x86_64-linux-gnu \
+//        --cflag -mcmodel=kernel --cflag -mno-red-zone \
+//        --cflag -fno-stack-protector --cflag -ffreestanding \
+//        -o tie_mod.o
+//
+// 约定：
+//   * 入口符号用 #[no_mangle] 固定，避免模块名前缀变化；
+//   * 需要内核在卸载期执行的代码放 #[link_section(".exit.text")]；
+//   * .modinfo（license/author）由 Kbuild 侧补，不在 tie 源码里手写；
+//   * 内核模块不得引用 libc：本骨架只返回状态码，供构建链验证。
+
+#[no_mangle]
+pub func tie_mod_init() -> i32 {
+    return 0
+}
+
+#[no_mangle]
+#[link_section(".exit.text")]
+pub func tie_mod_exit() -> i32 {
+    return 0
+}
