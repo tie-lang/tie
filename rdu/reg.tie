@@ -1,0 +1,112 @@
+type tie<class, unsafe:raw>
+// reg.tie：嵌入式基础层（rdu）——MMIO 寄存器访问模块（命名空间 rdu_reg）
+// 层级定位：rdu = Reusable Device Utils，嵌入式基础层——面向裸机/无操作系统的
+// 底层场景提供纯计算与寄存器访问工具，编译出的 .a 无运行时依赖（freestanding 可直接链接）。
+//
+// 纪律与 bits.tie 一致：标量参数、无动态内存、无递归、无顶层全局变量。
+// 本模块唯一的"触底"是 mmio_read*/mmio_write*（volatile 宽度访问），
+// 因此文件头声明 raw 域凭据；不使用指针类型，地址一律用 i64 表达。
+//
+// 宽度语义：read8/16/32/64 返回零扩展后的 i64（读回值按无符号解释），
+// write8/16/32/64 只写目标宽度的低若干位，超出部分被截断。
+//
+// 调用：import 后 rdu_reg.read32(addr) / rdu_reg.update32(addr, shift, width, val)。
+
+namespace rdu_reg {
+// 读取 8 位寄存器（零扩展到 i64）
+pub func read8(addr: i64) -> i64 {
+    unsafe {
+        return to_i64(mmio_read8(addr))
+    }
+}
+
+// 读取 16 位寄存器
+pub func read16(addr: i64) -> i64 {
+    unsafe {
+        return to_i64(mmio_read16(addr))
+    }
+}
+
+// 读取 32 位寄存器
+pub func read32(addr: i64) -> i64 {
+    unsafe {
+        return to_i64(mmio_read32(addr))
+    }
+}
+
+// 读取 64 位寄存器
+pub func read64(addr: i64) -> i64 {
+    unsafe {
+        return to_i64(mmio_read64(addr))
+    }
+}
+
+// 写入 8 位寄存器（取低 8 位）
+pub func write8(addr: i64, v: i64) {
+    unsafe {
+        mmio_write8(addr, v)
+    }
+}
+
+// 写入 16 位寄存器（取低 16 位）
+pub func write16(addr: i64, v: i64) {
+    unsafe {
+        mmio_write16(addr, v)
+    }
+}
+
+// 写入 32 位寄存器（取低 32 位）
+pub func write32(addr: i64, v: i64) {
+    unsafe {
+        mmio_write32(addr, v)
+    }
+}
+
+// 写入 64 位寄存器
+pub func write64(addr: i64, v: i64) {
+    unsafe {
+        mmio_write64(addr, v)
+    }
+}
+
+// 取位域：从 shift 位起取 width 位（width 必须 1..63），结果右对齐
+pub func field(v: i64, shift: i64, width: i64) -> i64 {
+    if width <= 0 || width > 63 {
+        return 0
+    }
+    return (v >> shift) & ((1 << width) - 1)
+}
+
+// 写位域：把 f 的低 width 位写到 v 的 shift 位起，其余位不变
+pub func with_field(v: i64, shift: i64, width: i64, f: i64) -> i64 {
+    if width <= 0 || width > 63 {
+        return v
+    }
+    var mask: i64 = ((1 << width) - 1) << shift
+    return (v & (-1 ^ mask)) | ((f << shift) & mask)
+}
+
+// 读-改-写 32 位寄存器位域：读回 → 改位域 → 写回，返回写回后的完整值
+pub func update32(addr: i64, shift: i64, width: i64, f: i64) -> i64 {
+    var old: i64 = read32(addr)
+    var nv: i64 = with_field(old, shift, width, f)
+    write32(addr, nv)
+    return nv
+}
+
+// 置位：把 32 位寄存器的 mask 位全部置 1（读-改-写），返回新值
+pub func set_bits32(addr: i64, mask: i64) -> i64 {
+    var old: i64 = read32(addr)
+    var nv: i64 = old | mask
+    write32(addr, nv)
+    return nv
+}
+
+// 清位：把 32 位寄存器的 mask 位全部清 0（读-改-写），返回新值
+pub func clear_bits32(addr: i64, mask: i64) -> i64 {
+    var old: i64 = read32(addr)
+    var nv: i64 = old & (-1 ^ mask)
+    write32(addr, nv)
+    return nv
+}
+}
