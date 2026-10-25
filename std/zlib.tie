@@ -795,6 +795,112 @@ pub func deflate(immut data: table<i64>) -> table<i64> {
     return out
 }
 
+// ---------- 快速匹配（有界窗口 + 提前退出） ----------
+// find_match 会回溯到窗口底部（最长 32 KiB），在长内容上退化为
+// O(n × 窗口)。快速路径把回溯距离限制在 fw_back 字节、命中长度达到
+// fw_cap 即停止：压缩率略有下降，但压缩耗时随窗口线性下降。
+// 供 compress_fast / tofflib PDF 内容流这类「要快、体积稍有让步」的场景使用。
+func find_match_fast(data: table<i64>, i: i64, fw_back: i64, fw_cap: i64) -> (i64, i64) {
+    var n = len(data)
+    var maxlen = n - i
+    if maxlen > 258 {
+        maxlen = 258
+    }
+    var best_len: i64 = 0
+    var best_dist: i64 = 0
+    var startback = i - fw_back
+    if startback < 0 {
+        startback = 0
+    }
+    var s = i - 1
+    while s >= startback {
+        if data[s] == data[i] {
+            var l: i64 = 1
+            while l < maxlen && data[s + l] == data[i + l] {
+                l = l + 1
+            }
+            if l > best_len {
+                best_len = l
+                best_dist = i - s
+                if l >= fw_cap {
+                    return (best_len, best_dist)
+                }
+            }
+        }
+        s = s - 1
+    }
+    return (best_len, best_dist)
+}
+
+// 原始 DEFLATE 快速路径：固定 Huffman，有界回溯 + 长度提前退出。
+pub func deflate_fast(immut data: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var wr = table_new_i64()
+    table_push(wr, 0)
+    table_push(wr, 0)
+    var n = len(data)
+    var llen = fixed_len_tab()
+    var dlen = fixed_dist_tab()
+    var lcode = canonical_codes(llen, 288)
+    var dcode = canonical_codes(dlen, 32)
+    var lb = len_base_tab()
+    var le = len_extra_tab()
+    var db = dist_base_tab()
+    var de = dist_extra_tab()
+    var hdr: i64 = 1 | (1 << 1)
+    put_bits(wr, out, hdr, 3)
+    var i: i64 = 0
+    while i < n {
+        var m = find_match_fast(data, i, 4096, 32)
+        var ml = m.0
+        if ml >= 3 {
+            var li = len_to_sym(ml)
+            emit_code(wr, out, lcode[257 + li], llen[257 + li])
+            put_bits(wr, out, ml - lb[li], le[li])
+            var di = dist_to_sym(m.1)
+            emit_code(wr, out, dcode[di], 5)
+            put_bits(wr, out, m.1 - db[di], de[di])
+            i = i + ml
+        } else {
+            var by = data[i] & 0xFF
+            emit_code(wr, out, lcode[by], llen[by])
+            i = i + 1
+        }
+    }
+    emit_code(wr, out, lcode[256], llen[256])
+    if wr[1] > 0 {
+        table_push(out, wr[0] & 0xFF)
+        wr[0] = 0
+        wr[1] = 0
+    }
+    return out
+}
+
+// 快速 zlib（RFC1950）容器：deflate_fast + Adler-32。
+pub func compress_fast(data: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var h = zlib_header()
+    var i: i64 = 0
+    while i < len(h) {
+        table_push(out, h[i])
+        i = i + 1
+    }
+    var body = deflate_fast(data)
+    i = 0
+    while i < len(body) {
+        table_push(out, body[i])
+        i = i + 1
+    }
+    var a = adler32(data)
+    var b = be32bytes(a)
+    i = 0
+    while i < 4 {
+        table_push(out, b[i])
+        i = i + 1
+    }
+    return out
+}
+
 // ============================================================================
 // 七、zlib 容器（RFC1950）：compress / decompress
 // ============================================================================
