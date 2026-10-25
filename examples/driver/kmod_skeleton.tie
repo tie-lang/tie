@@ -12,8 +12,18 @@ type tie<logic>
 // 约定：
 //   * 入口符号用 #[no_mangle] 固定，避免模块名前缀变化；
 //   * 需要内核在卸载期执行的代码放 #[link_section(".exit.text")]；
-//   * .modinfo（license/author）由 Kbuild 侧补，不在 tie 源码里手写；
+//   * .modinfo 由源码里的字符串全局直接落地（编译器把带 section 的字符串
+//     全局改写为内联字节数组，内核按 NUL 分隔逐条解析）；
 //   * 内核模块不得引用 libc：本骨架只返回状态码，供构建链验证。
+
+#[link_section(".modinfo")]
+var tie_mod_license: string = "license=GPL"
+
+#[link_section(".modinfo")]
+var tie_mod_author: string = "author=Jiro"
+
+#[link_section(".modinfo")]
+var tie_mod_desc: string = "description=tie kernel module skeleton"
 
 #[no_mangle]
 pub func tie_mod_init() -> i32 {

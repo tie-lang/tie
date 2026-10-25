@@ -237,6 +237,19 @@ pub func global_attr_put(nm: string, bits: i64, arg: i64, sec: i64) {
     table_push(g_gattr_secs, sec)
 }
 
+// 查询某全局的 link_section 段名（无则空串）。全局名唯一，线性扫即可。
+pub func global_attr_sec_of(nm: string) -> string {
+    var nid = interner.intern(nm)
+    var i: i64 = 0
+    while i < len(g_gattr_names) {
+        if g_gattr_names[i] == nid && (g_gattr_bits[i] & 8) == 8 {
+            return interner.lookup(g_gattr_secs[i])
+        }
+        i = i + 1
+    }
+    return ""
+}
+
 pub func global_ptr_fn_reg(nm: string, fn_nm: string) {
     var nid = interner.intern(nm)
     table_push(g_global_names, nid)

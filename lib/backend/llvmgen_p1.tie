@@ -229,6 +229,24 @@ func emit_globals() {
                 // string 全局默认空串常量（null 会被 strcmp 段错误）；
                 // const 字符串全局有初始字面量 → 指向该字面量常量
                 if g_global_tys[i] == TK_STR {
+                    // 内核 .modinfo 一类段要求**内联字符串数据**：段里若放指针，
+                    // 内核按 NUL 分隔解析时会把 8 字节指针当成文本。故为带
+                    // section 的字符串全局另发私有常量数组，指针全局指向它。
+                    var gsec = global_attr_sec_of(nm)
+                    if gsec != "" {
+                        var ltxt = ""
+                        if i < len(g_global_strs) && g_global_strs[i] >= 0 {
+                            ltxt = intern.lookup(g_global_strs[i])
+                        }
+                        var bl = utf.byte_len(ltxt)
+                        var esc = escape_str(ltxt)
+                        var bsym = "@" + lv_nm + ".bytes"
+                        line(bsym + " = private unnamed_addr constant [" + to_string(bl + 1) +
+                            " x i8] c\"" + esc + "\\00\", section \"" + gsec + "\", align 1")
+                        line("@" + lv_nm + " = global ptr " + bsym)
+                        oi = oi + 1
+                        continue
+                    }
                     var eslot = 0
                     if i < len(g_global_strs) && g_global_strs[i] >= 0 {
                         eslot = str_slot(g_global_strs[i])
@@ -268,13 +286,28 @@ func emit_globals() {
     }
 }
 
+// 全局名是否字符串类型（apply_global_sections 跳过内联字符串分支用）。
+func global_is_str(nm: string) -> bool {
+    var nid = interner.intern(nm)
+    var i: i64 = 0
+    while i < len(g_global_names) {
+        if g_global_names[i] == nid {
+            return g_global_tys[i] == TK_STR
+        }
+        i = i + 1
+    }
+    return false
+}
+
 // 全局段归属后处理：emit_globals 已把全部 global 行写入 out_lines，这里
 // 按行前缀定位（`@<sym> = global `）并追加 `, section "…"`。用于内核
 // 模块（.modinfo 等）与固件保留数据段。全局符号名唯一，前缀不会误中。
+// 字符串全局在 emit_globals 里已按「数组进段 + 指针指向」处理，这里跳过，
+// 否则 8 字节指针也会被塞进段里污染内核解析。
 func apply_global_sections() {
     var i: i64 = 0
     while i < len(g_gattr_names) {
-        if (g_gattr_bits[i] & 8) == 8 {
+        if (g_gattr_bits[i] & 8) == 8 && !global_is_str(intern.lookup(g_gattr_names[i])) {
             var nm = intern.lookup(g_gattr_names[i])
             var sec = intern.lookup(g_gattr_secs[i])
             var pre = "@" + ns_replace(nm) + " = global "
