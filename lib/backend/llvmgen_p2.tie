@@ -4,22 +4,100 @@ type tie<class>
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 llvmgen.tie。
 namespace llvmgen {
+// 取全名的最后一段（`a::b::f` → `f`）；无命名空间时原样返回。
+// 供 #[no_mangle] 使用：去掉模块/命名空间修饰，发射 C 级稳定符号。
+func last_seg(s: string) -> string {
+    var n = str_len(s)
+    var i = n - 2
+    while i >= 0 {
+        if str.slice(s, i, i + 2) == "::" {
+            return str.slice(s, i + 2, n)
+        }
+        i = i - 1
+    }
+    return s
+}
+// 源符号（池 id）→ 发射符号映射：定义与调用两侧共用，保证属性改名后一致。
+pub var g_sym_src: table<i64> = [];
+pub var g_sym_out: table<i64> = [];
+
+// 预计算全部函数的发射符号（含入口名、export_name、no_mangle 规则），
+// 供定义（gen_func）与调用点（gen_inst_b_35_call）统一取值。
+pub func build_sym_map() {
+    g_sym_src = []
+    g_sym_out = []
+    var nf = ir.func_count()
+    var i: i64 = 0
+    while i < nf {
+        var nid = ir.func_name(i)
+        var nm = intern.lookup(nid)
+        var out = ns_replace(nm)
+        if str_len(g_entry_name) > 0 && nm == g_entry_name {
+            out = "main"
+        }
+        var fat = ir.func_attr(i)
+        if (fat & 4) == 4 {
+            out = intern.lookup(ir.func_attr_arg(i))
+        } else if (fat & 1) == 1 {
+            out = last_seg(nm)
+        }
+        table_push(g_sym_src, nid)
+        table_push(g_sym_out, interner.intern(out))
+        i = i + 1
+    }
+}
+
+// 按源符号池 id 取发射符号；未登记（如外部 declare）回落 ns_replace。
+pub func sym_of_name(nid: i64) -> string {
+    var i = len(g_sym_src) - 1
+    while i >= 0 {
+        if g_sym_src[i] == nid {
+            return interner.lookup(g_sym_out[i])
+        }
+        i = i - 1
+    }
+    return ns_replace(intern.lookup(nid))
+}
+
+// #[used]：把标注函数登记到 @llvm.used，阻止链接期 --gc-sections 丢弃。
+// 必须在全部函数定义之后调用（符号表已就绪，且 LLVM 要求模块级追加）。
+pub func emit_llvm_used() {
+    var nf = ir.func_count()
+    var cnt: i64 = 0
+    var i: i64 = 0
+    while i < nf {
+        if (ir.func_attr(i) & 2) == 2 {
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    if cnt == 0 {
+        return
+    }
+    var items = ""
+    i = 0
+    while i < nf {
+        if (ir.func_attr(i) & 2) == 2 {
+            if str_len(items) > 0 {
+                items = items + ", "
+            }
+            items = items + "ptr @" + sym_of_name(ir.func_name(i))
+        }
+        i = i + 1
+    }
+    line("@llvm.used = appending global [" + to_string(cnt) + " x ptr] [" + items + "], section \"llvm.metadata\"")
+}
+
 // 单个函数生成
 func gen_func(fid: i64) {
     g_pfid = fid
     g_pcnt = ir.func_params_cnt(fid)
     var name = intern.lookup(ir.func_name(fid))
-    // 命名空间函数全名 → LLVM 符号：`::` 转 `$`（对齐 Rust ns_symbol；
-    // 调用点 call(35) 同约定，保证定义与调用两侧符号一致）
-    var sym = str.clone(name)
-    var ns_pos = find_sub(name, "::")
-    if ns_pos >= 0 {
-        sym = ns_replace(name)
-    }
-    // 程序入口：主文件的 main（可能在命名空间内）以 C 入口符号 @main 发射。
-    // 其余同名 main（库函数）仍按命名空间符号，不抢入口。
-    if str_len(g_entry_name) > 0 && name == g_entry_name {
-        sym = "main"
+    var sym = sym_of_name(ir.func_name(fid))
+    var fat = ir.func_attr(fid)
+    var sect = ""
+    if (fat & 8) == 8 {
+        sect = " section \"" + intern.lookup(ir.func_attr_sec(fid)) + "\""
     }
     var ret_llvm = llvm_ty(ir.func_ret(fid))
     // main 特殊：void main → define i32 @main
@@ -72,7 +150,7 @@ func gen_func(fid: i64) {
     if ir.func_inline(fid) == 1 {
         inl_kw = " alwaysinline"
     }
-    line("define " + exp_kw + ret_llvm + " @" + sym + "(" + params_llvm + ")" + inl_kw + " {")
+    line("define " + exp_kw + ret_llvm + " @" + sym + "(" + params_llvm + ")" + inl_kw + sect + " {")
     // F1 增强：临时 alloca 提升到 entry block——本函数全部 alloca（含循环体内
     // 的 ok 槽）前置输出，再对函数体行级重编号解决编号倒挂。流程：
     // 1) 切函数级缓冲 g_fn_lines（line() 重定向）；

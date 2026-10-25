@@ -576,6 +576,8 @@ pub func emit() -> string {
     emit_globals()
     // S2.4：vtable 全局常量段（方法函数指针表，每个 impl 一个）
     emit_vtables()
+    // 符号表：定义/调用两侧统一发射名（声明属性）
+    build_sym_map()
     // 各函数
     var nf = ir.func_count()
     var i: i64 = 0
@@ -589,6 +591,8 @@ pub func emit() -> string {
     unsafe {
         var et1 = GetTickCount()
     }
+    // #[used] 汇总（必须在函数定义之后）
+    emit_llvm_used()
     e_t_funcs = et1 - et0
     // 字符串常量节
     line("")

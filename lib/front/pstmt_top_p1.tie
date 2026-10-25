@@ -222,6 +222,52 @@ func parse_generic_attr() -> i64 {
     // ns 段：读 lexeme（unsafe 是关键字 token 非 ident）
     var ns = interner.intern(putil.peek_lexeme())
     putil.advance()
+    // 驱动/固件声明属性：单段名（无命名空间点）。与 unsafe 凭据属性共用
+    // 同一 `#[]` 通道；本组属性由语义层转交 IR，最终在 llvmgen 发射。
+    //   #[no_mangle] / #[used]
+    //   #[export_name("sym")] / #[link_section("sec")]
+    if putil.peek_tag() != lex_dot {
+        var anm = interner.lookup(ns)
+        if anm == "no_mangle" || anm == "used" {
+            if !putil.expect(lex_rbracket, "']'") {
+                return -1
+            }
+            putil.eat(lex_semi)
+            return ns
+        }
+        if anm == "export_name" || anm == "link_section" {
+            if !putil.expect(lex_lparen, "'('") {
+                return -1
+            }
+            if putil.peek_tag() != lex_str {
+                putil.set_err(putil.peek_line(), putil.peek_col(),
+                    "#[" + anm + "] 的参数必须是字符串字面量")
+                return -1
+            }
+            var raw = putil.peek_lexeme()
+            var rn = str_len(raw)
+            var clean = str.clone(raw)
+            if rn >= 2 {
+                if str_char(raw, 0) == "\"" {
+                    if str_char(raw, rn - 1) == "\"" {
+                        clean = str.slice(raw, 1, rn - 1)
+                    }
+                }
+            }
+            g_pending_attr_arg = interner.intern(clean)
+            putil.advance()
+            if !putil.expect(lex_rparen, "')'") {
+                return -1
+            }
+            if !putil.expect(lex_rbracket, "']'") {
+                return -1
+            }
+            putil.eat(lex_semi)
+            return ns
+        }
+        putil.set_err(line, col, "未知属性 '#[" + anm + "]'（声明属性支持 unsafe.* 凭据域，或 no_mangle/used/export_name/link_section）")
+        return -1
+    }
     if !putil.expect(lex_dot, "'.'") {
         return -1
     }

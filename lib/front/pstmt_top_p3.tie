@@ -305,7 +305,10 @@ func parse_fn_def() -> i64 {
     // 三期通用 `#[]` 属性通道（§7.1）：`#[unsafe.share] func X` 等声明属性
     // 附着到函数节点（val bit3 = has_attr；函数级便捷 = 整函数隐式持证）
     if g_pending_attr != 0 {
-        ast.set_val(f, ast.val(f) + 8)   // val bit3 = has_attr
+        var full0 = interner.lookup(g_pending_attr)
+        if putil.has_prefix(str.clone(full0), "unsafe.") {
+            ast.set_val(f, ast.val(f) + 8)   // val bit3 = has_attr
+        }
         // 2026-10-01 泛化：把属性里的**域**登记为该函数的持证域（不再只认 lock）。
         // `#[unsafe.mem]` ⇒ 记 mem 位；函数级持证形态 ⇒ 整个函数体在域匹配下视为
         // 持该域。irgen 另按「是否含 lock 位」决定是否把函数体置于去锁作用域。
@@ -316,8 +319,17 @@ func parse_fn_def() -> i64 {
             // 记**本模块局部 id**（待装载后由 cap_apply_file 按基址提交）——
             // 直接 fn_cap_put 会在 import 场景下错位（见 sstate.s_imp_cap_nodes 注释）。
             sstate.imp_cap_put(f, types.cap_bit_of(capn))
+        } else if full == "no_mangle" {
+            sstate.decl_attr_put(f, 1, 0, 0)
+        } else if full == "used" {
+            sstate.decl_attr_put(f, 2, 0, 0)
+        } else if full == "export_name" {
+            sstate.decl_attr_put(f, 4, g_pending_attr_arg, 0)
+        } else if full == "link_section" {
+            sstate.decl_attr_put(f, 8, 0, g_pending_attr_arg)
         }
         g_pending_attr = 0
+        g_pending_attr_arg = 0
     }
     // 文件级授权（`type tie<角色, unsafe:mem, unsafe:ext>`）**不在此处登记**：
     // 它按文件基址统一施加（sstate.cap_apply_file），这样 import 的模块也拿得到

@@ -681,6 +681,12 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
     // p.9.11.10 inline fn：N_FN_DEF val bit5 = is_inline（parser 已登记）。llvmgen
     // gen_func 读 ir.func_inline 在 define 头附加 alwaysinline 属性。
     ir.func_inline_set(fid, (ast.s_val(fn_node) >> 5) & 1)
+    // 驱动/固件声明属性（#[no_mangle]/#[used]/#[export_name]/#[link_section]）：
+    // 前端登记在 sstate 侧表，此处按 AST 节点回填 IR 函数元数据。
+    var fat = sstate.decl_attr_kind(fn_node)
+    if fat > 0 {
+        ir.func_attr_set(fid, fat, sstate.decl_attr_arg(fn_node), sstate.decl_attr_sec(fn_node))
+    }
     g_cur_func = fid
     var entry = ir.new_block(fid, interner.intern("entry"))
     g_entry_block = entry     // p.6.10.3：entry 级表变量析构候选登记用

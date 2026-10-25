@@ -1472,4 +1472,55 @@ pub func sorted_insert_fn(ref keys: table<i64>, ref vals: table<i64>, ref nodes:
     return pos
 }
 
+// ---------- 声明属性（驱动/固件形态）----------
+// kind 位：1=no_mangle 2=used 4=export_name（arg=符号名池 id）
+//           8=link_section（sec=段名池 id）。前端解析期按 AST 节点 id 登记，
+// irgen 注册 IR 函数时读取并写入 IR 元数据，llvmgen 发射时应用。
+pub var decl_attr_nodes: table<i64> = [];
+pub var decl_attr_kinds: table<i64> = [];
+pub var decl_attr_args: table<i64> = [];
+pub var decl_attr_secs: table<i64> = [];
+
+pub func decl_attr_put(node: i64, kind: i64, arg: i64, sec: i64) {
+    table_push(decl_attr_nodes, node)
+    table_push(decl_attr_kinds, kind)
+    table_push(decl_attr_args, arg)
+    table_push(decl_attr_secs, sec)
+}
+
+func decl_attr_find(node: i64) -> i64 {
+    var i = len(decl_attr_nodes) - 1
+    while i >= 0 {
+        if decl_attr_nodes[i] == node {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+pub func decl_attr_kind(node: i64) -> i64 {
+    var i = decl_attr_find(node)
+    if i < 0 {
+        return 0
+    }
+    return decl_attr_kinds[i]
+}
+
+pub func decl_attr_arg(node: i64) -> i64 {
+    var i = decl_attr_find(node)
+    if i < 0 {
+        return 0
+    }
+    return decl_attr_args[i]
+}
+
+pub func decl_attr_sec(node: i64) -> i64 {
+    var i = decl_attr_find(node)
+    if i < 0 {
+        return 0
+    }
+    return decl_attr_secs[i]
+}
+
 }

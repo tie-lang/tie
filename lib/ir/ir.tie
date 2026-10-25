@@ -70,6 +70,11 @@ pub var ir_funcs_entry: table<i64> = [];        // 入口块 id（-1 = 未建块
 pub var ir_funcs_inst_total: table<i64> = [];   // 函数内指令总数（llvmgen 统计）
 pub var ir_funcs_exported: table<i64> = [];     // 导出标记（0 私有 / 1 导出）
 pub var ir_funcs_inline: table<i64> = [];       // 内联标记（p.9.11.10；0 普通 / 1 inline fn）
+// 驱动/固件声明属性（见 sstate.fn_attr_*）：kind 位 1=no_mangle 2=used
+// 4=export_name（arg）8=link_section（sec）。
+pub var ir_funcs_attr_kind: table<i64> = [];
+pub var ir_funcs_attr_arg: table<i64> = [];
+pub var ir_funcs_attr_sec: table<i64> = [];
 pub var ir_blocks_func: table<i64> = [];        // 块表：所属函数 id
 pub var ir_blocks_name: table<i64> = [];        // 块表：块名（池 id；-1 = 无名字）
 pub var ir_blocks_start: table<i64> = [];       // 块表：指令段起始（含）
@@ -242,6 +247,9 @@ pub func new_module() -> i64 {
     table_trunc(ir_funcs_inst_total, 0)
     table_trunc(ir_funcs_exported, 0)
     table_trunc(ir_funcs_inline, 0)
+    table_trunc(ir_funcs_attr_kind, 0)
+    table_trunc(ir_funcs_attr_arg, 0)
+    table_trunc(ir_funcs_attr_sec, 0)
     table_trunc(ir_blocks_func, 0)
     table_trunc(ir_blocks_name, 0)
     table_trunc(ir_blocks_start, 0)
@@ -282,6 +290,9 @@ pub func new_func(name_id: i64, ret_ty: i64, params: table<i64>) -> i64 {
     table_push(ir_funcs_inst_total, 0)
     table_push(ir_funcs_exported, 0)
     table_push(ir_funcs_inline, 0)
+    table_push(ir_funcs_attr_kind, 0)
+    table_push(ir_funcs_attr_arg, 0)
+    table_push(ir_funcs_attr_sec, 0)
     var i: i64 = 0
     while i < len(params) {
         var pv = new_value()
@@ -467,6 +478,22 @@ pub func func_inline_set(func_id: i64, v: i64) {
 }
 pub func func_inline(func_id: i64) -> i64 {
     return ir_funcs_inline[func_id]
+}
+
+// ---------- 驱动/固件声明属性（llvmgen 发射应用）----------
+pub func func_attr_set(func_id: i64, kind: i64, arg: i64, sec: i64) {
+    ir_funcs_attr_kind[func_id] = kind
+    ir_funcs_attr_arg[func_id] = arg
+    ir_funcs_attr_sec[func_id] = sec
+}
+pub func func_attr(func_id: i64) -> i64 {
+    return ir_funcs_attr_kind[func_id]
+}
+pub func func_attr_arg(func_id: i64) -> i64 {
+    return ir_funcs_attr_arg[func_id]
+}
+pub func func_attr_sec(func_id: i64) -> i64 {
+    return ir_funcs_attr_sec[func_id]
 }
 
 // ---------- 块表访问器 ----------

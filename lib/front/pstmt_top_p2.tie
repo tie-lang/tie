@@ -167,6 +167,14 @@ func parse_namespace() -> i64 {
                     }
                     table_push(body_stmts, st)
                 }
+            } else if tag == lex_hash {
+                // 命名空间成员上的声明属性（驱动形态：#[no_mangle] / #[export_name]
+                // / #[link_section] / #[used]）：与顶层同一属性通道，附着到下一成员。
+                var at2 = parse_generic_attr()
+                if at2 < 0 {
+                    return -1
+                }
+                g_pending_attr = at2
             } else {
                 putil.set_err(putil.peek_line(), putil.peek_col(), "命名空间体内只允许函数定义、类定义或嵌套命名空间，实际是 " + putil.describe(tag))
                 return -1
