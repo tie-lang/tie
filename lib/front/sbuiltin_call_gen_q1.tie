@@ -98,6 +98,34 @@ pub func builtin_call_b_volatile_store(fn_name: string, args: table<i64>, call_n
         return types.named(TK_VOID)
 }
 
+// ---------- 驱动能力：MMIO 寄存器按宽度访问（p.9.21.2 族） ----------
+// 读：1 个参数（整数地址），返回无符号宽度类型（u8/u16/u32/u64）。
+// 写：2 个参数（整数地址, 值），返回值 void；值由 codegen 截断到目标宽度。
+pub func builtin_call_b_mmio_read(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数（寄存器地址），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "mmio_read8" { return types.named(TK_U8) }
+        if fn_name == "mmio_read16" { return types.named(TK_U16) }
+        if fn_name == "mmio_read32" { return types.named(TK_U32) }
+        return types.named(TK_U64)
+}
+
+pub func builtin_call_b_mmio_write(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数（寄存器地址, 值），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
 pub func builtin_call_b_addr_of_field(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
     var nargs = len(args)
     // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------

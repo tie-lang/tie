@@ -24,6 +24,11 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
     if fn_name == "ptr_add" || fn_name == "slice_index" { return builtin_call_b_ptr_add(fn_name, args, call_node) }
     if fn_name == "slice_of" { return builtin_call_b_slice_of(fn_name, args, call_node) }
     if fn_name == "share" { return builtin_call_b_share(fn_name, args, call_node) }
+    // ---------- 驱动能力：MMIO 寄存器按宽度访问 ----------
+    // 地址是整数（inttoptr），宽度由内置名决定：读返回无符号宽度类型，
+    // 写接受任意整型并截断到目标宽度。全部归 raw 域（见 types.builtin_domain）。
+    if fn_name == "mmio_read8" || fn_name == "mmio_read16" || fn_name == "mmio_read32" || fn_name == "mmio_read64" { return builtin_call_b_mmio_read(fn_name, args, call_node) }
+    if fn_name == "mmio_write8" || fn_name == "mmio_write16" || fn_name == "mmio_write32" || fn_name == "mmio_write64" { return builtin_call_b_mmio_write(fn_name, args, call_node) }
     // ---------- S1.3 to_* 显式数值转换族（p.9.0-S.8 规范 §2.11 正名） ----------
     // to_i8..to_u128 / to_f32 / to_f64：1 参数字 → 目标类型。
     // as_* 中的 as_i64/as_f64 仍留在此组——其返回类型推导与解包目标相同，
