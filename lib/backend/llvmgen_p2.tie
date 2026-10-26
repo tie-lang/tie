@@ -62,6 +62,14 @@ pub func sym_of_name(nid: i64) -> string {
 // #[used]：把标注函数登记到 @llvm.used，阻止链接期 --gc-sections 丢弃。
 // 必须在全部函数定义之后调用（符号表已就绪，且 LLVM 要求模块级追加）。
 pub func emit_llvm_used() {
+    // UEFI：EDK2 的 LoadImage 要求镜像带基址重定位表（.reloc），否则返回
+    // EFI_NOT_FOUND（shell 报 “Not Found”）。tie 程序若没有任何绝对地址引用，
+    // lld-link 不会生成 .reloc；此处固定发一个指向首函数的锚点全局，制造
+    // ABS64 重定位，链接时由 /include:__tie_uefi_reloc 强制保留。
+    var uefi_anchor = g_uefi_mode && ir.func_count() > 0
+    if uefi_anchor {
+        line("@__tie_uefi_reloc = private global ptr @" + sym_of_name(ir.func_name(0)))
+    }
     var nf = ir.func_count()
     var cnt: i64 = 0
     var i: i64 = 0
@@ -79,10 +87,18 @@ pub func emit_llvm_used() {
         }
         i = i + 1
     }
+    // -O1 起 LLVM 会先做全局 DCE，未被 @llvm.used 引用的 private 锚点会在进入
+    // 链接器之前就被删掉（/include 也就无从生效）。把锚点一并登记进 @llvm.used。
+    if uefi_anchor {
+        cnt = cnt + 1
+    }
     if cnt == 0 {
         return
     }
     var items = ""
+    if uefi_anchor {
+        items = "ptr @__tie_uefi_reloc"
+    }
     i = 0
     while i < nf {
         if (ir.func_attr(i) & 2) == 2 {

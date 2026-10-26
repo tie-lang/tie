@@ -1,0 +1,93 @@
+type tie<class, unsafe:raw>
+// port.tie：嵌入式基础层（rdu）——I/O 端口访问模块（命名空间 rdu_port）
+// 层级定位：rdu = Reusable Device Utils，嵌入式基础层——面向裸机/固件/UEFI 场景。
+//
+// 与 reg.tie 的分工：reg.tie 走 MMIO（内存映射，volatile load/store）；
+// 本模块走 **I/O 端口**（x86 in/out 指令），用于串口 0x3F8、PIC、PIT、
+// isa-debug-exit 0xF4 这类必须用 in/out 才能访问的设备。
+// 二者不可互替：把端口地址当内存地址做 volatile 写只会写低端内存。
+//
+// 纪律：标量参数、无动态内存、无递归、无顶层全局变量；
+// 唯一的"触底"是 asm! 内联汇编（in/out 指令），故文件头声明 raw 域凭据。
+//
+// 实现注意（实测得出，勿改）：
+//   * 内联汇编必须带 sideeffect —— 无输出的 asm 若不可观测，LLVM 会整段删除；
+//     该语义已由编译器对 tie 的 asm! 统一加 sideeffect 保证。
+//   * outb/inb 使用 AL/DX 这类定宽寄存器，操作数一律按 i32 传入，
+//     LLVM 才会分配 32 位寄存器（"%rdx→%edx" 这类 64→32 直传汇编器不接受）。
+//   * 端口号范围 0..65535，超出范围由调用方保证；本模块只做低 16 位截断语义。
+//
+// 调用：import "/rdu/port.tie" as port 后
+//   port.out8(0x3F8, 0x55) / port.in8(0x3F8) / port.out16(...) / port.in32(...) / port.io_wait()
+
+namespace rdu_port {
+// 向端口写 8 位
+pub func out8(hw: i64, v: i64) {
+    var dummy: i32 = 0
+    var pv: i32 = to_i32(v)
+    var ph: i32 = to_i32(hw)
+    unsafe {
+        asm!("movl $2, %edx; movl $1, %eax; outb %al, %dx", out(reg) dummy, in(reg) pv, in(reg) ph)
+    }
+}
+
+// 向端口写 16 位
+pub func out16(hw: i64, v: i64) {
+    var dummy: i32 = 0
+    var pv: i32 = to_i32(v)
+    var ph: i32 = to_i32(hw)
+    unsafe {
+        asm!("movl $2, %edx; movl $1, %eax; outw %ax, %dx", out(reg) dummy, in(reg) pv, in(reg) ph)
+    }
+}
+
+// 向端口写 32 位
+pub func out32(hw: i64, v: i64) {
+    var dummy: i32 = 0
+    var pv: i32 = to_i32(v)
+    var ph: i32 = to_i32(hw)
+    unsafe {
+        asm!("movl $2, %edx; movl $1, %eax; outl %eax, %dx", out(reg) dummy, in(reg) pv, in(reg) ph)
+    }
+}
+
+// 从端口读 8 位（零扩展到 i64）
+pub func in8(hw: i64) -> i64 {
+    var v: i32 = 0
+    var ph: i32 = to_i32(hw)
+    unsafe {
+        asm!("inb %dx, %al; movzbl %al, $0", out(reg) v, in(reg) ph)
+    }
+    return to_i64(v)
+}
+
+// 从端口读 16 位（零扩展到 i64）
+pub func in16(hw: i64) -> i64 {
+    var v: i32 = 0
+    var ph: i32 = to_i32(hw)
+    unsafe {
+        asm!("inw %dx, %ax; movzwl %ax, $0", out(reg) v, in(reg) ph)
+    }
+    return to_i64(v)
+}
+
+// 从端口读 32 位（零扩展到 i64）
+pub func in32(hw: i64) -> i64 {
+    var v: i32 = 0
+    var ph: i32 = to_i32(hw)
+    unsafe {
+        asm!("inl %dx, %eax", out(reg) v, in(reg) ph)
+    }
+    return to_i64(v)
+}
+
+// I/O 等待：向未使用的 0x80 端口写一次，给慢速设备留出时序
+pub func io_wait() {
+    var dummy: i32 = 0
+    var pv: i32 = 0
+    var ph: i32 = 128
+    unsafe {
+        asm!("movl $2, %edx; movl $1, %eax; outb %al, %dx", out(reg) dummy, in(reg) pv, in(reg) ph)
+    }
+}
+}

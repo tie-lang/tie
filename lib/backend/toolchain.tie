@@ -329,8 +329,18 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         // UEFI 固件应用：MS x64 ABI 的 PE/COFF，无 CRT、无导入库；
         // efi_application 子系统（值 10）+ efi_main 入口，lld-link 直接产出 .efi。
         cmd = cmd + " -nostdlib -nostartfiles -ffreestanding -fno-stack-protector"
-        cmd = cmd + " -ffunction-sections -fdata-sections"
+        // 注意：UEFI 模式不能加 -fdata-sections。锚点全局 @__tie_uefi_reloc 会被
+        // 拆进独立的 .data$ 段，而 lld-link 的 /include 无法让这种未引用数据
+        // 段逃过 /opt:ref 的消除，.reloc 就为空；放进统一 .data 段后 /include
+        // 生效，ABS64 重定位得以保留。函数分段仍然保留，供 /opt:ref 裁剪死函数。
+        cmd = cmd + " -ffunction-sections"
         cmd = cmd + " -Wl,/subsystem:efi_application -Wl,/nodefaultlib -Wl,/machine:x64 -Wl,/Brepro"
+        // EDK2 的 LoadImage 要求镜像带基址重定位表（.reloc），否则返回
+        // EFI_NOT_FOUND（shell 报 “Not Found”）。tie 程序若没有任何绝对地址
+        // 引用，lld-link 不会发 .reloc；故在 UEFI 模式下由后端固定发一个
+        // 指向入口函数的锚点全局（@__tie_uefi_reloc），并由 /include 强制保留，
+        // 从而制造 ABS64 重定位。
+        cmd = cmd + " -Wl,/include:__tie_uefi_reloc"
         // UEFI 无 CRT：std 全部函数进入同一目标文件，死代码仍引用 malloc/printf
         // 等 libc 符号。本模式先 /opt:ref 裁剪未引用 COMDAT，但 PE 链接器在
         // 裁剪前解析符号，故用 /force:unresolved 放行死代码中的未定义引用。
