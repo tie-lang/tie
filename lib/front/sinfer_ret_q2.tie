@@ -158,6 +158,28 @@ pub func infer_call(id: i64) -> i64 {
             }
             ka = ka + 1
         }
+        // len() 实参类型门禁（实参推断之后做：此前只有实参节点 id，拿不到类型）。
+        // 合法集合必须与 irgen_bi_dyn.bi_len 的分派严格一致：
+        //   定长数组 → 编译期常量 N；字符串 → 读 ptr-8 长度头；表/映射 → 表长。
+        // 三者之外都会落到 s21_table_len(实参)，对 i64 等标量就是
+        // `load i64, ptr %<i64>` / `getelementptr i8, ptr %<i64>` ⇒ opt 报
+        // "%N defined with type 'i64' but expected 'ptr'"（E00883 中端失败），
+        // 且行号指向无关的中间产物位置，用户在源码里无从改起。故在语义期拦下。
+        // 放行未登记（<0）与宽类型（num/text/misc）：泛型/未定型实参此刻可能尚无
+        // 具体类型，误拦会打断既有合法泛型代码。
+        if fnm == "len" && nc == 1 {
+            var lt = infer_expr(args[0])
+            if lt < 0 {
+                return -1
+            }
+            if !types.is_wide(lt) && lt != types.named(TK_STR) &&
+                !types.is_table(lt) && !types.is_array(lt) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "len() 只支持字符串或动态表，实际是 " + types.type_name(lt)
+                return -1
+            }
+        }
         // S1.2 动态返回类型特判（builtin_call 无法静态确定）：
         // addr_of(x) → ptr<实参类型>；deref(p) → 指针元素类型；
         // slice_of(a, s, n) → slice<元素类型>；ptr_add(p, n) → ptr<元素类型>
