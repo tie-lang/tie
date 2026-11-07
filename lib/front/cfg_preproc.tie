@@ -32,6 +32,46 @@ import "../support/diag/errors.tie"
 
 namespace cfgpre {
 
+// 条件编译特性集合（--feature 注入，逗号分隔）。driver 在编译入口单点调用
+// set_features，被导入文件的 #cfg 预处理复用同一集合（判据单一来源）。
+var g_features: string = "";
+
+pub func set_features(s: string) {
+    g_features = s
+}
+
+// 特性是否命中：逐段精确比较（逗号分隔，末段无逗号）。空名不匹配。
+func feature_hit(name: string) -> bool {
+    if len(name) == 0 || len(g_features) == 0 {
+        return false
+    }
+    var m = len(g_features)
+    var st: i64 = 0
+    var j: i64 = 0
+    while j <= m {
+        if j == m || str_byte(g_features, j) == 44 {
+            var seg = j - st
+            if seg == len(name) {
+                var eq = true
+                var k: i64 = 0
+                while k < seg {
+                    if str_byte(g_features, st + k) != str_byte(name, k) {
+                        eq = false
+                        break
+                    }
+                    k = k + 1
+                }
+                if eq {
+                    return true
+                }
+            }
+            st = j + 1
+        }
+        j = j + 1
+    }
+    return false
+}
+
 // ---------- 字节级工具（自包含） ----------
 
 // 子串 [a, b)（字节级）。
@@ -197,6 +237,11 @@ func eval_cond(cond: string, target: string, profile: string) -> bool {
                 r = !r
             }
         }
+    } else if key == "feature" {
+        // 条件编译特性：#cfg(feature=xxx) 在 --feature 集合中为真。
+        // 集合由 driver 单点注入（与 target/profile 同源），逗号分隔精确匹配；
+        // 未知特性 = 假，避免拼错名字静默选错分支却零诊断。
+        r = feature_hit(val)
     } else {
         r = false   // 未知键 = 假
     }

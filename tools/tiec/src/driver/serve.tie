@@ -463,6 +463,8 @@ func sv_analyze(p: table<i64>) -> i64 {
     var cfg_target = normalize_target("")
     var cfg_profile = ""
     semantic.set_cfg_env(cfg_target, cfg_profile)
+    // 常驻服务不接受 CLI 特性集合：显式清空，避免跨请求残留上一次的 feature。
+    cfgpre.set_features("")
     var pruned = cfgpre.preprocess(src, cfg_target, cfg_profile)
     if tie.support::has_prefix(str.clone(pruned), "ERR:") {
         dbgem.set_err_proto(pruned)

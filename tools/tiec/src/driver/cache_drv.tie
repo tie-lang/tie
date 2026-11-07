@@ -186,6 +186,8 @@ pub func dep_cache_key() -> string {
     // 检查恒开（规范 8.5 不可关闭）⇒ 缓存键固定 C1。保留该标记是有意的：
     // 旧缓存写的是 C0，标记不同即自动失效，不会误命中「无检查」的旧产物。
     m = m + "\nC1"
+    // 条件编译特性集合决定 #cfg 裁剪结果，必须进键；两处逐字段对齐。
+    m = m + "\nFT" + g_features
     m = m + "\nv" + compiler_ident()
     return "tc" + to_string(str_hash(m))
 }
@@ -558,6 +560,8 @@ pub func cache_key_str(src: string) -> string {
     // 检查恒开（规范 8.5 不可关闭）⇒ 缓存键固定 C1。保留该标记是有意的：
     // 旧缓存写的是 C0，标记不同即自动失效，不会误命中「无检查」的旧产物。
     m = m + "\nC1"
+    // 条件编译特性集合决定 #cfg 裁剪结果，必须进键；两处逐字段对齐。
+    m = m + "\nFT" + g_features
     m = m + "\nv" + compiler_ident()
     return "tc" + to_string(str_hash(m))
 }
@@ -624,7 +628,8 @@ pub func mod_slice_key(p: string, fp: string, topt: i64) -> string {
     if g_noconc {
         q = "|Q1"
     }
-    return "tm" + to_string(str_hash(p + "|" + fp + "|" + compiler_ident() + "|M" + to_string(topt) + "|TG" + g_target + "|R" + k_g_src + q))
+    // FT：特性集合影响 #cfg 裁剪后的源码，片段不可跨集合复用。
+    return "tm" + to_string(str_hash(p + "|" + fp + "|" + compiler_ident() + "|M" + to_string(topt) + "|TG" + g_target + "|R" + k_g_src + q + "|FT" + g_features))
 }
 
 // p.9.21.9：全部模块片段命中 → 返回路径表（模块序 = dep_depset 序）；
