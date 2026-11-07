@@ -1080,11 +1080,19 @@ func main() -> i64 {
 
     // 收集文件：compiler/**/*.tie + prep/pkg/repl
     var dirs: table<string> = table_new_string()
+    // 扫描范围必须覆盖**全部**含诊断消息的源码目录：整合到 lib/* 之后，
+    // codegen / ast / sema 里也有大量 set_err，漏扫会让这些诊断失去码号、
+    // 运行时落 E00000 兜底（实测漏扫时 926 → 819，少 107 条）。
     table_push(dirs, g_root + "\\lib\\front")
     table_push(dirs, g_root + "\\lib\\backend")
+    table_push(dirs, g_root + "\\lib\\codegen")
     table_push(dirs, g_root + "\\lib\\ir")
+    table_push(dirs, g_root + "\\lib\\ast")
+    table_push(dirs, g_root + "\\lib\\sema")
     table_push(dirs, g_root + "\\lib\\support")
     table_push(dirs, g_root + "\\lib\\diag")
+    table_push(dirs, g_root + "\\lib\\jit")
+    table_push(dirs, g_root + "\\lib\\rt")
     table_push(dirs, g_root + "\\tools\\tiec\\src")
     if fs.exists(g_root + "\\prep") {
         table_push(dirs, g_root + "\\prep")
