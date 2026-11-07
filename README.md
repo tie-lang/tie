@@ -43,9 +43,10 @@ export TIE_LIB_ROOT=$PWD
 (cd lib/rt && ../../_local_only/bin/tiec.exe src/trm_lite.run.tie -o trm_lite.a --no-warn)
 export TIE_TRM_LITE_LIB=$PWD/lib/rt/trm_lite.a
 
-# 2. LLVM-C 薄垫片（C ABI）
+# 2. LLVM-C 薄垫片（C ABI）；LLVM_PREFIX 指向本机 LLVM 安装根
+LLVM_PREFIX=${LLVM_PREFIX:-<LLVM 安装根>}
 clang -shared -O2 lib/jit/tiej_llvm.c \
-      -I D:/LLVM/include -L D:/LLVM/lib -lLLVM-C \
+      -I "$LLVM_PREFIX/include" -L "$LLVM_PREFIX/lib" -lLLVM-C \
       -o _local_only/bin/tiej_llvm.dll
 
 # 3. JIT 驱动
@@ -59,10 +60,13 @@ _local_only/bin/backend_probe.exe
 
 ## 当前能力
 
-`lib/ir` + `lib/backend` + `lib/jit` + `tools/tiej`：
-tieir（函数 / 参数 / add·sub·mul / ret）→ LLVM 文本 → LLJIT → 查符号 → 调用。
+`tools/tiec` 是完整编译器源码，按 `lib/*` 分层装配（前端 / 中端 IR / 后端），
+可直接编译并运行 `std/`、`sys/`、`ext/`、`rdu/` 下的库与常规程序；它同时是自举的，
+用仓内 `tiec` 即可编译自身。`_local_only/probes/tests/` 保留编译器回归用例。
 
-`tools/tiec` 是完整编译器源码；`std/` 是它的标准库根；`_local_only/probes/tests/` 保留编译器回归用例。
+`lib/ir` + `lib/backend` + `lib/jit` + `tools/tiej` 另有一条最小 JIT 自检通道：
+tieir（函数 / 参数 / add·sub·mul / ret）→ LLVM 文本 → LLJIT → 查符号 → 调用。
+这是后端能力的冒烟闭环，不是编译器的能力边界。
 
 ## 许可
 
