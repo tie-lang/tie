@@ -34,6 +34,13 @@ pub func no_concurrency() -> bool {
 // 段 1 前端：词法 + 语法 + 语义（含 import）。失败返回 1（frontend 内部已
 // 打印诊断，wrapper 不重复打印）。
 pub func kpass_front() -> i64 {
+    // TIEC_INC=1 时打印本单元启用的编译期技术，便于核对 t 轴成本分级。
+    if get_env("TIEC_INC") == "1" {
+        var lvl = effective_tie_opt()
+        dbg_txt("TIER t" + to_string(lvl) + " frag=" + to_string(tier_frag_cache()) +
+            " asm=" + to_string(tier_assembly()) +
+            " analysis=" + to_string(tier_analysis_cache()))
+    }
     if frontend(k_g_src, k_g_base_dir) < 0 {
         return 1
     }
@@ -72,7 +79,8 @@ pub func kpass_irgen() -> i64 {
     // 有 lazy/eager 导入标注时禁用装配：片段序列化不含函数属性三列，装配
     // 后标记会丢失，根集合可能被误判而裁掉按名查找的符号。降级全量 irgen
     // 只损失这类单元的增量构建速度，换取绝对正确的产物。
-    if cache_enabled() && !g_emit_ir && !sstate.has_import_mod() {
+    // t2 起才启用装配路径（编译期技术按成本分级，策略不进缓存键）。
+    if cache_enabled() && tier_assembly() && !g_emit_ir && !sstate.has_import_mod() {
         var ap = modcache_assembly_paths()
         if len(ap) > 0 {
             var order = asm_build_order()
@@ -169,7 +177,9 @@ pub func kpass_irgen() -> i64 {
     // p.9.21.8 池过滤落地后**默认开**（片段池 = 引用过滤 + 保序压缩，
     // 写放大消除）；片段写入失败只损失该模块片段，编译不受影响
     //（单元级缓存与产物链路零改动）。
-    if cache_enabled() {
+    // t1 起才做片段写入与命中检查：逐文件指纹 + 片段落盘属单遍线性成本，
+    // t0（零 pass 直出、最快反馈）跳过它；聚合产物缓存仍恒开。
+    if cache_enabled() && tier_frag_cache() {
         var af = mod_attribution_fill()
         if af == 0 {
             var mc = mod_cache_update()
@@ -250,7 +260,61 @@ func asm_side_recover() -> i64 {
     if tieir.asm_flag_wsock() {
         g_used_wsock = true
     }
+    // 聚合类型表完备性校验（必须）：tuple 的字段表 tup_offs/tup_n/tup_tys 是
+    // irgen 期在遇到元组类型时**惰性注册**的，装配路径跳过 irgen ⇒ 表为空，
+    // 而片段 IR 里仍带 BASE_TUPLE 类型 id，llvmgen 取字段类型时越界（实测
+    // 报 `OOB llvmgen::llvm_ty [tup_offs] idx 0 len 0`，响亮失败但 t2 反而
+    // 编不过）。此处按「IR 里出现的 tuple 类型 id 是否都能在表里找到」判定，
+    // 覆盖不到就降级全量——宁可贵，不可错。
+    if !asm_types_ready() {
+        asm_recover_err = "装配后聚合类型表不完整（tuple 字段表为空或越界）"
+        return -1
+    }
     return 0
+}
+
+// 装配后类型表完备性：扫描全部函数签名与指令结果类型，凡出现 tuple 类型 id
+// 者，要求其下标落在 tup_offs 的有效范围内。返回 false = 表不完整，须降级。
+func asm_types_ready() -> bool {
+    var nf = ir.func_count()
+    var i: i64 = 0
+    while i < nf {
+        if !asm_ty_ok(ir.func_ret(i)) {
+            return false
+        }
+        var np = ir.func_params_cnt(i)
+        var p: i64 = 0
+        while p < np {
+            if !asm_ty_ok(ir.func_param_ty(i, p)) {
+                return false
+            }
+            p = p + 1
+        }
+        i = i + 1
+    }
+    var ni = ir.inst_count()
+    var k: i64 = 0
+    while k < ni {
+        if !asm_ty_ok(ir.ins_ty(k)) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// 单个类型 id 是否可用：只校验 tuple（其余聚合类型的元数据在 types 表内，
+// 不依赖 irgen 期注册）。t < BASE_TUPLE 的标量类型恒可用。
+func asm_ty_ok(t: i64) -> bool {
+    if t < types.BASE_TUPLE {
+        return true
+    }
+    // tuple 类型 id 区间 = [BASE_TUPLE, BASE_ENUM)（见 types.tie 的区间常量）。
+    if t < types.BASE_ENUM {
+        var idx = t - types.BASE_TUPLE
+        return idx >= 0 && idx < len(types.tup_offs)
+    }
+    return true
 }
 
 // 前缀判定（str 无 starts_with 内置；逐码点比对）

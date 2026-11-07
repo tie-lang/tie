@@ -606,6 +606,30 @@ pub func cache_enabled() -> bool {
     return str_len(cache_dir_value()) > 0
 }
 
+// ==================== 编译期技术按 t 轴成本分级 ====================
+// 这些技术**不改变产物代码**，只改变编译耗时与内存，因此是编译期策略，
+// 一律不进缓存键（键里只保留影响 IR 的因素，如 t 档对应的 pass 集合）。
+//
+//  恒开（含 t0）：依赖集指纹、聚合产物缓存查找/写入、缓存目录解析、
+//                 单遍读文件、诊断聚合——近零成本且恒有益，恒开才不会让
+//                 最低档反而更慢。
+//  t1：模块级 tieir 片段写入与命中检查、增量失效判定（单遍线性）。
+//  t2：片段装配路径（跳过 irgen，需副作用恢复；收益最大、风险最高）。
+//  t3：预留跨构建持久化分析缓存与剖析驱动的复用决策。
+//
+// 分级只控制「额外开销换额外收益」的部分；同一源码在任意档位下产物逐字节一致。
+pub func tier_frag_cache() -> bool {
+    return effective_tie_opt() >= 1
+}
+
+pub func tier_assembly() -> bool {
+    return effective_tie_opt() >= 2
+}
+
+pub func tier_analysis_cache() -> bool {
+    return effective_tie_opt() >= 3
+}
+
 // ==================== p.9.21.6-2 模块级 tieir 片段缓存 ====================
 // 模块 = import 的文件（主文件 = 0，导入文件按展开顺序 1..k）。irgen + pass
 // 管道完成后，按模块写/命中标准格式 tieir 片段（tieir.write_mod_slice）。
