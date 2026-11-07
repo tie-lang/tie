@@ -13,7 +13,7 @@ pub func cache_dir_value() -> string {
     if g_cfg_root >= 0 {
         var d = config.get_str(g_cfg_root, "cache.dir")
         if str_len(d) > 0 {
-            return cache_sep(d)
+            return d
         }
     }
     var home = get_env("USERPROFILE")
@@ -23,27 +23,7 @@ pub func cache_dir_value() -> string {
     if str_len(home) == 0 {
         return ""
     }
-    return cache_sep(home) + "/.tiec-cache"
-}
-
-// 反斜杠统一成正斜杠：Windows 的 USERPROFILE 自带 `\`，与后续拼接的 `/`
-// 混用会得到 `C:\Users\x/.tiec-cache/mods/...` 这种混合形态——实测同一路径
-// 外部判存在、编译器进程内 file_exists 判不存在，导致模块片段每次都重写
-//（命中判定失效）。统一成正斜杠后与 Linux 同形，规避该问题。
-func cache_sep(d: string) -> string {
-    var sb = string_builder()
-    var i: i64 = 0
-    var n = str_len(d)
-    while i < n {
-        var c = str_byte(d, i)
-        if c == 92 {   // '\'
-            sb_append_byte(sb, 47)   // '/'
-        } else {
-            sb_append_byte(sb, c)
-        }
-        i = i + 1
-    }
-    return sb_build(sb)
+    return home + "/.tiec-cache"
 }
 
 // 依赖集 = 入口源码路径（g_input，规范绝对）+ semantic.imported_paths()
@@ -661,11 +641,14 @@ pub func tier_analysis_cache() -> bool {
 // 写放大消除——模块缓存**默认开**（无需 TIEC_MODCACHE）。
 
 // p.9.21.9：片段缓存键（写入与装配命中判定共用；键不含 IR，irgen 前可判）。
-// p.9.21.11：键加入**单元根**（主源路径 k_g_src）——模块 IR 含上下文相关的
-// 泛型展开（任一调用方模块实例化的展开归属到模板来源模块），同一模块在不同
-// 根单元下的片段字节不同；键不含根会跨上下文污染（实测：regress 测试工程写
-// 的 std/string.tie 片段被 driver 装配命中，其 test::expect_eq 展开引用的
-// test::expect 在 driver 单元无定义 → opt 报 use of undefined value）。
+// p.9.21.11：键加入**单元根路径**——模块 IR 含上下文相关的泛型展开（任一调用
+// 方模块实例化的展开归属到模板来源模块），同一模块在不同根单元下的片段字节
+// 不同；键不含根会跨上下文污染（实测：regress 测试工程写的 std/string.tie 片段
+// 被 driver 装配命中，其 test::expect_eq 展开引用的 test::expect 在 driver 单元
+// 无定义 → opt 报 use of undefined value）。
+// ⚠ 这里必须用**根单元的路径**（g_input），不能用 k_g_src —— 后者存的是根源
+// 文件的**内容**（不是路径）。早期把 k_g_src 织进键，导致改根文件任意一个字符
+// 就让**全部模块**的片段键一起失效（实测 6/6 重写、片段缓存等于没开）。
 pub func mod_slice_key(p: string, fp: string, topt: i64) -> string {
     // Q：并发缺席标记（见 dep_cache_key）——片段里是否免锁由它决定，键必须织入。
     var q = "|Q0"
@@ -673,7 +656,17 @@ pub func mod_slice_key(p: string, fp: string, topt: i64) -> string {
         q = "|Q1"
     }
     // FT：特性集合影响 #cfg 裁剪后的源码，片段不可跨集合复用。
-    return "tm" + to_string(str_hash(p + "|" + fp + "|" + compiler_ident() + "|M" + to_string(topt) + "|TG" + g_target + "|R" + k_g_src + q + "|FT" + g_features))
+    var raw = p + "|" + fp + "|" + compiler_ident() + "|M" + to_string(topt) +
+        "|TG" + g_target + "|R" + g_input + q + "|FT" + g_features
+    var key = "tm" + to_string(str_hash(raw))
+    // TIEC_INC=1：把**同一次计算**的 raw 与 key 一起打印（排查键漂移用；
+    // 逐字段打印容易漏字段，曾经漏掉 Q 段）。
+    if get_env("TIEC_INC") == "1" {
+        dbg_txt("MODRAW " + p + " => " + key + " rawlen=" + to_string(str_len(raw)) +
+            " ftlen=" + to_string(str_len(g_features)) +
+            " rootlen=" + to_string(str_len(g_input)) + " | " + raw)
+    }
+    return key
 }
 
 // p.9.21.9：全部模块片段命中 → 返回路径表（模块序 = dep_depset 序）；
@@ -750,6 +743,13 @@ pub func mod_cache_update() -> i64 {
         var fp = dep_file_fp(p)
         var key = mod_slice_key(p, fp, topt)
         var frag = cdir + "/" + key + ".tir"
+        // TIEC_INC=1：交叉判定同一条路径——file_exists 与 file_read 若给
+        // 出相反结论，说明存在性判据本身有问题（排查片段重复写用）。
+        if get_env("TIEC_INC") == "1" {
+            var fr0 = file_read(frag)
+            dbg_txt("MODCHK exists=" + to_string(file_exists(frag)) +
+                " readlen=" + to_string(str_len(fr0)) + " path=" + frag)
+        }
         if file_exists(frag) {
             hits = hits + 1
         } else {
