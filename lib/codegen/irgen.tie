@@ -784,8 +784,11 @@ func gen_one_lazy_init(nid: i64, node: i64, ty: i64) -> i64 {
     ir.add_operand(ex, 1, 2)
     var exv = ir.get_value(ex)
     tig_ext_call1("exit", exv, types.named(TK_I64), -1)
-    var rte = ir.new_inst(be, 32, -1)                    // 不可达，仅终结块
-    ir.add_operand(rte, exv, 0)
+    // 用「跳自己」终结该块：exit 永不返回，这条 br 不可达。不能写成
+    // `ret <const_i 的结果>` —— const_i 不发射独立指令（使用点内联成
+    // 立即数），ret 引用它会得到 undefined value（LLVM opt 报错）。
+    var rte = ir.new_inst(be, 30, -1)                    // br（30）
+    ir.add_operand(rte, be, 1)
     return 0
 }
 

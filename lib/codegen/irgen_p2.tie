@@ -375,6 +375,15 @@ func tig_global_var(s: i64, full: string) -> i64 {
         ty = types.named(TK_I64)  // 无标注：语义已推断，兜底 i64
     }
     var telem = sinfer.gb_telem_of(intern.intern(nm))
+    // 类型检查必须放在**所有分支之前**：表全局走下面的 `global_table_reg`
+    // 分支、不进标量 else，放在 else 里会让 `lazy var` 表静默退化成入口建表
+    // （值对、时机不对，最难察觉）。裸 `var` 不受影响（aux != 1）。
+    if ast.s_aux(s) == 1 && !scalar_init_deferred_ok(ty) {
+        // 只剩表/容器不支持（需另建表生命周期与 RC）。提示去掉前缀：
+        // `var` 不带修饰即入口求值，是最自然的写法；`eager var` 只是显式重申。
+        sm_err_msg = "lazy var '" + nm + "' 不支持表/容器类型（需另建表生命周期与引用计数）——去掉 lazy 前缀即可按入口求值"
+        return -1
+    }
     // p.9.12.6 边界：全局行池 table<R> v1 不支持（列式行池需每字段列 @g 全局，成本高，
     // 先局部；显式拒绝，不静默降级为单表语义）
     if types.is_table(ty) {
@@ -400,18 +409,14 @@ func tig_global_var(s: i64, full: string) -> i64 {
         // 正/负整数初值全丢；②负字面量（UNARY 取负）折叠为 0；③字符串初值直传
         // 原始 lexeme（带引号未反转义）且拼接/算术表达式不折叠。
         // r.1.1.2 扩展：bool/char/浮点（含负浮点）字面量初值同样折叠落位。
-        // lazy 全局（`lazy var`）：初值不在入口求值，改由 tie_lazy_<name>()
-        // 在首次读时求值一次；标志全局同时登记（i64，0 = 未初始化）。
-        // 只支持数值/bool/char/trit——字符串/表/聚合涉及 RC 与容器构造，
-        // 不在首版范围（与计算型初值物化保持同一安全边界）。
+        // `lazy` / `eager` 都是**可选修饰符**：裸 `var`（无前缀）就是默认行为
+        // ——初值在入口求值，与改造前完全一致，各类型都支持。`lazy` 才引入
+        // 惰性守卫，`eager` 只是把默认语义显式写出来。
+        //
+        // lazy 全局：初值不在入口求值，改由 tie_lazy_<name>() 在首次读时求值
+        // 一次；标志全局同时登记（i64，三态 0/1/2）。只支持数值/bool/char/trit
+        // ——字符串/表/聚合涉及 RC 与容器构造，不在首版范围。
         var is_lazy = false
-        // `lazy var` 用在不支持的类型上时**响亮拒绝**：字符串/表/聚合的惰性
-        // 物化需要一并处理引用计数与容器构造，静默退化成入口求值会让副作用
-        // 时机与用户预期不符（值对、时机不对，最难察觉）。
-        if ast.s_aux(s) == 1 && !scalar_init_deferred_ok(ty) {
-            sm_err_msg = "lazy var '" + nm + "' 暂只支持数值/bool/char/trit（字符串与表/聚合需要处理引用计数，请改用 eager var）"
-            return -1
-        }
         if ast.s_aux(s) == 1 && scalar_init_deferred_ok(ty) {
             var linit = sstate.child(s, 1)
             if linit >= 0 {
@@ -456,7 +461,7 @@ func tig_global_var(s: i64, full: string) -> i64 {
         // 静态折叠——登记到聚合 init 列表，main 入口求值存回（槽零初始化兜底）。
         // 与"表全局 main 入口创建"同构。
         var gk2 = types.kind(ty)
-        if gk2 == K_STRUCT || gk2 == K_ENUM {
+        if !is_lazy && (gk2 == K_STRUCT || gk2 == K_ENUM) {
             var ainit = sstate.child(s, 1)
             if ainit >= 0 {
                 table_push(g_agginit_names, intern.intern(nm))
@@ -472,14 +477,23 @@ func tig_global_var(s: i64, full: string) -> i64 {
     }
 }
 
-// 计算型初值可延后到入口求值的标量类型：数值 / bool / char / trit。
-// 字符串与表、聚合类型不在此列——字符串全局赋值涉及引用计数与 SSO 语义，
-// 延后物化需要一并处理 RC，超出本次修复范围（仍是已知限制）。
+// 初值可延后求值的全局类型（`lazy var` 与计算型初值物化共用）。
+//   - 数值 / bool / char / trit / string：槽是标量或 ptr，直接 store；
+//   - struct / enum：槽是聚合，`store %agg` 合法，`volatile_load` 也能读回；
+//   - **表不在此列**：表全局要在入口建表句柄并参与 `g_ginit` 的元素填充与
+//     引用计数，惰性物化需要另建一套表生命周期管理，暂明确拒绝。
 func scalar_init_deferred_ok(ty: i64) -> bool {
     if ty == types.TK_I64 || ty == types.TK_F32 || ty == types.TK_F64 {
         return true
     }
     if ty == types.TK_BOOL || ty == types.TK_CHAR || ty == types.TK_TRIT {
+        return true
+    }
+    if ty == types.TK_STR {
+        return true
+    }
+    var k = types.kind(ty)
+    if k == K_STRUCT || k == K_ENUM {
         return true
     }
     return false
