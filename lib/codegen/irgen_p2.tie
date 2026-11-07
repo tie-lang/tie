@@ -409,6 +409,17 @@ func tig_global_var(s: i64, full: string) -> i64 {
             } else {
                 llvmgen.global_scalar_init(nm, hv)
             }
+        } else if (ast.s_val(s) & 1) == 0 && scalar_init_deferred_ok(ty) {
+            // 计算型 var 初值（如 `var g: i64 = helper()`）无法静态折叠。
+            // 此前静默跳过 ⇒ @g 恒为 0，初值丢失且零诊断（静默正确性错误）。
+            // 改为登记到 main 入口（--shared 走 tie$rt_init）求值存回，
+            // 与聚合初值、表全局初始化同构。
+            var cinit = sstate.child(s, 1)
+            if cinit >= 0 {
+                table_push(g_agginit_names, intern.intern(nm))
+                table_push(g_agginit_nodes, cinit)
+                table_push(g_agginit_tys, ty)
+            }
         }
         // 2026-10-13 聚合全局初值物化：struct/enum 初值（构造器/调用形态）无法
         // 静态折叠——登记到聚合 init 列表，main 入口求值存回（槽零初始化兜底）。
@@ -428,6 +439,19 @@ func tig_global_var(s: i64, full: string) -> i64 {
     if gdk != 0 {
         llvmgen.global_attr_put(nm, gdk, sstate.decl_attr_arg(s), sstate.decl_attr_sec(s))
     }
+}
+
+// 计算型初值可延后到入口求值的标量类型：数值 / bool / char / trit。
+// 字符串与表、聚合类型不在此列——字符串全局赋值涉及引用计数与 SSO 语义，
+// 延后物化需要一并处理 RC，超出本次修复范围（仍是已知限制）。
+func scalar_init_deferred_ok(ty: i64) -> bool {
+    if ty == types.TK_I64 || ty == types.TK_F32 || ty == types.TK_F64 {
+        return true
+    }
+    if ty == types.TK_BOOL || ty == types.TK_CHAR || ty == types.TK_TRIT {
+        return true
+    }
+    return false
 }
 
 // 命名空间递归：生成体内全部函数（全名 = prefix::函数名）。
