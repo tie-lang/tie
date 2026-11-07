@@ -268,9 +268,19 @@ pub func global_ptr_fn_reg(nm: string, fn_nm: string) {
 pub var g_entry_name: string = "";
 // UEFI 模式：MSVC 目标下 clang 会引用 `_fltused`（浮点使用标记），无 CRT 时需自行定义。
 pub var g_uefi_mode: bool = false;
+// 未引用声明裁剪：默认开启。编译器不自己删 IR 函数，只把「无法证明对外可见」
+// 的函数标 internal，可达闭包由 LLVM GlobalDCE 按引用关系计算——vtable 全局、
+// @llvm.used、函数地址、call 目标都会自动保住对应符号，天然 fail-safe。
+// 显式对外的根（入口 / 声明属性 / 导出白名单 / 动态库导出面）保持 external。
+// 产物需要被外部链接的模式（shared / obj / freestanding / uefi / tieir）由
+// driver 关闭，TIE_NO_DCE=1 可整体回退，用于对照验证。
+pub var g_prune_dead: bool = true;
 
 pub func set_uefi_mode(v: bool) {
     g_uefi_mode = v
+}
+pub func set_prune_dead(v: bool) {
+    g_prune_dead = v
 }
 pub func set_entry(n: string) {
     g_entry_name = n
@@ -407,6 +417,13 @@ pub func reset_global_regs() {
     g_vt_off = table_new_i64()
     g_vt_syms = table_new_i64()
     call_syms = table_new_i64()
+    // 全局声明属性四张平行表也必须同批清：漏了它们，常驻服务的下一单元
+    // 会把上一单元的 #[used] / #[link_section] 残留带进 @llvm.used 与段归属，
+    // 产生指向不存在符号的根，破坏未引用声明裁剪的根集合正确性。
+    g_gattr_names = table_new_i64()
+    g_gattr_bits = table_new_i64()
+    g_gattr_args = table_new_i64()
+    g_gattr_secs = table_new_i64()
     g_linux_args = 0
 }
 

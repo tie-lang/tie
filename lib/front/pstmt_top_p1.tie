@@ -224,11 +224,15 @@ func parse_generic_attr() -> i64 {
     putil.advance()
     // 驱动/固件声明属性：单段名（无命名空间点）。与 unsafe 凭据属性共用
     // 同一 `#[]` 通道；本组属性由语义层转交 IR，最终在 llvmgen 发射。
-    //   #[no_mangle] / #[used]
+    //   #[no_mangle] / #[used] / #[keep]
     //   #[export_name("sym")] / #[link_section("sec")]
+    // #[keep] 是 #[used] 的同义别名：绝大多数「必须保留」的声明由编译器
+    // 从导出属性、白名单、虚表与函数值取用自动推导，只有外部进程用运行时
+    // 拼出的字符串按名查找这类不可判定场景才需要显式写。两者共用位 2，
+    // 不新增属性位。
     if putil.peek_tag() != lex_dot {
         var anm = interner.lookup(ns)
-        if anm == "no_mangle" || anm == "used" {
+        if anm == "no_mangle" || anm == "used" || anm == "keep" {
             if !putil.expect(lex_rbracket, "']'") {
                 return -1
             }

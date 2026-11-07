@@ -251,8 +251,11 @@ pub func run_unit() -> i64 {
         // 置位 g_shared（.dll/.so 扩展名触发的动态库模式也要让后续分派识别）
         g_shared = true
         irgen.set_dynlib(true)
-        irgen.set_dll_export(g_dll_export_cli)
     }
+    // 导出白名单无条件注入：动态库模式下由 irgen 过滤导出面；普通可执行
+    // 产物下由 llvmgen 把它当作「按名查找的根」保持 external，避免未引用
+    // 声明裁剪删掉外部进程要按名解析的符号。
+    irgen.set_dll_export(g_dll_export_cli)
     // S3.1 构建配置：分层合并（内置默认 < 用户 config < 项目 config < profile < CLI；
     // 已由角色注册表预加载时（scan_header 前）直接复用，避免重复解析文件）
     if !g_cfg_loaded {

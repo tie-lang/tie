@@ -448,6 +448,13 @@ pub func kpass_emit() -> i64 {
     if g_uefi {
         llvmgen.set_uefi_mode(true)
     }
+    // 未引用声明裁剪：产物需要被外部按名链接时一律关闭，避免内部符号
+    // 被标 internal 后其他目标文件找不到。TIE_NO_DCE=1 用于对照验证。
+    var prune = !g_shared && !g_emit_obj && !g_freestanding && !g_uefi && !g_emit_ir
+    if get_env("TIE_NO_DCE") == "1" {
+        prune = false
+    }
+    llvmgen.set_prune_dead(prune)
     var ll_text = tie.backend::render(ir.ctx_current())
     unsafe {
         var t3e = clock()

@@ -59,6 +59,69 @@ pub func sym_of_name(nid: i64) -> string {
     return ns_replace(intern.lookup(nid))
 }
 
+// --dll-export 白名单命中判定（逗号分隔的发射符号名）。与 irgen 侧的
+// dll_export_hit 分工不同：这里比较的是已经过声明属性改名的发射符号，
+// 更贴近链接器实际看到的名字，且普通可执行产物下同样生效。
+func dll_export_hit_sym(sym: string) -> bool {
+    if str_len(g_dll_export) == 0 {
+        return false
+    }
+    var m = str_len(g_dll_export)
+    var st: i64 = 0
+    var j: i64 = 0
+    while j <= m {
+        if j == m || str_byte(g_dll_export, j) == 44 {
+            var seg = j - st
+            if seg == str_len(sym) {
+                var eq = true
+                var k: i64 = 0
+                while k < seg {
+                    if str_byte(g_dll_export, st + k) != str_byte(sym, k) {
+                        eq = false
+                        break
+                    }
+                    k = k + 1
+                }
+                if eq {
+                    return true
+                }
+            }
+            st = j + 1
+        }
+        j = j + 1
+    }
+    return false
+}
+
+// 判断函数是否为「对外可见根」。根保持 external，其余函数标 internal，
+// 可达闭包由 LLVM GlobalDCE 按引用关系计算：vtable 全局常量、@llvm.used、
+// 函数地址（ptrtoint）、call 目标都会自动保住对应符号，编译器无需自己
+// 证明可达性。判据只取编译器能静态证明的信息，证明不了的一律当根。
+func is_export_root(fid: i64, sym: string) -> bool {
+    // 入口：main 或 --entry 指定的函数，链接器必须按名找到
+    if sym == "main" {
+        return true
+    }
+    if str_len(g_entry_name) > 0 {
+        if intern.lookup(ir.func_name(fid)) == g_entry_name {
+            return true
+        }
+    }
+    // 显式对外声明属性：no_mangle / used（含 keep 别名）/ export_name / link_section
+    if ir.func_attr(fid) != 0 {
+        return true
+    }
+    // 动态库导出面：dllexport 的函数必须外部可见
+    if g_dynlib && ir.func_exported(fid) == 1 {
+        return true
+    }
+    // --dll-export 白名单命中
+    if dll_export_hit_sym(sym) {
+        return true
+    }
+    return false
+}
+
 // #[used]：把标注函数登记到 @llvm.used，阻止链接期 --gc-sections 丢弃。
 // 必须在全部函数定义之后调用（符号表已就绪，且 LLVM 要求模块级追加）。
 pub func emit_llvm_used() {
@@ -188,7 +251,15 @@ func gen_func(fid: i64) {
         line("$" + sym + " = comdat any")
         sect = sect + " comdat($" + sym + ")"
     }
-    line("define " + exp_kw + ret_llvm + " @" + sym + "(" + params_llvm + ")" + inl_kw + sect + " {")
+    // 未引用声明裁剪：非根函数标 internal，交给 LLVM GlobalDCE 按引用闭包删除。
+    // 只改链接属性，不删 IR 函数、不改指令、不动诊断，因此产物语义不变；
+    // 根集合与 -t 档无关，裁剪收益由 LLVM 优化档决定（-O0 保留局部符号）。
+    // 产物需被外部链接的模式由 driver 关闭此开关。
+    var link_kw = ""
+    if g_prune_dead && !is_export_root(fid, sym) {
+        link_kw = "internal "
+    }
+    line("define " + link_kw + exp_kw + ret_llvm + " @" + sym + "(" + params_llvm + ")" + inl_kw + sect + " {")
     // F1 增强：临时 alloca 提升到 entry block——本函数全部 alloca（含循环体内
     // 的 ok 槽）前置输出，再对函数体行级重编号解决编号倒挂。流程：
     // 1) 切函数级缓冲 g_fn_lines（line() 重定向）；

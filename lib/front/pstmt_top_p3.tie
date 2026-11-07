@@ -665,6 +665,12 @@ func parse_actor() -> i64 {
         ast.set_val(s, 8)   // val bit3 = has_attr（语义层按属性名查 pending 域）
         g_pending_attr = 0
     }
+    // 驱动/固件声明属性位集同样在此消费清零。actor 不使用这组属性，
+    // 但不清会残留到下一声明，把 #[used] 误标成别处的保留根，
+    // 导致未引用声明裁剪把无关函数判为对外可见。
+    g_pending_attr_arg = 0
+    g_pending_attr_sec = 0
+    g_pending_attr_bits = 0
     return s
 }
 
