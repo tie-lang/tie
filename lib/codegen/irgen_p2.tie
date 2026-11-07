@@ -405,6 +405,13 @@ func tig_global_var(s: i64, full: string) -> i64 {
         // 只支持数值/bool/char/trit——字符串/表/聚合涉及 RC 与容器构造，
         // 不在首版范围（与计算型初值物化保持同一安全边界）。
         var is_lazy = false
+        // `lazy var` 用在不支持的类型上时**响亮拒绝**：字符串/表/聚合的惰性
+        // 物化需要一并处理引用计数与容器构造，静默退化成入口求值会让副作用
+        // 时机与用户预期不符（值对、时机不对，最难察觉）。
+        if ast.s_aux(s) == 1 && !scalar_init_deferred_ok(ty) {
+            sm_err_msg = "lazy var '" + nm + "' 暂只支持数值/bool/char/trit（字符串与表/聚合需要处理引用计数，请改用 eager var）"
+            return -1
+        }
         if ast.s_aux(s) == 1 && scalar_init_deferred_ok(ty) {
             var linit = sstate.child(s, 1)
             if linit >= 0 {
