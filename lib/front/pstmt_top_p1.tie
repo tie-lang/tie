@@ -643,7 +643,17 @@ func parse_import() -> i64 {
             return -1
         }
     }
-    var nimp = ast.new_node(N_IMPORT, path, is_pub, alias_id, line, col)
+    // 导入时机前缀写进 val 高位：bit1 = lazy / bit2 = eager（bit0 已是 is_pub）。
+    // 前缀由 pstmt_top.parse_program 在识别到「lazy/eager + import」时置位，
+    // 这里消费后立即清零，避免影响后续声明。
+    var imp_val = is_pub
+    if g_pending_import_mod == 1 {
+        imp_val = imp_val + 2
+    } else if g_pending_import_mod == 2 {
+        imp_val = imp_val + 4
+    }
+    g_pending_import_mod = 0
+    var nimp = ast.new_node(N_IMPORT, path, imp_val, alias_id, line, col)
     if len(sel) > 0 {
         ast.set_children(nimp, sel)
     }

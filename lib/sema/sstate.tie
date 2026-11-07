@@ -427,6 +427,44 @@ pub var g_imp_alias_paths: table<string> = [];   // 对应导入路径（归一�
 // expand_imports 推进）。file_id_of_node 对基址二分定位任意节点的来源模块。
 pub var g_file_base: table<i64> = [];    // 文件 id -> 该文件首节点基址（升序；主文件 0）
 pub var g_file_stem: table<string> = []; // 文件 id -> 文件名词干（顶层限定通道，2026-10-12；宏展开文件为空）
+
+// 导入时机标记（按文件 id，与 g_imported 下标 +1 对齐）：0 = 默认半惰性 /
+// 1 = lazy / 2 = eager。由 expand_one_import 在展开时从 N_IMPORT 的 val 高位登记。
+// 主文件恒 0。irgen 据此给来源模块的函数打 IR 标记，llvmgen 据此决定是否
+// 保持 external 或跳过未引用函数。
+pub var g_file_import_mod: table<i64> = [];
+
+pub func reset_file_import_mod() {
+    g_file_import_mod = []
+}
+
+pub func set_file_import_mod(fid: i64, mod: i64) {
+    while len(g_file_import_mod) <= fid {
+        table_push(g_file_import_mod, 0)
+    }
+    g_file_import_mod[fid] = mod
+}
+
+pub func file_import_mod(fid: i64) -> i64 {
+    if fid < 0 || fid >= len(g_file_import_mod) {
+        return 0
+    }
+    return g_file_import_mod[fid]
+}
+
+// 本单元是否存在 lazy/eager 导入标注。装配路径跳过 irgen，而函数属性三列
+// 未进 tieir 片段序列化，标记会在装配后丢失并导致根集合误判；有标注时
+// 由 driver 降级到全量 irgen，保证产物绝对正确。
+pub func has_import_mod() -> bool {
+    var i: i64 = 0
+    while i < len(g_file_import_mod) {
+        if g_file_import_mod[i] != 0 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
 // 程序入口全名（主文件 file id 0 里最后一段为 main 的函数；命名空间内的
 // main 记 "ns::main"）。llvmgen 据此以 C 入口符号 @main 发射。
 pub var g_entry_name: string = "";

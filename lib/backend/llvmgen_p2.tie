@@ -107,9 +107,21 @@ func is_export_root(fid: i64, sym: string) -> bool {
             return true
         }
     }
-    // 显式对外声明属性：no_mangle / used（含 keep 别名）/ export_name / link_section
-    if ir.func_attr(fid) != 0 {
+    var fat = ir.func_attr(fid)
+    // eager 模块（位 32）：整模块全量物化，是 #[keep] / --dll-export 的
+    // 模块级批量形式，供插件、反射、按名查找边界使用。
+    if (fat & 32) == 32 {
         return true
+    }
+    // 显式对外声明属性：no_mangle / used（含 keep 别名）/ export_name / link_section
+    if (fat & 15) != 0 {
+        return true
+    }
+    // lazy 模块（位 16）：作者显式声明该模块不需要被外部按名查找，因此
+    // 白名单与动态库导出面都不提升它。这是纯可见性/成本语义，正文检查
+    // 与诊断集合不受影响；若确实需要对外，改用 eager import 即可。
+    if (fat & 16) == 16 {
+        return false
     }
     // 动态库导出面：dllexport 的函数必须外部可见
     if g_dynlib && ir.func_exported(fid) == 1 {

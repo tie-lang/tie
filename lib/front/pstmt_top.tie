@@ -20,6 +20,12 @@ pub var g_pending_attr_sec: i64 = 0;
 // 驱动/固件声明属性位集：1 no_mangle / 2 used / 4 export_name / 8 link_section
 pub var g_pending_attr_bits: i64 = 0;
 
+// 导入时机前缀（上下文关键字，不进保留字表）：1 = lazy / 2 = eager。
+// 只在「顶层 import 前」按词素文本识别，其余位置 lazy/eager 仍是普通标识符，
+// 避免把生态里已有的同名局部变量（如 std/regex.tie）升成保留字。
+// 由 parse_import 消费后写进 N_IMPORT 的 val 高位并清零。
+pub var g_pending_import_mod: i64 = 0;
+
 // p.9.11 `reentrant`（规范 §10.7）：parse_actor 解析方法期间置 1，供 parse_fn_def
 // 判「reentrant 仅可用于 actor 消息方法」（顶层/普通函数标注解析期即拒绝）。
 pub var g_in_actor_body: i64 = 0;
@@ -72,6 +78,24 @@ pub func parse_program() -> i64 {
     var stmts: table<i64> = table_new_i64()
     var done = false
     while !done {
+        // 每轮先清：前缀只作用于紧随其后那一条 import，绝不跨语句残留。
+        g_pending_import_mod = 0
+        // 导入时机前缀：只在「lazy/eager 紧跟 import」时按词素文本识别为修饰符。
+        // 用 lex_ident 而非新保留字，保证同名标识符（局部变量、函数参数等）
+        // 在其它位置继续可用——上下文关键字不侵占用户命名空间。
+        if putil.peek_tag() == lex_ident {
+            var lx = putil.peek_lexeme()
+            if lx == "lazy" || lx == "eager" {
+                if putil.peek_n(1) == lex_import {
+                    if lx == "lazy" {
+                        g_pending_import_mod = 1
+                    } else {
+                        g_pending_import_mod = 2
+                    }
+                    putil.advance()
+                }
+            }
+        }
         var tag = putil.peek_tag()
         if tag == lex_eof {
             done = true

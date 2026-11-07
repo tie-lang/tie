@@ -69,7 +69,10 @@ pub func kpass_irgen() -> i64 {
     //（响亮打印，不静默）。
     // --emit-ir 取的是「当前源码」的 IR：装配路径跳过 irgen，代码生成期才登记的类型
     // （显式向量段、tuple 字段表）在当前进程中为空表 ⇒ emit 阶段取 LLVM 类型文本越界。
-    if cache_enabled() && !g_emit_ir {
+    // 有 lazy/eager 导入标注时禁用装配：片段序列化不含函数属性三列，装配
+    // 后标记会丢失，根集合可能被误判而裁掉按名查找的符号。降级全量 irgen
+    // 只损失这类单元的增量构建速度，换取绝对正确的产物。
+    if cache_enabled() && !g_emit_ir && !sstate.has_import_mod() {
         var ap = modcache_assembly_paths()
         if len(ap) > 0 {
             var order = asm_build_order()

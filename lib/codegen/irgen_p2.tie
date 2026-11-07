@@ -689,6 +689,16 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
     // 驱动/固件声明属性（#[no_mangle]/#[used]/#[export_name]/#[link_section]）：
     // 前端登记在 sstate 侧表，此处按 AST 节点回填 IR 函数元数据。
     var fat = sstate.decl_attr_kind(fn_node)
+    // 导入时机（按来源文件）：16 = lazy 模块 / 32 = eager 模块。位 1/2/4/8
+    // 已由声明属性占用，高位不干扰 build_sym_map / emit_llvm_used / section 判定。
+    // llvmgen 的 is_export_root 见「任意非零属性即根」，故 eager 位会自动让该
+    // 模块所有函数保持 external；lazy 位由 llvmgen 用于跳过未引用函数。
+    var fimod = sstate.file_import_mod(sstate.file_id_of_node(fn_node))
+    if fimod == 1 {
+        fat = fat + 16
+    } else if fimod == 2 {
+        fat = fat + 32
+    }
     if fat > 0 {
         ir.func_attr_set(fid, fat, sstate.decl_attr_arg(fn_node), sstate.decl_attr_sec(fn_node))
     }
