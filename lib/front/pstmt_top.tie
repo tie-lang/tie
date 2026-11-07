@@ -80,20 +80,25 @@ pub func parse_program() -> i64 {
     while !done {
         // 每轮先清：前缀只作用于紧随其后那一条 import，绝不跨语句残留。
         g_pending_import_mod = 0
-        // 导入时机前缀：只在「lazy/eager 紧跟 import」时按词素文本识别为修饰符。
-        // 用 lex_ident 而非新保留字，保证同名标识符（局部变量、函数参数等）
-        // 在其它位置继续可用——上下文关键字不侵占用户命名空间。
-        // 注：`lazy/eager var` 的求值时机守卫尚未实装（需要在 irgen 期生成带
-        // 条件分支的初始化函数），方案见仓外交接稿——在那之前不引入半成品
-        // 语法，避免「写了 lazy 实际按 eager 执行」掩盖副作用时机。
+        // 时机前缀：只在「lazy/eager 紧跟 import 或 var/const」时按词素文本
+        // 识别为修饰符。用 lex_ident 而非新保留字，保证同名标识符（局部变量、
+        // 函数参数等）在其它位置继续可用——上下文关键字不侵占用户命名空间。
+        g_pending_var_mod = 0
         if putil.peek_tag() == lex_ident {
             var lx = putil.peek_lexeme()
             if lx == "lazy" || lx == "eager" {
-                if putil.peek_n(1) == lex_import {
-                    if lx == "lazy" {
-                        g_pending_import_mod = 1
+                var nxt = putil.peek_n(1)
+                var is_imp = nxt == lex_import
+                var is_var = nxt == lex_var || nxt == lex_const
+                if is_imp || is_var {
+                    var md: i64 = 1
+                    if lx == "eager" {
+                        md = 2
+                    }
+                    if is_imp {
+                        g_pending_import_mod = md
                     } else {
-                        g_pending_import_mod = 2
+                        g_pending_var_mod = md
                     }
                     putil.advance()
                 }

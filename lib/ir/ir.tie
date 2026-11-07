@@ -75,6 +75,35 @@ pub var ir_funcs_inline: table<i64> = [];       // 内联标记（p.9.11.10；0 
 pub var ir_funcs_attr_kind: table<i64> = [];
 pub var ir_funcs_attr_arg: table<i64> = [];
 pub var ir_funcs_attr_sec: table<i64> = [];
+// lazy 全局名单（名字池 id，升序）：这些全局的初值由各自的 tie_lazy_<name>()
+// 首次读时求值。irgen 登记、llvmgen 消费（lib/ir 是双方共享底层，避免
+// llvmgen 反向 import irgen 成环）。只存放名字 id，LLVM 侧据此把 load 换成
+// call、store 后追加标志置位。
+pub var ir_lazy_globals: table<i64> = [];
+
+// 把一个全局名标记为 lazy（幂等）。
+pub func lazy_mark(name_id: i64) {
+    var i: i64 = 0
+    while i < len(ir_lazy_globals) {
+        if ir_lazy_globals[i] == name_id {
+            return
+        }
+        i = i + 1
+    }
+    table_push(ir_lazy_globals, name_id)
+}
+
+// 该全局名是否为 lazy（线性查找；数量极少，Eager 场景为零）。
+pub func lazy_has(name_id: i64) -> bool {
+    var i: i64 = 0
+    while i < len(ir_lazy_globals) {
+        if ir_lazy_globals[i] == name_id {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
 pub var ir_blocks_func: table<i64> = [];        // 块表：所属函数 id
 pub var ir_blocks_name: table<i64> = [];        // 块表：块名（池 id；-1 = 无名字）
 pub var ir_blocks_start: table<i64> = [];       // 块表：指令段起始（含）
@@ -250,6 +279,7 @@ pub func new_module() -> i64 {
     table_trunc(ir_funcs_attr_kind, 0)
     table_trunc(ir_funcs_attr_arg, 0)
     table_trunc(ir_funcs_attr_sec, 0)
+    table_trunc(ir_lazy_globals, 0)
     table_trunc(ir_blocks_func, 0)
     table_trunc(ir_blocks_name, 0)
     table_trunc(ir_blocks_start, 0)

@@ -455,6 +455,22 @@ pub func file_import_mod(fid: i64) -> i64 {
 // 本单元是否存在 lazy/eager 导入标注。装配路径跳过 irgen，而函数属性三列
 // 未进 tieir 片段序列化，标记会在装配后丢失并导致根集合误判；有标注时
 // 由 driver 降级到全量 irgen，保证产物绝对正确。
+// 本单元是否存在 `lazy var` 全局。装配路径跳过 irgen，惰性初始化函数不会
+// 生成、`ir.lazy_globals` 也为空，llvmgen 会退回普通 load 而读到零值——
+// 有 lazy 全局时由 driver 降级全量 irgen，保证产物正确。
+pub func has_lazy_global() -> bool {
+    var i: i64 = 0
+    var n = len(g_extra_tops)
+    while i < n {
+        var s = g_extra_tops[i]
+        if ast.s_tag(s) == 100 && ast.s_aux(s) == 1 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
 pub func has_import_mod() -> bool {
     var i: i64 = 0
     while i < len(g_file_import_mod) {

@@ -114,6 +114,12 @@ pub var g_ginit_nodes: table<i64>;
 pub var g_agginit_names: table<i64>;
 pub var g_agginit_nodes: table<i64>;
 pub var g_agginit_tys: table<i64>;
+// lazy 全局（`lazy var`）：名字池 id / 初值节点 / 类型。这些全局不参与入口
+// 物化，而是各自生成一个 `tie_lazy_<name>()` 惰性初始化函数；llvmgen 在
+// 发射读/写该全局时改为调用该函数 / 追加标志置位。
+pub var g_lazy_names: table<i64>;
+pub var g_lazy_nodes: table<i64>;
+pub var g_lazy_tys: table<i64>;
 // p.6.4.5：程序是否使用了网络原语（net_* 内联 Winsock2 直调）。置位后
 // driver 链接 ws2_32（-lws2_32）；脱离 tie_interp 后独立链，净程序无需桥。
 pub var g_used_wsock: bool = false;
@@ -375,6 +381,9 @@ pub func unit_reset() {
     g_agginit_names = table_new_i64()
     g_agginit_nodes = table_new_i64()
     g_agginit_tys = table_new_i64()
+    g_lazy_names = table_new_i64()
+    g_lazy_nodes = table_new_i64()
+    g_lazy_tys = table_new_i64()
     // 「惰性一次」的单元级缓存：不清则第二单元直接命中第一单元的形状
     //（实测 g_stl_done 残留 ⇒ struct_field_off 越界，index 1 / len 1）。
     g_stl_fbase = table_new_i64()
@@ -444,6 +453,11 @@ pub func tig_ast() -> i64 {
             tig_global_var(s, sstate.name_str(s))
         }
         i = i + 1
+    }
+    // lazy 全局的惰性初始化函数：必须在全部全局登记之后（初值可能引用其他
+    // 全局），且在生成任何用户函数体之前（指令按函数连续，便于重编号）。
+    if gen_lazy_inits() < 0 {
+        return -1
     }
     // 顶层遍历：FnDef（顶层函数）/ Namespace（递归函数体）/ 全局 VarDecl 已登记
     i = 0
@@ -610,6 +624,11 @@ pub func tig_src(src: string, base_dir: string) -> i64 {
         }
         i = i + 1
     }
+    // lazy 全局的惰性初始化函数：必须在全部全局登记之后（初值可能引用其他
+    // 全局），且在生成任何用户函数体之前（指令按函数连续，便于重编号）。
+    if gen_lazy_inits() < 0 {
+        return -1
+    }
     // 顶层遍历：FnDef（顶层函数）/ Namespace（递归函数体）/ 全局 VarDecl 已登记
     i = 0
     while i < n {
@@ -644,6 +663,92 @@ pub func tig_src(src: string, base_dir: string) -> i64 {
 // tig_global_var / tig_ns / tig_fn_def 三个顶层入口 / 函数生成主逻辑。
 // 归属纠偏：这三个函数原被误移入子文件，现迁回主文件顶层入口分区。
 
+
+// ---------- lazy 全局的惰性初始化函数 ----------
+// 为每个 `lazy var` 生成 `tie_lazy_<name>() -> T`：入口读标志 → 未初始化则
+// 求值初值、写槽、置标志 → 汇合后读值返回。llvmgen 在发射对该全局的
+// load 时改调它，store 后追加标志置位（单点覆盖，不依赖 irgen 补点）。
+// 调用时机：全部全局登记之后（初值可能引用其他全局）、函数体生成之前。
+pub func gen_lazy_inits() -> i64 {
+    var saved_fn = g_cur_func
+    var saved_blk = g_cur_block
+    var saved_nm = g_cur_fn_name
+    var i: i64 = 0
+    while i < len(g_lazy_names) {
+        if gen_one_lazy_init(g_lazy_names[i], g_lazy_nodes[i], g_lazy_tys[i]) < 0 {
+            g_cur_func = saved_fn
+            g_cur_block = saved_blk
+            g_cur_fn_name = saved_nm
+            return -1
+        }
+        i = i + 1
+    }
+    g_cur_func = saved_fn
+    g_cur_block = saved_blk
+    g_cur_fn_name = saved_nm
+    return 0
+}
+
+func gen_one_lazy_init(nid: i64, node: i64, ty: i64) -> i64 {
+    // nid 是带 '@' 前缀的全局名（与地址操作数同形态）；去掉后拼标志名，
+    // 再统一按 '@name' 形态登记为全局地址操作数。
+    var full = interner.lookup(nid)
+    var nm = full
+    if str_len(full) > 0 && str_byte(full, 0) == 64 {   // '@'
+        nm = str.slice(full, 1, str_len(full))
+    }
+    var flag = "@" + nm + "$lz"
+    var slot = "@" + nm
+    var params: table<i64> = table_new_i64()
+    var fid = ir.new_func(interner.intern("tie_lazy_" + nm), ty, params)
+    g_cur_func = fid
+    g_cur_fn_name = nm
+    var b0 = ir.new_block(fid, interner.intern("entry"))
+    var bi = ir.new_block(fid, interner.intern("init"))
+    var br = ir.new_block(fid, interner.intern("ret"))
+    // entry：读标志，eq 0 走 init，否则直接 ret
+    g_cur_block = b0
+    var ld = ir.new_inst(b0, 21, types.named(TK_I64))   // load i64 @flag
+    ir.add_operand(ld, interner.intern(flag), 3)
+    var lv = ir.get_value(ld)
+    var cmp = ir.new_inst(b0, 12, types.named(TK_BOOL)) // icmp eq（12，权威见 ks 表）
+    ir.add_operand(cmp, lv, 0)
+    ir.add_operand(cmp, 0, 2)                            // 立即数 0
+    ir.add_operand(cmp, 0, 2)                            // CMP_EQ
+    var cv = ir.get_value(cmp)
+    var cb = ir.new_inst(b0, 31, -1)                     // cond_br（31）
+    ir.add_operand(cb, cv, 0)
+    ir.add_operand(cb, bi, 1)
+    ir.add_operand(cb, br, 1)
+    // init：求值初值 → 写槽 → 置标志 → br ret
+    g_cur_block = bi
+    var v = tig_expr(node)
+    if v < 0 {
+        sm_err_msg = "lazy var '" + nm + "' 的初值求值失败"
+        return -1
+    }
+    var st = ir.new_inst(bi, 22, -1)                     // store T v, ptr @g
+    ir.add_operand(st, ty, 2)
+    ir.add_operand(st, v, 0)
+    ir.add_operand(st, interner.intern(slot), 3)
+    var one = ir.new_inst(bi, 60, types.named(TK_I64))   // const_i 1
+    ir.add_operand(one, 1, 2)
+    var ov = ir.get_value(one)
+    var stf = ir.new_inst(bi, 22, -1)                    // store i64 1, ptr @flag
+    ir.add_operand(stf, types.named(TK_I64), 2)
+    ir.add_operand(stf, ov, 0)
+    ir.add_operand(stf, interner.intern(flag), 3)
+    var b1 = ir.new_inst(bi, 30, -1)                     // br（30）
+    ir.add_operand(b1, br, 1)
+    // ret：读槽并返回
+    g_cur_block = br
+    var ld2 = ir.new_inst(br, 21, ty)
+    ir.add_operand(ld2, interner.intern(slot), 3)
+    var rv = ir.get_value(ld2)
+    var rt = ir.new_inst(br, 32, -1)                     // ret（32）
+    ir.add_operand(rt, rv, 0)
+    return 0
+}
 
 // ---------- 全局表初始化（--shared 缺陷修复）----------
 // 普通 exe 在 main 入口对所有模块表全局预建表句柄（@g = global ptr null → store

@@ -10,6 +10,13 @@ type tie<class>
 // 树式无环：由 pstmt_flow.tie import。
 import "./pexpr.tie"
 
+// 全局 var 求值时机前缀（上下文关键字）：1 = lazy / 2 = eager。
+// 由 pstmt_top 的顶层分派在识别到「lazy|eager 紧跟 var|const」时置位，
+// parse_var_decl 消费后写进 N_VAR_DECL 的 aux（该槽此前恒为 -1）并清零。
+// 定义在本模块（而非 pstmt_top）是因为依赖方向 pstmt_top → pstmt_flow →
+// pstmt，反向不可见。
+pub var g_pending_var_mod: i64 = 0;
+
 namespace pstmt {
 
 // p.9.11.34 短闭包 `t -> expr`（临时单参函数）：**在 fn 类型标注的声明位**把
@@ -127,7 +134,15 @@ pub func parse_var_decl(is_const: i64) -> i64 {
         }
         return -1
     }
-    var v = ast.new_node(N_VAR_DECL, name, is_const, -1, line, col)
+    // 求值时机前缀落 aux：1 = lazy / 2 = eager / -1 = 未标注（保持原约定）。
+    var vmod: i64 = -1
+    if g_pending_var_mod == 1 {
+        vmod = 1
+    } else if g_pending_var_mod == 2 {
+        vmod = 2
+    }
+    g_pending_var_mod = 0
+    var v = ast.new_node(N_VAR_DECL, name, is_const, vmod, line, col)
     var kids: table<i64> = table_new_i64()
     table_push(kids, ty)
     table_push(kids, init)

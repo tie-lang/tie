@@ -80,7 +80,8 @@ pub func kpass_irgen() -> i64 {
     // 后标记会丢失，根集合可能被误判而裁掉按名查找的符号。降级全量 irgen
     // 只损失这类单元的增量构建速度，换取绝对正确的产物。
     // t2 起才启用装配路径（编译期技术按成本分级，策略不进缓存键）。
-    if cache_enabled() && tier_assembly() && !g_emit_ir && !sstate.has_import_mod() {
+    if cache_enabled() && tier_assembly() && !g_emit_ir &&
+        !sstate.has_import_mod() && !sstate.has_lazy_global() {
         var ap = modcache_assembly_paths()
         if len(ap) > 0 {
             var order = asm_build_order()

@@ -400,8 +400,32 @@ func tig_global_var(s: i64, full: string) -> i64 {
         // 正/负整数初值全丢；②负字面量（UNARY 取负）折叠为 0；③字符串初值直传
         // 原始 lexeme（带引号未反转义）且拼接/算术表达式不折叠。
         // r.1.1.2 扩展：bool/char/浮点（含负浮点）字面量初值同样折叠落位。
+        // lazy 全局（`lazy var`）：初值不在入口求值，改由 tie_lazy_<name>()
+        // 在首次读时求值一次；标志全局同时登记（i64，0 = 未初始化）。
+        // 只支持数值/bool/char/trit——字符串/表/聚合涉及 RC 与容器构造，
+        // 不在首版范围（与计算型初值物化保持同一安全边界）。
+        var is_lazy = false
+        if ast.s_aux(s) == 1 && scalar_init_deferred_ok(ty) {
+            var linit = sstate.child(s, 1)
+            if linit >= 0 {
+                table_push(g_lazy_names, intern.intern(nm))
+                table_push(g_lazy_nodes, linit)
+                table_push(g_lazy_tys, ty)
+                // 全局地址操作数统一带 '@' 前缀（见 irgen_builder 的
+                // `interner.intern("@" + name)`），标记必须同形态才匹配得上。
+                ir.lazy_mark(intern.intern("@" + nm))
+                // 标志全局：<name>$lz，i64，初值 0；值槽零初始化就位
+                //（首次读之前不会被观察）。
+                llvmgen.global_scalar_reg(nm + "$lz", types.named(TK_I64))
+                llvmgen.global_scalar_init(nm + "$lz", 0)
+                llvmgen.global_scalar_init(nm, 0)
+                is_lazy = true
+            }
+        }
         var (hf, hstr, hfp, hv, hsid) = global_init_fold(sstate.child(s, 1))
-        if hf {
+        if is_lazy {
+            // 初值交由惰性函数处理，此处不落静态值、也不进入口物化
+        } else if hf {
             if hstr {
                 llvmgen.global_str_init(nm, hsid)
             } else if hfp {
