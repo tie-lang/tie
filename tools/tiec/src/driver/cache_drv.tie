@@ -13,7 +13,7 @@ pub func cache_dir_value() -> string {
     if g_cfg_root >= 0 {
         var d = config.get_str(g_cfg_root, "cache.dir")
         if str_len(d) > 0 {
-            return d
+            return cache_sep(d)
         }
     }
     var home = get_env("USERPROFILE")
@@ -23,7 +23,27 @@ pub func cache_dir_value() -> string {
     if str_len(home) == 0 {
         return ""
     }
-    return home + "/.tiec-cache"
+    return cache_sep(home) + "/.tiec-cache"
+}
+
+// 反斜杠统一成正斜杠：Windows 的 USERPROFILE 自带 `\`，与后续拼接的 `/`
+// 混用会得到 `C:\Users\x/.tiec-cache/mods/...` 这种混合形态——实测同一路径
+// 外部判存在、编译器进程内 file_exists 判不存在，导致模块片段每次都重写
+//（命中判定失效）。统一成正斜杠后与 Linux 同形，规避该问题。
+func cache_sep(d: string) -> string {
+    var sb = string_builder()
+    var i: i64 = 0
+    var n = str_len(d)
+    while i < n {
+        var c = str_byte(d, i)
+        if c == 92 {   // '\'
+            sb_append_byte(sb, 47)   // '/'
+        } else {
+            sb_append_byte(sb, c)
+        }
+        i = i + 1
+    }
+    return sb_build(sb)
 }
 
 // 依赖集 = 入口源码路径（g_input，规范绝对）+ semantic.imported_paths()
