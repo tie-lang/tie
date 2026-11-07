@@ -1016,7 +1016,12 @@ func gn_write_td() {
         i = i + 1
     }
     sb_append(sb, "]\n")
-    file_write(g_root + "\\diagdocs\\diagcodes.data.tie", sb_build(sb))
+    // 机器可读清单是**文档产物**，仓内默认没有 diagdocs/ 目录（按“文档不入库”
+    // 约定），且没有任何运行时消费者——目录不存在时安静跳过，不报
+    // “系统找不到指定的路径”制造噪音。
+    if fs.exists(g_root + "\\diagdocs") {
+        file_write(g_root + "\\diagdocs\\diagcodes.data.tie", sb_build(sb))
+    }
 }
 
 // compiler 目录相对路径。
@@ -1133,7 +1138,7 @@ func main() -> i64 {
     // 写目录 + td 清单
     gn_write_cat()
     gn_write_td()
-    println("[gen-diagcodes.tie] 共 " + to_string(len(g_key)) + " 条诊断；生成 compiler/frontend/diagcode_cat.gen.tie + diagdocs/diagcodes.data.tie")
+    println("[gen-diagcodes.tie] 共 " + to_string(len(g_key)) + " 条诊断；生成 lib/support/diag/diagcode_cat.gen.tie")
     var f1: i64 = 0
     var f2: i64 = 0
     var f3: i64 = 0
@@ -1166,12 +1171,15 @@ func main() -> i64 {
     println("  家族 1: " + to_string(f1) + " | 2: " + to_string(f2) + " | 3: " + to_string(f3) +
         " | 4: " + to_string(f4) + " | 5: " + to_string(f5) + " | 6: " + to_string(f6) +
         " | 7: " + to_string(f7) + " | 9: " + to_string(f9))
-    // 性能敏感读取用 zd 变体：调 tiec --compress-data 产出 diagcodes.zd
-    var zc = exec_code("compiler\\tiec.exe --compress-data diagdocs\\diagcodes.data.tie -o diagdocs\\diagcodes.zd")
-    if zc == 0 {
-        println("[gen-diagcodes.tie] zd 变体已生成: diagdocs/diagcodes.zd")
-    } else {
-        println("[gen-diagcodes.tie] zd 生成失败（退出码 " + to_string(zc) + "）；td 清单仍可用")
+    // 性能敏感读取用 zd 变体：调 tiec --compress-data 产出 diagcodes.zd。
+    // 同上：文档产物 + 仓内无 diagdocs/ 时跳过，不做无意义的外部进程调用。
+    if fs.exists(g_root + "\\diagdocs") {
+        var zc = exec_code("compiler\\tiec.exe --compress-data diagdocs\\diagcodes.data.tie -o diagdocs\\diagcodes.zd")
+        if zc == 0 {
+            println("[gen-diagcodes.tie] zd 变体已生成: diagdocs/diagcodes.zd")
+        } else {
+            println("[gen-diagcodes.tie] zd 生成失败（退出码 " + to_string(zc) + "）；td 清单仍可用")
+        }
     }
     return 0
 }
