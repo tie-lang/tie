@@ -37,19 +37,6 @@ func lazy_bare(id: i64) -> string {
     return s
 }
 
-// 当前是否正在发射惰性初始化函数本身（`tie_lazy_*`）。这类函数内部读值槽
-// 必须保持普通 load，否则会被改写成对自身的 call 而无限递归。
-func in_lazy_fn() -> bool {
-    if g_pfid < 0 {
-        return false
-    }
-    var nm = interner.lookup(ir.func_name(g_pfid))
-    if str_len(nm) < 9 {
-        return false
-    }
-    return str.slice(nm, 0, 9) == "tie_lazy_"
-}
-
 pub func gen_inst_b_21_load(inst_id: i64) {
     var op = ir.ins_op(inst_id)
     var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
@@ -66,7 +53,7 @@ pub func gen_inst_b_21_load(inst_id: i64) {
         // 这里是**所有全局读的最终出口**，单点覆盖，不依赖 irgen 补读取点。
         if ir.ins_opnd_kind(inst_id, 0) == 3 {
             var lzid = ir.ins_opnd(inst_id, 0)
-            if ir.lazy_has(lzid) && !in_lazy_fn() {
+            if ir.lazy_has(lzid) {
                 line(reg + " = call " + ty + " @tie_lazy_" + ns_replace(lazy_bare(lzid)) + "()")
                 return
             }
@@ -98,8 +85,10 @@ pub func gen_inst_b_22_store(inst_id: i64) {
         // 惰性初始化函数自身的 store 也会走到这里，重复置 1 无害。
         if ir.ins_opnd_kind(inst_id, 2) == 3 {
             var lzid = ir.ins_opnd(inst_id, 2)
-            if ir.lazy_has(lzid) && !in_lazy_fn() {
-                line("store i64 1, ptr @" + ns_replace(lazy_bare(lzid) + "$lz"))
+            if ir.lazy_has(lzid) {
+                // 置 2（已完成）而非 1：写后读必须被视为已初始化，不能再
+                // 触发初值，也不能被 chk 误判成「初始化中 → 环」。
+                line("store i64 2, ptr @" + ns_replace(lazy_bare(lzid) + "$lz"))
             }
         }
         return

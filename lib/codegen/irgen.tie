@@ -704,24 +704,46 @@ func gen_one_lazy_init(nid: i64, node: i64, ty: i64) -> i64 {
     g_cur_func = fid
     g_cur_fn_name = nm
     var b0 = ir.new_block(fid, interner.intern("entry"))
+    var bchk = ir.new_block(fid, interner.intern("chk"))
     var bi = ir.new_block(fid, interner.intern("init"))
-    var br = ir.new_block(fid, interner.intern("ret"))
-    // entry：读标志，eq 0 走 init，否则直接 ret
+    var br = ir.new_block(fid, interner.intern("do"))
+    var be = ir.new_block(fid, interner.intern("err"))
+    // 标志三态：0 = 未初始化 / 1 = 初始化中 / 2 = 完成。
+    // entry：== 2 → done；== 1 → err（循环初始化）；否则 init。
     g_cur_block = b0
     var ld = ir.new_inst(b0, 21, types.named(TK_I64))   // load i64 @flag
     ir.add_operand(ld, interner.intern(flag), 3)
     var lv = ir.get_value(ld)
-    var cmp = ir.new_inst(b0, 12, types.named(TK_BOOL)) // icmp eq（12，权威见 ks 表）
-    ir.add_operand(cmp, lv, 0)
-    ir.add_operand(cmp, 0, 2)                            // 立即数 0
-    ir.add_operand(cmp, 0, 2)                            // CMP_EQ
-    var cv = ir.get_value(cmp)
-    var cb = ir.new_inst(b0, 31, -1)                     // cond_br（31）
-    ir.add_operand(cb, cv, 0)
-    ir.add_operand(cb, bi, 1)
-    ir.add_operand(cb, br, 1)
-    // init：求值初值 → 写槽 → 置标志 → br ret
+    var c2 = ir.new_inst(b0, 12, types.named(TK_BOOL))  // icmp eq（12，权威见 ks 表）
+    ir.add_operand(c2, lv, 0)
+    ir.add_operand(c2, 2, 2)                             // 立即数 2 = 已完成
+    ir.add_operand(c2, 0, 2)                             // CMP_EQ
+    var c2v = ir.get_value(c2)
+    var cb2 = ir.new_inst(b0, 31, -1)                    // cond_br（31）
+    ir.add_operand(cb2, c2v, 0)
+    ir.add_operand(cb2, br, 1)
+    ir.add_operand(cb2, bchk, 1)
+    // chk：== 1 → 重入（环），跳 err
+    g_cur_block = bchk
+    var c1 = ir.new_inst(bchk, 12, types.named(TK_BOOL))
+    ir.add_operand(c1, lv, 0)
+    ir.add_operand(c1, 1, 2)                             // 立即数 1 = 初始化中
+    ir.add_operand(c1, 0, 2)
+    var c1v = ir.get_value(c1)
+    var cb1 = ir.new_inst(bchk, 31, -1)
+    ir.add_operand(cb1, c1v, 0)
+    ir.add_operand(cb1, be, 1)
+    ir.add_operand(cb1, bi, 1)
+    // init：**先**置 1（初始化中）再求值——这样初值若（直接或间接）引用
+    // 本变量，重入时能命中 chk 的环检测，而不是读到未初始化的 0。
     g_cur_block = bi
+    var one = ir.new_inst(bi, 60, types.named(TK_I64))   // const_i 1
+    ir.add_operand(one, 1, 2)
+    var ov = ir.get_value(one)
+    var stf0 = ir.new_inst(bi, 22, -1)                   // store i64 1, ptr @flag
+    ir.add_operand(stf0, types.named(TK_I64), 2)
+    ir.add_operand(stf0, ov, 0)
+    ir.add_operand(stf0, interner.intern(flag), 3)
     var v = tig_expr(node)
     if v < 0 {
         sm_err_msg = "lazy var '" + nm + "' 的初值求值失败"
@@ -731,22 +753,35 @@ func gen_one_lazy_init(nid: i64, node: i64, ty: i64) -> i64 {
     ir.add_operand(st, ty, 2)
     ir.add_operand(st, v, 0)
     ir.add_operand(st, interner.intern(slot), 3)
-    var one = ir.new_inst(bi, 60, types.named(TK_I64))   // const_i 1
-    ir.add_operand(one, 1, 2)
-    var ov = ir.get_value(one)
-    var stf = ir.new_inst(bi, 22, -1)                    // store i64 1, ptr @flag
+    var two = ir.new_inst(bi, 60, types.named(TK_I64))   // const_i 2
+    ir.add_operand(two, 2, 2)
+    var twov = ir.get_value(two)
+    var stf = ir.new_inst(bi, 22, -1)                    // store i64 2, ptr @flag
     ir.add_operand(stf, types.named(TK_I64), 2)
-    ir.add_operand(stf, ov, 0)
+    ir.add_operand(stf, twov, 0)
     ir.add_operand(stf, interner.intern(flag), 3)
     var b1 = ir.new_inst(bi, 30, -1)                     // br（30）
     ir.add_operand(b1, br, 1)
-    // ret：读槽并返回
+    // done：读槽并返回。用 volatile_load（op 71）**绕过** llvmgen 的 lazy
+    // 替换——否则这条「读自己」会被改写成 call 自身而无限递归。
     g_cur_block = br
-    var ld2 = ir.new_inst(br, 21, ty)
+    var ld2 = ir.new_inst(br, 71, ty)
     ir.add_operand(ld2, interner.intern(slot), 3)
     var rv = ir.get_value(ld2)
     var rt = ir.new_inst(br, 32, -1)                     // ret（32）
     ir.add_operand(rt, rv, 0)
+    // err：循环初始化——打印并终止（响亮失败，不给静默的 0）
+    g_cur_block = be
+    var msg = ir.new_inst(be, 62, types.named(TK_I64))   // const_str
+    ir.add_operand(msg, interner.intern("lazy var 循环初始化：" + nm), 0)
+    var mv = ir.get_value(msg)
+    tig_print_str_line(mv, true)
+    var ex = ir.new_inst(be, 60, types.named(TK_I64))
+    ir.add_operand(ex, 1, 2)
+    var exv = ir.get_value(ex)
+    tig_ext_call1("exit", exv, types.named(TK_I64), -1)
+    var rte = ir.new_inst(be, 32, -1)                    // 不可达，仅终结块
+    ir.add_operand(rte, exv, 0)
     return 0
 }
 
