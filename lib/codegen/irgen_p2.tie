@@ -381,7 +381,7 @@ func tig_global_var(s: i64, full: string) -> i64 {
     if ast.s_aux(s) == 1 && !scalar_init_deferred_ok(ty) {
         // 只剩表/容器不支持（需另建表生命周期与 RC）。提示去掉前缀：
         // `var` 不带修饰即入口求值，是最自然的写法；`eager var` 只是显式重申。
-        sm_err_msg = "lazy var '" + nm + "' 不支持表/容器类型（需另建表生命周期与引用计数）——去掉 lazy 前缀即可按入口求值"
+        sm_err_msg = "lazy var '" + nm + "' 不支持该类型（需单独处理生命周期与引用计数）——去掉 lazy 前缀即可按入口求值"
         return -1
     }
     // p.9.12.6 边界：全局行池 table<R> v1 不支持（列式行池需每字段列 @g 全局，成本高，
@@ -396,11 +396,24 @@ func tig_global_var(s: i64, full: string) -> i64 {
     // 表全局登记：llvmgen 输出 global ptr null + main 入口初始化
     if types.is_table(ty) || telem >= 0 {
         llvmgen.global_table_reg(nm)
-        // r.1.1.3：非空表字面量初值 → 记录，main 入口创建后整体构造（逐元素 push）
         var ginit = sstate.child(s, 1)
-        if ginit >= 0 && ast.s_tag(ginit) == S_N_TABLE_LIT && sstate.nchild(ginit) > 0 {
-            table_push(g_ginit_names, intern.intern(nm))
-            table_push(g_ginit_nodes, ginit)
+        if ast.s_aux(s) == 1 {
+            // lazy 表：初值交给 tie_lazy_<name>() 首次读时建表，
+            // **不进 g_ginit**（否则入口就建表，惰性语义失效）。
+            if ginit >= 0 {
+                table_push(g_lazy_names, intern.intern(nm))
+                table_push(g_lazy_nodes, ginit)
+                table_push(g_lazy_tys, ty)
+                ir.lazy_mark(intern.intern("@" + nm))
+                llvmgen.global_scalar_reg(nm + "$lz", types.named(TK_I64))
+                llvmgen.global_scalar_init(nm + "$lz", 0)
+            }
+        } else {
+            // r.1.1.3：非空表字面量初值 → 记录，main 入口创建后整体构造
+            if ginit >= 0 && ast.s_tag(ginit) == S_N_TABLE_LIT && sstate.nchild(ginit) > 0 {
+                table_push(g_ginit_names, intern.intern(nm))
+                table_push(g_ginit_nodes, ginit)
+            }
         }
     } else {
         llvmgen.global_scalar_reg(nm, ty)
@@ -477,11 +490,12 @@ func tig_global_var(s: i64, full: string) -> i64 {
     }
 }
 
-// 初值可延后求值的全局类型（`lazy var` 与计算型初值物化共用）。
+// 初值可延后求值的全局类型（`lazy var` 与计算型初值物化共用）：
 //   - 数值 / bool / char / trit / string：槽是标量或 ptr，直接 store；
 //   - struct / enum：槽是聚合，`store %agg` 合法，`volatile_load` 也能读回；
-//   - **表不在此列**：表全局要在入口建表句柄并参与 `g_ginit` 的元素填充与
-//     引用计数，惰性物化需要另建一套表生命周期管理，暂明确拒绝。
+//   - table：槽是 `global ptr null`，初值由 `tig_table_lit` / 函数调用建句柄，
+//     同样返回一个 ptr；入口建表逻辑按 lazy 名单跳过（见 gen_global_tbl_init）。
+// 其余（map / port / 函数值 / 元组等）不在此列，保持明确拒绝。
 func scalar_init_deferred_ok(ty: i64) -> bool {
     if ty == types.TK_I64 || ty == types.TK_F32 || ty == types.TK_F64 {
         return true
@@ -490,6 +504,9 @@ func scalar_init_deferred_ok(ty: i64) -> bool {
         return true
     }
     if ty == types.TK_STR {
+        return true
+    }
+    if types.is_table(ty) {
         return true
     }
     var k = types.kind(ty)

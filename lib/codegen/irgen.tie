@@ -803,6 +803,12 @@ pub func gen_global_tbl_init() -> i64 {
     var saved_fn = g_cur_fn_name
     var gi: i64 = 0
     while gi < len(gb_keys) {
+        // lazy 表由 tie_lazy_<name>() 在首次读时建表；这里若也建一个空表并
+        // store 到 @g，会与惰性初值竞争（还泄漏一个空表句柄），必须跳过。
+        if ir.lazy_has(interner.intern("@" + intern.lookup(gb_keys[gi]))) {
+            gi = gi + 1
+            continue
+        }
         var gte = gb_telem[gi]
         if gte >= 0 {
             // p.9.12.6 边界：全局行池 table<R> v1 不支持（列式行池需每字段列 @g 全局）
