@@ -234,6 +234,10 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     }
     // 表 ==/!=：句柄短路 → 长度短路 → 逐元素循环（语义层已放行并校验可比性）
     if (op == 5 || op == 6) && types.is_table(lhs_t) {
+        if types.is_map(lhs_t) {
+            // 映射：数组模式按键有序存储 → zip 对比即按键规范化语义
+            return tig_map_compare(op, lhs_t, lv, rv)
+        }
         // p.9.12.6：table<struct> 局部变量是行池（列式表示，scope 槽只是第 0 列
         // 句柄）——按普通表比较会把「第 0 列 vs 整行表」错位。走逐列比较。
         var lelem = types.table_elem(lhs_t)

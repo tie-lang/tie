@@ -485,6 +485,184 @@ func tig_table_compare(op: i64, ty: i64, lv: i64, rv: i64) -> i64 {
     return res
 }
 
+// 映射按内容相等：len 短路 → 运行期模式分支。
+//  数组模式（≤1024 条目）：数据按键有序（内联二分插入），两侧 zip 对比即
+//  按键规范化语义——键二进制安全比较 + 值按静态类型比较（tig_agg_field_cmp）。
+//  哈希模式（>1024 条目，条目无序）：len 相等 + 遍历 l 的非空槽，逐键查 r
+//  （contains 免 raise + map_get 取值比较）——无重复键 ⇒ 单方向即充分。
+//  布局：数组 entry 16 字节（键 ptr@0、值@8）；哈希 cap@0、htab@16、空槽键 null。
+//  值类型边界：多字值（struct/enum/fn/any）装不进 8 字节值槽，编译期拒绝。
+func tig_map_compare(op: i64, ty: i64, lv: i64, rv: i64) -> i64 {
+    var vty = types.table_elem(ty)
+    if vty < 0 {
+        vty = types.low(ty)
+    }
+    if vty < 0 {
+        sm_err_msg = "元组比较目标不是元组（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var vk = types.kind(vty)
+    if vk == K_STRUCT || vk == K_ENUM || vk == K_FN || vk == K_TUPLE || vty == types.named(TK_ANY) {
+        sm_err_msg = "映射相等不支持多字值类型 " + types.type_name(vty) + "（entry 值槽 8 字节，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var BT = types.named(TK_BOOL)
+    var T64 = types.named(TK_I64)
+    var rslot = ir.new_inst(g_cur_block, 20, BT)
+    ir.add_operand(rslot, BT, 2)
+    var rsv = ir.get_value(rslot)
+    s21_store(rsv, tig_bool_lit(1), BT)
+    var lenchk = ir.new_block(g_cur_func, interner.intern("eq.map.len"))
+    var falseblk = ir.new_block(g_cur_func, interner.intern("eq.map.no"))
+    var modechk = ir.new_block(g_cur_func, interner.intern("eq.map.mode"))
+    var done = ir.new_block(g_cur_func, interner.intern("eq.map.done"))
+    // 同一句柄短路（仅值类型不含浮点时启用）
+    if !eq_ty_has_float(vty, 0) {
+        var li = tig_ptrtoint(lv)
+        var ri = tig_ptrtoint(rv)
+        var same = tig_icmp_c(li, ri, 0)
+        var cb0 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb0, same, 0)
+        ir.add_operand(cb0, done, 1)
+        ir.add_operand(cb0, lenchk, 1)
+    } else {
+        var br0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br0, lenchk, 1)
+    }
+    // 长度短路（两模式 len@8 同义）
+    g_cur_block = lenchk
+    var nl = s21_table_len(lv)
+    var nr = s21_table_len(rv)
+    var le = tig_icmp_c(nl, nr, 0)
+    var cb1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb1, le, 0)
+    ir.add_operand(cb1, modechk, 1)
+    ir.add_operand(cb1, falseblk, 1)
+    // 模式分派：esz 符号位（哈希模式 esz 为负；s21_map_is_hash 已返回 i1 值 id）
+    g_cur_block = modechk
+    var ish = s21_map_is_hash(lv)
+    var ainit = ir.new_block(g_cur_func, interner.intern("eq.map.ainit"))
+    var ahead = ir.new_block(g_cur_func, interner.intern("eq.map.ahead"))
+    var abody = ir.new_block(g_cur_func, interner.intern("eq.map.abody"))
+    var anext = ir.new_block(g_cur_func, interner.intern("eq.map.anext"))
+    var hinit = ir.new_block(g_cur_func, interner.intern("eq.map.hinit"))
+    var hhead = ir.new_block(g_cur_func, interner.intern("eq.map.hhead"))
+    var hbody = ir.new_block(g_cur_func, interner.intern("eq.map.hbody"))
+    var hchk = ir.new_block(g_cur_func, interner.intern("eq.map.hchk"))
+    var hget = ir.new_block(g_cur_func, interner.intern("eq.map.hget"))
+    var hstep = ir.new_block(g_cur_func, interner.intern("eq.map.hstep"))
+    var cbm = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbm, ish, 0)
+    ir.add_operand(cbm, hinit, 1)
+    ir.add_operand(cbm, ainit, 1)
+    // ---------- 数组臂：zip 对比（键有序） ----------
+    g_cur_block = ainit
+    var kslot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(kslot, T64, 2)
+    var ksv = ir.get_value(kslot)
+    s21_store(ksv, tig_int_lit(0), T64)
+    var bri = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bri, ahead, 1)
+    g_cur_block = ahead
+    var kc = tig_icmp_c(s21_load(ksv, T64), nl, 2)  // slt
+    var cbh = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbh, kc, 0)
+    ir.add_operand(cbh, abody, 1)
+    ir.add_operand(cbh, done, 1)
+    g_cur_block = abody
+    var kv = s21_load(ksv, T64)
+    var offv = s21_bin(2, kv, tig_int_lit(16))  // mul：i * 16
+    var kl = s21_load(s21_gep(t21_data(lv), offv, false), types.named(TK_STR))
+    var kr = s21_load(s21_gep(t21_data(rv), offv, false), types.named(TK_STR))
+    var keq = tig_str_cmp_bytes(5, kl, kr)
+    if keq < 0 {
+        return -1
+    }
+    var offv8 = s21_bin(0, offv, tig_int_lit(8))  // add：+8
+    var vl = s21_load(s21_gep(t21_data(lv), offv8, false), vty)
+    var vr = s21_load(s21_gep(t21_data(rv), offv8, false), vty)
+    var vc = tig_agg_field_cmp(vty, vl, vr)
+    if vc < 0 {
+        return -1
+    }
+    var kbad = ir.new_inst(g_cur_block, 8, BT)  // xor：键不等
+    ir.add_operand(kbad, keq, 0)
+    ir.add_operand(kbad, 1, 2)
+    var vbad = ir.new_inst(g_cur_block, 8, BT)  // xor：值不等（vc = 值相等）
+    ir.add_operand(vbad, vc, 0)
+    ir.add_operand(vbad, 1, 2)
+    var bad = ir.new_inst(g_cur_block, 7, BT)  // or：键不等或值不等
+    ir.add_operand(bad, ir.get_value(kbad), 0)
+    ir.add_operand(bad, ir.get_value(vbad), 0)
+    var cbb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbb, ir.get_value(bad), 0)
+    ir.add_operand(cbb, falseblk, 1)
+    ir.add_operand(cbb, anext, 1)
+    g_cur_block = anext
+    s21_store(ksv, s21_bin(0, kv, tig_int_lit(1)), T64)  // i++
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, ahead, 1)
+    // ---------- 哈希臂：遍历 l 非空槽，逐键 contains + get 比较 ----------
+    g_cur_block = hinit
+    var cap = s21_load(s21_gep(lv, 0, true), T64)
+    var htab = s21_load(s21_gep(lv, 16, true), types.named(TK_STR))
+    var hslot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(hslot, T64, 2)
+    var hsp = ir.get_value(hslot)
+    s21_store(hsp, tig_int_lit(0), T64)
+    var bh0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bh0, hhead, 1)
+    g_cur_block = hhead
+    var hc = tig_icmp_c(s21_load(hsp, T64), cap, 2)  // slt
+    var cbh2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbh2, hc, 0)
+    ir.add_operand(cbh2, hbody, 1)
+    ir.add_operand(cbh2, done, 1)
+    g_cur_block = hbody
+    var kp = s21_hslot_key(htab, s21_load(hsp, T64))
+    var nonempty = tig_cmp_zero(kp, 1)  // key != null（已是 i1 值 id）
+    var cbh3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbh3, nonempty, 0)
+    ir.add_operand(cbh3, hchk, 1)
+    ir.add_operand(cbh3, hstep, 1)
+    g_cur_block = hchk
+    var c1v = s21_map_contains(rv, kp)  // i1 布尔
+    var cbh4 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbh4, c1v, 0)
+    ir.add_operand(cbh4, hget, 1)
+    ir.add_operand(cbh4, falseblk, 1)
+    g_cur_block = hget
+    var hv = s21_hslot_val(htab, s21_load(hsp, T64), vty)
+    var gv2 = s21_map_get(rv, kp, vty)
+    var vc2 = tig_agg_field_cmp(vty, hv, gv2)
+    if vc2 < 0 {
+        return -1
+    }
+    var cbh5 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbh5, vc2, 0)
+    ir.add_operand(cbh5, hstep, 1)
+    ir.add_operand(cbh5, falseblk, 1)
+    g_cur_block = hstep
+    s21_store(hsp, s21_bin(0, s21_load(hsp, T64), tig_int_lit(1)), T64)  // i++
+    var bh1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bh1, hhead, 1)
+    // 失败分支（两臂共用的提前退出出口）
+    g_cur_block = falseblk
+    s21_store(rsv, tig_bool_lit(0), BT)
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, done, 1)
+    // 汇合：读结果槽；!= 取反
+    g_cur_block = done
+    var res = s21_load(rsv, BT)
+    if op == 6 {
+        var nx = ir.new_inst(g_cur_block, 8, BT)
+        ir.add_operand(nx, res, 0)
+        ir.add_operand(nx, 1, 2)
+        return ir.get_value(nx)
+    }
+    return res
+}
+
 // 逻辑短路 && / ||：cond_br + phi 汇合（对齐 Rust ir.rs）。
 //   a && b：br a → then(求 b) / else(false)；then 后 phi [b, then], [false, else]
 //   a || b：br a → then(true) / else(求 b)；else 后 phi [true, then], [b, else]
