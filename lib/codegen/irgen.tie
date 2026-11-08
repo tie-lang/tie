@@ -237,6 +237,12 @@ pub var rp_keys: table<i64>;
 pub var rp_si: table<i64>;
 pub var rp_ncol: table<i64>;
 pub var rp_allocas: table<table<i64>>;
+// 按类型生成的专用相等比较函数（规范 §3.6 自引用共归纳的编译期收敛机制）：
+// memo 键 = 类型 id（table/map/struct），值 = 函数符号名 intern id。先登记
+// 后生成体 ⇒ 成环类型间的相互引用发射 call 而非内联（编译期断链），运行期
+// 由句柄对栈（tl_tbl$eq_mark/unmark）判重入。单元级（unit_reset 清）。
+pub var g_eq_keys: table<i64>;
+pub var g_eq_names: table<i64>;
 // p.6.1.7-RCA-2【2026-09-06】：tuple **返回**路径需要对表元素 retain 的标记（见
 // irgen_stmt Return / irgen_agg tig_tuple_lit_typed）——返回的元组表元素 retain 后
 // 交给调用方，出口析构减回；普通 tuple 构造不置位。
@@ -400,6 +406,8 @@ pub func unit_reset() {
     rp_si = table_new_i64()
     rp_ncol = table_new_i64()
     rp_allocas = []
+    g_eq_keys = table_new_i64()
+    g_eq_names = table_new_i64()
     // 命名计数器（参与符号名后缀）：不归零则本单元哨兵从上一单元的计数接着编
     //（实测 comprehension.tie 的 @tl_loopf_main_274… 而非 _1…，产物逐字节不等）。
     g_tf_ctr = 0

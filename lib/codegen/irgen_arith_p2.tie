@@ -391,6 +391,28 @@ func tig_tuple_compare(op: i64, lhs: i64, rhs: i64, lv: i64, rv: i64) -> i64 {
     if raddr < 0 {
         return -1
     }
+    // 自引用结构（规范 §3.6）：可能成环的 struct 走按类型生成的专用比较
+    // 函数（内联展开会编译期无限递归）；元组类型有限不成环，恒走内联。
+    if types.kind(agg) == K_STRUCT {
+        var seen_t: table<i64> = table_new_i64()
+        if tig_ty_may_cycle(agg, seen_t, 0) {
+            var fnm = tig_eq_fn_get(agg)
+            if str_len(fnm) == 0 {
+                return -1
+            }
+            var eq2 = tig_eq_call_two(fnm, laddr, raddr)
+            if eq2 < 0 {
+                return -1
+            }
+            if op == 6 {
+                var nx2 = ir.new_inst(g_cur_block, 8, types.named(TK_BOOL))
+                ir.add_operand(nx2, eq2, 0)
+                ir.add_operand(nx2, 1, 2)
+                return ir.get_value(nx2)
+            }
+            return eq2
+        }
+    }
     var eq = tig_agg_cmp_fields(agg, laddr, raddr)
     if eq < 0 {
         return -1
@@ -530,6 +552,23 @@ func tig_agg_field_cmp(fty: i64, lfv: i64, rfv: i64) -> i64 {
         return tig_agg_cmp_fields(fty, la, ra)
     }
     if types.kind(fty) == K_STRUCT {
+        // 嵌套结构：可能成环 → 专用比较函数（字段地址直传）；有限图内联递归
+        var seen_n: table<i64> = table_new_i64()
+        if tig_ty_may_cycle(fty, seen_n, 0) {
+            var fnm = tig_eq_fn_get(fty)
+            if str_len(fnm) == 0 {
+                return -1
+            }
+            var la = agg_val_to_addr(lfv, fty)
+            if la < 0 {
+                return -1
+            }
+            var ra = agg_val_to_addr(rfv, fty)
+            if ra < 0 {
+                return -1
+            }
+            return tig_eq_call_two(fnm, la, ra)
+        }
         // 嵌套结构：值落内存后递归逐字段比较（与顶层结构 == 同一判据）
         var ls = agg_val_to_addr(lfv, fty)
         if ls < 0 {

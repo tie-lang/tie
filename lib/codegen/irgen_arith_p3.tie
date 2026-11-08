@@ -373,6 +373,338 @@ func tig_ty_may_cycle(t: i64, seen: ref table<i64>, depth: i64) -> bool {
     return false
 }
 
+// 取（或按需生成）类型 t 的专用相等比较函数符号名。memo 先登记后生成体
+// ⇒ 成环类型间的相互引用在编译期断链（发射 call 而非内联展开），运行期由
+// 句柄对栈（tl_tbl$eq_mark/unmark）判重入实现共归纳。失败返回 ""（错误已置）。
+func tig_eq_fn_get(t: i64) -> string {
+    var i: i64 = 0
+    while i < len(g_eq_keys) {
+        if g_eq_keys[i] == t {
+            return intern.lookup(g_eq_names[i])
+        }
+        i = i + 1
+    }
+    var k = types.kind(t)
+    var nm = ""
+    if k == K_TABLE || k == K_MAP {
+        nm = "tie_eq_t" + to_string(len(g_eq_keys))
+    } else if k == K_STRUCT {
+        nm = "tie_eq_s" + to_string(len(g_eq_keys))
+    } else {
+        sm_err_msg = "内部错误：相等函数生成收到非容器/聚合类型（函数 " + g_cur_fn_name + "）"
+        return ""
+    }
+    table_push(g_eq_keys, t)
+    table_push(g_eq_names, intern.intern(nm))
+    var gr: i64 = -1
+    if k == K_TABLE || k == K_MAP {
+        gr = tig_eq_gen_table(t, nm)
+    } else {
+        gr = tig_eq_gen_struct(t, nm)
+    }
+    if gr < 0 {
+        return ""
+    }
+    return nm
+}
+
+// 同单元专用比较函数调用（opcode 35 call；两 ptr 实参，返回 i1）。
+func tig_eq_call_two(fnm: string, a1: i64, a2: i64) -> i64 {
+    var BT = types.named(TK_BOOL)
+    var TSTR = types.named(TK_STR)
+    var ci = ir.new_inst(g_cur_block, 35, BT)
+    ir.add_operand(ci, interner.intern(fnm), 0)
+    ir.add_operand(ci, BT, 2)
+    ir.add_operand(ci, TSTR, 2)
+    ir.add_operand(ci, a1, 0)
+    ir.add_operand(ci, TSTR, 2)
+    ir.add_operand(ci, a2, 0)
+    return ir.get_value(ci)
+}
+
+// 生成表/映射专用比较函数（规范 §3.6「自引用由比较过程检测并终止」）：
+// 函数体 = mark → 命中即真（共归纳）→ 句柄/长度短路 → 位可比 memcmp 快路径
+// → 逐元素循环。元素为表/映射/struct 时**调用**对应专用函数（memo 断编译期
+// 递归），其余元素走 tig_agg_field_cmp 内联判据。结果槽 + 唯一出口：unmark
+// 与 ret 只写一处，与全部早退路径汇合（配对弹出不会漏）。
+func tig_eq_gen_table(ty: i64, nm: string) -> i64 {
+    var ety = types.table_elem(ty)
+    if ety < 0 {
+        ety = types.low(ty)
+    }
+    var BT = types.named(TK_BOOL)
+    var T64 = types.named(TK_I64)
+    var TSTR = types.named(TK_STR)
+    var params: table<i64> = table_new_i64()
+    table_push(params, TSTR)
+    table_push(params, TSTR)
+    var fid = ir.new_func(interner.intern(nm), BT, params)
+    var saved_fn = g_cur_fn_name
+    var saved_func = g_cur_func
+    var saved_block = g_cur_block
+    g_cur_func = fid
+    g_cur_fn_name = nm
+    g_used_trmlite = true
+    var lv = ir.param_val(fid, 0)
+    var rv = ir.param_val(fid, 1)
+    var b0 = ir.new_block(fid, interner.intern("entry"))
+    var bhit = ir.new_block(fid, interner.intern("hit"))
+    var bsame = ir.new_block(fid, interner.intern("same"))
+    var blen = ir.new_block(fid, interner.intern("len"))
+    var bmc = ir.new_block(fid, interner.intern("memcmp"))
+    var bmz = ir.new_block(fid, interner.intern("mczero"))
+    var binit = ir.new_block(fid, interner.intern("init"))
+    var bhead = ir.new_block(fid, interner.intern("head"))
+    var bbody = ir.new_block(fid, interner.intern("body"))
+    var bstep = ir.new_block(fid, interner.intern("step"))
+    var bfalse = ir.new_block(fid, interner.intern("no"))
+    var bexit = ir.new_block(fid, interner.intern("exit"))
+    g_cur_block = b0
+    var rslot = ir.new_inst(g_cur_block, 20, BT)
+    ir.add_operand(rslot, BT, 2)
+    var rsv = ir.get_value(rslot)
+    s21_store(rsv, tig_bool_lit(1), BT)
+    // mark：命中 = 同一对比较正在进行 → 共归纳判相等
+    var mi = tl_i64_2("tl_tbl$eq_mark", tig_ptrtoint(lv), tig_ptrtoint(rv))
+    var hit = tig_icmp_c(mi, tig_int_lit(0), 3)  // sgt（已是 i1 值 id）
+    var cb0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb0, hit, 0)
+    ir.add_operand(cb0, bhit, 1)
+    ir.add_operand(cb0, bsame, 1)
+    g_cur_block = bhit
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, bexit, 1)
+    // 句柄短路（值类型不含浮点时启用）
+    g_cur_block = bsame
+    if !eq_ty_has_float(ety, 0) {
+        var li = tig_ptrtoint(lv)
+        var ri = tig_ptrtoint(rv)
+        var same = tig_icmp_c(li, ri, 0)
+        var cb1 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb1, same, 0)
+        ir.add_operand(cb1, bexit, 1)
+        ir.add_operand(cb1, blen, 1)
+    } else {
+        var br1 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br1, blen, 1)
+    }
+    // 长度短路
+    g_cur_block = blen
+    var nl = s21_table_len(lv)
+    var nr = s21_table_len(rv)
+    var le = tig_icmp_c(nl, nr, 0)
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, le, 0)
+    if tig_ty_bitwise_comparable(ety) {
+        ir.add_operand(cb2, bmc, 1)
+    } else {
+        ir.add_operand(cb2, binit, 1)
+    }
+    ir.add_operand(cb2, bfalse, 1)
+    // 位可比快路径
+    g_cur_block = bmc
+    var gt0 = tig_icmp_c(nl, tig_int_lit(0), 3)  // sgt（空表免 memcmp：null 实参 C UB）
+    var cbm = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbm, gt0, 0)
+    ir.add_operand(cbm, bmz, 1)
+    var bm = ir.new_block(fid, interner.intern("mcmp"))
+    ir.add_operand(cbm, bm, 1)
+    g_cur_block = bm
+    var bytes = s21_bin(2, nl, tig_int_lit(elem_size(ety)))
+    var atsm: table<i64> = table_new_i64()
+    var avsm: table<i64> = table_new_i64()
+    table_push(atsm, TSTR)
+    table_push(avsm, t21_data(lv))
+    table_push(atsm, TSTR)
+    table_push(avsm, t21_data(rv))
+    table_push(atsm, T64)
+    table_push(avsm, bytes)
+    var cmpm = tig_ext_call_typed("memcmp", atsm, avsm, types.named(TK_I32))
+    if cmpm < 0 {
+        g_cur_fn_name = saved_fn
+        g_cur_func = saved_func
+        g_cur_block = saved_block
+        return -1
+    }
+    var c0m = tig_icmp_c(cmpm, tig_int_lit(0), 0)  // eq
+    s21_store(rsv, c0m, BT)
+    var brm = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brm, bexit, 1)
+    g_cur_block = bmz
+    var brz = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brz, bexit, 1)
+    // 循环
+    g_cur_block = binit
+    var kslot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(kslot, T64, 2)
+    var ksv = ir.get_value(kslot)
+    s21_store(ksv, tig_int_lit(0), T64)
+    var bri = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bri, bhead, 1)
+    g_cur_block = bhead
+    var kc = tig_icmp_c(s21_load(ksv, T64), nl, 2)  // slt
+    var cbh = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbh, kc, 0)
+    ir.add_operand(cbh, bbody, 1)
+    ir.add_operand(cbh, bexit, 1)
+    g_cur_block = bbody
+    var kv = s21_load(ksv, T64)
+    var esz = s21_bin(6, t21_esz(lv), tig_int_lit(4611686018427387903))  // and：掩掉深表/哈希位
+    var offv = s21_bin(2, kv, esz)
+    var ek = types.kind(ety)
+    var fc: i64 = -1
+    if ek == K_TABLE || ek == K_MAP {
+        // 元素为表/映射：加载句柄 → 调专用比较函数（编译期递归断链）
+        var el = s21_load(s21_gep(t21_data(lv), offv, false), ety)
+        var er = s21_load(s21_gep(t21_data(rv), offv, false), ety)
+        var sub = tig_eq_fn_get(ety)
+        if str_len(sub) == 0 {
+            g_cur_fn_name = saved_fn
+            g_cur_func = saved_func
+            g_cur_block = saved_block
+            return -1
+        }
+        fc = tig_eq_call_two(sub, el, er)
+    } else if ek == K_STRUCT {
+        // 元素为 struct：元素地址直传（数据缓冲连续布局）→ 调专用函数
+        var sub = tig_eq_fn_get(ety)
+        if str_len(sub) == 0 {
+            g_cur_fn_name = saved_fn
+            g_cur_func = saved_func
+            g_cur_block = saved_block
+            return -1
+        }
+        fc = tig_eq_call_two(sub, s21_gep(t21_data(lv), offv, false), s21_gep(t21_data(rv), offv, false))
+    } else {
+        var ld = s21_load(s21_gep(t21_data(lv), offv, false), ety)
+        var rd = s21_load(s21_gep(t21_data(rv), offv, false), ety)
+        fc = tig_agg_field_cmp(ety, ld, rd)
+    }
+    if fc < 0 {
+        g_cur_fn_name = saved_fn
+        g_cur_func = saved_func
+        g_cur_block = saved_block
+        return -1
+    }
+    var notfc = ir.new_inst(g_cur_block, 8, BT)  // xor：元素不等
+    ir.add_operand(notfc, fc, 0)
+    ir.add_operand(notfc, 1, 2)
+    var cbb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbb, ir.get_value(notfc), 0)
+    ir.add_operand(cbb, bfalse, 1)
+    ir.add_operand(cbb, bstep, 1)
+    g_cur_block = bstep
+    s21_store(ksv, s21_bin(0, kv, tig_int_lit(1)), T64)  // k++
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, bhead, 1)
+    g_cur_block = bfalse
+    s21_store(rsv, tig_bool_lit(0), BT)
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, bexit, 1)
+    // 唯一出口：unmark（与入口 mark 配对）+ ret
+    g_cur_block = bexit
+    var ea: table<i64> = table_new_i64()
+    var ev: table<i64> = table_new_i64()
+    tig_trmlite_call("tl_tbl$eq_unmark", ea, ev, -1)
+    var res = s21_load(rsv, BT)
+    var rt = ir.new_inst(g_cur_block, 32, -1)  // ret
+    ir.add_operand(rt, res, 0)
+    g_cur_fn_name = saved_fn
+    g_cur_func = saved_func
+    g_cur_block = saved_block
+    return 0
+}
+
+// 生成 struct 专用比较函数：逐字段 and 链（直线无早退，无 mark——可构造的
+// 值级环必经表字段，环检测由表专用函数的句柄对栈承担）。字段分派：表/映射
+// → 加载句柄调表专用函数；嵌套 struct → 字段地址直传调子函数；其余内联判据。
+func tig_eq_gen_struct(agg: i64, nm: string) -> i64 {
+    var si = types.low(agg)
+    if si < 0 || si >= len(cls_fldoff) {
+        sm_err_msg = "元组比较目标不是元组（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var BT = types.named(TK_BOOL)
+    var TSTR = types.named(TK_STR)
+    var nf = cls_nfld[si]
+    var off = cls_fldoff[si]
+    var params: table<i64> = table_new_i64()
+    table_push(params, TSTR)
+    table_push(params, TSTR)
+    var fid = ir.new_func(interner.intern(nm), BT, params)
+    var saved_fn = g_cur_fn_name
+    var saved_func = g_cur_func
+    var saved_block = g_cur_block
+    g_cur_func = fid
+    g_cur_fn_name = nm
+    var la = ir.param_val(fid, 0)
+    var ra = ir.param_val(fid, 1)
+    var b0 = ir.new_block(fid, interner.intern("entry"))
+    g_cur_block = b0
+    var acc: i64 = -1
+    var i: i64 = 0
+    while i < nf {
+        var fty = fld_tys[off + i]
+        var lgp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 左字段地址
+        ir.add_operand(lgp, la, 0)
+        ir.add_operand(lgp, i, 2)
+        var rgp = ir.new_inst(g_cur_block, 27, agg)
+        ir.add_operand(rgp, ra, 0)
+        ir.add_operand(rgp, i, 2)
+        var fc: i64 = -1
+        var fk = types.kind(fty)
+        if fk == K_TABLE || fk == K_MAP {
+            var lv = tig_agg_field_load(ir.get_value(lgp), fty)
+            var rv = tig_agg_field_load(ir.get_value(rgp), fty)
+            var sub = tig_eq_fn_get(fty)
+            if str_len(sub) == 0 {
+                g_cur_fn_name = saved_fn
+                g_cur_func = saved_func
+                g_cur_block = saved_block
+                return -1
+            }
+            fc = tig_eq_call_two(sub, lv, rv)
+        } else if fk == K_STRUCT {
+            var sub = tig_eq_fn_get(fty)
+            if str_len(sub) == 0 {
+                g_cur_fn_name = saved_fn
+                g_cur_func = saved_func
+                g_cur_block = saved_block
+                return -1
+            }
+            fc = tig_eq_call_two(sub, ir.get_value(lgp), ir.get_value(rgp))
+        } else {
+            var lv = tig_agg_field_load(ir.get_value(lgp), fty)
+            var rv = tig_agg_field_load(ir.get_value(rgp), fty)
+            fc = tig_agg_field_cmp(fty, lv, rv)
+        }
+        if fc < 0 {
+            g_cur_fn_name = saved_fn
+            g_cur_func = saved_func
+            g_cur_block = saved_block
+            return -1
+        }
+        if acc < 0 {
+            acc = fc
+        } else {
+            var a2 = ir.new_inst(g_cur_block, 6, BT)  // and
+            ir.add_operand(a2, acc, 0)
+            ir.add_operand(a2, fc, 0)
+            acc = ir.get_value(a2)
+        }
+        i = i + 1
+    }
+    if acc < 0 {
+        acc = tig_bool_lit(1)
+    }
+    var rt = ir.new_inst(g_cur_block, 32, -1)  // ret
+    ir.add_operand(rt, acc, 0)
+    g_cur_fn_name = saved_fn
+    g_cur_func = saved_func
+    g_cur_block = saved_block
+    return 0
+}
+
 // 表按内容相等：句柄短路 → 长度短路 → 逐元素循环。
 // 结果用 i1 槽汇合（而非 phi），循环提前失败与多个入口都写同一个槽，
 // 无需枚举 done 块的全部前驱。元素比较复用 tig_agg_field_cmp，故标量、
@@ -400,13 +732,15 @@ func tig_table_compare(op: i64, ty: i64, lv: i64, rv: i64) -> i64 {
     var seen_c: table<i64> = table_new_i64()
     var track = tig_ty_may_cycle(ety, seen_c, 0)
     if track {
-        // 编译期响亮拒绝：本比较器是**内联展开**——元素比较逐层内联，成环
-        // 类型（struct 表字段回指自身）会让 IR 生成无限递归（实测静默 127
-        // 退出）。运行时句柄对栈（tl_tbl$eq_mark/unmark）基建已就位，但运行
-        // 期共归纳需要「按类型生成专用比较函数」（编译期按类型 memo 化、调用
-        // 复用）才能收敛——列为后续批（irgen.tie 的 tie_lazy_* 是现成范式）。
-        sm_err_msg = "自引用类型 '" + types.type_name(ety) + "' 的相等比较暂不支持（内联比较器无法收敛；需按类型生成专用比较函数，函数 " + g_cur_fn_name + "）"
-        return -1
+        // 自引用类型（规范 §3.6「自引用由比较过程检测并终止」）：内联展开对
+        // 成环类型编译期无限递归 ⇒ 改发**按类型生成的专用比较函数**调用
+        // （memo 化断编译期递归；函数体内 mark 命中即真 = 共归纳，句柄/长度
+        // 短路与位可比 memcmp 快路径与内联版逐项等价）。
+        var fnm = tig_eq_fn_get(ty)
+        if str_len(fnm) == 0 {
+            return -1
+        }
+        return tig_eq_call_two(fnm, lv, rv)
     }
     var lenchk = ir.new_block(g_cur_func, interner.intern("eq.tbl.len"))
     var falseblk = ir.new_block(g_cur_func, interner.intern("eq.tbl.no"))
