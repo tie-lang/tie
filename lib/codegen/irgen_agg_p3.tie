@@ -335,6 +335,126 @@ func rp_write(nm: i64, i: i64, v: i64) -> i64 {
     return 0
 }
 
+// 行池字段写 t[i].f（= 与 op= 复合）：按列句柄定位字段列，grow-set 语义
+//（越界行以默认值补齐——与 rows[id] = e 的行物化一致，各列恒齐平）。
+// 值语义判据与 tig_field_assign 普通路径对齐（窄整数 S1.3 收窄 / any 字段
+// P2c 装箱 / 复合赋值读-改-写）。idxnode = N_INDEX 节点（t[i]），i 取其 child 1。
+func rp_field_write(r: i64, fidx: i64, fty: i64, idxnode: i64, op: i64, valnode: i64, fname: string) -> i64 {
+    var si = rp_si[r]
+    var inode = sstate.child(idxnode, 1)
+    var iv = tig_expr(inode)
+    if iv < 0 {
+        return -1
+    }
+    var vv = tig_expr(valnode)
+    if vv < 0 {
+        return -1
+    }
+    // S1.3 窄整数字段：赋值值按字段类型转换（对齐普通路径）
+    var vt = ast.node_type(valnode)
+    if op < 0 && vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
+        (types.is_int(fty) || types.is_float(fty)) && vt != fty {
+        var cv = tig_coerce(vv, vt, fty)
+        if cv < 0 {
+            return -1
+        }
+        vv = cv
+    }
+    // P2c：any 字段赋值装箱
+    if fty == types.named(TK_ANY) && vt >= 0 && vt != types.named(TK_ANY) {
+        var bx5 = tig_box_any(vv, vt)
+        if bx5 < 0 {
+            return -1
+        }
+        vv = bx5
+    }
+    var ch = s21_load(rp_allocas[r][fidx], types.named(TK_STR))  // 列句柄
+    var defv = rp_fld_default_val(si, fidx, fty)
+    if defv < 0 {
+        return -1
+    }
+    if op >= 0 {
+        // 复合：读当前字段（越界 → 零值）→ 运算 → 写回
+        var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+        ir.add_operand(ok_slot, types.named(TK_I8), 2)
+        var cur = s21_table_at(ch, iv, ir.get_value(ok_slot), fty)
+        var res = tig_compound_assign(op, cur, vv, fty)
+        if res < 0 {
+            sm_err_msg = "复合字段赋值运算失败（字段 " + fname + "，函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+        vv = res
+    }
+    // 值落临时槽（tbl_set 按地址拷贝 esz 字节）
+    var ta = ir.new_inst(g_cur_block, 20, fty)
+    ir.add_operand(ta, fty, 2)
+    var tp = ir.get_value(ta)
+    s21_store(tp, vv, fty)
+    var need = s21_bin(0, iv, tig_int_lit(1))  // i+1
+    rp_col_grow_set(ch, iv, need, fty, defv, tp)
+    return 0
+}
+
+// 行池 ==/!=：两侧必须都是已登记行池变量（同结构）。len 相等（各列恒齐平，
+// 比较第 0 列即可，但为防御仍逐列走 tig_table_compare 的长度短路）+ 逐字段列
+// 比较——每列是普通 table<fty>，复用 tig_table_compare（结构字段列递归、表
+// 字段列深比较、浮点 IEEE oeq、字符串二进制安全均由既有判据覆盖）。
+// 任一侧不是行池变量 → 编译期拒绝：表字面量临时是普通 P2a 行式表（单句柄），
+// 与行池列式表示不同，静默比较会按第 0 列错位。
+func tig_rowpool_compare(op: i64, lnode: i64, rnode: i64) -> i64 {
+    if ast.s_tag(lnode) != 6 || ast.s_tag(rnode) != 6 {
+        sm_err_msg = "行池 ==/!= 仅支持两个行池变量（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var lr = rp_find(interner.intern(sstate.name_str(lnode)))
+    var rr = rp_find(interner.intern(sstate.name_str(rnode)))
+    if lr < 0 || rr < 0 {
+        sm_err_msg = "行池 ==/!= 仅支持两个行池变量（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var si_l = rp_si[lr]
+    var si_r = rp_si[rr]
+    if si_l != si_r {
+        sm_err_msg = "行池比较两侧结构不同（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var nf = cls_nfld[si_l]
+    if nf == 0 {
+        // 无字段结构：两个空池恒相等
+        if op == 6 {
+            return tig_bool_lit(0)
+        }
+        return tig_bool_lit(1)
+    }
+    var acc: i64 = -1
+    var k: i64 = 0
+    while k < nf {
+        var fty = rp_fld_ty(si_l, k)
+        var chl = s21_load(rp_allocas[lr][k], types.named(TK_STR))
+        var chr2 = s21_load(rp_allocas[rr][k], types.named(TK_STR))
+        var ck = tig_table_compare(5, types.table_of(fty), chl, chr2)
+        if ck < 0 {
+            return -1
+        }
+        if acc < 0 {
+            acc = ck
+        } else {
+            var av = ir.new_inst(g_cur_block, 6, types.named(TK_BOOL))  // and
+            ir.add_operand(av, acc, 0)
+            ir.add_operand(av, ck, 0)
+            acc = ir.get_value(av)
+        }
+        k = k + 1
+    }
+    if op == 6 {
+        var nx = ir.new_inst(g_cur_block, 8, types.named(TK_BOOL))  // xor i1, 1
+        ir.add_operand(nx, acc, 0)
+        ir.add_operand(nx, 1, 2)
+        return ir.get_value(nx)
+    }
+    return acc
+}
+
 // 行池整行读 r = rows[i]：id >= len → 默认行；否则逐字段 tbl_at + 聚合构造赋值。返回 R 值。
 func rp_read(nm: i64, i: i64) -> i64 {
     var r = rp_find(nm)

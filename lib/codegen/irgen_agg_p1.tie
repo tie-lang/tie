@@ -398,6 +398,19 @@ func tig_field_assign(id: i64) -> i64 {
     }
     var fty = agg_field_ty(base_ty, fidx)
     var is_idx = ast.s_tag(base) == 13  // t[i] 下标 base
+    // p.9.12.6 行池字段写 t[i].f（= 与 op=）：按列定位（rp_find）→ 列句柄上
+    // grow-set 字段值（越界行以默认值补齐，与 rows[id] = e 的行物化一致）。
+    // 此前行池误走普通表读-改-写回：把整行 R（多字聚合）tbl_set 进第 0 列
+    //（单字元素）→ 写坏列句柄、字段值丢失（回归语料 t[0].y = 9 读回 0 的根源）。
+    if is_idx {
+        var tnode0 = sstate.child(base, 0)
+        if ast.s_tag(tnode0) == 6 {
+            var rr0 = rp_find(interner.intern(sstate.name_str(tnode0)))
+            if rr0 >= 0 {
+                return rp_field_write(rr0, fidx, fty, base, op, val, fname)
+            }
+        }
+    }
     var tbl_v: i64 = -1
     var idx_v: i64 = -1
     var copy_slot: i64 = -1

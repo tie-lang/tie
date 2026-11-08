@@ -367,6 +367,13 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
     if t < 0 {
         return -1
     }
+    // p.9.12.6：iter 是行池变量 → 元素读走 rp_read（逐列取 + 聚合构造）。
+    // t（scope 槽）只是第 0 列句柄，tbl_at 会把 R 行按普通表元素读出（错位：
+    // 8 字节列缓冲上按 16 字节行读 → 字段错乱）。
+    var rp_r: i64 = -1
+    if ast.s_tag(iter) == 6 {
+        rp_r = rp_find(interner.intern(sstate.name_str(iter)))
+    }
     // 元素类型判定优先级：
     //   1. iter 变量的作用域完整类型（table<T> → table_elem）
     //   2. ast.node_type(iter) 的表元素类型（语义推导）
@@ -499,7 +506,12 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
     // r.1.6.7 独占免锁：iter 是裸局部变量且静态证得独占 → 遍历读走免锁。
     // （for 的 iter 是**只读**位置，esc_scan 的 FOR 分支按只读处理，故遍历本身
     //  不会把候选置死；真正的泄漏点仍由循环子树里的其它语句决定。）
-    var iv = s21_table_at_ex(t, cur_v, ir.get_value(ok_slot), elem_llvm_ty, esc_take(iter, "for 遍历"))
+    var iv: i64 = -1
+    if rp_r >= 0 {
+        iv = rp_read(interner.intern(sstate.name_str(iter)), cur_v)
+    } else {
+        iv = s21_table_at_ex(t, cur_v, ir.get_value(ok_slot), elem_llvm_ty, esc_take(iter, "for 遍历"))
+    }
     if iv < 0 {
         return -1
     }

@@ -82,10 +82,44 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
         // p.9.12.6 行池变量：声明类型是 table<struct>（struct 元素）→ 列式行池
         //（多列聚合表示），不入通用表变量路径（单句柄 + retain/release 假设）。
         // row pool 仅存在符号存储位，无面向值传递；读写/len 由 rp_* 分支处理。
-        if types.is_table(ty) {
+        // map 不是行池（is_table 含 map，须显式排除——否则 map<struct> 局部被
+        // 劫持成行池、键全丢）。
+        if types.is_table(ty) && !types.is_map(ty) {
             var te_rp = types.table_elem(ty)
             if te_rp > 0 && types.kind(te_rp) == K_STRUCT {
-                return rp_decl(nm, ty)
+                var rd = rp_decl(nm, ty)
+                if rd < 0 {
+                    return -1
+                }
+                // §2.15 行池初始化：
+                //  - 非空表字面量 [e0, e1, ...] → 按行 0..n-1 逐行 rp_write（列同步
+                //    扩容 + 字段分发）。此前初始化器被静默丢弃——回归语料
+                //    table_struct_elem.tie 期望 3/9/13/10/17/2 实际 0/0/10/0/10
+                //    的根因（regress 只验编译不验输出，故长期未暴露）。
+                //  - `= []` / 无 init → 空池（既有行为，规范 2.15 示例即 `= []`）。
+                //  - 其余 init（变量拷贝/调用结果）→ 编译期拒绝：行池无从复制
+                //    （p.9.12.6 边界同款口径），静默丢数据不可接受。
+                if init >= 0 && ast.s_tag(init) != 12 {
+                    sm_err_msg = "行池 table<" + types.type_name(te_rp) + "> 仅支持表字面量初始化（变量 '" + sstate.name_str(id) + "'，函数 " + g_cur_fn_name + "）"
+                    return -1
+                }
+                if init >= 0 {
+                    var ncl = sstate.nchild(init)
+                    var ci: i64 = 0
+                    while ci < ncl {
+                        var cell = sstate.child(init, ci)
+                        var valnode = sstate.child(cell, 1)
+                        var v = tig_expr(valnode)
+                        if v < 0 {
+                            return -1
+                        }
+                        if rp_write(nm, tig_int_lit(ci), v) < 0 {
+                            return -1
+                        }
+                        ci = ci + 1
+                    }
+                }
+                return 0
             }
         }
         var alloca = ir.new_inst(g_cur_block, 20, ty)  // alloca
