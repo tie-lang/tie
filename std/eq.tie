@@ -1,0 +1,65 @@
+type tie<class, unsafe:mem>
+// eq.tie：相等运算的类型无关原语与显式入口。
+// 内容相等由编译器按静态类型生成；本模块只承载不依赖类型信息的字节级比较
+// 与身份判断，供一般程序显式导入。unsafe 凭据不随导入传播，调用方无需持有。
+
+unsafe extern fn memcmp(a: ptr<u8>, b: ptr<u8>, n: i64) -> i32;
+
+// 二进制安全文本相等：长度头 + 字节序列，内嵌空字符不作终止符。
+// 与运算符 == 的内容相等结论一致，另作显式入口便于按名取用。
+pub func str_eq_bytes(a: string, b: string) -> bool {
+    var na = len(a)
+    if na != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < na {
+        if str_byte(a, i) != str_byte(b, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 位相等：按字节序列逐位比较，不做任何语义解释。
+pub func bit_eq(a: ptr<u8>, b: ptr<u8>, n: i64) -> bool {
+    if n < 0 {
+        return false
+    }
+    if n == 0 {
+        return true
+    }
+    unsafe {
+        return memcmp(a, b, n) == 0
+    }
+}
+
+// 带门控的批量字节比较：规模小于一百二十八字节时逐字节比较，
+// 其余走向量化比较。小规模下宽读在首元素不同时反而更慢，故不无条件启用。
+pub func bytes_eq(a: ptr<u8>, b: ptr<u8>, n: i64) -> bool {
+    if n < 0 {
+        return false
+    }
+    if n >= 128 {
+        return bit_eq(a, b, n)
+    }
+    var i: i64 = 0
+    unsafe {
+        while i < n {
+            if deref(ptr_add(a, i)) != deref(ptr_add(b, i)) {
+                return false
+            }
+            i = i + 1
+        }
+    }
+    return true
+}
+
+// 显式身份比较：两个指针是否指向同一块存储。
+// 内容相等请用 ==；参与本比较的全局不参与只读空表折叠。
+pub func ptr_same(a: ptr<u8>, b: ptr<u8>) -> bool {
+    unsafe {
+        return ptr_to_int(a) == ptr_to_int(b)
+    }
+}
