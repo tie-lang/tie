@@ -477,20 +477,12 @@ func agg_val_to_addr(v: i64, agg: i64) -> i64 {
     return ap
 }
 
-// 单字段比较（==）：标量 icmp / 浮点 fcmp / 字符串 strcmp+icmp /
+// 单字段比较（==）：标量 icmp / 浮点 fcmp / 字符串长度头 + 字节序列 /
 // 嵌套元组递归；表/映射字段不支持。
 func tig_agg_field_cmp(fty: i64, lfv: i64, rfv: i64) -> i64 {
     if fty == types.named(TK_STR) {
-        // strcmp(lfv, rfv) == 0
-        var cmp = tig_ext_call2("strcmp", lfv, types.named(TK_STR), rfv, types.named(TK_STR), types.named(TK_I32))
-        if cmp < 0 {
-            return -1
-        }
-        var inst = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp i1
-        ir.add_operand(inst, cmp, 0)
-        ir.add_operand(inst, 0, 2)
-        ir.add_operand(inst, 0, 2)  // eq
-        return ir.get_value(inst)
+        // 与顶层 == 共用二进制安全判据，避免字段比较出现另一套语义
+        return tig_str_cmp_bytes(5, lfv, rfv)
     }
     if fty == types.named(TK_F64) || fty == types.named(TK_F32) {
         // fcmp oeq

@@ -151,9 +151,112 @@ func tig_scalar_to_str(v: i64, t: i64) -> i64 {
     return -1
 }
 
-// 字符串二元运算：拼接（+）→ tie 运行时 str_cat 桥（tie_str_cat 无——用
-// llvmgen 的 str_cat(56) 指令，llvmgen 内联 malloc+memcpy）；比较 → strcmp。
-// 复用 ir opcode：str_cat(56) 拼接；比较走 icmp(12) + 桥 strcmp。
+// 二进制安全文本比较：长度头 + 字节序列，内嵌 NUL 不作终止符。
+// 返回 i1 值 id；op 5..10 依次为 == != < > <= >=。
+// 机制：取两侧长度头的较小值做 memcmp，得到公共前缀的字典序符号；前缀相同
+// 时再由长度决定大小。UTF-8 字节序与码点序一致，故按字节比较即规范 §3.6
+// 的「按码点顺序比较」。字符串块带 32 字节尾填充，CRT 向量化宽读不越界。
+func tig_str_cmp_bytes(op: i64, lv: i64, rv: i64) -> i64 {
+    var nl = s21_str_head_len(lv)
+    var nr = s21_str_head_len(rv)
+    // 较小长度 = memcmp 的比较长度，避免读越界
+    var lt_len = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(lt_len, nl, 0)
+    ir.add_operand(lt_len, nr, 0)
+    ir.add_operand(lt_len, 2, 2)  // slt
+    var sel = ir.new_inst(g_cur_block, 34, types.named(TK_I64))
+    ir.add_operand(sel, ir.get_value(lt_len), 0)
+    ir.add_operand(sel, nl, 0)
+    ir.add_operand(sel, nr, 0)
+    var mlen = ir.get_value(sel)
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, lv)
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, rv)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, mlen)
+    var cmp = tig_ext_call_typed("memcmp", ats, avs, types.named(TK_I32))
+    if cmp < 0 {
+        return -1
+    }
+    // 公共前缀的三种符号：=0 / <0 / >0
+    var c0 = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(c0, cmp, 0)
+    ir.add_operand(c0, 0, 2)
+    ir.add_operand(c0, 0, 2)  // eq
+    var lt0 = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(lt0, cmp, 0)
+    ir.add_operand(lt0, 0, 2)
+    ir.add_operand(lt0, 2, 2)  // slt
+    var gt0 = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(gt0, cmp, 0)
+    ir.add_operand(gt0, 0, 2)
+    ir.add_operand(gt0, 3, 2)  // sgt
+    // 长度关系：前缀相同时由长度兜底
+    var le = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(le, nl, 0)
+    ir.add_operand(le, nr, 0)
+    ir.add_operand(le, 0, 2)  // eq
+    var lnlt = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(lnlt, nl, 0)
+    ir.add_operand(lnlt, nr, 0)
+    ir.add_operand(lnlt, 2, 2)  // slt
+    var eq_all = ir.new_inst(g_cur_block, 6, types.named(TK_BOOL))  // and
+    ir.add_operand(eq_all, ir.get_value(c0), 0)
+    ir.add_operand(eq_all, ir.get_value(le), 0)
+    var eqv = ir.get_value(eq_all)
+    if op == 5 {
+        return eqv
+    }
+    if op == 6 {
+        var nx = ir.new_inst(g_cur_block, 8, types.named(TK_BOOL))
+        ir.add_operand(nx, eqv, 0)
+        ir.add_operand(nx, 1, 2)
+        return ir.get_value(nx)
+    }
+    // 前缀相同且左更短 ⇒ 左 < 右；前缀不同时由 memcmp 符号定
+    var lt_same = ir.new_inst(g_cur_block, 6, types.named(TK_BOOL))
+    ir.add_operand(lt_same, ir.get_value(c0), 0)
+    ir.add_operand(lt_same, ir.get_value(lnlt), 0)
+    var lt_all = ir.new_inst(g_cur_block, 7, types.named(TK_BOOL))  // or
+    ir.add_operand(lt_all, ir.get_value(lt0), 0)
+    ir.add_operand(lt_all, ir.get_value(lt_same), 0)
+    // 前缀相同且左更长 ⇒ 左 > 右
+    var rngt = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(rngt, nr, 0)
+    ir.add_operand(rngt, nl, 0)
+    ir.add_operand(rngt, 2, 2)  // slt
+    var gt_same = ir.new_inst(g_cur_block, 6, types.named(TK_BOOL))
+    ir.add_operand(gt_same, ir.get_value(c0), 0)
+    ir.add_operand(gt_same, ir.get_value(rngt), 0)
+    var gt_all = ir.new_inst(g_cur_block, 7, types.named(TK_BOOL))  // or
+    ir.add_operand(gt_all, ir.get_value(gt0), 0)
+    ir.add_operand(gt_all, ir.get_value(gt_same), 0)
+    if op == 7 {
+        return ir.get_value(lt_all)
+    }
+    if op == 8 {
+        return ir.get_value(gt_all)
+    }
+    // <= 是 > 的否定；>= 是 < 的否定
+    if op == 9 {
+        var ng = ir.new_inst(g_cur_block, 8, types.named(TK_BOOL))
+        ir.add_operand(ng, ir.get_value(gt_all), 0)
+        ir.add_operand(ng, 1, 2)
+        return ir.get_value(ng)
+    }
+    if op == 10 {
+        var nl2 = ir.new_inst(g_cur_block, 8, types.named(TK_BOOL))
+        ir.add_operand(nl2, ir.get_value(lt_all), 0)
+        ir.add_operand(nl2, 1, 2)
+        return ir.get_value(nl2)
+    }
+    return -1
+}
+
+// 字符串二元运算：拼接（+）→ str_cat(56) 指令；比较 → 长度头 + 字节序列。
 func tig_binary_str(op: i64, lv: i64, rv: i64) -> i64 {
     if op == 0 {
         // 拼接：str_cat(56) 指令 [lhs, rhs]
@@ -162,33 +265,8 @@ func tig_binary_str(op: i64, lv: i64, rv: i64) -> i64 {
         ir.add_operand(inst, rv, 0)
         return ir.get_value(inst)
     }
-    // 比较：strcmp(lv, rv) → i32；再与 0 比较。
-    // strcmp 是 libc 函数（llvmgen 无条件 declare），走 extern_call(36)。
-    var cmp = tig_ext_call2("strcmp", lv, types.named(TK_STR), rv, types.named(TK_STR), types.named(TK_I32))
-    if cmp < 0 {
-        return -1
-    }
-    var c: i64 = -1
-    if op == 5 {
-        c = 0  // ==
-    } else if op == 6 {
-        c = 1  // !=
-    } else if op == 7 {
-        c = 2  // <
-    } else if op == 8 {
-        c = 3  // >
-    } else if op == 9 {
-        c = 4  // <=
-    } else if op == 10 {
-        c = 5  // >=
-    } else {
-        return -1
-    }
-    var inst = ir.new_inst(g_cur_block, 12, types.named(10))  // icmp i1
-    ir.add_operand(inst, cmp, 0)
-    ir.add_operand(inst, 0, 2)
-    ir.add_operand(inst, c, 2)
-    return ir.get_value(inst)
+    // 比较：长度头 + 字节序列（二进制安全；含内嵌 NUL 的文本不再被截断）
+    return tig_str_cmp_bytes(op, lv, rv)
 }
 
 // 逻辑短路 && / ||：cond_br + phi 汇合（对齐 Rust ir.rs）。
