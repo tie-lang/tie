@@ -328,6 +328,51 @@ func tig_ty_bitwise_comparable(t: i64) -> bool {
     return false
 }
 
+// 类型图可能成环：struct 字段经表/映射元素回指自身（路径访问集判环，镜像
+// 语义层 eq_comparable 的 seen 纪律）。纯表自嵌套（table<table<T>>）类型有
+// 限不成环；可构造的值级环必经 struct 表字段链。无环类型零开销——句柄对
+// 栈的进出栈调用只在可能成环的类型上发射。
+func tig_ty_may_cycle(t: i64, seen: ref table<i64>, depth: i64) -> bool {
+    if t < 0 || depth > 32 {
+        return false
+    }
+    var k = types.kind(t)
+    if k == K_STRUCT {
+        var si = types.low(t)
+        if si < 0 || si >= len(cls_fldoff) {
+            return false
+        }
+        var i: i64 = 0
+        while i < len(seen) {
+            if seen[i] == si {
+                return true
+            }
+            i = i + 1
+        }
+        var base = len(seen)
+        table_push(seen, si)
+        var off = cls_fldoff[si]
+        var cnt = cls_nfld[si]
+        var j: i64 = 0
+        while j < cnt {
+            if tig_ty_may_cycle(fld_tys[off + j], seen, depth + 1) {
+                return true
+            }
+            j = j + 1
+        }
+        table_trunc(seen, base)
+        return false
+    }
+    if k == K_TABLE || k == K_MAP {
+        var et = types.table_elem(t)
+        if et < 0 {
+            return false
+        }
+        return tig_ty_may_cycle(et, seen, depth + 1)
+    }
+    return false
+}
+
 // 表按内容相等：句柄短路 → 长度短路 → 逐元素循环。
 // 结果用 i1 槽汇合（而非 phi），循环提前失败与多个入口都写同一个槽，
 // 无需枚举 done 块的全部前驱。元素比较复用 tig_agg_field_cmp，故标量、
@@ -347,6 +392,22 @@ func tig_table_compare(op: i64, ty: i64, lv: i64, rv: i64) -> i64 {
     ir.add_operand(rslot, BT, 2)
     var rsv = ir.get_value(rslot)
     s21_store(rsv, tig_bool_lit(1), BT)
+    // 自引用环检测（规范 §3.6「自引用由比较过程检测并终止」）：可能成环的
+    // 类型才进句柄对栈（无环类型零开销）。mark 命中 = 同一对比较正在进行
+    // → 按共归纳判相等直接短路；退出在 done 统一 unmark（全部分支唯一汇合
+    // 点，配对弹出不漏）。可构造的值级环必经 struct 表字段链——递归比较
+    // 再次进入本函数时同一句柄对被识别。
+    var seen_c: table<i64> = table_new_i64()
+    var track = tig_ty_may_cycle(ety, seen_c, 0)
+    if track {
+        // 编译期响亮拒绝：本比较器是**内联展开**——元素比较逐层内联，成环
+        // 类型（struct 表字段回指自身）会让 IR 生成无限递归（实测静默 127
+        // 退出）。运行时句柄对栈（tl_tbl$eq_mark/unmark）基建已就位，但运行
+        // 期共归纳需要「按类型生成专用比较函数」（编译期按类型 memo 化、调用
+        // 复用）才能收敛——列为后续批（irgen.tie 的 tie_lazy_* 是现成范式）。
+        sm_err_msg = "自引用类型 '" + types.type_name(ety) + "' 的相等比较暂不支持（内联比较器无法收敛；需按类型生成专用比较函数，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
     var lenchk = ir.new_block(g_cur_func, interner.intern("eq.tbl.len"))
     var falseblk = ir.new_block(g_cur_func, interner.intern("eq.tbl.no"))
     var initblk = ir.new_block(g_cur_func, interner.intern("eq.tbl.init"))
@@ -473,8 +534,14 @@ func tig_table_compare(op: i64, ty: i64, lv: i64, rv: i64) -> i64 {
     s21_store(rsv, tig_bool_lit(0), BT)
     var brf = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(brf, done, 1)
-    // 汇合：读结果槽；!= 取反
+    // 汇合：读结果槽；!= 取反。可能成环的类型在此统一 unmark（唯一汇合点，
+    // 与入口 eq_mark 配对弹出——hit/memcmp/循环三路全经此处）。
     g_cur_block = done
+    if track {
+        var empty_a: table<i64> = table_new_i64()
+        var empty_b: table<i64> = table_new_i64()
+        tig_trmlite_call("tl_tbl$eq_unmark", empty_a, empty_b, -1)
+    }
     var res = s21_load(rsv, BT)
     if op == 6 {
         var nx = ir.new_inst(g_cur_block, 8, BT)

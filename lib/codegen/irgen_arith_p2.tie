@@ -542,8 +542,13 @@ func tig_agg_field_cmp(fty: i64, lfv: i64, rfv: i64) -> i64 {
         return tig_agg_cmp_fields(fty, ls, rs)
     }
     if types.is_table(fty) || types.is_map(fty) {
-        sm_err_msg = "元组字段为表类型，不支持 ==/!= 比较（字段类型 " + types.type_name(fty) + "）"
-        return -1
+        // 规范 §3.6：表/映射字段按内容递归比较（此前编译期拒绝是结构与表
+        // 相等落地前的临时裁决）。句柄对栈环检测由 tig_table_compare /
+        // tig_map_compare 自带（may_cycle 门控，无环类型零开销）。
+        if types.is_map(fty) {
+            return tig_map_compare(5, fty, lfv, rfv)
+        }
+        return tig_table_compare(5, fty, lfv, rfv)
     }
     // 整数/bool/char/trit：icmp eq
     var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
