@@ -317,10 +317,23 @@ func eq_ty_has_float(t: i64, depth: i64) -> bool {
     return false
 }
 
+// 位可比较元素类型：整数族 / bool / char。判据 = memcmp 逐字节与 == 语义
+// 一致——浮点排除（NaN 位相同而 IEEE 不等、±0 位不同而 IEEE 相等）；字符串
+// 排除（元素槽是长度头指针，等值串可异址）；struct 排除（布局填充字节未
+// 初始化，memcmp 可能误判不等）。
+func tig_ty_bitwise_comparable(t: i64) -> bool {
+    if types.is_int(t) || t == types.named(TK_BOOL) || t == types.named(TK_CHAR) {
+        return true
+    }
+    return false
+}
+
 // 表按内容相等：句柄短路 → 长度短路 → 逐元素循环。
 // 结果用 i1 槽汇合（而非 phi），循环提前失败与多个入口都写同一个槽，
 // 无需枚举 done 块的全部前驱。元素比较复用 tig_agg_field_cmp，故标量、
 // 浮点（IEEE oeq）、字符串（二进制安全）与结构字段走与顶层 == 同一判据。
+// 性能分层：元素为位可比较标量 → 长度相等后单次 memcmp 取代逐元素循环
+//（行池比较的标量字段列自动受益）。
 func tig_table_compare(op: i64, ty: i64, lv: i64, rv: i64) -> i64 {
     var ety = types.table_elem(ty)
     if ety < 0 {
@@ -358,12 +371,64 @@ func tig_table_compare(op: i64, ty: i64, lv: i64, rv: i64) -> i64 {
     var nl = s21_table_len(lv)
     var nr = s21_table_len(rv)
     var le = tig_icmp_c(nl, nr, 0)
+    var bitwise = tig_ty_bitwise_comparable(ety)
+    var mcmpblk = ir.new_block(g_cur_func, interner.intern("eq.tbl.memcmp"))
     var cb1 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb1, le, 0)
-    ir.add_operand(cb1, initblk, 1)
+    if bitwise {
+        ir.add_operand(cb1, mcmpblk, 1)
+    } else {
+        ir.add_operand(cb1, initblk, 1)
+    }
     ir.add_operand(cb1, falseblk, 1)
-    // 循环初始化：k = 0
-    g_cur_block = initblk
+    if bitwise {
+        // memcmp 快路径：n = nl * esz（编译期元素宽度）。nl == 0 时不调 memcmp
+        //（空表 data 可能为 null，n=0 的 null 实参是 C UB）直接判相等。
+        g_cur_block = mcmpblk
+        var zblk = ir.new_block(g_cur_func, interner.intern("eq.tbl.z"))
+        var mb = ir.new_block(g_cur_func, interner.intern("eq.tbl.m"))
+        var gt0 = tig_icmp_c(nl, tig_int_lit(0), 3)  // sgt
+        var cbm = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cbm, gt0, 0)
+        ir.add_operand(cbm, mb, 1)
+        ir.add_operand(cbm, zblk, 1)
+        g_cur_block = mb
+        var eszb = tig_int_lit(elem_size(ety))
+        var bytes = s21_bin(2, nl, eszb)  // mul
+        var atsm: table<i64> = table_new_i64()
+        var avsm: table<i64> = table_new_i64()
+        table_push(atsm, types.named(TK_STR))
+        table_push(avsm, t21_data(lv))
+        table_push(atsm, types.named(TK_STR))
+        table_push(avsm, t21_data(rv))
+        table_push(atsm, types.named(TK_I64))
+        table_push(avsm, bytes)
+        var cmpm = tig_ext_call_typed("memcmp", atsm, avsm, types.named(TK_I32))
+        if cmpm < 0 {
+            return -1
+        }
+        var c0m = tig_icmp_c(cmpm, tig_int_lit(0), 0)  // eq
+        s21_store(rsv, c0m, BT)
+        var brm = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brm, done, 1)
+        g_cur_block = zblk
+        s21_store(rsv, tig_bool_lit(1), BT)
+        var brz = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brz, done, 1)
+        // 快路径下循环块（initblk/head/body）未生成内容：函数顶部已创建，
+        // LLVM 要求每个块带终结指令，空块补 br done（无前驱，永不执行）。
+        g_cur_block = initblk
+        var bri0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(bri0, done, 1)
+        g_cur_block = head
+        var brh0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brh0, done, 1)
+        g_cur_block = body
+        var brb0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brb0, done, 1)
+    } else {
+        // 循环初始化：k = 0
+        g_cur_block = initblk
     var kslot = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(kslot, T64, 2)
     var ksv = ir.get_value(kslot)
@@ -402,6 +467,7 @@ func tig_table_compare(op: i64, ty: i64, lv: i64, rv: i64) -> i64 {
     s21_store(ksv, s21_bin(0, kv, tig_int_lit(1)), T64)  // k++
     var brb = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(brb, head, 1)
+    }
     // 失败分支
     g_cur_block = falseblk
     s21_store(rsv, tig_bool_lit(0), BT)
