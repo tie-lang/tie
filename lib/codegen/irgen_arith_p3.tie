@@ -269,6 +269,156 @@ func tig_binary_str(op: i64, lv: i64, rv: i64) -> i64 {
     return tig_str_cmp_bytes(op, lv, rv)
 }
 
+// 相等比较的元素类型是否含浮点。含浮点时禁用句柄短路：NaN 不等于自身，
+// 同一块的内容相等按内容语义应为假，短路会错误地给出真。无法判定的类型
+// 一律保守返回真（只损失一次短路，不改变结论）。
+func eq_ty_has_float(t: i64, depth: i64) -> bool {
+    if t < 0 || depth > 16 {
+        return true
+    }
+    if types.is_float(t) {
+        return true
+    }
+    if types.is_table(t) {
+        return eq_ty_has_float(types.table_elem(t), depth + 1)
+    }
+    if types.kind(t) == K_STRUCT {
+        var si = types.low(t)
+        if si < 0 || si >= len(cls_fldoff) {
+            return true
+        }
+        var off = cls_fldoff[si]
+        var cnt = cls_nfld[si]
+        var i: i64 = 0
+        while i < cnt {
+            if eq_ty_has_float(fld_tys[off + i], depth + 1) {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+    if types.kind(t) == K_TUPLE {
+        var ti = t - BASE_TUPLE
+        if ti < 0 || ti >= len(tup_n) {
+            return true
+        }
+        var to = tup_offs[ti]
+        var tn = tup_n[ti]
+        var j: i64 = 0
+        while j < tn {
+            if eq_ty_has_float(tup_tys[to + j], depth + 1) {
+                return true
+            }
+            j = j + 1
+        }
+        return false
+    }
+    return false
+}
+
+// 表按内容相等：句柄短路 → 长度短路 → 逐元素循环。
+// 结果用 i1 槽汇合（而非 phi），循环提前失败与多个入口都写同一个槽，
+// 无需枚举 done 块的全部前驱。元素比较复用 tig_agg_field_cmp，故标量、
+// 浮点（IEEE oeq）、字符串（二进制安全）与结构字段走与顶层 == 同一判据。
+func tig_table_compare(op: i64, ty: i64, lv: i64, rv: i64) -> i64 {
+    var ety = types.table_elem(ty)
+    if ety < 0 {
+        // 防御分支：裸 table 的元素类型未知，语义层已先行拒绝；复用既有文案
+        sm_err_msg = "元组比较目标不是元组（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var BT = types.named(TK_BOOL)
+    var T64 = types.named(TK_I64)
+    var rslot = ir.new_inst(g_cur_block, 20, BT)
+    ir.add_operand(rslot, BT, 2)
+    var rsv = ir.get_value(rslot)
+    s21_store(rsv, tig_bool_lit(1), BT)
+    var lenchk = ir.new_block(g_cur_func, interner.intern("eq.tbl.len"))
+    var falseblk = ir.new_block(g_cur_func, interner.intern("eq.tbl.no"))
+    var initblk = ir.new_block(g_cur_func, interner.intern("eq.tbl.init"))
+    var head = ir.new_block(g_cur_func, interner.intern("eq.tbl.h"))
+    var body = ir.new_block(g_cur_func, interner.intern("eq.tbl.b"))
+    var done = ir.new_block(g_cur_func, interner.intern("eq.tbl.done"))
+    // 同一句柄短路（仅类型不含浮点时启用）
+    if !eq_ty_has_float(ety, 0) {
+        var li = tig_ptrtoint(lv)
+        var ri = tig_ptrtoint(rv)
+        var same = tig_icmp_c(li, ri, 0)
+        var cb0 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb0, same, 0)
+        ir.add_operand(cb0, done, 1)
+        ir.add_operand(cb0, lenchk, 1)
+    } else {
+        var br0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(br0, lenchk, 1)
+    }
+    // 长度短路
+    g_cur_block = lenchk
+    var nl = s21_table_len(lv)
+    var nr = s21_table_len(rv)
+    var le = tig_icmp_c(nl, nr, 0)
+    var cb1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb1, le, 0)
+    ir.add_operand(cb1, initblk, 1)
+    ir.add_operand(cb1, falseblk, 1)
+    // 循环初始化：k = 0
+    g_cur_block = initblk
+    var kslot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(kslot, T64, 2)
+    var ksv = ir.get_value(kslot)
+    s21_store(ksv, tig_int_lit(0), T64)
+    var bri = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bri, head, 1)
+    // head：k < nl → body / done
+    g_cur_block = head
+    var kc = tig_icmp_c(s21_load(ksv, T64), nl, 2)  // slt
+    var cbh = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbh, kc, 0)
+    ir.add_operand(cbh, body, 1)
+    ir.add_operand(cbh, done, 1)
+    // body：两侧元素逐个比较，任一不等即写结果槽并退出
+    g_cur_block = body
+    var kv = s21_load(ksv, T64)
+    // esz 低 62 位才是元素字节宽度：bit62 是深表标记、bit63 是 map 哈希标记。
+    // 不过滤会拿带标记的巨大值算偏移，复合元素表读到越界内存而误判相等。
+    var esz = s21_bin(6, t21_esz(lv), tig_int_lit(4611686018427387903))  // and
+    var offv = s21_bin(2, kv, esz)  // mul：k * esz
+    var ld = s21_load(s21_gep(t21_data(lv), offv, false), ety)
+    var rd = s21_load(s21_gep(t21_data(rv), offv, false), ety)
+    var fc = tig_agg_field_cmp(ety, ld, rd)
+    if fc < 0 {
+        return -1
+    }
+    var notfc = ir.new_inst(g_cur_block, 8, BT)  // xor i1 fc, 1
+    ir.add_operand(notfc, fc, 0)
+    ir.add_operand(notfc, 1, 2)
+    var next = ir.new_block(g_cur_func, interner.intern("eq.tbl.next"))
+    var cbb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbb, ir.get_value(notfc), 0)
+    ir.add_operand(cbb, falseblk, 1)
+    ir.add_operand(cbb, next, 1)
+    g_cur_block = next
+    s21_store(ksv, s21_bin(0, kv, tig_int_lit(1)), T64)  // k++
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, head, 1)
+    // 失败分支
+    g_cur_block = falseblk
+    s21_store(rsv, tig_bool_lit(0), BT)
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, done, 1)
+    // 汇合：读结果槽；!= 取反
+    g_cur_block = done
+    var res = s21_load(rsv, BT)
+    if op == 6 {
+        var nx = ir.new_inst(g_cur_block, 8, BT)
+        ir.add_operand(nx, res, 0)
+        ir.add_operand(nx, 1, 2)
+        return ir.get_value(nx)
+    }
+    return res
+}
+
 // 逻辑短路 && / ||：cond_br + phi 汇合（对齐 Rust ir.rs）。
 //   a && b：br a → then(求 b) / else(false)；then 后 phi [b, then], [false, else]
 //   a || b：br a → then(true) / else(求 b)；else 后 phi [true, then], [b, else]

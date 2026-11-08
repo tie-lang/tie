@@ -232,6 +232,10 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     if types.kind(lhs_t) == K_TUPLE || types.kind(lhs_t) == K_STRUCT {
         return tig_tuple_compare(op, lhs, rhs, lv, rv)
     }
+    // 表 ==/!=：句柄短路 → 长度短路 → 逐元素循环（语义层已放行并校验可比性）
+    if (op == 5 || op == 6) && types.is_table(lhs_t) {
+        return tig_table_compare(op, lhs_t, lv, rv)
+    }
     // op 码（ast）：0=+ 1=- 2=* 3=/ 4=% 5== 6!= 7< 8> 9<= 10>= 11&& 12||
     // 13& 14| 15^ 16<< 17>>（逻辑已在短路分支处理；此处为位运算）
     // tie-IR opcode：add(0) sub(1) mul(2) div(3) mod(4) icmp(12) and(6) or(7)
