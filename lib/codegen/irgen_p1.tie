@@ -476,6 +476,11 @@ func is_libc_sym(sym: string) -> bool {
     if sym == "memmove" {
         return true
     }
+    // 内容相等：libc memcmp（二进制安全文本比较；字符串块带 32 字节尾填充，
+    // CRT 向量化宽读不越界）。先单独登记再让源码调用，避免自举引导死锁。
+    if sym == "memcmp" {
+        return true
+    }
     if sym == "exit" || sym == "remove" {
         return true
     }

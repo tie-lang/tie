@@ -428,6 +428,11 @@ func extern_decl(sym: string) -> string {
     if sym == "memcpy" {
         return "declare void @memcpy(ptr, ptr, i64)"
     }
+    // 内容相等：二进制安全文本比较（长度由调用方按两侧长度头取较小值，
+    // 内嵌 NUL 不作为终止符参与比较）。
+    if sym == "memcmp" {
+        return "declare i32 @memcmp(ptr, ptr, i64)"
+    }
     // 表容器 tl_tbl 用 libc memset（零化/越界零值；CRT 提供）
     if sym == "memset" {
         return "declare void @memset(ptr, i8, i64)"
@@ -697,7 +702,7 @@ func user_extern_decl(sym: string) -> string {
     // redefinition；这些符号声明固定，绝不在此推导。
     if sym == "printf" || sym == "strlen" || sym == "strcmp" ||
         sym == "malloc" || sym == "free" || sym == "memcpy" || sym == "memmove" ||
-        sym == "memset" ||
+        sym == "memcmp" || sym == "memset" ||
         sym == "fopen" || sym == "fwrite" || sym == "fread" ||
         sym == "fseek" || sym == "ftell" ||
         sym == "fclose" || sym == "fflush" ||
