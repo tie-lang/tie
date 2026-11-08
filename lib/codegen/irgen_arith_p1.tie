@@ -226,9 +226,10 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
         var rf = tig_coerce(rv, rhs_t, types.named(TK_F64))
         return tig_binary_float(op, lf, rf, fsem)
     }
-    // 元组 ==/!=：逐字段递归比较（语义层已校验两侧为结构相等元组；
-    // < > <= >= 在语义层已被拦截，此处仅处理 5/6）
-    if types.kind(lhs_t) == K_TUPLE {
+    // 元组/结构 ==/!=：逐字段递归比较（语义层已校验两侧类型相容与可比性；
+    // < > <= >= 在语义层已被拦截，此处仅处理 5/6）。结构若有 op_eq 方法，
+    // 已在函数开头的运算符重载分支优先分派。
+    if types.kind(lhs_t) == K_TUPLE || types.kind(lhs_t) == K_STRUCT {
         return tig_tuple_compare(op, lhs, rhs, lv, rv)
     }
     // op 码（ast）：0=+ 1=- 2=* 3=/ 4=% 5== 6!= 7< 8> 9<= 10>= 11&& 12||

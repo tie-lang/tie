@@ -377,7 +377,9 @@ func tig_tuple_compare(op: i64, lhs: i64, rhs: i64, lv: i64, rv: i64) -> i64 {
         return -1
     }
     var agg = ast.node_type(lhs)
-    if types.kind(agg) != K_TUPLE {
+    // 结构与元组共用逐字段比较：两者都是按值聚合，字段表布局不同由
+    // tig_agg_cmp_fields 按类型分派。防御分支复用既有诊断文案，避免码表变动。
+    if types.kind(agg) != K_TUPLE && types.kind(agg) != K_STRUCT {
         sm_err_msg = "元组比较目标不是元组（函数 " + g_cur_fn_name + "）"
         return -1
     }
@@ -415,13 +417,36 @@ func tig_agg_operand_addr(node: i64, pre_val: i64, agg: i64) -> i64 {
 // 比较两个同类型聚合地址的全部字段（== 语义）：逐字段比较 + and 合并。
 // 返回 i1（全部字段相等 → true）；空元组恒真。
 func tig_agg_cmp_fields(agg: i64, laddr: i64, raddr: i64) -> i64 {
-    var t = agg - BASE_TUPLE
-    var nf = tup_n[t]
-    var off = tup_offs[t]
+    var nf: i64 = 0
+    var off: i64 = 0
+    var is_tuple: bool = false
+    if types.kind(agg) == K_TUPLE {
+        var t = agg - BASE_TUPLE
+        nf = tup_n[t]
+        off = tup_offs[t]
+        is_tuple = true
+    } else if types.kind(agg) == K_STRUCT {
+        var si = types.low(agg)
+        if si < 0 || si >= len(cls_fldoff) {
+            // 防御分支：复用既有文案，不新增诊断码
+            sm_err_msg = "元组比较目标不是元组（函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+        nf = cls_nfld[si]
+        off = cls_fldoff[si]
+    } else {
+        sm_err_msg = "元组比较目标不是元组（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
     var acc: i64 = -1
     var i: i64 = 0
     while i < nf {
-        var fty = tup_tys[off + i]
+        var fty: i64 = 0
+        if is_tuple {
+            fty = tup_tys[off + i]
+        } else {
+            fty = fld_tys[off + i]
+        }
         var lgp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 左字段地址
         ir.add_operand(lgp, laddr, 0)
         ir.add_operand(lgp, i, 2)
@@ -503,6 +528,18 @@ func tig_agg_field_cmp(fty: i64, lfv: i64, rfv: i64) -> i64 {
             return -1
         }
         return tig_agg_cmp_fields(fty, la, ra)
+    }
+    if types.kind(fty) == K_STRUCT {
+        // 嵌套结构：值落内存后递归逐字段比较（与顶层结构 == 同一判据）
+        var ls = agg_val_to_addr(lfv, fty)
+        if ls < 0 {
+            return -1
+        }
+        var rs = agg_val_to_addr(rfv, fty)
+        if rs < 0 {
+            return -1
+        }
+        return tig_agg_cmp_fields(fty, ls, rs)
     }
     if types.is_table(fty) || types.is_map(fty) {
         sm_err_msg = "元组字段为表类型，不支持 ==/!= 比较（字段类型 " + types.type_name(fty) + "）"
