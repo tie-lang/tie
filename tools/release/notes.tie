@@ -1,0 +1,344 @@
+type tie<logic>
+// tools/release/notes.tie —— 发行说明生成器
+// ============================================================
+// 职责：把一段提交历史转成发行说明（发布文档）正文。提交标题形如
+//   type(scope): 描述
+//   type: 描述
+// 按 type 分组、按组内提交先后排列，输出 Markdown。
+//
+// 用法（先编译再运行，logic 角色编译为可执行程序）：
+//   tiec tools/release/notes.tie -o _local_only/bin/notes.exe
+//   notes.exe --base <ref> --head <ref> --version <版本> [--title <标题>] [--out <文件>]
+//
+//   --base    起始引用；"auto" = 最近一个标签；给空串表示导出全部历史
+//   --head    终止引用；缺省 HEAD
+//   --version 版本号，写进正文标题
+//   --title   正文主标题；缺省 "tie 发行说明"
+//   --out     输出文件；缺省写标准输出
+//
+// 约定：
+//   - 只读 git，不改工作树；退出码 0 = 成功，1 = 参数或仓库错误。
+//   - 正文用 Markdown；分组顺序固定，与提交类型一一对应。
+//   - 提交类型不认识时归入「其它」，不丢弃条目。
+// ============================================================
+
+// ---- 分组表：序号 → (类型, 中文标题) ----
+
+func group_type(i: i64) -> string {
+    if i == 0 { return "feat" }
+    if i == 1 { return "fix" }
+    if i == 2 { return "perf" }
+    if i == 3 { return "refactor" }
+    if i == 4 { return "docs" }
+    if i == 5 { return "test" }
+    if i == 6 { return "chore" }
+    return ""
+}
+
+func group_title(i: i64) -> string {
+    if i == 0 { return "新功能" }
+    if i == 1 { return "修复" }
+    if i == 2 { return "性能" }
+    if i == 3 { return "重构" }
+    if i == 4 { return "文档" }
+    if i == 5 { return "测试" }
+    if i == 6 { return "杂项" }
+    return "其它"
+}
+
+func group_count() -> i64 {
+    return 8
+}
+
+// ---- 字符串工具（码点语义；输入短串，逐字符拼接可接受）----
+
+func is_ws_cp(c: string) -> bool {
+    if c == " " { return true }
+    if c == "\t" { return true }
+    if c == "\n" { return true }
+    if c == "\r" { return true }
+    return false
+}
+
+func slice_cp(s: string, from: i64, to: i64) -> string {
+    var out = ""
+    var i = 0
+    var n = str_len(s)
+    while i < n {
+        if i >= from && i < to {
+            out = out + str_char(s, i)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+func trim_cp(s: string) -> string {
+    var n = str_len(s)
+    var a = 0
+    var b = n
+    while a < b && is_ws_cp(str_char(s, a)) {
+        a = a + 1
+    }
+    while b > a && is_ws_cp(str_char(s, b - 1)) {
+        b = b - 1
+    }
+    return slice_cp(s, a, b)
+}
+
+// 子串首位置（码点索引）；未命中返回 -1。
+func sub_pos(s: string, sub: string) -> i64 {
+    var n = str_len(s)
+    var m = str_len(sub)
+    if m == 0 { return 0 }
+    var i = 0
+    while i + m <= n {
+        var j = 0
+        var ok = true
+        while j < m && ok {
+            if str_char(s, i + j) == str_char(sub, j) {
+                j = j + 1
+            } else {
+                ok = false
+            }
+        }
+        if ok { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// 按分隔符切分；返回 table<string>。
+func split_by(s: string, sep: string) -> table<string> {
+    var out = table_new_string()
+    var cur = ""
+    var i = 0
+    var n = str_len(s)
+    var m = str_len(sep)
+    if m == 0 {
+        table_push(out, s)
+        return out
+    }
+    while i < n {
+        var hit = true
+        var j = 0
+        while j < m {
+            if str_char(s, i + j) != str_char(sep, j) {
+                hit = false
+                j = m
+            } else {
+                j = j + 1
+            }
+        }
+        if hit {
+            table_push(out, cur)
+            cur = ""
+            i = i + m
+        } else {
+            cur = cur + str_char(s, i)
+            i = i + 1
+        }
+    }
+    table_push(out, cur)
+    return out
+}
+
+// ---- 提交标题解析：type(scope): 描述 ----
+
+// 类型段：第一个冒号前的内容，trim 后取用。
+func subj_type(subj: string) -> string {
+    var p = sub_pos(subj, ":")
+    if p < 0 { return "" }
+    return trim_cp(slice_cp(subj, 0, p))
+}
+
+// 作用域段：类型与冒号之间若有一对圆括号，取其中内容。
+func subj_scope(subj: string) -> string {
+    var lp = sub_pos(subj, "(")
+    if lp < 0 { return "" }
+    var rp = sub_pos(subj, ")")
+    if rp < 0 || rp < lp { return "" }
+    return trim_cp(slice_cp(subj, lp + 1, rp))
+}
+
+// 描述段：第一个冒号之后的内容，trim 后取用。
+func subj_desc(subj: string) -> string {
+    var p = sub_pos(subj, ":")
+    if p < 0 { return trim_cp(subj) }
+    return trim_cp(slice_cp(subj, p + 1, str_len(subj)))
+}
+
+// ---- 主流程 ----
+
+func main() {
+    var base = "auto"
+    var head = "HEAD"
+    var version = ""
+    var title = "tie 发行说明"
+    var outpath = ""
+
+    var i = 0
+    var n = arg_count()
+    while i < n {
+        var a = arg_string(i)
+        var step = 1
+        if a == "--base" && i + 1 < n {
+            base = arg_string(i + 1)
+            step = 2
+        } else if a == "--head" && i + 1 < n {
+            head = arg_string(i + 1)
+            step = 2
+        } else if a == "--version" && i + 1 < n {
+            version = arg_string(i + 1)
+            step = 2
+        } else if a == "--title" && i + 1 < n {
+            title = arg_string(i + 1)
+            step = 2
+        } else if a == "--out" && i + 1 < n {
+            outpath = arg_string(i + 1)
+            step = 2
+        } else {
+            println("未知参数：" + a)
+            exit(1)
+        }
+        i = i + step
+    }
+
+    // 起始引用 = 最近标签；仓库无标签时报错并给出可用替代。
+    // 只用 exec_output 取值：exec_code 会让子进程 stdout 直通本进程输出，
+    // 会污染发行说明正文；判定改由内容形状承担（标签名不含空白）。
+    if base == "auto" {
+        var d = trim_cp(exec_output("git describe --tags --abbrev=0"))
+        if d == "" || sub_pos(d, " ") >= 0 {
+            println("仓库内没有标签，无法定位起点；请用 --base 指定引用，或用 --base \"\" 导出全部历史")
+            exit(1)
+        }
+        base = d
+    }
+
+    // 取提交历史：sha<TAB>标题
+    var cmd = "git log --no-merges --format=%h%x09%s "
+    if base == "" {
+        cmd = cmd + head
+    } else {
+        cmd = cmd + base + ".." + head
+    }
+    var raw = exec_output(cmd)
+    var rows = split_by(raw, "\n")
+
+    // 条目四元组，四个平行表按索引对齐。
+    var e_type = table_new_string()
+    var e_scope = table_new_string()
+    var e_sha = table_new_string()
+    var e_desc = table_new_string()
+
+    var k = 0
+    while k < len(rows) {
+        var line = trim_cp(rows[k])
+        k = k + 1
+        if line == "" { continue }
+        var tab = sub_pos(line, "\t")
+        if tab < 0 { continue }
+        var sha = trim_cp(slice_cp(line, 0, tab))
+        var subj = trim_cp(slice_cp(line, tab + 1, str_len(line)))
+        var ty = subj_type(subj)
+        if ty == "" { ty = "other" }
+        table_push(e_type, ty)
+        table_push(e_scope, subj_scope(subj))
+        table_push(e_sha, sha)
+        table_push(e_desc, subj_desc(subj))
+    }
+
+    // 空区间 = 引用无效或区间内无提交；两种情形都无法成文，直接报错。
+    if len(e_type) == 0 {
+        println("未取到提交：请检查引用是否存在、区间是否为空")
+        exit(1)
+    }
+
+    // 正文
+    var out = table_new_string()
+    var head_line = title
+    if version != "" {
+        head_line = title + " " + version
+    }
+    table_push(out, "# " + head_line)
+    table_push(out, "")
+
+    var g = 0
+    while g < group_count() {
+        var want = group_type(g)
+        var body = table_new_string()
+        var e = 0
+        while e < len(e_type) {
+            if e_type[e] == want {
+                var sc = e_scope[e]
+                var sha = e_sha[e]
+                var ds = e_desc[e]
+                var item = "- " + ds
+                if sc != "" {
+                    item = item + "（" + sc + "，`" + sha + "`）"
+                } else {
+                    item = item + "（`" + sha + "`）"
+                }
+                table_push(body, item)
+            }
+            e = e + 1
+        }
+        if len(body) > 0 {
+            table_push(out, "## " + group_title(g))
+            table_push(out, "")
+            var b = 0
+            while b < len(body) {
+                table_push(out, body[b])
+                b = b + 1
+            }
+            table_push(out, "")
+        }
+        g = g + 1
+    }
+
+    // 「其它」组：类型不在固定表内
+    var other = table_new_string()
+    var e2 = 0
+    while e2 < len(e_type) {
+        var ty2 = e_type[e2]
+        var known = false
+        var g2 = 0
+        while g2 < group_count() {
+            if group_type(g2) == ty2 { known = true }
+            g2 = g2 + 1
+        }
+        if !known {
+            var item2 = "- " + e_desc[e2] + "（`" + e_sha[e2] + "`）"
+            table_push(other, item2)
+        }
+        e2 = e2 + 1
+    }
+    if len(other) > 0 {
+        table_push(out, "## " + group_title(group_count()))
+        table_push(out, "")
+        var o = 0
+        while o < len(other) {
+            table_push(out, other[o])
+            o = o + 1
+        }
+        table_push(out, "")
+    }
+
+    // 输出
+    var doc = ""
+    var q = 0
+    while q < len(out) {
+        doc = doc + out[q] + "\n"
+        q = q + 1
+    }
+    if outpath == "" {
+        println(doc)
+    } else {
+        if !file_write(outpath, doc) {
+            println("写入失败：" + outpath)
+            exit(1)
+        }
+        println("已写入：" + outpath + "（" + to_string(len(e_type)) + " 条提交）")
+    }
+}
