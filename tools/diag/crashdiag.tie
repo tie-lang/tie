@@ -23,7 +23,7 @@ type tie<logic>
 // 退出码: 0 = 正常运行结束 / 1 = 运行期 panic（已写崩溃日志）/
 //         2 = 参数或程序加载/注册错误。
 
-import "../../lib/interp/tiep/tiep.tie"
+import "../../lib/interp/interp.tie"
 
 var g_fail_early: string = "";
 
@@ -99,12 +99,12 @@ func cdx_strip_hdr(src: string) -> string {
 func load_program(src: string) -> string {
     var clean = cdx_strip_hdr(src)
     // 1. 注册源程序全部顶层函数
-    var r1 = tiep.eval(clean)
+    var r1 = interp.eval(clean)
     if w_err != "" {
         return "程序注册失败: " + w_err
     }
     // 2. 注入单参入口，内部调 main()（main 需 0 参；eval_call 协议要求恰好 1 参）
-    var r2 = tiep.eval("func __tie_crash_entry__(arg: string) -> i64 { main() ; return 0 }")
+    var r2 = interp.eval("func __tie_crash_entry__(arg: string) -> i64 { main() ; return 0 }")
     if w_err != "" {
         return "注入入口失败（被测程序需无参 main()）: " + w_err
     }
@@ -119,14 +119,14 @@ func build_report(prog: string, msg: string) -> string {
     s = s + "程序: " + prog + "\n"
     s = s + "错误: " + msg + "\n"
     s = s + "调用栈 (backtrace, 自外向内):\n"
-    var d = tiep.dbg_err_depth()
+    var d = interp.dbg_err_depth()
     if d == 0 {
         s = s + "  (无候选栈帧)\n"
     }
     var i: i64 = 0
     while i < d {
-        s = s + "  #" + to_string(i) + " " + tiep.dbg_err_name(i) +
-            " (行:" + to_string(tiep.dbg_err_line(i)) + ")\n"
+        s = s + "  #" + to_string(i) + " " + interp.dbg_err_name(i) +
+            " (行:" + to_string(interp.dbg_err_line(i)) + ")\n"
         i = i + 1
     }
     s = s + "符号化说明: 帧为解释器函数 + 函数体首行（源码 -g 行映射见 docs/p.9.2.1.md）\n"
@@ -162,14 +162,14 @@ func main() -> i64 {
         logpath = prog + ".crash.log"
     }
     var src = file_read(prog)
-    tiep.reset()
-    tiep.dbg_start(false)
+    interp.reset()
+    interp.dbg_start(false)
     var err = load_program(src)
     if err != "" {
         println("崩溃诊断失败: " + err)
         return 2
     }
-    var res = tiep.eval_call("__tie_crash_entry__", "")
+    var res = interp.eval_call("__tie_crash_entry__", "")
     var _ignored = res
     if w_err != "" {
         // run-time panic 路径

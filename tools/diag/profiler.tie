@@ -12,7 +12,7 @@ type tie<logic>
 // 被测程序约定：模块式（只定义函数）、入口无参 `func main`（同 ）。
 // 用法: `profiler [-o <out>] <program.tie>`；退出码 0。
 
-import "../../lib/interp/tiep/tiep.tie"
+import "../../lib/interp/interp.tie"
 
 // ---------- 工具 ----------
 func pr_has_prefix(s: string, p: string) -> bool {
@@ -100,20 +100,20 @@ func main() -> i64 {
     var src = pr_prepare(file_read(prog))
 
     // 运行（插桩采样）
-    tiep.reset()
-    tiep.dbg_start(true)
-    var r1 = tiep.eval(src)
+    interp.reset()
+    interp.dbg_start(true)
+    var r1 = interp.eval(src)
     if w_err != "" {
         println("剖析失败（注册）: " + w_err)
         return 1
     }
-    var r2 = tiep.eval("func __prof_entry__(arg: string) -> i64 { main() ; return 0 }")
+    var r2 = interp.eval("func __prof_entry__(arg: string) -> i64 { main() ; return 0 }")
     if w_err != "" {
         println("剖析失败（注入入口，需无参 main()）: " + w_err)
         return 1
     }
     var t0 = time_now()
-    var rr = tiep.eval_call("__prof_entry__", "")
+    var rr = interp.eval_call("__prof_entry__", "")
     var _ig = rr
     var t1 = time_now()
 
@@ -126,14 +126,14 @@ func main() -> i64 {
     var sn = table_new_string()
     var stt = table_new_i64()
     var sch = table_new_i64()
-    var ne = tiep.dbg_ev_count()
+    var ne = interp.dbg_ev_count()
     var j: i64 = 0
     while j < ne {
-        var k = tiep.dbg_ev_kind(j)
+        var k = interp.dbg_ev_kind(j)
         if k == "C" {
-            var nm = tiep.dbg_ev_name(j)
+            var nm = interp.dbg_ev_name(j)
             table_push(sn, nm)
-            table_push(stt, tiep.dbg_ev_t(j))
+            table_push(stt, interp.dbg_ev_t(j))
             table_push(sch, 0)
             var ix = pf_idx(names, nm)
             if ix < 0 {
@@ -150,7 +150,7 @@ func main() -> i64 {
                 var nm = sn[top]
                 var st0 = stt[top]
                 var cs = sch[top]
-                var en = tiep.dbg_ev_t(j)
+                var en = interp.dbg_ev_t(j)
                 var inc = en - st0
                 if inc < 0 { inc = 0 }
                 var sf = inc - cs
@@ -175,9 +175,9 @@ func main() -> i64 {
     var st2 = table_new_string()
     var j2: i64 = 0
     while j2 < ne {
-        var k2 = tiep.dbg_ev_kind(j2)
+        var k2 = interp.dbg_ev_kind(j2)
         if k2 == "C" {
-            table_push(st2, tiep.dbg_ev_name(j2))
+            table_push(st2, interp.dbg_ev_name(j2))
             var path = ""
             var d: i64 = 0
             while d < len(st2) {

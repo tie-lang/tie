@@ -108,7 +108,7 @@ func collect_macros() -> i64 {
                     sm_err_msg = "声明式宏 '" + interner.lookup(nm_id) + "' 缺少展开体"
                     return -1
                 }
-                var body_proto = tiep.sstate_subtree_protocol(body_node)
+                var body_proto = interp.sstate_subtree_protocol(body_node)
                 if w_err != "" {
                     sm_err_line = s_lines[s]
                     sm_err_col = s_cols[s]
@@ -219,14 +219,14 @@ func register_macros() -> i64 {
         }
         pool_restore()
         var node = g_macro_nodes[i]
-        var proto = tiep.sstate_subtree_protocol(node)
+        var proto = interp.sstate_subtree_protocol(node)
         if w_err != "" {
             sm_err_line = s_lines[node]
             sm_err_col = s_cols[node]
             sm_err_msg = "宏定义序列化失败: " + w_err
             return -1
         }
-        var r = tiep.eval_proto(proto)
+        var r = interp.eval_proto(proto)
         if w_err != "" {
             sm_err_line = s_lines[node]
             sm_err_col = s_cols[node]
@@ -292,7 +292,7 @@ func expand_one(call_id: i64) -> i64 {
             table_push(argstrs, src)
             k2 = k2 + 1
         }
-        var rp = tiep.eval_macro_proc(name, argstrs)
+        var rp = interp.eval_macro_proc(name, argstrs)
         if w_err != "" {
             sm_err_line = s_lines[call_id]
             sm_err_col = s_cols[call_id]
@@ -311,7 +311,7 @@ func expand_one(call_id: i64) -> i64 {
             sm_err_msg = "宏 '" + name + "' 的实参缺失"
             return -1
         }
-        var aproto = tiep.sstate_subtree_protocol(a)
+        var aproto = interp.sstate_subtree_protocol(a)
         if w_err != "" {
             sm_err_line = s_lines[call_id]
             sm_err_col = s_cols[call_id]
@@ -322,7 +322,7 @@ func expand_one(call_id: i64) -> i64 {
         k = k + 1
     }
     // 执行宏（编译期；宏体错误在此暴露）
-    var result = tiep.eval_macro(name, args)
+    var result = interp.eval_macro(name, args)
     if w_err != "" {
         sm_err_line = s_lines[call_id]
         sm_err_col = s_cols[call_id]

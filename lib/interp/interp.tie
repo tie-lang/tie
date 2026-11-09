@@ -42,14 +42,14 @@ type tie<class>
 //   （每个控制流语句/表达式类别一个函数），任务规格固定为三模块布局。
 
 import "./session.tie"
-import "./tiep_bin.tie"    // 二元运算分区（eval_binary 及算术/比较/位运算辅助）
-import "./tiep_call.tie"   // 函数调用分区（call_fn/参数绑定/call_builtin/join_print）
-import "./tiep_macro.tie"  // 宏执行分区（eval_proto/eval_macro/eval_macro_proc/exec_code_proto）
-import "./tiep_code.tie"   // code 值构造分区（gen_code_lit/卫生/插值/协议拼接）
-import "./tiep_dbug.tie"   // p.9.2 工具链共享仪器（崩溃/DAP/剖析；默认关）
-import "../../front/parser.tie"
-import "../../sema/sstate.tie"
-import "../../ir/types.tie"   // S3.3：TK_TRIT 等类型关键字常量（树合并后
+import "./binary_ops.tie"    // 二元运算分区（eval_binary 及算术/比较/位运算辅助）
+import "./call.tie"   // 函数调用分区（call_fn/参数绑定/call_builtin/join_print）
+import "./macro_exec.tie"  // 宏执行分区（eval_proto/eval_macro/eval_macro_proc/exec_code_proto）
+import "./code_val.tie"   // code 值构造分区（gen_code_lit/卫生/插值/协议拼接）
+import "./debug_probe.tie"   // p.9.2 工具链共享仪器（崩溃/DAP/剖析；默认关）
+import "../front/parser.tie"
+import "../sema/sstate.tie"
+import "../ir/types.tie"   // S3.3：TK_TRIT 等类型关键字常量（树合并后
 // 与 semantic 树共享 types——若本模块自持同名常量会重复定义）
 
 // 批次④：sleep_ms 内建所需的 kernel32 Sleep（Windows 目标，CRT 隐式链接；
@@ -109,7 +109,7 @@ pub var g_fn_src_names: table<string>; // 顶层函数名
 pub var g_fn_src_texts: table<string>; // 对应定义源码切片（原文）
 pub var g_fn_src_ready: bool = false;  // 惰性初始化守卫
 
-namespace tiep {
+namespace interp {
 
 // ==================== 入口 ====================
 
@@ -479,10 +479,10 @@ pub func eval_call(name: string, arg: string) -> string {
 // ==================== 工具 ====================
 
 
-}   // namespace tiep
+}   // namespace interp
 
 
-import "./tiep_import.tie"
-import "./tiep_p1.tie"
-import "./tiep_p2.tie"
-import "./tiep_p3.tie"
+import "./import_expand.tie"
+import "./core_p1.tie"
+import "./core_p2.tie"
+import "./core_p3.tie"
