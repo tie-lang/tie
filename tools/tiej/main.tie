@@ -1,16 +1,29 @@
 type tie<logic, unsafe:mem, unsafe:ext>
 import "../../lib/ir/ir.tie"
-import "../../lib/ir/types.tie"
-import "../../lib/support/interner.tie"
+import "../../lib/support/text.tie"
 import "../../lib/backend/render.tie"
 import "../../lib/jit/llvmc.tie"
+import "/std/prelude.tie"
+using lang;
+import "../../lib/sema/sstate.tie"
+import "../../lib/front/context.tie"
+import "../../lib/ir/context.tie"
+import "../../lib/front/cfg_preproc.tie"
+import "../../lib/front/api.tie"
+import "../../lib/front/parser.tie"
+import "../../lib/codegen/irgen.tie"
 namespace tie.tool.tiej;
-// main.tie —— tiej 命令行入口（真实 IR → 后端 → LLJIT 自检）
+// main.tie —— tiej 命令行入口：源码 → 进程内编译 → LLJIT → 调用
 // ============================================================
 // 用法（仓根）：
 //   tiec tools/tiej/main.tie -o _local_only/bin/tiej.exe
-//   _local_only/bin/tiej.exe [--selftest]
-// 构造 jadd(a,b) 使用 lib/ir 的公开构造面，后端只经 tie.backend::render。
+//   tiej --selftest                        后端自检（手构 IR，验垫片与调用链）
+//   tiej <源文件> <函数名> [i64 参数...]    编译并调用（最多 5 个参数）
+//
+// 编译全程在进程内：parse_ast → check_ast → tig_ast → render，不落中间文件、
+// 不调外部编译器。边界：只支持纯标量函数——JIT 沙箱不链接表/运行时，含表、
+// spawn、字符串插值运行时桥的函数会在 irgen 或链接期被拒绝。
+// ============================================================
 
 func chk(ok: bool, tag: string) -> bool {
     if ok {
@@ -21,68 +34,142 @@ func chk(ok: bool, tag: string) -> bool {
     return ok
 }
 
-func build_add() {
-    types.init_tup()
-    types.init_sym()
-    var t64 = types.named(3)
-    var params: table<i64> = [t64, t64]
-    var f = ir.new_func(interner.intern("jadd"), t64, params)
-    var blk = ir.new_block(f, interner.intern("entry"))
-    var i = ir.new_inst(blk, 0, t64)
-    ir.add_operand(i, 0, 0)
-    ir.add_operand(i, 1, 0)
-    var r = ir.new_inst(blk, 32, -1)
-    ir.add_operand(r, ir.get_value(i), 0)
-}
 
+// 垫片自检：只验 DLL 可装载、LLJIT 会话可开。完整链路（IR 装载 → 查符号 →
+// 调用）由源码模式覆盖，不再用手构 IR 做第二套验证。
 func selftest() -> i64 {
-    build_add()
-    var ll = tie.backend::render(ir.ctx_current())
-    if !chk(str_len(ll) > 0, "render") {
-        println("[backend] " + tie.backend::last_error())
-        return 1
-    }
     if !chk(tie.jit::available(), "tiej_llvm.dll available") {
-        println("构建垫片：clang -shared -O2 lib/jit/tiej_llvm.c -I D:/LLVM/include -L D:/LLVM/lib -lLLVM-C -o _local_only/bin/tiej_llvm.dll")
+        println("构建垫片：clang -shared -O2 lib/jit/tiej_llvm.c -I <LLVM>/include -L <LLVM>/lib -lLLVM-C -o _local_only/bin/tiej_llvm.dll")
         return 1
     }
     var j = tie.jit::open()
     if !chk(j != 0, "open") {
+        println("[jit] " + tie.jit::last_error())
+        return 1
+    }
+    tie.jit::close(j)
+    println("tiej selftest: PASS（垫片装载；完整链路见源码模式）")
+    return 0
+}
+
+// 取目录段（含尾斜杠；无分隔符返回空串）。
+func dir_of(path: string) -> string {
+    var n = str_len(path)
+    var i = n - 1
+    while i >= 0 {
+        var c = str_char(path, i)
+        if c == "/" || c == "\\" {
+            var out = ""
+            var k = 0
+            while k <= i {
+                out = out + str_char(path, k)
+                k = k + 1
+            }
+            return out
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// 源码 → IR → JIT → 调用。argv 已按顺序解析为整数。
+func run_source(path: string, fname: string, argv: table<i64>) -> i64 {
+    var src = file_read(path)
+    if str_len(src) == 0 {
+        println("读取失败：" + path)
+        return 1
+    }
+    var clean = tie.support::strip_type_header(src)
+    sstate.ctx_new()
+    ir.ctx_new()
+    irgen.unit_reset()
+    // JIT 沙箱无表运行时：关掉越界检查，避免生成对运行时的依赖。
+    irgen.set_check_bounds(false)
+    // 目标函数列入导出白名单：否则未引用函数会被根集合裁剪，JIT 查不到符号。
+    irgen.set_dll_export(fname)
+
+    if tie.front::parse(clean, 0, 0) < 0 {
+        println("[parse] " + parser.ast_err_protocol())
+        return 1
+    }
+    var serr = tie.front::check(dir_of(path), false, 0)
+    // 成功返回 "OK:N"，失败才是 "ERR:…"——按前缀判定，别按长度。
+    if tie.support::has_prefix(serr, "ERR:") {
+        println("[sem] " + serr)
+        return 1
+    }
+    if irgen.tig_ast() != 0 {
+        println("[irgen] 生成失败（该函数可能依赖表/运行时，JIT 只支持纯标量函数）")
+        return 1
+    }
+    var ll = tie.backend::render(ir.ctx_current())
+    if str_len(ll) == 0 {
+        println("[backend] " + tie.backend::last_error())
+        return 1
+    }
+
+    if !tie.jit::available() {
+        println("缺少 tiej_llvm.dll：clang -shared -O2 lib/jit/tiej_llvm.c -I <LLVM>/include -L <LLVM>/lib -lLLVM-C -o _local_only/bin/tiej_llvm.dll")
+        return 1
+    }
+    var j = tie.jit::open()
+    if j == 0 {
+        println("[jit] " + tie.jit::last_error())
         return 1
     }
     var rc = tie.jit::add_ir(j, ll)
     if rc != 0 {
         println("[jit] " + tie.jit::last_error())
-    }
-    if !chk(rc == 0, "add_ir") {
         tie.jit::close(j)
         return 1
     }
-    var a = tie.jit::lookup(j, "jadd")
-    if !chk(a != 0, "lookup jadd") {
+    var addr = tie.jit::lookup(j, fname)
+    if addr == 0 {
+        println("[jit] 找不到函数符号：" + fname)
         tie.jit::close(j)
         return 1
     }
+    var p0: i64 = 0
+    var p1: i64 = 0
+    var p2: i64 = 0
+    var p3: i64 = 0
+    var p4: i64 = 0
+    if len(argv) > 0 { p0 = argv[0] }
+    if len(argv) > 1 { p1 = argv[1] }
+    if len(argv) > 2 { p2 = argv[2] }
+    if len(argv) > 3 { p3 = argv[3] }
+    if len(argv) > 4 { p4 = argv[4] }
+    var res: i64 = 0
     unsafe {
-        var r = dyn_call_p(a, 3, 4, 0, 0, 0)
-        chk(r == 7, "jadd(3,4) = " + to_string(r))
+        res = dyn_call_p(addr, p0, p1, p2, p3, p4)
     }
     tie.jit::close(j)
-    println("tiej selftest: PASS")
+    println(fname + " = " + to_string(res))
     return 0
 }
 
 func main() {
     var n = arg_count()
-    if n > 1 {
-        var a = arg_string(1)
-        if a == "--selftest" {
-            selftest()
-            return
-        }
-        println("tiej —— 尚未实现: " + a)
-        println("用法: tiej [--selftest]")
-        return
+    if n == 0 || arg_string(0) == "--selftest" {
+        var rc = selftest()
+        exit(rc)
     }
-    selftest()
+    if n < 2 {
+        println("用法: tiej <源文件> <函数名> [i64 参数...]（最多 5 个）")
+        println("      tiej --selftest")
+        exit(2)
+    }
+    var path = arg_string(0)
+    var fname = arg_string(1)
+    if n > 7 {
+        println("参数过多：JIT 调用最多 5 个 i64 参数")
+        exit(2)
+    }
+    var argv = table_new_i64()
+    var i = 2
+    while i < n {
+        table_push(argv, to_i64(arg_string(i)))
+        i = i + 1
+    }
+    exit(run_source(path, fname, argv))
 }

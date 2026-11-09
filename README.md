@@ -64,9 +64,10 @@ _local_only/bin/backend_probe.exe
 可直接编译并运行 `std/`、`sys/`、`ext/`、`rdu/` 下的库与常规程序；它同时是自举的，
 用仓内 `tiec` 即可编译自身。`_local_only/probes/tests/` 保留编译器回归用例。
 
-`lib/ir` + `lib/backend` + `lib/jit` + `tools/tiej` 另有一条最小 JIT 自检通道：
-tieir（函数 / 参数 / add·sub·mul / ret）→ LLVM 文本 → LLJIT → 查符号 → 调用。
-这是后端能力的冒烟闭环，不是编译器的能力边界。
+`lib/ir` + `lib/backend` + `lib/jit` + `tools/tiej` 另有一条 JIT 通道：
+源码 → 进程内前端与 irgen → LLVM 文本 → LLJIT → 按符号调用，不落中间文件、
+不调外部编译器。当前边界：标量函数，最多 5 个 i64 参数；JIT 沙箱不链接表
+运行时，含表/spawn 的函数会被拒绝。
 
 ## 许可
 
