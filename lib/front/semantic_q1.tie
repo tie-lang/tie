@@ -351,7 +351,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
 // expand_one_import（parse_ast + append_ast_mem）。状态重置、collect 系列、
 // 逐函数 check 循环与错误返回格式全部保留。
 // 返回 "OK:<typed>" 或 "ERR:<line> <col> <msg>"。
-pub func check_ast(base_dir: string) -> string {
+pub func check_ast(base_dir: string, ep: fn(string) -> string, em: fn(string, table<string>) -> string, eproc: fn(string, table<string>) -> string) -> string {
     g_cur_dir = base_dir
     reset_sem_state()
     // 内存直拷：ast 节点池 → sstate 9 列（替代 sstate.load_ast 的文本反序列化）
@@ -380,7 +380,7 @@ pub func check_ast(base_dir: string) -> string {
     sm_t_imp = smc3 - smc1
     // 宏展开 pass（跨文件宏：g_extra_tops 收集全部文件顶层宏定义；
     // 展开结果参与类型检查）。失败返回与后续同格式的 ERR 协议文本。
-    if mexpand.expand_sstate() < 0 {
+    if mexpand.expand_sstate(ep, em, eproc) < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     unsafe {

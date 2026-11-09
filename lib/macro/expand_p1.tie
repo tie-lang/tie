@@ -3,6 +3,9 @@ type tie<class>
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 mexpand.tie。
+
+// 宏展开自身的错误通道（不再借用解释器的全局）。失败时由执行器返回值同步。
+var g_macro_err: string = "";
 namespace mexpand {
 // 池快照：s_* 池 9 列 + node_types + s_n（节点总数）深拷贝到 g_pool_*。
 func pool_save() {
@@ -108,11 +111,11 @@ func collect_macros() -> i64 {
                     sm_err_msg = "声明式宏 '" + interner.lookup(nm_id) + "' 缺少展开体"
                     return -1
                 }
-                var body_proto = interp.sstate_subtree_protocol(body_node)
-                if w_err != "" {
+                var body_proto = sstate.subtree_protocol(body_node)
+                if g_macro_err != "" {
                     sm_err_line = s_lines[s]
                     sm_err_col = s_cols[s]
-                    sm_err_msg = "声明式宏 '" + interner.lookup(nm_id) + "' 展开体序列化失败: " + w_err
+                    sm_err_msg = "声明式宏 '" + interner.lookup(nm_id) + "' 展开体序列化失败: " + g_macro_err
                     return -1
                 }
                 var npar = s_nchild[s] - 1
@@ -208,7 +211,7 @@ func file_root_find(root_id: i64) -> i64 {
 // 注册全部宏到 interp：每个宏定义子树序列化为协议文本（根 = 宏定义
 // 节点 id 0）→ eval_proto（load_ast + 归档 + 顶层注册）。
 // 每轮注册前恢复池快照（上一轮 eval_proto 已重建 s_* 池）。
-func register_macros() -> i64 {
+func register_macros(exec_proto: fn(string) -> string) -> i64 {
     var i: i64 = 0
     while i < len(g_macro_keys) {
         // 声明式宏不注册进 interp（无编译期执行，模板代换在
@@ -219,15 +222,16 @@ func register_macros() -> i64 {
         }
         pool_restore()
         var node = g_macro_nodes[i]
-        var proto = interp.sstate_subtree_protocol(node)
-        if w_err != "" {
+        var proto = sstate.subtree_protocol(node)
+        if g_macro_err != "" {
             sm_err_line = s_lines[node]
             sm_err_col = s_cols[node]
-            sm_err_msg = "宏定义序列化失败: " + w_err
+            sm_err_msg = "宏定义序列化失败: " + g_macro_err
             return -1
         }
-        var r = interp.eval_proto(proto)
-        if w_err != "" {
+        var r = exec_proto(proto)
+        if str_len(r) > 0 { g_macro_err = r }
+        if g_macro_err != "" {
             sm_err_line = s_lines[node]
             sm_err_col = s_cols[node]
             sm_err_msg = "宏 '" + interner.lookup(g_macro_keys[i]) + "' 注册失败: " + r
@@ -243,7 +247,7 @@ func register_macros() -> i64 {
 //   实参序列化 → eval_macro → 结果加载 → 替换调用点。
 // eval_macro 会重建 s_* 池（宏体执行环境），故执行前恢复池快照（池 =
 // 主文件 AST + 已展开追加），执行后再恢复并追加结果。
-func expand_one(call_id: i64) -> i64 {
+func expand_one(call_id: i64, exec_macro: fn(string, table<string>) -> string, exec_proc: fn(string, table<string>) -> string) -> i64 {
     var nm_id = s_names[call_id]
     var mi = macro_find(nm_id)
     // 声明式宏：模板代换 + 卫生唯一化（不编译期执行，不需要 interp，
@@ -283,17 +287,18 @@ func expand_one(call_id: i64) -> i64 {
                 return -1
             }
             var src = deparse_arg_expr(a)
-            if w_err != "" {
+            if g_macro_err != "" {
                 sm_err_line = s_lines[call_id]
                 sm_err_col = s_cols[call_id]
-                sm_err_msg = "过程宏实参解引用失败: " + w_err
+                sm_err_msg = "过程宏实参解引用失败: " + g_macro_err
                 return -1
             }
             table_push(argstrs, src)
             k2 = k2 + 1
         }
-        var rp = interp.eval_macro_proc(name, argstrs)
-        if w_err != "" {
+        var rp = exec_proc(name, argstrs)
+            if str_len(rp) > 0 { g_macro_err = rp }
+        if g_macro_err != "" {
             sm_err_line = s_lines[call_id]
             sm_err_col = s_cols[call_id]
             sm_err_msg = "过程宏 '" + name + "' 展开失败: " + rp
@@ -311,19 +316,20 @@ func expand_one(call_id: i64) -> i64 {
             sm_err_msg = "宏 '" + name + "' 的实参缺失"
             return -1
         }
-        var aproto = interp.sstate_subtree_protocol(a)
-        if w_err != "" {
+        var aproto = sstate.subtree_protocol(a)
+        if g_macro_err != "" {
             sm_err_line = s_lines[call_id]
             sm_err_col = s_cols[call_id]
-            sm_err_msg = "宏实参序列化失败: " + w_err
+            sm_err_msg = "宏实参序列化失败: " + g_macro_err
             return -1
         }
         table_push(args, aproto)
         k = k + 1
     }
     // 执行宏（编译期；宏体错误在此暴露）
-    var result = interp.eval_macro(name, args)
-    if w_err != "" {
+    var result = exec_macro(name, args)
+        if str_len(result) > 0 { g_macro_err = result }
+    if g_macro_err != "" {
         sm_err_line = s_lines[call_id]
         sm_err_col = s_cols[call_id]
         sm_err_msg = "宏 '" + name + "' 展开失败: " + result
@@ -367,7 +373,7 @@ func finish_expand(call_id: i64, name: string, result: string) -> i64 {
 // ==================== 过程宏实参解引用（AST → 源码文本） ====================
 // 过程宏实参以**源码文本**传给宏体（token 流 API 驱动），此函数把 s_* 池
 // 表达式子树还原为源码。二元/一元/三目一律括号包裹保证重解析语义一致。
-// 覆盖常用表达式节点；未知节点置 w_err。
+// 覆盖常用表达式节点；未知节点置 g_macro_err。
 func deparse_arg_expr(node: i64) -> string {
     var t = s_tags[node]
     if t == N_INT_LIT {
@@ -377,21 +383,21 @@ func deparse_arg_expr(node: i64) -> string {
         if s_names[node] >= 0 {
             return interner.lookup(s_names[node])
         }
-        w_err = "浮点字面量缺少文本"
+        g_macro_err = "浮点字面量缺少文本"
         return ""
     }
     if t == N_STR_LIT {
         if s_names[node] >= 0 {
             return interner.lookup(s_names[node])
         }
-        w_err = "字符串字面量缺少文本"
+        g_macro_err = "字符串字面量缺少文本"
         return ""
     }
     if t == N_CHAR_LIT {
         if s_names[node] >= 0 {
             return interner.lookup(s_names[node])
         }
-        w_err = "字符字面量缺少文本"
+        g_macro_err = "字符字面量缺少文本"
         return ""
     }
     if t == N_BOOL_LIT {
@@ -407,13 +413,13 @@ func deparse_arg_expr(node: i64) -> string {
         if s_names[node] >= 0 {
             return interner.lookup(s_names[node])
         }
-        w_err = "变量节点缺少名字"
+        g_macro_err = "变量节点缺少名字"
         return ""
     }
     if t == N_UNARY {
         var op = s_vals[node]
         var opr = deparse_arg_expr(s_children[s_coff[node]])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         if op == 0 {
@@ -433,26 +439,26 @@ func deparse_arg_expr(node: i64) -> string {
     if t == N_BINARY {
         var op = s_vals[node]
         var l = deparse_arg_expr(s_children[s_coff[node]])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         var r = deparse_arg_expr(s_children[s_coff[node] + 1])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         return "(" + l + " " + bin_sym(op) + " " + r + ")"
     }
     if t == N_TERNARY {
         var c = deparse_arg_expr(s_children[s_coff[node]])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         var a = deparse_arg_expr(s_children[s_coff[node] + 1])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         var b = deparse_arg_expr(s_children[s_coff[node] + 2])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         return "(" + c + " ? " + a + " : " + b + ")"
@@ -475,7 +481,7 @@ func deparse_arg_expr(node: i64) -> string {
                 out = out + ", "
             }
             out = out + deparse_arg_expr(s_children[s_coff[node] + k])
-            if w_err != "" {
+            if g_macro_err != "" {
                 return ""
             }
             k = k + 1
@@ -484,7 +490,7 @@ func deparse_arg_expr(node: i64) -> string {
     }
     if t == N_METHOD_CALL {
         var recv = deparse_arg_expr(s_children[s_coff[node]])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         var out: string = recv + "." + interner.lookup(s_names[node]) + "("
@@ -504,7 +510,7 @@ func deparse_arg_expr(node: i64) -> string {
                 out = out + ", "
             }
             out = out + deparse_arg_expr(s_children[s_coff[node] + k])
-            if w_err != "" {
+            if g_macro_err != "" {
                 return ""
             }
             k = k + 1
@@ -513,29 +519,29 @@ func deparse_arg_expr(node: i64) -> string {
     }
     if t == N_INDEX {
         var base = deparse_arg_expr(s_children[s_coff[node]])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         var idx = deparse_arg_expr(s_children[s_coff[node] + 1])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         return base + "[" + idx + "]"
     }
     if t == N_FIELD_ACCESS {
         var base = deparse_arg_expr(s_children[s_coff[node]])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         return base + "." + interner.lookup(s_names[node])
     }
     if t == N_RANGE {
         var a = deparse_arg_expr(s_children[s_coff[node]])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         var b = deparse_arg_expr(s_children[s_coff[node] + 1])
-        if w_err != "" {
+        if g_macro_err != "" {
             return ""
         }
         if s_vals[node] == 1 {
@@ -559,14 +565,14 @@ func deparse_arg_expr(node: i64) -> string {
             } else {
                 out = out + deparse_arg_expr(s_children[s_coff[cell] + 1])
             }
-            if w_err != "" {
+            if g_macro_err != "" {
                 return ""
             }
             k = k + 1
         }
         return out + "]"
     }
-    w_err = "过程宏实参解引用不支持节点类型 tag " + to_string(t)
+    g_macro_err = "过程宏实参解引用不支持节点类型 tag " + to_string(t)
     return ""
 }
 

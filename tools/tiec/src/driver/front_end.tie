@@ -8,6 +8,20 @@ type tie<class>
 // 主文件顶层 main() 以 driver.<名>() 调用。
 import "../../../../lib/front/api.tie"
 namespace driver {
+
+// 执行器包装：命名空间函数不能作值传递（E00393），同文件裸名包装可作值。
+func fe_eval_proto(proto: string) -> string {
+    return interp::eval_proto(proto)
+}
+
+func fe_eval_macro(name: string, args: table<string>) -> string {
+    return interp::eval_macro(name, args)
+}
+
+func fe_eval_macro_proc(name: string, args: table<string>) -> string {
+    return interp::eval_macro_proc(name, args)
+}
+
 pub func frontend(src: string, base_dir: string) -> i64 {
     // 内存版：parse_ast 返回 0/-1（成功时 AST 在 ast 节点池内存），
     // 失败时由 parser.ast_err_protocol() 组装与 parse_src 相同的 "ERR:line col msg"
@@ -43,7 +57,10 @@ pub func frontend(src: string, base_dir: string) -> i64 {
     // 必须在 check_ast 之前设置——语义侧警告收集/遍历全程由该开关门控。
     // II1 可见性梯度：把 CLI 档位传给语义层（默认 1 = A1b = 历史行为）。
     // 必须在 check_ast 之前设置——check_visibility 在调用解析点全程消费该档位。
-    var sem = tie.front::check(base_dir, g_front_warn, g_cli_visibility)
+    // 宏展开的执行器由装配层注入（lib/macro 只依赖形参，不依赖解释器）。
+    interp::reset()
+    var sem = tie.front::check(base_dir, g_front_warn, g_cli_visibility,
+                               fe_eval_proto, fe_eval_macro, fe_eval_macro_proc)
     unsafe {
         var t1e = clock()
     }

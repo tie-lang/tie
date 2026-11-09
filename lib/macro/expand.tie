@@ -30,7 +30,6 @@ type tie<class>
 //   sstate 树；无环）。本模块由 semantic 树 import（semantic import
 //   "./mexpand.tie"），与语义链共享 s_* 池与 sm_err_* 错误槽。
 
-import "../interp/interp.tie"
 
 // ==================== 宏表 ====================
 pub var g_macro_keys: table<i64>;   // 宏名池 id（升序语义：线性查找即可）
@@ -81,8 +80,9 @@ namespace mexpand {
 // 宏展开主入口（semantic.check_ast 调用；前置：copy_ast_tables 已完成，
 // s_* 池 = 主文件 AST，g_root = 顶层 StmtList）。返回 0 成功；-1 失败
 //（错误写入 sm_err_line/sm_err_col/sm_err_msg）。
-pub func expand_sstate() -> i64 {
-    interp.reset()
+pub func expand_sstate(exec_proto: fn(string) -> string,
+                   exec_macro: fn(string, table<string>) -> string,
+                   exec_proc: fn(string, table<string>) -> string) -> i64 {
     g_macro_keys = table_new_i64()
     g_macro_nodes = table_new_i64()
     g_macro_isproc = table_new_i64()
@@ -96,7 +96,7 @@ pub func expand_sstate() -> i64 {
     // 1.5 保存主文件 AST 池快照（宏执行会重建 s_* 池，见 pool_save/restore）
     pool_save()
     // 2. 注册宏到 interp（宏体编译期执行环境）
-    if register_macros() < 0 {
+    if register_macros(exec_proto) < 0 {
         return -1
     }
     // 3. 展开循环（递归展开：结果可再含宏调用）
@@ -124,7 +124,7 @@ pub func expand_sstate() -> i64 {
                                 return -1
                             }
                         }
-                        var rc = expand_one(i)
+                        var rc = expand_one(i, exec_macro, exec_proc)
                         if rc < 0 {
                             return -1
                         }
@@ -167,5 +167,5 @@ pub func expand_sstate() -> i64 {
 
 }   // namespace mexpand
 
-import "./mexpand_p1.tie"
-import "./mexpand_p2.tie"
+import "./expand_p1.tie"
+import "./expand_p2.tie"

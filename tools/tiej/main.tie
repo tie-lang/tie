@@ -140,6 +140,19 @@ func wrapper_ir(target: string, sig: table<string>, args: table<string>, ret: st
 }
 
 // 源码 → IR → 包装 → JIT → 调用。
+// JIT 沙箱不执行编译期宏：显式拒绝，不静默放过。
+func jit_no_proto(proto: string) -> string {
+    return "ERR: JIT 不支持编译期宏展开"
+}
+
+func jit_no_macro(name: string, args: table<string>) -> string {
+    return "ERR: JIT 不支持编译期宏展开"
+}
+
+func jit_no_proc(name: string, args: table<string>) -> string {
+    return "ERR: JIT 不支持编译期宏展开"
+}
+
 func run_source(path: string, fname: string, sig: table<string>, args: table<string>, ret: string) -> i64 {
     var src = file_read(path)
     if str_len(src) == 0 {
@@ -159,7 +172,7 @@ func run_source(path: string, fname: string, sig: table<string>, args: table<str
         println("[parse] " + parser.ast_err_protocol())
         return 1
     }
-    var serr = tie.front::check(dir_of(path), false, 0)
+    var serr = tie.front::check(dir_of(path), false, 0, jit_no_proto, jit_no_macro, jit_no_proc)
     // 成功返回 "OK:N"，失败才是 "ERR:…"——按前缀判定，别按长度。
     if tie.support::has_prefix(serr, "ERR:") {
         println("[sem] " + serr)

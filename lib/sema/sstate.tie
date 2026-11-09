@@ -595,6 +595,77 @@ pub const S_N_GUARD_WITH: i64 = 147;    // `unsafe with(share) { ... }` 临时�
 pub const S_N_GUARD_REVOKE: i64 = 149;
 namespace sstate {
 
+// 子树 → 协议文本（BFS 重编号；与 load_ast 的行格式兼容）。
+// 纯序列化、不含执行：宏展开与实参序列化共用，前端因此不必依赖解释器。
+pub func subtree_protocol(root: i64) -> string {
+    // BFS 收集（map_old/map_new 兼作访问标记）
+    var map_old: table<i64> = table_new_i64()
+    var map_new: table<i64> = table_new_i64()
+    var order: table<i64> = table_new_i64()
+    table_push(order, root)
+    table_push(map_old, root)
+    table_push(map_new, 0)
+    var qi: i64 = 0
+    while qi < len(order) {
+        var cur = order[qi]
+        var k: i64 = 0
+        while k < s_nchild[cur] {
+            var c = s_children[s_coff[cur] + k]
+            if c >= 0 {
+                var seen = false
+                var m: i64 = 0
+                while m < len(map_old) {
+                    if map_old[m] == c {
+                        seen = true
+                        break
+                    }
+                    m = m + 1
+                }
+                if !seen {
+                    table_push(order, c)
+                    table_push(map_old, c)
+                    table_push(map_new, len(order) - 1)
+                }
+            }
+            k = k + 1
+        }
+        qi = qi + 1
+    }
+    // 输出协议文本（行格式与 sstate.load_ast 兼容）
+    var out: string = to_string(len(order)) + ":\n"
+    var n: i64 = 0
+    while n < len(order) {
+        var oid = order[n]
+        var line: string = to_string(map_new[n]) + " " + to_string(s_tags[oid]) + " " +
+            to_string(s_names[oid]) + " " + to_string(s_vals[oid]) + " " +
+            to_string(s_aux[oid]) + " " + to_string(s_lines[oid]) + " " +
+            to_string(s_cols[oid]) + " " + to_string(s_nchild[oid])
+        var k: i64 = 0
+        while k < s_nchild[oid] {
+            var c = s_children[s_coff[oid] + k]
+            if c < 0 {
+                line = line + " -1"
+            } else {
+                // 查新 id（线性；子树规模小）
+                var mid: i64 = -1
+                var m: i64 = 0
+                while m < len(map_old) {
+                    if map_old[m] == c {
+                        mid = map_new[m]
+                        break
+                    }
+                    m = m + 1
+                }
+                line = line + " " + to_string(mid)
+            }
+            k = k + 1
+        }
+        out = out + line + "\n"
+        n = n + 1
+    }
+    return out
+}
+
 
 // ==================== 移动语义：变量 live/moved 状态 ====================
 // 独立升序表 lv_moved：存在即 moved（复用 bs_find 二分）。函数边界（check_fn
