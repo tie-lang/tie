@@ -1,0 +1,330 @@
+type tie<class>
+// tools/release/notes_core.tie —— 发行说明核心（一处实现，两种形态）
+// ============================================================
+// 职责：解析命令行、读取提交历史、按类型分组、生成 Markdown。
+//   - logic 入口（notes.tie）编译为可执行程序；
+//   - tsc 入口（notes.tsc.tie）由 tiep 解释执行；
+//   两者共用本模块：规则、分组与格式只有一份。
+// 依赖：只用内建与语言原语（零 import），可被两种角色加载。
+// 约定：失败返回空串，原因经 last_error() 取回；本模块不退出进程。
+// ============================================================
+
+var g_core_err: string = "";
+var g_opt_base: string = "auto";
+var g_opt_head: string = "HEAD";
+var g_opt_version: string = "";
+var g_opt_title: string = "tie 发行说明";
+var g_opt_out: string = "";
+
+namespace notescore {
+
+// 最近一次失败原因（空 = 无错误）。
+pub func last_error() -> string {
+    return g_core_err
+}
+
+pub func opt_base() -> string { return g_opt_base }
+pub func opt_head() -> string { return g_opt_head }
+pub func opt_version() -> string { return g_opt_version }
+pub func opt_title() -> string { return g_opt_title }
+pub func opt_out() -> string { return g_opt_out }
+
+// ---- 字符串工具（码点语义；输入短串，逐字符拼接可接受）----
+
+pub func is_ws_cp(c: string) -> bool {
+    if c == " " { return true }
+    if c == "\t" { return true }
+    if c == "\n" { return true }
+    if c == "\r" { return true }
+    return false
+}
+
+pub func slice_cp(s: string, from: i64, to: i64) -> string {
+    var out = ""
+    var i = 0
+    var n = str_len(s)
+    while i < n {
+        if i >= from && i < to {
+            out = out + str_char(s, i)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+pub func trim_cp(s: string) -> string {
+    var n = str_len(s)
+    var a = 0
+    var b = n
+    while a < b && is_ws_cp(str_char(s, a)) {
+        a = a + 1
+    }
+    while b > a && is_ws_cp(str_char(s, b - 1)) {
+        b = b - 1
+    }
+    return slice_cp(s, a, b)
+}
+
+pub func sub_pos(s: string, sub: string) -> i64 {
+    var n = str_len(s)
+    var m = str_len(sub)
+    if m == 0 { return 0 }
+    var i = 0
+    while i + m <= n {
+        var j = 0
+        var ok = true
+        while j < m && ok {
+            if str_char(s, i + j) == str_char(sub, j) {
+                j = j + 1
+            } else {
+                ok = false
+            }
+        }
+        if ok { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+pub func split_by(s: string, sep: string) -> table<string> {
+    var out = table_new_string()
+    var cur = ""
+    var i = 0
+    var n = str_len(s)
+    var m = str_len(sep)
+    if m == 0 {
+        table_push(out, s)
+        return out
+    }
+    while i < n {
+        var hit = true
+        var j = 0
+        while j < m {
+            if str_char(s, i + j) != str_char(sep, j) {
+                hit = false
+                j = m
+            } else {
+                j = j + 1
+            }
+        }
+        if hit {
+            table_push(out, cur)
+            cur = ""
+            i = i + m
+        } else {
+            cur = cur + str_char(s, i)
+            i = i + 1
+        }
+    }
+    table_push(out, cur)
+    return out
+}
+
+// ---- 提交标题解析：type(scope): 描述 ----
+
+pub func subj_type(subj: string) -> string {
+    var p = sub_pos(subj, ":")
+    if p < 0 { return "" }
+    return trim_cp(slice_cp(subj, 0, p))
+}
+
+pub func subj_scope(subj: string) -> string {
+    var lp = sub_pos(subj, "(")
+    if lp < 0 { return "" }
+    var rp = sub_pos(subj, ")")
+    if rp < 0 || rp < lp { return "" }
+    return trim_cp(slice_cp(subj, lp + 1, rp))
+}
+
+pub func subj_desc(subj: string) -> string {
+    var p = sub_pos(subj, ":")
+    if p < 0 { return trim_cp(subj) }
+    return trim_cp(slice_cp(subj, p + 1, str_len(subj)))
+}
+
+// ---- 分组表：序号 → (提交类型, 中文标题) ----
+
+pub func group_type(i: i64) -> string {
+    if i == 0 { return "feat" }
+    if i == 1 { return "fix" }
+    if i == 2 { return "perf" }
+    if i == 3 { return "refactor" }
+    if i == 4 { return "docs" }
+    if i == 5 { return "test" }
+    if i == 6 { return "chore" }
+    return ""
+}
+
+pub func group_title(i: i64) -> string {
+    if i == 0 { return "新功能" }
+    if i == 1 { return "修复" }
+    if i == 2 { return "性能" }
+    if i == 3 { return "重构" }
+    if i == 4 { return "文档" }
+    if i == 5 { return "测试" }
+    if i == 6 { return "杂项" }
+    return "其它"
+}
+
+pub func group_count() -> i64 {
+    return 8
+}
+
+// ---- 参数解析（两种入口共用同一套规则）----
+
+// 解析 argv；成功 0，失败 -1（g_core_err 已置）。
+pub func parse_args() -> i64 {
+    g_core_err = ""
+    var i = 0
+    var n = arg_count()
+    while i < n {
+        var a = arg_string(i)
+        var step = 1
+        if a == "--base" && i + 1 < n {
+            g_opt_base = arg_string(i + 1)
+            step = 2
+        } else if a == "--head" && i + 1 < n {
+            g_opt_head = arg_string(i + 1)
+            step = 2
+        } else if a == "--version" && i + 1 < n {
+            g_opt_version = arg_string(i + 1)
+            step = 2
+        } else if a == "--title" && i + 1 < n {
+            g_opt_title = arg_string(i + 1)
+            step = 2
+        } else if a == "--out" && i + 1 < n {
+            g_opt_out = arg_string(i + 1)
+            step = 2
+        } else {
+            g_core_err = "未知参数：" + a
+            return -1
+        }
+        i = i + step
+    }
+    return 0
+}
+
+// ---- 渲染：取历史 → 分组 → Markdown；失败返回空串 ----
+
+pub func render() -> string {
+    g_core_err = ""
+    var base = g_opt_base
+    var head = g_opt_head
+    if base == "auto" {
+        // 只取 stdout；判定看内容形状（标签名不含空白），不用退出码——
+        // exec_code 会让子进程输出直通本进程。
+        var d = trim_cp(exec_output("git describe --tags --abbrev=0"))
+        if d == "" || sub_pos(d, " ") >= 0 {
+            g_core_err = "仓库内没有标签，无法定位起点；请用 --base 指定引用，或用 --base \"\" 导出全部历史"
+            return ""
+        }
+        base = d
+    }
+
+    var cmd = "git log --no-merges --format=%h%x09%s "
+    if base == "" {
+        cmd = cmd + head
+    } else {
+        cmd = cmd + base + ".." + head
+    }
+    var rows = split_by(exec_output(cmd), "\n")
+
+    var e_type = table_new_string()
+    var e_scope = table_new_string()
+    var e_sha = table_new_string()
+    var e_desc = table_new_string()
+    var k = 0
+    while k < len(rows) {
+        var line = trim_cp(rows[k])
+        k = k + 1
+        if line == "" { continue }
+        var tab = sub_pos(line, "\t")
+        if tab < 0 { continue }
+        var subj = trim_cp(slice_cp(line, tab + 1, str_len(line)))
+        var ty = subj_type(subj)
+        if ty == "" { ty = "other" }
+        table_push(e_type, ty)
+        table_push(e_scope, subj_scope(subj))
+        table_push(e_sha, trim_cp(slice_cp(line, 0, tab)))
+        table_push(e_desc, subj_desc(subj))
+    }
+    if len(e_type) == 0 {
+        g_core_err = "未取到提交：请检查引用是否存在、区间是否为空"
+        return ""
+    }
+
+    var out = table_new_string()
+    var head_line = g_opt_title
+    if g_opt_version != "" {
+        head_line = g_opt_title + " " + g_opt_version
+    }
+    table_push(out, "# " + head_line)
+    table_push(out, "")
+
+    var g = 0
+    while g < group_count() {
+        var want = group_type(g)
+        var body = table_new_string()
+        var e = 0
+        while e < len(e_type) {
+            if e_type[e] == want {
+                var item = "- " + e_desc[e]
+                if e_scope[e] != "" {
+                    item = item + "（" + e_scope[e] + "，`" + e_sha[e] + "`）"
+                } else {
+                    item = item + "（`" + e_sha[e] + "`）"
+                }
+                table_push(body, item)
+            }
+            e = e + 1
+        }
+        if len(body) > 0 {
+            table_push(out, "## " + group_title(g))
+            table_push(out, "")
+            var b = 0
+            while b < len(body) {
+                table_push(out, body[b])
+                b = b + 1
+            }
+            table_push(out, "")
+        }
+        g = g + 1
+    }
+
+    // 其它：类型不在固定表内
+    var other = table_new_string()
+    var e2 = 0
+    while e2 < len(e_type) {
+        var ty2 = e_type[e2]
+        var known = false
+        var g2 = 0
+        while g2 < group_count() {
+            if group_type(g2) == ty2 { known = true }
+            g2 = g2 + 1
+        }
+        if !known {
+            table_push(other, "- " + e_desc[e2] + "（`" + e_sha[e2] + "`）")
+        }
+        e2 = e2 + 1
+    }
+    if len(other) > 0 {
+        table_push(out, "## " + group_title(group_count()))
+        table_push(out, "")
+        var o = 0
+        while o < len(other) {
+            table_push(out, other[o])
+            o = o + 1
+        }
+        table_push(out, "")
+    }
+
+    var doc = ""
+    var q = 0
+    while q < len(out) {
+        doc = doc + out[q] + "\n"
+        q = q + 1
+    }
+    return doc
+}
+
+}
