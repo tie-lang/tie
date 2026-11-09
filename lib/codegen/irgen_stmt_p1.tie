@@ -1,10 +1,10 @@
 type tie<class>
-// lib/codegen/irgen_stmt_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_stmt_p1.tie —— 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_stmt.tie。
 namespace irgen {
-// S1.4 --check-bounds：数组下标越界运行时检查（仅 g_check_bounds 置位时生成）。
+// --check-bounds：数组下标越界运行时检查（仅 g_check_bounds 置位时生成）。
 // idx_node 为下标表达式 AST 节点（取其类型），iv 为其求值结果值引用，
 // len_count 为数组定长元素个数（编译期常量）。越界（iv<0 || iv>=len）→ 打印
 // 消息 + exit(1)（对齐 tig_panic 的 call_vararg+exit 范式，不依赖字符串拼接）。
@@ -40,7 +40,7 @@ func tig_array_bounds_check(idx_node: i64, iv: i64, len_count: i64) -> i64 {
 
 // 表下标读取 t[i]：动态表 → tie_table_at_<suffix>(表指针, i64, ok)。
 // 简化（阶段 A）：不生成越界检查块（driver 树索引均有 len 守卫）。
-// S1.4 扩展：**表**的高侧越界读检查（仅 `--check-bounds` 时生成；默认关 ⇒ 零额外指令）。
+// 扩展：**表**的高侧越界读检查（仅 `--check-bounds` 时生成；默认关 ⇒ 零额外指令）。
 //
 // 与上面定长数组版同范式，差别在判据来源：表的越界标志由 `tbl_at` 的 ok 出参给出，
 // 而**它本来就算好了**（`i < len`），此前只在调用点被存进 `ok_addr` 后就丢弃。
@@ -68,7 +68,7 @@ func tig_table_bounds_check(ok_addr: i64, iv: i64, t: i64, idx_node: i64, target
     //   （-1 < 2）⇒ 它 `memcpy(data + (-1)*esz)`，即**堆下读**，而且 ok 报 1。
     //   实测（无检查）：`t[neg]` 返回 -8070398854950596583（分配器元数据），
     //   在**完全安全的代码里**发生 —— 违反「不用 unsafe 就无需担心内存安全」。
-    //   写路径早有此检查（诊断「表下标越界（负索引）」），读路径缺失 ⇒ 本轮补上。
+    //   写路径早有此检查（诊断「表下标越界（负索引）」），读路径缺失 ⇒ 已补上。
     //   成本 = 同一 panic 块上的**一个 icmp**，不新增分支目标。
     // 负下标一律判：无符号下标经 zext 后不可能为负，多出的一个 icmp 已折进同一
     // 分支（不新增分支目标），换来的是**不依赖类型推断的可靠性**。
@@ -153,7 +153,7 @@ func tig_index_read(id: i64) -> i64 {
         if iv0 < 0 {
             return -1
         }
-        // S1.4 --check-bounds：定长数组读，动态下标越界检查（默认关）
+        // --check-bounds：定长数组读，动态下标越界检查（默认关）
         if tig_array_bounds_check(idx, iv0, types.array_len(aaty)) < 0 {
             return -1
         }
@@ -166,7 +166,7 @@ func tig_index_read(id: i64) -> i64 {
         ir.add_operand(ld0, eptr0, 0)
         return ir.get_value(ld0)
     }
-    // p.9.12.6 行池读：base 是登记过行池变量 → 逐字段取 + 聚合构造（rp_read）
+    // 行池读：base 是登记过行池变量 → 逐字段取 + 聚合构造（rp_read）
     if ast.s_tag(base) == 6 {
         var rpn = interner.intern(sstate.name_str(base))
         if rp_is(rpn) {
@@ -185,7 +185,7 @@ func tig_index_read(id: i64) -> i64 {
     if iv < 0 {
         return -1
     }
-    // E3 键值表读取：m[key] → tie_map_get / tie_map_get_string（键为字符串 ptr）。
+    // 键值表读取：m[key] → tie_map_get / tie_map_get_string（键为字符串 ptr）。
     // base 类型是 map（作用域变量类型优先，其次 node_types）→ 走 map 桥，
     // 与 Rust 基线 ir.rs tig_index_assign 的 map 分支同构（tie_map_* 专用桥）。
     var base_is_map: bool = false
@@ -217,11 +217,11 @@ func tig_index_read(id: i64) -> i64 {
             //（与 agg_p2 with 拷贝的槽模型对齐；此前落入 i64 支导致 store/load 类型错）
             mret = types.named(TK_STR)
         } else if map_val_ty == types.named(TK_ANY) {
-            // P2c：map<any> 读——值槽存堆指针 → 读指针 → 从堆还原 {i64,i64} any
+            // map<any> 读——值槽存堆指针 → 读指针 → 从堆还原 {i64,i64} any
             var hp = s21_map_get(t, iv, types.named(TK_STR))
             return s21_load(hp, types.named(TK_ANY))
         }
-        // 批次 7：内联二分/哈希读（替代 tie_map_get 桥）；缺失键 → 运行时错误
+        // 内联二分/哈希读（替代 tie_map_get 桥）；缺失键 → 运行时错误
         return s21_map_get(t, iv, mret)
     }
     // 元素类型：base 是表变量 → 优先 irgen 作用域完整类型（参数/局部表变量），
@@ -282,7 +282,7 @@ func tig_index_read(id: i64) -> i64 {
     }
     var suffix = bridge_suffix(elem)
     var ret_ty = types.named(TK_I64)
-    // P2a 复合元素（struct/enum/fn）：返回类型 = 元素类型 id（多字元素类型化
+    // 复合元素（struct/enum/fn）：返回类型 = 元素类型 id（多字元素类型化
     // load，供字段访问/方法调用/整体使用）
     var ekind2 = types.kind(elem)
     if ekind2 == K_STRUCT || ekind2 == K_ENUM || ekind2 == K_FN || ekind2 == K_TUPLE || elem == types.named(TK_ANY) {
@@ -303,9 +303,9 @@ func tig_index_read(id: i64) -> i64 {
     var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
     ir.add_operand(ok_slot, types.named(TK_I8), 2)
     var ok_addr = ir.get_value(ok_slot)
-    // r.1.6.7 独占免锁：base 是**裸局部变量**且静态证得独占 → tbl_at_nl
+    // 独占免锁：base 是**裸局部变量**且静态证得独占 → tbl_at_nl
     var rv_at = s21_table_at_ex(t, iv, ok_addr, ret_ty, esc_take(base, "读 t[i]"))
-    // S1.4：--check-bounds 下，用户源码的 t[i] 高侧越界即诊断（默认关 ⇒ 指令数与原先一致）。
+    // --check-bounds 下，用户源码的 t[i] 高侧越界即诊断（默认关 ⇒ 指令数与原先一致）。
     // 审计模式（TIE_CB_AUDIT=1）只报告不中断，用于一次收全所有越界点。
     if tig_table_bounds_check(ok_addr, iv, t, idx, tig_cb_target(), base) < 0 {
         return -1
@@ -321,7 +321,7 @@ func tig_cb_target() -> i64 {
     return 1
 }
 
-// p.6.10.2 步2：表句柄引用计数插桩辅助——生成 tl_tbl$tbl_retain / tl_tbl$tbl_release
+// 步2：表句柄引用计数插桩辅助——生成 tl_tbl$tbl_retain / tl_tbl$tbl_release
 // 桥调用（trm_lite.a 静态链接；表变量赋值/覆盖时保持别名计数守恒，防悬垂与双释放）。
 // 参数 hv = 表句柄指令值（LLVM ptr，表槽指针）。桥形参为 i64（x64 ABI 指针复用
 // 整数 8 字节通道）——先 ptrtoint（opcode 24）转 i64 再按 TK_I64 发射实参，
@@ -360,7 +360,7 @@ func tig_is_param(nid: i64) -> bool {
     return false
 }
 
-// p.6.10.3：函数出口析构——释放 entry 级局部表变量（候选 alloca 清单）。引用计数由
+// 函数出口析构——释放 entry 级局部表变量（候选 alloca 清单）。引用计数由
 // 外传点（return/全局/赋值）retain 守恒，此处仅为收尾。仅 entry 级候选（循环/分支
 // 内 var 排除：非 entry 块的 alloca 在出口块 load 不满足支配关系）。空槽由 tbl_release
 // 空句柄守卫跳过。
@@ -372,14 +372,14 @@ func tig_tbl_exit_release() {
         tig_tbl_release_call(ir.get_value(old))
         i = i + 1
     }
-    // r.1.6.14：值语义形参的出口释放——与入口的 retain 成对。
+    // 值语义形参的出口释放——与入口的 retain 成对。
     var _pi: i64 = 0
     while _pi < len(g_ownparam_slots) {
         var pv9 = s21_load(g_ownparam_slots[_pi], types.named(TK_STR))
         tig_tbl_release_call(pv9)
         _pi = _pi + 1
     }
-    // r.1.6.13：聚合（struct）局部的表字段释放——与绑定处的 tig_agg_retain_bound 成对。
+    // 聚合（struct）局部的表字段释放——与绑定处的 tig_agg_retain_bound 成对。
     var _ai: i64 = 0
     while _ai < len(g_aggcand_allocas) {
         tig_agg_release_fields(g_aggcand_allocas[_ai], g_aggcand_tys[_ai])
@@ -390,7 +390,7 @@ func tig_tbl_exit_release() {
     clo_exit_release()
 }
 
-// p.6.10.4：循环/分支内表变量自遮蔽——非 entry 块声明的表变量，槽在回边重执行时被
+// 循环/分支内表变量自遮蔽——非 entry 块声明的表变量，槽在回边重执行时被
 // `store 新表` 覆盖上一迭代表 → 旧引用丢失泄漏。解法：每个此类声明配一个**零值全局**
 // 哨兵（天然首值 0 / 由 global_scalar_init 归零），首次进入跳 release（槽未初始化，
 // 直接 load 即崩）；回边重写时哨兵已置 1 → release 槽内上一轮表。**用 select 把 release
@@ -398,7 +398,7 @@ func tig_tbl_exit_release() {
 // 支配关系（实测分裂块在大型自举代码中触发 LLVM「instruction does not dominate」）。
 func tig_loopvar_release(av: i64) {
     g_tf_ctr = g_tf_ctr + 1
-    // r.1.1.4：哨兵名含所在函数名——独立编译再静态链接的单元（用户程序 vs
+    // 哨兵名含所在函数名——独立编译再静态链接的单元（用户程序 vs
     // trm_lite.a）函数名天然不同，哨兵名互不冲突（LNK2005 多重定义根治；
     // 实测 rebuild trm_lite.a 后与用户程序同发 tl_loopf_1 → 链接失败）。
     // `::` → `$`（对齐 llvmgen 命名空间 mangle），其余标识符字符本就合法。
@@ -431,7 +431,7 @@ func tig_loopvar_release(av: i64) {
     ir.add_operand(fls, flag_addr, 3)
 }
 
-// 聚合局部的**回边释放**（r.1.6.13）：与 tig_loopvar_release 同构（零值哨兵 + select 归零，
+// 聚合局部的**回边释放**：与 tig_loopvar_release 同构（零值哨兵 + select 归零，
 // 不分裂控制流块），差别只在释放动作是「按类型递归释放各表字段」。
 // 缺它则循环内声明的 struct 局部逐轮 retain 而只在出口 release 一次 ⇒ rc 逐轮漂移
 // （保守方向：表恒显共享 ⇒ 越界恒中止、COW 恒复制），故补齐成对。
@@ -502,7 +502,7 @@ func tig_index_assign(id: i64) -> i64 {
     // 目标必须是 Index：children=[base, index]
     var base = sstate.child(target, 0)
     var idx = sstate.child(target, 1)
-    // p.9.12.6 行池写：base 是登记过行池变量 → 负下标诊断 + 多列同步扩 + 逐字段写
+    // 行池写：base 是登记过行池变量 → 负下标诊断 + 多列同步扩 + 逐字段写
     if ast.s_tag(base) == 6 {
         var rpn2 = interner.intern(sstate.name_str(base))
         if rp_is(rpn2) {
@@ -529,7 +529,7 @@ func tig_index_assign(id: i64) -> i64 {
         if iv2 < 0 {
             return -1
         }
-        // S1.4 --check-bounds：定长数组写，动态下标越界检查（默认关）
+        // --check-bounds：定长数组写，动态下标越界检查（默认关）
         if tig_array_bounds_check(idx, iv2, types.array_len(aaty2)) < 0 {
             return -1
         }
@@ -584,7 +584,7 @@ func tig_index_assign(id: i64) -> i64 {
     if iv < 0 {
         return -1
     }
-    // E3 键值表赋值：m[key] = v → tie_map_set / tie_map_set_string（键为字符串 ptr）。
+    // 键值表赋值：m[key] = v → tie_map_set / tie_map_set_string（键为字符串 ptr）。
     // base 类型是 map（作用域变量类型优先，其次 node_types）→ 走 map 桥，
     // 与 Rust 基线 ir.rs tig_index_assign 的 map 分支同构（含复合赋值读写回写）。
     var base_is_map: bool = false
@@ -617,7 +617,7 @@ func tig_index_assign(id: i64) -> i64 {
             // map<table<T>> 写入触发 store i64(ptr) 的 IR 类型错）
             pty_m = types.named(TK_STR)
         } else if map_val_ty == types.named(TK_ANY) {
-            // P2c：map<any> 值槽存堆指针（any 16 字节放不进 8 字节值槽）
+            // map<any> 值槽存堆指针（any 16 字节放不进 8 字节值槽）
             pty_m = types.named(TK_STR)
         }
         // 复合赋值（m[k] += v）：先读旧值（s21_map_get，缺失 raise）→ 运算 → 写回
@@ -642,7 +642,7 @@ func tig_index_assign(id: i64) -> i64 {
                 return -1
             }
         }
-        // P2c：map<any> 值写入——装箱 + 堆拷贝，值槽存堆指针
+        // map<any> 值写入——装箱 + 堆拷贝，值槽存堆指针
         if map_val_ty == types.named(TK_ANY) {
             var vtm = ast.node_type(val)
             var src_m: i64 = v_m
@@ -722,7 +722,7 @@ func tig_index_assign(id: i64) -> i64 {
     }
     var suffix = bridge_suffix(elem)
     var pty = types.named(TK_I64)
-    // P2a 复合元素：槽类型 = 元素类型 id（多字元素类型化 store/load）
+    // 复合元素：槽类型 = 元素类型 id（多字元素类型化 store/load）
     var elem_k2 = types.kind(elem)
     if elem_k2 == K_STRUCT || elem_k2 == K_ENUM || elem_k2 == K_FN || elem_k2 == K_TUPLE || elem == types.named(TK_ANY) {
         pty = elem
@@ -730,7 +730,7 @@ func tig_index_assign(id: i64) -> i64 {
         // 堆句柄元素（嵌套容器 table<table<T>> / table<map<T>> / port 对象）：
         // 运行期就是 ptr，必须走 ptr 参数形态的 set 桥。
         //
-        // RCA（2026-09-28）：此前写入路径只把 K_PORT 归入 ptr 分支，table/map 落到
+        // RCA：此前写入路径只把 K_PORT 归入 ptr 分支，table/map 落到
         // `suffix = bridge_suffix(elem)`——而 bridge_suffix 只识别 string/bool/f64，
         // 表类型一律返回 "i64"，pty 因此停在 i64，发射出
         // `store i64 <表句柄ptr>, ptr <i64槽>`：IR 类型不自洽，LLVM opt 报
@@ -755,7 +755,7 @@ func tig_index_assign(id: i64) -> i64 {
     if op >= 0 {
         var ok_r = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
         ir.add_operand(ok_r, types.named(TK_I8), 2)
-        // r.1.6.7 独占免锁：base 裸局部变量且静态证得独占 → 免锁读旧值。
+        // 独占免锁：base 裸局部变量且静态证得独占 → 免锁读旧值。
         // 注意此处**只查询不计审计数**（esc_live 直查），避免同一处访问被计两次。
         var old = s21_table_at_ex(t, iv, ir.get_value(ok_r), pty, esc_live_or_lock(base))
         if old < 0 {
@@ -776,18 +776,18 @@ func tig_index_assign(id: i64) -> i64 {
             return -1
         }
     }
-    // p.6.10.4：表下标写表值 t[i] = v（v 为表）→ retain——元素持有引用。
+    // 表下标写表值 t[i] = v（v 为表）→ retain——元素持有引用。
     // 仅表路径（base_is_map 分支已提前 return，map 值非 tl_tbl 表）。op < 0 为
     // 普通赋值，v 即表句柄（ptr）；复合赋值 op>=0 的 v 是运算结果（i64），且表
     // 元素复合赋值不合法，故仅普通写。须在 any 装箱之前 retain（装箱后 v 是
-    // any 聚合盒，非表句柄——code 30，与 table_push 的 p.6.10.4 同构）。
-    // r.1.1.4：瞬态值（调用 tag 7 / 表字面量 tag 12）免 retain（所有权转移给
+    // any 聚合盒，非表句柄——code 30，与 table_push 的 同构）。
+    // 瞬态值（调用 tag 7 / 表字面量 tag 12）免 retain（所有权转移给
     // 容器），仅别名值（变量/下标/字段读）retain——与 table_push 同纪律。
     var ivt = ast.node_type(val)
     if op < 0 && ivt >= 0 && types.is_table(ivt) && ast.s_tag(val) != 7 && ast.s_tag(val) != 12 {
         tig_tbl_retain_call(v)
     }
-    // P2b 异构元素装箱：表<any> 下标写，值须 box 为 any
+    // 异构元素装箱：表<any> 下标写，值须 box 为 any
     if pty == types.named(TK_ANY) {
         var vt6 = ast.node_type(val)
         if vt6 >= 0 && vt6 != types.named(TK_ANY) {
@@ -798,9 +798,9 @@ func tig_index_assign(id: i64) -> i64 {
             v = bx
         }
     }
-    // r.1.6.7 独占免锁：写路径同样按独占判定选免锁入口（越界静默跳过语义不变）
+    // 独占免锁：写路径同样按独占判定选免锁入口（越界静默跳过语义不变）
     var ex_w = esc_take(base, "写 t[i]")
-    // r.1.6.14：值语义模式下先分离（裸变量目标；默认关 ⇒ no-op）
+    // 值语义模式下先分离（裸变量目标；默认关 ⇒ no-op）
     // 独占免锁时句柄无别名 ⇒ 分离是空操作，跳过（对齐 table_push 的判据）。
     if !ex_w && ast.s_tag(base) == 6 {
         t = tig_cow_before_write(t, interner.intern(sstate.name_str(base)))

@@ -1,8 +1,8 @@
 type tie<class>
-// lib/ir/ir.tie —— 自举 v2 T2.2：列式 tie-IR（LLVM 三层架构中端核心）
+// lib/ir/ir.tie —— ：列式 tie-IR（LLVM 三层架构中端核心）
 // ============================================================
-// tie 版编译器的**中端中间表示**：前端（T2.4-T2.6）产出本 IR，供 pass
-// 管线（T2.3）与后端 llvmgen（T2.8）消费。Rust 种子 ir.rs（5111 行，
+// tie 版编译器的**中端中间表示**：前端产出本 IR，供 pass
+// 管线与后端 llvmgen消费。Rust 种子 ir.rs（5111 行，
 // AST 直生 .ll、无显式 IR 中间结构）是行为基准——本文件把其指令种类
 // 提炼为列式指令表，成为自举编译器中真正的中间层。
 //
@@ -22,8 +22,8 @@ type tie<class>
 //   块；call 族：① 被调方 + 实参值；常量指令：立即数即常量值
 //   （const_str 为字符串池 id）。
 //
-// # opcode 数据表（data 风格，权威 55 条，T2.8 消费说明见 op_desc）
-//   p.9.20.3 前置修复（2026-09-21）：旧表与实现漂移（ks71/ns70/gs73 长度不齐，
+// # opcode 数据表（data 风格，权威 55 条，消费说明见 op_desc）
+//   前置修复：旧表与实现漂移（ks71/ns70/gs73 长度不齐，
 //   且 14 个幽灵 code 实现中不存在）。现按实现权威重建——code/名字以
 //   irgen 产出（irgen_lit 等 new_inst 字面量）与 llvmgen 消费（llvmgen_inst
 //   的 op == N 分派）双向交叉一致为准；neg(5)/not(9) 由 sub 0,x 与 xor 实现，
@@ -123,7 +123,7 @@ var op_names: table<string>;           // opcode 表：名
 var op_groups: table<i64>;             // opcode 表：组号（OP_GRP_*）
 var op_descs: table<string>;           // opcode 表：T2.8 消费说明
 
-// # pub 方法全集（组件契约，p.9.21 G7 库资格①；增删须同步此处与 ROAD）
+// # pub 方法全集
 //   （含 ir_meta.tie——元信息与本本体配套，同一库的两个入口）
 //   生命周期：new_module reset_meta
 //   构造：new_value new_func new_block new_inst set_cur_fn add_operand
@@ -368,7 +368,7 @@ pub func new_inst(block_id: i64, opcode: i64, ty: i64) -> i64 {
     return iid
 }
 
-// p.9.21.10 性能：装配器批量操作数接口——整表接续 + 逐指令元数据回填，
+// 性能：装配器批量操作数接口——整表接续 + 逐指令元数据回填，
 // 替代 3M 次 add_operand 逐条调用（跨命名空间调用 + 段连续断言的开销）。
 // 仅限装配器使用：调用方必须保证 off/cnt 覆盖 [0, ops 总量) 且互不重叠。
 pub func ops_append(ops: table<i64>, kinds: table<i64>) {
@@ -385,13 +385,13 @@ pub func set_inst_ops_meta(inst_id: i64, off: i64, cnt: i64) {
     ir_insts_ops_cnt[inst_id] = cnt
 }
 
-// 登记当前生成函数名（irgen.tig_fn_def 调用；p.6.1.4 交错诊断定位用）
+// 登记当前生成函数名（irgen.tig_fn_def 调用；交错诊断定位用）
 pub func set_cur_fn(full: string) {
     ir_cur_fn = full
 }
 
 pub func add_operand(inst_id: i64, operand: i64, kind: i64) {
-    // p.6.1.4 交错检测断言：操作数段必须紧接指令段尾（off+cnt == len(ir_ops)）。
+    // 交错检测断言：操作数段必须紧接指令段尾（off+cnt == len(ir_ops)）。
     // 调用方若在 add_operand 序列中间内联其它向 ir_ops push 的调用（如常量
     // 生成 tig_int_lit_ty 内联 push），段会交错错位——后端按 ops_off+len 读
     // 切片会拿错操作数（forward reference / store 错位）。此处 panic 把未知
@@ -502,7 +502,7 @@ pub func func_inst_total(func_id: i64) -> i64 {
 pub func func_exported(func_id: i64) -> i64 {
     return ir_funcs_exported[func_id]
 }
-// ---------- 内联标注（p.9.11.10 inline fn）----------
+// ---------- 内联标注（inline fn）----------
 pub func func_inline_set(func_id: i64, v: i64) {
     ir_funcs_inline[func_id] = v
 }
@@ -592,7 +592,7 @@ pub func diag_off(inst_id: i64) -> i64 {
     return ir_insts_ops_off[inst_id]
 }
 
-// ---------- p.9.20.3 中端 pass 写 API ----------
+// ---------- 中端 pass 写 API ----------
 // 原则：最小写面。改写只允许两种形态——整指令改写为单 IMM 常量（const 折叠）、
 // 操作数原位替换（值传播）；物理删除走 compact_dead（块区间整体重建）。
 

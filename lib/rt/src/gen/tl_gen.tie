@@ -1,15 +1,15 @@
 type tie<class, unsafe:mem>
-// core/gen/tl_gen.tie —— p.9.5.1 生成器式协程运行期：惰性迭代/流（trm-lite 侧）。
-// 定位：语言侧 yield（p.9.11.15，tiec f04962d）目前编译为「攒表返回」——生成器
+// core/gen/tl_gen.tie —— 生成器式协程运行期：惰性迭代/流（trm-lite 侧）。
+// 定位：语言侧 yield（tiec f04962d）目前编译为「攒表返回」——生成器
 // 签名登记为 table<elem>，调用方得表，for 直接消费（急切物化、无运行期调用点）；
-// 惰性运行期契约 = p.9.11.16 迭代器协议（struct 实现 has_next/next 即可被
+// 惰性运行期契约 = 迭代器协议（struct 实现 has_next/next 即可被
 // for/推导式消费分派）。本模块在该协议之上提供**惰性流**：
 //   · 惰性序列：counter/infinite 逐元素按需产出，不一次性物化；
 //   · 管道组合：fmap/filter/take 全部惰性（不产生中间表），管道末端 for 直接消费；
 //   · 无限流：infinite(lo, step) 无限产出，take 截断取 N；
 //   · 生成器互操作：from_table 惰性包装 tiec 生成器（yield）返回的表（句柄持有 +
 //     逐元素读取，下游管道不物化；源表本身由语言侧急切生成——契约如实记录）；
-//   · 多 worker 共享消费：pull/pull_id 原子拉取（锁内推进，p.9.5.2 迁移/窃取底座）。
+//   · 多 worker 共享消费：pull/pull_id 原子拉取（锁内推进，迁移/窃取底座）。
 // 承载：注册表式流状态（全局平行表，id 1 起，0 号占位）+ 自有 CS 互斥
 // （Stream 值 = {id}，跨线程经注册表访问状态 → 挂起状态不绑定 worker，可随
 // 任务迁移/窃取）。for-in 协议（has_next/next）为**单消费者**契约；并发共享
@@ -66,7 +66,7 @@ func gg_ensure() {
         g_g_pend = table_new_i64()
         g_g_has = table_new_i64()
         // fn 表以**字面量**建（元素尺寸随类型推导：fn 元素 16B；table_new_i64
-        // esz=8 会截断 fn 值 → 表元素调用崩溃，p.9.5.x 同款纪律）
+        // esz=8 会截断 fn 值 → 表元素调用崩溃，.x 同款纪律）
         g_g_map = [gg_dummy_map]
         g_g_filt = [gg_dummy_filt]
         table_push(g_g_kind, 0)
@@ -204,8 +204,8 @@ func gg_pull_locked(id: i64) -> i64 {
     return 0
 }
 
-// ---------- 惰性流（p.9.5.1） ----------
-// Stream = 可迭代协议对象（p.9.11.16）：struct 实现 has_next/next → for/推导式
+// ---------- 惰性流 ----------
+// Stream = 可迭代协议对象：struct 实现 has_next/next → for/推导式
 // 直接消费（while it.has_next() { x = it.next() }，接收者求值一次）。
 struct Stream {
     var id: i64
@@ -269,7 +269,7 @@ pub func infinite(lo: i64, step: i64) -> Stream {
 }
 
 // 惰性包装生成器/既有表：句柄 retain 持有 + 逐元素读取（下游管道惰性，不复制）。
-// 源表由语言侧 yield 生成器（p.9.11.15 急切攒表）或用户提供；表须存活于流
+// 源表由语言侧 yield 生成器（急切攒表）或用户提供；表须存活于流
 // 消费期间（retain 保证——流注册表长期持有，进程退出回收）。
 pub func from_table(t: table<i64>) -> Stream {
     var id = gg_alloc(3)
@@ -315,7 +315,7 @@ pub func take(s: Stream, n: i64) -> Stream {
     return st
 }
 
-// ---------- p.9.5.2 原子拉取（多 worker 共享消费） ----------
+// ---------- 原子拉取（多 worker 共享消费） ----------
 // 锁内推进一个元素并写 out（i64 地址，x64 ABI 逐字节）；返回 1=有值 / 0=耗尽。
 // 任意 worker 可调——流状态在全局注册表（不绑定 worker），挂起状态随任务经
 // S-deque 迁移/窃取而不破坏惰性语义（每个元素恰被交付一次）。

@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/semantic_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/front/semantic_q1.tie —— 分片 1
 // ============================================================
 // 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 semantic.tie。
 // 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
@@ -15,7 +15,7 @@ pub func sm_warn_reset() {
 }
 
 // 登记一条警告（line/col + 核心消息；核心消息由 diagcode 目录精确匹配）。
-// p.9.14.2：总开关关闭时不登记（独立 pass 未启用，零收集成本）。
+// 总开关关闭时不登记（独立 pass 未启用，零收集成本）。
 pub func sm_warn_add(line: i64, col: i64, msg: string) {
     if !sm_warn_active {
         return
@@ -31,7 +31,7 @@ pub func sm_set_cur_file(fid: i64) {
     sm_cur_file = fid
 }
 
-// OK 协议组装："OK:<typed>"（p.9.14.1：警告改结构化事件直发，不再拼 ;W: 文本段；
+// OK 协议组装："OK:<typed>"（警告改结构化事件直发，不再拼;W: 文本段；
 // driver 经 warn_count/warn_line_at/warn_col_at/warn_msg_at 读取渲染，输出端一次归一化）。
 pub func sm_ok_protocol() -> string {
     return "OK:" + to_string(g_typed)
@@ -45,7 +45,7 @@ pub func set_lib_root(p: string) {
     }
 }
 
-// p.9.11.13 扩展（2026-10-12）：#cfg 求值环境注入——driver 在编译入口单点调用
+// 扩展：#cfg 求值环境注入——driver 在编译入口单点调用
 // （cfg_target/cfg_profile 归一化后），供被导入文件的 #cfg 预处理复用（判据单一来源）。
 pub func set_cfg_env(target: string, profile: string) {
     g_cfg_env_target = target
@@ -87,7 +87,7 @@ pub func resolve_import_path(path: string) -> string {
         }
         return normalize_path(parent + str.slice(path, 3, str_len(path)))
     }
-    // p.9.13.7-B：内置库根别名（/std、/ext、/rdu、/sys）→ 库根 + 原路径
+    // -B：内置库根别名（std、/ext、/rdu、/sys）→ 库根 + 原路径
     if is_lib_alias(path) {
         return normalize_path(lib_root() + path)
     }
@@ -105,14 +105,14 @@ pub func check_debug_src(src: string, base_dir: string) -> string {
     return check_debug(ast_text)
 }
 
-// ==================== 语义/分析状态重置（p.9.16.1 单一出处）====================
+// ==================== 语义/分析状态重置（单一出处）====================
 // 原为 check_impl / check_ast 各写一份的 277 行重置序列（两份逐字节相同）。
 // 抽出为单一出处后，release_ast() 也复用它——三处判据不可能漂移。
 // ⚠ 本函数不清 intern 池与 parser 节点池：那两者在 parse 阶段已填充且
 // check 阶段仍要被读（node_names 存 intern id），只能在「AST 用完」后由
 // release_ast 一并清。
 func reset_sem_state() {
-    // p.9.22.6：结构化输出·交叉引用侧表随语义状态一并复位（单一出处——
+    // 结构化输出·交叉引用侧表随语义状态一并复位（单一出处——
     // check_impl / check_ast / release_ast 三处判据不可能漂移）。
     xref.reset()
     s_tags = table_new_i64()
@@ -138,14 +138,14 @@ func reset_sem_state() {
     sp_vars = table_new_i64()
     types.init_sym()
     // enum 状态表重置（2026-08-15 enum 语言特性；每次编译清零）
-    // p.9.11.32 类型别名注册表重置
+    // 类型别名注册表重置
     alias_keys = table_new_i64()
     alias_vals = table_new_i64()
     gb_keys = table_new_i64()
     gb_vals = table_new_i64()
     gb_const = table_new_i64()
     gb_telem = table_new_i64()
-    // p.9.21.6-1 模块边界显式化：来源模块列随每次编译清零
+    // -1 模块边界显式化：来源模块列随每次编译清零
     //（sg_mod 签名行 / gb_mod 全局行 / st_mod struct 行 / g_file_base 文件基址；
     // g_file_base 由 expand_imports 复位并推主文件基址，此处仅清符号列）。
     sg_mod = table_new_i64()
@@ -171,7 +171,7 @@ func reset_sem_state() {
     g_typed = 0
     sm_err_msg = ""
     sm_warn_reset()
-    // 泛型模板登记表重置（gt_*，T3b 单态化展开器预置；每次编译清零）
+    // 泛型模板登记表重置（gt_*，单态化展开器预置；每次编译清零）
     gty_keys = table_new_i64()
     gty_vals = table_new_i64()
     gty_full = table_new_i64()
@@ -180,7 +180,7 @@ func reset_sem_state() {
     gtyp_names = table_new_i64()
     gty_node = table_new_i64()
     gty_is_struct = table_new_i64()
-    // S2.4：泛型约束段 + port/impl 状态表重置（每次编译清零）
+    // 泛型约束段 + port/impl 状态表重置（每次编译清零）
     gtyp_conoff = table_new_i64()
     gtyp_cons = table_new_i64()
     gtyp_defoff = table_new_i64()
@@ -208,7 +208,7 @@ func reset_sem_state() {
     gd_nodes = table_new_i64()
     gd_tys = table_new_i64()
     gd_nms = table_new_string()
-    // 实例化记录表重置（gin_*，T3b 单态化展开器；每次编译清零）
+    // 实例化记录表重置（gin_*，单态化展开器；每次编译清零）
     gin_keys = table_new_i64()
     gin_vals = table_new_i64()
     gin_tmpl = table_new_i64()
@@ -216,7 +216,7 @@ func reset_sem_state() {
     gin_nargs = table_new_i64()
     gin_is_struct = table_new_i64()
     garg_vals = table_new_i64()
-    // S2.2 闭包语义全局重置（每次编译清零）
+    // 闭包语义全局重置（每次编译清零）
     g_clo_pending = table_new_i64()
     cl_ret = table_new_i64()
     cl_owner_sig = table_new_i64()
@@ -284,14 +284,14 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     if r < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
-    // S2.4 impl 块统一处理（struct/port 全部登记后：方法改名 + 签名登记 +
+    // impl 块统一处理（struct/port 全部登记后：方法改名 + 签名登记 +
     // 完整性/签名检查 + impl 记录）。须在 expand_generics 之前——泛型约束
     // 校验（instantiate_fn/struct）依赖 impl 表就绪。
     var ifr = scollect.collect_impl_fns()
     if ifr < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
-    // 泛型单态化预扫描展开（T3b）：遍历模板 → 扫描调用点 → 展开 → 去重 →
+    // 泛型单态化预扫描展开：遍历模板 → 扫描调用点 → 展开 → 去重 →
     // 递归处理新实例化（展开产物进入 fn_keys/st_keys 后由后续阶段覆盖）。
     // 须在 collect_all_struct_fields 之前——展开的 struct 字段拍平由
     // instantiate_struct 即时完成，主流程再遍历 st_keys 时 cls_done 跳过
@@ -299,7 +299,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     if ge < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
-    // 泛型字段类型预实例化（2026-08-14）：字段类型中的模板 struct 引用（如
+    // 泛型字段类型预实例化：字段类型中的模板 struct 引用（如
     // `A<i64>`）在此先行实例化，避免 collect_all_struct_fields 拍平时实例化
     // 副作用顶偏 cls_fldoff（详见 scollect.pre_instantiate_field_types 注释）
     var pr = scollect.pre_instantiate_field_types()
@@ -316,7 +316,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     if r5 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
-    // p.9.17.2 缺陷 #4a：延迟的全局标量初始化类型检查（须在 enum 变体收集后——
+    // 缺陷 #4a：延迟的全局标量初始化类型检查（须在 enum 变体收集后——
     // enum 变体常量初始化器依赖 en_vnames 变体表）
     var r6 = scollect.check_deferred_global_inits()
     if r6 < 0 {
@@ -327,7 +327,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     if r4 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
-    // 逐函数检查（T3b 稳定化：检查期间 infer_call 会触发展开新实例化 → fn_keys
+    // 逐函数检查（稳定化：检查期间 infer_call 会触发展开新实例化 → fn_keys
     // 增长，循环重扫直到无新函数——防 sorted_insert 把新签名插到游标之前被跳过）
     var checked: table<i64> = table_new_i64()
     var again: bool = true
@@ -349,7 +349,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
                 table_push(checked, fid)
                 again = true
                 var fname = intern.lookup(fid)
-                // S1.5 移动语义：每函数检查前重置 live/moved 状态表
+                // 移动语义：每函数检查前重置 live/moved 状态表
                 // （lv_* 局部表在 scheck.check_fn 重置；lv_moved 独立表在此
                 // 同步重置——sstate 定义，见 lv_moved_reset）
                 sstate.lv_moved_reset()
@@ -357,7 +357,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
                 if r2 < 0 {
                     return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
                 }
-                // S1.5 移动语义独立 pass：类型检查后遍历函数体，跟踪 live/moved
+                // 移动语义独立 pass：类型检查后遍历函数体，跟踪 live/moved
                 // （复用已重置的 lv_moved；内置/原语调用借用，用户函数按值堆参数移动）。
                 // 门控全在 smove 内部：凭据（§11.6）**始终检查**；堆类型**默认开**
                 // （2026-10-01 迁移完成：tiec 自举审计 85 → 0，string 已因
@@ -370,7 +370,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
             i = i + 1
         }
     }
-    // S2.2 闭包体延迟检查：所有函数检查完后 FIFO 处理 g_clo_pending
+    // 闭包体延迟检查：所有函数检查完后 FIFO 处理 g_clo_pending
     // （闭包体用登记时 lv 快照重建独立作用域，不影响外层函数）
     var rc = scheck.check_pending_closures()
     if rc < 0 {
@@ -381,7 +381,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     return sm_ok_protocol()
 }
 
-// 内存版 check 核心（T5.3 消除 AST 文本协议往返；前置条件：
+// 内存版 check 核心（消除 AST 文本协议往返；前置条件：
 // parser.parse_ast 已成功执行、ast 节点池在内存）。
 // 与 check_impl(ast_text, base_dir) 语义完全等价：仅把 sstate.load_ast(协议文本)
 // 替换为 copy_ast_tables()（内存直拷 ast 表 → sstate 表），import 展开走内存版
@@ -404,7 +404,7 @@ pub func check_ast(base_dir: string) -> string {
     sm_t_copy = smc1 - smc0
     g_root = s_n - 1
     // import 展开（主文件顶层进 g_extra_tops，import 文件递归合并）。
-    // dev33 批次10 任务29：跨文件宏——import 展开**先于**宏展开，导入文件的
+    // 跨文件宏——import 展开**先于**宏展开，导入文件的
     // 宏定义（pub）才可见；同时记录各文件顶层 StmtList 根（g_file_roots，
     // 供 mexpand 做宏可见性判定）。
     var er = expand_imports()
@@ -415,7 +415,7 @@ pub func check_ast(base_dir: string) -> string {
         var smc3 = GetTickCount()
     }
     sm_t_imp = smc3 - smc1
-    // S3.3 宏展开 pass（跨文件宏：g_extra_tops 收集全部文件顶层宏定义；
+    // 宏展开 pass（跨文件宏：g_extra_tops 收集全部文件顶层宏定义；
     // 展开结果参与类型检查）。失败返回与后续同格式的 ERR 协议文本。
     if mexpand.expand_sstate() < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
@@ -432,7 +432,7 @@ pub func check_ast(base_dir: string) -> string {
         var smc4 = GetTickCount()
     }
     sm_t_coll = smc4 - smc3
-    // S2.4 impl 块统一处理（同 check_impl：方法改名 + 签名登记 + 完整性/
+    // impl 块统一处理（同 check_impl：方法改名 + 签名登记 + 完整性/
     // 签名检查 + impl 记录；须在 expand_generics 之前——泛型约束校验依赖
     // impl 表就绪）
     var ifr = scollect.collect_impl_fns()
@@ -443,7 +443,7 @@ pub func check_ast(base_dir: string) -> string {
         var smc5 = GetTickCount()
     }
     sm_t_impl = smc5 - smc4
-    // 泛型单态化预扫描展开（T3b）：同 check_impl（见其注释）
+    // 泛型单态化预扫描展开：同 check_impl（见其注释）
     var ge = expand_generics()
     if ge < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
@@ -452,7 +452,7 @@ pub func check_ast(base_dir: string) -> string {
         var smc6 = GetTickCount()
     }
     sm_t_gen = smc6 - smc5
-    // 泛型字段类型预实例化（2026-08-14）：字段类型中的模板 struct 引用（如
+    // 泛型字段类型预实例化：字段类型中的模板 struct 引用（如
     // `A<i64>`）在此先行实例化，避免 collect_all_struct_fields 拍平时实例化
     // 副作用顶偏 cls_fldoff（详见 scollect.pre_instantiate_field_types 注释）
     var pr = scollect.pre_instantiate_field_types()
@@ -473,7 +473,7 @@ pub func check_ast(base_dir: string) -> string {
     if r5 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
-    // p.9.17.2 缺陷 #4a：延迟的全局标量初始化类型检查（须在 enum 变体收集后——
+    // 缺陷 #4a：延迟的全局标量初始化类型检查（须在 enum 变体收集后——
     // enum 变体常量初始化器依赖 en_vnames 变体表）
     var r6 = scollect.check_deferred_global_inits()
     if r6 < 0 {
@@ -484,7 +484,7 @@ pub func check_ast(base_dir: string) -> string {
     if r4 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
-    // 逐函数检查（T3b 稳定化，同 check_impl）
+    // 逐函数检查（稳定化，同 check_impl）
     // 性能重构：checked 改直索引表（checked[sig] = 1；sig 稠密 0..N-1）——
     // 旧版线性扫 checked 查 fid 是 O(N²)；泛型展开中 sig 追加时循环扩容。
     unsafe {
@@ -505,13 +505,13 @@ pub func check_ast(base_dir: string) -> string {
                 checked[sig] = 1
                 again = true
                 var fname = intern.lookup(fid)
-                // S1.5 移动语义：每函数检查前重置 live/moved 状态表（同 check_impl）
+                // 移动语义：每函数检查前重置 live/moved 状态表（同 check_impl）
                 sstate.lv_moved_reset()
                 var r2 = scheck.check_fn_walk(fname)
                 if r2 < 0 {
                     return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
                 }
-                // S1.5 移动语义独立 pass（同 check_impl；门控在 smove 内部两层）
+                // 移动语义独立 pass（同 check_impl；门控在 smove 内部两层）
                 var r_mv = smove.check_fn_walk(fname)
                 if r_mv < 0 {
                     return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
@@ -520,7 +520,7 @@ pub func check_ast(base_dir: string) -> string {
             i = i + 1
         }
     }
-    // S2.2 闭包体延迟检查：所有函数检查完后 FIFO 处理 g_clo_pending
+    // 闭包体延迟检查：所有函数检查完后 FIFO 处理 g_clo_pending
     // （闭包体用登记时 lv 快照重建独立作用域，不影响外层函数）
     var rc = scheck.check_pending_closures()
     if rc < 0 {
@@ -547,7 +547,7 @@ pub func check_ast(base_dir: string) -> string {
     return sm_ok_protocol()
 }
 
-// p.9.16.1 内存工程：前端 AST 释放接口（LSP「重型能力用完即弃」）。
+// 内存工程：前端 AST 释放接口（LSP「重型能力用完即弃」）。
 // 语义：把 s_* 列式表与符号表回退到空始态，并同时清 intern 池与 parser 节点池。
 // 用途：tsp 在每次分析产出所需结果（诊断 / 符号索引）后调用，
 // 把「按需物化整棵 AST」的峰值还给系统（长驻会话不再随文档数线性增长）。
@@ -585,14 +585,14 @@ pub func release_ast_keep_intern() {
     ast.reset()
 }
 
-// p.9.15.1 依赖感知缓存：转调 sstate.imported_paths（driver 无法直接访问
+// 依赖感知缓存：转调 sstate.imported_paths（driver 无法直接访问
 // sstate 命名空间，经 semantic 透出；sstate 函数跨命名空间调用已由本文件
 // 既有 sstate.xxx 用法证实可行）。
 pub func imported_paths() -> table<string> {
     return sstate.imported_paths()
 }
 
-// p.9.14.2 独立警告 pass：总开关访问器（driver 经 semantic. 转调；必须在
+// 独立警告 pass：总开关访问器（driver 经 semantic. 转调；必须在
 // namespace 内定义才能被 driver 用 semantic.set_warn_enabled/semantic.sm_warn_enabled
 // 访问——顶层 pub 函数不挂 semantic 命名空间，此前报「未定义」即由此起）。
 // 是否启用警告检查。

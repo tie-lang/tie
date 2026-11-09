@@ -1,10 +1,10 @@
 type tie<class>
-// lib/front/semantic_gen.tie —— 泛型单态化预扫描（T3b）子模块
+// lib/front/semantic_gen.tie —— 泛型单态化预扫描子模块
 // ============================================================
 // 从 semantic.tie 拆出：在 collect_top 之后、collect_all_struct_fields 之前
 // 调用，遍历 g_extra_tops 中的函数体，重建扫描期局部变量表后逐个推断函数体
 // 表达式，触发 sgen.instantiate_* 泛型展开（见 expand_generics 头注释）。
-// # 模块拆分范式（2026-08-11）：同 namespace semantic 跨多文件闭合并集，
+// # 模块拆分范式：同 namespace semantic 跨多文件闭合并集，
 //   被 import 文件全部代码并入编译单元、一切符号全局可见；同 namespace
 //   跨文件函数可互相裸名调用、访问主文件顶层全局 var；本文件不含全局
 //   var、不含 import，仅自建 namespace semantic 并放置本分区函数。
@@ -12,7 +12,7 @@ type tie<class>
 //   mexpand 树），本文件被其 import。
 namespace semantic {
 
-// ==================== 泛型单态化预扫描（T3b） ====================
+// ==================== 泛型单态化预扫描 ====================
 // 在 collect_top 之后、collect_all_struct_fields 之前调用：遍历 g_extra_tops
 // 中的函数体（顶层 + 命名空间递归），重建扫描期局部变量表后逐个推断函数体
 // 表达式——infer_call 遇到泛型调用/构造/方法调用时触发 sgen.instantiate_*
@@ -42,7 +42,7 @@ func expand_generics() -> i64 {
         i0 = i0 + 1
     }
     // 主循环：扫描函数体（触发展开）→ 新函数入队
-    // 规模上限（p.9.21.2 RCA，2026-09-22）：旧实现为绝对上限 2000，而本函数统计的是
+    // 规模上限（RCA，2026-09-22）：旧实现为绝对上限 2000，而本函数统计的是
     // **编译单元内被扫描的函数总数**（顶层函数 + 命名空间函数 + 泛型展开产物），该数随
     // 源码规模线性增长——2026-09 的 tiec 单单元已含约 1900 个函数，任何合法的小函数拆分
     // 都会撞上限（实测：把 builtin_expr 的 108 个内置分支提为独立函数即触发 E00520）。

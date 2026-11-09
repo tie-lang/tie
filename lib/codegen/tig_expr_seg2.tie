@@ -1,10 +1,10 @@
 type tie<class>
-// lib/backend/tig_expr_seg2.tie —— tig_expr 分派链分段 2（p.9.21 G2 单函数 ≤300 行）
+// lib/backend/tig_expr_seg2.tie —— tig_expr 分派链分段 2
 // ============================================================
 // 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
 // 与原函数同 namespace，跨文件裸名互调；段尾 return <sentinel> = 本段未命中。
 namespace irgen {
-// asm 内存约束操作数的**地址**（S1.2 I1，2026-10-02 补 (mem) 约束）。
+// asm 内存约束操作数的**地址**（，2026-10-02 补 (mem) 约束）。
 // 变量（局部/全局）→ 该变量**真实的槽地址**：asm 直接读/写槽本身，故
 // out(mem)/inout(mem) 天然写回变量，无需额外 load/store 回写。
 // 其它表达式 → 求值后落临时 alloca，返回该 alloca 地址（只读用途；写回无意义）。
@@ -44,13 +44,13 @@ func asm_mem_addr(e: i64) -> (a: i64, k: i64) {
 func tig_expr_seg2(id: i64) -> i64 {
     var tag = ast.s_tag(id)
     if tag == 131 {
-        // S1.2 I1 asm!：生成 inline_asm 指令（模板池 id + 操作数方向/值对）。
+        // asm!：生成 inline_asm 指令（模板池 id + 操作数方向/值对）。
         // 第一个 out 操作数 → 结果类型（call 返回值）；其余 out 第一版忽略。
-        // 任务17：平台条件编译——target("arch") 标注按当前编译目标分支：
+        // 平台条件编译——target("arch") 标注按当前编译目标分支：
         //   无 target 标注 → 始终发射（向后兼容）；
         //   有 target 标注 → 当前目标匹配任一 → 发射；全不匹配 → 明确报错。
         var nc = sstate.nchild(id)
-        // ---------- 平台条件编译判定（任务17）----------
+        // ---------- 平台条件编译判定----------
         var has_target: bool = false
         var matched: bool = false
         var listed = ""
@@ -128,7 +128,7 @@ func tig_expr_seg2(id: i64) -> i64 {
             var opv = sstate.child(id, k)
             var dirv = ast.s_val(opv)
             if dirv == 3 {
-                // target("arch") 平台标注（任务17）：不占 asm 操作数，跳过
+                // target("arch") 平台标注：不占 asm 操作数，跳过
                 k = k + 1
                 continue
             }
@@ -206,11 +206,11 @@ func tig_expr_seg2(id: i64) -> i64 {
         return tig_int_lit(0)  // 哑值（asm 表达式无值）
     }
     if tag == 132 {
-        // S2.2 闭包字面量（N_FN_LIT）：生成入口函数 + 构造闭包值 {env, entry}
+        // 闭包字面量（N_FN_LIT）：生成入口函数 + 构造闭包值 {env, entry}
         return tig_closure_lit(id)
     }
     if tag == 133 {
-        // S2.3：`expr ?` 解包（N_TRY）：Result/Option 枚举——Err/None 提前
+        // `expr ?` 解包（N_TRY）：Result/Option 枚举——Err/None 提前
         // return，Ok/Some 解包 payload。语义由 sinfer.infer_try_unwrap 校验。
         return tig_try(id)
     }
@@ -235,7 +235,7 @@ func tig_expr_seg2(id: i64) -> i64 {
         return tig_int_lit(0)
     }
     if tag == S_N_GUARD_REVOKE {
-        // r.1.6.7 `unsafe.revoke(g)` 凭据撤销（§11.6）：与 unsafe.get 同族，
+        // `unsafe.revoke(g)` 凭据撤销（§11.6）：与 unsafe.get 同族，
         // 凭据无运行时表示 ⇒ 撤销**运行期无操作**（失效跟踪与诊断都在编译期
         // 语义层完成）。实参仍求值一次，保持"实参表达式都会被生成"的一致语义。
         var ra = sstate.child(id, 0)
@@ -247,11 +247,11 @@ func tig_expr_seg2(id: i64) -> i64 {
         }
         return tig_int_lit(0)
     }
-    // p.9.10.1 match/switch 表达式：按模式链短路求值各分支表达式 → phi 汇合。
+    // match/switch 表达式：按模式链短路求值各分支表达式 → phi 汇合。
     if tag == N_SWITCH_EXPR {
         return tig_switch_expr(id)
     }
-    // p.9.11.3 try 错误聚合块（N_TRY_BLOCK=157）：线性发射块体语句（块内 `?`
+    // try 错误聚合块（N_TRY_BLOCK=157）：线性发射块体语句（块内 `?`
     // 传播到当前函数），末表达式值为 try 块值。
     if tag == 157 {
         return tig_try_block(id)

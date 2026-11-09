@@ -1,7 +1,7 @@
 type tie<class>
 // ============================================================================
 // p256.tie：ext/tls——纯 tie NIST P-256（secp256r1/prime256v1）ECDH（命名空间 p256）
-// 用途：p.6.1.8 遗留——baidu 等公网服务器 TLS 1.2 仅支持 P-256 ECDHE（不支持
+// 用途：遗留——baidu 等公网服务器 TLS 1.2 仅支持 P-256 ECDHE（不支持
 // X25519），为 tls1_2 提供 secp256r1 临时密钥对生成、公钥导出、ECDH 共享密钥。
 // 全纯 tie：域算术与点运算基于 std/bigint（32 位 limb 小端、u128 中间量），
 // 无任何 extern / Rust / Windows CNG 依赖（对照 ext/ecdsa 的 BCrypt 路线）。
@@ -10,7 +10,7 @@ type tie<class>
 //   p = FFFFFFFF 00000001 00000000 00000000 00000000 FFFFFFFF FFFFFFFF FFFFFFFF
 //   a = -3 mod p（p 的特殊结构使 3 倍点公式可用 a=-3）
 //   b = 5AC635D8 AA3A93E7 B3EBBD55 769886BC 651D06B0 CC53B0F6 3BCE3C3E 27D2604B
-//   G = (6B17D1F2 E12C4247 F8BCE6E5 63A440F2 77037D81 2DEB33A0 F4A13945 D898C296,
+//   G = (6B17D1F2 C4247 F8BCE6E5 63A440F2 77037D81 2DEB33A0 F4A13945 D898C296,
 //        4FE342E2 FE1A7F9B 8EE7EB4A 7C0F9E16 2BCE3357 6B315ECE CBB64068 37BF51F5)
 //   n = FFFFFFFF 00000000 FFFFFFFF FFFFFFFF BCE6FAAD A7179E84 F3B9CAC2 FC632551
 //
@@ -32,7 +32,7 @@ type tie<class>
 //   - 仿射求逆每步分支（double/add 的 λ 分母零判断），非常数时间——本模块面向
 //     公网握手互通（临时密钥，一次性），不做侧信道隔离（同 x25519.tie 定位）。
 //   - dh 对端点做 on_curve + 边界校验（防无效曲线攻击）。
-//   - 私钥由 std/csprng 的 strong_bytes（BCryptGenRandom，CSPRNG）生成（r.1.2.1）；
+//   - 私钥由 std/csprng 的 strong_bytes（BCryptGenRandom，CSPRNG）生成；
 //     常数时间列为后续（同 x25519.tie 既有注记）。
 // ============================================================================
 
@@ -212,7 +212,7 @@ func from_be32(b: table<i64>) -> table<i64> {
 // ---- 公共 API ----
 
 // 生成临时私钥 d（1 ≤ d < n），返回 32 字节大端 hex（64 位）。
-// r.1.2.1：私钥材料走 std/csprng strong_bytes（BCryptGenRandom，CSPRNG）；
+// 私钥材料走 std/csprng strong_bytes（BCryptGenRandom，CSPRNG）；
 // 系统 RNG 失败返回 ""（哨兵，不降级到伪随机）。
 pub func keygen() -> string {
     ensure()
@@ -293,7 +293,7 @@ pub func dh(d_hex: string, peer_pub: table<i64>) -> table<i64> {
     return to_be32(S.x)
 }
 
-// ---- ECDSA 复用入口（r.1.6.14）----
+// ---- ECDSA 复用入口----
 // 保持 Point 类型模块内私有，对外暴露纯 bigint/布尔原语，供 std/ecdsa_p256 复用
 // 标量乘与点加，避免跨命名空间的结构体字段访问。三函数均以内核 g_n 约束标量。
 

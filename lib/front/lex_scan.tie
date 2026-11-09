@@ -1,7 +1,7 @@
 type tie<class>
-// lib/front/lex_scan.tie —— T2.4 token 扫描器（模块拆分）
+// lib/front/lex_scan.tie —— token 扫描器（模块拆分）
 // ============================================================
-// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）完整词法器
+// 职责：完整词法器
 // lexer.tie 拆分为 5 模块之一（本文件 = 各 token 扫描器 + 错误槽写入）。
 // 共享状态（g_codes/g_n/g_src/g_line_starts/g_err_*）来自 ./lex_state.tie
 // （经 ./lex_tokdefs.tie 传递可达），tag 常量来自 ./lex_tokdefs.tie，
@@ -25,7 +25,7 @@ namespace lexscan {
 
 
 // 字符串（可跨行；lexeme = 原始切片含引号，parser 阶段再解码转义）。
-// p.8.2.3 字符串插值：遇未转义 '{'（'{{' 转义字面）→ 当前段以合成 lexeme
+// 字符串插值：遇未转义 '{'（'{{' 转义字面）→ 当前段以合成 lexeme
 // `"text"` 发 lex_str + 发 lex_interp_lbrace（插值专用 tag，区别于块开括号
 // lex_lbrace，避免 `if s == "a" {` 的块 lbrace 被 parser 误认插值）标记插值
 // 开始（g_str_interp=1），返回 `{` 后位置由主循环继续 lex 表达式；主循环遇
@@ -34,9 +34,9 @@ namespace lexscan {
 pub func scan_string(pos: i64) -> i64 {
     var start = pos
     var cont = g_str_interp == 2
-    // p.9.23.1 插值显式化（对齐规范 §1.9）：插值仅发生在 h"..." 插值字符串
+    // 插值显式化（对齐规范 §1.9）：插值仅发生在 h"..." 插值字符串
     //（g_str_hmode，主循环 h 分支置位）；普通串花括号一律字面——JSON/模板/
-    // 代码片段/正则照原样书写。原前瞻插值判定（含 p.9.23 D3 asm 模板特判，
+    // 代码片段/正则照原样书写。原前瞻插值判定（含 asm 模板特判，
     // 其语义被「普通串花括号字面」覆盖）整体移除；插值表达式按 h"{expr}" 紧贴
     // 书写，h 串内字面花括号写作 {{ / }}。
     var interp_mode = g_str_hmode
@@ -44,7 +44,7 @@ pub func scan_string(pos: i64) -> i64 {
         pos = pos + 1   // 跳过开引号 '"'（h 串由主循环分支先跳过 'h'）
     }
     // 段文本构建（字面 `{`/`}` 原样保留；`{{`/`}}` **不**在 lexer 折叠——
-    // p.9.12.1：字符串字面量里的 `}}` 是 JSON/模板合法字节，逐字保留，不能
+    // 字符串字面量里的 `}}` 是 JSON/模板合法字节，逐字保留，不能
     // 折叠成 `}`（曾致 tsp 等 JSON 响应缺尾括号）。插值字符串段的花括号
     // 转义（{{→{ / }}→}）改由 parser 的 parse_interp_chain 折叠；\X 转义原样
     // 保留，由 parser 的 str_unescape_quoted 统一还原）
@@ -118,7 +118,7 @@ pub func scan_string(pos: i64) -> i64 {
 
 pub func scan_triple_string(pos: i64) -> i64 {
     var cont = g_str_interp == 2
-    // p.9.23.1：h"""...""" 多行插值串（g_str_hmode）——语义同 h"..."；
+    // h"""...""" 多行插值串（g_str_hmode）——语义同 h"..."；
     // 普通三引号花括号一律字面（前瞻插值判定移除）。
     var interp_mode = g_str_hmode
     var start = pos
@@ -226,7 +226,7 @@ pub func scan_triple_string(pos: i64) -> i64 {
             sb_append_byte(sb, 125)
             p = p + 2
         } else if ch == 123 {
-            // p.9.23.1：插值开始——h 三引号（g_str_hmode）内无条件触发；
+            // 插值开始——h 三引号（g_str_hmode）内无条件触发；
             // 普通三引号花括号一律字面（原前瞻判定移除，对齐规范 §1.9）。
             if interp_mode {
                 var seg = sb_build(sb)
@@ -271,8 +271,8 @@ pub func scan_triple_string(pos: i64) -> i64 {
     return close + 3
 }
 
-// p.9.11.19 raw 字符串 r"..."：免转义字面（`\n` 保持两字符；**无插值**——`{`
-// 原样字符，不触发 p.8.2.3 插值链）。内双引号转义形态裁决：`""` 双写 → 字面
+// raw 字符串 r"..."：免转义字面（`\n` 保持两字符；**无插值**——`{`
+// 原样字符，不触发 插值链）。内双引号转义形态裁决：`""` 双写 → 字面
 // `"`（`r"a""b"` = a"b）；否则遇 `"` 结束（`r""` 空串）。跨行 raw 不做专门
 // 支持（内容含换行照常原样收录，与普通字符串一致）。入口：scan_ident 扫到
 // 标识符 "r" 且下一字符为 '"'（pos 已指向开引号）。产出 lex_str token，
@@ -435,7 +435,7 @@ pub func scan_number(pos: i64) -> i64 {
     if is_float {
         tag = lex_float
     }
-    // S1.3 L3 后缀字面量：数字后紧跟类型后缀（i8/i16/i32/i64/u8/u16/u32/u64/
+    // L3 后缀字面量：数字后紧跟类型后缀（i8/i16/i32/i64/u8/u16/u32/u64/
     // f32/f64，无空白）→ 吞并进 lexeme（如 "42i32" / "0x80u16" / "1.5f32"）。
     // 浮点后缀（f32/f64）把 token 标记为 lex_float（parser 按后缀定类型）。
     // 只吞精确后缀串：非后缀字母序列不吞（"42abc" 保持 42 + abc，parser 报错）。
@@ -490,7 +490,7 @@ pub func scan_number(pos: i64) -> i64 {
 }
 
 // 标识符 / 关键字：切片 intern 后查关键字表转 tag。
-// p.9.11.19：标识符恰为 "r" 且下一字符是 '"' → raw 字符串 r"..."（转发
+// 标识符恰为 "r" 且下一字符是 '"' → raw 字符串 r"..."（转发
 // scan_raw_string，pos 已指向开引号）；否则普通标识符/关键字。
 pub func scan_ident(pos: i64) -> i64 {
     var start = pos
@@ -519,7 +519,7 @@ pub func scan_ident(pos: i64) -> i64 {
 // 符号：3→2→1 字符最长匹配查符号表；未命中报「无法识别的字符」
 pub func scan_symbol(pos: i64) -> i64 {
     var start = pos
-    // p.9.13.1 单箭头统一：`=>` 已移除。在最长匹配之前显式判定「`=` 后紧跟 `>`」，
+    // 单箭头统一：`=>` 已移除。在最长匹配之前显式判定「`=` 后紧跟 `>`」，
     // 提前报精确诊断（避免退化成 `=` `>` 两个 token 的隐性误配误指）。相邻 `>=`
     //（首字符 `>`）、`==`、`=` 因首字符/第二字符不同不受影响。
     if pos + 1 < g_n && g_codes[pos] == 61 && g_codes[pos + 1] == 62 {

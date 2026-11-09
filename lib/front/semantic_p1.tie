@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/semantic_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/front/semantic_p1.tie —— 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 semantic.tie。
@@ -23,7 +23,7 @@ func path_dir(path: string) -> string {
 }
 
 // 归一化路径：折叠 "段/../"（"a/b/../c" → "a/c"），循环直到稳定。
-// S3.2：import 展开去重按**字符串**比较，未归一化路径（如 llvmgen 经
+// import 展开去重按**字符串**比较，未归一化路径（如 llvmgen 经
 // "./../middle/ir.tie" 展开得 "compiler/backend/../middle/ir.tie"，而
 // ir_meta 经 "./ir.tie" 得 "compiler/middle/ir.tie"）字符串不同 → 去重
 // 失效 → 同一文件二次内联 → 全局变量/函数重复定义。所有解析结果统一
@@ -78,7 +78,7 @@ func normalize_path(p: string) -> string {
     return out
 }
 
-// p.9.13.7-B：判定 import 是否为内置库根别名（/std、/ext、/rdu、/sys 前缀）。
+// -B：判定 import 是否为内置库根别名（std、/ext、/rdu、/sys 前缀）。
 func is_lib_alias(path: string) -> bool {
     if tie.support::has_prefix(path, "/std/") { return true }
     if tie.support::has_prefix(path, "/ext/") { return true }
@@ -87,7 +87,7 @@ func is_lib_alias(path: string) -> bool {
     return false
 }
 
-// p.9.13.7-B：内置库根解析。CLI set_lib_root > TIE_LIB_ROOT 环境变量 >
+// -B：内置库根解析。CLI set_lib_root > TIE_LIB_ROOT 环境变量 >
 // 默认 ~/.tiec-lib/tlib。惰性求值，首次命中后缓存到 g_lib_root。
 func lib_root() -> string {
     if str_len(g_lib_root) > 0 {
@@ -116,7 +116,7 @@ func lib_root() -> string {
 
 // 已导入集合线性查找（文件少，线性足够）
 func imported_has(p: string) -> bool {
-    // p.9.14.2：用 intern id 有序二分替代对 g_imported 的线性查找（import 病态
+    // 用 intern id 有序二分替代对 g_imported 的线性查找（import 病态
     // 主因，driver 数百文件 O(n²)）。intern.intern 对同字符串返回同 id（intern
     // 池去重），二分查 g_imp_idkeys 即等价于"已导入含 p"判断。
     return sstate.bs_find(g_imp_idkeys, intern.intern(p)) >= 0
@@ -213,7 +213,7 @@ func sel_collect_refs(node: i64, names: table<i64>, ref flags: table<i64>) {
 func expand_one_import(imp_node: i64) -> i64 {
     var p = sstate.name_str(imp_node)
     var full = resolve_import_path(p)
-    // p.9.13.7-B：库根别名但库根目录缺失 → 明确诊断（提示 fetch-lib / 环境变量）
+    // -B：库根别名但库根目录缺失 → 明确诊断（提示 fetch-lib / 环境变量）
     if is_lib_alias(p) && !file_is_dir(lib_root()) {
         sm_err_line = s_lines[imp_node]
         sm_err_col = s_cols[imp_node]
@@ -252,9 +252,9 @@ func expand_one_import(imp_node: i64) -> i64 {
         return 0
     }
     table_push(g_imported, full)
-    // p.9.14.2：同步维护 intern id 有序索引（imported_has 二分免去线性扫描）。
+    // 同步维护 intern id 有序索引（imported_has 二分免去线性扫描）。
     sstate.sorted_insert(g_imp_idkeys, g_imp_idvals, intern.intern(full), 0)
-    // 批次1-任务1（import 段错误修复）：file_read 原语对不存在的文件会触发
+    // -（import 段错误修复）：file_read 原语对不存在的文件会触发
     // 运行时段错误（0xC0000005——运行时 tie_file_read 对缺失文件返回无效指针，
     // 运行时在独立仓库 tiec_rust，主仓库 0-Rust 铁律无法修改）。故必须在调用
     // file_read 之前用 file_exists 拦截，输出带文件路径与 import 语句位置的
@@ -289,7 +289,7 @@ func expand_one_import(imp_node: i64) -> i64 {
     //      （strip_type_decl 只剥行不解读）⇒ 库文件无法按模块授权。
     // 父模块授权**不继承**（与「文件级授权不随 import 扩散」同一规则，方向相反
     // 的那一半）：子模块要什么域，自己头部声明。
-    // p.9.11.13 扩展（2026-10-12）：被导入文件的 #cfg 预处理（与主文件同规则；
+    // 扩展：被导入文件的 #cfg 预处理（与主文件同规则；
     // target/profile 由 driver 经 semantic.set_cfg_env 单点注入）——此前仅主
     // 文件过预处理，库文件中的 #cfg 行会被词法器当作 `#[` 属性误判（E00449）。
     // 先于一切状态变更（defer 之前），错误路径直接返回、无需恢复。
@@ -316,7 +316,7 @@ func expand_one_import(imp_node: i64) -> i64 {
     var src2 = strip_type_decl(src_c)
     unsafe { tt1 = GetTickCount() }
     sm_t_imp_strip = sm_t_imp_strip + (tt1 - tt0)
-    // T5.3 内存版 + 细分计时：lex 与语法构建分开计量（run_lex → stage1 →
+    // 内存版 + 细分计时：lex 与语法构建分开计量（run_lex → stage1 →
     // stage2 与 parse_ast 内部逐行等价）
     var lok = lexer.run_lex(src2)
     unsafe { tt2 = GetTickCount() }
@@ -351,7 +351,7 @@ func expand_one_import(imp_node: i64) -> i64 {
     if base < 0 {
         return -1
     }
-    // import as 别名（M2.1.7）：alias = imp_node.aux（字符串池 id，-1 = 无别名）。
+    // import as 别名：alias = imp_node.aux（字符串池 id，-1 = 无别名）。
     // 有别名时，把被导入文件顶层 namespace 的段名替换为别名（f2 作为唯一入口）。
     var alias_id = s_aux[imp_node]
     var new_root = len(s_tags) - 1
@@ -359,10 +359,10 @@ func expand_one_import(imp_node: i64) -> i64 {
     // 段 id，供递归展开的分片（多文件共享同名 namespace）继承改名。
     var rn_orig: table<i64> = table_new_i64()
     if alias_id >= 0 {
-        // p.9.11.14：别名登记 + 重复诊断（编译单元内 import 别名必须唯一；
+        // 别名登记 + 重复诊断（编译单元内 import 别名必须唯一；
         // 别名映射 → g_imp_alias_names/paths 平行表，供后续工具/诊断显示）。
         // 语义等价：别名 = 被导入文件顶层 namespace 的命名记录（内联模型下
-        // 别名经改名生效，非纯解析糖——M2.1.7 既有行为）。
+        // 别名经改名生效，非纯解析糖——既有行为）。
         var anm = intern.lookup(alias_id)
         var ak2: i64 = 0
         var adup: bool = false
@@ -400,12 +400,12 @@ func expand_one_import(imp_node: i64) -> i64 {
             ak = ak + 1
         }
     }
-    // dev33 批次10 任务29：记录导入文件顶层 StmtList 根 → 文件 id（宏可见性）
+    // 记录导入文件顶层 StmtList 根 → 文件 id（宏可见性）
     table_push(g_file_roots, new_root)
     // 2026-10-12：文件名词干（顶层限定通道：`文件词干.顶层成员`，裸名保持可用）
     table_push(g_file_stem, sstate.stem_of_path(full))
     g_file_count = g_file_count + 1
-    // p.9.21.6-1 模块边界显式化：登记本文件节点基址（append_ast_mem 已返回
+    // -1 模块边界显式化：登记本文件节点基址（append_ast_mem 已返回
     // base；节点 id ∈ [base, base+本文件节点数)——递归展开的后续文件基址
     // 只会更大，g_file_base 恒升序，file_id_of_node 二分正确）。
     table_push(g_file_base, base)
@@ -421,7 +421,7 @@ func expand_one_import(imp_node: i64) -> i64 {
     // 递归：新文件顶层中的 import 立即展开；其余进 g_extra_tops
     var saved_dir = g_cur_dir
     g_cur_dir = path_dir(full)
-    // p.9.11.31 选择性导入：N_IMPORT 子节点非空 = `import "path".{a, b}`。
+    // 选择性导入：N_IMPORT 子节点非空 = `import "path".{a, b}`。
     // 过滤策略（内联模型）：保留集 = 选中名 + 其依赖闭包（保留符号体里引用
     // 的同文件顶层名，不动点收敛）——被选符号的内部依赖自动跟随保留；
     // 未列入且不在闭包内的顶层声明不进 g_extra_tops（不登记不发射），
@@ -599,19 +599,19 @@ func expand_imports() -> i64 {
     // 导入时机标记随单元复位：常驻服务编译下一单元时不得残留上一单元的
     // lazy/eager 文件标记，否则会把无关模块判成全量物化或放弃导出面。
     sstate.reset_file_import_mod()
-    // p.9.21.6-1 模块边界显式化：每文件节点基址表复位（文件 0 = 主文件，基址 0；
+    // -1 模块边界显式化：每文件节点基址表复位（文件 0 = 主文件，基址 0；
     // 导入文件经 append_ast_mem 连续追加节点，expand_one_import 推进基址表）。
     g_file_base = table_new_i64()
     table_push(g_file_base, 0)
-    // p.9.14.2：intern id 去重索引随每次编译清零（防跨编译累积污染）。
+    // intern id 去重索引随每次编译清零（防跨编译累积污染）。
     g_imp_idkeys = table_new_i64()
     g_imp_idvals = table_new_i64()
     g_extra_tops = table_new_i64()
-    // p.9.11.14：import 别名登记表重置（编译单元一次）
+    // import 别名登记表重置（编译单元一次）
     g_imp_alias_names = table_new_string()
     sstate.ns_rename_reset()
     g_imp_alias_paths = table_new_string()
-    // dev33 批次10 任务29：文件起源跟踪复位；g_file_roots[文件 id] = 顶层
+    // 文件起源跟踪复位；g_file_roots[文件 id] = 顶层
     // StmtList 根 id（平行表；主文件 = 0，导入文件按展开顺序递增）
     g_file_roots = table_new_i64()
     g_file_count = 1
@@ -637,7 +637,7 @@ func expand_imports() -> i64 {
     return 0
 }
 
-// ==================== 内存版 AST 表复制（T5.3 消除协议往返）====================
+// ==================== 内存版 AST 表复制（消除协议往返）====================
 // 把 parser.parse_ast 留在内存的 ast 节点池（ast 命名空间 9 列全局表）复制到
 // sstate 的 s_* 9 列表。语义与 sstate.load_ast(协议文本) 完全等价——协议文本
 // 就是 build_protocol 对 ast 表的逐字节序列化，此处改为直接内存复制，

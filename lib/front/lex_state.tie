@@ -1,7 +1,7 @@
 type tie<class>
-// lib/front/lex_state.tie —— T2.4 词法器共享状态（模块拆分）
+// lib/front/lex_state.tie —— 词法器共享状态（模块拆分）
 // ============================================================
-// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）完整词法器
+// 职责：完整词法器
 // lexer.tie 拆分为 5 模块之一（本文件 = 共享全局状态，零依赖叶节点）。
 // tie 语言约束：全局变量只能在文件顶层声明（命名空间体内只允许函数/类/
 // 嵌套命名空间），故本文件全部共享全局变量放顶层，供各模块函数**裸名**
@@ -9,7 +9,7 @@ type tie<class>
 // namespace lexst 为本模块身份占位。
 // 依赖：无。由 lex_tokdefs.tie import（传递可达 lex_scan/lexer）。
 
-// ---------- 全局列式 token 表（T0.4 全局表：下标对齐 = token 序号）----------
+// ---------- 全局列式 token 表（全局表：下标对齐 = token 序号）----------
 pub var tok_tags: table<i64>;
 pub var tok_lines: table<i64>;
 pub var tok_cols: table<i64>;
@@ -18,7 +18,7 @@ pub var tok_lexemes: table<i64>;
 // ---------- doc 注释表（ordinal 单调递增，push 即排序对）----------
 pub var doc_keys: table<i64>;
 pub var doc_vals: table<i64>;
-// p.9.11.29：每条 doc 附着的声明起始 token 所在行（与 doc_keys 平行，push 同序）；
+// 每条 doc 附着的声明起始 token 所在行（与 doc_keys 平行，push 同序）；
 // parser 侧以此行号与 ast.line(声明节点) 匹配完成归属。
 pub var doc_decl_lines: table<i64>;
 
@@ -36,11 +36,11 @@ pub var g_byte_starts: table<i64>;
 pub var g_line_has_token: bool = false;
 pub var g_last_line_tag: i64 = 0;   // 行尾最后 token 的 tag（-1 = 无）
 pub var g_paren_depth: i64 = 0;     // 括号深度（只统计 ( 与 [）
-// p.8.2.3 字符串插值模式：0=正常；1=插值表达式 lex 中（`}` 后需续扫字符串段）；
+// 字符串插值模式：0=正常；1=插值表达式 lex 中（`}` 后需续扫字符串段）；
 // 2=插值结束标记已扫，下一 token 续扫字符串段（无开引号）
 pub var g_str_interp: i64 = 0;
 pub var g_str_hmode: bool = false;   // p.9.23.1 插值显式化：当前字符串是 h"..." 插值串（普通串花括号一律字面）
-// p.9.11.30 三引号多行字符串模式（与 g_str_interp==2 组合：插值表达式结束后续扫
+// 三引号多行字符串模式（与 g_str_interp==2 组合：插值表达式结束后续扫
 // 三引号内容段而非单行字符串）
 pub var g_str_triple: i64 = 0;
 

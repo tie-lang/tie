@@ -1,11 +1,11 @@
 type tie<logic>
-// lib/front/error_driver.tie —— T2.7 错误 golden 对比驱动
+// lib/front/error_driver.tie —— 错误 golden 对比驱动
 // ============================================================
 // 遍历 _local_only/probes/tests/errors/golden/*.tie，对每个文件跑 semantic.check_src，
 // 将语义/语法错误输出为「语义错误 @行:列: 消息」（与 .stderr golden 对齐；
 // 原 Rust 基线 test-errors.ps1/regenerate-golden.ps1 已随 0-Rust 退役，2026-09-13 删除）。
 //
-// 库归属（p.9.21 G3）：本文件是**编排入口**（自带 main，驱动 sema 跑语料），
+// 库归属：本文件是**编排入口**（自带 main，驱动 sema 跑语料），
 // 不属于 diag 库（diag 库 = diagcode/errors 数据表与对外渲染），因此门禁矩阵
 // 将其归到 driver 库。放在 frontend/ 只是历史路径，diag 库不持有对 sema 的依赖。
 import "./semantic.tie"
@@ -14,7 +14,7 @@ import "./semantic.tie"
 // 词法错误（lexer 消息特征）/ 语法错误（parser 消息特征）/ 语义错误（其余）。
 // 命名 fmt_err_msg：避免与 interp/interp.tie 的 fmt_err（2 参数）同名冲突——
 // error_driver import semantic → mexpand → interp，同名顶层函数合并后
-// 语义检查会把 interp 的 2 参数调用误解析到本 1 参数函数（批次1-任务2 修复）。
+// 语义检查会把 interp 的 2 参数调用误解析到本 1 参数函数（修复）。
 func fmt_err_msg(r: string) -> string {
     // ERR:line col msg
     var rest = str.slice(r, 4, str_len(r))
@@ -80,9 +80,9 @@ func main() {
         "_local_only/probes/tests/errors/golden/err_060.tie", "_local_only/probes/tests/errors/golden/err_061.tie",
         "_local_only/probes/tests/errors/golden/err_062.tie", "_local_only/probes/tests/errors/golden/err_063.tie",
         "_local_only/probes/tests/errors/golden/err_064.tie", "_local_only/probes/tests/errors/golden/err_065.tie",
-        // 批次1（import 段错误修复）回归用例：
-        // err_066 = import 不存在的文件（任务1）；err_067 = import 语法错误文件；
-        // err_068 = import 语义错误文件（任务2 两类坏输入）
+        // 回归用例：
+        // err_066 = import 不存在的文件；err_067 = import 语法错误文件；
+        // err_068 = import 语义错误文件（两类坏输入）
         "_local_only/probes/tests/errors/golden/err_066.tie", "_local_only/probes/tests/errors/golden/err_067.tie",
         "_local_only/probes/tests/errors/golden/err_068.tie"
     ]

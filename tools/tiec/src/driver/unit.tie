@@ -23,13 +23,13 @@ pub func run_unit() -> i64 {
     // LLVM 自动向量化用满宿主向量宽度（AVX2/AVX-512），未置位时默认 SSE。
     tc.set_native_simd(driver.effective_tie_opt() >= 3 || driver.effective_llvm_opt() >= 3)
     irgen.set_esc_audit(g_cli_esc_audit)
-    // p.9.20.5 tail call 文本提示：-t1/-t2/-t3 下会生成缺块终结指令的非法 IR
+    // tail call 文本提示：-t1/-t2/-t3 下会生成缺块终结指令的非法 IR
     // （opt 报 expected instruction opcode，bb3 标签插在循环体回边之前），
     // 暂停用；-t 轴改为承载「-t3 最高档开启本机 SIMD 自动向量化」。
     llvmgen.set_tail_enable(0)
     tc.set_fast_math(g_cli_fast_math)
     tc.set_no_warn(g_no_warn)
-    // p.9.13.7-B：CLI 显式库根（--lib-root）注入前端 import 解析。
+    // -B：CLI 显式库根（--lib-root）注入前端 import 解析。
     if str_len(g_lib_root_cli) > 0 {
         semantic.set_lib_root(g_lib_root_cli)
     }
@@ -49,7 +49,7 @@ pub func run_unit() -> i64 {
         }
         return exec_code(tsp_path)
     }
-    // S3.2：--dump-irt 短路——只读 .tir 输出可读摘要（不编译）
+    // --dump-irt 短路——只读 .tir 输出可读摘要（不编译）
     if str_len(g_dump_irt) > 0 {
         var drc = tieir.read(g_dump_irt)
         if drc != 0 {
@@ -98,7 +98,7 @@ pub func run_unit() -> i64 {
         dbg_txt("读取源码失败: " + g_input)
         return 1
     }
-    // S3.4：自定义角色注册表需先于头部扫描可用（config.data.tie roles 段）。 
+    // 自定义角色注册表需先于头部扫描可用（config.data.tie roles 段）。 
     // 分层合并：无配置文件时返回内置默认根；config 语法错误 → 报错退出。
     if !g_cfg_loaded {
         g_cfg_root = config.load_merge(g_config_path, g_cli_profile)
@@ -111,7 +111,7 @@ pub func run_unit() -> i64 {
     // 角色注册引导：内建默认表 → config roles → 项目 roles.data.tie
     // → .tie/deps/*/roles.data.tie（包定制角色 = 纯数据声明，不扩展加载器）
     driver.role_registry_boot(base_dir_of(str.clone(g_input)))
-    // p.9.11.13 #cfg 条件编译预处理：词法前按行裁剪（#cfg/#else/#end/#endif）。
+    // #cfg 条件编译预处理：词法前按行裁剪（#cfg/#else/#end/#endif）。
     // 必须在头部扫描（scan_header）之前——否则 #cfg 行会被当成头部首个非声明
     // 内容终止角色识别；裁剪后源码再走 scan_header + strip_type_header。
     // 条件求值源：--target > 配置 target > 主机（os/target 键）；生效 profile
@@ -128,7 +128,7 @@ pub func run_unit() -> i64 {
             cfg_profile = config.get_str(g_cfg_root, "profile")
         }
     }
-    // p.9.11.13 扩展（2026-10-12）：向 semantic 注入 #cfg 求值环境——被导入
+    // 扩展：向 semantic 注入 #cfg 求值环境——被导入
     // 文件的预处理（expand_one_import）复用同一 target/profile 判据。
     semantic.set_cfg_env(cfg_target, cfg_profile)
     cfgpre.set_features(g_features)
@@ -143,14 +143,14 @@ pub func run_unit() -> i64 {
     if _sh_r < 0 {
         return 1
     }
-    // r.1.6.7：文件级 lock 授权（`type tie<logic, unsafe:lock>`）——头部角色声明
+    // 文件级 lock 授权（`type tie<logic, unsafe:lock>`）——头部角色声明
     // 中的修饰角色 `unsafe:lock` ⇒ 整文件的表访问置于**去锁**作用域（文件级持证
-    // 形态，见 unsafe-credential-lock.md §3）。注入 irgen，供函数体生成时判定。
+    // 形态，见 ）。注入 irgen，供函数体生成时判定。
 
     // 剥离头部声明行（`type tie` / `type tie<X>` 是真语法行，须从正文移除；
     // 旧 `// tie:` 是注释由 lexer 跳过，无需处理）
     var clean = tie.support::strip_type_header(src)
-    // p.9.11.29：--dump-docs 短路——解析后输出 doc 注释注册表摘要（不编译）。
+    // --dump-docs 短路——解析后输出 doc 注释注册表摘要（不编译）。
     // 修复 2026-09-29：原短路置于头部剥离之前，对任何含规范 §1.1 头部的文件
     // （`type tie<X>` 为真语法行、必须位于文件最前）一律 E00000 解析失败，故
     // tlib 全部文件不可用。现移至此——src 已过 #cfg 裁剪，clean 已剥离头部行，
@@ -164,10 +164,10 @@ pub func run_unit() -> i64 {
         print(pstmt_top.pdoc_dump())
         return 0
     }
-    // p.9.13.2 语言前置注入：应用代码（logic/script）自动获得 str/math 域基元的
+    // 语言前置注入：应用代码（logic/script）自动获得 str/math 域基元的
     // 裸名（免 import、免前缀）。同名用户定义优先遮蔽（using 语义已保证）。
     clean = prelude_inject(clean, g_role, src)
-    // S1.4 R3 文件名-头部一致性检查（F1）：`xxx.<基础>[-<参数>][-<修饰>...].tie`
+    // R3 文件名-头部一致性检查（F1）：`xxx.<基础>[-<参数>][-<修饰>...].tie`
     // 与头部声明不一致 = 编译错误（单一真相，升级自现状警告）。
     var fname = file_name_of(str.clone(g_input))
     var name_role = role_from_filename(fname)
@@ -203,7 +203,7 @@ pub func run_unit() -> i64 {
             return 1
         }
     }
-    // S1.2 文件级 unsafe 角色（type tie<..., unsafe>）：整文件 unsafe 上下文。
+    // 文件级 unsafe 角色（type tie<..., unsafe>）：整文件 unsafe 上下文。
     // 2026-10-07：此处原先**全局**抬升 g_unsafe_depth，造成两个偏差（均违反规范 §11.6）：
     //   ① 上下文**扩散给被 import 的模块**（父授权不继承 —— 与 caps 同类的越权，
     //      2026-10-01 只修了 caps 那一半）；
@@ -241,7 +241,7 @@ pub func run_unit() -> i64 {
     if disp == "check" {
         g_emit_ir = true
     }
-    // M5 动态库模式（dev33 批次 12）：--shared 或输出扩展名 .dll/.so → 动态库。
+    // 动态库模式：--shared 或输出扩展名 .dll/.so → 动态库。
     // 要求 library 角色（class/type，无 main）；通知 irgen 标记导出面（dllexport）
     // 并做边界检查（表/struct 不跨库）。
     if detect_shared_mode() {
@@ -257,7 +257,7 @@ pub func run_unit() -> i64 {
     // 产物下由 llvmgen 把它当作「按名查找的根」保持 external，避免未引用
     // 声明裁剪删掉外部进程要按名解析的符号。
     irgen.set_dll_export(g_dll_export_cli)
-    // S3.1 构建配置：分层合并（内置默认 < 用户 config < 项目 config < profile < CLI；
+    // 构建配置：分层合并（内置默认 < 用户 config < 项目 config < profile < CLI；
     // 已由角色注册表预加载时（scan_header 前）直接复用，避免重复解析文件）
     if !g_cfg_loaded {
         g_cfg_root = config.load_merge(g_config_path, g_cli_profile)
@@ -267,14 +267,14 @@ pub func run_unit() -> i64 {
         }
     }
     // CLI 显式参数 → 覆盖合并结果（最高优先；CLI 是显式意图，不警告）
-    // p.9.20 双轴：llvm_opt / tiec_opt 两键独立覆盖
+    // 双轴：llvm_opt / tiec_opt 两键独立覆盖
     if g_llvm_set {
         g_cfg_root = config.apply_cli(g_cfg_root, "llvm_opt", to_string(g_llvm_opt))
     }
     if g_tie_set {
         g_cfg_root = config.apply_cli(g_cfg_root, "tiec_opt", to_string(g_tie_opt))
     }
-    // p.9.1.2：编译资源可调——内存上限 / 并发度写入配置（降档逻辑在
+    // 编译资源可调——内存上限 / 并发度写入配置（降档逻辑在
     // effective_llvm_opt，见 kpass_link）。（mem_limit>0 才覆盖；0=不限跳过）
     if g_mem_limit != 0 {
         g_cfg_root = config.apply_cli(g_cfg_root, "tiec.mem_limit", to_string(g_mem_limit))
@@ -285,7 +285,7 @@ pub func run_unit() -> i64 {
     if str_len(g_target) > 0 {
         g_cfg_root = config.apply_cli(g_cfg_root, "target", g_target)
     }
-    // --backend 实现选择（P4b 验收）：CLI 显式 > 配置 tiec.backend
+    // --backend 实现选择（验收）：CLI 显式 > 配置 tiec.backend
     // -Werror 的配置兜底：`tiec.warn_error = true`（配置里写 `["tiec": ["warn_error": true]]`）。
     // CLI 未显式给出时按配置生效；只能**开**，不能用来关 CLI 已开的开关。
     // 注：config 有自己的语法（数组容器 `[...]` + `"键": 值`），**不是** tie:data 的
@@ -303,7 +303,7 @@ pub func run_unit() -> i64 {
         return 1
     }
     var crc0 = driver.compile_program(clean)
-    // p.9.22.10 tinker 发送出口（--tink / --tink-file）：编译后统一发帧
+    // tinker 发送出口（--tink / --tink-file）：编译后统一发帧
     //（stage 记录帧 / 失败 diag 帧 / 产物 artifact 帧；人为文本已在 stderr）。
     if g_tink || str_len(g_tink_file) > 0 {
         tinker.run_send(crc0)

@@ -1,7 +1,7 @@
 type tie<class>
 // ext/tink.tie —— tink 协议（v3 线格式；命名空间 tink）
 // ============================================================
-// 线格式（全大端 BE；设计依据：tink v3 设计文档 §3 线格式 / §4 注册表）：
+// 线格式（全大端 BE；设计依据：tink v3 设计说明 §3 线格式 / §4 注册表）：
 //   帧 = [magic u8[2] = 0x74 0x6B][ver u8 = 3][type u8][flags u16]
 //        [stream_id u32][seq u32][len u16]
 //        [扩展区]?            （flags.EXT：ext_len u16 + TLV 序列）
@@ -38,7 +38,7 @@ type tie<class>
 // 说明：未知 type 由读方「跳过 + 计数」，编解码层不视为非法；type_defined /
 //   type_writable 供写方纪律与探针使用；0xF0–0xFF 为私有/实验（不进规范，可用）。
 //   写方不得使用 0x7x–0xEx 预留块与各预留槽；已定义槽永不复用/改名。
-// 探针：std/tink_*_probe.tie（12 个，覆盖帧骨架→中继全协议；对应设计文档 §11 探针集）。
+// 探针：std/tink_*_probe.tie（12 个，覆盖帧骨架→中继全协议；对应设计说明 §11 探针集）。
 
 import "../std/bytes.tie" as bytes
 import "../std/x25519.tie" as x25519
@@ -483,7 +483,7 @@ pub func frame_skip(b: table<i64>, pos: i64) -> i64 {
 // ==================== 帧组装 ====================
 // 合法输入 → 完整帧字节；非法输入 → 空表。
 //   ext：TLV 序列字节（EXT 位置位时写入，可为空；EXT 位未置位时必须为空）
-//   PROTECTED 编码未接线（密码层里程碑）——本层拒绝，防止「声称保护而未加密」。
+//   PROTECTED 编码未接线（密码层尚未实现）——本层拒绝，防止「声称保护而未加密」。
 //   CRC 位置位时自动计算覆盖「头 + 扩展 + 载荷」的 CRC32C 并置尾。
 pub func frame_encode(ftype: i64, flags: i64, stream_id: i64, seq: i64, payload: table<i64>, ext: table<i64>) -> table<i64> {
     var empty = table_new_i64()
@@ -1677,7 +1677,7 @@ pub func rp_check(ref st: table<i64>, seq: i64) -> i64 {
 //   （各流 next_seq 摘要 = 断点续传）。
 // 防重放：兑换后记录 ticket id 至有效期结束；单次性位 = 永久烧毁（过期亦拒）。
 // 恢复期密钥：res_secret → "tink v3 res c/s ap traffic"（方向分离）。
-// early data：仅幂等请求（REQUEST flags bit0；RPC 层接线见 M10）。
+// early data：仅幂等请求（REQUEST flags bit0；RPC 层接线见 ）。
 // 票据真实性：参考格式以服务器 ticket 密钥附加 16B HMAC（先验后兑；不加密——机密不放票据）。
 
 pub func tkt_max_ttl_ms() -> i64 { return 7 * 24 * 3600 * 1000 }
@@ -2784,7 +2784,7 @@ pub func chunk_proof_frame(stream_id: i64, seq: i64, body: table<i64>, prot: i64
 // FORWARD（0x60）：target peer_id ‖ 内层帧。relay **不解密载荷**（不解析内层、只读 target）；
 // 拒绝 → 0x06xx（TARGET_UNREACHABLE / FORWARD_REFUSED）。
 // 迁移：连接以 CONN_ID（TLV 1）标识；新路径同 CONN_ID 帧**经认证后**即接管（数据报绑定）；
-// 流绑定下迁移 = 重连 + RESUME（见 M8）。
+// 流绑定下迁移 = 重连 + RESUME（见 ）。
 
 // target ‖ inner
 pub func forward_body(target: table<i64>, inner: table<i64>) -> table<i64> {

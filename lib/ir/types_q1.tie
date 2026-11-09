@@ -1,5 +1,5 @@
 type tie<class>
-// lib/ir/types_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/ir/types_q1.tie —— 分片 1
 // ============================================================
 // 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 types.tie。
 // 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
@@ -99,7 +99,7 @@ pub func enum_of(idx: i64) -> i64 {
     return BASE_ENUM + idx
 }
 
-// ---------- S1.2 不安全类型（ptr/slice/atomic）构造 ----------
+// ---------- 不安全类型（ptr/slice/atomic）构造 ----------
 // 嵌套聚合负载（T ≥ NEST_SLOT_OFF）走各自序号表（同 table_of 方案防进位碰撞）。
 // ptr<T>：id = 7<<40 | T。T 为任意类型 id（含嵌套聚合）。
 pub func ptr_of(elem: i64) -> i64 {
@@ -152,7 +152,7 @@ pub func atomic_of(elem: i64) -> i64 {
     return BASE_ATOMIC + NEST_SLOT_OFF + n
 }
 
-// p.9.11 future<T>：id = 15<<40 | T（async 非 void 方法调用的凭据类型，规范
+// future<T>：id = 15<<40 | T（async 非 void 方法调用的凭据类型，规范
 // §10.6）。LLVM 表示 = i64（actor record 句柄）；await 取值（等 done/读 result/
 // 清门闩）。负载 T 为方法返回类型 id；嵌套聚合走 nest_future_elems 防进位。
 pub func future_of(elem: i64) -> i64 {
@@ -293,7 +293,7 @@ pub func array_len(t: i64) -> i64 {
     return -1
 }
 
-// ---------- S2.2 fn 函数值类型构造 ----------
+// ---------- fn 函数值类型构造 ----------
 // fn(A, B) -> R：id = 10<<40 | 签名索引。签名 = 返回类型 + 参数类型列表，
 // 查 fn 签名表编码（低负载为签名表行号）。参数可含任意类型 id（含嵌套聚合、
 // 另一个 fn 类型——函数值作参数天然合法）。
@@ -334,7 +334,7 @@ pub func fn_of(ret: i64, params: table<i64>) -> i64 {
     return BASE_FN + n
 }
 
-// p.6.2.4 闭包参数 ref / 变参：fn_of 扩展版，登记 ref 标志 + 变参标志。
+// 闭包参数 ref / 变参：fn_of 扩展版，登记 ref 标志 + 变参标志。
 // p_refs：并行表（0/1，按引用传递；仅表参数合法）；has_var：末位变参
 // （参数列表末位 = table<T>，LLVM 表现同 table）。查重严格匹配全元数据。
 // 旧 fn_of 调用仍可用（等价于全 0 refs + 非变参），新建的签名在扩容版
@@ -378,7 +378,7 @@ pub func fn_of2(ret: i64, params: table<i64>, p_refs: table<i64>, has_var: i64) 
     return BASE_FN + n
 }
 
-// fn 第 k 个参数是否按引用传递（p.6.2.4）：fn 类型 -> 0/1；越界/非 fn 返回 0。
+// fn 第 k 个参数是否按引用传递：fn 类型 -> 0/1；越界/非 fn 返回 0。
 pub func fn_param_ref(t: i64, k: i64) -> i64 {
     var idx = low(t)
     if idx >= 0 && idx < len(fn_nparams) {
@@ -389,7 +389,7 @@ pub func fn_param_ref(t: i64, k: i64) -> i64 {
     return 0
 }
 
-// fn 变参标志（p.6.2.4）：fn 类型 -> 0/1；非 fn 返回 0。
+// fn 变参标志：fn 类型 -> 0/1；非 fn 返回 0。
 pub func fn_has_var_of(t: i64) -> i64 {
     var idx = low(t)
     if idx >= 0 && idx < len(fn_has_var) {
@@ -427,7 +427,7 @@ pub func fn_param_of(t: i64, k: i64) -> i64 {
     return -1
 }
 
-// ---------- S2.4 port 对象类型构造 ----------
+// ---------- port 对象类型构造 ----------
 // port P：id = 11<<40 | port 索引（port 表行号，语义层登记顺序）。
 pub func port_of(idx: i64) -> i64 {
     return BASE_PORT + idx
@@ -474,7 +474,7 @@ pub func set_actor_name(idx: i64, nm: string) {
 
 // ---------- 三期 A 组 guard<cap> 凭据类型构造 ----------
 // guard<cap>：id = 13<<40 | 能力域索引（0=share 1=mem 2=ext 3=lock）。
-// r.1.6.7：新增 lock 域——能力面 = **绕过运行时表锁**（去锁访问），危害面 = 数据竞争。
+// 新增 lock 域——能力面 = **绕过运行时表锁**（去锁访问），危害面 = 数据竞争。
 // 与 share 域（跨 actor 共享内存）语义分开：share 管「共享出去」，lock 管「主动去锁」，
 // 审计清单据此可区分两种意图。trm/raw 目前只走 `#[unsafe.*]` 属性形态、无 guard 索引，
 // 故 3 不冲突；若将来它们需要 guard 域，索引顺延。
@@ -503,7 +503,7 @@ pub func guard_cap_index(name: string) -> i64 {
     return 0 - 1
 }
 
-// ---- 能力域**位集**（2026-10-01，为「域匹配」引入）----
+// ---- 能力域**位集**（为「域匹配」引入）----
 // 域匹配要判「当前作用域是否持有 X 域凭据」，而作用域可能同时持多域
 // （文件级授权可一次授权多域）⇒ 用位集比集合查询更直接。
 // 位序与 guard_cap_index 一致：0=share 1=mem 2=ext 3=lock 4=raw。
@@ -540,7 +540,7 @@ pub func cap_name_of_bit(b: i64) -> string {
 }
 
 // ---- 受门禁内建 → 所属能力域（2026-10-01「域匹配」的查表依据）----
-// 与 domain-classification.md 的承载表**逐项对应**；改归类时同步改这里。
+// 与 的承载表**逐项对应**；改归类时同步改这里。
 //   返回 0 = 该内建**不受门禁**（安全内置，不进清单）。
 // 归类的判据是「该操作一旦误用引发哪一种 UB」，不是「看起来是否底层」。
 pub func builtin_domain(fnm: string) -> i64 {
@@ -648,7 +648,7 @@ pub func kind(id: i64) -> i64 {
     if id >= BASE_VEC {
         return K_VEC
     }
-    // p.9.11 future 段（15<<40）高于 array 段，必须最先判
+    // future 段（15<<40）高于 array 段，必须最先判
     if id >= BASE_FUTURE {
         return K_FUTURE
     }
@@ -702,7 +702,7 @@ pub func low(id: i64) -> i64 {
     if id >= BASE_VEC {
         return id - BASE_VEC
     }
-    // p.9.11 future 段（15<<40）最高，必须最先判
+    // future 段（15<<40）最高，必须最先判
     if id >= BASE_FUTURE {
         return id - BASE_FUTURE
     }
@@ -904,7 +904,7 @@ pub func table_elem(t: i64) -> i64 {
     return -1
 }
 
-// ---------- S1.2 不安全类型判据 ----------
+// ---------- 不安全类型判据 ----------
 // ptr/slice/atomic 判据（kind 段判别）。
 pub func is_ptr(t: i64) -> bool {
     if kind(t) == K_PTR {
@@ -927,7 +927,7 @@ pub func is_atomic(t: i64) -> bool {
     return false
 }
 
-// 是否不安全类型（指针/切片/原子——安全代码不可见，S1.2 S1 全归 unsafe）
+// 是否不安全类型（指针/切片/原子——安全代码不可见，全归 unsafe）
 pub func is_unsafe_ty(t: i64) -> bool {
     var k = kind(t)
     if k == K_PTR || k == K_SLICE || k == K_ATOMIC {
@@ -1008,10 +1008,10 @@ func ensure_tykw_names() {
     table_push(tykw_names, "misc")
     table_push(tykw_names, "table")
     table_push(tykw_names, "map")
-    // 批次 2（i128/u128）：索引 21/22 对齐 TK_I128/TK_U128
+    // 索引 21/22 对齐 TK_I128/TK_U128
     table_push(tykw_names, "i128")
     table_push(tykw_names, "u128")
-    // P2b：索引 23 对齐 TK_ANY（异构表动态元素类型）
+    // 索引 23 对齐 TK_ANY（异构表动态元素类型）
     table_push(tykw_names, "any")
 }
 

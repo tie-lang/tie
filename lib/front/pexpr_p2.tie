@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/pexpr_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// lib/front/pexpr_p2.tie —— 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 pexpr.tie。
@@ -19,7 +19,7 @@ func parse_primary() -> i64 {
             if n2 == "get" {
                 return parse_guard_get(line, col)
             }
-            // r.1.6.7 `unsafe.revoke(g)` 凭据撤销（§11.6）：撤销后该凭据及其传递
+            // `unsafe.revoke(g)` 凭据撤销（§11.6）：撤销后该凭据及其传递
             // 派生出的凭据一并失效。
             if n2 == "revoke" {
                 return parse_guard_revoke(line, col)
@@ -30,27 +30,27 @@ func parse_primary() -> i64 {
         return -1
     }
     if tag == lex_asm {
-        // S1.2 I1：`asm!("template", in(reg) expr, out(reg) expr)` 内联汇编
+        // `asm!("template", in(reg) expr, out(reg) expr)` 内联汇编
         return parse_asm_expr(line, col)
     }
-    // S3.3 准引用字面量：`` `(expr) ``（表达式形式，立即解析）或
-    // `` `{ stmts } ``（块形式，块体延迟解析——与 S2.2 闭包体同机制）。
+    // 准引用字面量：`` `(expr) ``（表达式形式，立即解析）或
+    // `` `{ stmts } ``（块形式，块体延迟解析——与 闭包体同机制）。
     if tag == lex_backtick {
         return parse_quasi(line, col)
     }
-    // S3.3 插值表达式：`$x`（宏参数/变量嵌入）或 `$(expr)`（复杂表达式嵌入）。
+    // 插值表达式：`$x`（宏参数/变量嵌入）或 `$(expr)`（复杂表达式嵌入）。
     // 仅准引用内合法；普通代码出现由语义层对非宏上下文报错。
     if tag == lex_dollar {
         return parse_interp(line, col)
     }
-    // S2.2 闭包字面量 `func(x: i64) -> i64 { ... }`：解析函数头（参数/返回
+    // 闭包字面量 `func(x: i64) -> i64 { ... }`：解析函数头（参数/返回
     // 类型）+ 配平跳过函数体 + 延迟快照登记，函数体由 pstmt_flow.
     // parse_deferred_closures 在 parse_program 末尾恢复解析（语义层 N_FN_LIT
     // 推断已同步实现）。
     if tag == lex_func {
         return parse_fn_lit(line, col)
     }
-    // p.9.13.1 单箭头统一：match/switch 表达式：`switch <subject> { pat -> expr, _ -> expr }`。
+    // 单箭头统一：match/switch 表达式：`switch <subject> { pat -> expr, _ -> expr }`。
     // 表达式位模式匹配——分支体为表达式（见 pstmt_flow.parse_switch_expr）。
     // switch 为保留字 token，表达式位置出现即表达式分支式 switch。
     if tag == lex_switch {
@@ -75,23 +75,23 @@ func parse_primary() -> i64 {
             }
             return ast.new_node(N_TRIT_LIT, -1, tv, -1, line, col)
         }
-        // 批次 2：字面量值域限于 i64 可表示范围（parse_int_lit 返回 i64，
+        // 字面量值域限于 i64 可表示范围（parse_int_lit 返回 i64，
         // i128/u128 常量经 add i128 0, i64 构造，超范围回绕符号扩展错误）
         if putil.int_lit_overflow(lex) {
             putil.set_err(line, col, "整数字面量超出 i64 可表示范围")
             return -1
         }
         var v = putil.parse_int_lit(lex)
-        // S1.3 L3：aux = 后缀类型 TyKw（-1 = 无后缀，默认 i64）
+        // L3：aux = 后缀类型 TyKw（-1 = 无后缀，默认 i64）
         var sufx = putil.parse_lit_suffix(lex)
         putil.advance()
         return ast.new_node(N_INT_LIT, -1, v, sufx, line, col)
     }
     if tag == lex_float {
-        // S1.3 L3：剥离 f32/f64 后缀存纯数字文本（llvmgen 输出用），
+        // L3：剥离 f32/f64 后缀存纯数字文本（llvmgen 输出用），
         // aux = 后缀类型（无后缀 → f64，对齐现状 FloatLit 语义）
         var lex = putil.peek_lexeme()
-        // p.9.11.19：浮点字面量含 `_` 分隔符（1_000.5）→ 输出文本剥离 `_`
+        // 浮点字面量含 `_` 分隔符（1_000.5）→ 输出文本剥离 `_`
         var lid = interner.intern(putil.strip_underscores(putil.strip_lit_suffix(lex)))
         var sufx = putil.parse_lit_suffix(lex)
         if sufx < 0 {
@@ -103,7 +103,7 @@ func parse_primary() -> i64 {
     if tag == lex_str {
         var lid = interner.intern(putil.peek_lexeme())
         putil.advance()
-        // p.8.2.3 字符串插值：`"Hello, {name}!"` → 拼接链（lexer 在插值段后
+        // 字符串插值：`"Hello, {name}!"` → 拼接链（lexer 在插值段后
         // 产 STR + lex_interp_lbrace（插值专用 tag）+ expr + } + STR ... 序列；
         // 块/结构体开括号是 lex_lbrace，此处不误入）
         if putil.peek_tag() == lex_interp_lbrace {
@@ -168,9 +168,9 @@ func parse_primary() -> i64 {
                 }
             }
         }
-        // p.9.11.3 try 错误聚合块：`try { ... }`（try 非保留字，仅当紧跟 `{` 按
+        // try 错误聚合块：`try { ... }`（try 非保留字，仅当紧跟 `{` 按
         // try 块解析；否则落回 N_VAR/N_CALL 常规路径，规避用户变量名 try）。块体
-        // 为语句块——pexpr 位于 import 树底层无法解析语句，复用 S2.2 延迟闭包体
+        // 为语句块——pexpr 位于 import 树底层无法解析语句，复用 延迟闭包体
         // 快照机制（putil.defer_closure_push + 配平跳过 + skip_closure_body），
         // 块体由 pstmt_flow.parse_deferred_closures 末尾 parse_block 解析并回填为
         // N_TRY_BLOCK 的 children[0]（StmtList）。块内 `?` 传播点语义与块外一致
@@ -275,7 +275,7 @@ func parse_primary() -> i64 {
             ast.set_children(path, pkids)
             return path
         }
-        // 泛型调用/构造探测：`max<i64>(3, 5)` / `Box<i64>(42)`（2026-08-14）。
+        // 泛型调用/构造探测：`max<i64>(3, 5)` / `Box<i64>(42)`。
         // '<' 后是「完整类型实参列表 + '>' + '('」才按泛型处理，否则 '<' 是
         // 普通比较运算符（is_generic_call_ahead 内部 save/restore，不消费 token）。
         var targs = -1
@@ -312,8 +312,8 @@ func parse_primary() -> i64 {
     if tag == lex_lbracket {
         return parse_table_lit(line, col)
     }
-    // p.9.11.5 记录字面量 `{k: v}`：表达式起始位的 `{`。消歧判定表
-    //（写死规则，与 p.8.2.9 尾随闭包 / 语句块对 `{` 的消费逻辑正交）：
+    // 记录字面量 `{k: v}`：表达式起始位的 `{`。消歧判定表
+    //（写死规则，与 尾随闭包 / 语句块对 `{` 的消费逻辑正交）：
     //   `{` 之后的**首元素**：
     //     标识符/字符串字面量 + 紧跟 `:` → 记录字面量（键: 值 元素序列）；
     //     `}`（空）            → 空记录（语义 = 空表/空映射；表达式位 `{}`
@@ -376,7 +376,7 @@ func parse_paren_or_tuple(line: i64, col: i64) -> i64 {
     return ast.child_at(first, 0)
 }
 
-// ---------- p.9.11.5 记录字面量 ----------
+// ---------- 记录字面量 ----------
 // 记录字面量 `{k: v}`：`{` 已在表达式起始位判定为记录（见 parse_primary）。
 // 元素为「键: 值」对；键 = 标识符或字符串字面量，值 = 任意表达式；可嵌套
 // `{a: {b: 1}}`、可空 `{}`。
@@ -718,7 +718,7 @@ func parse_guard_get(line: i64, col: i64) -> i64 {
     if cap < 0 {
         return -1
     }
-    // 能力域白名单：share / mem / ext / lock（r.1.6.7 新增 lock = 绕过运行时表锁）
+    // 能力域白名单：share / mem / ext / lock（新增 lock = 绕过运行时表锁）
     var capname = interner.lookup(cap)
     if types.guard_cap_index(capname) < 0 {
         putil.set_err(putil.peek_line(), putil.peek_col(), "unsafe.get 的能力域必须是 share/mem/ext/lock，实际是 '" + capname + "'")
@@ -743,7 +743,7 @@ func parse_guard_get(line: i64, col: i64) -> i64 {
     return n
 }
 
-// r.1.6.7 `unsafe.revoke(g)` 凭据撤销表达式（§11.6）：
+// `unsafe.revoke(g)` 凭据撤销表达式（§11.6）：
 // unsafe → . → revoke → ( 凭据变量 )。
 // 产出 N_GUARD_REVOKE[children=[凭据表达式]]。实参须为 guard<cap> 变量
 // （语义层校验：类型 + 未失效）；撤销纯编译期生效，无运行时表示。

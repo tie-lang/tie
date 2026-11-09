@@ -1,10 +1,10 @@
 type tie<class>
-// lib/front/pstmt_flow_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/front/pstmt_flow_p1.tie —— 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 pstmt_flow.tie。
 namespace pstmt_flow {
-// S3.3 准引用块内函数定义：`func name(params) -> ret { body }`（宏生成函数）。
+// 准引用块内函数定义：`func name(params) -> ret { body }`（宏生成函数）。
 // 与顶层 parse_fn_def 同构的简化版（无 pub/unsafe/泛型/默认值参数）：
 // name/参数名支持 `$` 插值名（expect_ident_quasi——gensym 结果作函数名），
 // 产出 N_FN_DEF（name, val=0, aux=nparams, children=[泛型槽-1, 返回类型,
@@ -78,7 +78,7 @@ func parse_fn_def_in_block() -> i64 {
     return f
 }
 
-// `panic(expr)`：S2.3 不可恢复错误（消息为 string 表达式；可配置目标行为——
+// `panic(expr)`：不可恢复错误（消息为 string 表达式；可配置目标行为——
 // 桌面打印+退出 / 嵌入式 halt / wasm trap，语义层校验）。
 func parse_panic() -> i64 {
     var line = putil.peek_line()
@@ -245,12 +245,12 @@ func parse_guard_with() -> i64 {
     return n
 }
 
-// `if cond { } else { }` / else if 链；p.9.10.2 增加 `if let <pattern> = <expr> { }`
+// `if cond { } else { }` / else if 链；增加 `if let <pattern> = <expr> { }`
 // 解构条件（见 parse_if_let）。
 func parse_if() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
-    // p.9.10.2 if-let：`if let <pattern> = <expr> { then } [else { else }]`。
+    // if-let：`if let <pattern> = <expr> { then } [else { else }]`。
     // `let` 非保留字（lex_ident），此处按语境识别——`if` 后紧跟 `let` 即按
     // if-let 解析（纯糖，脱糖为现有 switch 语句）。先消费 `if`（parse_if_let
     // 游标停在 `let` 上，其内部再消费 `let`）。
@@ -301,7 +301,7 @@ func parse_if() -> i64 {
     return n
 }
 
-// p.9.10.2 `if let <pattern> = <expr> { then } [else { else }]` 解构条件。
+// `if let <pattern> = <expr> { then } [else { else }]` 解构条件。
 // 游标停在 `let` 上（parse_if 已确认后跟 `let`）。纯糖：脱糖为现有 switch 语句
 //   if let P = E { B } [else { EB }]  ≡  switch E { case P: B ; default: EB }
 // 复用语句位 switch 的模式/解构/守卫语义：匹配成功进入 then 块并把 P 解构出的
@@ -373,7 +373,7 @@ func parse_if_let(line: i64, col: i64) -> i64 {
     return n
 }
 
-// p.8.2.11 `guard <cond> else { stmts }` 早退语句。语法脱糖语义：
+// `guard <cond> else { stmts }` 早退语句。语法脱糖语义：
 //   guard c else { B } ≡ if not(c) { B }
 // 解析产出 N_GUARD_STMT[cond, else_list]（else 块必须跳转收尾由 scheck 校验，
 // irgen 按 if-not 发射）。游标停在 `guard` 上（调用方已验证后不跟 `<`/`=`）。
@@ -403,7 +403,7 @@ func parse_guard_else() -> i64 {
     return n
 }
 
-// p.9.11.4 `defer { stmts }` 资源释放语句。游标停在 `defer` 上（调用方已确认
+// `defer { stmts }` 资源释放语句。游标停在 `defer` 上（调用方已确认
 // 后跟 `{`）。产出 N_DEFER[children=[块 StmtList]]。defer 块内禁止 return/break/
 // continue/yield/goto/panic/嵌套 defer 由 scheck 校验（仅允许表达式语句与
 // 赋值/读作用域变量）。
@@ -422,7 +422,7 @@ func parse_defer() -> i64 {
     return n
 }
 
-// `while cond { }`（label 为循环标签，E5）
+// `while cond { }`（label 为循环标签，）
 func parse_while(label: i64) -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
@@ -445,7 +445,7 @@ func parse_while(label: i64) -> i64 {
     return n
 }
 
-// `for var in expr { }`（label 为循环标签，E5）
+// `for var in expr { }`（label 为循环标签，）
 func parse_for(label: i64) -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
@@ -453,7 +453,7 @@ func parse_for(label: i64) -> i64 {
     var var_id: i64 = -1
     var dest_names: table<i64> = table_new_i64()
     if putil.peek_tag() == lex_lparen {
-        // p.8.2.2 for..in 解构迭代：`for (a, b) in t` → desugar 为
+        // for..in 解构迭代：`for (a, b) in t` → desugar 为
         // `for _tmpN in t { var a = _tmpN.Item1; var b = _tmpN.Item2; body }`
         putil.advance()  // '('
         var dd = false
@@ -533,7 +533,7 @@ func parse_for(label: i64) -> i64 {
     return n
 }
 
-// 探测「循环标签前缀」：当前标识符 + 冒号 + while/for（E5）
+// 探测「循环标签前缀」：当前标识符 + 冒号 + while/for
 func is_loop_label_ahead() -> bool {
     if putil.peek_tag() != lex_ident {
         return false
@@ -551,7 +551,7 @@ func is_loop_label_ahead() -> bool {
     return false
 }
 
-// `L: while/for` 带标签循环（E5）
+// `L: while/for` 带标签循环
 func parse_labeled_loop() -> i64 {
     var label = putil.expect_ident()
     if label < 0 {
@@ -569,7 +569,7 @@ func parse_labeled_loop() -> i64 {
     return -1
 }
 
-// `break` / `continue`（可选标签 break L / continue L，E1+E5）
+// `break` / `continue`（可选标签 break L / continue L，）
 func parse_loop_jump(is_continue: bool) -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()

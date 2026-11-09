@@ -1,9 +1,9 @@
 type tie<class>
 // bytes.tie：标准库——字节表（动态 i64 表，元素 0..255）工具（命名空间 bytes），
 // 基于底座原语 byte_read / byte_write / byte_concat / bit_read / bit_write。
-// 接口（library-v2 §4.1）：表参数/返回全部标注元素类型 table<i64>。
+// 接口（§4.1）：表参数/返回全部标注元素类型 table<i64>。
 // 调用：import 后 bytes.read(path) / bytes.to_ascii(t)；命名空间内互调为裸调用。
-// 命名规范：命名空间内函数不加 bytes_ 前缀（统一 func 写法，Harbor M2.1.6）。
+// 命名规范：命名空间内函数不加 bytes_ 前缀（统一 func 写法，Harbor ）。
 // 命名说明：bit_read / bit_write 与底座原语同名——语义分析中**内置原语优先于
 // 用户函数**解析（sinfer.infer_call 先查 builtin_call），故函数体内裸调 bit_read
 // 命中的是底座原语而非自身，不构成递归；外部用限定调用 bytes.bit_read 命中本函数。
@@ -17,9 +17,9 @@ type tie<class>
 // （0..127），遇非 ASCII 码点返回空表。
 //
 // == 关于 read 的返回类型（历史限制说明，已放开）==
-// 设计文档 library-v2 §4.1 原定 `read(path) -> Result<table<i64>, string>`（失败
+// 设计说明 §4.1 原定 `read(path) -> Result<table<i64>, string>`（失败
 // 返回 Result.Err）。曾因 tiec 枚举 payload 白名单不支持 table 而退化为字节表
-// 哨兵；p.6.2.1 已放开 table 作 payload（见 _local_only/probes/tests/_p6_probe/enum_payload_lift.tie）。
+// 哨兵；已放开 table 作 payload（见 _local_only/probes/tests/_p6_probe/enum_payload_lift.tie）。
 // 本函数保持返回类型化 table<i64>（真表语义）的既有签名（API 稳定，不破坏
 // 调用方），错误信号退化为 byte_read 的编译器报错退出 + 文档约定。
 namespace bytes {
@@ -95,7 +95,7 @@ pub func from_ascii(s: string) -> table<i64> {
 }
 
 // ============================================================================
-// 增强（p.9.1.1.15）：二进制数组操作 —— slice/subset/append/fill/反序、按值
+// 增强：二进制数组操作 —— slice/subset/append/fill/反序、按值
 // 搜索/计数/替换、大小端 u16/u32/u64/f32/f64 读写、hex 字面量互转、base64
 // （字节表级，含原始二进制；与 std/encoding 的 ASCII base64 互补）。
 // 全部向后兼容：在既有 read/write/concat/bit_read/bit_write 上新增函数。

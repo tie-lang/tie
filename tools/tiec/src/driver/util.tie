@@ -1,7 +1,7 @@
 type tie<class>
 // compiler/driver/util.tie —— driver 文本/路径工具子模块
 
-// p.9.22.10 tinker：人读文本出口（--tink 时 stdout 让位帧流，文本改走 stderr；
+// tinker：人读文本出口（--tink 时 stdout 让位帧流，文本改走 stderr；
 // 非 tink 模式与 println 逐字节等价）。编译路径的 println 统一经此出口。
 // 常驻编译服务：g_svc_cap_on 时改为**按请求捕获**（帧内回传，客户端按请求配对，
 // 不依赖共享 stderr 的时序切分）。
@@ -19,16 +19,16 @@ pub func dbg_txt(s: string) {
     }
 }
 // ============================================================
-// 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
+// 从 driver.tie 拆出（方法库化：driver 编排薄壳）。
 // 拆分范式：同编译单元跨文件（文本内联）——本文件只含函数与注释，
 // 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
 // 风格 flat：顶层平铺函数。本组工具被同单元其他组件裸名依赖（实测
 // consteval.tie 等 12+ 处裸调 slice/trim/split_lines…），收进 ns 会切断
 // 这些调用；待语言层 L1 可见性梯度落地后再收敛进 driver ns。
-// ★ p.9.16.1：**纯文本工具已迁出**到 `frontend/textutil.tie`（find_char /
+// ★ ：**纯文本工具已迁出**到 `frontend/textutil.tie`（find_char /
 // has_prefix / slice / trim / split_char / split_lines / strip_type_header）。
 // 为什么迁：frontend 有 7 个纯文本工具是**裸名依赖**本文件的，但 frontend 树
-// 不能依赖 driver（p.9.21.1 依赖方向契约）——LSP（tsp）只编译 frontend 树，
+// 不能依赖 driver（依赖方向契约）——LSP（tsp）只编译 frontend 树，
 // 不编译 driver ⇒ 这些函数缺失，**LSP 根本编不出来**（实测 E00489）。
 // 迁到 frontend 后：frontend 自足，driver 侧经同编译单元仍可见（零调用点改动）。
 // 在 s 中查找子串 needle 首次出现位置（0 起字符索引）；未找到返回 -1。
@@ -121,7 +121,7 @@ pub func replace_ext(path: string, new_ext: string) -> string {
     if last_dot > 0 {
         base = tie.support::slice(path, 0, last_dot)
     }
-    // r.1.6.1：空后缀（Linux 可执行文件无扩展名）→ 返回去扩展名的基名，不带尾点
+    // 空后缀（Linux 可执行文件无扩展名）→ 返回去扩展名的基名，不带尾点
     if str_len(new_ext) == 0 {
         return base
     }

@@ -1,7 +1,7 @@
 type tie<class>
 // lib/front/sgen_inst.tie —— 模板实例化（展开器核心）分区
 // ============================================================
-// 里程碑：泛型单态化展开器（T3b）。从 sgen.tie 拆出的独立分区
+// 职责：泛型单态化展开器。从 sgen.tie 拆出的独立分区
 // （原「模板实例化（展开器核心）」区块），沿用 sinfer→sinfer_ret 先例。
 // 说明：与 sgen.tie 共用 namespace sgen 闭合并集，划分遵循同名 namespace
 // 跨文件先例。子文件与被 import 文件（sgen.tie）文本内联并入同一编译单元，
@@ -13,7 +13,7 @@ namespace sgen {
 
 // ==================== 模板实例化（展开器核心）====================
 
-// S2.4 泛型约束校验（静态分发，port-model.md §2.3）：模板 gti 的第 k 个类型
+// 泛型约束校验：模板 gti 的第 k 个类型
 // 参数带 port 约束（gtyp_cons 槽），实参 args[k]（K_STRUCT）必须已 impl 该
 // port——违反 = 编译错误「类型 X 未实现 port Y」。TypeVar 实参（嵌套泛型，
 // 如 Box<T> 里 T 未具体化）跳过——外层实例化时递归校验。约束引用的 port
@@ -48,7 +48,7 @@ pub func check_generic_constraints(gti: i64, args: table<i64>, line: i64, col: i
                 sm_err_line = line
                 sm_err_col = col
                 if sstate.port_is_iface(pi) {
-                    // p.9.11.21 interface 约束不满足：定位第一个违规方法
+                    // interface 约束不满足：定位第一个违规方法
                     var vio = stype.iface_first_violation(pi, at)
                     if vio >= 0 {
                         var vname = sstate.port_method_name(pi, vio)
@@ -80,7 +80,7 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
     if sig0 >= 0 {
         return sig0  // 已实例化（幂等）
     }
-    // S2.4 泛型约束校验（静态分发）：实参化时检查 T 的实参类型 impl 约束 port
+    // 泛型约束校验（静态分发）：实参化时检查 T 的实参类型 impl 约束 port
     //（漏 impl 的实参化 = 编译错误）。须在深度防御之前（校验不占递归深度）。
     if check_generic_constraints(gti, args, line, col) < 0 {
         return -1
@@ -119,7 +119,7 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
     var p_defs: table<i64> = table_new_i64()
     var p_vars: table<i64> = table_new_i64()
     var required: i64 = nparams
-    // p.8.1.3 变长泛型：变参（最后一个形参 ...T）不占必选位（对齐 collect_fn）
+    // 变长泛型：变参（最后一个形参 ...T）不占必选位（对齐 collect_fn）
     if nparams > 0 {
         var lastp0 = sstate.child(new_node, sstate.slot_off(new_node) + 1 + (nparams - 1))
         if s_aux[lastp0] == 1 {
@@ -143,7 +143,7 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
         if is_var == 1 {
             pt = types.table_of(pt)
         }
-        // ref 形参仅支持表/定长数组（对齐 collect_fn 校验；p.9.11.11 immut 存 bit1，掩码 & 1）
+        // ref 形参仅支持表/定长数组（对齐 collect_fn 校验；immut 存 bit1，掩码 & 1）
         if (s_vals[p] & 1) == 1 && !types.is_table(pt) && !types.is_array(pt) {
             g_inst_depth = g_inst_depth - 1
             sm_err_line = line
@@ -175,7 +175,7 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
         }
         k = k + 1
     }
-    // M2.1.8 自动 ref：命名空间前缀是（模板）struct 且首参是该 struct 类型 → 首参按引用。
+    // 自动 ref：命名空间前缀是（模板）struct 且首参是该 struct 类型 → 首参按引用。
     // 实例化方法（如 Box::get → Box$i64::get）前缀 "Box" 是模板 struct——首参 struct 类型 → ref。
     if nparams > 0 {
         var last2 = sstate.rfind_ns(mangled)
@@ -214,7 +214,7 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
     return sig
 }
 
-// p.8.2.6 默认类型参数兜底：实参表按模板参数序，若尾部缺省（显式实参/推断
+// 默认类型参数兜底：实参表按模板参数序，若尾部缺省（显式实参/推断
 // 都只给了前 k 个）则为缺失的末尾参数追加默认类型（未声明默认 → 报错）。
 // 返回补充后的 args（新表）；失败返回空表（sm_err_* 已置）。仅处理"尾部连续
 // 缺失"。优先级：显式 > 推断 > 默认（缺失才补默认）。
@@ -263,7 +263,7 @@ func fill_missing_defaults(gti: i64, args: table<i64>, line: i64, col: i64) -> t
 // 实例化 struct 模板 → struct 索引。幂等（st_keys 已命中直接返回）。
 pub func instantiate_struct(gti: i64, args: table<i64>) -> i64 {
     var full = intern.lookup(gty_full[gti])
-    // p.8.2.6 默认类型参数：实参少于形参时补尾部默认（如 Box<i64> 对
+    // 默认类型参数：实参少于形参时补尾部默认（如 Box<i64> 对
     // struct Box<T, U=string> → U 自动补 string）。补完后再 mangle/校验。
     args = fill_missing_defaults(gti, args, 1, 1)
     if len(args) == 0 && gtyp_nparams[gti] > 0 {
@@ -282,7 +282,7 @@ pub func instantiate_struct(gti: i64, args: table<i64>) -> i64 {
         sm_err_msg = "泛型 struct '" + full + "' 需要 " + to_string(n_tp) + " 个类型参数，实际 " + to_string(len(args)) + " 个"
         return -1
     }
-    // S2.4 泛型约束校验（静态分发）：struct 模板的约束实参化时同样检查
+    // 泛型约束校验（静态分发）：struct 模板的约束实参化时同样检查
     if check_generic_constraints(gti, args, 1, 1) < 0 {
         return -1
     }
@@ -307,7 +307,7 @@ pub func instantiate_struct(gti: i64, args: table<i64>) -> i64 {
         sm_err_col = 1
         return -1
     }
-    // p.9.21.6-1 模块边界显式化：实例化 struct 的来源模块 = 模板定义所在
+    // -1 模块边界显式化：实例化 struct 的来源模块 = 模板定义所在
     // 文件（node = gty_node[gti]；new_node 是合成节点无文件归属，不能反查）
     st_mod[si] = sstate.file_id_of_node(node)
     // 字段拍平（实例化 struct 无父；cls_done 置位 → collect_all_struct_fields 跳过）

@@ -1,10 +1,10 @@
 type tie<class, unsafe:mem>
-// ext/gfx/event.tie —— p.6.8.10 事件系统 E3 tie 封装（namespace ev）
-// EN: tie-side wrapper for the E3 event queue (mouse/keyboard with pos/keycode/
+// ext/gfx/event.tie —— 事件系统 tie 封装（namespace ev）
+// EN: tie-side wrapper for the event queue (mouse/keyboard with pos/keycode/
 // timestamp) + signal flags (namespace ev).
 //
 // 设计 / Design：
-//   * 本模块把 p.6.8.10 thunk（ext/gfx/win/win.cpp 追加的 E3 入口）直透为 namespace
+//   * 本模块把 thunk（ext/gfx/win/win.cpp 追加的 入口）直透为 namespace
 //     `ev` 的函数。C 端每窗口一个环形事件队列（容量 EVENT_CAP=256，满则丢最旧并置
 //     overflow 标志），事件结构 `{type, x, y, key, t_ms}`；WndProc 捕获 WM_MOUSEMOVE /
 //     WM_LBUTTONDOWN/UP / WM_RBUTTONDOWN/UP / WM_KEYDOWN/UP / WM_CHAR / WM_TIMER。
@@ -16,11 +16,11 @@ type tie<class, unsafe:mem>
 //   * 访问器 `ev.type/ev.x/ev.y/ev.key/ev.ts(flat, i)` 按事件序号 i 读平面记录的字段；
 //     `ev.count(flat)` 返回事件条数。
 //   * 事件类型常量以函数形式暴露（tie 命名空间跨模块只导出函数，不导出 var —— 见
-//     p.6.8.7 记录）：`ev.t_mouse_move()` / `ev.t_lbutton_down()` / `ev.t_lbutton_up()` /
+//     记录）：`ev.t_mouse_move` / `ev.t_lbutton_down` / `ev.t_lbutton_up` /
 //     `ev.t_rbutton_down()` / `ev.t_rbutton_up()` / `ev.t_key_down()` / `ev.t_key_up()` /
 //     `ev.t_timer()`。
 //   * 信号标志：`ev.timer_flag(hwnd)` 读取 WM_TIMER 信号并复位（一次性）；paint_pending
-//     语义沿用 p.6.8.9 `win.paint_pending`。`ev.overflow(hwnd)` 读溢出标志。
+//     语义沿用 `win.paint_pending`。`ev.overflow(hwnd)` 读溢出标志。
 //   * `ev.post(hwnd, msg, wparam, lparam)` 直绑 PostMessageW，供探针向自身窗口注入合成
 //     消息（确定性验证主路径）。`ev.set_timer(hwnd, ms)` 直绑 SetTimer 触发真实 WM_TIMER。
 //

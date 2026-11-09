@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/sinfer_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/front/sinfer_q1.tie —— 分片 1
 // ============================================================
 // 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sinfer.tie。
 // 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
@@ -92,7 +92,7 @@ pub func gb_find(nid: i64) -> i64 {
     return gb_vals[idx]
 }
 
-// p.9.12.4：全局查找带命名空间前缀补全（对齐 resolve_call_name 候选 2：
+// 全局查找带命名空间前缀补全（对齐 resolve_call_name 候选 2：
 // 裸名 → 当前命名空间逐级外层补全 "ns::name"）。返回实际命中键的池 id
 //（裸名命中返回原 nid；未命中 -1）。命名空间常量以全名登记 gb_*，函数体内
 // 裸名引用须经此前缀补全才能命中。
@@ -131,7 +131,7 @@ pub func gb_find_ns_key(nid: i64) -> i64 {
     return -1
 }
 
-// p.9.12.4：全局查找（裸名 + 命名空间前缀补全）→ 返回类型 id；-1 = 未声明
+// 全局查找（裸名 + 命名空间前缀补全）→ 返回类型 id；-1 = 未声明
 pub func gb_find_ns(nid: i64) -> i64 {
     var k = gb_find_ns_key(nid)
     if k < 0 {
@@ -194,7 +194,7 @@ pub func var_dyn(nid: i64) -> i64 {
     return 1
 }
 
-// p.8.1.5：Option<T> 形态判定 + payload 类型——枚举含 Some(T)（恰 1 字段）与
+// Option<T> 形态判定 + payload 类型——枚举含 Some(T)（恰 1 字段）与
 // None 变体 → 返回 T；否则 -1（非 Option）。en_* 变体表为 frontend 共享全局。
 pub func option_payload_ty(ty: i64) -> i64 {
     if types.kind(ty) != K_ENUM {
@@ -226,7 +226,7 @@ pub func option_payload_ty(ty: i64) -> i64 {
     return -1
 }
 
-// p.8.1.5：Option<T> 类型 id（Option 模板实例化，幂等；失败 -1）
+// Option<T> 类型 id（Option 模板实例化，幂等；失败 -1）
 pub func option_ty_of(t: i64) -> i64 {
     var gidx = sstate.gt_find("Option")
     if gidx < 0 {
@@ -309,10 +309,10 @@ pub func arg_table_elem_ty(a: i64) -> i64 {
     return -1
 }
 
-// ==================== 裸调用名解析（M2.1.7） ====================
+// ==================== 裸调用名解析 ====================
 // 候选 1：顶层裸名；候选 2：当前命名空间前缀补全（逐级外层）；
 // 候选 3：using 引入的命名空间。返回实际注册键（全名）。
-// T3b 泛型扩展：候选命中判定同时覆盖普通函数（fn_sig）与泛型模板（gt_find）
+// 泛型扩展：候选命中判定同时覆盖普通函数（fn_sig）与泛型模板（gt_find）
 // ——模板不进入 fn_keys，裸调用名解析须能定位到 gt_* 表。
 pub func resolve_call_name(name: string) -> string {
     var nid = intern.intern(name)
@@ -365,7 +365,7 @@ pub func resolve_call_name(name: string) -> string {
         if sstate.fn_sig(cand) >= 0 || sstate.gt_find(cand) >= 0 {
             return cand
         }
-        // 别名增名（2026-10-12）：using 记录的名称可能已被改名为别名——回退再试
+        // 别名增名：using 记录的名称可能已被改名为别名——回退再试
         var rn4 = sstate.ns_rename_target(full)
         if str_len(rn4) > 0 {
             var cand2 = rn4 + "::" + name

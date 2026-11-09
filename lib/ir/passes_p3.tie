@@ -7,11 +7,11 @@ type tie<class>
 // 同 len 提交、同 in-place 写；_nl 前提 = 原循环两条访问本就选了 _nl）。
 //
 // 两个形状（严格匹配，任一条件不满足即放弃，宁可少融合）：
-//   P1 拷贝段：while i < len(src) { table_push(dst, src[i]); i = i + 1 }
+//   拷贝段：while i < len(src) { table_push(dst, src[i]); i = i + 1 }
 //       守卫 icmp(load i_slot, len值)；体：at_nl(src,load i,out) → 越界检查 →
 //       push_nl(dst,读 out)；回边块含步进 +1。
 //       → tbl_append_tbl_nl(ptri(dst), ptri(src), len值)
-//   P2 零填充：while i < n { table_push(dst, 0); i = i + 1 }
+//   零填充：while i < n { table_push(dst, 0); i = i + 1 }
 //       体：push_nl(dst, const0)；回边即体。
 //       → tbl_append_zeros_nl(ptri(dst), n)
 //
@@ -20,7 +20,7 @@ type tie<class>
 //   * i_slot 全模块恰两处 store：初值 const 0（在 G 的前驱 P）+ 步进
 //     （load i +1）；G 的前驱 ⊆ {P, 回边块}；
 //   * B 的前驱恰为 {G}（防外部直入体）；
-//   * P1：体终结 = cond_br(检查, R, J)；J 含 push 且终 br G；R 区（R 可达块集 S）
+//   * ：体终结 = cond_br(检查, R, J)；J 含 push 且终 br G；R 区（R 可达块集 S）
 //     仅经 B(true) 进入、内部自洽（指向 S 的分支源 ∈ S∪{B}；指向 J 的源 ⊆
 //     {B}∪S）——改写把检查常量压断后 S 不可达；
 //   * at/push 均 _nl 入口且各恰一处；push 槽/out 槽各恰一处写（store ←读 out）/
@@ -31,15 +31,15 @@ type tie<class>
 //   * 元素类型门（types.kind）：拒深表（表/映射）/结构/枚举/函数/元组/any。
 //
 // 改写手法（零新增指令，全部就地手术）：
-//   * P1 复用 at 调用槽位：符号改 append；实参换 (ptri(dst), ptri(src), n值)
+//   * 复用 at 调用槽位：符号改 append；实参换 (ptri(dst), ptri(src), n值)
 //     （全 i64 ⇒ 类型操作数不动）；
-//   * P1 复用检查的 or 指令 → rewrite_to_const(0)：cond_br 恒走 J（"检查通过"）；
-//   * P2 复用 push 调用槽位：符号改 append_zeros；第 2 实参 = n（类型操作数
+//   * 复用检查的 or 指令 → rewrite_to_const(0)：cond_br 恒走 J（"检查通过"）；
+//   * 复用 push 调用槽位：符号改 append_zeros；第 2 实参 = n（类型操作数
 //     一并改为 i64——push 槽类型可能非 i64）；
 //   * 回边块/体的步进 store：值换成 n（循环变量收敛值）；终结 br 改指 E。
 //   * 删集合先"试探"，经全模块 use 校验（存活指令不得引用待删值）后才提交标记。
 //
-// 形状模式（r.1.7）：同一惯用法两套入口——`_nl`（unsafe:lock 已证，免锁）与
+// 形状模式：同一惯用法两套入口——`_nl`（unsafe:lock 已证，免锁）与
 // 带锁变体（安全代码，运行时一次加锁）。模式由体块内出现的 push 符号判定。
 // 未做（明确的 IR 约束，非遗漏）：
 //   * 常量填充（push 常量 K≠0 → repeat），需 3 参改写；pass 只能就地改操作数，
@@ -490,7 +490,7 @@ func af_body_push_mode(B: i64) -> i64 {
     return 0 - 1
 }
 
-// ---------- P2：零填充 / 常量填充 ----------
+// ---------- ：零填充 / 常量填充 ----------
 func af_try_p2(G: i64, E: i64, B: i64, iv_slot: i64, nv: i64, ref dead: table<bool>, locked: bool) -> i64 {
     var bt = ir.block_end(B) - 1
     if bt < ir.block_start(B) {
@@ -660,7 +660,7 @@ func af_try_p2(G: i64, E: i64, B: i64, iv_slot: i64, nv: i64, ref dead: table<bo
     return 1
 }
 
-// ---------- P1：拷贝段 ----------
+// ---------- ：拷贝段 ----------
 func af_try_p1(G: i64, E: i64, B: i64, iv_slot: i64, nv: i64, ref dead: table<bool>, locked: bool) -> i64 {
     var bt = ir.block_end(B) - 1
     if bt < ir.block_start(B) {

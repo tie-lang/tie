@@ -1,17 +1,17 @@
 type tie<class, unsafe:mem>
-// core/gc/gc_tri.tie —— trm-lite 复杂形态 GC（p.6.5.3 并发三色 / p.6.5.4 分代 + 整理）
+// core/gc/gc_tri.tie —— trm-lite 复杂形态 GC（并发三色 / 分代 + 整理）
 // 托管堆模型（tie 可表达的扁平对象图，对象 id 即下标）：
 //   对象表 g_o_size/g_o_alive/g_o_color/g_o_age（并行 table<i64>；age 分代）
 //   边表   g_e_from/g_e_to/g_e_alive（from→to 引用，alive=生效）
-//   根表   g_c_roots（保守根：显式 add_root；精确栈图 p.6.5.6 前任务 env 内引用
+//   根表 g_c_roots（保守根：显式 add_root；精确栈图 前任务 env 内引用
 //          经写屏障维持不变量，sweep 仅无任务窗口执行）
 //   记集   g_c_rs（remembered set：老年代→新生代 引用目标，minor 种子）
 //   三色   0=白 1=灰 2=黑
-// 分代（p.6.5.4）：
+// 分代：
 //   · 新生代 age<TG_AGE_T，老年代 age>=TG_AGE_T
 //   · minor（半代）：重置 young 白 + 老黑；种子 = 全根 + rs；标记；sweep 只回收
 //     young 白；存活 young age++（达阈值晋升）。老年代不被 young sweep。
-//   · major：全量三色回收（同 p.6.5.3）+ **mark-compact**：存活对象按 id 升序
+//   · major：全量三色回收（同 ）+ **mark-compact**：存活对象按 id 升序
 //     重排到表前段（old→new 重映射），重写边表/根表；回收槽压缩。
 // 并发模型：独立 GC 锁 g_gc_cs；后台回收器（bg_step）做 minor + 与 worker 真并发；
 // major 显式调用（ctx_gc_major / gc_collect_sync）。sweep 仅无任务窗口。
@@ -192,7 +192,7 @@ pub func drop_ref(from: i64, k: i64) {
 }
 
 // 登记回收根（保守根；去重）。cycle 进行中与新根 → 置灰压栈（根写屏障，
-// p.6.5.3：防晚到根 white 被 young sweep 误收）。
+// 防晚到根 white 被 young sweep 误收）。
 pub func add_root(id: i64) {
     ensure()
     if id < 0 || id >= len(g_o_alive) {
@@ -351,7 +351,7 @@ pub func mark_done_view() -> i64 {
 // 标记栈：g_stack 为 table（append 语义，历史元素不删除），g_sp = 栈尾索引
 // （空栈 = -1）。push 后索引 = len-1；pop 读 g_stack[g_sp] 并递减。
 // （曾用 g_sp 做元素计数 + g_stack[g_sp-1] pop：table append 后新旧元素错位，
-//   重复 pop 到旧根，多级对象停留 gray 不标黑——p.6.5.3 直连形态误通过。）
+//   重复 pop 到旧根，多级对象停留 gray 不标黑——直连形态误通过。）
 func step_locked() -> i64 {
     if mark_empty() {
         return 0

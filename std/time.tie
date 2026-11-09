@@ -1,6 +1,6 @@
 type tie<class>
 // time.tie：标准库——时间/计时工具（命名空间 time），基于底座原语
-// time_now 实现 + p.9.1.1.20 新增单调高分辨率时钟（libc GetTickCount）。
+// time_now 实现 + 新增单调高分辨率时钟（libc GetTickCount）。
 //
 // 底座原语语义（对齐 crates/tie-interp/src/lib.rs tie_time_now）：
 // - time_now() 返回 **Unix 纪元秒**（SystemTime 距 1970-01-01 的整秒数，i64）。
@@ -11,9 +11,9 @@ type tie<class>
 //
 // 计时用途：tick_start() 记录起点到模块级全局变量 t_tick_start（秒），
 // tick_ms() 返回起点到当前经过的毫秒数。t_tick_start 是顶层持久变量
-// （T0.4 全局变量机制，编译期映射为 IR 全局槽），跨函数共享。
+// （全局变量机制，编译期映射为 IR 全局槽），跨函数共享。
 //
-// p.9.1.1.20 单调高分辨率时钟：
+// 单调高分辨率时钟：
 // - 墙钟 time_now/now() 是挂钟时间（Unix 纪元秒），可能因系统校时/闰秒**回跳**
 //   （非单调），且精度仅到秒——不适合测量代码耗时。
 // - 单调时钟 mono_ms() 走 libc GetTickCount（kernel32，自系统启动起的**单调**
@@ -28,7 +28,7 @@ type tie<class>
 //
 // 调用：import 后 time.now() / time.tick_start() / time.tick_ms() / ...
 //        以及 time.mono_ms() / time.mono_start() / time.mono_elapsed_ms()。
-// 命名规范：命名空间内函数不加 time_；pub func 显式导出（Harbor M2.1.7）。
+// 命名规范：命名空间内函数不加 time_；pub func 显式导出（Harbor ）。
 
 // 墙钟计时起点（Unix 纪元秒，time_now 单位）。0 = 尚未 tick_start。
 var t_tick_start: i64 = 0;
@@ -77,12 +77,12 @@ pub func seconds(s: i64) -> i64 {
 }
 
 // ====================================================================
-// p.9.1.1.20 单调高分辨率时钟（GetTickCount 包装）
+// 单调高分辨率时钟（GetTickCount 包装）
 // ====================================================================
 
 // 单调毫秒：自系统启动起的毫秒数（libc GetTickCount，DWORD 32 位）。**单调**，
 // 绝不因校时/闰秒回退，用于耗时测量。与 now()（墙钟秒，可回跳）正交。
-// 外层命名对应里程碑语法的 time_mono_ms()；命名空间内裸名 mono_ms()。
+// 外层命名对应早期语法的 time_mono_ms()；命名空间内裸名 mono_ms()。
 pub func mono_ms() -> i64 {
     unsafe {
         return GetTickCount()
@@ -96,7 +96,7 @@ pub func mono_start() {
 }
 
 // 自 mono_start() 记录时刻起的单调毫秒数 = mono_ms() - t_mono_start。
-// 外层命名对应里程碑语法的 time_elapsed_ms()；命名空间内裸名 mono_elapsed_ms()。
+// 外层命名对应早期语法的 time_elapsed_ms()；命名空间内裸名 mono_elapsed_ms()。
 // 未调用 mono_start()（t_mono_start 仍为 0）时返回自系统启动起的毫秒数——
 // 使用约定：先 mono_start() 再 mono_elapsed_ms()。
 pub func mono_elapsed_ms() -> i64 {

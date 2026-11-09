@@ -1,8 +1,8 @@
 type tie<class>
-// lib/ir/pass/passmanager.tie —— 自举 v2 T2.3：AnalysisManager
+// lib/ir/pass/passmanager.tie —— ：AnalysisManager
 // ============================================================
-// 里程碑：自举 v2 计划 T2.3 Pass 基础设施（LLVM new pass manager 借鉴，
-// 用户决策：不做简化）。本模块 = pass 管线核心：
+// 职责：Pass 基础设施（LLVM new pass manager 借鉴，
+// 不做简化）。本模块 = pass 管线核心：
 //   1. AnalysisManager：分析结果缓存（analysis_id -> 结果 id）+
 //      脏标记（analysis_dirty 0/1）+ 依赖者集合（analysis_dependents，
 //      嵌套段：off/cnt + 扁平段）——惰性计算 + 失效追踪传播；
@@ -14,7 +14,7 @@ type tie<class>
 // # 惰性计算（对齐 LLVM AnalysisManager::getResult）
 //   get_analysis(analysis_id, ir_unit)：
 //     - 缓存命中（cache >= 0 且不 dirty）→ 直接返回，不重算；
-//     - 否则经 passes.dispatch_pass（C1 字符串分派表）调用该分析的
+//     - 否则经 passes.dispatch_pass（字符串分派表）调用该分析的
 //       compute_* 函数 → 缓存结果 + 清脏 → 返回。计算计数 +1
 //       （pm_calc_cnt，测试断言「首次计算、二次命中缓存」的依据）。
 //
@@ -24,7 +24,7 @@ type tie<class>
 //   下次 get_analysis 重算。dependents 由 sync() 从注册表重建：
 //   对每个分析 pass B，其声明的每个依赖 D → dependents[D] += B。
 //
-// # 注册表强制（本任务验收点之一）
+// # 注册表强制（管线不变量之一）
 //   begin_pass(pass_id) 置执行上下文（pm_cur_pass = pass_id + 1；
 //   0 = 无上下文，直接调用 get_analysis 放行——测试惰性/失效用）。
 //   上下文内 get_analysis(aid) 先检查 aid 在该 pass 声明的 deps 中，
@@ -40,9 +40,9 @@ type tie<class>
 // 调用：import 后 pm.init() / pm.get_analysis(...) / pm.run_pipeline(...)
 // 命名规范：命名空间内函数不加 pm_ 前缀；内部工具私有（非 pub）。
 //
-// p.9.1.2/p.9.1.3 并发预留：当前 run_pass/run_pipeline 为**串行**执行。
+// 并发预留：当前 run_pass/run_pipeline 为**串行**执行。
 // 并发度配置槽 = config advanced.threads（--jobs <N>）已注册，但 pass 级并行
-// 与增量缓存一并留待 p.9.1.3（编译缓存）后落地——届时对独立 pass/独立文件
+// 与增量缓存一并落地——届时对独立 pass/独立文件
 // 做 `--jobs N` 并行调度，本模块 run_pipeline 即为并行入口的挂接点。
 
 import "./pass_registry.tie"
@@ -233,10 +233,10 @@ func pass_in_deps(pass_id: i64, analysis_id: i64) -> bool {
 // 取分析结果（LLVM getAnalysis<T> 的 tie 版）：
 //   1. 执行上下文内先做注册表强制（越权 → 内部错误 + 返回 -1）；
 //   2. 缓存命中（cache >= 0 且不脏）→ 直接返回（不重算）；
-//   3. 否则经 passes.dispatch_pass（C1 分派）调用 compute_* →
+//   3. 否则经 passes.dispatch_pass（分派）调用 compute_* →
 //      缓存结果 + 清脏 + 计算计数 +1 → 返回。
 // 分析 id 即 pass id（注册表行号）；ir_unit 当前为占位（单模块
-// IR 全局表，传 0；T2.8 多模块时传模块句柄）。
+// IR 全局表，传 0；多模块时传模块句柄）。
 pub func get_analysis(analysis_id: i64, ir_unit: i64) -> i64 {
     sync()
     if analysis_id < 0 {
@@ -261,7 +261,7 @@ pub func get_analysis(analysis_id: i64, ir_unit: i64) -> i64 {
             return pm_analysis_cache[analysis_id]
         }
     }
-    // 真算：C1 分派到 compute_xxx
+    // 真算：分派到 compute_xxx
     var nm = passreg.pass_name_of(analysis_id)
     var r = passes.dispatch_pass(nm, ir_unit)
     if r < 0 {
@@ -304,7 +304,7 @@ pub func invalidate(analysis_id: i64) {
 //   1. 校验类别（只允许转换 pass）；
 //   2. 建执行上下文（注册表强制生效）；
 //   3. 自动满足全部声明依赖（get_analysis，惰性/缓存命中皆可）；
-//   4. 经 C1 分派执行转换（run_*）；
+//   4. 经 分派执行转换（run_*）；
 //   5. 置执行标志 + 退出上下文；
 //   6. 按 pass_inv 声明失效对应分析（后续 get_analysis 重算）。
 // 任一步失败：置内部错误标记并返回 -1。

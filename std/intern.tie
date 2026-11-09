@@ -1,5 +1,5 @@
 type tie<class>
-// intern.tie：标准库——字符串池（intern，命名空间 intern，自举 T0.6）
+// intern.tie：标准库——字符串池（intern，命名空间 intern，自举 ）
 // 作用：把字符串登记为稳定整数 id（相同串返回相同 id），供编译器符号表把
 // O(len) 字符串比较降为 O(1) 整数比较（阶段 2 compiler/lib/interner.tie 消费，
 // AST 名字字段存池 id——B1 列式设计依赖）。
@@ -136,7 +136,7 @@ pub func intern(s: string) -> i64 {
     bucket_init()
     var h = hash_str(s)
     var i = h % intern_bcnt
-    // 线性探测：非空槽逐个确认；空槽 = 未登记（r.1.1.8：字节级比较，
+    // 线性探测：非空槽逐个确认；空槽 = 未登记（字节级比较，
     // 不再用 strcmp 语义的 `==`）
     while intern_bucket[i] != 0 {
         var k = intern_bucket[i] - 1
@@ -177,7 +177,7 @@ pub func interned_len() -> i64 {
     return len(intern_pool)
 }
 
-// p.9.16.1 内存工程：把池回退到**空始态**（长驻进程——LSP——的内存回收入口）。
+// 内存工程：把池回退到**空始态**（长驻进程——LSP——的内存回收入口）。
 // 清空 id→串池 / 正查键值表 / 哈希桶 / 桶数；此后新登记从 id 0 重新分配。
 //
 // ⚠ 约定（调用方必须遵守）：调用后先前取得的**任何 id 全部失效**。故调用点只在

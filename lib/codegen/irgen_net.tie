@@ -1,14 +1,14 @@
 type tie<class>
 // lib/codegen/irgen_net.tie —— 生成器 L3：TCP/解析辅助（wsa_init、net_resolve、net_tcp_*）
 // ============================================================
-// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 自 irgen_expr.tie 按域拆出。
 // 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
 // 顶层全局 var 与 import 树留在 irgen.tie 主文件。
 namespace irgen {
-// ==================== p.6.4.5 网络原语内联（Winsock2 直调，去 Rust 桥） ====================
+// ==================== 网络原语内联（Winsock2 直调，去 Rust 桥） ====================
 // 一次性 WSAStartup：模块级 @g_wsock_init 全局（i64）标志，首调初始化并置 1，
 // 后续幂等跳过。LPWSADATA 传 408 字节 raw 缓冲（WSAStartup 填充后即丢弃）。
-// r.1.6.4：Linux 分支直接返回——POSIX socket 免初始化，无需 wsock 全局。
+// Linux 分支直接返回——POSIX socket 免初始化，无需 wsock 全局。
 func tig_wsa_init() {
     if tig_is_linux() {
         return
@@ -51,7 +51,7 @@ func tig_wsa_init() {
     g_cur_block = bDo
 }
 // 构建 16 字节 sockaddr_in（小端写入）：sin_family=AF_INET(2)、
-// sin_port=htons(port)（高字节先）、sin_addr.s_addr=网络序 u32（saddr 为 I32
+// sin_port=htons(port)（高字节先）、sin_addr.s_addr=网络序 u32（saddr 为 
 // 值，小端存 4 字节即线上字节序）、sin_zero 清零。返回 raw 缓冲指针。
 func tig_wsa_addr(pt: i64, saddr: i64) -> i64 {
     var T64 = types.named(TK_I64)
@@ -69,7 +69,7 @@ func tig_wsa_addr(pt: i64, saddr: i64) -> i64 {
     return sa
 }
 // socket(AF_INET, stype, 0) → 句柄(i64)；stype=1 TCP(SOCK_STREAM)/2 UDP(SOCK_DGRAM)。
-// r.1.6.4：Linux 分支——POSIX socket() 返回 int fd（sext 到 i64 槽，-1 失败）。
+// Linux 分支——POSIX socket() 返回 int fd（sext 到 i64 槽，-1 失败）。
 func tig_net_socket(stype: i64) -> i64 {
     var I32 = types.named(TK_I32)
     if tig_is_linux() {
@@ -139,7 +139,7 @@ func tig_net_resolve(host: i64) -> i64 {
 }
 // ---- TCP ----
 // net_tcp_listen(port) -> i64：socket(STREAM)+bind(0.0.0.0:port)+listen(8)
-// r.1.6.4：Linux 分支——fd 为 POSIX int（bind/listen 传 I32、关闭 close）。
+// Linux 分支——fd 为 POSIX int（bind/listen 传 、关闭 close）。
 func tig_net_tcp_listen(pt: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -259,7 +259,7 @@ func tig_net_tcp_listen(pt: i64) -> i64 {
     return s21_load(svv, T64)
 }
 // net_tcp_accept(h) -> i64：accept → 连接句柄（失败 -1）
-// r.1.6.4：Linux 分支——POSIX accept() 返回 int（sext 到 i64 槽，-1 失败）。
+// Linux 分支——POSIX accept() 返回 int（sext 到 i64 槽，-1 失败）。
 func tig_net_tcp_accept(h: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -284,7 +284,7 @@ func tig_net_tcp_accept(h: i64) -> i64 {
     return tig_ext_call_typed("accept", ats, avs, T64)  // SOCKET（-1 即失败）
 }
 // net_tcp_connect(host, port) -> i64：socket(STREAM)+resolve+connect
-// r.1.6.4：Linux 分支——connect 的 fd 参数传 I32、失败关闭 close。
+// Linux 分支——connect 的 fd 参数传 、失败关闭 close。
 func tig_net_tcp_connect(host: i64, pt: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -394,7 +394,7 @@ func tig_net_tcp_connect(host: i64, pt: i64) -> i64 {
     return s21_load(svv, T64)
 }
 // net_tcp_send(h, data:串) -> i64：send 按 UTF-8 字节发送（到串数据指针）
-// r.1.6.4：Linux 分支——send 的 fd 参数传 I32（同一行参语义）。
+// Linux 分支——send 的 fd 参数传 （同一行参语义）。
 func tig_net_tcp_send(h: i64, data: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -422,7 +422,7 @@ func tig_net_tcp_send(h: i64, data: i64) -> i64 {
     return tig_sext(r, I32, T64)
 }
 // net_tcp_recv(h, max) -> string（仅 ASCII 安全；二进制请用 recv_bytes）
-// r.1.6.4：Linux 分支——recv 的 fd 参数传 I32（返回语义同 Windows）。
+// Linux 分支——recv 的 fd 参数传 （返回语义同 Windows）。
 func tig_net_tcp_recv(h: i64, max: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -455,9 +455,9 @@ func tig_net_tcp_recv(h: i64, max: i64) -> i64 {
     var nr = tig_select_i(rgt0, r64, tig_int_lit(0), T64)  // <0/0 → 空串哨兵
     return tig_bytes_to_tie(buf, nr)
 }
-// ---- 字节版（p.6.6.1 TLS 用）----
+// ---- 字节版（TLS 用）----
 // net_tcp_send_bytes(h, data:表<i64>) -> i64：逐元素取低字节拼字节缓冲后 send
-// r.1.6.4：Linux 分支——fd 参数传 I32（字节拼装循环逻辑复用同构）。
+// Linux 分支——fd 参数传 （字节拼装循环逻辑复用同构）。
 func tig_net_tcp_send_bytes(h: i64, data: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -546,7 +546,7 @@ func tig_net_tcp_send_bytes(h: i64, data: i64) -> i64 {
 }
 // net_tcp_recv_bytes(h, max) -> 表<i64>：recv 原始字节 → 逐字节装入 i64 元素表
 //    （cap=max, len=实收, data=8×max 元素缓冲, esz=8——仿 tig_byte_read 表格式）
-// r.1.6.4：Linux 分支——recv 的 fd 参数传 I32（表格式构建同 Windows）。
+// Linux 分支——recv 的 fd 参数传 （表格式构建同 Windows）。
 func tig_net_tcp_recv_bytes(h: i64, max: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -633,7 +633,7 @@ func tig_net_tcp_recv_bytes(h: i64, max: i64) -> i64 {
     return tig_fill_table(edata, max, nr)
 }
 // net_close(h) -> bool：closesocket 返回 0 = 成功
-// r.1.6.4：Linux 分支——close(int) 回收 fd（返回 0 = 成功）。
+// Linux 分支——close(int) 回收 fd（返回 0 = 成功）。
 func tig_net_close(h: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)

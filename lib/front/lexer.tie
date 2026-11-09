@@ -1,12 +1,12 @@
 type tie<class>
-// lib/front/lexer.tie —— 自举 v2 T2.4：完整词法器（模块拆分后主入口）
+// lib/front/lexer.tie —— ：完整词法器（模块拆分后主入口）
 // ============================================================
-// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）。由 T1.1 原型
+// 说明：实现源自早期原型，
 // compiler/proto/lexer.tie 升版（16/16 文件 token 已验证一致），行为基准
 // Rust crates/tie-frontend/src/lexer.rs（错误消息逐字对齐）。相比原型：
 // 错误消息走 ./errors.tie 数据表；符号扫描改 **46 条升序符号表 + 二分**
 // （3→2→1 最长匹配）；新增 **doc 注释保留**（/// 行 / /** 块）。
-// # 模块拆分（2026-08-11）：原 845 行单文件按「无环 import 树」拆为 5 模块——
+// # 模块拆分：原 845 行单文件按「无环 import 树」拆为 5 模块——
 //   lex_state.tie（共享全局）/ lex_symtab.tie（关键字符号表）/
 //   lex_tokdefs.tie（tag 常量+列式表+ASI）/ lex_scan.tie（扫描器）/
 //   本文件（主循环 run_lex + 协议 tokenize + 错误对外接口）。
@@ -21,10 +21,10 @@ type tie<class>
 //   doc_keys/doc_vals）；EOF 未 flush 丢弃；/**/ 空闭合按普通块注释；
 //   doc 不产 token、不影响 ASI 与错误。
 // # ASI：行尾自动补分号；行尾二元运算符/逗号/冒号/点/开括号/大括号/分号/
-//   else/in 不补（++/-- 不算二元运算符，后缀 i++ 行尾应补；S2.3 起 '?' 后缀
+//   else/in 不补（++/-- 不算二元运算符，后缀 i++ 行尾应补； '?' 后缀
 //   解包符同样不算，行尾 `expr ?` 应补分号断句）。
 //
-// # pub 方法全集（组件契约，p.9.21 G7 库资格①；增删须同步此处与 ROAD）
+// # pub 方法全集
 //   扫描入口：run_lex(src) -> bool（true = 成功，token 表含末尾 Eof）
 //   协议输出：tokenize(src) -> string（首行 <N>: 逐 token 协议；出错为 ERR 协议）
 //   token 读取：token_count token_tag token_line token_col
@@ -80,7 +80,7 @@ pub func dump_docs() -> string {
 
 // ---------- 核心词法扫描 ----------
 // 核心词法扫描：源文本 → 列式 token 表（含 Eof；不产生协议文本）。
-// 供 tokenize 与 T2.5 parser 直接消费；出错置全局错误槽，返回 false。
+// 供 tokenize 与 parser 直接消费；出错置全局错误槽，返回 false。
 pub func run_lex(src: string) -> bool {
     lexsym.ensure_kw()
     lexsym.ensure_sym()
@@ -109,8 +109,8 @@ pub func run_lex(src: string) -> bool {
     lextok.build_line_starts()
     var pos: i64 = 0
     while pos < g_n {
-        // p.8.2.3 插值 `}` 后：续扫字符串段（无开引号，scan_string 内部按
-        // g_str_interp==2 处理）；p.9.11.30 三引号插值续段走 scan_triple_string
+        // 插值 `}` 后：续扫字符串段（无开引号，scan_string 内部按
+        // g_str_interp==2 处理）；三引号插值续段走 scan_triple_string
         if g_str_interp == 2 {
             var r2: i64 = 0
             if g_str_triple == 1 {
@@ -154,7 +154,7 @@ pub func run_lex(src: string) -> bool {
             }
             r = lexscan.scan_symbol(pos)   // '\' 后非换行 → 无法识别的字符
         } else if c == 104 && pos + 1 < g_n && g_codes[pos + 1] == 34 {
-            // p.9.23.1（规范 §1.9）：h 紧跟引号 = 插值字符串。h 非保留字，
+            // （规范 §1.9）：h 紧跟引号 = 插值字符串。h 非保留字，
             // 仅在此位置特殊识别（h(x)/hx 等仍走标识符）。普通串花括号一律
             // 字面，插值显式开启：h"{expr}"、多行 h"""..."""（同带插值）；
             // h 串内字面花括号写作 {{ / }}；h 与形态前缀 r 不组合。
@@ -183,7 +183,7 @@ pub func run_lex(src: string) -> bool {
         if r < 0 {
             return false
         }
-        // p.8.2.3：插值模式中遇 `}`（lex_rbrace）→ 标记续扫（下一 token 走
+        // 插值模式中遇 `}`（lex_rbrace）→ 标记续扫（下一 token 走
         // 字符串段续扫）。表达式内的 `}`（块/表字面量）不存在——tie 表用 `[`，
         // `{` 不是表达式起始，插值表达式内不可能出现顶层 `}`，判定无歧义。
         if g_str_interp == 1 && lextok.token_tag(lextok.token_count() - 1) == lex_rbrace {
@@ -199,7 +199,7 @@ pub func run_lex(src: string) -> bool {
 
 // ---------- 协议输出 ----------
 // 协议文本：首行 <N>:（N = 含 Eof 的 token 总数），随后每行 tag line col
-// lexeme_id；词法错误返回 ERR:<line> <col> <message>（T1.2 协议）。
+// lexeme_id；词法错误返回 ERR:<line> <col> <message>（协议）。
 pub func tokenize(src: string) -> string {
     var ok = run_lex(src)
     if !ok {

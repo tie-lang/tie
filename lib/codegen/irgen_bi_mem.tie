@@ -1,12 +1,12 @@
 type tie<class>
-// lib/codegen/irgen_bi_mem.tie —— 内置生成器：unsafe 指针/内存（S1.2）
+// lib/codegen/irgen_bi_mem.tie —— 内置生成器：unsafe 指针/内存
 // ============================================================
-// 自 irgen_expr.tie 的 builtin_expr 拆出（p.9.21.2 两步制①）。
+// 自 irgen_expr.tie 的 builtin_expr 拆出。
 // 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
 // 顶层全局 var 与 import 树留在 irgen.tie 主文件。
 namespace irgen {
-// S1.2 unsafe 指针/内存内置
-// 内置 `addr_of`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `addr_of`
 pub func bi_addr_of(nm: string, id: i64) -> i64 {
 if nm == "addr_of" {
     // addr_of(x) → 变量槽地址（ptr<变量类型>）；非变量表达式 → 求值落
@@ -40,8 +40,8 @@ if nm == "addr_of" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `addr_of_field`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `addr_of_field`
 pub func bi_addr_of_field(nm: string, id: i64) -> i64 {
 if nm == "addr_of_field" {
     // addr_of_field(obj, "field") → 聚合字段地址（agg_gep）。
@@ -98,8 +98,8 @@ if nm == "addr_of_field" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `deref`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `deref`
 pub func bi_deref(nm: string, id: i64) -> i64 {
 if nm == "deref" {
     // deref(p) → load 元素类型
@@ -120,8 +120,8 @@ if nm == "deref" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `deref_write`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `deref_write`
 pub func bi_deref_write(nm: string, id: i64) -> i64 {
 if nm == "deref_write" {
     // deref_write(p, v) → store 元素类型
@@ -156,11 +156,11 @@ if nm == "deref_write" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `volatile_load`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `volatile_load`
 pub func bi_volatile_load(nm: string, id: i64) -> i64 {
 if nm == "volatile_load" {
-    // volatile_load(p) → load volatile 元素类型（任务15：MMIO/硬件寄存器读，
+    // volatile_load(p) → load volatile 元素类型（MMIO/硬件寄存器读，
     // 发射 volatile 标志——LLVM 保证不被优化删除/合并/重排）。
     var p = tig_expr(call_arg(id, 0))
     if p < 0 {
@@ -179,11 +179,11 @@ if nm == "volatile_load" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `volatile_store`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `volatile_store`
 pub func bi_volatile_store(nm: string, id: i64) -> i64 {
 if nm == "volatile_store" {
-    // volatile_store(p, v) → store volatile 元素类型（任务15：MMIO/硬件寄存器写，
+    // volatile_store(p, v) → store volatile 元素类型（MMIO/硬件寄存器写，
     // volatile 标志禁止优化删除/重排/合并）。
     var p = tig_expr(call_arg(id, 0))
     if p < 0 {
@@ -282,9 +282,9 @@ pub func bi_mmio_write(nm: string, id: i64) -> i64 {
     return 1
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `is_null`（p.9.21.2 两步制①：自 builtin_expr 提取）
-// r.1.6.15 `share(x)`：**恒等传递**——值不变，效果在**绑定处**（目标变量登记为
+// unsafe 指针/内存内置
+// 内置 `is_null`
+// `share(x)`：**恒等传递**——值不变，效果在**绑定处**（目标变量登记为
 // 「显式共享」⇒ 写路径跳过 COW）。这是值语义的逃生舱：需要零拷贝就地改、且能
 // 自行证明并发安全时用它。危险面由域门禁（unsafe 上下文 + share 凭据）承担。
 pub func bi_share(nm: string, id: i64) -> i64 {
@@ -315,8 +315,8 @@ if nm == "is_null" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `ptr_add`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `ptr_add`
 pub func bi_ptr_add(nm: string, id: i64) -> i64 {
 if nm == "ptr_add" {
     // ptr_add(p, n) → p + n 元素步长（gep 单索引）
@@ -342,8 +342,8 @@ if nm == "ptr_add" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `ptr_to_int`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `ptr_to_int`
 pub func bi_ptr_to_int(nm: string, id: i64) -> i64 {
 if nm == "ptr_to_int" {
     // ptr_to_int(p) → ptrtoint i64
@@ -358,8 +358,8 @@ if nm == "ptr_to_int" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `int_to_ptr`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `int_to_ptr`
 pub func bi_int_to_ptr(nm: string, id: i64) -> i64 {
 if nm == "int_to_ptr" {
     // int_to_ptr(i) → inttoptr ptr（字节指针 ptr<u8>）
@@ -374,8 +374,8 @@ if nm == "int_to_ptr" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `alloc`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `alloc`
 pub func bi_alloc(nm: string, id: i64) -> i64 {
 if nm == "alloc" {
     // alloc(n) → 原始字节缓冲（ptr<u8>，LLVM ptr 直传）。
@@ -394,8 +394,8 @@ if nm == "alloc" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `free`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `free`
 pub func bi_free(nm: string, id: i64) -> i64 {
 if nm == "free" {
     // free(p) → libc free
@@ -409,8 +409,8 @@ if nm == "free" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `memcpy`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `memcpy`
 pub func bi_memcpy(nm: string, id: i64) -> i64 {
 if nm == "memcpy" {
     // memcpy(dst, src, n) → libc @memcpy(ptr, ptr, i64)
@@ -443,8 +443,8 @@ if nm == "memcpy" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `memset`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `memset`
 pub func bi_memset(nm: string, id: i64) -> i64 {
 if nm == "memset" {
     // memset(p, val, n) → libc @memset(ptr, i8, i64)
@@ -475,18 +475,18 @@ if nm == "memset" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `slice_of`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `slice_of`
 pub func bi_slice_of(nm: string, id: i64) -> i64 {
 if nm == "slice_of" {
     // slice_of(obj, start, len) → slice<元素类型> 聚合：指针 + 长度。
     // 字符串路径：数据指针直接 + len（第一版）。
-    // 动态表路径（任务16）：表 → 连续内存切片——alloc 连续缓冲 + 逐元素
+    // 动态表路径：表 → 连续内存切片——alloc 连续缓冲 + 逐元素
     // tie_table_at_* 拷贝（全 .tie，无新增 Rust 桥；运行时表数据区在桥内）。
     var arr = call_arg(id, 0)
     var at2 = ast.node_type(arr)
     if types.is_table(at2) {
-        // ---------- 动态表 → 连续内存切片（任务16）----------
+        // ---------- 动态表 → 连续内存切片----------
         // 元素类型：table_elem（typed table<T>）→ var_table_elem（table_new_i64
         // 等语义登记，裸 table 无元素信息）→ i64 兜底。
         var etab: i64 = types.named(TK_I64)
@@ -645,8 +645,8 @@ if nm == "slice_of" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `slice_len`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `slice_len`
 pub func bi_slice_len(nm: string, id: i64) -> i64 {
 if nm == "slice_len" {
     var s = tig_expr(call_arg(id, 0))
@@ -658,8 +658,8 @@ if nm == "slice_len" {
 }
 }
 
-// S1.2 unsafe 指针/内存内置
-// 内置 `slice_index`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// unsafe 指针/内存内置
+// 内置 `slice_index`
 pub func bi_slice_index(nm: string, id: i64) -> i64 {
 if nm == "slice_index" {
     // slice_index(s, i) → s[i]：gep 元素步长 + load

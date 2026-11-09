@@ -1,12 +1,12 @@
 type tie<class>
-// lib/ir/tieir_ser.tie —— S3.2：tieir 序列化模块（.tir 二进制格式）
+// lib/ir/tieir_ser.tie —— ：tieir 序列化模块（.tir 二进制格式）
 // ============================================================
-// 里程碑：库/包模型 S3.2（docs/plans/tieir-format.md S3 + package-model.md L2）。
+// 职责：库/包模型。
 // 把当前编译单元的 IR 本体（ir.tie 列式表）+ 元信息侧表（ir_meta.tie）序列化
 // 为**二进制 .tir 分发格式**（段 1-7），并可反序列化回内存结构（roundtrip）、
-// 输出可读摘要（dump）、计算内容哈希（P5c 签名载体）。
+// 输出可读摘要（dump）、计算内容哈希（签名载体）。
 //
-// # 段布局（对齐 tieir-format.md §2.1）
+// # 段布局
 //   段 1 魔数 + 格式版本    "TIEIR" + i64 版本（=1）
 //   段 2 模块头             包名/版本/IR 版本/编译器版本/依赖图（名+版本）
 //   段 3 字符串池           interner 池 0..len 全量（id 即下标，重建后 id 一致）
@@ -15,7 +15,7 @@ type tie<class>
 //   段 6 导出表             export_table 各列（name/sig/line/col）
 //   段 7 span 段            inst_span 各列（file/line/col）
 //
-// # 编码约定（对齐 tieir-format.md §4「定宽 i64 编码，varint 后置」）
+// # 编码约定
 //   - i64 一律定宽 8 字节大端（(v >> (56-8k)) & 0xFF，回绕式位移重建位模式）；
 //   - 字符串 = 长度(i64) + 逐码点(i64)（char_code 编码 / str_from_code 还原，
 //     支持任意 Unicode；字符串池 id 为进程内句柄，序列化必须还原文本——见
@@ -25,11 +25,11 @@ type tie<class>
 //     按「参数先于指令」的创建顺序自然复现（new_func 领参数值、new_inst 领
 //     结果值，单调递增），偏移一致性是 roundtrip 校验项而非重建依赖。
 //
-// # 校验（对齐 tieir-format.md §7：IR 语法校验防损坏/伪造）
+// # 校验
 //   - 魔数/版本不匹配、段号乱序、段体越界、列长不匹配（如符号表六列行数
 //     不一致）、字符串长度越界 → 报错返回 -1（安装/加载失败安全底线）。
 //
-// # 哈希（P5c 签名载体）
+// # 哈希（签名载体）
 //   - tieir.hash_bytes：对段 2-7 字节区间的 FNV-1a 32 位哈希（自实现字节版，
 //     std/crypto 的 fnv1a 只收字符串——字节表须逐字节哈希，非可打印字节
 //     经 to_ascii 会丢失，不可复用）。
@@ -43,7 +43,7 @@ type tie<class>
 // 调用：import 后 tieir.serialize() / tieir.write(path) / tieir.read(path) /
 // tieir.dump_text() / tieir.hash_bytes(t, from, to) / tieir.err_msg()
 //
-// # pub 方法全集（组件契约，p.9.21 G7 库资格①；增删须同步此处与 ROAD）
+// # pub 方法全集
 //   序列化：serialize() -> table<i64>（当前模块 → 字节表，段 1 魔数 / 2 版本 /
 //     3-7 元信息与列式段）content_hash() -> i64（段 2-7 FNV-1a 32）
 //     hash_bytes(t, from, to) -> i64（任意字节区间哈希）
@@ -65,9 +65,9 @@ pub const TIEIR_MAGIC1: i64 = 73;    // 'I'
 pub const TIEIR_MAGIC2: i64 = 69;    // 'E'
 pub const TIEIR_MAGIC3: i64 = 73;    // 'I'
 pub const TIEIR_MAGIC4: i64 = 82;    // 'R'
-// 格式版本（V3 迁移转换器触发条件）。v2（p.9.20）：模块头新增 t 轴档位与
+// 格式版本（V3 迁移转换器触发条件）。v2：模块头新增 t 轴档位与
 // pass 管道版本两个 i64——旧版读新版会错位，故 bump 并由版本校验拦截。
-// v3（p.9.22.8）：尾部新增**段 8 语义符号表**（可选，由调用方经 set_sec8
+// v3：尾部新增**段 8 语义符号表**（可选，由调用方经 set_sec8
 // 注入；无注入 = 与 v2 同构的字节流）；读侧放宽——段号大于已知最大段的段按
 // 「段号 + 段长」整体跳过（前向兼容路径），v2 文件仍可读。
 const TIEIR_VERSION: i64 = 3;
@@ -81,7 +81,7 @@ const SEC_SEMSYS: i64 = 8;       // 段号：语义符号表（p.9.22.8，可选
 
 // ---------- 全局状态 ----------
 pub var tieir_out: table<i64>;       // 序列化输出字节表
-// p.9.22.8 段 8 注入（模块边界纪律：本模块不 import driver/dbgem——调用方
+// 段 8 注入（模块边界纪律：本模块不 import driver/dbgem——调用方
 // （driver 经 dbgem）先构建列组字节，再经 set_sec8 注入「段头 + 段体」完整
 // 字节；空 = 不写段 8。同 tieir_slice.set_fn_mods 注入先例。）
 var sec8_tail: table<i64>;
@@ -285,7 +285,7 @@ pub func serialize() -> table<i64> {
     wr_str(tieir_out, pool_str(ir_meta.get_pkg_version()))
     wr_i64(tieir_out, ir_meta.get_ir_version())
     wr_str(tieir_out, pool_str(ir_meta.get_compiler_version()))
-    // p.9.20：t 轴档位 + pass 管道版本（单元头可自证复现条件；格式版本 2 起）
+    // t 轴档位 + pass 管道版本（单元头可自证复现条件；格式版本 2 起）
     wr_i64(tieir_out, ir_meta.get_tie_opt())
     wr_i64(tieir_out, ir_meta.get_pass_ver())
     wr_i64(tieir_out, ir_meta.dep_count())
@@ -356,11 +356,11 @@ pub func serialize() -> table<i64> {
     }
     // 指令表（操作数段交织：每操作数 = 值 + kind；每条指令前写所属块 id——
     // 反序列化时块区间尚未重建，归属须显式携带）。
-    // p.9.21.10：块归属改**归属表**（每块回填自己的区间 → O(ni)）——原单向
+    // 块归属改**归属表**（每块回填自己的区间 → O(ni)）——原单向
     // 游标在「块表序 ≠ 指令 id 序」（irgen 乱序建块，区间不交叠但乱序）时
     // 会越过目标块再也回不来，其后所有指令的 own 全部写成越界值
     //（driver 实测 663730/663974 条 own==block_count）。
-    // p.9.21.11 §5.1：归属逻辑统一到 ir.blk_attr_fill（区间回填、表序后者
+    // §5.1：归属逻辑统一到 ir.blk_attr_fill（区间回填、表序后者
     // 覆盖——与原内联回填逐位一致；空 sel 表 = 全部块参与）。
     var blk_of: table<i64> = ir.blk_attr_fill(ir.inst_count(), table_new_i64())
     wr_i64(tieir_out, ir.inst_count())
@@ -498,7 +498,7 @@ pub func deserialize(t: table<i64>) -> i64 {
     // 复位目标结构（本体 + 侧表配套）
     ir.new_module()
     ir_meta.reset_meta()
-    // p.9.22.8：段 8 读侧状态复位（无段 8 的 v2 文件读到 0 列）
+    // 段 8 读侧状态复位（无段 8 的 v2 文件读到 0 列）
     tieir_ss_n = 0
     tieir_ss_fno = table_new_i64()
     tieir_ss_kind = table_new_i64()
@@ -513,7 +513,7 @@ pub func deserialize(t: table<i64>) -> i64 {
     var pkg_ver = rd_str(t)
     var ir_ver = rd_i64(t)
     var comp_ver = rd_str(t)
-    // p.9.20：t 轴档位 + pass 管道版本（格式版本 2 起存在）
+    // t 轴档位 + pass 管道版本（格式版本 2 起存在）
     var tie_opt = rd_i64(t)
     var pass_ver = rd_i64(t)
     var dep_n = rd_i64(t)
@@ -554,7 +554,7 @@ pub func deserialize(t: table<i64>) -> i64 {
         return -1
     }
     var pi2: i64 = 0
-    // 池 id 重映射（p.9.21.8）：pool_remap[文件 id] = 进程 id。全量池单元
+    // 池 id 重映射：pool_remap[文件 id] = 进程 id。全量池单元
     //（serialize 主路径）重建序 = 原 id → 恒等；压缩池片段（write_mod_slice）
     // 重建经 str_pool 幂等 intern → 文件 id 与进程 id 脱钩，段 4/5/6 池引用
     // 统一经 pool_remap_id 转换。
@@ -609,7 +609,7 @@ pub func deserialize(t: table<i64>) -> i64 {
         return -1
     }
     var fi2: i64 = 0
-    // p.9.21.7（D1）：文件布局 = 原模块交错序（每函数 [参数][指令操作数]），
+    // 文件布局 = 原模块交错序（每函数 [参数][指令操作数]），
     // fpo/ops_off 是原布局位置——**不能**与重建自然偏移（函数表先建 → 参数
     // 0..P-1 连续）比对。原布局一致性改由指令段的函数边界 fpo 连续性校验
     //（见下方 inst 循环）；此处仅记录 + 基础边界检查。
@@ -690,7 +690,7 @@ pub func deserialize(t: table<i64>) -> i64 {
         bi2 = bi2 + 1
     }
     // 指令表（操作数交织：值 + kind）。
-    // p.9.21.7（D1）值空间重映射：文件值 id = 原模块交错创建序（函数边界处
+    // 值空间重映射：文件值 id = 原模块交错创建序（函数边界处
     // 参数领号、结果随指令领号）；重建模块函数表先建 → 参数 0..P-1、结果
     // P.. 顺序领号。remap[原 id] = 重建 id；文件内部一致性由
     // ①结果值连续性（ivl == next_orig）②函数边界 fpo 连续性 双校验保证。
@@ -809,7 +809,7 @@ pub func deserialize(t: table<i64>) -> i64 {
             if tieir_err != "" {
                 return -1
             }
-            // 池载荷判定（p.9.21.8）：kind 3 = 全局名；kind 0 的操作数①且
+            // 池载荷判定：kind 3 = 全局名；kind 0 的操作数①且
             // opcode ∈ {const_str(62), const_f(51), call(35), extern_call(36),
             // call_vararg(41)} = 池 id 载荷（与 llvmgen collect_strings/
             // collect_externs 清单对齐）——经池重映射，不做值重映射。
@@ -922,7 +922,7 @@ pub func deserialize(t: table<i64>) -> i64 {
         spi2 = spi2 + 1
     }
     tieir_pos = tieir_sec_end
-    // ---- 尾部段循环（p.9.22.8）：段 8 = 语义符号表；未知段（段号 > 已知
+    // ---- 尾部段循环：段 8 = 语义符号表；未知段（段号 > 已知
     // 最大段）按「段号 + 段长」整体跳过——前向兼容路径，防尾随垃圾仍成立
     // （跳过必须严格落在段体末尾且不越界）。
     while tieir_pos < n {
@@ -1007,7 +1007,7 @@ pub func read(path: string) -> i64 {
     return deserialize(t)
 }
 
-// ---------- dump（可读摘要，对齐 tieir-format.md §2.2 dump 工具） ----------
+// ---------- dump ----------
 
 // 输出当前状态的可读摘要文本（序列化或反序列化后均可调用）。
 pub func dump_text() -> string {
@@ -1063,10 +1063,10 @@ pub func dump_text() -> string {
     return s
 }
 
-// ---------- 内容哈希（P5c 签名载体；段 2-7 字节区间） ----------
+// ---------- 内容哈希（签名载体；段 2-7 字节区间） ----------
 
 // 对字节表 [from, to) 区间计算 FNV-1a 32 位哈希（自实现字节版；
-// 段 1 不计——对齐 tieir-format.md §7「内容哈希：对段 2-7 计算」）。
+// 段 1 不计——对齐 §7「内容哈希：对段 2-7 计算」）。
 // 返回 32 位无符号值（0..0xFFFFFFFF）。
 pub func hash_bytes(t: table<i64>, from: i64, to: i64) -> i64 {
     var h: i64 = 2166136261   // FNV offset basis（32 位）

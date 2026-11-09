@@ -5,7 +5,7 @@ type tie<class>
 // 按码点索引，中文等多字节字符（UTF-8 一个汉字 3 字节）下 len 的字节数会放大
 // 边界导致 trim/slice 等错位（尾随空白无法去除、子串匹配错位）。表元素数仍用 len。
 // 调用：import 后 str.trim(...) / str.split(...)；命名空间内互调为裸调用
-// 命名规范：命名空间内函数不加 str_ 前缀（统一 func 写法，Harbor M2.1.6）
+// 命名规范：命名空间内函数不加 str_ 前缀（统一 func 写法，Harbor ）
 
 namespace str {
 // 判断单字符字符串是否为空白字符（空格、制表符、换行、回车）
@@ -105,7 +105,7 @@ pub func slice(s: string, start: i64, end: i64) -> string {
 }
 
 // 字节级子串定位（内部）：返回子串首次出现的**字节偏移**；未找到 -1。
-// ★ 性能（2026-10-18）：旧实现用 str_char 逐码点比较，而 str_char 是 O(偏移)
+// ★ 性能：旧实现用 str_char 逐码点比较，而 str_char 是 O(偏移)
 //   的（UTF-8 码点索引要从头扫）⇒ 整体 O(n²·m)。实测对 73KB 源码做 7 字节
 //   子串搜索需 63 秒（tiec 的 prelude 前置判定走 str.find），把「顶层函数数 ~
 //   编译时间」拖成平方关系。改为 str_byte（O(1) 字节访问）后为 O(n·m)。
@@ -344,7 +344,7 @@ pub func to_lower(s: string) -> string {
 
 // 把字符串表 items 的元素用 sep 连接成一个字符串；空表返回空串。
 // 约定：items 是字符串动态表（table<string>），与 split 的输出互逆。
-// library-v2：表参数标注元素类型 table<string>（类型化约定）。
+// 接口说明：表参数标注元素类型 table<string>（类型化约定）。
 pub func join(items: table<string>, sep: string) -> string {
     // 性能重写（O(total)）：旧 out + items[i] 逐段全量拷贝是 O(n²)——
     // 万行文本 join 实测秒级。StringBuilder 原地追加替代。
@@ -381,14 +381,14 @@ pub func repeat(s: string, n: i64) -> string {
     return sb_build(sb)
 }
 
-// 深拷贝字符串（S1.5 移动语义配套）：返回 s 的独立副本。
+// 深拷贝字符串（移动语义配套）：返回 s 的独立副本。
 // 实现复用字符串拼接 s + ""（irgen 生成 str_cat 指令 = malloc+memcpy 新缓冲），
 // 保证 clone 结果与源完全独立，后续修改互不影响（无需引用计数）。
 // 语义：clone 调用处实参**借用**（smove 特判不移动源），
-// 与移动语义的"复制需显式 clone"配套（docs/plans/ui-framework.md §4.2 + roadmap §S1.5）。
+// 与移动语义的"复制需显式 clone"配套。
 // 注：此为标准库过渡实现（纯 tie，零共享文件改动）；后续可升格为语言内置
 // （sbuiltin 注册 + irgen 直接生成），行为等价。
-// library-v2：删除 copy（与 clone 重复），一语义一名不保留别名。
+// 接口说明：删除 copy（与 clone 重复），一语义一名不保留别名。
 pub func clone(s: string) -> string {
     return s + ""
 }

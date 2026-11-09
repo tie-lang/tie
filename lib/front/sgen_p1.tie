@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/sgen_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/front/sgen_p1.tie —— 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 sgen.tie。
@@ -23,7 +23,7 @@ func type_seg(t: i64) -> string {
     return out
 }
 
-// 类型实参后缀：`$T1$T2...`（空表返回 ""）
+// 类型实参后缀：`$$...`（空表返回 ""）
 func mangle_suffix(args: table<i64>) -> string {
     var out: string = ""
     var k: i64 = 0
@@ -98,7 +98,7 @@ func find_tp(tp_names: table<i64>, nm: string) -> i64 {
 // 具体值（-1-编码还原）——实例化后类型检查不再需要值环境。
 func clone_inner(node: i64, tp_names: table<i64>, kinds: table<i64>, args: table<i64>) -> i64 {
     var tag = s_tags[node]
-    // N_CASE_BIND（case 解构绑定，p.8.1.2 泛型函数）：children[1] 是**变量名池 id**
+    // N_CASE_BIND（case 解构绑定，泛型函数）：children[1] 是**变量名池 id**
     //（非 AST 节点——parser 直接把 intern id 塞进 children），不能递归克隆（会把
     // 池 id 当节点 id 越界读 s_tags）；children[0] 变体引用照常递归。
     if tag == N_CASE_BIND {
@@ -193,7 +193,7 @@ func clone_inner(node: i64, tp_names: table<i64>, kinds: table<i64>, args: table
                 return type_node_from_id(types.struct_of(si))
             }
             if gidx >= 0 && gty_is_struct[gidx] == 2 {
-                // p.8.1.2 泛型 enum 模板形参（`r: Result<T,E>` 克隆后实参已具体化）：
+                // 泛型 enum 模板形参（`r: Result<T,E>` 克隆后实参已具体化）：
                 // 与 struct 模板同款——当场实例化并替换整个节点。此前漏处理导致
                 // instantiate_fn 走 stype.parse_type_node 报「类型 'Result' 未定义」
                 // （stype 只查 st_keys/en_keys 具体实例，不认模板名 + N_TYPE_ARGS）。
@@ -469,7 +469,7 @@ func bind_tp(tpi: i64, arg_ty: i64, bk: ref table<i64>, bv: ref table<i64>, call
     return 0
 }
 
-// 按模板参数顺序收尾 args。未绑定参数：p.8.2.6 若有默认类型参数则自动代入
+// 按模板参数顺序收尾 args。未绑定参数：若有默认类型参数则自动代入
 // 默认，否则报"无法推断"。优先级：显式实参 > 推断绑定 > 默认类型参数。
 func finish_args(gti: i64, tp_names: table<i64>, bk: table<i64>, bv: table<i64>, call_id: i64) -> table<i64> {
     var kinds = sstate.gt_param_kinds(gti)
@@ -515,7 +515,7 @@ func finish_args(gti: i64, tp_names: table<i64>, bk: table<i64>, bv: table<i64>,
             b2 = b2 + 1
         }
         if found < 0 {
-            // p.8.2.6 默认类型参数：未推断且带默认 → 自动代入默认（解析为类型 id）。
+            // 默认类型参数：未推断且带默认 → 自动代入默认（解析为类型 id）。
             // 默认类型可为简单类型（i64/string/any）或模板 struct 引用（如
             // Box<i64>，parse_generic_type_node 会实例化）；跨参数引用（引用
             // 其他类型参数的默认）在此解析为未登记类型 → 报"无法推断"。

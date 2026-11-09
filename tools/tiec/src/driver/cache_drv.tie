@@ -1,7 +1,7 @@
 type tie<class>
 // compiler/driver/cache_drv.tie —— driver 依赖感知缓存子模块
 // ============================================================
-// 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
+// 从 driver.tie 拆出（方法库化：driver 编排薄壳）。
 // 拆分范式：同编译单元跨文件（文本内联）——本文件只含函数与注释，
 // 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
 // 风格 ns：函数在 `namespace driver` 内，一律 pub（driver 库 API 面）；
@@ -40,8 +40,8 @@ pub func dep_depset() -> table<string> {
     return out
 }
 
-// 单文件指纹（p.9.15.1 暂用 str_hash 对照；tsha1r 内联实现待定）
-// p.9.15.1：**本次编译的源码集指纹** —— 全部模块的**内容指纹**排序后取哈希。
+// 单文件指纹（暂用 str_hash 对照；tsha1r 内联实现待定）
+// **本次编译的源码集指纹** —— 全部模块的**内容指纹**排序后取哈希。
 // 只取指纹、**不取路径** ⇒ 与调用目录/路径写法无关（同一源码集在任何 cwd 下同值）；
 // 排序 ⇒ 与遍历序无关（今日铁律：摘要/编号只依赖内容，不依赖遍历序）。
 // 用途：由 driver 烘进产物，充当「编译器自身身份」（见 g_tiec_build_stamp）。
@@ -73,7 +73,7 @@ pub func source_set_stamp() -> string {
     return g_src_stamp
 }
 
-// p.9.15.1：把「本次源码集指纹」烘进产物的 `g_tiec_build_stamp` 全局初值。
+// 把「本次源码集指纹」烘进产物的 `g_tiec_build_stamp` 全局初值。
 // 仅当该全局存在时执行（即**正在编译 tiec 自身**）⇒ 用户程序零成本、产物零影响。
 // 调用点须在 irgen **之后**（全局已登记）、emit **之前**（初值尚可覆写）。
 pub func bake_build_stamp() {
@@ -82,7 +82,7 @@ pub func bake_build_stamp() {
     }
 }
 
-// p.9.15.1：**编译器自身身份**（参与全部缓存键）。
+// **编译器自身身份**（参与全部缓存键）。
 // 非空构建戳 ⇒ 「源码集指纹 + 手工盐」；空 ⇒ 退回手工盐并**响亮报告**
 //（不静默：静默退回会让「以为自动了、其实没有」长期潜伏）。
 pub func compiler_ident() -> string {
@@ -147,7 +147,7 @@ pub func dep_cache_key() -> string {
         i = i + 1
     }
     // 输出相关参数（对齐旧 cache_key_str：双轴优化档/目标/角色/shared/emit/fastmath/bounds + 盐）
-    // p.9.20：优化键拆 L（LLVM/clang 轴）+ M（tiec 中端轴）——键变化 = 缓存一次性全失效
+    // 优化键拆 L（LLVM/clang 轴）+ M（tiec 中端轴）——键变化 = 缓存一次性全失效
     var level = effective_llvm_opt()
     var topt = effective_tie_opt()
     var copt = effective_clang_opt()
@@ -183,8 +183,8 @@ pub func dep_cache_key() -> string {
     } else {
         m = m + "\nQ0"
     }
-    // 检查恒开（规范 8.5 不可关闭）⇒ 缓存键固定 C1。保留该标记是有意的：
-    // 旧缓存写的是 C0，标记不同即自动失效，不会误命中「无检查」的旧产物。
+    // 检查恒开（规范 8.5 不可关闭）⇒ 缓存键固定。保留该标记是有意的：
+    // 旧缓存写的是，标记不同即自动失效，不会误命中「无检查」的旧产物。
     m = m + "\nC1"
     // 条件编译特性集合决定 #cfg 裁剪结果，必须进键；两处逐字段对齐。
     m = m + "\nFT" + g_features
@@ -245,7 +245,7 @@ pub func dep_manifest_ok(ck: string) -> bool {
     return true
 }
 
-// p.9.15.4：**进程私有的中间产物前缀**。
+// **进程私有的中间产物前缀**。
 // 为何要私有：`.ll`/`.opt.ll` 原先叫 `<输出>.ll`、`<输出>.opt.ll`，**就写在用户输出旁边**
 // ⇒ 同一输出路径的两个并发编译互相踩：一方写而另一方在读（实测「写 IR 文件失败」）、
 // 一方清理时删掉另一方正在用的 `.opt.ll`（实测 `no such file: …opt.ll`）。
@@ -284,7 +284,7 @@ pub func ir_priv_prefix(base: string) -> string {
     return base
 }
 
-// p.9.15.4：本进程的中间产物路径（`.ll` / `.opt.ll`）。惰性算一次。
+// 本进程的中间产物路径（`.ll` / `.opt.ll`）。惰性算一次。
 // ★ `--emit-ir` 时**不私有化**：那时 `.ll` 就是**交付物**，必须落在用户指定路径。
 // ★ 单一出处：全 driver 只此一处算这两个路径（原先 kpass_emit / kpass_link 各算一份）。
 pub func ir_paths_init() {
@@ -324,7 +324,7 @@ pub func ir_prefix() -> string {
     return g_ir_prefix_g
 }
 
-// p.9.15.4：清理私有中间产物；`--keep-ir` 时先把它们**拷回**用户可见的名字。
+// 清理私有中间产物；`--keep-ir` 时先把它们**拷回**用户可见的名字。
 // 旧行为是「不删」＝留在 `<输出>.ll`；私有化后必须显式拷回，否则 --keep-ir 形同失效。
 pub func cleanup_ir() {
     var irp = ir_path()
@@ -350,7 +350,7 @@ pub func cleanup_ir() {
     }
 }
 
-// p.9.15.4：**发布最终产物**（私有中转件 → 用户路径）。**必须替换目标**。
+// **发布最终产物**（私有中转件 → 用户路径）。**必须替换目标**。
 // ① 链接器直接写用户路径时，两个并发编译会在链接器层面互锁同一文件
 //    （实测 `LNK1104: 无法打开文件 xxx.exe`）；② 被中断的链接会在用户路径
 //    留下**半写的 exe**。⇒ 先链到私有中转名，再改名发布。
@@ -397,7 +397,7 @@ pub func publish_artifact(tmp: string, dst: string) -> bool {
     return false
 }
 
-// p.9.15.3：**缓存发布的临时名** —— `dst + ".tmp"`，**故意不做进程唯一**。
+// **缓存发布的临时名** —— `dst + ".tmp"`，**故意不做进程唯一**。
 // ⚠ 走过的弯路：先想用 pid 后缀（`GetCurrentProcessId`），但
 //   ① `time_now` 是**秒**级、`rand_range` 按秒播种 ⇒ 同秒两进程取值相同（实测），
 //      时间+随机这条常规路走不通；
@@ -412,7 +412,7 @@ pub func cache_tmp_of(dst: string) -> string {
     return dst + ".tmp"
 }
 
-// p.9.15.3：**原子发布** —— 先写唯一临时名，再「**只创建不替换**」地改到目标名。
+// **原子发布** —— 先写唯一临时名，再「**只创建不替换**」地改到目标名。
 // 为何必须：原实现直接写目标名（`file_copy`/`file_write`/`byte_write` 都是直写）
 // ⇒ 并发读者可能读到**半写完**的缓存对象（截断的 .exe/.tir），而读者侧的
 // 「产物二次指纹核对」在同一进程两次读之间无法察觉持续中的半写。
@@ -480,7 +480,7 @@ pub func cache_store_dep() -> i64 {
     }
     var ck = cdir + "/" + dep_cache_key()
     // 先写主对象，再写 .dep 清单（清单缺失时命中判定直接失效重编，安全）。
-    // p.9.15.3：两者都走「临时名 + 原子发布」，防并发读者看到半写对象。
+    // 两者都走「临时名 + 原子发布」，防并发读者看到半写对象。
     var ot = cache_tmp_of(ck)
     if file_copy(artifact, ot) {
         if cache_publish(ot, ck) {
@@ -516,7 +516,7 @@ pub func str_hash(s: string) -> i64 {
 }
 
 // 缓存键：把输入源码与全部输出相关参数织入哈希（改动任一即失效重编）。
-// p.9.20：优化键拆 L（LLVM/clang 轴）+ M（tiec 中端轴）+ TG（目标），须与
+// 优化键拆 L（LLVM/clang 轴）+ M（tiec 中端轴）+ TG（目标），须与
 // dep_cache_key 逐字段对齐——两处不同步会导致命中过期产物。
 pub func cache_key_str(src: string) -> string {
     var level = effective_llvm_opt()
@@ -544,7 +544,7 @@ pub func cache_key_str(src: string) -> string {
     if str_len(g_cflags) > 0 {
         m = m + "\nCF" + g_cflags
     }
-    // S1.4：fast-math 与越界检查影响产物，织入缓存键（默认关，缺省行为不变）
+    // fast-math 与越界检查影响产物，织入缓存键（默认关，缺省行为不变）
     if g_cli_fast_math {
         m = m + "\nF1"
     } else {
@@ -557,8 +557,8 @@ pub func cache_key_str(src: string) -> string {
     } else {
         m = m + "\nQ0"
     }
-    // 检查恒开（规范 8.5 不可关闭）⇒ 缓存键固定 C1。保留该标记是有意的：
-    // 旧缓存写的是 C0，标记不同即自动失效，不会误命中「无检查」的旧产物。
+    // 检查恒开（规范 8.5 不可关闭）⇒ 缓存键固定。保留该标记是有意的：
+    // 旧缓存写的是，标记不同即自动失效，不会误命中「无检查」的旧产物。
     m = m + "\nC1"
     // 条件编译特性集合决定 #cfg 裁剪结果，必须进键；两处逐字段对齐。
     m = m + "\nFT" + g_features
@@ -630,18 +630,18 @@ pub func tier_analysis_cache() -> bool {
     return effective_tie_opt() >= 3
 }
 
-// ==================== p.9.21.6-2 模块级 tieir 片段缓存 ====================
+// ==================== -2 模块级 tieir 片段缓存 ====================
 // 模块 = import 的文件（主文件 = 0，导入文件按展开顺序 1..k）。irgen + pass
 // 管道完成后，按模块写/命中标准格式 tieir 片段（tieir.write_mod_slice）。
 // 命中判定 = 缓存键（源路径 + 源指纹 + 编译器盐 + t 档 + 目标）——片段字节
 // 不参与判定（全量池使字节可随无关文件漂移，见 tieir_slice.tie 头注）。
 // 片段写入失败（如归属不连续）只损失该模块片段，编译不受影响。
 //
-// p.9.21.8：片段池已改引用过滤 + 保序压缩（见 tieir_slice.tie 头注），
+// 片段池已改引用过滤 + 保序压缩（见 tieir_slice.tie 头注），
 // 写放大消除——模块缓存**默认开**（无需 TIEC_MODCACHE）。
 
-// p.9.21.9：片段缓存键（写入与装配命中判定共用；键不含 IR，irgen 前可判）。
-// p.9.21.11：键加入**单元根路径**——模块 IR 含上下文相关的泛型展开（任一调用
+// 片段缓存键（写入与装配命中判定共用；键不含 IR，irgen 前可判）。
+// 键加入**单元根路径**——模块 IR 含上下文相关的泛型展开（任一调用
 // 方模块实例化的展开归属到模板来源模块），同一模块在不同根单元下的片段字节
 // 不同；键不含根会跨上下文污染（实测：regress 测试工程写的 std/string.tie 片段
 // 被 driver 装配命中，其 test::expect_eq 展开引用的 test::expect 在 driver 单元
@@ -669,7 +669,7 @@ pub func mod_slice_key(p: string, fp: string, topt: i64) -> string {
     return key
 }
 
-// p.9.21.9：全部模块片段命中 → 返回路径表（模块序 = dep_depset 序）；
+// 全部模块片段命中 → 返回路径表（模块序 = dep_depset 序）；
 // 任一未命中 → 空表（装配路径要求全命中；部分命中走全量 irgen + 补写）。
 pub func modcache_assembly_paths() -> table<string> {
     var out: table<string> = table_new_string()
@@ -682,7 +682,7 @@ pub func modcache_assembly_paths() -> table<string> {
         var fp = dep_file_fp(p)
         var frag = cdir + "/" + mod_slice_key(p, fp, topt) + ".tir"
         if !file_exists(frag) {
-            // p.9.21.10 修正：任一未命中必须返回**空表**（此前 return out 会把
+            // 修正：任一未命中必须返回**空表**（此前 return out 会把
             // 已累积的部分列表带回 → 装配器拿残缺片段集静默装配，缺失模块的
             // 函数全部变成未定义符号——driver 实测 218 模块缺 21 个）。
             return table_new_string()
@@ -753,7 +753,7 @@ pub func mod_cache_update() -> i64 {
         if file_exists(frag) {
             hits = hits + 1
         } else {
-            // p.9.15.3：片段同样「临时名 + 原子发布」——装配路径要求**全命中**，
+            // 片段同样「临时名 + 原子发布」——装配路径要求**全命中**，
             // 半写片段一旦被读到会直接进装配（.tir 无内建校验），后果是坏 IR。
             var ftmp = cache_tmp_of(frag)
             if tieir.write_mod_slice(ftmp, i2, p, fp) {
@@ -761,7 +761,7 @@ pub func mod_cache_update() -> i64 {
                     written = written + 1
                 }
             } else {
-                // p.9.21.10：写失败不再静默（TIEC_INC=1 打印模块与原因）
+                // 写失败不再静默（TIEC_INC=1 打印模块与原因）
                 var inc2 = get_env("TIEC_INC")
                 if inc2 == "1" {
                     dbg_txt("MODWRITE-FAIL " + p + " : " + tieir.err_msg())

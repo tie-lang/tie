@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/scheck_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/front/scheck_p1.tie —— 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 scheck.tie。
@@ -257,7 +257,7 @@ func w16_record(nid: i64, ln: i64, cl: i64) {
     table_push(w16_cl, cl)
 }
 
-// 判定 for 迭代对象是否为字符串码点迭代器调用 `s.chars()`（dev33 批次4）。
+// 判定 for 迭代对象是否为字符串码点迭代器调用 `s.chars`。
 // 结构：MethodCall，方法名 == "chars"，接收者（child[slot_off]）类型为 string
 // 且无实参。用于 S_N_FOR 分支把循环变量登记为单字符 string。
 func is_chars_iter(iter: i64) -> bool {
@@ -292,7 +292,7 @@ func check_cf_block(blk: i64, s: i64) -> i64 {
     return r
 }
 
-// p.8.2.11：guard else 块（N_STMTLIST）是否以跳转语句收尾。
+// guard else 块（N_STMTLIST）是否以跳转语句收尾。
 func guard_else_ends_in_jump(list: i64) -> bool {
     var n = sstate.nchild(list)
     if n == 0 {
@@ -303,13 +303,13 @@ func guard_else_ends_in_jump(list: i64) -> bool {
     return t == S_N_RETURN || t == S_N_BREAK || t == S_N_CONTINUE || t == S_N_GOTO || t == S_N_PANIC
 }
 
-// p.9.11.4 defer 块内禁止的流控语句判定（return/break/continue/goto/panic）。
+// defer 块内禁止的流控语句判定（return/break/continue/goto/panic）。
 func defer_forbidden_jump(t: i64) -> bool {
     return t == S_N_RETURN || t == S_N_BREAK || t == S_N_CONTINUE ||
         t == S_N_GOTO || t == S_N_PANIC
 }
 
-// p.9.11.4 defer 语句检查：检查块体（表达式/赋值/读变量均正常推断），并
+// defer 语句检查：检查块体（表达式/赋值/读变量均正常推断），并
 // 递归拒绝块内出现 return/break/continue/goto/panic/嵌套 defer（资源释放
 // 语句在退出时线性执行，不允许提前跳转/不可恢复退出/再注册）。递归扫描
 // 允许结构块（if/while/for/switch/try/unsafe），但在仍碰见禁止语句即报诊断。
@@ -555,7 +555,7 @@ func check_arm_patterns_plain(c: i64, subj_ty: i64) -> i64 {
             i = i + 1
             continue
         }
-        // P2c：any 主体 struct 匹配/绑定——`case Point:`（N_VAR 解析为 struct 名）
+        // any 主体 struct 匹配/绑定——`case Point:`（N_VAR 解析为 struct 名）
         // 与 `case Point(p):`（N_CASE_BIND 解构，绑定变量类型 = struct）
         if subj_ty == types.named(TK_ANY) {
             var bind_id2: i64 = -1
@@ -572,7 +572,7 @@ func check_arm_patterns_plain(c: i64, subj_ty: i64) -> i64 {
                     var s_ty = types.struct_of(st_vals[sidx])
                     if bind_id2 >= 0 {
                         sinfer.lv_insert(bind_id2, s_ty, 0, -1, 0)
-                        // p.9.22.6 全量符号表：case 绑定声明登记（kind 5；
+                        // 全量符号表：case 绑定声明登记（kind 5；
                         // 绑定名 id 存于 N_CASE_BIND 槽，节点取该绑定节点）。
                         xref.reg_decl(bind_id2, 5, s_ty, p)
                     }
@@ -606,7 +606,7 @@ func check_arm_patterns_plain(c: i64, subj_ty: i64) -> i64 {
             var tmatch_ty = sgen.parse_generic_type_node(tynode)
             var tyname = types.type_name(tmatch_ty)
             if subj_ty == types.named(TK_ANY) {
-                // P2b：any 主体类型匹配——case 类型必须可装箱
+                // any 主体类型匹配——case 类型必须可装箱
                 //（整数/浮点/bool/string/char；装箱 tag 见 tig_box_any）
                 var boxable: bool = false
                 if types.is_int(tmatch_ty) || types.is_float(tmatch_ty) ||

@@ -1,7 +1,7 @@
 type tie<class>
-// lib/front/pexpr_type.tie — T2.5 parser 类型解析（再拆分）
+// lib/front/pexpr_type.tie — parser 类型解析（再拆分）
 // ============================================================
-// 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
+// 职责：完整 parser 再拆分：
 // 原 pexpr.tie 拆出「类型解析 parse_type + parse_tuple_type」部分。
 // 依赖：./putil.tie（token 流/工具，经其传递可达 pst/ast/errors/interner/string）。
 // 2026-08-14 泛型语法：原 import ./pexpr.tie 改为 ./putil.tie——本模块不调用
@@ -67,7 +67,7 @@ pub func parse_type() -> i64 {
         return parse_tuple_type(line, col)
     }
     if tag == lex_ident {
-        // S2.2 函数值类型：`fn(参数类型...) -> 返回类型`。
+        // 函数值类型：`fn(参数类型...) -> 返回类型`。
         // 'fn' 是标识符 token（非关键字，unsafe fn 语法兼容），此处特判：
         // 标识符文本 == "fn" 且后随 '(' → 函数类型；否则按结构类型引用解析。
         if putil.peek_lexeme() == "fn" && putil.peek_n(1) == lex_lparen {
@@ -148,7 +148,7 @@ func parse_array_type(line: i64, col: i64) -> i64 {
     return t
 }
 
-// 函数值类型：`fn(参数类型...) -> 返回类型`（S2.2，闭包/函数指针）。
+// 函数值类型：`fn(参数类型...) -> 返回类型`（闭包/函数指针）。
 // 前提：当前 peek 为标识符 "fn"（'fn' 是标识符 token，此处特判消费）。
 // 产出 N_FN_TYPE 节点：children = [返回类型, 参数类型...]（返回类型在前，
 // 与 N_FN_DEF 的 children 布局呼应）。返回类型可省略（缺省 void）。
@@ -197,7 +197,7 @@ func parse_fn_type(line: i64, col: i64) -> i64 {
     return t
 }
 
-// 类型实参列表：`<T1, T2, ...>`（使用点，如 `Box<i64>` / `max<i64>(...)`）。
+// 类型实参列表：`<, , ...>`（使用点，如 `Box<i64>` / `max<i64>(...)`）。
 // 逐个用 parse_type 递归解析实参（实参可为内建泛型 table<T>/map<T>、嵌套
 // 结构引用 Box<i64>、元组类型等）；闭合用 expect_type_gt（自动处理 `>>` 分裂）。
 // v2 值实参：整型字面量 `<1280>`（N_INT_LIT）与类型实参同表混排（语义层按
@@ -258,7 +258,7 @@ pub func parse_type_args() -> i64 {
     return n
 }
 
-// 元组类型：`(T1, T2, ...)` / `(name: T1, name: T2, ...)`
+// 元组类型：`(, , ...)` / `(name: , name: , ...)`
 func parse_tuple_type(line: i64, col: i64) -> i64 {
     if !putil.expect(lex_lparen, "'('") {
         return -1

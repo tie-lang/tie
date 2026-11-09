@@ -1,7 +1,7 @@
 type tie<class>
 // compiler/driver/role_reg.tie —— driver 角色注册表子模块
 // ============================================================
-// 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
+// 从 driver.tie 拆出（方法库化：driver 编排薄壳）。
 // 拆分范式：同编译单元跨文件（文本内联）——本文件只含函数与注释，
 // 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
 // 风格 ns：函数在 `namespace driver` 内，一律 pub（driver 库 API 面）；
@@ -308,7 +308,7 @@ pub func is_valid_mod_role(name: string) -> bool {
 
 // 修饰角色的**域参数**校验（`type tie<logic, unsafe:mem, unsafe:ext>`）。
 // unsafe 修饰角色的参数 = 能力域，取值与 guard<cap> 的域一致，且**与能力域归类
-// 定案保持同步**（tie-main/docs/designs/domain-classification.md 的五域）：
+// 定案保持同步**：
 //   share / mem / ext / raw / lock
 //   · lock  = 去锁访问（绕过运行时表锁）—— 唯一驱动 irgen 的域；
 //   · 其余四域 = 域匹配时的「本文件隐式持证」声明。
@@ -472,7 +472,7 @@ pub func parse_role_decl(sub: string) -> i64 {
         if colon >= 0 {
             var base = trim(tie.support::slice(str.clone(item), 0, colon))
             var param = trim(tie.support::slice(str.clone(item), colon + 1, str_len(item)))
-            // r.1.6.7：**修饰角色带域参数**（`unsafe:lock`）——必须在基础角色分支之前
+            // **修饰角色带域参数**（`unsafe:lock`）——必须在基础角色分支之前
             // 判定，否则 `unsafe` 会被当基础角色而报「未知基础角色」。
             if is_valid_mod_role(str.clone(base)) {
                 if !is_valid_mod_param(str.clone(base), str.clone(param)) {

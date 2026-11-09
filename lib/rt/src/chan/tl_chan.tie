@@ -1,5 +1,5 @@
 type tie<class, unsafe:mem>
-// core/chan/tl_chan.tie —— trm-lite channel（mailbox）承载（p.6.5.7）
+// core/chan/tl_chan.tie —— trm-lite channel（mailbox）承载
 // 语义对标 Go（简化子集，互斥 + 条件变量）：
 //   · ch_send(ch, v)：锁定入队 + 唤醒一个等待者；通道关闭 → -1；队列满 → 0
 //     （满语义 = Go 阻塞 send 的务实降级：调用方依 0 自选重试/放弃，防单线程挂死）
@@ -14,7 +14,7 @@ import "../mnn/tl_sync.tie"
 
 const CH_MAX: i64 = 256       // 通道数上限
 const CH_CAP: i64 = 64        // 单通道环形容量
-// p.6.7.12 ch_select 常项（文件级 const，命名空间体内禁止 const）
+// ch_select 常项（文件级 const，命名空间体内禁止 const）
 const CH_SEL_RETRY: i64 = 20      // select 不可用时重试上限（×1ms）
 const CH_TBL_OFF_DATA: i64 = 16   // 表句柄 data 字段偏移
 const CH_TBL_OFF_LEN: i64 = 8     // 表句柄 len 字段偏移
@@ -22,7 +22,7 @@ const RECV_NONE: i64 = 123456789  // 非阻塞 recv 哨兵（消息值不可能�
 
 var g_ch_next: i64 = 0        // 下一个通道句柄（1 起；并发打开由 g_alloc_cs 串行化）
 var g_alloc_cs: i64 = 0       // 全局分配锁（ch_open：句柄序号 + 平行数组追加复合临界区，
-                              //   p.6.7.3 全局读写原子化——裸 g_ch_next++ 并发打开丢句柄）
+                              //   全局读写原子化——裸 g_ch_next++ 并发打开丢句柄）
 var g_ch_cs: table<i64> = []  // 每通道 CRITICAL_SECTION 缓冲地址
 var g_ch_cv: table<i64> = []  // 每通道 CONDITION_VARIABLE 缓冲地址
 var g_ch_closed: table<i64> = []
@@ -56,7 +56,7 @@ pub func ensure() {
 }
 
 // 分配新 channel，返回句柄（1 起；达上限返回 0）。
-// p.6.7.3：句柄序号与平行数组追加是复合临界区——全程持全局分配锁防并发打开
+// 句柄序号与平行数组追加是复合临界区——全程持全局分配锁防并发打开
 // 交错（丢句柄/平行数组错位）；CS/cv 缓冲分配在锁外（alloc 线程安全）。
 pub func ch_open() -> i64 {
     ensure()
@@ -118,7 +118,7 @@ pub func ch_send(ch: i64, v: i64) -> i64 {
     return res
 }
 
-// 阻塞发送（p.9.5.x T3 背压，Go 阻塞 send 语义）：队满 → 条件变量限时等待
+// 阻塞发送（.x 背压，Go 阻塞 send 语义）：队满 → 条件变量限时等待
 // 空位（SleepConditionVariableCS 释放 CS，被 recv 取走唤醒），直到入队成功；
 // 通道已关闭 → 返回 1。返回 0 = 已入队。ch_send/ch_send_now 非阻塞降级契约
 // 保留（供 select / 轮询方使用）；本原语供同步 RPC / 需要背压的调用方。
@@ -191,7 +191,7 @@ pub func ch_recv(ch: i64) -> i64 {
 }
 
 // 关闭：幂等。之后 send 失败、recv 排空后返回 -1。
-// p.6.7.12：**广播唤醒**全部阻塞 recv（WakeAllConditionVariable）——close 后所有
+// **广播唤醒**全部阻塞 recv（WakeAllConditionVariable）——close 后所有
 // 等待者依次醒来、先排空残留消息再统一返回 -1（Go 语义：close 后 recv 直到空）。
 pub func ch_close(ch: i64) {
     ensure()
@@ -208,7 +208,7 @@ pub func ch_close(ch: i64) {
     }
 }
 
-// ---------- p.6.7.12 ch_select：多路非阻塞收发（任一可用分支执行） ----------
+// ---------- ch_select：多路非阻塞收发（任一可用分支执行） ----------
 // 语言入口：ch_select(handles: table<i64>, actions: table<i64>, values: table<i64>)
 // -> i64。平行数组按分支下标对齐：actions[i] = 1 表示 recv 分支（命中即从通道
 // i 取一条写入 values[i]）、-1 表示 send 分支（命中即把 values[i] 发入通道 i）。

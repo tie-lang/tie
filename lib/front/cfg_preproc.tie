@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/cfg_preproc.tie —— p.9.11.13 #cfg 条件编译预处理（词法前）
+// lib/front/cfg_preproc.tie —— #cfg 条件编译预处理（词法前）
 // ============================================================
 // 在 driver 读文件后、头部扫描（scan_header）/词法（lex）之前按行扫描指令：
 //   `#cfg(条件)`  → 条件块开始（真保留、假裁剪）
@@ -7,7 +7,7 @@ type tie<class>
 //   `#end` / `#endif` → 条件块结束
 // 条件为假时**裁剪**该文本块（整行从源流移除，不 lex/parse）；真时原样保留。
 //
-// 边界与裁决（p.9.11.13 务实定界）：
+// 边界与裁决（务实定界）：
 //   - 行级/块级文本行裁剪：裁剪区整体从源流移除；后续诊断行号相对裁剪后
 //     源码计算（近似，可接受，注明）；
 //   - 单层：不允许嵌套 #cfg；一个 #cfg 块最多一个 #else；#else/#end 悬空、
@@ -257,7 +257,7 @@ func eval_cond(cond: string, target: string, profile: string) -> bool {
 // 参数：target = 目标三元组（--target > 配置 target > 空）；profile = 生效
 // profile（--profile > 配置顶层 profile 键）。
 pub func preprocess(src: string, target: string, profile: string) -> string {
-    // 性能快路径（2026-10-12）：源中不含 '#' 字节 ⇒ 必无任何指令/属性行，
+    // 性能快路径：源中不含 '#' 字节 ⇒ 必无任何指令/属性行，
     // 原样返回（免逐行拆分与重建——被导入文件现全部经此函数，自举链多数
     // 文件走此路径）。含 '#' 的文件走下方原路径（行为不变）。
     var fast = true

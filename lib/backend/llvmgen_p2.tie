@@ -1,5 +1,5 @@
 type tie<class>
-// lib/backend/llvmgen_p2.tie —— llvmgen 分片 2（p.9.21.3 单文件 ≤800 行）
+// lib/backend/llvmgen_p2.tie —— llvmgen 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 llvmgen.tie。
@@ -213,14 +213,14 @@ func gen_func(fid: i64) {
     if sym == "main" && ret_llvm == "void" {
         ret_llvm = "i32"
     }
-    // r.1.6.3：Linux 目标 + 程序用 arg_*（g_linux_args）→ main 定义带
+    // Linux 目标 + 程序用 arg_*（g_linux_args）→ main 定义带
     // `i32 %0, ptr %1`（argc/argv，C 运行期注入；tie main 本身无参，LLVM 层
     // 附加形参，irgen 生成的指令不引用它们）。Windows 保持无参（IR 逐字节
     // 不变，CommandLineToArgvW 既有路径）。形参 %0/%1 在 renumber 时按
     // N < g_pcnt 原样保留（ren_ref），entry 捕获 store 行于重编号后插入，
     // 不参与映射。
     var linux_main: bool = g_linux_target == 1 && g_linux_args == 1 && sym == "main"
-    // r.1.6.3：Linux main 附加形参占位——renumber 起始编号须避开形参 %0/%1
+    // Linux main 附加形参占位——renumber 起始编号须避开形参 %0/%1
     //（普通函数 = g_pcnt；Linux main = 2，见 g_ren_base 注释）。
     if linux_main {
         g_ren_base = 2
@@ -242,7 +242,7 @@ func gen_func(fid: i64) {
             pk = pk + 1
         }
     }
-    // M5 动态库导出面（dev33 批次 12）：动态库模式下，irgen 登记的导出函数
+    // 动态库导出面：动态库模式下，irgen 登记的导出函数
     // （顶层函数 + 命名空间 pub func，ir.func_exported==1）带 dllexport——
     // Windows lld-link 据此自动导出符号（Linux ELF 忽略该存储类，符号默认
     // 可见）。内部辅助函数（私有/非导出）不标记。
@@ -250,7 +250,7 @@ func gen_func(fid: i64) {
     if g_dynlib && ir.func_exported(fid) == 1 {
         exp_kw = "dllexport "
     }
-    // p.9.11.10 inline fn：附加 LLVM 函数内联属性。裁决——统一用 `alwaysinline`
+    // inline fn：附加 LLVM 函数内联属性。裁决——统一用 `alwaysinline`
     //（强制内联，-O0 也生效；据优化档在 -O1+ 用 `inlinehint` 可交优化器裁断，
     // 但 alwaysinline 保证语义可见且语义安全：inline 仅作用于显式标注函数，对
     // 递归/编译器自身（未标 inline）无影响，LLVM 对 alwaysinline 递归只内联限定
@@ -282,13 +282,13 @@ func gen_func(fid: i64) {
     // 5) 并入全局 out_lines，恢复全局缓冲。
     g_fn_lines = table_new_string()
     g_fn_mode = 1
-    // p.6.1.7 落地（2026-09-06）：每函数重建收集数组（杜绝跨函数累积——旧码只重置
+    // 落地：每函数重建收集数组（杜绝跨函数累积——旧码只重置
     // g_hoisted_cnt 不清表 → fid>0 函数出口读上一函数条目）。全量收集 + 入口零初始化
     // = 循环体 alloca 全部静态化 → 根治「逐迭代动态栈分配 → 0xC00000FD」（RCA-2，
     // repro2_sort 大 string 冒泡；配合 irgen_stmt 引用计数修复系列 8e62a46/81b5775）。
     g_hoisted_allocas = table_new_i64()
     g_hoisted_cnt = 0
-    // tail call 收集：块尾 ret 的直接来源 call（p.9.20.5）
+    // tail call 收集：块尾 ret 的直接来源 call
     g_tail_ids = table_new_i64()
     if g_inst_blk_ready == 0 {
         build_inst_blk()
@@ -355,12 +355,12 @@ func gen_func(fid: i64) {
                         var v_a = ir.ins_val(ainst)
                         if v_a >= 0 {
                             line("%" + to_string(v_a) + " = alloca " + ty_a)
-                            // p.6.1.7 落地：入口零初始化（提升后槽位跨迭代复用，未初始
+                            // 落地：入口零初始化（提升后槽位跨迭代复用，未初始
                             // 化读从「每轮新鲜垃圾」变为 0）。ren_ref 对行内 %N（N<g_pcnt）
                             // 按形参原样保留——小号 id 的 alloca 补 store 会写成对形参的
                             // store（opt reject：defined i64 expected ptr），跳过即可。
                             if v_a >= g_pcnt {
-                                // r.1.1.1 全类型入口零初始化：此前仅 i64/i8/ptr/double
+                                // 全类型入口零初始化：此前仅 i64/i8/ptr/double
                                 // 四型覆盖（i1/i32 等槽位提升后读旧值/垃圾，语义不确定）。
                                 // 实测编译器自身 IR 含 i1×249/i32×11/聚合×21 等未清零 alloca；
                                 // 补齐后任何提升槽首读必得确定 0（分析确认当前无读先于写，
@@ -413,7 +413,7 @@ func gen_func(fid: i64) {
         var gft1 = GetTickCount()
     }
     g_t_ren = g_t_ren + (gft1 - gft0)
-    // r.1.6.3：Linux main 入口捕获 store——重编号后插入（store 引用的 %0/%1
+    // Linux main 入口捕获 store——重编号后插入（store 引用的 %0/%1
     // 是形参，renumber 前插入会被 ren_ref 误映射为指令值 id）。entry 块标签
     // 行（"bb{eblk}:"）后首行插入两条 store，把 argc/argv 落全局槽供
     // arg_count/arg_string 读取；LLVM 对 store 位置只要求在被引用前（SSA），

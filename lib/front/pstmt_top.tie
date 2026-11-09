@@ -1,7 +1,7 @@
 type tie<class>
-// lib/front/pstmt_top.tie — T2.5 parser 顶层声明（再拆分）
+// lib/front/pstmt_top.tie — parser 顶层声明（再拆分）
 // ============================================================
-// 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
+// 职责：完整 parser 再拆分：
 // 原 pstmt.tie（1091 行）拆为 pstmt_top（本文件：程序入口 + 顶层声明
 // import/using/namespace/extern/fn/struct）+ pstmt_flow（语句分派+控制流）
 // + pstmt（var 声明/表达式赋值）。
@@ -26,11 +26,11 @@ pub var g_pending_attr_bits: i64 = 0;
 // 由 parse_import 消费后写进 N_IMPORT 的 val 高位并清零。
 pub var g_pending_import_mod: i64 = 0;
 
-// p.9.11 `reentrant`（规范 §10.7）：parse_actor 解析方法期间置 1，供 parse_fn_def
+// `reentrant`（规范 §10.7）：parse_actor 解析方法期间置 1，供 parse_fn_def
 // 判「reentrant 仅可用于 actor 消息方法」（顶层/普通函数标注解析期即拒绝）。
 pub var g_in_actor_body: i64 = 0;
 
-// p.9.11.12 @注解/属性：声明前置注解 `@name` / `@name(args)`（元数据，无运行期
+// @注解/属性：声明前置注解 `@name` / `@name(args)`（元数据，无运行期
 // 行为）。注册表按「声明节点 id → 注解条目」平行存放（每个注解一条记录）：
 //   g_ann_nodes[序] = 声明节点 id（解析完声明回填；-1 = 尚未附着）
 //   g_ann_names[序] = 注解名（字符串池 id）
@@ -46,7 +46,7 @@ pub var g_ann_arg_ids: table<i64>;
 pub var g_ann_lines: table<i64>;
 pub var g_ann_cols: table<i64>;
 
-// p.9.11.29 doc 注释 `///`：声明前连续 ///（或 /** */）行经词法 collect_doc/
+// doc 注释 `///`：声明前连续 ///（或 /** */）行经词法 collect_doc/
 // flush_doc 落表后，此处按「doc 声明起始行 == ast.line(声明节点)」完成归属
 // 登记（@注解同路：解析期注册表，零运行时；tsp/工具链消费经 pdoc_* 接口，
 // Keel/tdiag 落盘在组件层做）。每份文件 parse_program 独立重置（同 pann）。
@@ -62,7 +62,7 @@ namespace pstmt_top {
 pub func parse_program() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
-    // p.9.11.12：注解注册表重置（每份文件解析独立；import 展开的文件各自重置）
+    // 注解注册表重置（每份文件解析独立；import 展开的文件各自重置）
     g_ann_nodes = table_new_i64()
     g_ann_names = table_new_i64()
     g_ann_arg_off = table_new_i64()
@@ -70,7 +70,7 @@ pub func parse_program() -> i64 {
     g_ann_arg_ids = table_new_i64()
     g_ann_lines = table_new_i64()
     g_ann_cols = table_new_i64()
-    // p.9.11.29：doc 注册表重置（同 pann——每份文件解析独立）
+    // doc 注册表重置（同 pann——每份文件解析独立）
     g_doc_nodes = table_new_i64()
     g_doc_texts = table_new_i64()
     g_doc_dlines = table_new_i64()
@@ -114,14 +114,14 @@ pub func parse_program() -> i64 {
             }
             ast.collect_stmt(stmts, s)
         } else if tag == lex_inline {
-            // p.9.11.10 inline fn：`inline func ...`（inline 可跟 pub/const）
+            // inline fn：`inline func ...`（inline 可跟 pub/const）
             var s = parse_fn_def()
             if s < 0 {
                 return -1
             }
             ast.collect_stmt(stmts, s)
         } else if tag == lex_pub {
-            // pub 后：pub func / pub macro / pub #[macro]（dev33 批次10 任务29
+            // pub 后：pub func / pub macro / pub #[macro]（
             // 跨文件宏：pub macro 导出跨文件可见，非 pub 宏同文件私有）。
             var nxt = putil.peek_n(1)
             if nxt == lex_macro {
@@ -141,7 +141,7 @@ pub func parse_program() -> i64 {
                 ast.set_val(s, ast.val(s) + 2)   // val bit1 = ispub
                 ast.collect_stmt(stmts, s)
             } else if nxt == lex_const {
-                // p.9.21.5 II2：`pub const` —— 常量纳入 pub API 面（A2b：
+                // II2：`pub const` —— 常量纳入 pub API 面（A2b：
                 // 常量可见性跟随 L1 梯度）。val bit0 = is_const（parse_var_decl
                 // 置位），bit1 = ispub（此处置位，与 macro 同款）。
                 putil.advance()   // pub
@@ -164,7 +164,7 @@ pub func parse_program() -> i64 {
                 ast.set_val(sv, ast.val(sv) + 2)   // val bit1 = ispub
                 ast.collect_stmt(stmts, sv)
             } else if nxt == lex_import {
-                // p.9.11.14 重导出：`pub import "path" [as 别名]`（内联模型
+                // 重导出：`pub import "path" [as 别名]`（内联模型
                 // 零成本；parse_import 内部消化 pub 前缀）
                 var s = parse_import()
                 if s < 0 {
@@ -179,8 +179,8 @@ pub func parse_program() -> i64 {
                 ast.collect_stmt(stmts, s)
             }
         } else if tag == lex_unsafe {
-            // S1.2：`unsafe fn ...`（unsafe 函数）或 `unsafe extern fn ...`
-            // （E3 强制 unsafe 标注的 extern 声明）。按下一 token 分派。
+            // `unsafe fn ...`（unsafe 函数）或 `unsafe extern fn ...`
+            // （强制 unsafe 标注的 extern 声明）。按下一 token 分派。
             var nxt = putil.peek_n(1)
             if nxt == lex_extern {
                 var s = parse_extern()
@@ -196,7 +196,7 @@ pub func parse_program() -> i64 {
                 ast.collect_stmt(stmts, s)
             }
         } else if tag == lex_repr {
-            // S1.2：`repr(C) struct ...`（C 内存布局结构体）
+            // `repr(C) struct ...`（C 内存布局结构体）
             var s = parse_struct()
             if s < 0 {
                 return -1
@@ -227,14 +227,14 @@ pub func parse_program() -> i64 {
             }
             ast.collect_stmt(stmts, s)
         } else if tag == lex_port {
-            // S2.4：port 接口声明
+            // port 接口声明
             var s = parse_port()
             if s < 0 {
                 return -1
             }
             ast.collect_stmt(stmts, s)
         } else if tag == lex_alias {
-            // p.9.11.32：类型别名声明（真保留字；既有 alias 标识符已由
+            // 类型别名声明（真保留字；既有 alias 标识符已由
             // prep/alias_kw_clean.tie 一键改名为 alias_id）
             var s = parse_alias()
             if s < 0 {
@@ -242,14 +242,14 @@ pub func parse_program() -> i64 {
             }
             ast.collect_stmt(stmts, s)
         } else if tag == lex_interface {
-            // p.9.11.21：interface 结构性接口声明
+            // interface 结构性接口声明
             var s = parse_interface()
             if s < 0 {
                 return -1
             }
             ast.collect_stmt(stmts, s)
         } else if tag == lex_impl {
-            // S2.4：impl 实现块（impl Drawable for Button { ... }）
+            // impl 实现块（impl Drawable for Button { ... }）
             var s = parse_impl()
             if s < 0 {
                 return -1
@@ -282,7 +282,7 @@ pub func parse_program() -> i64 {
             decl_attr_consume(s)
             ast.collect_stmt(stmts, s)
         } else if tag == lex_const {
-            // p.8.1.1：`const fn` / `const func` → const fn 定义；否则 const 全局变量
+            // `const fn` / `const func` → const fn 定义；否则 const 全局变量
             if putil.peek_lexeme_n(1) == "fn" || putil.peek_lexeme_n(1) == "func" {
                 var s = parse_fn_def()
                 if s < 0 {
@@ -298,14 +298,14 @@ pub func parse_program() -> i64 {
                 ast.collect_stmt(stmts, s)
             }
         } else if tag == lex_macro {
-            // S3.3：宏定义 `macro name(...) -> code { ... }`（编译期函数）
+            // 宏定义 `macro name(...) -> code { ... }`（编译期函数）
             var s = parse_macro_def()
             if s < 0 {
                 return -1
             }
             ast.collect_stmt(stmts, s)
         } else if tag == lex_hash {
-            // M4（dev33 批次9）过程宏属性 `#[macro]` + 三期通用 `#[]` 属性通道
+            // 过程宏属性 `#[macro]` + 三期通用 `#[]` 属性通道
             // （§7.1，A/B/C 组声明属性 `#[unsafe.share]` 等）。按属性名分派：
             //   #[macro] → 过程宏定义（保留兼容）
             //   其他（#[unsafe.x]）→ 通用属性，附着到下一 actor/func 声明
@@ -336,7 +336,7 @@ pub func parse_program() -> i64 {
             }
             ast.collect_stmt(stmts, su2)
         } else if tag == lex_at {
-            // p.9.11.12 @注解/属性：`@name` / `@name(args)`（可堆叠）后跟声明
+            // @注解/属性：`@name` / `@name(args)`（可堆叠）后跟声明
             var s2 = parse_annotated_decl()
             if s2 < 0 {
                 return -1
@@ -347,17 +347,17 @@ pub func parse_program() -> i64 {
             return -1
         }
     }
-    // S2.2：回填延迟闭包函数体。parse_primary 解析闭包字面量时只解析头部
+    // 回填延迟闭包函数体。parse_primary 解析闭包字面量时只解析头部
     // （pexpr 在 import 树底层无法调用 pstmt_flow 的语句解析——成环），
     // 函数体 token 流被配平跳过并登记快照；这里在整份文件解析完后统一
     // 恢复快照、parse_block 解析函数体、回填到 N_FN_LIT（见
     // pstmt_flow.parse_deferred_closures）。
-    // S3.3：准引用块 `` `{ stmts } `` 同款延迟——parse_deferred_all 交替
+    // 准引用块 `` `{ stmts } `` 同款延迟——parse_deferred_all 交替
     // 处理闭包表与准引用块表直到两者都稳定（嵌套/交错均可）。
     if parse_deferred_all() < 0 {
         return -1
     }
-    // p.9.11.29：doc 注释归属回填（声明起始行匹配，详见 doc_attach_all）
+    // doc 注释归属回填（声明起始行匹配，详见 doc_attach_all）
     if pstmt_flow.ui_inject_pending(stmts) < 0 {
         return -1
     }
@@ -368,10 +368,10 @@ pub func parse_program() -> i64 {
 }
 
 
-// ---------- p.9.11.12 @注解/属性（声明前置元数据） ----------
+// ---------- @注解/属性（声明前置元数据） ----------
 
 
-// ---------- p.9.11.12 注解查询接口（编译期元数据） ----------
+// ---------- 注解查询接口（编译期元数据） ----------
 // 工具链消费（Keel 注册表 / tieapi / tdiag）在组件层做；本批提供可查询入口：
 //   pann_count(decl) / pann_name(decl,i) / pann_argc(decl,i) /
 //   pann_arg_node(decl,i,k) / pann_line(decl,i) / pann_col(decl,i)
@@ -440,7 +440,7 @@ pub func pann_col(decl: i64, i: i64) -> i64 {
     return g_ann_cols[idx]
 }
 
-// ---------- p.9.11.29 doc 注释注册表（解析收尾回填，查询接口） ----------
+// ---------- doc 注释注册表（解析收尾回填，查询接口） ----------
 // 归属回填：整份文件解析完后对顶层声明做一次 walk，凡声明节点起始行与某条
 // doc 的声明起始行相等且双方均未被消费即登记（容器声明递归进成员：struct
 // 字段/方法、actor 字段/方法、port/interface 方法、impl 方法、namespace 内
@@ -512,14 +512,14 @@ pub func pdoc_dump() -> string {
 // ---------- 函数 / struct 定义 ----------
 
 
-// `[pub] [unsafe] func name [<T1, T2>] (params) -> Ty { stmts }`
-// 泛型（2026-08-14）：名字后紧跟类型参数列表 `<T1, T2>`；产出 N_FN_DEF
+// `[pub] [unsafe] func name [<, >] (params) -> Ty { stmts }`
+// 泛型：名字后紧跟类型参数列表 `<, >`；产出 N_FN_DEF
 // children = [泛型槽(-1或N_TYPE_PARAMS), 返回类型, 参数..., 函数体]。
-// S1.2：val 复用为标志位（bit0=is_pub, bit1=is_unsafe）。
+// val 复用为标志位（bit0=is_pub, bit1=is_unsafe）。
 // 一期并发：val bit2 = is_async（`pub async func` = actor 异步投递方法；仅 actor
 // 体内语义合法，解析层统一接受、语义层拦截非 actor 用法）。
-// S2.4：port 方法签名（无体）由 parse_port_method 单独解析（见下）。
-// ---------- p.9.11.28 return 可省：判定辅助 ----------
+// port 方法签名（无体）由 parse_port_method 单独解析（见下）。
+// ---------- return 可省：判定辅助 ----------
 
 
 // ---------- 块 / 控制流语句 ----------

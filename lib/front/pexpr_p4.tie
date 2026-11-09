@@ -1,15 +1,15 @@
 type tie<class>
-// lib/front/pexpr_p4.tie —— 分片 4：箭头续扩（p.9.13.4）
+// lib/front/pexpr_p4.tie —— 分片 4：箭头续扩
 // ============================================================
-// 依据 docs/designs/tie-primitive-op-design.md §4：
+// 依据 §4：
 //   * 管道进容器/字段：`t -> [i]` → `t[i]`；`p -> .field` → `p.field`
 // 手法：**纯解析脱糖**，复用既有 N_INDEX / N_FIELD_ACCESS，无新 AST 节点、
-// 无语义层与 IR 改动——既有数据流箭头语义与 p.8.2.8 的 D1–D6 裁决原样保留。
+// 无语义层与 IR 改动——既有数据流箭头语义与 的 –裁决原样保留。
 //
 // 与既有裁决的边界（务必保持）：
-//   D2) `a -> obj.f`（有基址 obj）仍为**字段赋值**；新形态是 `p -> .f`（箭头后
+//   ) `a -> obj.f`（有基址 obj）仍为**字段赋值**；新形态是 `p -> .f`（箭头后
 //       紧跟 `.`，无基址）→ 读取。二者按「箭头后首个 token」区分，不冲突。
-//   D3) `arr[i] <- x` / `a -> arr[i]`（有基址）仍为 N_INDEX_ASSIGN；新形态是
+//   ) `arr[i] <- x` / `a -> arr[i]`（有基址）仍为 N_INDEX_ASSIGN；新形态是
 //       `t -> [i]`（箭头后紧跟 `[`）→ 读取。
 //   探测失败必须完整回退 token 流（save_pos/restore_pos），不留副作用。
 namespace pexpr {
@@ -23,10 +23,10 @@ func p4_field(base: i64, fld: i64) -> i64 {
     return fa
 }
 
-// 块管道形态（p.9.13.4）：箭头后是 `{ 绑定名 -> 体 }` 时构造 N_BLOCK_PIPE。
+// 块管道形态：箭头后是 `{ 绑定名 -> 体 }` 时构造 N_BLOCK_PIPE。
 // 形态判定＝三 token 前瞻：`{` + 标识符 + `->`。不匹配返回 -1（调用方回退常规解析）。
 // 注意与尾随闭包的区别：`x -> f() { … }` 的 `{ }` 已在后缀层被 f() 吃为末参
-//（p.8.2.8 裁决 D4），到达本层时 `{` 只可能是块管道开头。
+//（裁决 ），到达本层时 `{` 只可能是块管道开头。
 func pipe_block_form(lhs: i64) -> i64 {
     if putil.peek_tag() != lex_lbrace {
         return -1
@@ -58,7 +58,7 @@ func pipe_block_form(lhs: i64) -> i64 {
     return n
 }
 
-// 管道读取式目标（p.9.13.4）：箭头后紧跟 `[` / `.` 时按读取脱糖。
+// 管道读取式目标：箭头后紧跟 `[` / `.` 时按读取脱糖。
 // 返回脱糖节点 id；形态不符返回 -1（调用方退回常规目标解析）。
 func pipe_read_form(base: i64) -> i64 {
     var t = putil.peek_tag()
@@ -86,7 +86,7 @@ func p4_try_index_read(base: i64) -> i64 {
     return -1
 }
 
-// 箭头一段：优先尝试读取式目标（p.9.13.4），否则常规目标 + 折叠。
+// 箭头一段：优先尝试读取式目标，否则常规目标 + 折叠。
 // 另有两种前缀形态（在常规目标之前判定，见下）：
 //   * 管道接运算符 `t -> + [x]` / `t -> in xs` → 脱糖为 `t + [x]` / `t in xs`
 //   * 条件管道 `x -> (cond ? f : g)`
@@ -115,7 +115,7 @@ func arrow_step(op: i64, lhs: i64) -> i64 {
     return arrow_fold(op, lhs, tgt)
 }
 
-// 管道接运算符（p.9.13.4 第 3 项）：箭头后直接跟二元运算符时，脱糖为以 lhs 作
+// 管道接运算符（第 3 项）：箭头后直接跟二元运算符时，脱糖为以 lhs 作
 // 左操作数的二元表达式 —— `t -> + [x]` ≡ `t + [x]`，`t -> in xs` ≡ `t in xs`。
 // 覆盖全部二元运算符 token（算术/比较/逻辑/位/移位/`in`）；右操作数用
 // parse_ternary（不再进箭头层，避免链式歧义）。形态不符返回 -1（调用方回退）。
@@ -202,7 +202,7 @@ func pipe_op_code(tag: i64) -> i64 {
     return -1
 }
 
-// 条件管道（p.9.13.4）：`x -> (cond ? f : g)` 脱糖为 `cond ? (x -> f) : (x -> g)`。
+// 条件管道：`x -> (cond ? f : g)` 脱糖为 `cond ? (x -> f) : (x -> g)`。
 // 两个分支各接箭头（调用分支走末参追加，裸 fn 分支保留箭头节点交语义层分派）。
 // 三元的 children 布局 = [cond, then, else]。
 func arrow_cond(op: i64, lhs: i64, tern: i64) -> i64 {
@@ -263,7 +263,7 @@ func arrow_fold(op: i64, lhs: i64, rhs: i64) -> i64 {
     return mk_binary(op, lhs, rhs)
 }
 
-// 反/正向解构（p.9.13.4 第 6 项）：`(a, b) <- t` 与 `t -> (a, b)` 等价，均脱糖为
+// 反/正向解构（第 6 项）：`(a, b) <- t` 与 `t -> (a, b)` 等价，均脱糖为
 // 语句序列（N_STMTLIST，语义层按语句块检查、irgen 的 ExprStmt 分支按语句序列生成）：
 //     var _rd<行>_<列> = <数据表达式>
 //     var a = _rd<行>_<列>.Item1
@@ -341,7 +341,7 @@ func p4_field_assign(tgt_n: i64, data_n: i64) -> i64 {
     return fa
 }
 
-// p.9.11.6 表不可变更新 `with` 链（自 pexpr_p1 原样迁入，优先级低于箭头）：
+// 表不可变更新 `with` 链（自 pexpr_p1 原样迁入，优先级低于箭头）：
 // `t with {k: v}` 左结合链式；右操作数用 parse_ternary（刻意不进箭头层）。
 func arrow_with_chain(lhs: i64) -> i64 {
     var cur = lhs

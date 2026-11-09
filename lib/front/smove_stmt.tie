@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/smove_stmt.tie —— S1.5 移动语义独立检查 pass（语句检查分区）
+// lib/front/smove_stmt.tie —— 移动语义独立检查 pass（语句检查分区）
 // ============================================================
 // 从 smove.tie 拆分出的"语句检查"分区：负责移动语义检查的语句级递归遍历
 // （check_stmt / check_switch_case / check_block / push_ns_of）。
@@ -20,7 +20,7 @@ namespace smove {
 // ==================== 语句检查 ====================
 func check_stmt(s: i64) -> i64 {
     var tag = s_tags[s]
-    // 语句级宏（dev33 批次10 任务28）展开残留的嵌套 StmtList / 块形式
+    // 语句级宏展开残留的嵌套 StmtList / 块形式
     // N_CODE_LIT（`$body` 插值块后）：按语句块递归（与 scheck 处理一致）。
     if tag == S_N_STMTLIST {
         return check_block(s)
@@ -151,7 +151,7 @@ func check_stmt(s: i64) -> i64 {
     // ExprStmt：children=[表达式]
     if tag == S_N_EXPR_STMT {
         var e = sstate.child(s, 0)
-        // 语句级宏（dev33 批次10 任务28）：`$body` 插值块后子节点是块形式
+        // 语句级宏：`$body` 插值块后子节点是块形式
         // N_CODE_LIT / 嵌套 StmtList → 按语句块递归（不按表达式读取检查）。
         if e >= 0 {
             var et = s_tags[e]
@@ -165,7 +165,7 @@ func check_stmt(s: i64) -> i64 {
                 }
                 return 0
             }
-            // p.9.11.3 try 错误聚合块：表达式位，其块体是语句 → 按块遍历移动语义
+            // try 错误聚合块：表达式位，其块体是语句 → 按块遍历移动语义
             if et == S_N_TRY_BLOCK {
                 return check_block(sstate.child(e, 0))
             }
@@ -294,7 +294,7 @@ func check_stmt(s: i64) -> i64 {
         }
         return 0
     }
-    // p.9.11.4 defer 资源释放：块体遍历移动语义（读作用域变量/赋值）
+    // defer 资源释放：块体遍历移动语义（读作用域变量/赋值）
     if tag == S_N_DEFER {
         var blk_d = sstate.child(s, 0)
         if blk_d >= 0 {
@@ -310,7 +310,7 @@ func check_stmt(s: i64) -> i64 {
         return 0
     }
     if tag == S_N_GUARD_REVOKE {
-        // r.1.6.7 `unsafe.revoke(g)`：实参**豁免** moved 检查。
+        // `unsafe.revoke(g)`：实参**豁免** moved 检查。
         // 理由：`delegate` 会 move 消费接收者（父凭据），而规范语义要求
         // 「撤销父凭据 ⇒ 其派生凭据一并失效」——若在此对已 move 的父凭据报
         // moved 错，撤销父就永远不可达，该语义成为死条文。撤销的对象是
@@ -319,7 +319,7 @@ func check_stmt(s: i64) -> i64 {
         return 0
     }
     // FieldAssign：children=[基址, 值]（基址按引用；值 = **复制**入字段）
-    // ★ 值位置**不消耗**来源（2026-10-02）：`c.conn = sc` 之后继续读 `sc`
+    // ★ 值位置**不消耗**来源：`c.conn = sc` 之后继续读 `sc`
     // 是 tie 的惯用写法（实测 tlib 的 sse::connect / httpc::open_stream 均如此）。
     // 依据与「any 装箱不消耗源」同一条：赋值把**值的一份句柄**存进字段，tie 无
     // 析构器 ⇒ 源依然有效，不存在「已释放仍可用」的危险；把它判成移动会让

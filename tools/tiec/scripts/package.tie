@@ -17,9 +17,9 @@ type tie<logic>
 //   2. repl.exe 自举（tiec 编译 repl/repl.tie；-skip-repl 可跳过）
 //   3. 组装 dist/tie-{版本}/（bin/examples/editor + bin/llvm/ 精简工具链
 //      + std/ext/rdu + skills + docs + compiler 源码 + 包根发行文档；
-//      p.7.2.4：源码 compiler/std/ext/rdu/examples/skills/editor 收拢到 src/ 下）
+//      源码 compiler/std/ext/rdu/examples/skills/editor 收拢到 src/ 下）
 //   4. tar 打包为 zip（Windows 自带 bsdtar：tar -a -c -f）
-//   5. 另打 tie-{版本}-src.zip（只含 src/，p.7.2.4）
+//   5. 另打 tie-{版本}-src.zip（只含 src）
 
 // ---------- 命令行参数 ----------
 // 内置 version/args 原语见 tiec 环境；此处用 arg_string 读取（pkg 同款约定）。
@@ -162,7 +162,7 @@ func s3_llvm(dist: string) -> i64 {
         return 0
     }
     if g_llvm_mode == "none" {
-        // 不带 LLVM：不装配任何 LLVM 文件；包根 LLVM.md 说明如何自装/复用 LLVM
+        // 不带 LLVM：不装配任何 LLVM 文件；包根 说明如何自装/复用 LLVM
         var note = "# 未捆绑 LLVM（llvm-none 包）\n\n此发行包不含 LLVM 工具链。\n请在系统安装 LLVM（clang/opt/lld、llvm-ar），并把编译器指向其安装位置：\n  tiec --backend win32（TIE_LLVM_HOME 环境变量或 PATH 中的 clang/opt/llvm-ar/lld-link）。\n当前官方捆绑版本：LLVM 22（clang 22.1.8）。\nEN: This package does not bundle LLVM. Install LLVM and point tiec at it via TIE_LLVM_HOME or PATH.\nRecommended bundled version: LLVM 22 (clang 22.1.8).\n"
         var _r = file_write(dist + "\\LLVM.md", note)
         println("[3.5] 未捆绑 LLVM（llvm-none；自装说明见包根 LLVM.md）")
@@ -207,7 +207,7 @@ func s3_llvm(dist: string) -> i64 {
     return 0
 }
 
-// LLVM 版本标注（包内 bin/llvm/VERSION.txt + llvm-none 包根 LLVM.md 共用说明）。
+// LLVM 版本标注。
 func llvm_version_note() -> string {
     var v = "22.1.8"
     // 从 lib/clang/<major> 子目录读取主版本（若存在）；仅作校验提示
@@ -339,7 +339,7 @@ func step3_assemble(root: string, version: string, dist: string) -> i64 {
         var _r = fs_remove_all(dist)
     }
     var _r = fs_create_dir_all(dist + "\\bin")
-    // p.7.2.4：源码收拢到 src/（composer 复制进 src/ 子目录）
+    // 源码收拢到 src/（composer 复制进 src/ 子目录）
     var _r = fs_create_dir_all(dist + "\\src")
 
     var r1 = s3_bin(root, dist)
@@ -354,7 +354,7 @@ func step3_assemble(root: string, version: string, dist: string) -> i64 {
     return 0
 }
 
-// p.7.2.2/7.2.3 组件聚合：把 tie-repo 下各组件源码仓收拢进发行包 src/components/。
+// 组件聚合：把 tie-repo 下各组件源码仓收拢进发行包 src/components/。
 // 组件仓与 tie-main 同级（位于本仓的上两级目录）；
 // 只收录源码（剔除全部构建产物），使聚合发行包成为「全套工具链源码 + 编译器」
 // 的一体形态（组件独立发行物各自在组件仓出仓，聚合包为源码级完整快照）。
@@ -489,7 +489,7 @@ func step5_src_zip(root: string, version: string, dist: string) -> i64 {
     if fs_exists(src_zip) {
         var _r = fs_remove(src_zip)
     }
-    // p.7.2.4：只含 src/——在 dist/tie-{version}/ 内打包 src 子树
+    // 只含 src/——在 dist/tie-{version}/ 内打包 src 子树
     var old = exec_code("cd /d " + shell_q(dist) + " && tar -a -c -f " + shell_q(src_zip) + " src")
     if old != 0 || !fs_exists(src_zip) {
         println("[package] src.zip 打包失败（退出码 " + to_string(old) + "）")
@@ -537,8 +537,8 @@ func main() -> i64 {
 }
 
 func io_cwd() -> string {
-    // cwd 内建返回当前工作目录绝对路径（p.6.4.1 内联 Win32/CRT）。
-    // 不能用 exec_output("cd")：p.6.4.6 内联 exec_output 以 CreateProcess 直跑
+    // cwd 内建返回当前工作目录绝对路径（内联 Win32/CRT）。
+    // 不能用 exec_output("cd")：内联 exec_output 以 CreateProcess 直跑
     // 命令，cmd 内建 cd 无输出 → 空串 → 回退 "." 会让 zip 步骤路径错乱。
     var out = cwd()
     if out == "" {

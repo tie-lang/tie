@@ -1,7 +1,7 @@
 type tie<class>
-// lib/front/pstmt_flow.tie — T2.5 parser 语句分派+控制流（再拆分）
+// lib/front/pstmt_flow.tie — parser 语句分派+控制流（再拆分）
 // ============================================================
-// 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
+// 职责：完整 parser 再拆分：
 // 原 pstmt.tie 拆出的「语句分派 parse_stmt + 块/if/while/for/标签/
 // switch/return 控制流」部分。
 // 依赖：./pstmt.tie（var 声明/表达式赋值，经其传递可达 pexpr/putil/ast）。
@@ -34,7 +34,7 @@ pub func parse_stmt() -> i64 {
         return parse_return()
     }
     if tag == lex_yield {
-        // p.9.11.15 yield 生成器产出语句：`yield expr;`
+        // yield 生成器产出语句：`yield expr;`
         return parse_yield()
     }
     if tag == lex_break {
@@ -47,7 +47,7 @@ pub func parse_stmt() -> i64 {
         if is_loop_label_ahead() {
             return parse_labeled_loop()
         }
-        // p.9.11.4 defer 资源释放：`defer { ... }`（defer 非保留字，仅当紧跟 `{`
+        // defer 资源释放：`defer { ... }`（defer 非保留字，仅当紧跟 `{`
         // 按 defer 语句解析，否则落回表达式/赋值路径，规避用户变量名 defer）。
         // try 属表达式（parse_primary 处理），此处不拦。
         if putil.peek_lexeme() == "defer" {
@@ -55,7 +55,7 @@ pub func parse_stmt() -> i64 {
                 return parse_defer()
             }
         }
-        // p.8.2.11 guard else 早退：`guard <cond> else { ... }`。guard 非保留字
+        // guard else 早退：`guard <cond> else { ... }`。guard 非保留字
         //（guard<cap> 是类型名），此处语境识别——语句位 `guard` 后不跟 `<`（该
         // 情形是类型 `guard<cap>`，本就不该作语句）且不跟 `=`（guard 作变量赋值）
         // 时按 guard 语句解析。
@@ -76,7 +76,7 @@ pub func parse_stmt() -> i64 {
         return -1
     }
     if tag == lex_unsafe {
-        // S1.2 U3：`unsafe { ... }` 局部逃逸块（块内可触底）
+        // U3：`unsafe { ... }` 局部逃逸块（块内可触底）
         // 三期 goto：`unsafe goto #x`（§7.1.5）——unsafe 后跟 goto 关键字
         // 是 goto 跳转语句（无条件 br），否则按 unsafe 块解析。
         // 三期 A 组（§7.1.1 + unsafe-model §13.4）：
@@ -91,7 +91,7 @@ pub func parse_stmt() -> i64 {
         if nxt == lex_ident && putil.peek_lexeme_n(1) == "use" {
             return parse_guard_use()
         }
-        // p.9.11.6：`with` 已保留字化（lex_with），`unsafe with(share)` 的 with
+        // `with` 已保留字化（lex_with），`unsafe with(share)` 的 with
         // 现为关键词 token；此处改用 lex_with 判定（与其 lexeme 文本一致）。
         if nxt == lex_with {
             return parse_guard_with()
@@ -108,11 +108,11 @@ pub func parse_stmt() -> i64 {
         return parse_goto_label()
     }
     if tag == lex_panic {
-        // S2.3：`panic(expr)` 不可恢复错误语句
+        // `panic(expr)` 不可恢复错误语句
         return parse_panic()
     }
     if tag == lex_func {
-        // S3.3：准引用块内语句起始位置的 `func name() {...}` 按函数定义
+        // 准引用块内语句起始位置的 `func name {...}` 按函数定义
         // 解析（宏生成函数，见 parse_fn_def_in_block）；普通函数体内 func
         // 保持闭包字面量语义（走 parse_expr_or_assign → 闭包）。
         if g_in_quasi_block != 0 {
@@ -163,7 +163,7 @@ pub func parse_block() -> i64 {
     return list
 }
 
-// ---------- S2.2 延迟闭包函数体回填 ----------
+// ---------- 延迟闭包函数体回填 ----------
 
 // 回填延迟闭包函数体：parse_primary 解析闭包字面量（func(x: i64) -> i64 {
 // ... }）时只解析头部，函数体 token 流被配平跳过并登记快照（pexpr 在
@@ -200,11 +200,11 @@ pub func parse_deferred_closures() -> i64 {
     return 0
 }
 
-// ---------- S3.3 延迟准引用块体回填 ----------
+// ---------- 延迟准引用块体回填 ----------
 
 // 回填延迟准引用块体：parse_primary 解析 `` `{ stmts } `` 时只登记
 // N_CODE_LIT 节点 + 块体 token 流快照（pexpr 在 import 树底层无法调用
-// 本模块的语句解析——成环，与 S2.2 闭包同款）。整份文件解析完后由
+// 本模块的语句解析——成环，与 闭包同款）。整份文件解析完后由
 // pstmt_top.parse_deferred_all 调用本函数：逐块恢复快照 → parse_block
 // 解析块体 → 回填到 N_CODE_LIT 的 children[0]（块形式子 AST = StmtList）。
 // 嵌套：外层准引用块体内若再有准引用块，parse_block 解析时会再次登记到
@@ -233,7 +233,7 @@ pub func parse_deferred_code_blocks() -> i64 {
 }
 
 
-// p.9.13.1 单箭头统一：switch 表达式分支臂分隔符由 `=>` 改为 `->`（p.8.2.8
+// 单箭头统一：switch 表达式分支臂分隔符由 `=>` 改为 `->`（
 // 数据流箭头 lex_arrow），语义零变化。`_` 作通配缺省臂。臂之间用 `,` 分隔
 // （不允许多模式臂——逗号即臂分隔，避免歧义）。产出：
 //   N_SWITCH_EXPR[aux=ncases, val=1=含 `_` 通配臂,
@@ -282,7 +282,7 @@ pub func parse_switch_expr(line: i64, col: i64) -> i64 {
             }
             var when_expr = -1
             if putil.eat(lex_when) {
-                // p.9.13.1 单箭头统一：守卫用 parse_ternary（不消费顶层 `->`），
+                // 单箭头统一：守卫用 parse_ternary（不消费顶层 `->`），
                 // 保证紧随的臂分隔符 `->` 不被管道判定吃走；臂体在 `->` 之后用
                 // parse_expr 解析（体内 `->` 才是数据流管道）。
                 when_expr = pexpr.parse_ternary()

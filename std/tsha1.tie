@@ -26,8 +26,8 @@ type tie<class>
 // 用途：tie 平台自有通用安全哈希底座（插件审计链 / 完整性校验 / 指纹）。
 // 现状：v2「状态随输出位长 n」重构——内部状态规模由 n 决定，消除「输出扩展被
 //   内部状态封顶」。唯一语义源：_local_only/probes/tests/tsha_probe/gen_tsha1_core.py（逐式镜像）。
-//   设计：docs/superpowers/specs/2026-08-30-tsha1-state-per-n-design.md、
-//         docs/superpowers/specs/2026-08-30-tsha1-security-design.md
+//   设计：、
+//         
 //
 // 接口（公开四类函数 + 一个导出用诊断辅助）：
 //   tsha.tsha1f(msg, n, base=48) -> string  快速模型（F_压缩 一通用环核，R_F=12）
@@ -93,7 +93,7 @@ var tsha1_warned: i64 = 0;
 namespace tsha {
 
 // ============================================================================
-// == 安全声明（security-design §1/§2/§5，docs/superpowers/specs/2026-08-30-tsha1-security-design.md）==
+// == 安全声明==
 //
 // · 有效安全位 = min(名义位 k=n·L48, 状态位 s)；state-per-n 构造保证 s ≥ k
 //      恒成立 ⇒ 无任何 SHAKE 式「输出长、安全被容量封顶」缺口，实得 = k。
@@ -274,9 +274,9 @@ func is_base_ok(base: i64) -> bool {
     return false
 }
 
-// 字宽 W：model 码 0=f/2=b/3=x 每字 32 trit（K32/D32 ≈ L48/32）；
+// 字宽 W：model 码 0=f/2=b/3=x 每字 32 trit（K32/≈ L48/32）；
 //   model 1（r）每字 16 trit（Ktr/Dtr ≈ L48/TRIT16，TRIT16=16·log2 3）。
-// K32/D32 = 0.17453007814753613，Ktr/Dtr = 0.22023243839286438（ceil 精确）。
+// K32/= 0.17453007814753613，Ktr/Dtr = 0.22023243839286438（ceil 精确）。
 func words_for(n: i64, model: i64) -> i64 {
     var w: i64 = 0
     if model == 1 {
@@ -497,8 +497,8 @@ func ensure_xdcon() {
 // ---- 消息预处理：64 字节块 → 两组 (M,N) 平面 + Pw 位平面 + 3 基调度键（单遍扫描）----
 // 越界字节按 0 处理（等价纯零填充 ljust(64,0)）。
 // 3 为奇数乘子：3^k mod 2^32 恒非零 → 64 位低 3 位全部贡献（原 24^k 在 k≥11 湮灭）。
-// A6（p.6.10.1 去分配）：Pw 改由调用方复用传入（ref 写回，进入即清零 16 槽），
-//   消除每块 table_new_i64 + 16 次 push 的热路径分配；返回值改为 (M0,N0,M1,N1,skey)。
+// A6（去分配）：Pw 改由调用方复用传入（ref 写回，进入即清零 16 槽），
+//   消除每块 table_new_i64 + 16 次 push 的热路径分配；返回值改为 (,N0,,N1,skey)。
 func block_planes_skey(msg: string, pos: i64, nbytes: i64, full: bool, Pw: ref table<i64>) -> (m0: i64, n0: i64, m1: i64, n1: i64, skey: i64) {
     var M0v: i64 = 0
     var N0v: i64 = 0
@@ -591,7 +591,7 @@ func block_planes_skey(msg: string, pos: i64, nbytes: i64, full: bool, Pw: ref t
 }
 
 // 位平面吸收（F1-2）：每块一次、compress 轮前调用；16 条 Pw 按锚点字 w%W 平衡加并入 lanes。
-// A6（p.6.10.1）：W 改为显式参数（lanes 为 digest 级复用 scratch，长度固定 ≥ 2·maxW）。
+// A6：W 改为显式参数（lanes 为 digest 级复用 scratch，长度固定 ≥ 2·maxW）。
 func absorb(lanes: ref table<i64>, W: i64, Pw: table<i64>, skey: i64, half: bool) {
     var w: i64 = 0
     while w < 16 {
@@ -753,9 +753,9 @@ func lfsr_mix(lanes: ref table<i64>, td_start: i64, L: i64, r: i64,
 }
 
 // ---- 单块压缩（model: 0=f 1=r 2=b 3=x；half = (model==1)）----
-// A6（p.6.10.1 去分配）：lanes/Pw 由 digest 级 scratch 复用传入（len(lanes) ≥ 2·W、len(Pw) ≥ 16），
+// A6（去分配）：lanes/Pw 由 digest 级 scratch 复用传入（len(lanes) ≥ 2·W、len(Pw) ≥ 16），
 //   消除每块 table_new + 逐项 push 的热路径分配。
-// A7（p.6.10.x 再去分配）：轨表 t_start/t_len/t_kind/t_rate 同样提升为 digest 级定长 scratch
+// A7（.x 再去分配）：轨表 t_start/t_len/t_kind/t_rate 同样提升为 digest 级定长 scratch
 //   （各 ≥4 槽，索引直写 + tcount 控制有效长度），消除每块 4×table_new + push。
 func compress(model: i64, h: ref table<i64>, msg: string, pos: i64, nbytes: i64,
               t_lo: i64, t_hi: i64, last: bool,
@@ -1144,7 +1144,7 @@ func compress48(model: i64, n: i64, h: ref table<i64>, msg: string, pos: i64, nb
 }
 
 // 最后综合（终筛）：S=4 轮全 W 字单环收束（rcon=0 表，skey=0x13579BDF），随后投影。
-// A6（p.6.10.1 去分配）：lanes 复用调用方 scratch（原值已无用，整写）；zrc 复用 Pw 清零 16 槽。
+// A6（去分配）：lanes 复用调用方 scratch（原值已无用，整写）；zrc 复用 Pw 清零 16 槽。
 func fin_synth(h: ref table<i64>, half: bool, lanes: ref table<i64>, Pw: ref table<i64>) {
     var W = len(h)
     if W == 1 {
@@ -1208,7 +1208,7 @@ func digest(model: i64, msg: string, nbytes: i64, n: i64) -> string {
         i = i + 1
     }
     h[0] = h[0] ^ 0x01010000 ^ 32
-    // A6（p.6.10.1 去分配）：块压缩 scratch 一次建、全程复用（lanes 2·maxW=64、Pw 16 槽），
+    // A6（去分配）：块压缩 scratch 一次建、全程复用（lanes 2·maxW=64、Pw 16 槽），
     //   消除每块 table_new + push；特化内核（w9/w11/w12）无需二者，通用路径（含 r/n=64）消费。
     var lanes = table_new_i64()
     var sp: i64 = 0

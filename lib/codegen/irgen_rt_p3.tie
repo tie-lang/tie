@@ -1,11 +1,11 @@
 type tie<class>
-// lib/codegen/irgen_rt_p3.tie —— irgen_rt 分片 3（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_rt_p3.tie —— irgen_rt 分片 3
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_rt.tie。
 namespace irgen {
 
-// p.9.11 消息 ABI：ptr 表示的消息返回类型（string/table/map/port——LLVM repr
+// 消息 ABI：ptr 表示的消息返回类型（string/table/map/port——LLVM repr
 // = ptr，而消息结果槽 result@96 是单 i64 槽）。dispatch 侧 ptrtoint 打包、
 // 调用方（gen_actor_sync_call / tig_await）inttoptr 还原。struct/tuple/数组
 // 等聚合值表示不适用（结果槽单 i64，维持既有拒绝/不支持面）。
@@ -62,13 +62,13 @@ func gen_actor_method(aidx: i64, mi: i64, anode: i64) -> i64 {
     g_lp_top = 0
     g_tv_keys = table_new_i64()
     g_tv_elems = table_new_i64()
-    // r.1.6.7：逃逸分析状态同样按「每函数」重置——闭包体/方法体是独立函数，
+    // 逃逸分析状态同样按「每函数」重置——闭包体/方法体是独立函数，
     // 其内候选集与外层互不串用（外层候选在本函数体内不成立：捕获变量的所有权
     // 可能落在另一执行流）。注意此处是**清空**而非保存/恢复：闭包体生成发生在外层
     // 函数的生成过程中，若恢复外层状态会把「已被闭包捕获 ⇒ 可能被并发访问」的表
     // 重新判为独占 —— 方向必须偏向保守。
     esc_reset()
-    // r.1.6.7：显式 lock 凭据**不跨函数继承**——闭包/方法体是独立函数，若沿用
+    // 显式 lock 凭据**不跨函数继承**——闭包/方法体是独立函数，若沿用
     // 外层的去锁状态，而该闭包可能被 spawn / 存全局 ⇒ 在另一执行流里对同一张表
     // 做免锁访问 ⇒ 真实数据竞争。故在此清零。
     // 刻意**不保存/恢复**：闭包体生成发生在外层生成过程中，恢复会把外层的去锁
@@ -104,7 +104,7 @@ func gen_actor_method(aidx: i64, mi: i64, anode: i64) -> i64 {
     }
     // 函数体：children[slot_off + 1 + npars]
     var body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + npars)
-    // p.9.11 `reentrant`（规范 §10.7）：本 handler 的 record 指针值 id 与重入位
+    // `reentrant`（规范 §10.7）：本 handler 的 record 指针值 id 与重入位
     // 登记到生成器上下文——方法体内的 actor 同步 RPC 等待点（gen_actor_sync_call）
     // 据此生成「嵌套排空本 actor 异步消息」分支。错误路径直接中止编译，无需恢复。
     var s_arec9 = g_cur_actor_recval
@@ -157,13 +157,13 @@ func gen_actor_dispatch(aidx: i64, anode: i64) -> i64 {
     g_lp_top = 0
     g_tv_keys = table_new_i64()
     g_tv_elems = table_new_i64()
-    // r.1.6.7：逃逸分析状态同样按「每函数」重置——闭包体/方法体是独立函数，
+    // 逃逸分析状态同样按「每函数」重置——闭包体/方法体是独立函数，
     // 其内候选集与外层互不串用（外层候选在本函数体内不成立：捕获变量的所有权
     // 可能落在另一执行流）。注意此处是**清空**而非保存/恢复：闭包体生成发生在外层
     // 函数的生成过程中，若恢复外层状态会把「已被闭包捕获 ⇒ 可能被并发访问」的表
     // 重新判为独占 —— 方向必须偏向保守。
     esc_reset()
-    // r.1.6.7：显式 lock 凭据**不跨函数继承**——闭包/方法体是独立函数，若沿用
+    // 显式 lock 凭据**不跨函数继承**——闭包/方法体是独立函数，若沿用
     // 外层的去锁状态，而该闭包可能被 spawn / 存全局 ⇒ 在另一执行流里对同一张表
     // 做免锁访问 ⇒ 真实数据竞争。故在此清零。
     // 刻意**不保存/恢复**：闭包体生成发生在外层生成过程中，恢复会把外层的去锁
@@ -241,7 +241,7 @@ func gen_actor_dispatch(aidx: i64, anode: i64) -> i64 {
         ir.add_operand(inst, rec_i64, 0)  // rec（i64）
         var ak1: i64 = 0
         while ak1 < len(argvals) {
-            // ★ 架构增强：实参**类型**取自 hargtys（原来硬编码 T64 ⇒ 只能传 i64；
+            // ★ 架构增强：实参**类型**取自 hargtys（原来硬编码 ⇒ 只能传 i64；
             //   传 fn（%fn.0 聚合）会报「expected 'i64'」）。
             var pty_call = T64
             if ak1 < len(hargtys) {
@@ -256,7 +256,7 @@ func gen_actor_dispatch(aidx: i64, anode: i64) -> i64 {
             var ret = ir.new_inst(g_cur_block, 32, T64)  // ret 0
             ir.add_operand(ret, dv, 0)
         } else if actor_ret_via_ptr(hret) {
-            // ★ p.9.11 消息 ABI 修正（actor string 字段/返回缺口）：ptr 表示
+            // ★ 消息 ABI 修正（actor string 字段/返回缺口）：ptr 表示
             //   返回类型（string/table/map/port）——handler 按语义类型声明
             //   （string → ret ptr），而 dispatch 声明 fn -> i64 ⇒ 曾直接
             //   `ret ptr`（LLVM「value doesn't match function result type
@@ -387,14 +387,14 @@ func tig_yield_drain() {
     g_cur_block = exit
 }
 
-// ---------- p.6.7.6 S-pool：常驻 worker + 池启动发射 ----------
+// ---------- S-pool：常驻 worker + 池启动发射 ----------
 // worker 函数 `tie_s_pool_worker(i64) -> i64`（每程序恰一份，模块生成开始急切
 // 生成，避免指令编号交错）：循环 pop_task(me, env_out, rc_out) 抢任务（出参
 // env/rc 槽）→ call_indirect 执行（rc 0→i64 / 1→void）→ task_done；空队 →
 // pool_idle_wait（CV 限时，防忙轮询）。
 // 线程由内置 spawn 侧 tig_s_pool_start 发 CreateThread 建（@tie_s_pool_worker
 // kind3 直引函数地址，arg=worker 序号 0..P-1），池常驻不随 drain 终止。
-// p.6.7.7：worker 序号参数（ir.param_val(fid,0)）→ pop_task 的 me——per-worker
+// worker 序号参数（ir.param_val(fid,0)）→ pop_task 的 me——per-worker
 // 段尾 LIFO / 窃取定位自己段。
 func gen_s_pool_worker_eager() {
     if g_s_pool_worker_gen == 1 {
@@ -489,7 +489,7 @@ func gen_s_pool_worker_eager() {
     ir.add_operand(br2, b_join, 1)
     g_cur_block = b_join
     tig_trmlite_call("trm_lite_sched$task_done", tig_empty_types(), tig_empty_vals(), -1)
-    // p.6.7.10 调度点让出：after_task(me) → 该 worker 本轮让出（gosched 显式点 /
+    // 调度点让出：after_task(me) → 该 worker 本轮让出（gosched 显式点 /
     // 时间片耗尽），经 pool_give_wait 1ms 限时后回 loop（给其余 worker 抢单机会）
     var yat: table<i64> = table_new_i64()
     var yav: table<i64> = table_new_i64()
@@ -568,7 +568,7 @@ func tig_s_pool_start() {
     //   · 函数地址：op63（ptrtoint @tie_s_pool_worker → i64）+ inttoptr → ptr 值
     //     （函数符号不能登记 g_global_names，kind3 直引会落 %N 未定义）；
     //   · IMM 参数（i64/i32 0）直接传字面量 0，不传值 id（否则输出池 id 数字）。
-    //   · arg3 = worker 序号（0..P-1，p.6.7.7 per-worker 段定位）：inttoptr 后
+    //   · arg3 = worker 序号（0..P-1，per-worker 段定位）：inttoptr 后
     //     作 LPARAM 直传，worker 函数以 i64 参数接收。
     var P8 = types.ptr_of(types.named(TK_I8))
     var n0p = ir.new_inst(g_cur_block, 25, TS)  // inttoptr i64 0 → ptr null
@@ -613,7 +613,7 @@ func tig_s_pool_start() {
     g_cur_block = b_jn
 }
 
-// actor 等待循环（阶段1块2；p.6.7.6 改池同步点）：actor 消息任务经 S-pool
+// actor 等待循环（阶段1块2；改池同步点）：actor 消息任务经 S-pool
 // 常驻线程并行执行，等待 = 等队列排空（yield_wait）+ 重查谓词 + 空转限时。
 // cond_eq=true 退出条件为 load(ptr)==0（等 pending 空闲）；false 为 !=0（等 done=1）。
 func tig_actor_wait(ptr: i64, cond_eq: bool) {
@@ -638,7 +638,7 @@ func tig_actor_wait(ptr: i64, cond_eq: bool) {
     ir.add_operand(cb, ir.get_value(ic), 0)
     ir.add_operand(cb, exit, 1)
     ir.add_operand(cb, chk, 1)
-    // ★ p.9.11 修正（消费者出站同步 RPC 挂死的根因）：等待退让改用
+    // ★ 修正（消费者出站同步 RPC 挂死的根因）：等待退让改用
     //   tl_sync$sleep(1)——无锁 OS 睡眠。曾用 sched$yield_wait：其谓词
     //   `g_pend_s > 0` 把**调用者自己的任务**也计入（pop_task 不减、task_done
     //   才减）⇒ 从 actor 消费者任务内等待时谓词永真 = 自死锁（A 的消费者等
@@ -656,7 +656,7 @@ func tig_actor_wait(ptr: i64, cond_eq: bool) {
     g_cur_block = exit
 }
 
-// reentrant 等待（p.9.11，规范 §10.7）：与 tig_actor_wait 同判据（等 *ptr != 0，
+// reentrant 等待（规范 §10.7）：与 tig_actor_wait 同判据（等 *ptr != 0，
 // 即 done@104 置位），差异在「条件未满足」分支——不空转，而是调用
 // actor_task_nested(rec) **嵌套排空本 actor 队列中的异步消息**（重入处理其它
 // 消息，破 A→B→A 环）。同步消息不被消费（step 的 syncf 检查；done 单槽留给
@@ -718,7 +718,7 @@ func tig_actor_wait_reent(ptr: i64, rec_val: i64) {
     g_cur_block = exit
 }
 
-// p.9.11 `await`（规范 §10.6 结果的延后取得）：future<T> 凭据取值。
+// `await`（规范 §10.6 结果的延后取得）：future<T> 凭据取值。
 // fut_val = record 句柄（i64 值 id，future 模式调用在发布后立即返回的凭据）。
 // 流程 = 等待 done@104（reentrant 方法内嵌套排空，与 gen_actor_sync_call 的
 // 等待点同一分流）→ 读 result@96（类型 ret_ty）→ fail@120 非 0 → raise
@@ -738,7 +738,7 @@ func tig_await(fut_val: i64, ret_ty: i64) -> i64 {
     }
     var res = s21_load(resp, T64)
     if actor_ret_via_ptr(ret_ty) {
-        // p.9.11：ptr 表示返回——result@96 存 i64，inttoptr 还原（同
+        // ptr 表示返回——result@96 存 i64，inttoptr 还原（同
         // gen_actor_sync_call 的读取侧）
         var ptA = ir.new_inst(g_cur_block, 25, types.named(TK_STR))
         ir.add_operand(ptA, res, 0)
@@ -770,7 +770,7 @@ func tig_await(fut_val: i64, ret_ty: i64) -> i64 {
     return res
 }
 
-// 调用方同步 RPC 生成（p.9.5.x T2/T4：per-actor 多槽队列 + 原子单飞）：
+// 调用方同步 RPC 生成（.x /：per-actor 多槽队列 + 原子单飞）：
 // `c.m(args...)` → 同步进门闩（mq_sync@160 CAS 抢占，至多一个同步 RPC 在途）
 // → 预留消息槽（tig_mq_reserve；队满背压限时等待空位）→ 写 mid/args 到
 // per-message 槽 + done=0 → 发布（mq_pub+=1）→ CAS 激活单飞标志，成功才 spawn
@@ -789,7 +789,7 @@ func gen_actor_sync_call(rech: i64, mi: i64, args: table<i64>, argtys: table<i64
     if !is_async {
         tig_mq_sync_enter(rec_ptr)
     }
-    // ② 预留消息槽（队满 → 背压限时等待空位；T3 Go 阻塞 send 语义降级）
+    // ② 预留消息槽（队满 → 背压限时等待空位；Go 阻塞 send 语义降级）
     var slot = tig_mq_reserve(rec_ptr)
     // ③ done=0（同步专用；唯一在途同步 RPC 独占 done@104 语义）
     if !is_async {
@@ -813,7 +813,7 @@ func gen_actor_sync_call(rech: i64, mi: i64, args: table<i64>, argtys: table<i64
         mp0 = mp0 + 1
     }
     tig_mq_publish(rec_ptr, slot, mi, args, margtys, syncf)
-    // p.9.11 future 模式（async 非 void，规范 §10.6）：凭据 = record 句柄。
+    // future 模式（async 非 void，规范 §10.6）：凭据 = record 句柄。
     // 步骤 ①③④ 与同步同形（门闩占用 ⇒ 同一 actor 至多一个未 await 凭据；
     // syncf=1 ⇒ 消费者完成后写 result@96/done@104）；差异仅在不等待——
     // `await f` 时再等 done/读 result/清门闩（tig_await，同一套尾部）。
@@ -827,7 +827,7 @@ func gen_actor_sync_call(rech: i64, mi: i64, args: table<i64>, argtys: table<i64
     // ⑤ 同步：等 done=1 → 读 result/fail → 清门闩（fail≠0 → raise）
     var resp = s21_gep(rec_ptr, 96, true)
     var donep = s21_gep(rec_ptr, 104, true)
-    // p.9.11 `reentrant`：本方法标注 reentrant 且正运行在 actor handler 内
+    // `reentrant`：本方法标注 reentrant 且正运行在 actor handler 内
     //（g_cur_actor_recval 为本方法的 record 句柄值 id）⇒ 等待期嵌套排空本
     // actor 的异步消息（规范 §10.7 重入，破 A→B→A 环）；否则纯空转（默认
     // 不重入语义一字不变）。
@@ -838,7 +838,7 @@ func gen_actor_sync_call(rech: i64, mi: i64, args: table<i64>, argtys: table<i64
     }
     var res = s21_load(resp, T64)
     if actor_ret_via_ptr(ret_ty) {
-        // p.9.11：ptr 表示返回（string/table/map/port）——result@96 存的是
+        // ptr 表示返回（string/table/map/port）——result@96 存的是
         // dispatch ptrtoint 后的 i64，此处 inttoptr 还原为指针值
         var ptS = ir.new_inst(g_cur_block, 25, types.named(TK_STR))
         ir.add_operand(ptS, res, 0)
@@ -888,7 +888,7 @@ func tig_default_val(ty: i64) -> i64 {
         return tig_bool_lit(0)
     }
     if ty == types.named(TK_ANY) {
-        // P2c：any 零值 = 零聚合 {tag:0, payload:0}（对齐 t21_zero；不可用
+        // any 零值 = 零聚合 {tag:0, payload:0}（对齐 t21_zero；不可用
         // tig_int_lit_ty(0,any)——会生成非法 `add {i64,i64} 0, 0`）
         var za2 = ir.new_inst(g_cur_block, 20, ty)
         ir.add_operand(za2, ty, 2)

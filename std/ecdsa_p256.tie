@@ -1,7 +1,7 @@
 type tie<class>
 // ============================================================================
 // ecdsa_p256.tie：标准库——纯 tie ECDSA 签名，NIST P-256 / SHA-256（命名空间 ecdsa_p256）
-// 用途：r.1.6.14——为 Linux 提供无 CNG/无 extern 的 P-256（secp256r1）EC-DSA 签名。
+// 用途：——为 Linux 提供无 CNG/无 extern 的 P-256（secp256r1）EC-DSA 签名。
 //   复用既有纯 tie `ext/tls/p256.tie` 的域算术与标量乘（已由 openssl 确定性密钥对
 //   逐字节验证）+ `std/bigint.tie`（mod-n 运算与模逆）+ `std/hmac.tie`（RFC 6979
 //   确定性 k 的 HMAC-SHA256 DRBG）。**无任何新的外部/系统依赖，纯 tie**。
@@ -32,7 +32,7 @@ type tie<class>
 //   keydata = V‖0x00‖int2octets(x)‖bits2octets(h)，再 0x01 一遍，随后循环产出候选。
 //   P-256 的 qlen=256=holen，无位截断，k = int(V) 直接判 1≤k<n。
 //
-// == 性能纪律（r.1.6.14）==
+// == 性能纪律==
 //   - mod-n / mod-p 全部走 bigint limb 数组（add/sub/mul/invmod），**无字符串参与**；
 //   - hex 仅在固定边界（32/65 字节，64/130 hex）做预分配拼接，无循环逐字节 += 大串；
 //   - 标量乘一律复用 `p256.mulf/mulp/addp`，sign=1 次、verify≈3 次标量乘（含点加），
@@ -41,7 +41,7 @@ type tie<class>
 // == 安全注记（同 p256/ed25519 定位）==
 //   仿射点运算与 bigint 分支非常数时间（field inv、double-and-add 按位分支），且
 //   RFC 6979 确定性 k 不引入系统 RNG 依赖；本模块面向功能正确性 + 确定性向量验证，
-//   **不提供侧信道隔离**，生产签名须在调用层复核（见 r167-ecdsa-decision.md §3.5）。
+//   **不提供侧信道隔离**，生产签名须在调用层复核。
 //
 // 依赖：bigint.tie（limb 数组算术）、hmac.tie（HMAC-SHA256）、ext/tls/p256.tie（点数/标量乘）。
 // ============================================================================

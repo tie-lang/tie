@@ -1,5 +1,5 @@
 type tie<logic>
-// lib/ir/tieir_test.tie —— tie.tir 库独立自检（p.9.21 G7 库资格②）
+// lib/ir/tieir_test.tie —— tie.tir 库独立自检
 // ============================================================
 // 无 driver 可跑：本文件即入口（tie<logic>），只 import 被测库（tieir_ser
 // 链载 ir/ir_meta/interner/std/bytes），覆盖序列化模块的全部对外契约：
@@ -209,7 +209,7 @@ func main() {
         ok = false
     }
 
-    // ---------- 模块片段 roundtrip（p.9.21.6-2，tieir_slice） ----------
+    // ---------- 模块片段 roundtrip（-2，tieir_slice） ----------
     // 构造 2 函数 2 模块：f（模块 0，1 参数 1 块 1 指令）/ g（模块 1，2 参数
     // 2 块 4 指令）。写模块 1 片段 → 清空 → 读回 → 断言只含 g 且 id 平移正确。
     ir.new_module()
@@ -242,7 +242,7 @@ func main() {
     ir.add_operand(gi2, ir.get_value(gi1), 0)
     ir.add_operand(gi2, gt, 1)
     ir.add_operand(gi2, ge, 1)
-    // p.9.21.8 池过滤覆盖：const_str（kind 0 载荷 = 字符串池 id）与全局名
+    // 池过滤覆盖：const_str（kind 0 载荷 = 字符串池 id）与全局名
     //（kind 3 载荷 = 池 id）——两类特殊操作数写入时须走池重映射而非值平移。
     var gi4 = ir.new_inst(gt, 62, 3)   // const_str（操作数① = 字符串池 id）
     ir.add_operand(gi4, interner.intern("hello"), 0)
@@ -273,7 +273,7 @@ func main() {
         ok = false
     }
     if wok {
-        // p.9.21.11：v3 片段不再可经 tieir.read（v2 全量反序列化）读回——
+        // v3 片段不再可经 tieir.read（v2 全量反序列化）读回——
         // roundtrip 改走装配路径（asm_from_slices 单片段全命中装配）。
         ir.new_module()
         ir_meta.reset_meta()
@@ -315,7 +315,7 @@ func main() {
             if !check(ir.func_entry(0) == 0, "片段入口块平移") {
                 ok = false
             }
-            // p.9.21.8 池过滤重映射：const_str 载荷 / 全局名读回文本一致
+            // 池过滤重映射：const_str 载荷 / 全局名读回文本一致
             //（池压缩错位会 lookup 到错串；符号/导出 name+sig 同路径覆盖）
             if !check(ir.ins_op(3) == 62 && ir.ins_opnd_kind(3, 0) == 0 && interner.lookup(ir.ins_opnd(3, 0)) == "hello",
                       "片段 const_str 载荷池重映射") {
@@ -331,7 +331,7 @@ func main() {
             if !check(ir_meta.sym_count() == 1 && ir_meta.export_count() == 1, "片段符号/导出子集") {
                 ok = false
             }
-            // p.9.21.11：v3 片段 span 段整体移除（恒为全 0 冗余）→ 装配后恒空
+            // v3 片段 span 段整体移除（恒为全 0 冗余）→ 装配后恒空
             if !check(ir_meta.span_count() == 0, "片段 v3 span 已移除（恒空）") {
                 ok = false
             }
@@ -351,7 +351,7 @@ func main() {
         ok = false
     }
 
-    // ---------- 多函数交错 roundtrip（p.9.21.7 / D1 回归核心） ----------
+    // ---------- 多函数交错 roundtrip（回归核心） ----------
     // 真实 irgen 形态：边建函数边建体（f 全建完再建 g）→ ops 段为每函数
     // [参数][操作数] 交错。序列化 → 反序列化 → 值空间重映射（重建 = 参数
     // 0..P-1 先行、结果 P.. 按序）后必须语义等价。

@@ -1,8 +1,8 @@
 type tie<class>
 // lib/codegen/irgen_str.tie —— 生成器内联原语（字符串/表容器/字典/数字转字符串） 子模块
 // ============================================================
-// 从 irgen.tie 拆分而来：把 S2.1 字符串原语（s21_*）、SSO 短串池（s21_sso_* / s21_sb_* /
-// s21_str_*）、动态表容器批次6（s21_table_* / t21_*）、字典容器批次7（s21_map_*）以及
+// 从 irgen.tie 拆分而来：把 字符串原语（s21_*）、SSO 短串池（s21_sso_* / s21_sb_* /
+// s21_str_*）、动态表容器、字典容器以及
 // 数字转字符串（tig_i128_to_str / tig_i64_to_str / s21_codepoint_to_str）这批"内联原语"
 // 独立成子文件。它们全部面向 {ptr,len} 字符串、表、字典容器，生成普通 tie-IR 指令
 //（零新 opcode），供 irgen 主文件的核心区函数与 sstmt/ssexpr 生成函数裸名调用。
@@ -23,8 +23,8 @@ type tie<class>
 // 依赖约定：ir.* / types / interner 等经主文件既有 import 链内联可达（本文件不重复 import）。
 
 namespace irgen {
-// ==================== S2.1 字符串 {ptr,len} 原语实现 ====================
-// 字符串运行时布局（S2.1 决策 O2 + F1）：
+// ==================== 字符串 {ptr,len} 原语实现 ====================
+// 字符串运行时布局（决策 O2 + F1）：
 //   ptr → [8 字节 i64 长度头][UTF-8 数据][\0 边界自动 NUL]
 // 长度头位于数据指针 -8 处（load i64, gep(i8, ptr, -8)）——len(s) O(1)；
 // 数据 NUL 结尾——旧 strlen/strcmp/printf 与 FFI 传方向零拷贝兼容。
@@ -33,7 +33,7 @@ namespace irgen {
 // sb_build 产出带头。以下辅助全部生成普通 tie-IR 指令（零新 opcode）。
 
 
-// ==================== 动态表容器批次 6（去 tie_table_* 桥） ====================
+// ==================== 动态表容器 ====================
 // 表句柄 = ptr → 32 字节 {cap:i64@0, len:i64@8, data:ptr@16, esz:i64@24}。
 //   cap  = 元素容量（个）；len = 元素数；data = 元素数组首指针；esz = 单元素字节数
 //   （bool=1，其余=8）。data 缓冲大小 = newcap*esz；增长策略 1.5x：
@@ -44,7 +44,7 @@ namespace irgen {
 // strlen+memcpy 扫描——对未初始化堆缓冲 strlen 读垃圾，属漏洞 A 类隐患）。
 
 
-// ==================== P2a：表容器运行时迁入 trm-lite（tl_tbl）====================
+// ==================== ：表容器运行时迁入 trm-lite（tl_tbl）====================
 // 句柄 = 32 字节 {cap@0, len@8, data@16, esz@24} 原始缓冲——tl_tbl（trm_lite.a）
 // 与旧内联布局完全一致，故 len/data/esz 字段读取（s21_table_len/t21_data/t21_esz）
 // 保留内联；可变操作（new/push/at/set）委托 tl_tbl$tbl_*（g_used_trmlite 置位，
@@ -68,8 +68,8 @@ pub func struct_align_of(t: i64) -> i64 {
 }
 
 
-// ==================== 字典容器批次 7（去 tie_map_* 桥） ====================
-// map 句柄复用批次 6 表基座（32 字节 {cap,len,data,esz}），esz 兼作模式标记：
+// ==================== 字典容器 ====================
+// map 句柄复用表基座（32 字节 {cap,len,data,esz}），esz 兼作模式标记：
 //   数组模式：esz=16 → data = 按 strcmp 字节序有序的 {key:ptr,value} 16B 元素数组；
 //             查找=二分、插入=二分定位+memmove 平移、精确增长（内存零尾部浪费）。
 //   哈希模式：esz=16|1<<63（i64 负值）→ data = 开放寻址哈希表（16B/槽；

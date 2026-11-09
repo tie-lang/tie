@@ -1,15 +1,15 @@
 type tie<class>
-// compiler/interp/interp_call_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// compiler/interp/interp_call_p1.tie —— 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 interp_call.tie。
-// 内置名单 nid 表（p.9.17.3 后半；namespace 外——tie 全局必须顶层）。
+// 内置名单 nid 表（后半；namespace 外——tie 全局必须顶层）。
 // 名单数据源在 is_builtin_nid 内内联惰性构建（勿在此处另抄一份）。
 var bi_nids: table<i64>;
 var bi_nids_ready: bool = false;
 
 namespace tiep {
-// 函数调用：内置函数 → 用户函数 → 报错。nid 版主实现（p.9.17.3 后半）：
+// 函数调用：内置函数 → 用户函数 → 报错。nid 版主实现（后半）：
 // 入口直传 interned id——免 nname_str 构造、内置名单与函数表查找全部整数键
 // （对齐变量环境 env_nids 先例）；name 只供 ns 前缀段 / dbg / 错误文本，
 // 由 interner.lookup 还原一次。args = 实参值表；arg_nodes = 实参 AST 节点表。
@@ -87,7 +87,7 @@ func call_fn_nid(nid: i64, args: table<Value>, arg_nodes: table<i64>) -> Value {
             }
             isess.var_declare(pname, tv)
         } else if isess.nval(p) == 1 {
-            // T0.3 by_ref：实参必须是可寻址表变量；引用槽记录调用方变量名。
+            // by_ref：实参必须是可寻址表变量；引用槽记录调用方变量名。
             // 注意：tie 的 || 不短路，先判越界再取节点
             if i >= len(arg_nodes) {
                 w_err = "函数 '" + name +
@@ -179,8 +179,8 @@ func call_fn(name: string, args: table<Value>, arg_nodes: table<i64>) -> Value {
     return call_fn_nid(interner.intern(name), args, arg_nodes)
 }
 
-// 内置函数名单（对齐 Rust call_fn 的内置分支；T4.1 核心子集）。
-// p.9.17.3 后半：名单数据源 = is_builtin_nid 内的 bi_nids（interned id 表，
+// 内置函数名单（对齐 Rust call_fn 的内置分支；核心子集）。
+// 后半：名单数据源 = is_builtin_nid 内的 bi_nids（interned id 表，
 // **内联惰性构建**——教训：经辅助函数取名单 = 每次判定多付一次完整解释器
 // 函数调用，F_call 实测 +28%）。字符串版 is_builtin 转薄包装。
 pub func is_builtin(name: string) -> bool {
@@ -210,15 +210,15 @@ pub func is_builtin_nid(nid: i64) -> bool {
         table_push(bi_nids, interner.intern("table_at"))
         table_push(bi_nids, interner.intern("eval"))
         table_push(bi_nids, interner.intern("eval_call"))
-        // 卫生/编译期代码生成（S3.3：gensym 显式卫生唯一标识符、eval_code
+        // 卫生/编译期代码生成（gensym 显式卫生唯一标识符、eval_code
         // 编译期代码生成——仅宏体环境可用，运行期语义层拦截）
         table_push(bi_nids, interner.intern("gensym"))
         table_push(bi_nids, interner.intern("eval_code"))
         table_push(bi_nids, interner.intern("eval_expr"))
-        // M4（dev33 批次9 任务27）：compile_error("消息") 宏内主动报编译错误——
+        // compile_error("消息") 宏内主动报编译错误——
         // 置 w_err 上抛，mexpand 以调用点行列号报「宏展开失败」。
         table_push(bi_nids, interner.intern("compile_error"))
-        // M4 过程宏（dev33 批次9）：token 流 API——tokenize（源码→token 流）、
+        // 过程宏：token 流 API——tokenize（源码→token 流）、
         // deparse（token 流→源码）、token_len/token_tag_at/token_lexeme_at
         // （token 流检视）。仅宏环境（编译期 interp）可用。
         table_push(bi_nids, interner.intern("tokenize"))
@@ -226,7 +226,7 @@ pub func is_builtin_nid(nid: i64) -> bool {
         table_push(bi_nids, interner.intern("token_len"))
         table_push(bi_nids, interner.intern("token_tag_at"))
         table_push(bi_nids, interner.intern("token_lexeme_at"))
-        // tsh 脚本运行时（shell 角色，p.9.4）：把过程/环境/文件桥开放给解释器
+        // tsh 脚本运行时（shell 角色）：把过程/环境/文件桥开放给解释器
         // 求值——基础原语在编译端内联到 libc/win32（无 tie_interp 依赖），直调。
         table_push(bi_nids, interner.intern("get_env"))
         table_push(bi_nids, interner.intern("set_env"))
@@ -241,7 +241,7 @@ pub func is_builtin_nid(nid: i64) -> bool {
         table_push(bi_nids, interner.intern("path_join"))
         table_push(bi_nids, interner.intern("mkdir_all"))
         table_push(bi_nids, interner.intern("remove_dir_all"))
-        // tsh 脚本字符串/目录/参数/哈希/超时内建（p.9.4 脚本语义升级）：
+        // tsh 脚本字符串/目录/参数/哈希/超时内建（脚本语义升级）：
         // 字面 `|` 逃逸 pipe_char；目录枚举 list_dir/walk_dir；脚本参数
         // arg_count/arg_at；file SHA256 get_file_hash；exit(n) 条件退出。
         table_push(bi_nids, interner.intern("contains"))
@@ -261,13 +261,13 @@ pub func is_builtin_nid(nid: i64) -> bool {
         table_push(bi_nids, interner.intern("get_file_hash"))
         table_push(bi_nids, interner.intern("exec_code_timeout"))
         table_push(bi_nids, interner.intern("exit"))
-        // 动态加载原语（p.9.17.4 第一步：编译端 p.6.6.20 四件套移植）
+        // 动态加载原语（第一步：编译端 四件套移植）
         table_push(bi_nids, interner.intern("load_library"))
         table_push(bi_nids, interner.intern("get_proc"))
         table_push(bi_nids, interner.intern("dyn_call"))
         table_push(bi_nids, interner.intern("dyn_call_p"))
         table_push(bi_nids, interner.intern("cstr_to_string"))
-        // p.9.17.4 第二步：JIT 源码库查询
+        // 第二步：JIT 源码库查询
         table_push(bi_nids, interner.intern("fn_source"))
         // 批次④确定性内建：remove_file（确定删单文件，替代 exec del 的 flake）、
         // sort_strings（字符串表按字节序排序）、regex_findstr（findstr 正则子集

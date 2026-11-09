@@ -1,5 +1,5 @@
 type tie<class>
-// lib/codegen/irgen_stmt_p4.tie —— 分片 4（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_stmt_p4.tie —— 分片 4
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_stmt.tie。
@@ -186,7 +186,7 @@ func tig_block_stmts(blk: i64) -> i64 {
         if block_terminated() {
             g_cur_block = ir.new_block(g_cur_func, interner.intern("blk.dead"))
         }
-        // r.1.6.7 逃逸分析前置钩子：生成该语句前先扫描其整棵子树，命中「句柄离开
+        // 逃逸分析前置钩子：生成该语句前先扫描其整棵子树，命中「句柄离开
         // 本次调用」的泄漏点即把相关候选表**立即置死**（单调）。一并覆盖：
         //   · 顺序语句 → 流敏感（泄漏点之前的访问仍享免锁快路径）；
         //   · 循环语句 → 子树里的泄漏点被**提前**置死（循环体只生成一次，
@@ -198,7 +198,7 @@ func tig_block_stmts(blk: i64) -> i64 {
         }
         i = i + 1
     }
-    // p.9.11.4 defer：命名函数体的最外层块末尾（隐式函数收尾，块未终止即流到
+    // defer：命名函数体的最外层块末尾（隐式函数收尾，块未终止即流到
     // 隐式 return）→ 运行函数级全部 defer（作用域 0 与已清标志的循环 defer 因
     // 已执行而自动跳过）。须在 scope_pop 前发射以保证 defer body 读到作用域变量。
     if g_in_fn_body != 0 && g_block_lvl == 1 && len(g_def_flags) > 0 && !block_terminated() {
@@ -214,7 +214,7 @@ func tig_block_stmts(blk: i64) -> i64 {
     return 0
 }
 
-// p.9.11.3 try 错误聚合块（表达式）：线性发射块体语句（块内 `?` 经 tig_try
+// try 错误聚合块（表达式）：线性发射块体语句（块内 `?` 经 tig_try
 // 在 Err/None 时 ret 传播到当前函数——与块外一致，try 纯语法分组）。末语句若
 // 为 N_EXPR_STMT 取其表达式值作为 try 块的值；无末值则返回哑值（仅作语句）。
 // 注意：块体语句可能被 tig_stmt 内部阻塞（如 `?` 条件切块），逐语句在同一

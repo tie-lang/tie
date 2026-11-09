@@ -1,10 +1,10 @@
 type tie<class>
-// lib/ir/pass/passes.tie —— 自举 v2 T2.3：具体 pass 实现
+// lib/ir/pass/passes.tie —— ：具体 pass 实现
 // ============================================================
-// 里程碑：自举 v2 计划 T2.3 Pass 基础设施（LLVM new pass manager 借鉴，
-// 用户决策：不做简化——分析/转换分离、依赖声明、失效声明全量实现）。
-// 本模块 = 演示 pass 族（验证基础设施可用，T2.8 接入真实 IR 前的最小
-// 样板），全部函数签名统一为 C1 分派约定 `(ir_unit: i64) -> i64`：
+// 职责：Pass 基础设施（LLVM new pass manager 借鉴，
+// 不做简化——分析/转换分离、依赖声明、失效声明全量实现）。
+// 本模块 = 演示 pass 族（验证基础设施可用，接入真实 IR 前的最小
+// 样板），全部函数签名统一为 分派约定 `(ir_unit: i64) -> i64`：
 //   分析 pass 返回「结果 id」（本阶段结果 = 引用计数，数字即结果）；
 //   转换 pass 返回「执行标记」（成功 = 1）。
 //
@@ -13,7 +13,7 @@ type tie<class>
 //               （printf/println/print）引用数 → 返回计数
 //   globalrefs  分析：统计全局符号引用（const_global 指令）数
 //   pruneexterns 转换：依赖 externrefs，剪除未引用 extern 声明
-//               ——本阶段仅演示执行 + 打印统计（T2.8 接真实 IR）
+//               ——本阶段仅演示执行 + 打印统计（接真实 IR）
 //   pruneglobals 转换：依赖 globalrefs，剪除未引用全局符号（同上）
 //
 // # 与 LLVM pass 的对应（不做简化的直接映射）
@@ -24,14 +24,14 @@ type tie<class>
 //     getAnalysis 满足依赖，执行后声明 preserved analyses——tie 版
 //     反向声明「失效集」pass_inv，语义等价）；
 //   - getAnalysis<T> 的「按类型取结果」在 tie 版 = 按名字（pass id）
-//     get_analysis + C1 字符串分派（无函数指针的语言替代方案）。
+//     get_analysis + 字符串分派（无函数指针的语言替代方案）。
 //
-// # C1 字符串分派（本模块是分派表的唯一登记方）
+// # 字符串分派（本模块是分派表的唯一登记方）
 //   - 登记顺序**固定**：externrefs=0 globalrefs=1 pruneexterns=2
 //     pruneglobals=3（ensure_dispatch 幂等注册，重复调用返回原序号）；
 //     dispatch_pass 的 switch case 常量 0-3 必须与登记顺序一致
-//     （C1 模式：整数 case 走 C5 LLVM switch 跳转表 O(1) 分派）。
-//   - 新增 pass 的接入步骤（T2.8 沿用）：
+//     （模式：整数 case 走 LLVM switch 跳转表 O(1) 分派）。
+//   - 新增 pass 的接入步骤（沿用）：
 //     ① 在 ensure_dispatch 尾部 register 新名字（case 常量 = 登记
 //        顺序，**只允许尾部追加，不得调整既有顺序**）；
 //     ② 在 dispatch_pass 的 switch 尾部追加对应 case（常量 = 该名字
@@ -48,19 +48,19 @@ type tie<class>
 //   reg_pass 登记由调用方（pass_test）完成，本模块只提供 compute/
 //   run 函数与分派表，职责单一。
 //
-// # IR 消费（当前仅扫描，T2.8 接真实消费）
+// # IR 消费（当前仅扫描，接真实消费）
 //   opcode 字面量对齐 ir.tie opcode 数据表（权威 53 条，ensure_opcodes）：
 //   42=extern_call 43=printf 44=println 45=print 64=const_global；
 //   ir_unit 参数当前为占位（单模块 IR 全局表，传 0；多模块时传模块句柄）。
 //
-// # 结果形态的演进（T2.8 前置说明）
-//   本阶段分析结果 = 引用计数（i64 即结果，便于验收断言）；T2.8
+// # 结果形态的演进（前置说明）
+//   本阶段分析结果 = 引用计数（i64 即结果，便于验收断言）；
 //   将改为「引用集合的列式 blob id」（extern 引用 id 列表 → 独立
 //   结果表，返回表 id）——AnalysisManager 的缓存/失效机制不变，
 //   只换结果内容，接口 `(ir_unit) -> i64` 保持。
 //
 // # 错误契约
-//   - 分析/转换函数本身不打印错误（C1 约定：处理器只返回结果，
+//   - 分析/转换函数本身不打印错误（约定：处理器只返回结果，
 //     错误判定归调用方）；本模块唯一的 println 是转换的演示统计；
 //   - dispatch_pass 对未知名字返回 -1，passmanager 置内部错误标记
 //     （越权请求/漏登记 dispatch 名都走这条路，显式暴露不静默）。
@@ -88,7 +88,7 @@ namespace passes {
 //
 // # 分派表与注册表的关系（两个「表」的分工）
 //   - 本模块的 dispatch 表（lib/dispatch.tie）：**名字 → 处理函数
-//     序号**，C1 分派用——只有这里登记过名字，dispatch_pass 才能
+//     序号**，分派用——只有这里登记过名字，dispatch_pass 才能
 //     分派到对应 compute_*/run_*；
 //   - passreg 注册表：**名字 → pass id + 类别 + 依赖/失效声明**，
 //     管线调度用——get_analysis/run_pass 用它做依赖满足与强制校验；
@@ -111,7 +111,7 @@ func ensure_dispatch() {
 
 // externrefs 分析：扫描 IR 指令表，统计 extern 调用与桥函数
 // （printf/println/print）引用数。结果 id = 引用计数（本阶段
-// 计数即结果；T2.8 改为引用集合的列式 blob id）。
+// 计数即结果；改为引用集合的列式 blob id）。
 // 统计口径说明：42=extern_call 是显式 extern 符号调用；
 // 43/44/45（printf/println/print）是编译器内置桥函数调用，
 // 语义上也属于「外部符号依赖」，一并计入——pruneexterns 判断
@@ -162,7 +162,7 @@ pub func compute_globalrefs(ir_unit: i64) -> i64 {
 // ---------- 转换 pass ----------
 
 // pruneexterns 转换：依赖 externrefs（由 AnalysisManager 自动满足）。
-// 正式实现（T2.8）：从 IR 移除未被引用的 extern 声明，并按其
+// 正式实现：从 IR 移除未被引用的 extern 声明，并按其
 // preserved/pass_inv 声明失效下游分析。本阶段仅演示执行：
 // 重新统计引用数打印（演示：正式实现应从缓存读分析结果，此处
 // 重扫仅为输出演示统计），返回执行标记 1。
@@ -178,7 +178,7 @@ pub func run_pruneglobals(ir_unit: i64) -> i64 {
     return 1
 }
 
-// ---------- C1 字符串分派（唯一入口）----------
+// ---------- 字符串分派（唯一入口）----------
 // passmanager 经本函数调用任意 pass：按名字查分派表序号 → switch
 // 静态展开（case 常量 0-3 与 ensure_dispatch 登记顺序一一对应，
 // 见文件头说明）。分析走 compute_*，转换走 run_*；未知名字（未

@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/sinfer_q3.tie —— 分片 3（p.9.21.3 单文件 ≤800 行）
+// lib/front/sinfer_q3.tie —— 分片 3
 // ============================================================
 // 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sinfer.tie。
 // 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
@@ -82,14 +82,14 @@ pub func infer_generic_fn_call(full_name: string, gti: i64, id: i64, args: table
     if vr < 0 {
         return -1
     }
-    // S1.2 安全边界：泛型 unsafe 函数在安全代码中调用 = 编译错误
+    // 安全边界：泛型 unsafe 函数在安全代码中调用 = 编译错误
     if sstate.sig_unsafe(sig) == 1 && g_unsafe_depth == 0 {
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
         sm_err_msg = "调用 unsafe 函数 '" + full_name + "' 必须在 unsafe 块或 unsafe 函数中（安全代码禁止触底）"
         return -1
     }
-    // 参数个数（实例化签名；p.8.1.3 变长泛型：变参函数允许超出 total）
+    // 参数个数（实例化签名；变长泛型：变参函数允许超出 total）
     var req = sg_required[sig]
     var total = sg_nparams[sig]
     var is_var = sstate.fn_has_variadic(sig)
@@ -100,7 +100,7 @@ pub func infer_generic_fn_call(full_name: string, gti: i64, id: i64, args: table
         return -1
     }
     // 参数类型检查（实例化形参已具体化 → 现有类型系统自然验证；
-    // p.8.1.3 变长泛型：超出固定形参数（total-1）的实参与变参元素类型匹配）
+    // 变长泛型：超出固定形参数（total-1）的实参与变参元素类型匹配）
     var off = sg_off[sig]
     var j2: i64 = 0
     while j2 < nc {
@@ -262,20 +262,20 @@ pub func infer_method_call(id: i64) -> i64 {
             // 未绑定：命名空间前缀
             full = rname + "::" + mname
         } else if types.kind(rt2) == K_ATOMIC {
-            // S1.2 A1 atomic<T> 内置方法（c.load() / c.fetch_add(1, Relaxed)）
+            // A1 atomic<T> 内置方法（c.load / c.fetch_add(1, Relaxed)）
             return infer_atomic_method(rt2, mname, args, id)
         } else if types.kind(rt2) == K_ACTOR {
             // 一期并发：actor 句柄方法调用（c.inc(5) 转发到该 actor 的消息方法）
             return infer_actor_method(rt2, mname, args, id)
         } else if types.kind(rt2) == K_PORT {
-            // S2.4：port 对象方法调用（动态分发，vtable 间接调用）
+            // port 对象方法调用（动态分发，vtable 间接调用）
             return infer_port_method(rt2, mname, args, id)
         } else if types.is_guard(rt2) {
             // 三期 A 组：guard<cap>.delegate(cap') 同域派生（第1批，最小权限移交）
             return infer_guard_method(rt2, mname, args, id)
         } else if rt2 == types.named(TK_STR) && mname == "chars" {
-            // 字符串码点迭代器：`s.chars()` 是 for-in 专用（S2.1 后置语法糖，
-            // dev33 批次4）。无实参；返回类型 = string（单字符元素，语义层
+            // 字符串码点迭代器：`s.chars` 是 for-in 专用（后置语法糖，
+            // ）。无实参；返回类型 = string（单字符元素，语义层
             // scheck 的 S_N_FOR 分支负责识别该 MethodCall 并将循环变量登记
             // 为单字符 string）。
             if len(args) != 0 {
@@ -292,7 +292,7 @@ pub func infer_method_call(id: i64) -> i64 {
             return infer_struct_method(recv, rt2, mname, args, id)
         }
     } else {
-        // S2.4：表达式接收者（list[0] / 函数返回值 / 字段访问）——先推断
+        // 表达式接收者（list[0] / 函数返回值 / 字段访问）——先推断
         // 接收者类型：port 对象 → 动态分发（vtable 间接调用）；其余按
         // 命名空间路径解析（既有行为）。
         var rt3 = infer_expr(recv)
@@ -312,7 +312,7 @@ pub func infer_method_call(id: i64) -> i64 {
             g_typed = g_typed + 1
             return types.named(TK_STR)
         }
-        // p.9.11.17 表达式接收者的 fn 类型字段调用（如 make_cb().f(7)）：
+        // 表达式接收者的 fn 类型字段调用（如 make_cb.f(7)）：
         // 接收者类型为 struct 且 mname 命中 fn 类型字段 → 改写为 CALL_EXPR
         //（同绑定实例路径）；否则按命名空间路径解析（既有行为）。
         if rt3 >= 0 && types.kind(rt3) == K_STRUCT {
@@ -338,7 +338,7 @@ pub func infer_method_call(id: i64) -> i64 {
         sm_err_msg = "方法调用的对象必须是 struct 实例或 struct 名，实际是 " + types.type_name(infer_expr(recv))
         return -1
     }
-    // T3b 泛型扩展：命名空间路径的泛型模板函数调用（`ns.max<i64>(...)`）——
+    // 泛型扩展：命名空间路径的泛型模板函数调用（`ns.max<i64>(...)`）——
     // fn_sig 未命中但 gt_* 模板表命中 → 泛型调用路径（调用点推断 + 单态化展开）。
     // 与 sinfer_ret.resolve_call_name 裸调用通道的泛型扩展对称（sinfer_ret L488）。
     var gti_ns = sstate.gt_find(full)
@@ -443,7 +443,7 @@ pub func infer_method_call(id: i64) -> i64 {
     if vr < 0 {
         return -1
     }
-    // S1.2 安全边界：unsafe 命名空间函数在安全代码中调用 = 编译错误
+    // 安全边界：unsafe 命名空间函数在安全代码中调用 = 编译错误
     if sstate.sig_unsafe(sig) == 1 && g_unsafe_depth == 0 {
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
@@ -470,7 +470,7 @@ pub func infer_method_call(id: i64) -> i64 {
     var off = sg_off[sig]
     var j: i64 = 0
     while j < len(args) {
-        // 形参类型先于实参推断取出：短闭包实参位（p.9.11.34 上下文消歧）需要
+        // 形参类型先于实参推断取出：短闭包实参位（上下文消歧）需要
         // 「形参 fn ⇒ 展开」判据在 infer 之前生效。变参区实参不展开（元素类型）。
         var want_m = sp_tys[off + j]
         if has_var {
@@ -504,7 +504,7 @@ pub func infer_method_call(id: i64) -> i64 {
     return rt
 }
 
-// ==================== S2.3 目标类型引导的泛型 enum 构造 ====================
+// ==================== 目标类型引导的泛型 enum 构造 ====================
 // `var b: Result<i64, string> = Result.Err("bad")`：Result.Err 的 payload 是 E
 // （string 可推断），但 T 无信息（Err 不含 T）→ infer_generic_enum_construct
 // 报"无法推断类型参数 T"。目标类型引导：用赋值/return 目标类型（hint_ty，
@@ -513,7 +513,7 @@ pub func infer_method_call(id: i64) -> i64 {
 // 探测入口：右侧表达式是 MethodCall（接收者 = 泛型 enum 模板名）时调用。
 // 返回推断类型；-1 表示"不是可引导的泛型 enum 构造"（不设错误，调用方回退）。
 pub func try_enum_construct_hinted(expr: i64, hint_ty: i64) -> i64 {
-    // 支持两种形态（S2.3 扩展）：
+    // 支持两种形态（扩展）：
     //   - MethodCall：EnumName.Variant(args)（带 payload 构造）
     //   - FieldAccess：EnumName.Variant（无 payload 变体裸引用，如 Option.None）
     // 无 payload 变体裸引用在 infer_expr 的 FieldAccess 分支会报"无法推断类型
@@ -676,7 +676,7 @@ pub func recv_path_name(recv: i64) -> string {
 // struct 实例方法转发
 pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, ref args: table<i64>, id: i64) -> i64 {
     var bk = types.kind(recv_ty)
-    // p.9.11.20 enum 关联方法：接收者为 enum 类型 → 方法全名 = <enum 名>::<方法>
+    // enum 关联方法：接收者为 enum 类型 → 方法全名 = <enum 名>::<方法>
     //（复用 struct 方法机制：namespace <enum 名> 内 pub func，首参 = enum 类型
     // 自动 ref）。enum 名经 sstate.enum_name_of（en_keys/en_vals 反查）。
     var sname = ""
@@ -702,7 +702,7 @@ pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, ref args: t
     var full = sname + "::" + mname
     var sig = sstate.fn_sig(full)
     if sig < 0 {
-        // T3b 泛型方法（2026-08-14）：接收者是实例化 struct（如 Box$i64）→
+        // 泛型方法：接收者是实例化 struct（如 Box$i64）→
         // 目标函数 = 模板方法（Box::get）→ 从接收者类型提取类型实参 → 展开
         var rec = sstate.gin_find(sname)
         if rec >= 0 && gin_is_struct[rec] == 1 {
@@ -719,7 +719,7 @@ pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, ref args: t
                 }
             }
         }
-        // p.9.11.17 fn 类型字段调用：`cb.f(args)`（f 为 fn 类型字段）→ 改写为
+        // fn 类型字段调用：`cb.f(args)`（f 为 fn 类型字段）→ 改写为
         // CALL_EXPR（函数值间接调用）。字段名命中但非 fn 类型 → 不是字段调用，
         // 落回「没有方法」诊断。仅 struct 接收者（enum 无字段表，si 是 enum
         // 索引，不能查 cls_* 字段表）。
@@ -750,14 +750,14 @@ pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, ref args: t
     if vr < 0 {
         return -1
     }
-    // S1.2 安全边界：unsafe 方法在安全代码中调用 = 编译错误
+    // 安全边界：unsafe 方法在安全代码中调用 = 编译错误
     if sstate.sig_unsafe(sig) == 1 && g_unsafe_depth == 0 {
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
         sm_err_msg = "调用 unsafe 方法 '" + full + "' 必须在 unsafe 块或 unsafe 函数中（安全代码禁止触底）"
         return -1
     }
-    // p.9.11.25 方法命名实参 + 默认值（定案三）：与普通函数同一套重排/补齐，
+    // 方法命名实参 + 默认值（定案三）：与普通函数同一套重排/补齐，
     // 唯一差别是**接收者不参与**（recv_skip=1）——它已由调用对象给定，既不能
     // 被命名指定，也不参与默认值补齐。必须在参数个数检查**之前**做：重排会把
     // 跳过的默认值参数补齐，n_args 随之变为完整，个数检查即自然通过。
@@ -821,7 +821,7 @@ pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, ref args: t
     return rt
 }
 
-// p.9.11.16 迭代器协议（内建约定，注释定死）：可迭代对象 = 用户 struct 实现
+// 迭代器协议（内建约定，注释定死）：可迭代对象 = 用户 struct 实现
 // 两个方法（在 namespace <Struct 名> 内，与 struct 方法约定一致，首参 self 自动 ref）：
 //   pub func has_next(self) -> bool   —— 序列中还有元素？
 //   pub func next(self) -> T          —— 取当前元素并推进游标（T = 元素类型）

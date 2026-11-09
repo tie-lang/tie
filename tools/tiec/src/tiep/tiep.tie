@@ -1,11 +1,11 @@
 type tie<class>
-// compiler/interp/interp.tie —— 自举 v2 T4.1：解释器核心（eval/eval_call 两趟
+// compiler/interp/interp.tie —— ：解释器核心（eval/eval_call 两趟
 // 解析 + 树遍历求值器）
 // ============================================================
-// 里程碑：自举 v2 计划 T4.1（.omo/plans/self-hosting-v2.md）——把 Rust 解释器
+// 说明：把 Rust 解释器
 // crates/tie-interp/src/lib.rs 的 Session::eval（1653 行）/ eval_call（1716 行）/
 // Env::exec_stmt（1942 行）/ eval_expr（2311 行）/ eval_binary（2621 行）/
-// call_fn（2769 行）移植为 tie 语言，消费自举前端（T2.4-2.7）产出的
+// call_fn（2769 行）移植为 tie 语言，消费自举前端产出的
 // **列式 AST**（sstate 协议文本 → 本模块归档池，isess 提供稳定节点句柄）。
 //
 // # eval 两趟逻辑（对齐 Rust 1653 行）
@@ -80,7 +80,7 @@ var g_tsh_args_mode: bool = false;
 pub var g_split_defs: string = "";
 pub var g_split_stmts: string = "";
 
-// ==================== S3.3 宏执行环境状态 ====================
+// ==================== 宏执行环境状态 ====================
 // H2 词法卫生（默认）：宏体准引用内的绑定（var/func 声明名）克隆时改名
 // "__hyg<计数>_<原名>"——每次准引用求值计数递增，展开多次不冲突；调用方
 // 插值嵌入的代码保持原名（不捕获、不被捕获）。
@@ -94,13 +94,13 @@ pub var g_clone_new: table<i64>;   // 克隆 id 映射（s_* 池新 id）
 pub var g_hyg_old: table<i64>;     // 卫生改名映射（旧 name 池 id）
 pub var g_hyg_new: table<i64>;     // 卫生改名映射（新 name 池 id）
 
-// ==================== M4 token 流解析缓存 ====================
-// tokenize/deparse/token_* 内置（dev33 批次9）共享：parse_tokens 把 token 流
+// ==================== token 流解析缓存 ====================
+// tokenize/deparse/token_* 内置共享：parse_tokens 把 token 流
 // 文本解析为 tag 与 lexeme 两平行表，供检视内置与 deparse 复用。
 pub var g_tk_tags: table<i64>;       // 解析后的 token 流 tag 表
 pub var g_tk_lexemes: table<string>; // 解析后的 token 流 lexeme 表（未转义）
 
-// ==================== p.9.17.4 第二步：JIT 源码库 ====================
+// ==================== 第二步：JIT 源码库 ====================
 // 顶层函数定义源码切片：split_top/flush_statement 在源码扫描时顺带捕获
 // （脚本 eval_script 与 REPL eval 两条入口都经 split_top 副作用）；fn_source
 // 内建按名查询，返回原文切片供宿主装配临时编译单元（JIT 管线）。
@@ -119,7 +119,7 @@ pub func reset() {
     g_loop_label = ""
     g_consume_outer = 0
     g_consume_outer_val = Value.Nil
-    // S3.3：宏执行环境计数清零（卫生/gensym/克隆映射/嵌套深度）
+    // 宏执行环境计数清零（卫生/gensym/克隆映射/嵌套深度）
     g_hyg_counter = 0
     g_gensym_n = 0
     g_macro_depth = 0
@@ -127,10 +127,10 @@ pub func reset() {
     g_clone_new = table_new_i64()
     g_hyg_old = table_new_i64()
     g_hyg_new = table_new_i64()
-    // M4 token 流解析缓存清零
+    // token 流解析缓存清零
     g_tk_tags = table_new_i64()
     g_tk_lexemes = table_new_string()
-    // p.9.17.4 第二步：JIT 源码库清零（建好即置 ready，捕获侧无需再判空表）
+    // 第二步：JIT 源码库清零（建好即置 ready，捕获侧无需再判空表）
     g_fn_src_names = table_new_string()
     g_fn_src_texts = table_new_string()
     g_fn_src_ready = true
@@ -161,7 +161,7 @@ pub func script_args() -> table<string> {
 // 求值一段代码：顶层定义注册，否则包装为 main 体执行，返回格式化结果或错误。
 pub func eval(src: string) -> string {
     w_err = ""
-    // p.9.17.4 第二步：顶层函数源码捕获（split_top 扫描的副作用——把
+    // 第二步：顶层函数源码捕获（split_top 扫描的副作用——把
     // 定义段里的 func 源码切片存入 JIT 源码库；结果丢弃，主流程不变）。
     split_top(src)
     // 第一趟：原样解析（顶层定义）
@@ -245,7 +245,7 @@ pub func eval(src: string) -> string {
     return ""
 }
 
-// ==================== 整文件脚本求值（tsh 角色，p.9.4） ====================
+// ==================== 整文件脚本求值（tsh 角色） ====================
 // eval_script：把整个 `.tsh.tie` 脚本作为单一代码块求值——两趟：第一趟注册全部
 // 顶层定义（函数/命名空间/全局变量/extern），第二趟按源码顺序执行顶层可执行语句
 //（不压作用域 → var 落 globals、函数持久）。由此达成完整脚本语义：

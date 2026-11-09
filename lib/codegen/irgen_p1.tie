@@ -1,5 +1,5 @@
 type tie<class>
-// lib/codegen/irgen_p1.tie —— irgen 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_p1.tie —— irgen 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen.tie。
@@ -116,7 +116,7 @@ func resolve_call_name(fnm: string) -> string {
         if sstate.fn_sig(cand2) >= 0 {
             return cand2
         }
-        // 别名增名（2026-10-12，镜像 sinfer.resolve_call_name）：using 记录的
+        // 别名增名（镜像 sinfer.resolve_call_name）：using 记录的
         // 名称可能已被改名为别名——回退再试（两处实现必须同时对齐）
         var rn5 = sstate.ns_rename_target(full2)
         if str_len(rn5) > 0 {
@@ -233,7 +233,7 @@ func tig_variadic_table(nodes: table<i64>, elem: i64) -> i64 {
     var t = s21_table_new(size_v)
     var i: i64 = 0
     while i < len(nodes) {
-        // p.8.2.10 展开实参（N_SPREAD_ARG）：operand 是表，运行期把其全部元素
+        // 展开实参（N_SPREAD_ARG）：operand 是表，运行期把其全部元素
         // 依序并入变参表（tig_variadic_append_spread 发射复制循环）。
         if ast.s_tag(nodes[i]) == N_SPREAD_ARG {
             var sp_op = sstate.child(nodes[i], 0)
@@ -271,7 +271,7 @@ func tig_variadic_table(nodes: table<i64>, elem: i64) -> i64 {
     return t
 }
 
-// p.8.2.10 展开实参：把源表 src 的全部元素运行期依序并入变参表 t（复制循环）。
+// 展开实参：把源表 src 的全部元素运行期依序并入变参表 t（复制循环）。
 // 发射 4 块（cond/body/step/exit）线性小循环，逐元素 s21_table_at + s21_table_push。
 // 内部循环不做 loop_push/loop_pop（非用户循环——外层用户循环的 break/continue
 // 仍应导向用户循环标签，不受本复制循环干扰）。
@@ -468,11 +468,11 @@ func is_libc_sym(sym: string) -> bool {
         sym == "fread" || sym == "fseek" || sym == "ftell" || sym == "fclose" || sym == "fflush" {
         return true
     }
-    // S2.1：libc memcpy（StringBuilder 数据拷贝；无需 tie_interp 链接）
+    // libc memcpy（StringBuilder 数据拷贝；无需 tie_interp 链接）
     if sym == "memcpy" {
         return true
     }
-    // 批次 7：libc memmove（map 有序数组插入平移；重叠安全，无需 tie_interp 链接）
+    // libc memmove（map 有序数组插入平移；重叠安全，无需 tie_interp 链接）
     if sym == "memmove" {
         return true
     }
@@ -484,13 +484,13 @@ func is_libc_sym(sym: string) -> bool {
     if sym == "exit" || sym == "remove" {
         return true
     }
-    // r.1.6.6：libc/CRT 常用符号——abs（整数绝对值）/atexit（退出注册）/
+    // libc/CRT 常用符号——abs（整数绝对值）/atexit（退出注册）/
     // _setjmp/longjmp（闭包/分发栈回退，glibc 提供 _setjmp）。未登记会把纯
     // libc 程序误判为 interp 桥，Linux 目标链接直接拒绝。
     if sym == "abs" || sym == "atexit" || sym == "_setjmp" || sym == "longjmp" {
         return true
     }
-    // r.1.6.6：libc clock（tiec 内部计时点，Windows CRT/POSIX 均提供）——
+    // libc clock（tiec 内部计时点，Windows CRT/POSIX 均提供）——
     // 未登记会把纯 libc 程序误判为 interp 桥，Linux 目标链接直接拒绝。
     if sym == "clock" {
         return true
@@ -510,7 +510,7 @@ func is_libc_sym(sym: string) -> bool {
         sym == "copysign" || sym == "fmod" || sym == "remainder" || sym == "hypot" {
         return true
     }
-    // p.6.4.4：libc _gcvt（to_string(f64)：非变参 CRT，写 %g 格式数字到缓冲。Windows
+    // libc _gcvt（to_string(f64)：非变参 CRT，写 %g 格式数字到缓冲。Windows
     // clang 手写 IR 的 FP 变参（snprintf）会错位，故用非变参 _gcvt）
     if sym == "_gcvt" {
         return true
@@ -519,13 +519,13 @@ func is_libc_sym(sym: string) -> bool {
     if sym == "system" || sym == "getenv" || sym == "time" {
         return true
     }
-    // p.6.4.1 内联基础原语：rand（rand_range）/ _write（print_err → stderr）
+    // 内联基础原语：rand（rand_range）/ _write（print_err → stderr）
     // 均为 CRT 符号（非 interp 桥）。
     if sym == "rand" || sym == "_write" {
         return true
     }
-    // p.6.4.1 UTF-16 宽字符桥：Windows 系统调用面（kernel32/shell32，非 interp 桥）
-    // r.1.6.6：GetTickCount（kernel32 毫秒时钟，tiec 内部计时点）补登记——未登记
+    // UTF-16 宽字符桥：Windows 系统调用面（kernel32/shell32，非 interp 桥）
+    // GetTickCount（kernel32 毫秒时钟，tiec 内部计时点）补登记——未登记
     // 会把纯 libc 程序误判为 interp 桥；Linux 由 linux_compat.c shim 解析。
     if sym == "GetCommandLineW" || sym == "CommandLineToArgvW" || sym == "LocalFree" ||
         // 2026-10-16：补 GetEnvironmentVariableW —— tiej execrun.env_get（Windows
@@ -535,7 +535,7 @@ func is_libc_sym(sym: string) -> bool {
         sym == "GetTickCount" {
         return true
     }
-    // p.6.6.20 std/sqlite 动态加载：kernel32 LoadLibraryW/GetProcAddress
+    // std/sqlite 动态加载：kernel32 LoadLibraryW/GetProcAddress
     //（winsqlite3.dll 无 .lib 可链，须动态加载；符号经 CRT 隐式链 kernel32）
     if sym == "LoadLibraryW" || sym == "GetProcAddress" {
         return true
@@ -555,7 +555,7 @@ func is_libc_sym(sym: string) -> bool {
         sym == "SleepConditionVariableCS" {
         return true
     }
-    // p.6.4.2/p.6.4.3 文件系统原语内联：kernel32/shell32 *W API（UTF-16 安全路径）
+    // 文件系统原语内联：kernel32/shell32 *W API（UTF-16 安全路径）
     // + CRT memset（SHFILEOPSTRUCTW 零化）。全为系统库符号，非 interp 桥。
     if sym == "memset" || sym == "CreateFileW" || sym == "ReadFile" ||
         sym == "WriteFile" || sym == "FlushFileBuffers" || sym == "GetFileSizeEx" ||
@@ -572,7 +572,7 @@ func is_libc_sym(sym: string) -> bool {
         sym == "GetConsoleScreenBufferInfo" {
         return true
     }
-    // p.6.4.6 exec_output 进程管道内联：kernel32 进程/管道/句柄 API（非 interp 桥）。
+    // exec_output 进程管道内联：kernel32 进程/管道/句柄 API（非 interp 桥）。
     // CreatePipe/CreateProcessW/ReadFile 捕获子进程 stdout；SetHandleInformation 置
     // 可继承位；WaitForSingleObject/CloseHandle/GetExitCodeProcess 收尾。kernel32 经
     // CRT 隐式链接，无需额外 .lib。GetStdHandle(负句柄常量) 供 STARTUPINFOW.hStdInput。
@@ -580,7 +580,7 @@ func is_libc_sym(sym: string) -> bool {
         sym == "GetExitCodeProcess" || sym == "GetStdHandle" {
         return true
     }
-    // p.6.4.5 网络原语内联：Winsock2 符号（ws2_32，非 interp 桥）。仅 Windows
+    // 网络原语内联：Winsock2 符号（ws2_32，非 interp 桥）。仅 Windows
     // 目标下程序实际引用（net_* 调内联 IR 会 emit 这些符号），Linux 交叉目标
     // 若用 net_* 自然缺 ws2_32——与本文件其余 Win32 系统库符号处理一致。
     // 2026-10-12：清单收敛至 is_wsock_sym 单一来源（新增 select/ioctlsocket/
@@ -588,7 +588,7 @@ func is_libc_sym(sym: string) -> bool {
     if is_wsock_sym(sym) {
         return true
     }
-    // r.1.6.2：Linux POSIX 文件系统符号（file_* 内置 Linux 分支，UTF-8 直通）。
+    // Linux POSIX 文件系统符号（file_* 内置 Linux 分支，UTF-8 直通）。
     // 全为 libc 符号（非 interp 桥）——Linux 目标链 tie_interp.lib 会直接报错，
     // 凡引用 POSIX 文件符号必须置 is_libc，否则 link_exe 判 need_interp 失败。
     if sym == "open" || sym == "read" || sym == "write" || sym == "close" ||
@@ -597,8 +597,8 @@ func is_libc_sym(sym: string) -> bool {
         sym == "stat" || sym == "rename" {
         return true
     }
-    // r.1.6.3：Linux POSIX process/cwd/env 符号（exec_output/cwd/set_env 内置
-    // Linux 分支，UTF-8 直通；全为 libc 符号，非 interp 桥——同 r.1.6.2 注释）。
+    // Linux POSIX process/cwd/env 符号（exec_output/cwd/set_env 内置
+    // Linux 分支，UTF-8 直通；全为 libc 符号，非 interp 桥——同 注释）。
     // pipe/fork/dup2/execl/waitpid 供 exec_output 管道捕获；getcwd/setenv 供
     // cwd/set_env；strlen 已登记（arg_string/exec_output 取参长）。
     // 2026-10-15：补 chdir/execv/pipe2/_exit —— tiej 执行域引擎（execrun.tie，
@@ -611,8 +611,8 @@ func is_libc_sym(sym: string) -> bool {
         sym == "isatty" || sym == "tcgetattr" || sym == "tcsetattr" {
         return true
     }
-    // r.1.6.4：Linux POSIX socket 符号（net_* 内置 Linux 分支直调 libc socket 族，
-    // UTF-8/字节 IO 直通；全为 libc 符号，非 interp 桥——同 r.1.6.2 注释）。
+    // Linux POSIX socket 符号（net_* 内置 Linux 分支直调 libc socket 族，
+    // UTF-8/字节 IO 直通；全为 libc 符号，非 interp 桥——同 注释）。
     // socket/connect/bind/listen/accept/send/recv/sendto/recvfrom 同 libc 名；
     // gethostbyname/inet_addr 已在上方 Winsock 组登记（POSIX 亦存在）。
     if sym == "socket" || sym == "connect" || sym == "bind" || sym == "listen" ||
@@ -626,9 +626,9 @@ func is_libc_sym(sym: string) -> bool {
         sym == "epoll_wait" || sym == "fcntl" || sym == "poll" {
         return true
     }
-    // r.1.6.16：Linux 目标私有豁免——由 trm_lite_linux.a 的 compat shim 成员解析
-    // （BCryptGenRandom = getrandom(2) shim，r.1.6.8；tie_regex_* 五原语 = POSIX
-    // regcomp 桥，r.1.6.11）。仅在 Linux 目标登记：Windows 下二者保持原 interp
+    // Linux 目标私有豁免——由 trm_lite_linux.a 的 compat shim 成员解析
+    // （BCryptGenRandom = getrandom(2) shim，；tie_regex_* 五原语 = POSIX
+    // regcomp 桥，）。仅在 Linux 目标登记：Windows 下二者保持原 interp
     // 桥路径（tie_interp.lib / bcrypt.dll 解析），避免破坏既有链接行为。
     // 注意 tig_is_linux() 取 g_asm_target（driver 注入，恒非空）。
     if tig_is_linux() {
@@ -638,7 +638,7 @@ func is_libc_sym(sym: string) -> bool {
             sym == "tie_regex_replace" {
             return true
         }
-        // r.1.6.18：trm-lite Win32 同步原语对等（tl_linux_shim.o 成员提供 pthread
+        // trm-lite Win32 同步原语对等（tl_linux_shim.o 成员提供 pthread
         // 实现：Sleep→nanosleep、WakeAllConditionVariable→pthread_cond_broadcast）——
         // std_net_bytes 等复杂形态程序的 channel 广播/时限路径，Linux 由 .a 解析。
         if sym == "Sleep" || sym == "WakeAllConditionVariable" {
@@ -743,7 +743,7 @@ func is_extern_fn_id(fid: i64) -> bool {
     return false
 }
 
-// 动态库边界类型检查（任务 36 + S10 扩展）：标量 + string + slice<T> + repr(C) pod
+// 动态库边界类型检查（+ 扩展）：标量 + string + slice<T> + repr(C) pod
 // struct 可跨动态库边界；void 仅作返回类型。
 //   - slice<T>：{ptr,len} 两 i64，C ABI 良定义（如 {uintptr_t, size_t}）；
 //   - repr(C) pod struct：仅标量/固定长数组/嵌套 pod，布局明确可序列化；
@@ -761,11 +761,11 @@ func dynlib_ty_ok(t: i64) -> string {
     if t == types.named(TK_BOOL) || t == types.named(TK_TRIT) || t == types.named(TK_CHAR) {
         return ""
     }
-    // S10 扩展链面：slice<T> = {ptr,len}（指针+长度两个 i64，跨边界布局确定）
+    // 扩展链面：slice<T> = {ptr,len}（指针+长度两个 i64，跨边界布局确定）
     if types.kind(t) == K_SLICE {
         return ""
     }
-    // S10 扩展链面：repr(C) pod struct（固定 C 内存布局，字段仅标量）
+    // 扩展链面：repr(C) pod struct（固定 C 内存布局，字段仅标量）
     if is_repr_c_pod(t) {
         return ""
     }

@@ -1,13 +1,13 @@
 type tie<class>
 // compiler/interp/interp_dbug.tie —— 自举 v4 工具链共享仪器
-//（p.9.2.1 崩溃诊断 / p.9.2.3 DAP 调试 / p.9.2.4 剖析 的共享底层）
+//（崩溃诊断 / DAP 调试 / 剖析 的共享底层）
 // ============================================================
 // 范式：与 interp_call.tie 同——`namespace tiep` 跨文件闭合并集覆盖
 // call_fn / exec_stmt，顶层 var 全局可见、默认关闭（dbg_on=false），零行为
 // 侵入——不启用时 call_fn / exec_stmt 只多一个 `if dbg_on` 分支（常量假），
 // 编进 tiec.exe 不改变任何默认语义（自举不动点前提）。
 //
-// 记录一条**里程碑事件流**（每函数调用 C/R + 每语句 S），三者共享：
+// 记录一条**事件流**（每函数调用 C/R + 每语句 S），三者共享：
 //   - 崩溃诊断：panic 时把当前调用栈（dbg_stack）符号化挂到错误消息，
 //     并写崩溃日志文件；
 //   - DAP 调试：按函数/语句里程碑做断点/单步/调用栈/变量；
@@ -25,7 +25,7 @@ var dbg_sample: bool = false;      // 是否记录时间戳（剖析用；成本
 // 调用栈（当前深度 = len(dbg_stack_f)）
 var dbg_stack_f: table<string>;    // 帧函数名
 var dbg_stack_l: table<i64>;       // 帧入口行（函数体首行）
-// 里程碑事件流
+// 事件流
 var dbg_evk: table<string>;        // 事件类型 "C"/"R"/"S"（call/return/statement）
 var dbg_evn: table<string>;        // C/R 的函数名；S 为空
 var dbg_evl: table<i64>;           // 事件行（C=函数体首行，S=语句行，R=-1）

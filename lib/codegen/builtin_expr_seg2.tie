@@ -1,5 +1,5 @@
 type tie<class>
-// lib/backend/builtin_expr_seg2.tie —— builtin_expr 分派链分段 2（p.9.21 G2 单函数 ≤300 行）
+// lib/backend/builtin_expr_seg2.tie —— builtin_expr 分派链分段 2
 // ============================================================
 // 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
 // 与原函数同 namespace，跨文件裸名互调；段尾 return <sentinel> = 本段未命中。
@@ -12,8 +12,8 @@ namespace irgen {
         if nm == "to_trit" { return bi_to_trit(nm, id) }
         if nm == "trit_val" { return bi_trit_val(nm, id) }
         if nm == "len" { return bi_len(nm, id) }
-        // P2b：any 拆箱（as_bool/as_string/as_char——仅 any 参数；as_i64/as_f64
-        // 已在上方 as_dst 块重载处理）。P2d：as_table_* 拆箱为对应元素类型表
+        // any 拆箱（as_bool/as_string/as_char——仅 any 参数；as_i64/as_f64
+        // 已在上方 as_dst 块重载处理）。：as_table_* 拆箱为对应元素类型表
         //（返回表值 ptr，tag = 精确表类型 id，与装箱时的 tag 一致才匹配）。
         if nm == "as_bool" || nm == "as_string" || nm == "as_char" ||
         nm == "as_table_i64" || nm == "as_table_string" || nm == "as_table_bool" ||
@@ -52,9 +52,9 @@ namespace irgen {
             g_builtin_res = ux
             return 0
         }
-        // P2c：any_tag(x) → 读 {tag,payload} 的 tag 字段（标量 0-4 / 复合类型 id）
+        // any_tag(x) → 读 {tag,payload} 的 tag 字段（标量 0-4 / 复合类型 id）
         if nm == "any_tag" { return bi_any_tag(nm, id) }
-        // P2d-D3：map 高阶——map_keys(m)→table<string>；map_values(m)→table<V>
+        // -map 高阶——map_keys(m)→table<string>；map_values(m)→table<V>
         //（V 从实参 map<string,V> 类型解码）；map_contains(m, key)→bool（不 raise）
         if nm == "map_keys" || nm == "map_values" {
             var m0 = call_arg(id, 0)
@@ -125,7 +125,7 @@ namespace irgen {
         if nm == "print_err" { return bi_print_err(nm, id) }
         if nm == "mkdir_all" { return bi_mkdir_all(nm, id) }
         if nm == "regex_find_all" { return bi_regex_find_all(nm, id) }
-        // ---------- M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）----------
+        // ---------- 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）----------
         // 数学库（libm，llvmgen 无条件 declare；f64 → f64）。
         // 整数实参（sqrt(4)）→ sitofp 提升为 f64（LLVM 类型必须匹配）
         if nm == "sqrt" || nm == "sin" || nm == "cos" || nm == "tan" ||
@@ -164,7 +164,7 @@ namespace irgen {
             g_builtin_res = ir.get_value(bc)
             return 0
         }
-        // ---------- M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支） ----------
+        // ---------- 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支） ----------
         if nm == "pow" { return bi_pow(nm, id) }
         if nm == "atan2" || nm == "copysign" || nm == "fmod" || nm == "remainder" || nm == "hypot" {
             var dv1 = tig_expr(call_arg(id, 0))
@@ -185,14 +185,14 @@ namespace irgen {
             g_builtin_res = tig_ext_call2(nm, df1, types.named(TK_F64), df2, types.named(TK_F64), types.named(TK_F64))
             return 0
         }
-        // read_line：零参数 → string（p.6.4.10 内联 GetStdHandle(STD_INPUT_HANDLE) +
+        // read_line：零参数 → string（内联 GetStdHandle(STD_INPUT_HANDLE) +
         // ReadFile 逐字节读到 \n/EOF，去 Rust 桥 tie_read_line，**不置 g_used_interp**。
         // 支持无缓冲管道（脚本交互）：`echo hello | probe` 读到 "hello"；\r\n 规整、
         // \n 去除；EOF（管道关闭 / Ctrl-Z）返回已收集串或空串。
         if nm == "read_line" { return bi_read_line(nm, id) }
         if nm == "cwd" { return bi_cwd(nm, id) }
         // 单字符串参数 → ptr 返回（previously list_dir/walk_dir 亦走此处；现已内联）；
-        // path_*/http_get/msg_t 仍走 tie_* 桥（path_* 留待 p.6.4.10，http 属 p.6.4.9）
+        // path_*/http_get/msg_t 仍走 tie_* 桥（path_* 与 http 走不同通道）
         if nm == "list_dir" || nm == "walk_dir" {
             var sv = tig_expr(call_arg(id, 0))
             if sv < 0 {
@@ -206,25 +206,25 @@ namespace irgen {
             return 0
         }
         if nm == "http_get" { return bi_http_get(nm, id) }
-        // path_* 原语：p.6.4.10 内联纯 tie IR 生成（tig_path_*，见 irgen_path.tie），
-        // 去 Rust tie_path_* 桥，不再置 g_used_interp（p.6.4 残留桥清零）。
+        // path_* 原语：内联纯 tie IR 生成（tig_path_*，见 irgen_path.tie），
+        // 去 Rust tie_path_* 桥，不再置 g_used_interp（残留桥清零）。
         if nm == "path_basename" { return bi_path_basename(nm, id) }
         if nm == "path_dirname" { return bi_path_dirname(nm, id) }
         if nm == "path_abs" { return bi_path_abs(nm, id) }
         if nm == "path_normalize" { return bi_path_normalize(nm, id) }
         if nm == "eval" { return bi_eval(nm, id) }
-        // 双字符串参数 → ptr 返回（path_join：p.6.4.10 仍留 tie_path_join Rust 桥，
-        // path_* 系列待后续去桥；eval_call：p.6.4.10 降级不置 g_used_interp）
+        // 双字符串参数 → ptr 返回（path_join：仍留 tie_path_join Rust 桥，
+        // path_* 系列待后续去桥；eval_call：降级不置 g_used_interp）
         if nm == "eval_call" { return bi_eval_call(nm, id) }
-        // path_join：p.6.4.10 内联纯 tie IR 生成（同 basename/dirname 系列）
+        // path_join：内联纯 tie IR 生成（同 basename/dirname 系列）
         if nm == "path_join" { return bi_path_join(nm, id) }
-        // regex_find：p.6.4.8 内联纯 tie 最小正则引擎
+        // regex_find：内联纯 tie 最小正则引擎
         if nm == "regex_find" { return bi_regex_find(nm, id) }
-        // regex_replace：p.6.4.8 内联纯 tie 最小正则引擎
+        // regex_replace：内联纯 tie 最小正则引擎
         if nm == "regex_replace" { return bi_regex_replace(nm, id) }
-        // regex_group：p.6.4.8 内联纯 tie 最小正则引擎
+        // regex_group：内联纯 tie 最小正则引擎
         if nm == "regex_group" { return bi_regex_group(nm, id) }
-        // regex_match：p.6.4.8 内联纯 tie 最小正则引擎
+        // regex_match：内联纯 tie 最小正则引擎
         if nm == "regex_match" { return bi_regex_match(nm, id) }
         // 单字符串参数 i8 返回 → bool（file_exists 已有；remove_dir_all/mkdir_all 已有
         // mkdir_all；此处补 remove_dir_all）
@@ -248,7 +248,7 @@ namespace irgen {
             }
             return 0
         }
-        // 双字符串参数 i8 返回 → bool（untar_gz/unzip/http_get_file：p.6.4.9 内联，
+        // 双字符串参数 i8 返回 → bool（untar_gz/unzip/http_get_file：内联，
         // 不再走 tie_* 桥）
         if nm == "untar_gz" || nm == "unzip" || nm == "http_get_file" {
             var f1 = tig_expr(call_arg(id, 0))
@@ -273,7 +273,7 @@ namespace irgen {
         if nm == "byte_read" { return bi_byte_read(nm, id) }
         // byte_write：路径 + 字节表 → bool（tig_byte_write 原生 libc 实现）
         if nm == "byte_write" { return bi_byte_write(nm, id) }
-        // p.6.9.1 stdio：stdin_read(n) → i64 字节表（tig_stdin_read 内联 GetStdHandle+ReadFile）
+        // stdio：stdin_read(n) → i64 字节表（tig_stdin_read 内联 GetStdHandle+ReadFile）
         if nm == "stdin_read" { return bi_stdin_read(nm, id) }
         return -1  // 本段未命中
     }

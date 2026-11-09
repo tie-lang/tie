@@ -1,7 +1,7 @@
 type tie<class>
 // compiler/driver/front_end.tie —— driver 前端调用与诊断输出子模块
 // ============================================================
-// 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
+// 从 driver.tie 拆出（方法库化：driver 编排薄壳）。
 // 拆分范式：同编译单元跨文件（文本内联）——本文件只含函数与注释，
 // 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
 // 风格 ns：函数在 `namespace driver` 内，一律 pub（driver 库 API 面）；
@@ -9,12 +9,12 @@ type tie<class>
 import "../../../../lib/front/api.tie"
 namespace driver {
 pub func frontend(src: string, base_dir: string) -> i64 {
-    // T5.3 内存版：parse_ast 返回 0/-1（成功时 AST 在 ast 节点池内存），
+    // 内存版：parse_ast 返回 0/-1（成功时 AST 在 ast 节点池内存），
     // 失败时由 parser.ast_err_protocol() 组装与 parse_src 相同的 "ERR:line col msg"
     unsafe {
         var t0 = clock()
     }
-    // r.1.6.7：文件级 lock 授权（`type tie<logic, unsafe:lock>`）须在**解析之前**
+    // 文件级 lock 授权（`type tie<logic, unsafe:lock>`）须在**解析之前**
     // 告知 parser —— 只有 parser 知道「本文件」的边界（`parse_ast` 仅对主输入文件
     // 调用；import 的模块走语义层另一条路径），故文件级授权在 parser 内展开为
     // 「本文件每个函数隐式持 lock 域」，范围天然精确、不会波及 import 的模块。
@@ -27,7 +27,7 @@ pub func frontend(src: string, base_dir: string) -> i64 {
     g_t_parse = t0e - t0
     if prc < 0 {
         dbg_txt(diagcode.render_err_proto(parser.ast_err_protocol()))
-        // p.9.22：解析失败——错误槽落定（--emit diag:* 落盘与 tinker diag 帧共用；
+        // 解析失败——错误槽落定（--emit diag:* 落盘与 tinker diag 帧共用；
         // 无条件，不在 emit 分支内——tink 管道同样要拿到真实错误文本）。
         dbgem.set_err_proto(parser.ast_err_protocol())
         if len(g_emit_specs) > 0 {
@@ -39,9 +39,9 @@ pub func frontend(src: string, base_dir: string) -> i64 {
         var t1 = clock()
     }
     diagcode.warn_unreg_reset()
-    // p.9.14.2 独立警告 pass：把前端警告开关传给 semantic（-w 开启、默认只报错）。
+    // 独立警告 pass：把前端警告开关传给 semantic（-w 开启、默认只报错）。
     // 必须在 check_ast 之前设置——语义侧警告收集/遍历全程由该开关门控。
-    // p.9.21.4 II1 可见性梯度：把 CLI 档位传给语义层（默认 1 = A1b = 历史行为）。
+    // II1 可见性梯度：把 CLI 档位传给语义层（默认 1 = A1b = 历史行为）。
     // 必须在 check_ast 之前设置——check_visibility 在调用解析点全程消费该档位。
     var sem = tie.front::check(base_dir, g_front_warn, g_cli_visibility)
     unsafe {
@@ -50,23 +50,23 @@ pub func frontend(src: string, base_dir: string) -> i64 {
     g_t_sem = t1e - t1
     if tie.support::has_prefix(str.clone(sem), "ERR:") {
         dbg_txt(diagcode.render_err_proto(sem))
-        // p.9.22：语义失败——错误槽落定（同解析路径，无条件）。
+        // 语义失败——错误槽落定（同解析路径，无条件）。
         dbgem.set_err_proto(sem)
         if len(g_emit_specs) > 0 {
             dbgem.run_emit_dumps(1)
         }
         return -1
     }
-    // p.9.14.1：语义警告改结构化事件直发（driver 从 semantic.warn_* 直读渲染，
+    // 语义警告改结构化事件直发（driver 从 semantic.warn_* 直读渲染，
     // 不再解析 OK 协议中的 ;W: 文本段）。
     // 服务模式（--tink-serve）例外：警告只进结构化记录（diag 211），不向 stderr
     // 打印——LSP 场景 stderr 管道无人清读，全库警告会塞满管道致服务阻塞（实测）。
     if !g_tink_serve {
         print_warns()
     }
-    // p.9.22：结构化输出落盘（--emit ...；辅助输出——失败只打印，不改变编译结果）
+    // 结构化输出落盘（--emit ...；辅助输出——失败只打印，不改变编译结果）
     dbgem.run_emit_dumps(0)
-    // p.9.22.7：library/class 伴生 .sym.zd（--no-sym 关闭；采集未开时跳过）
+    // library/class 伴生 .sym.zd（--no-sym 关闭；采集未开时跳过）
     dbgem.run_sidecar()
     // -Werror：有任何警告即中止，不进入中端/后端（不产出任何中间产物与可执行文件）。
     if warn_gate() != 0 {
@@ -108,7 +108,7 @@ pub func warn_gate() -> i64 {
     return 1
 }
 
-// p.9.14.1：从 semantic 结构化警告事件直读渲染（warning[W#####] @l:c: 名字；建议。）。
+// 从 semantic 结构化警告事件直读渲染（warning[W#####] @l:c: 名字；建议。）。
 // 替代旧的 ";W:l c msg" 文本协议解析（序列化→再解析→二次归一化）。渲染仅一次
 // （diagcode.render_warning 输出端归一化），渲染结果与旧路径逐字节等价。
 pub func print_warns() -> string {

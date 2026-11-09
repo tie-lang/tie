@@ -31,7 +31,7 @@ type tie<class>
 //                   47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e
 //   sha512("abc") = ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a
 //                   2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f
-// 备注：命名空间内互调为裸调用（Harbor M2.1.6），内部函数不加 sha512_ 前缀。
+// 备注：命名空间内互调为裸调用（Harbor ），内部函数不加 sha512_ 前缀。
 // ============================================================================
 
 // 顶层常量（懒构建）：K 轮常量（80×64 位 = 160 个 32 位半分）与初始状态（8×2 半分）。
@@ -144,7 +144,7 @@ func add64(ah: i64, al: i64, bh: i64, bl: i64) -> table<i64> {
     return w64((ah + bh + carry), lsum)
 }
 
-// 三操作数 64 位加法（mod 2^64）→ [hi,lo]（用于 T1 = h+Σ1+ch+K+w 的串联）。
+// 三操作数 64 位加法（mod 2^64）→ [hi,lo]（用于 = h+Σ1+ch+K+w 的串联）。
 func add64_3(ah: i64, al: i64, bh: i64, bl: i64, ch: i64, cl: i64) -> table<i64> {
     var t = add64(ah, al, bh, bl)
     return add64(t[0], t[1], ch, cl)
@@ -291,7 +291,7 @@ func compress_block(st: ref table<i64>, wv: ref table<i64>, pt: table<i64>, n: i
         // Ch(e,f,g) = (e&f) ^ (~e&g)
         var ch_h: i64 = (e_h & f_h) ^ ((e_h ^ m32) & g_h)
         var ch_l: i64 = (e_l & f_l) ^ ((e_l ^ m32) & g_l)
-        // T1 = h + Σ1 + Ch + K[t] + w[t]
+        // = h + Σ1 + Ch + K[t] + w[t]
         var t1 = add64_3(h_h, h_l, sum1_h, sum1_l, ch_h, ch_l)
         t1 = add64(t1[0], t1[1], s5_k[2 * t], s5_k[2 * t + 1])
         t1 = add64(t1[0], t1[1], wv[2 * t], wv[2 * t + 1])
@@ -304,13 +304,13 @@ func compress_block(st: ref table<i64>, wv: ref table<i64>, pt: table<i64>, n: i
         // Maj(a,b,c) = (a&b) ^ (a&c) ^ (b&c)
         var maj_h: i64 = (a_h & b_h) ^ (a_h & c_h) ^ (b_h & c_h)
         var maj_l: i64 = (a_l & b_l) ^ (a_l & c_l) ^ (b_l & c_l)
-        // T2 = Σ0 + Maj
+        // = Σ0 + Maj
         var t2h = sum0_h + maj_h
         var t2l = sum0_l + maj_l
         var t2h_c = (t2l >> 32) & m32
         t2l = t2l & m32
         t2h = (t2h + t2h_c) & m32
-        // 轮换：h=g g=f f=e e=d+T1 d=c c=b b=a a=T1+T2
+        // 轮换：h=g g=f f=e e=d+d=c c=b b=a a=+
         h_h = g_h; h_l = g_l
         g_h = f_h; g_l = f_l
         f_h = e_h; f_l = e_l
@@ -319,7 +319,7 @@ func compress_block(st: ref table<i64>, wv: ref table<i64>, pt: table<i64>, n: i
         d_h = c_h; d_l = c_l
         c_h = b_h; c_l = b_l
         b_h = a_h; b_l = a_l
-        // a = T1 + T2
+        // a = + 
         var anew = add64(t1[0], t1[1], t2h, t2l)
         a_h = anew[0]; a_l = anew[1]
         t = t + 1

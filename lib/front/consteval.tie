@@ -1,4 +1,4 @@
-// lib/front/consteval.tie —— p.8.1.1 const fn 编译期求值器
+// lib/front/consteval.tie —— const fn 编译期求值器
 // ============================================================
 // const fn 是**纯编译期函数**：既生成普通运行期函数代码（后端照常发射），
 // 也允许在编译期常量上下文（全局标量初始化折叠）中被直接求值——静态元编程
@@ -41,7 +41,7 @@ var cv_out_sid: i64 = -1;
 
 namespace consteval {
 
-// p.9.0-S.7 规范 §3.3：floor 整除与成对取余（编译期折叠用）。
+// -S.7 规范 §3.3：floor 整除与成对取余（编译期折叠用）。
 // 与 AOT（tig_floor_divmod）和解释器（idiv_floor_i64/floormod_i64）同一定义：
 // 先取截断结果，余数非零且与除数异号时调整一格。不用布尔 != 比较，避免
 // 依赖布尔不等运算在求值器子集里的可用性。
@@ -336,7 +336,7 @@ pub func eval_const_expr(id: i64) -> (bool, bool, bool, i64, i64) {
             }
             return (true, false, false, i1 % i2, -1)
         }
-        // p.9.0-S.7 整除 `\`（规范 §3.3：向下取整的商）
+        // -S.7 整除 `\`（规范 §3.3：向下取整的商）
         if op == 24 {
             if s1 || s2 || i2 == 0 {
                 cv_failed = true
@@ -344,7 +344,7 @@ pub func eval_const_expr(id: i64) -> (bool, bool, bool, i64, i64) {
             }
             return (true, false, false, cv_idiv_floor(i1, i2), -1)
         }
-        // p.9.0-S.7 成对取余 `%%`（与 `\` 配对，余数符号跟随除数）
+        // -S.7 成对取余 `%%`（与 `\` 配对，余数符号跟随除数）
         if op == 26 {
             if s1 || s2 || i2 == 0 {
                 cv_failed = true
@@ -417,7 +417,7 @@ pub func eval_const_expr(id: i64) -> (bool, bool, bool, i64, i64) {
             }
             return (true, false, false, (i1 != 0 || i2 != 0) ? 1 : 0, -1)
         }
-        // p.9.23 缺陷修复（D1）：位运算与移位此前**无分支**，落 cv_failed →
+        // 缺陷修复位运算与移位此前**无分支**，落 cv_failed →
         // 调用方按「未折叠」静默取 0（`const A: i64 = 1 << 4` 得 0，无诊断）。
         // 补齐 B_BITAND(13)/B_BITOR(14)/B_BITXOR(15)/B_SHL(16)/B_SHR(17)；
         // 位移量越界（<0 或 >=64）为 UB，一律不折叠。
@@ -545,7 +545,7 @@ func exec_stmt(st: i64) -> i64 {
             }
             nv = cur_iv / iv
         } else if op == 24 {
-            // p.9.0-S.7 `\=`：floor 整除（规范 §3.3）
+            // -S.7 `\=`：floor 整除（规范 §3.3）
             if iv == 0 {
                 cv_failed = true
                 return -1
@@ -558,7 +558,7 @@ func exec_stmt(st: i64) -> i64 {
             }
             nv = cur_iv % iv
         } else if op == 26 {
-            // p.9.11 `%%=`：floor 取余复合赋值（与二元 %% 同语义，规范 §3.3）
+            // `%%=`：floor 取余复合赋值（与二元 %% 同语义，规范 §3.3）
             if iv == 0 {
                 cv_failed = true
                 return -1

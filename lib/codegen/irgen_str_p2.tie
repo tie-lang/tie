@@ -1,5 +1,5 @@
 type tie<class>
-// lib/codegen/irgen_str_p2.tie —— irgen_str 分片 2（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_str_p2.tie —— irgen_str 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_str.tie。
@@ -19,13 +19,13 @@ func s21_elem_zero_v(ty: i64) -> i64 {
     return z
 }
 
-// 表追加：p.6.7.2 起委托 tl_tbl$tbl_push 单步原子 append（锁内完成
+// 表追加：起委托 tl_tbl$tbl_push 单步原子 append（锁内完成
 // len/ensure/memcpy/set_len，多线程并发 push 正确）。值先落临时槽再传地址。
 func s21_table_push(t: i64, elem_llvm_ty: i64, v: i64) {
     s21_table_push_ex(t, elem_llvm_ty, v, false)
 }
 
-// r.1.7：免锁 push 内联快路径（excl ∧ 元素宽度编译期可知）。
+// 免锁 push 内联快路径（excl ∧ 元素宽度编译期可知）。
 // 形状与 tbl_push_nl 逐项等价：len < cap ⇒ 直写 data[len] + len++（无增长）；
 // 否则回退 tl_tbl$tbl_push_nl（增长 + 写 + 提交 len 原路）。
 func s21_table_push_nl_inl(t: i64, elem_llvm_ty: i64, v: i64, bs: i64) {
@@ -82,9 +82,9 @@ func s21_table_push_slow(t: i64, elem_llvm_ty: i64, v: i64) {
     tl_void_2("tl_tbl$tbl_push_nl", t21_ptri(t), t21_ptri(ir.get_value(slot)))
 }
 
-// r.1.6.7：excl = 编译器**静态证得**该表独占（句柄从未离开本次函数调用）→ 走
+// excl = 编译器**静态证得**该表独占（句柄从未离开本次函数调用）→ 走
 // `tbl_push_nl` 免锁入口。判据与风险边界见 irgen_esc.tie；默认（excl=false）与
-// 原实现逐指令一致。r.1.7：excl ∧ 宽度已知 ⇒ 再内联快路径（见 s21_table_push_nl_inl）。
+// 原实现逐指令一致。excl ∧ 宽度已知 ⇒ 再内联快路径（见 s21_table_push_nl_inl）。
 func s21_table_push_ex(t: i64, elem_llvm_ty: i64, v: i64, excl: bool) {
     g_used_trmlite = true
     var bs = rt_elem_inline_bytes(elem_llvm_ty)
@@ -107,7 +107,7 @@ func s21_table_push_ex(t: i64, elem_llvm_ty: i64, v: i64, excl: bool) {
     tl_void_2("tl_tbl$tbl_push", t21_ptri(t), t21_ptri(ir.get_value(slot)))
 }
 
-// p.9.12.2 负下标统一裁决：i<0 属编程错误 → 运行时诊断（表 N 下标 N 越界），
+// 负下标统一裁决：i<0 属编程错误 → 运行时诊断（表 N 下标 N 越界），
 // 打印后 exit(1)（与高侧越界读返回零值对齐裁决；负下标原为越界访存 UB、静默丢
 // 数据，现统一报错，不得静默也不得越界读/写）。noreturn；next_blk 供死 br 收尾
 //（LLVM 要求块有 terminator；opt 会 DCE 死 br）。
@@ -119,8 +119,8 @@ func s21_index_raise(next_blk: i64) {
     ir.add_operand(db, next_blk, 1)
 }
 
-// r.1.6.9 共享表越界写诊断：i >= len 且该表**被别名共享**（rc>1）→ 运行时诊断，
-// 打印后 exit(1)。独占表的越界写照旧自动扩容（p.9.12.2 保留），不走本函数。
+// 共享表越界写诊断：i >= len 且该表**被别名共享**（rc>1）→ 运行时诊断，
+// 打印后 exit(1)。独占表的越界写照旧自动扩容（保留），不走本函数。
 // noreturn；next_blk 供死 br 收尾（LLVM 要求块有 terminator；opt 会 DCE 死 br）。
 func s21_oob_raise(next_blk: i64) {
     var msg = tig_str_lit(interner.intern("\"运行时错误: 表下标越界——该表被别名共享，写越界会改变所有别名看到的长度；如需扩容请先 clone 出独立副本\""))
@@ -139,7 +139,7 @@ func s21_elem_zero(ty: i64) -> i64 {
     return t21_zero(ty)
 }
 
-// ==================== r.1.6.11 `deep` 形参：入口值语义分离 ====================
+// ==================== `deep` 形参：入口值语义分离 ====================
 // 语义：`func f(deep p: S)` ⇒ 函数内对 p 的**表字段**的一切修改都影响不到调用方。
 // 实现：入口对每个表字段**无条件克隆**一份私有副本（`tl_tbl$tbl_clone`）。
 // 为何不用 tbl_cow（按 rc 分流、rc=1 免拷贝）：**struct 按值拷贝不会 retain 其表
@@ -147,7 +147,7 @@ func s21_elem_zero(ty: i64) -> i64 {
 // ——rc=1 时可能实际已有别名，tbl_cow 会漏判成「独占」而不克隆，deep 就失效了。
 // 代价：每次调用一份 O(len) 拷贝，这正是 `deep` 这个修饰符向用户索取的代价
 // （用户显式要求值语义）；默认（无 deep）路径零改动、零成本。
-// 只处理 table 字段；map 无对应运行时入口，留待需要时补。
+// 只处理 table 字段；map 无对应运行时入口，需要时再补。
 func tig_deep_param_seal(slot: i64, pty: i64) -> i64 {
     if types.kind(pty) != K_STRUCT {
         return 0
@@ -174,7 +174,7 @@ func tig_deep_param_seal(slot: i64, pty: i64) -> i64 {
     return 0
 }
 
-// ============ r.1.6.13 聚合表字段的引用计数守恒（递归） ============
+// ============ 聚合表字段的引用计数守恒（递归） ============
 // 根因：retain 判据此前只看**一层**（`types.is_table(表达式类型)`）⇒ struct 拷贝/构造
 // 只发整聚合 load+store，其**表字段不被 retain** ⇒ rc ≠ 别名数。
 // 实测（提交 b4acf9d）：`var a = table_new_i64(); var s = S(a);` 之后 `a` 与 `s.t`
@@ -239,7 +239,7 @@ func tig_agg_retain_fields(slot: i64, ty: i64) -> i64 {
     return 0
 }
 
-// ============ r.1.6.14 值语义：写前分离（COW） ============
+// ============ 值语义：写前分离（COW） ============
 // 开关：**默认开启值语义**（2026-10-05 翻转）。`TIE_TBL_VALUE=0` 临时回到旧的
 // 共享语义（生成代码与接线前逐指令一致），仅供对照/排障；`=1` 显式开启与默认同义。
 // 翻转前的阻塞点（tiu probe_e1 段错误）已修：根因是**「返回含表字段的 struct」时
@@ -412,7 +412,7 @@ func tig_agg_release_fields(slot: i64, ty: i64) -> i64 {
     return 0
 }
 
-// 表下标写（p.9.12.2：越界自动扩容，杜绝静默丢弃）：
+// 表下标写（越界自动扩容，杜绝静默丢弃）：
 //   - 负下标(i<0) → 运行时诊断（不得静默/不得越界写）；
 //   - i >= len → 按元素零值逐槽 push 扩容 need = max(len, i+1) 后写 target；
 //   - 否则直接 tl_tbl$tbl_set(t, i, src)。
@@ -422,7 +422,7 @@ func s21_table_set(t: i64, i: i64, elem_llvm_ty: i64, v: i64) {
     s21_table_set_ex(t, i, elem_llvm_ty, v, false)
 }
 
-// r.1.6.7：excl = 静态证得独占 → 扩容路径末尾改走 `tbl_set_nl`（扩容时表仍独占）。
+// excl = 静态证得独占 → 扩容路径末尾改走 `tbl_set_nl`（扩容时表仍独占）。
 func s21_table_set_ex(t: i64, i: i64, elem_llvm_ty: i64, v: i64, excl: bool) {
     g_used_trmlite = true
     var T64 = types.named(TK_I64)
@@ -443,7 +443,7 @@ func s21_table_set_ex(t: i64, i: i64, elem_llvm_ty: i64, v: i64, excl: bool) {
     g_cur_block = nb
     s21_index_raise(mg)
     g_cur_block = mg
-    // 长度检查：need = i+1；need > len → **越界写按引用计数分流**（r.1.6.9）
+    // 长度检查：need = i+1；need > len → **越界写按引用计数分流**
     //
     // ★ 危险的精确定位：越界写会**隐式改变表的形状**（len/cap），而共享句柄的
     //   其它别名会看到这个改变——实测 `var a=[1,2,3]; var b=a; b[100]=42` 之后
@@ -452,7 +452,7 @@ func s21_table_set_ex(t: i64, i: i64, elem_llvm_ty: i64, v: i64, excl: bool) {
     //
     // ★ 但**独占表的扩容是无害的**：没有别人看得到。故按句柄 @40 的真实引用计数
     //   分流（tbl_retain/tbl_release 已在维护，不引入新状态）：
-    //     rc == 1（唯一持有者）⇒ 照旧自动扩容 —— p.9.12.2 语义**保留**。
+    //     rc == 1（唯一持有者）⇒ 照旧自动扩容 —— 语义**保留**。
     //       这一支是必需的：编译器自举依赖它（实测「struct + namespace 方法」路径
     //       会做越界写，改为一律报错会直接让自举不收敛）。
     //     rc  > 1（存在别名）⇒ 拒绝并诊断 —— 形状改变会让别名跟着变，属危险。
@@ -502,7 +502,7 @@ func s21_table_set_ex(t: i64, i: i64, elem_llvm_ty: i64, v: i64, excl: bool) {
     ir.add_operand(lcb, le, 1)
     // 循环体：push 一个零值，cur += 1
     g_cur_block = lb
-    // r.1.6.7：扩容期间的零值填充同样按独占分派（扩容时表仍独占）
+    // 扩容期间的零值填充同样按独占分派（扩容时表仍独占）
     s21_table_push_ex(t, elem_llvm_ty, zeroval, excl)
     s21_store(idx_p, s21_bin(0, cur, tig_int_lit(1)), T64)  // cur+1
     var bb = ir.new_inst(g_cur_block, 30, -1)  // br lc
@@ -519,7 +519,7 @@ func s21_table_set_ex(t: i64, i: i64, elem_llvm_ty: i64, v: i64, excl: bool) {
         fast_w = true
     }
     if fast_w && bs_w > 0 {
-        // r.1.7：免锁写内联。分流已证 i >= 0 且 i < len（need ≤ len 的原长路，或
+        // 免锁写内联。分流已证 i >= 0 且 i < len（need ≤ len 的原长路，或
         // 已扩容到 need = i+1）⇒ tbl_set_nl 的 `i < len` 判据恒真，可直写。
         var data_w = s21_load(s21_gep(t, RT_TBL_OFF_DATA, true), types.named(TK_STR))
         var ioff_w = s21_bin(2, i, tig_int_lit(bs_w))  // i * bs（mul）
@@ -534,13 +534,13 @@ func s21_table_set_ex(t: i64, i: i64, elem_llvm_ty: i64, v: i64, excl: bool) {
 }
 
 // 表下标读：tl_tbl$tbl_at(t, i, out) 高侧越界(>=len)写零 + 返回 ok；结果槽 load。
-// p.9.12.2 裁决：越界读（含负下标）语义不变（高侧返零；负下标为既有 UB，编译器
+// 裁决：越界读（含负下标）语义不变（高侧返零；负下标为既有 UB，编译器
 // 自举运行期有惰性负下标读，禁加负下标守卫以防自举失稳）；仅写路径负下标报错。
 func s21_table_at(t: i64, i: i64, ok_ptr: i64, elem_llvm_ty: i64) -> i64 {
     return s21_table_at_ex(t, i, ok_ptr, elem_llvm_ty, false)
 }
 
-// r.1.7：免锁读内联（excl ∧ 元素宽度编译期可知）。与 tbl_at_nl 逐项等价：
+// 免锁读内联（excl ∧ 元素宽度编译期可知）。与 tbl_at_nl 逐项等价：
 //   len = load[h+8]；i < len ⇒ v = load[data + i*bs]；否则元素零值（string 得 ""）。
 // 判据刻意**不含负下标守卫**（与运行时一致：`i < len` 对负数恒真 ⇒ 堆下读，
 // 该行为是既有裁决，读路径的守卫由 tig_table_bounds_check 在用户下标处另行施加）。
@@ -582,8 +582,8 @@ func s21_table_at_inl(t: i64, i: i64, ok_ptr: i64, elem_llvm_ty: i64, bs: i64) -
     return ir.get_value(phi)
 }
 
-// r.1.6.7：excl = 静态证得独占 → `tbl_at_nl` 免锁读（见 s21_table_push_ex 说明）。
-// r.1.7：excl ∧ 宽度已知 ⇒ 内联（见 s21_table_at_inl）。
+// excl = 静态证得独占 → `tbl_at_nl` 免锁读（见 s21_table_push_ex 说明）。
+// excl ∧ 宽度已知 ⇒ 内联（见 s21_table_at_inl）。
 func s21_table_at_ex(t: i64, i: i64, ok_ptr: i64, elem_llvm_ty: i64, excl: bool) -> i64 {
     g_used_trmlite = true
     var bs = rt_elem_inline_bytes(elem_llvm_ty)

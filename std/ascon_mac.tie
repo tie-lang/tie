@@ -10,7 +10,7 @@ type tie<class>
 //   Ascon 320 位内态 = 5×64 位字（本实现以 32 位 hi/lo 半分表示，同 blake2b）。
 //   SP 置换 p^r：轮常数异或入 x2（0xf0 - 15*轮次）→ x0^x4, x4^x3, x2^x1 →
 //     χ 替换（and-not 邻接）+ 线性扩散（rotr 异或；旋转 19/28,61/39,1/6,10/17,7/41）。
-//   12 轮初始化（p^12）→ 32 字节块吸收（x0..x3 异或，逐块 p^12）→ 末块 S4^=1 域分离
+//   12 轮初始化（p^12）→ 32 字节块吸收（x0..x3 异或，逐块 p^12）→ 末块 ^=1 域分离
 //     → p^12 终态 → 标签 = 前 128 位（x0||x1）。
 //   填充：0x80 + 零补到 32 字节块。轮常数 "0xf0 起"：p^12 用 0xf0,0xe1,...,0x4b。
 //   （本实现与官方 pyascon `ascon.mac(key,msg,"Ascon-Mac",16)` 逐字节一致。
@@ -23,7 +23,7 @@ type tie<class>
 //     msg="abc"    → 7244ecb6734d17a090b20744045f9e38
 //     msg=32*'a'   → 64691821cafb75901ebe6dec49af8c49
 //     长消息        → 98f689e6021161d9d49183f2fe403765
-// 备注：命名空间内互调为裸调用（Harbor M2.1.6）；内部函数不加 ascon_mac_ 前缀。
+// 备注：命名空间内互调为裸调用（Harbor ）；内部函数不加 ascon_mac_ 前缀。
 // ============================================================================
 
 namespace ascon_mac {
@@ -111,7 +111,7 @@ func word_lo(key: string, base: i64) -> i64 {
     return v
 }
 
-// 把第 b 个 32 字节消息块（跨 原文/0x80 填充）异或进状态 s[0..7]（S0..S3）。
+// 把第 b 个 32 字节消息块（跨 原文/0x80 填充）异或进状态 s[0..7]（..）。
 func xor_block(s: ref table<i64>, msg: string, n: i64, b: i64) {
     var base = b * 32
     var w: i64 = 0
@@ -220,7 +220,7 @@ func hex32(v: i64) -> string {
 // Ascon-MAC-128 主入口：key=16 字节（32 位 hex），msg=原始字符串，返回 32 位 hex。
 pub func ascon_mac128(key: string, msg: string) -> string {
     var s = table_new_i64()
-    // 内态初值：S0=IV(0x80808c0000000080)、S1=K0、S2=K1、S3=S4=0
+    // 内态初值：=IV(0x80808c0000000080)、=K0、=K1、==0
     table_push(s, 0x80808C00)
     table_push(s, 0x00000080)
     table_push(s, word_hi(key, 0))
@@ -232,7 +232,7 @@ pub func ascon_mac128(key: string, msg: string) -> string {
     table_push(s, 0)
     table_push(s, 0)
     perm(s, 12)   // 初始化 p^12
-    // 吸收：32 字节块，逐块（除末块）p^12；末块 S4^=1 域分离
+    // 吸收：32 字节块，逐块（除末块）p^12；末块 ^=1 域分离
     var n: i64 = len(msg)
     var pad_len: i64 = ((n + 32) / 32) * 32
     var nblocks: i64 = pad_len / 32
@@ -246,7 +246,7 @@ pub func ascon_mac128(key: string, msg: string) -> string {
     }
     s[9] = s[9] ^ 1    // S4 低字异或 1
     perm(s, 12)        // 终态 p^12
-    // 标签 = 前 128 位：S0 || S1（大端 hex）
+    // 标签 = 前 128 位：|| （大端 hex）
     return hex32(s[0]) + hex32(s[1]) + hex32(s[2]) + hex32(s[3])
 }
 

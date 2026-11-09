@@ -1,24 +1,24 @@
 type tie<class>
-// compiler/keel/keel_registry.tie —— Keel 龙骨架构 核心微内核化第一步（p.7.1.1 骨架层）
+// compiler/keel/keel_registry.tie —— Keel 龙骨架构 核心微内核化第一步（骨架层）
 // ============================================================
-// 里程碑：2026.2 路线图 p.7.1.1「Keel 龙骨架构核心微内核化第一步」骨架层。
-// 目标（docs/superpowers/specs/2026-08-29-plugin-kernel-design.md +
-// docs/designs/keel-architecture.md）：核心只余机制层——boot 引导加载器 /
+// 职责：微内核骨架层。
+// 目标（ +
+// ）：核心只余机制层——boot 引导加载器 /
 // registry 通用注册表 / auditor 安全审计器 / executor 管线执行骨架，
 // 一切行为皆为注册项。本模块 = 通用注册表（registry）。
 //
 // # 注册项 schema（每行 = 一个注册项；行号 = 注册顺序 = id）
-// 里程碑补充：p.7.1.2「id+version：schema 表驱动 + 同 id 异 version 仲裁」。
+// 补充：「id+version：schema 表驱动 + 同 id 异 version 仲裁」。
 //   新增注册项列 version（semver 字符串）+ 优先级 prio（来源：内建 0 < config
 //   1 < 项目 2 < 依赖包 3，默认 0）。同 id 同 version 幂等忽略；同 id 异
 //   version 走 arbitrate 按优先级仲裁，同优先级多版本 = 冲突负例。
 //
 //   id         string  全局唯一键（如 "tiec::pass_front"）
 //   kind       string  类别：pass | pipeline | builtin | role | cli | lib
-//                       （本任务先用 pass / pipeline）
+//                       （当前先用 pass / pipeline）
 //   version    string  semver 包版本（"1.2.3"；register 4 参走默认 "1.0.0"）
 //   prio       i64     来源优先级（默认 0=内建；越大越优先）
-//   impl       string  实现函数名（impl_name，C1 分派键；无实现/pipeline 为 ""）
+//   impl string 实现函数名（impl_name，分派键；无实现/pipeline 为 ""）
 //   deps       table<i64>  依赖注册项 id（只读拷贝进扁平段）
 //   嵌套段布局与 ir.tie 操作数段同款：行存 off/cnt，内容进扁平段。
 // **对 pipeline 注册项**，deps 扁平段复用为「有序 pass 引用列表」（执行序列）。
@@ -28,7 +28,7 @@ type tie<class>
 //   **id 稳定不变量**：id = 注册顺序（0 起），注册完成后永不改变。
 //   后续注册只追加，不移动既有行（与 lib/dispatch.tie 序号语义一致）。
 //
-// # C1 分派说明
+// # 分派说明
 //   tie 无函数指针，impl_name 参照 lib/support/dispatch.tie 模式：
 //   存「实现函数名字符串」，执行时按名分派（升序字符串表 + 二分 +
 //   整数 switch，见 keel_executor.tie 的 dispatch_impl）。

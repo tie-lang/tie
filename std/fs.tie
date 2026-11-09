@@ -18,8 +18,8 @@ type tie<class>
 //
 // 调用：import 后 fs.read_text(...) / fs.exists(...) / fs.write_text(...)；
 // 命名空间内互调为裸调用。
-// 命名规范：命名空间内函数不加 fs_ 前缀（统一 func 写法，Harbor M2.1.6）。
-// library-v2：读取类返回 Result<string, string>（失败 Err 带错误消息），
+// 命名规范：命名空间内函数不加 fs_ 前缀（统一 func 写法，Harbor ）。
+// 接口说明：读取类返回 Result<string, string>（失败 Err 带错误消息），
 // 写/删类保持 bool；别名去重（read_to_string→read_text、write→write_text、
 // append→append_text、remove_file/delete→remove、remove_dir_all→remove_all、
 // mkdir_all→create_dir_all、move→rename、list→read_dir）。
@@ -39,7 +39,7 @@ pub func read_text(path: string) -> Result<string, string> {
 }
 
 // 读取文件原始字节（byte_read 底座），返回字节表（元素 i64，值域 0..255，
-// D7 编解码器约定）；失败返回空表。
+// 编解码器约定）；失败返回空表。
 // 注：本应返回 Result<table<i64>, string>，但编译器 enum payload 白名单
 // 仅支持标量（i8..u64/bool/char/trit/string），table 作 payload 编译不过，
 // 故保持原始空表哨兵；需精确判断时先用 exists() 前置检查。
@@ -199,7 +199,7 @@ func str_char_slice(s: string, start: i64, end: i64) -> string {
 }
 
 // ============================================================================
-// 增强（p.9.1.1.18）：file_size 别名 / 递归目录复制（含 exclude 前缀过滤）/
+// 增强：file_size 别名 / 递归目录复制（含 exclude 前缀过滤）/
 // 目录递归大小聚合。全部在现有底座原语（walk_dir / file_is_file / file_size /
 // file_copy / mkdir_all）之上组合，纯 tie，向后兼容。
 // ============================================================================

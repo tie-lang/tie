@@ -22,7 +22,7 @@ type tie<class>
 namespace llvmgen {
 
 // ==================== 类型映射 ====================
-// asm! 内存（indirect）约束的参数类型串（S1.2 I1，2026-10-02）。
+// asm! 内存（indirect）约束的参数类型串（，2026-10-02）。
 // LLVM LangRef 要求 indirect 约束（`*m` / `=*m`）的操作数带 elementtype
 // 属性，否则 clang 报「Operand for indirect constraint must have
 // elementtype attribute」（实测）。实参类型是 ptr<T>，元素类型经
@@ -53,12 +53,12 @@ func llvm_ty(t: i64) -> string {
         return "i64"
     }
     if t == TK_I128 || t == TK_U128 {
-        // 批次 2（i128/u128）：LLVM 原生 i128 类型（add/sub/mul/sdiv/srem/
+        // LLVM 原生 i128 类型（add/sub/mul/sdiv/srem/
         // udiv/icmp 均类型参数化，llvm_ty 映射后自动支持）
         return "i128"
     }
     if t == TK_ANY {
-        // P2b 动态元素：{tag: i64, payload: i64}（16 字节值类型）
+        // 动态元素：{tag: i64, payload: i64}（16 字节值类型）
         return "{ i64, i64 }"
     }
     if t == TK_F32 {
@@ -77,7 +77,7 @@ func llvm_ty(t: i64) -> string {
         // 平衡三进制：i8 存储（值域 -1/0/1），对齐 Rust ir.rs（TritLit → i8）
         return "i8"
     }
-    // 元组/struct 聚合类型（M4/M6 扩展）：
+    // 元组/struct 聚合类型（扩展）：
     //   元组 → 内联结构体文本 {f0, f1, ...}（字段类型递归展开）；
     //   struct → 命名结构体 %struct.<名字>（emit_agg_types 输出 type 定义）。
     // 对齐 Rust llvm_ty 的 Tuple/Struct 映射（元组内联、类命名）。
@@ -92,13 +92,13 @@ func llvm_ty(t: i64) -> string {
         return "[" + to_string(types.array_len(t)) + " x " + llvm_ty(types.array_elem(t)) + "]"
     }
     if agg_k == K_FN {
-        // S2.2 fn 函数值类型：命名结构体 %fn.<签名索引> = { ptr, ptr }
+        // fn 函数值类型：命名结构体 %fn.<签名索引> = { ptr, ptr }
         //（字段 0 = 环境指针，字段 1 = 入口函数指针；emit_agg_types 输出定义）。
         // 签名索引 = t - BASE_FN（types.fn 类型低负载）
         return "%fn." + to_string(t - BASE_FN)
     }
     if agg_k == K_PORT {
-        // S2.4 port 对象类型：LLVM 表示 = 单个 ptr（指向堆上打包对象
+        // port 对象类型：LLVM 表示 = 单个 ptr（指向堆上打包对象
         // {data, vtable}）——表/传参/字段/返回天然支持（探针异构
         // table<Drawable> 依赖此表示；vtable 本身是全局静态常量）。
         return "ptr"
@@ -112,7 +112,7 @@ func llvm_ty(t: i64) -> string {
         return "i64"
     }
     if agg_k == K_FUTURE {
-        // p.9.11：future<T> 凭据类型 → i64（actor record 句柄；await 时解引用）
+        // future<T> 凭据类型 → i64（actor record 句柄；await 时解引用）
         return "i64"
     }
     if agg_k == K_TUPLE {
@@ -141,7 +141,7 @@ func llvm_ty(t: i64) -> string {
         var eidx2 = t - BASE_ENUM
         return "%enum." + types.enum_name_of(eidx2)
     }
-    // S1.2 不安全类型：
+    // 不安全类型：
     //   ptr<T>  → LLVM opaque ptr（元素类型仅语义信息）
     //   atomic<T> → 元素 LLVM 类型（atomic 是语义包装，LLVM 类型同元素）
     if agg_k == K_PTR {
@@ -160,7 +160,7 @@ func llvm_ty(t: i64) -> string {
 }
 
 // ==================== 字符串自省 ====================
-// 原子内存序名称（S1.2 A1）：order IMM → LLVM ordering 关键字
+// 原子内存序名称（A1）：order IMM → LLVM ordering 关键字
 func at_ord_name(ord: i64) -> string {
     if ord == 1 {
         return "acquire"
@@ -177,7 +177,7 @@ func at_ord_name(ord: i64) -> string {
     return "relaxed"
 }
 
-// asm 模板占位符转换（S1.2 I1）：Rust 风格 `{N}` → LLVM `$N`。
+// asm 模板占位符转换Rust 风格 `{N}` → LLVM `$N`。
 // `{N}` 是操作数序号引用；LLVM 语法是 `$N`。字符级扫描替换。
 func asm_tmpl_convert(t: string) -> string {
     var out = ""
@@ -211,9 +211,9 @@ func asm_tmpl_convert(t: string) -> string {
     }
     return out
 }
-// S2.1：@.str.N 序号 → 该字符串常量字节长度（与 emit_strings 同款 utf.byte_len）。
+// @.str.N 序号 → 该字符串常量字节长度（与 emit_strings 同款 utf.byte_len）。
 // 头部长度字段是 {ptr,len} 表示的编译期来源——字面量在 .rodata 带 8 字节 i64 头。
-// p.9.14.4：O(1) 直索引（str_slot 登记时算好 g_slot_len[slot]），替代线性扫
+// O(1) 直索引（str_slot 登记时算好 g_slot_len[slot]），替代线性扫
 // str_idx（每处字符串引用 O(S)，S = 全部字面量条数 → emit 平方源）。
 func str_len_of_slot(slot: i64) -> i64 {
     if slot >= 0 && slot < len(g_slot_len) {
@@ -222,7 +222,7 @@ func str_len_of_slot(slot: i64) -> i64 {
     return 0
 }
 
-// S2.1：字符串常量**数据指针**引用（内联 GEP 常量表达式，可直用于实参/ret/
+// 字符串常量**数据指针**引用（内联 GEP 常量表达式，可直用于实参/ret/
 // global 初始化——LLVM 常量表达式允许内联）。
 // 字面量布局升级：`{ i64 长度头, [N+1 x i8] 数据+\0 }`（{ptr,len} 表示 +
 // 边界自动 NUL：数据末尾保留 \0 供 FFI 零拷贝传递）。数据指针 = GEP 0,1。
@@ -234,7 +234,7 @@ func str_data_ref(slot: i64) -> string {
 }
 
 // 查找/登记字符串池 id → @.str.N 序号
-// p.9.14.4：O(1) 印章表直查（g_ss_stamp/g_ss_slotv，-1 = 未登记），替代线性
+// O(1) 印章表直查（g_ss_stamp/g_ss_slotv，-1 = 未登记），替代线性
 // 扫 str_pool（每条字符串指令 O(S)）。登记时同步算好 g_slot_len[slot]。
 func str_slot(name_id: i64) -> i64 {
     while len(g_ss_stamp) <= name_id {
@@ -334,7 +334,7 @@ func str_sort_slots() {
     str_count = n
 }
 
-// T4.5：遍历全部指令，收集 extern_call(36) 的符号名池 id（去重）。
+// 遍历全部指令，收集 extern_call(36) 的符号名池 id（去重）。
 // 符号名经 interner 还原文本；emit_extern_decls 按符号名输出 declare。
 // 阶段 A：同时收集 call(35) 用户函数符号（call_syms；无需 declare，本模块定义）。
 func collect_externs() {
@@ -424,7 +424,7 @@ func extern_decl(sym: string) -> string {
     if sym == "tl_tbl$tbl_clone_p" {
         return "declare i64 @tl_tbl$tbl_clone_p(ptr nocapture)"
     }
-    // S2.1：libc memcpy（StringBuilder 数据拷贝；clang 链接 CRT 提供）
+    // libc memcpy（StringBuilder 数据拷贝；clang 链接 CRT 提供）
     if sym == "memcpy" {
         return "declare void @memcpy(ptr, ptr, i64)"
     }
@@ -437,7 +437,7 @@ func extern_decl(sym: string) -> string {
     if sym == "memset" {
         return "declare void @memset(ptr, i8, i64)"
     }
-    // 批次 7 catch_panic：无条件 declare（emit 头部，带 returns_twice/noreturn
+    // catch_panic：无条件 declare（emit 头部，带 returns_twice/noreturn
     // 属性），此处不重复 declare（LLVM 拒绝重复定义）。
     if sym == "longjmp" || sym == "_setjmp" || sym == "llvm.frameaddress.p0" {
         return ""
@@ -481,7 +481,7 @@ func extern_decl(sym: string) -> string {
     if sym == "GetCurrentThreadId" {
         return "declare i64 @GetCurrentThreadId()"
     }
-    // p.6.6.20 std/sqlite 动态加载：kernel32 动态链接 API（winsqlite3.dll 桥）
+    // std/sqlite 动态加载：kernel32 动态链接 API（winsqlite3.dll 桥）
     if sym == "LoadLibraryW" {
         return "declare i64 @LoadLibraryW(ptr)"
     }
@@ -502,7 +502,7 @@ func extern_decl(sym: string) -> string {
         // 码点 → 单字符 UTF-8 字符串（返回堆串，调用方负责 tie_free_result）。
         return "declare ptr @tie_str_from_code(i64)"
     }
-    // ---------- 网络原语（P0：std/net）----------
+    // ---------- 网络原语（std/net）----------
     // 句柄 i64；recv 返回 ptr（堆串）；close 返回 i8（bool 桥）。
     if sym == "tie_net_tcp_listen" {
         return "declare i64 @tie_net_tcp_listen(i64)"
@@ -534,7 +534,7 @@ func extern_decl(sym: string) -> string {
     if sym == "tie_to_string_i64" {
         return "declare ptr @tie_to_string_i64(i64)"
     }
-    // p.6.4.4：to_string(f64) 与 parse_float 已内联 IR（tig_f64_to_str / tig_parse_float），
+    // to_string(f64) 与 parse_float 已内联 IR（tig_f64_to_str / tig_parse_float），
     // tie_to_string_f64 / tie_parse_float 桥 declare 移除（不再被 extern_call 引用）。
     if sym == "tie_parse_int" {
         return "declare i64 @tie_parse_int(ptr, ptr)"
@@ -628,7 +628,7 @@ func extern_decl(sym: string) -> string {
     if sym == "tie_table_set_string" {
         return "declare void @tie_table_set_string(ptr, i64, ptr, ptr)"
     }
-    // E3 键值表（map）桥：键为字符串 ptr；值按类型分 i64 / string 两个桥。
+    // 键值表（map）桥：键为字符串 ptr；值按类型分 i64 / string 两个桥。
     // 签名 (ptr map, ptr key, val, ptr ok)——与 tie_interp.lib 导出一一对应。
     if sym == "tie_mkdir_all" {
         return "declare i8 @tie_mkdir_all(ptr)"
@@ -691,9 +691,9 @@ func extern_decl(sym: string) -> string {
 }
 
 // 未登记符号（用户 libc extern，如 getenv/rand）声明推导：
-// 从 extern_call(36) 指令签名重构 `declare T @sym(T0, T1, ...)`。
+// 从 extern_call(36) 指令签名重构 `declare T @sym(, , ...)`。
 // op36 操作数：[0]=符号池id, [1]=返回类型IMM, 其后 [类型IMM, 值] 成对。
-// 批次5 任务13：用户 `unsafe extern fn getenv(name) -> string`（返回 char*）
+// 用户 `unsafe extern fn getenv(name) -> string`（返回 char*）
 // 必须在模块头声明 `declare ptr @getenv(ptr)`，否则 opt 报 use of undefined value。
 // 返回 ""（符号未被调用 / 已在模块头无条件 declare，无需再声明）。
 func user_extern_decl(sym: string) -> string {
@@ -718,7 +718,7 @@ func user_extern_decl(sym: string) -> string {
         sym == "atan2" || sym == "copysign" || sym == "fmod" || sym == "remainder" || sym == "hypot" {
         return ""
     }
-    // p.6.4.4：libc _gcvt（to_string(f64)；非变参 CRT，声明由调用签名自动推导）
+    // libc _gcvt（to_string(f64)；非变参 CRT，声明由调用签名自动推导）
     //
     // 2026-10-08：**取全部调用点里字典序最小的那个签名**（原来返回**首个**遇到的）。
     // 为何：扫描序随编译路径变（缓存命中走模块片段装配，指令表构建序不同）⇒
@@ -794,7 +794,7 @@ func user_extern_decl(sym: string) -> string {
     return best
 }
 
-// p.6.7.2：模块内是否已内联 trm-lite 表容器（tl_tbl$tbl_push define）——
+// 模块内是否已内联 trm-lite 表容器（tl_tbl$tbl_push define）——
 // toolchain 据此决定是否追加 trm_lite.a（内联了 → 桥符号模块自给，追加即
 // 与模块定义多重冲突）。与 emit_extern_decls 的豁免判定同源（ir 函数表）。
 pub func tbl_inlined_check() -> i64 {
@@ -810,13 +810,13 @@ pub func tbl_inlined_check() -> i64 {
 }
 
 // 输出 extern_call 收集到的 declare（模块头，无条件 declare 之后）。
-// p.6.7.2：若符号在本模块已有 define（含 import 内联的同库函数，如 trm_lite.a
+// 若符号在本模块已有 define（含 import 内联的同库函数，如 trm_lite.a
 // 构建时 tl_tbl$* 与 sched/gc 的表桥声明同模块）→ 豁免 declare，防 redefinition。
 func emit_extern_decls() {
     var i: i64 = 0
     while i < len(ext_syms) {
         var nm = intern.lookup(ext_syms[i])
-        // 批次 7 catch_panic：longjmp/_setjmp/llvm.frameaddress 已在模块头
+        // catch_panic：longjmp/_setjmp/llvm.frameaddress 已在模块头
         // 无条件 declare（带 returns_twice/noreturn 属性），跳过二次 declare。
         if nm == "longjmp" || nm == "_setjmp" || nm == "llvm.frameaddress.p0" {
             i = i + 1
@@ -880,7 +880,7 @@ func escape_str(s: string) -> string {
     return out
 }
 
-// 输出字符串常量节（模块末尾）。S2.1：布局升级为带 8 字节 i64 长度头的
+// 输出字符串常量节（模块末尾）。：布局升级为带 8 字节 i64 长度头的
 // { ptr,len } 表示——`{ i64 N, [N+1 x i8] c"...\00" }`（N = UTF-8 字节数，
 // 末尾 \0 为边界自动 NUL 预留位）。数据指针由 str_data_ref 经 GEP 取。
 func emit_strings() {

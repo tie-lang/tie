@@ -1,10 +1,10 @@
 type tie<class>
-// lib/front/sinfer_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/front/sinfer_p1.tie —— 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 sinfer.tie。
 namespace sinfer {
-// P1 数据流箭头推断（仅裸 Var 目标到达此处——调用/下标/字段目标已在解析器
+// 数据流箭头推断（仅裸 Var 目标到达此处——调用/下标/字段目标已在解析器
 // 脱糖）。Fwd(->)：数据=LHS 目标=RHS；Rev(<-)：数据=RHS 目标=LHS。
 // 目标 = 函数类型 → 传参（`f(data)`，数据作唯一实参）；= 数据变量 → 赋值
 //（类型 = 数据类型，校验可赋值；irgen 侧生成 store + 值）。
@@ -193,7 +193,7 @@ func infer_arrow_append(id: i64, tgt_n: i64, data_n: i64, t_ty: i64, data_ty: i6
     return types.named(TK_VOID)
 }
 
-// ==================== S1.2 A1 atomic<T> 内置方法 ====================
+// ==================== A1 atomic<T> 内置方法 ====================
 // 方法集（第一版 i64/f64/bool 元素）：
 //   load() → T                    （无参）
 //   store(v, order)               （2 参，返回 void）
@@ -201,7 +201,7 @@ func infer_arrow_append(id: i64, tgt_n: i64, data_n: i64, t_ty: i64, data_ty: i6
 //   compare_exchange(exp, new, order) → bool（CAS 成功标志）
 // order 参数：Relaxed/Acquire/Release/AcqRel/SeqCst 标识符 → IMM 0..4。
 //
-// §11.8 重分类（2026-10-01）：原子操作**不再要求 unsafe 上下文**。
+// §11.8 重分类：原子操作**不再要求 unsafe 上下文**。
 // 判据（设计定稿）：「构造安全 ⟺ 不可能引发 UB」——原子操作不产生数据竞争 UB，
 // 内存序写错属正确性 bug 而非内存不安全（与 Rust 同判）。故原先此处的
 // `g_unsafe_depth == 0 ⇒ 报错` 整段撤除；内存序参数照旧显式书写，后果由
@@ -345,7 +345,7 @@ func infer_asm_order(node: i64, id: i64) -> i64 {
     return -1
 }
 
-// ==================== 泛型调用路径（T3b 单态化 + 调用点推断）====================// 实参表类型细化：`table_new_*()` 变量/返回的类型是裸 table（元素类型在
+// ==================== 泛型调用路径（单态化 + 调用点推断）====================// 实参表类型细化：`table_new_*` 变量/返回的类型是裸 table（元素类型在
 // var_table_elem / table_ret_elem），泛型推断需带元素类型（table<T> 匹配）。
 // 例如 Box<table<i64>>(t)：t 的裸 table 若直接绑定 T 会与显式 table<i64> 冲突。
 func refine_arg_ty(a: i64, t: i64) -> i64 {
@@ -401,7 +401,7 @@ func infer_guard_method(gty: i64, mname: string, args: table<i64>, id: i64) -> i
     if s_tags[a0] == S_N_VAR {
         capn = sstate.name_str(a0)
     }
-    // r.1.6.7：域映射走 types 层单一事实源（新增 lock 域）
+    // 域映射走 types 层单一事实源（新增 lock 域）
     var capidx = types.guard_cap_index(capn)
     if capidx < 0 {
         sm_err_line = s_lines[id]
@@ -409,7 +409,7 @@ func infer_guard_method(gty: i64, mname: string, args: table<i64>, id: i64) -> i
         sm_err_msg = "guard.delegate 的能力域必须是 share/mem/ext/lock，实际是 '" + capn + "'"
         return -1
     }
-    // r.1.6.7：已撤销的凭据不能再派生。接收者 = MethodCall 节点自身首个子节点。
+    // 已撤销的凭据不能再派生。接收者 = MethodCall 节点自身首个子节点。
     var recv_gn = sstate.child(id, sstate.slot_off(id))
     if recv_gn >= 0 && s_tags[recv_gn] == S_N_VAR {
         if sstate.gr_is_dead(interner.intern(sstate.name_str(recv_gn))) {
@@ -590,7 +590,7 @@ func infer_generic_enum_construct(gti: i64, vname: string, args: table<i64>, id:
     return rt
 }
 
-// S2.4 port 方法调用推断（动态分发）：接收者类型 = port 对象。
+// port 方法调用推断（动态分发）：接收者类型 = port 对象。
 // 查 port 方法表（方法名 -> 声明序号 = vtable 字段序）；校验实参个数/类型
 // （方法签名去 self）；返回类型 = 方法返回类型。irgen 侧生成 vtable
 // 间接调用（call_indirect(70)：entry = vtable[序号]，env = data）。
@@ -652,7 +652,7 @@ func infer_actor_method(aty: i64, mname: string, args: table<i64>, id: i64) -> i
         sm_err_msg = "方法 '" + mname + "' 期望 " + to_string(np) + " 个参数，实际 " + to_string(n_args) + " 个"
         return -1
     }
-    // 架构增强（2026-03-03）：消息参数区是每槽 **64 字节字节缓冲**，参数按自身类型
+    // 架构增强：消息参数区是每槽 **64 字节字节缓冲**，参数按自身类型
     // 打包、8 字节对齐（后端 `actor_arg_byte_off` 两侧共用）。单个参数可以是任意类型
     // （含 16 字节的 fn 聚合）——**唯一约束是全部参数总字节 ≤ 64**。增强前是固定
     // 8 字节 i64 槽 ⇒ 只能传 i64（此限制已解除，见 E00901 的替代）。
@@ -712,7 +712,7 @@ func infer_actor_method(aty: i64, mname: string, args: table<i64>, id: i64) -> i
         return -1
     }
     var rt = sstate.actor_method_ret(ai, mname)
-    // p.9.11 async 返回值（规范 §10.6 结果的延后取得）：async 非 void 方法
+    // async 返回值（规范 §10.6 结果的延后取得）：async 非 void 方法
     // → 调用产生凭据 future<T>（`var f = w.compute(x)`；`await f` 取值）。
     // 同一 actor 至多一个未 await 凭据（mq_sync 门闩语义，见 gen_actor_sync_call
     // future 模式）。async void 方法维持 fire-and-forget（调用即丢弃）。
@@ -728,10 +728,10 @@ func infer_actor_method(aty: i64, mname: string, args: table<i64>, id: i64) -> i
     return rt
 }
 
-// p.9.11.17 fn 类型字段调用改写：MethodCall(recv, mname, args) 且 mname 命中
+// fn 类型字段调用改写：MethodCall(recv, mname, args) 且 mname 命中
 // recv 类型的 **fn 类型字段** → 就地改写为 CALL_EXPR（callee = 新建
 // FieldAccess 节点，children = [fa, args...]），复用 fn 值间接调用路径
-// （P2a：infer_call_expr / tig_call_expr → tig_call_fn_value）。改写时机在
+// （infer_call_expr / tig_call_expr → tig_call_fn_value）。改写时机在
 // sinfer（smove/irgen 之前），smove/irgen 对 CALL_EXPR 的既有处理直接生效。
 // 函数类型一等公民的四位承载（变量/形参/返回/字段）由此补全字段调用缺口。
 func rewrite_fn_field_call(id: i64, recv: i64, mname: string, args: table<i64>) -> i64 {
@@ -762,7 +762,7 @@ func rewrite_fn_field_call(id: i64, recv: i64, mname: string, args: table<i64>) 
     return infer_call_expr(id)
 }
 
-// ==================== 运算符重载（p.8.2.4） ====================
+// ==================== 运算符重载 ====================
 // 声明形式：struct 绑定命名空间函数 `namespace Struct { pub func op_add(self, other) ... }`
 // （命名约定：二元 op_add/op_sub/op_mul/op_div/op_mod、比较 op_eq/op_ne/op_lt/op_le/op_gt/op_ge、
 // 一元 op_neg；接收者 = 首参，右操作数 = 次参，一元仅接收者）。返回类型自由（== 类由用户

@@ -1,10 +1,10 @@
 type tie<class>
-// lib/ir/tieir_asm.tie —— p.9.21.9 片段装配器：入口 + 片段解析
+// lib/ir/tieir_asm.tie —— 片段装配器：入口 + 片段解析
 // ============================================================
-// v3（p.9.21.11）：u32 LE + UTF-8 + p1 偏置（i64 逃逸）+ [kind, payload]
+// v3：u32 LE + UTF-8 + p1 偏置（i64 逃逸）+ [kind, payload]
 // 操作数序；symtab/export/片段头转存重放。装配重放侧（build_seq/replay）
 // 拆至 tieir_asm_replay.tie（同 namespace 跨文件，铁律 11 拆解批次）。
-// lib/ir/tieir_asm.tie —— p.9.21.9 片段组装消费（装配器，与 write_mod_slice 对偶）
+// lib/ir/tieir_asm.tie —— 片段组装消费（装配器，与 write_mod_slice 对偶）
 // ============================================================
 // 全模块片段缓存命中时，跳过 irgen+passes（片段 = pass 后 IR，键含 t 档），
 // 按装配序把各模块 .tir 片段重放为完整单元 IR（ir/ir_meta 全局状态）。
@@ -70,7 +70,7 @@ pub var asm_f_pty_base: table<i64>;  // 函数 → 参数类型扁平基址
 pub var asm_f_pty: table<i64>;
 pub var asm_f_blk_base: table<i64>;  // 函数 → 块段基址（下标进 asm_fb_idx，见下）
 pub var asm_f_blk_cnt: table<i64>;
-// p.9.21.9 收口：块/指令的**按函数分组**索引（原实现假设「块表内同函数的块
+// 收口：块/指令的**按函数分组**索引（原实现假设「块表内同函数的块
 // 连续」——闭包/嵌套生成会让同一函数的块在块表里交错，导致指令区间串到别的
 // 函数、值偏移整体错位。改为显式分组：asm_fb_idx = 每函数的块记录下标段（
 // 块表相对序保序），asm_bi_base/cnt = 每块记录的指令区间）。
@@ -95,18 +95,18 @@ pub var asm_o_pool: table<i64>;      // 1 = 池载荷（载荷已是全局池 id
 pub var asm_pr_base: table<i64>;     // 片段 → 池 remap 基址
 pub var asm_pr: table<i64>;          // 片段池 id → 全局池 id
 pub var asm_frag_fn: table<i64>;     // 片段 → 函数数
-// p.9.21.9 收口：值映射表（片段值 id → 重放后的全局 ir 值 id；-1 = 未登记）。
+// 收口：值映射表（片段值 id → 重放后的全局 ir 值 id；-1 = 未登记）。
 // 替代原「per-fn 结果表 + 偏移」算法——后者隐含「同函数的值域连续」假设，而
 // 闭包/嵌套生成会让两个函数的值在原始值空间**交错**（父函数体生成途中生成
 // 闭包函数 → 闭包的值插在父函数值中间），偏移算法必然错位（实测 driver 树
 // str::trim_start 报「值操作数引用未登记结果」）。显式按值 id 建表则与交错
 // 无关：片段值 id 是唯一键，登记即查。
 pub var asm_vmap: table<i64>;
-// p.9.21.10：每片段值空间的全局基址——各片段值 id 独立从 0 压缩，vmap 是
+// 每片段值空间的全局基址——各片段值 id 独立从 0 压缩，vmap 是
 // 全局键空间，必须加片段基址才唯一（否则跨片段键碰撞 → 装配错值）。
 pub var asm_frag_vbase: table<i64>;
 pub var asm_frag_vtotal: i64 = 0;    // 此前各片段值空间大小的全局累计
-// p.9.21.9 收口：指令 gid 回执表（下标 = 指令记录；重放两趟法的中间态）。
+// 收口：指令 gid 回执表（下标 = 指令记录；重放两趟法的中间态）。
 // 两趟法动因：真实 IR 存在**前向值引用**（phi/合并类指令 op33、load op21 等
 // 的操作数指向创建序更靠后的值——irgen 先建指令、后补操作数，离线核查 driver
 // 片段共 910 处）。单趟「建指令即加操作数」必然撞未登记值 → 装配失败降级。
@@ -118,7 +118,7 @@ pub var asm_flag_sso: bool = false;   // 片段引用 s21_sso_* 全局（llvmgen
 pub var asm_flag_wsock: bool = false; // 片段引用 @g_wsock_init
 pub var asm_flag_catch: bool = false; // 片段引用 tie_panic_jb/active
 pub var asm_flag_sc: bool = false;    // 片段 call @tie_sc_off（str_char 缓存 helper）
-// p.9.21.9 收口：装配路径的 irgen 副作用恢复素材——
+// 收口：装配路径的 irgen 副作用恢复素材——
 //   asm_grefs = 片段引用的全局名（kind 3 操作数池 id，去重）→ driver 据此
 //     恢复全局登记族（linux_args/msg/rng/循环哨兵）与做「登记完备」校验；
 //   asm_exts  = 片段 extern_call(36) 的符号名池 id（去重）→ driver 据此恢复
@@ -130,7 +130,7 @@ namespace tieir {
 
 // 全局名归一化（去 '@' 前缀）：IR 里全局名带/不带前缀两种写法并存，
 // 白名单比对（置位恢复/登记完备校验）一律按裸名。
-// p.9.21.11：单字符循环拼接 O(n²) → str_sub_bytes 单次拷贝（池载荷操作数
+// 单字符循环拼接 O(n²) → str_sub_bytes 单次拷贝（池载荷操作数
 // 热路径，每池引用一次；'@' 后必为 ASCII 标识符，码点数 = 字节数）。
 func asm_bare_name(s: string) -> string {
     if str_len(s) > 1 && str_byte(s, 0) == 64 {   // '@'
@@ -205,7 +205,7 @@ pub func asm_flag_sso() -> bool { return asm_flag_sso }
 pub func asm_flag_wsock() -> bool { return asm_flag_wsock }
 pub func asm_flag_catch() -> bool { return asm_flag_catch }
 pub func asm_flag_sc() -> bool { return asm_flag_sc }
-// p.9.21.9 收口：装配路径副作用恢复素材（池 id，driver 侧 interner.name_str 取文本）
+// 收口：装配路径副作用恢复素材（池 id，driver 侧 interner.name_str 取文本）
 pub func asm_gref_count() -> i64 { return len(asm_grefs) }
 pub func asm_gref_id(i: i64) -> i64 { return asm_grefs[i] }
 pub func asm_ext_count() -> i64 { return len(asm_exts) }

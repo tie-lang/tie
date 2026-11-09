@@ -1,10 +1,10 @@
 type tie<class>
-// lib/front/pstmt_top_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/front/pstmt_top_p1.tie —— 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 pstmt_top.tie。
 namespace pstmt_top {
-// S3.3：交替处理延迟闭包与延迟准引用块（parse_program 末尾调用）。
+// 交替处理延迟闭包与延迟准引用块（parse_program 末尾调用）。
 // 闭包体里可含准引用块、准引用块里可含闭包——两张延迟表互相登记，
 // 单遍处理会漏：交替扫描直到两表长度都稳定（新增登记在解析过程中追加
 // 到表尾，动态 count 循环处理到队尾；外层再检查另一张表是否有新增）。
@@ -28,13 +28,13 @@ func parse_deferred_all() -> i64 {
     return 0
 }
 
-// S3.3 宏定义：`macro name(p1: code, ...) -> code { 函数体 }`。
+// 宏定义：`macro name(p1: code, ...) -> code { 函数体 }`。
 // 布局与 N_FN_DEF 一致但**无泛型槽**：children = [返回类型, 参数..., 函数体]；
 // name = 宏名，aux = 参数个数，val = 0。
 // 参数/返回类型必须是 code（准引用/插值载体）；宏体是普通 tie 语句
 // （编译期由 interp 执行，宏体错误在展开时报"宏执行错误"）。
 //
-// p.8.2.12 分支：**声明式宏**（裸形参 + 块体，无 `->`）走 N_DECL_MACRO_DEF：
+// 分支：**声明式宏**（裸形参 + 块体，无 `->`）走 N_DECL_MACRO_DEF：
 //   `macro swap(a, b) { var __t = $a; $a = $b; $b = __t }`
 // 形参名/`$名` 在体内 = 代换槽（替换为实参克隆）；`__` 前缀 = 卫生临时名，
 // 每次展开唯一化。分派依据：`)` 后是 `->`=函数式宏，是 `{`=声明式宏。
@@ -82,7 +82,7 @@ func parse_macro_def() -> i64 {
                 ast.set_children(p, pkids)
                 table_push(params, p)
             } else {
-                // 声明式宏裸形参（p.8.2.12，模板代换槽）
+                // 声明式宏裸形参（模板代换槽）
                 if param_kind == 1 {
                     putil.set_err(putil.peek_line(), putil.peek_col(), "宏 '" + interner.lookup(name) + "' 形参类型不一致：函数式宏形参须带 `: code`，不能混用裸标识符")
                     return -1
@@ -104,7 +104,7 @@ func parse_macro_def() -> i64 {
             }
         }
     }
-    // 分派：`)` 后 `->` = 函数式宏；`{` = 声明式宏（p.8.2.12）
+    // 分派：`)` 后 `->` = 函数式宏；`{` = 声明式宏
     if putil.peek_tag() == lex_arrow {
         if param_kind == 2 {
             putil.set_err(putil.peek_line(), putil.peek_col(), "声明式宏 '" + interner.lookup(name) + "' 是裸形参模板宏，不能有 '->' 返回类型（如需编译期函数宏请给每个形参加 `: code` 并返回 code）")
@@ -169,7 +169,7 @@ func is_code_type_node(ty: i64) -> bool {
     return false
 }
 
-// M4（dev33 批次9）过程宏属性：`#[macro]` 已消费 '#'，解析 `[macro]` 后紧跟
+// 过程宏属性：`#[macro]` 已消费 '#'，解析 `[macro]` 后紧跟
 // macro 定义，把 N_MACRO_DEF 的 val 置 1 标记为过程宏（token 流 API 驱动：
 // mexpand 展开时把实参解引用为源码文本、绑定为字符串传给宏体）。
 func parse_proc_macro_attr() -> i64 {
@@ -205,7 +205,7 @@ func parse_proc_macro_attr() -> i64 {
     return s
 }
 
-// 三期通用 `#[]` 属性通道（concurrency-model.md §7.1，2026-08-23 定稿）：
+// 三期通用 `#[]` 属性通道：
 // 点号命名空间风格属性 `#[ns.sub]`（如 `#[unsafe.share]` / `#[unsafe.trm]` /
 // `#[unsafe.mem]` / `#[unsafe.ext]`），附着在声明（actor / func / 方法）前，
 // 作为 unsafe 凭据门禁标记。`#[tag.x]` goto 标签走语句位置（parse_goto_label，
@@ -296,7 +296,7 @@ func parse_generic_attr() -> i64 {
         putil.set_err(line, col, "未知属性 '#[" + full + "]'（属性命名空间仅支持 unsafe，如 #[unsafe.share]）")
         return -1
     }
-    // 域白名单与能力域归类保持一致（tie-main/docs/designs/domain-classification.md）：
+    // 域白名单与能力域归类保持一致：
     // mem / ext / share / raw / lock 五域。`trm` 已随归类删除（无门禁承载、引擎已废弃），
     // 故不再接受 `#[unsafe.trm]`。
     var subn = interner.lookup(sub)
@@ -572,7 +572,7 @@ func doc_attach_all(stmts: table<i64>) {
 func parse_import() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
-    // p.9.11.14 重导出：`pub import "path" [as 别名]`——内联模型下 import 本就
+    // 重导出：`pub import "path" [as 别名]`——内联模型下 import 本就
     // 全量可见（重导出零成本），pub 仅作登记标记（N_IMPORT val bit0 = is_pub，
     // 供后续工具/诊断显示）。非法别名 token 由下方 expect_ident 拒绝。
     var is_pub: i64 = 0
@@ -609,7 +609,7 @@ func parse_import() -> i64 {
             return -1
         }
     }
-    // p.9.11.31 选择性导入：`import "path".{a, b}`——路径后可跟 `.{` 逗号分隔
+    // 选择性导入：`import "path".{a, b}`——路径后可跟 `.{` 逗号分隔
     // 标识符列表。选中名作为 N_IMPORT 的子节点（N_VAR，name = 名字池 id）随
     // AST 进 sstate，semantic.expand_one_import 按此过滤登记（子节点为空 =
     // 普通 import 全量可见）。

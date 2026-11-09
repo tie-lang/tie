@@ -13,7 +13,7 @@ type tie<class>
 // 实现说明：
 //   - 字节读取用 str_byte 直访内部字节 + utf8_seq_len 处理多字节（不再
 //     str_char+char_code 绕路）；
-//   - f64 IEEE 754 位模式：bitcast 原语直写（p.9.6.2；旧数学分解已删除——
+//   - f64 IEEE 754 位模式：bitcast 原语直写（旧数学分解已删除——
 //     log/pow + 52 次循环 ≈1500ns/次，且次正规数被简化为 ±0 丢信息）；
 //   - map 序列化接口为平行表（键表+值表）：tie 当前无 map 键枚举 API；
 //   - 异构数组用 encode_array(n, body)（元素自带类型标签，自描述）。
@@ -55,7 +55,7 @@ pub func u8_at(t: table<i64>, pos: i64) -> i64 {
 
 // ---------- 大端定宽写入 ----------
 
-// 性能（p.9.6.2）：单次分配字面量构造（每元素 table_push 走运行时原子加锁路径
+// 性能：单次分配字面量构造（每元素 table_push 走运行时原子加锁路径
 // ≈64ns/元素，8 元素 = 512ns；字面量一次分配 ≈50ns）。字节结果不变。
 pub func write_u16_be(n: i64) -> table<i64> {
     var out: table<i64> = [(n >> 8) & 0xFF, n & 0xFF]
@@ -100,7 +100,7 @@ pub func read_u64_be(t: table<i64>, pos: i64) -> (i64, i64) {
 }
 
 // ---------- f64 IEEE 754 位模式（bitcast 原语直写） ----------
-// 性能（p.9.6.2）：旧实现用数学分解（log/pow + 52 次尾数逐位循环 + parse_int(to_string(e))）
+// 性能：旧实现用数学分解（log/pow + 52 次尾数逐位循环 + parse_int(to_string(e))）
 // ≈1500ns/次；bitcast_f64_i64 编译为单条位搬运指令 ≈2ns。**语义更强**：数学分解把次正规
 // 数简化为 ±0（丢信息），bitcast 逐位精确（含次正规/NaN/±inf/±0）。字节对常规数不变。
 
@@ -338,7 +338,7 @@ pub func encode_string(s: string) -> table<i64> {
 // 0xC6 + u32 BE 长度 + 原始字节（bin32 形态；v1 的 0xc4 char / 0xc5 trit 已占用）。
 
 // encode_bytes：字节表 → 0xC6 + u32 BE 长度 + 原始字节。
-// 性能（p.9.6.2）：旧实现逐元素 table_push（≈120ns/字节，含掩码），改
+// 性能：旧实现逐元素 table_push（≈120ns/字节，含掩码），改
 // concat(5 字节头, 载荷) —— 载荷走单次 memcpy（≈0.1ns/字节），与载荷长度无关的
 // 常数开销。**注意**：不再逐元素 & 0xFF（字节表约定元素恒为 0..255，调用方
 // 保证；旧实现的掩码对合法输入是恒等操作，字节结果不变）。

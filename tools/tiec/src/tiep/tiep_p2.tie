@@ -1,5 +1,5 @@
 type tie<class>
-// compiler/interp/interp_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// compiler/interp/interp_p2.tie —— 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 interp.tie。
@@ -73,7 +73,7 @@ func exec_stmt_for(id: i64) {
             }
         }
     } else if it == W_STR {
-        // 字符串码点迭代（`.chars()`，dev33 批次4）：str_len 码点数，str_char 逐码点取单字符
+        // 字符串码点迭代（`.chars`，）：str_len 码点数，str_char 逐码点取单字符
         var s = vval.str_val(iter)
         var n = str_len(s)
         var i: i64 = 0
@@ -538,7 +538,7 @@ func exec_stmt_index_assign(id: i64) {
     g_has_last = false
 }
 
-// 求值表达式：返回 Value；失败置 w_err 返回 Value.Nil（p.9.17.2 拆箱值模型）。
+// 求值表达式：返回 Value；失败置 w_err 返回 Value.Nil（拆箱值模型）。
 func gen_expr(id: i64) -> Value {
     var t = isess.ntag(id)
     if t == N_INT_LIT {
@@ -563,7 +563,7 @@ func gen_expr(id: i64) -> Value {
         return vval.new_trit(isess.nval(id))
     }
     if t == N_VAR {
-        // p.9.17.3：直接用 interned id 查找（整数键），错误文本延迟到冷分支才还原
+        // 直接用 interned id 查找（整数键），错误文本延迟到冷分支才还原
         var v = isess.lookup_nid(isess.nname(id))
         if w_err != "" {
             // lookup_nid miss 已置同文本错误（变量未声明）
@@ -612,7 +612,7 @@ func gen_expr(id: i64) -> Value {
         return vval.new_range(s, e, isess.nval(id))
     }
     if t == N_IS {
-        // p.9.11 `is` 类型判定（规范 §3.16）：动态类型按 Value 变体匹配
+        // `is` 类型判定（规范 §3.16）：动态类型按 Value 变体匹配
         //（复用 case 类型 pattern 的 value_matches_ty；child(1) 是类型节点）。
         var subj = gen_expr(isess.nchild_at(id, 0))
         if w_err != "" {
@@ -621,7 +621,7 @@ func gen_expr(id: i64) -> Value {
         return vval.new_bool(value_matches_ty(subj, isess.nchild_at(id, 1)))
     }
     if t == N_BLOCK_PIPE {
-        // p.9.13.4 块管道 `x -> { v -> expr }`（此前仅 AOT 有分派，interp 侧缺
+        // 块管道 `x -> { v -> expr }`（此前仅 AOT 有分派，interp 侧缺
         // ⇒ 同程序两引擎行为不一致）。语义 = 内联绑定非闭包：压作用域把数据值
         // 绑定到节点名（对齐 AOT tig_block_pipe 的 scope_put(s_names[id])）→
         // 求值体 → 弹域。
@@ -642,11 +642,11 @@ func gen_expr(id: i64) -> Value {
         return gen_call(id)
     }
     if t == N_CODE_LIT {
-        // S3.3：准引用求值 → code 值（AST 协议文本）
+        // 准引用求值 → code 值（AST 协议文本）
         return gen_code_lit(id)
     }
     if t == N_CODE_INTERP {
-        // S3.3：插值表达式求值（准引用外的 `$x` = 读取变量 x 的 code/字符串值）
+        // 插值表达式求值（准引用外的 `$x` = 读取变量 x 的 code/字符串值）
         var v = isess.lookup_nid(isess.nname(id))
         if w_err != "" {
             return Value.Nil
@@ -703,7 +703,7 @@ func range_endpoint(node: i64) -> i64 {
     return vval.int_val(v)
 }
 
-// 一元运算：0=Neg 1=Not 2-5=自增自减（M4）。
+// 一元运算：0=Neg 1=Not 2-5=自增自减。
 func gen_unary(id: i64) -> Value {
     var op = isess.nval(id)
     var operand = isess.nchild_at(id, 0)
@@ -751,7 +751,7 @@ func gen_unary(id: i64) -> Value {
     return Value.Nil
 }
 
-// 自增/自减（M4）：前缀返回新值，后缀返回旧值。
+// 自增/自减：前缀返回新值，后缀返回旧值。
 func eval_inc_dec(op: i64, operand: i64) -> Value {
     var nm = isess.nname_str(operand)
     var cur = isess.lookup(nm)

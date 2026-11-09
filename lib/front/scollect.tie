@@ -1,7 +1,7 @@
 type tie<class>
-// lib/front/scollect.tie —— T2.6 顶层收集子遍（模块拆分）
+// lib/front/scollect.tie —— 顶层收集子遍（模块拆分）
 // ============================================================
-// 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）完整语义分析
+// 职责：完整语义分析
 // 拆分为 8 模块之一（本文件 = 顶层收集：函数/命名空间/struct/全局变量/
 // extern 登记 + struct 字段拍平 + 返回表预扫描 + 命名空间全名补全）。
 // 对应 proto/semantic.tie 862-872（tre_bi_init）+ 873-957（collect_top）
@@ -11,19 +11,19 @@ type tie<class>
 // + 1339-1407（collect_global_var）逻辑搬移。
 // 依赖：./sstate.tie（AST 全局 + 符号表 + 工具）+ ./sinfer.tie（表达式推断
 // + resolve_call_name + table_ret_elem）+ ./scollect_port.tie（同 namespace
-// scollect 跨文件拆分：S2.4 port/impl 及其余分区，本文件 import 文本内联并入）。
+// scollect 跨文件拆分：port/impl 及其余分区，本文件 import 文本内联并入）。
 // 树式无环：由 scheck.tie import。
 import "./sinfer.tie"
 import "./scollect_port.tie"
 
-// S2.4：impl 块暂存队列（N_IMPL 节点 id）。collect_top 遇到 N_IMPL 时只登记
+// impl 块暂存队列（N_IMPL 节点 id）。collect_top 遇到 N_IMPL 时只登记
 // 队列（struct 声明可能在其后，须等全部 struct 登记完再解析）；
 // collect_top 之后由 semantic 主流程调用 collect_impl_fns() 统一处理：
 // 方法节点改名 <struct 名>::<方法名> → g_extra_tops → collect_fn → reg_impl。
 // 注：tie 全局变量必须放文件顶层（namespace 外）。
 pub var g_impl_pending: table<i64>;
 
-// p.9.17.2 缺陷 #4a：标量全局的**初始化表达式类型检查延迟**执行——
+// 缺陷 #4a：标量全局的**初始化表达式类型检查延迟**执行——
 // collect_top 期间 enum 只有名字登记（en_keys），变体表（en_vnames 等）由
 // semantic 主流程在其后的 collect_all_enums() 填充；此时对 enum 变体常量
 // 初始化器跑 infer_expr 会误报 E00506「枚举 'X' 没有变体 'Y'」（变体扫描落空）。
@@ -44,7 +44,7 @@ pub func tre_bi_init() {
     sstate.sorted_insert(tre_bi_keys, tre_bi_vals, intern.intern("byte_read"), types.named(TK_I64))
     sstate.sorted_insert(tre_bi_keys, tre_bi_vals, intern.intern("byte_concat"), types.named(TK_I64))
     sstate.sorted_insert(tre_bi_keys, tre_bi_vals, intern.intern("regex_find_all"), types.named(TK_STR))
-    // p.6.9.1 stdio：stdin_read → i64 字节表（EOF 空表），升序插于 regex_find_all 后
+    // stdio：stdin_read → i64 字节表（EOF 空表），升序插于 regex_find_all 后
     sstate.sorted_insert(tre_bi_keys, tre_bi_vals, intern.intern("stdin_read"), types.named(TK_I64))
 }
 
@@ -63,17 +63,17 @@ func is_scalar_t(t: i64) -> bool {
     return false
 }
 
-// p.9.0-L.3 默认值 const 白名单（结构性判据，单源供「命名参数默认值」与
+// -L.3 默认值 const 白名单（结构性判据，单源供「命名参数默认值」与
 // 「actor 字段初值」共用）：字面量 / 空表 [] / const 全局引用 / 纯常量算术·
 // 比较·逻辑·位·移位·整除·幂·floor 取余 二元 / 一元负号·取反·按位非 / 三目。
 // 排除运行期表达式：函数调用、非空表字面量、闭包、下标、字段访问、箭头、
 // `in`、自增自减、可变全局/局部变量引用。
-// ★ 设计裁定（2026-10-09）：**结构性判定而非编译期求值**——const 全局的值在
+// ★ 设计裁定：**结构性判定而非编译期求值**——const 全局的值在
 // 后端 global_init_fold 折叠，发射点直接生成等价代码；const 不可变 ⇒ 运行期
 // 求值与编译期折叠同值，无需前端先折叠（也避开「引用后文 const」的收集序问题）。
 // ★ 分工：struct 字段默认值**不在**本白名单内——字段默认值是「逐构造运行期
 // 求值」语义（tiu DrawList 的 table_new_*() 90 处存量依赖），与参数默认值的
-// const 白名单是两回事，见 ROAD p.9.0-L.3 条目。
+// const 白名单是两回事，见 相关设计条目。
 // depth 上限防病态深表达式（16 层足够任何可读默认值）。
 func is_const_default_expr(n: i64, depth: i64) -> bool {
     if depth > 16 {
@@ -126,7 +126,7 @@ func is_const_default_expr(n: i64, depth: i64) -> bool {
     return false
 }
 
-// S10：extern 边界合格类型 = 标量（is_scalar_t）或 ptr<T>/slice<T>。
+// extern 边界合格类型 = 标量（is_scalar_t）或 ptr<T>/slice<T>。
 // 平台桥允许 unsafe extern 用指针传引用/出参（桥原生 Win32/OS API，如
 // GetConsoleMode 的指针形参、CreatePipe 的句柄出参）。表/map/struct 等堆布局仍拒绝。
 //（本判定同时用于返回类型——struct 按值返回的 C ABI（sret 隐藏指针）不在本最小集。）
@@ -138,7 +138,7 @@ func is_extern_ok_t(t: i64) -> bool {
     return k == K_PTR || k == K_SLICE
 }
 
-// p.6.8.3：extern 参数合格类型 = 标量/string/ptr/slice 或 **repr(C) struct**。
+// extern 参数合格类型 = 标量/string/ptr/slice 或 **repr(C) struct**。
 // repr(C) struct 按引用传（C ABI 传指针，callee 就地改读写）；非 repr(C) struct
 // 拒绝——布局非显式 C 契约，跨 FFI 边界字段偏移不确定（生成侧见 irgen_call.tig_struct_byref）。
 func is_extern_param_ok_t(t: i64) -> bool {
@@ -160,10 +160,10 @@ func is_extern_param_ok_t(t: i64) -> bool {
 
 // 顶层函数签名收集（含参数/返回类型解析 + 默认值/ref 校验）
 pub func collect_fn(fn_node: i64, full: string) -> i64 {
-    // 泛型模板登记分派（2026-08-14 泛型语法）：children[0] == N_TYPE_PARAMS
+    // 泛型模板登记分派（泛型语法）：children[0] == N_TYPE_PARAMS
     // 时按模板登记（sstate.reg_generic → gt_* 表），**不**按普通函数收集——
     // 否则模板参数类型（TypeVar 名如 "T"）经 stype.parse_type_node 会报
-    // "类 'T' 未定义"。单态化展开语义由 T3b 负责，本任务只保证泛型声明
+    // "类 'T' 未定义"。单态化展开语义由展开器负责，此处只保证泛型声明
     // 本身不使语义崩溃 + 模板结构就位。
     if sstate.nchild(fn_node) > 0 {
         var slot0 = sstate.child(fn_node, 0)
@@ -176,8 +176,8 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
                 return 0
             }
             if s_tags[slot0] == S_N_TYPE_ARGS {
-                // p.8.1.3 显式特化：`func name<具体类型>(...)` ——类型实参已具体
-                // 化，mangle 函数名为 name$T1$T2 并按普通函数收集（与泛型实例化
+                // 显式特化：`func name<具体类型>(...)` ——类型实参已具体
+                // 化，mangle 函数名为 name$$并按普通函数收集（与泛型实例化
                 // 同 key：调用点 instantiate_fn 幂等命中 → 自动优先绑定特化实现）。
                 var sargs = sgen.parse_type_args_ast(slot0)
                 if len(sargs) == 0 {
@@ -191,7 +191,7 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
     }
     var nparams = s_aux[fn_node]
     var is_pub = s_vals[fn_node]
-    // S1.2 的「参数/返回含指针类型 ⇒ 必须 unsafe fn」两条门禁已随安全边界
+    // 「参数/返回含指针类型 ⇒ 必须 unsafe fn」两条门禁已随安全边界
     // 重分类（§11.8，2026-10-01）撤销，故原先在此取出的函数 unsafe 标志
     //（val bit1）在本函数内不再被消费。`is_pub` 保留：下文 reg_fn 传的是整个
     // val（含各标志位），不只是 pub。
@@ -207,13 +207,13 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
     if ret_ty < 0 {
         return -1
     }
-    // §11.8 重分类（2026-10-01）：返回指针/切片/原子类型不再要求 unsafe fn ——
+    // §11.8 重分类：返回指针/切片/原子类型不再要求 unsafe fn ——
     // 返回值是一个值，持有它不引发 UB；解引用才是危险面，由调用点的操作级
     // 门禁（sinfer_ret_q2.tie 的 unsafe 内置清单）拦截。
-    // p.9.11.15 生成器检测：函数体含 N_YIELD → 生成器函数。语言侧定稿——
+    // 生成器检测：函数体含 N_YIELD → 生成器函数。语言侧定稿——
     // 生成器必须声明返回类型（= 元素类型，非 void），签名返回类型登记为
     // table<elem>（调用方 gen() 得表，for/推导式直接消费）；运行期惰性
-    // 协程由 p.9.5.1 trm-lite 承载，本轮 IR = 攒表返回（探针验证产出序列）。
+    // 协程由 trm-lite 承载，本轮 IR = 攒表返回（探针验证产出序列）。
     var g_body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams)
     var is_gen_fn: i64 = 0
     if g_body >= 0 {
@@ -236,7 +236,7 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
     var p_vars: table<i64> = table_new_i64()
     // 必选参数数（默认值前）：**初值 0**，由下方循环按「最后一个无默认值且非变参
     // 的参数位置 +1」覆盖。
-    // RCA（p.9.11.23，2026-09-27）：此处原为 `var required: i64 = nparams`
+    // RCA（2026-09-27）：此处原为 `var required: i64 = nparams`
     //（意图「默认全部必选」）+ 变参时扣 1，导致**全部参数都带默认值**的函数
     // 必选数停在 nparams（而非 0）——于是 `d0(c: 9)` 这类调用被个数检查
     // （nc < req）误拒，报「期望 3 个参数，实际 1 个」。同理变参函数
@@ -257,11 +257,11 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         if pt < 0 {
             return -1
         }
-        // §11.8 重分类（2026-10-01）：参数为指针/切片/原子类型不再要求 unsafe fn
+        // §11.8 重分类：参数为指针/切片/原子类型不再要求 unsafe fn
         // —— 传参只是复制一个值，不引发 UB。「安全切片 vs 裸指针」的两层门禁
         // 由此合到操作一层（见 sinfer_ret_q2.tie）。
         var is_ref = s_vals[p] & 1   // by_ref（p.9.11.11 immut 存 bit1，掩码 & 1）
-        // p.9.11.26 四约定矩阵：统一声明面 + 互斥诊断。
+        // 四约定矩阵：统一声明面 + 互斥诊断。
         //   bit0=ref（可写借用）· bit1=immut（只读借用）· bit2=move（所有权转移）
         //   · bit3=重复修饰 · bit4=deep（入口深拷贝）· bit5=shared（显式共享不复制）
         // 互斥裁决（同槽双约 = 语义矛盾，编译诊断）：
@@ -292,7 +292,7 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
             sm_err_msg = "参数 '" + sstate.name_str(p) + "' 不能同时标注 move 与 ref/immut（所有权已移交，无从借用）"
             return -1
         }
-        // ★ r.1.6.12 `shared` × `deep` 互斥：一个声明「不复制、共享同一份」，
+        // ★ `shared` × `deep` 互斥：一个声明「不复制、共享同一份」，
         // 一个声明「入口深拷贝、与调用方完全独立」——语义直接对立，同槽双标必是笔误。
         if is_shared_p == 1 && is_deep_p == 1 {
             sm_err_line = s_lines[p]
@@ -365,7 +365,7 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
             sm_err_msg = "参数 '" + sstate.name_str(p) + "' 缺少默认值：可选参数（带默认值）必须连续排在必选参数之后"
             return -1
         }
-        // 默认值白名单（p.9.0-L.3）：字面量（数/布尔/字符/字符串/空表 []）或
+        // 默认值白名单（-L.3）：字面量（数/布尔/字符/字符串/空表 []）或
         // const 白名单表达式（const 全局引用、常量算术/比较/拼接/三目——见
         // is_const_default_expr）。曾仅字面量 ⇒ E00359 挡住 const 引用与常量算术。
         if has_def == 1 {
@@ -418,11 +418,11 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         }
         k = k + 1
     }
-    // M2.1.8：namespace <struct 名> 内的函数，首参 == 该 struct 类型 → 首参
+    // namespace <struct 名> 内的函数，首参 == 该 struct 类型 → 首参
     // **自动按引用传递**（对齐 Rust ir.rs：param_by_ref[0]，字段修改反映到调用方）。
     // `pub func inc(c: Counter)` 在 namespace Counter 内：c 首参标 ref，
     // c.inc() 转发时传 c 的槽地址，inc 内 c.count 修改写回调用方。
-    // p.9.11.20 enum 关联方法同约定：namespace <enum 名> 内函数首参 == 该
+    // enum 关联方法同约定：namespace <enum 名> 内函数首参 == 该
     // enum 类型 → 首参自动 ref（方法分派 obj.method() → <enum>::method(obj)）。
     if nparams > 0 {
         var last2 = sstate.rfind_ns(full)
@@ -451,7 +451,7 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         sm_err_col = s_cols[fn_node]
         return -1
     }
-    // p.9.11.15：生成器标记（签名返回类型已登记为 table<elem>；scheck 校验
+    // 生成器标记（签名返回类型已登记为 table<elem>；scheck 校验
     // yield 元素类型、irgen 按生成器发射攒表/返回表）
     if is_gen_fn == 1 {
         var g_sig = sstate.fn_sig(full)
@@ -460,7 +460,7 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
     return 0
 }
 
-// p.9.11.15 生成器检测辅助：子树（语句/表达式）是否含 N_YIELD。
+// 生成器检测辅助：子树（语句/表达式）是否含 N_YIELD。
 // 递归扫描子节点；N_FN_LIT（闭包）与 N_FN_DEF（块内函数定义）为函数边界，
 // 不深入（闭包内 yield 由 scheck 在闭包体检查时报错，不属外层函数）。
 // **N_CASE_BIND 特判**（对齐 sgen.clone_inner）：children[1] 是**变量名池 id**
@@ -563,9 +563,9 @@ func collect_struct_decl(s: i64) -> i64 {
         sm_err_col = s_cols[s]
         return -1
     }
-    // p.9.22.6 全量符号表：struct 声明登记（kind 1；type = struct_of(idx)）。
+    // 全量符号表：struct 声明登记（kind 1；type = struct_of(idx)）。
     xref.reg_decl(snid, 1, types.struct_of(idx), s)
-    // p.9.21.6-1 模块边界显式化：struct 行来源模块回填（reg_struct 默认 0；
+    // -1 模块边界显式化：struct 行来源模块回填（reg_struct 默认 0；
     // 此处持定义节点 s，反查真实文件 id）
     st_mod[idx] = sstate.file_id_of_node(s)
     // struct 名登记（types.type_name / 泛型 mangling 片段还原用；追加式与

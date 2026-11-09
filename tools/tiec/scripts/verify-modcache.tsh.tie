@@ -1,10 +1,10 @@
 type tie<tsh>
-// scripts/verify-modcache.tsh.tie —— p.9.21.6-2 模块级 tieir 片段缓存验收
+// scripts/verify-modcache.tsh.tie —— -2 模块级 tieir 片段缓存验收
 // ============================================================
 // 用法（repo 根）：<tsh> -f scripts/verify-modcache.tsh.tie [tiec路径]
 //   tiec 默认 .\compiler\tiec.exe（升格后）；开发期可传新 driver 构建路径。
 //
-// ⚠ tsh REPL v1 已知局限（2026-09-23 实测）：exec_code 异步返回（须 sleep/轮询）、
+// ⚠ tsh REPL v1 已知局限（实测）：exec_code 异步返回（须 sleep/轮询）、
 //   list_dir 进程内按目录路径缓存（同路径重复列出拿到陈旧列表）、get_file_hash/
 //   exec_output 输出捕获不稳定。本脚本已尽量绕开（轮询 + 路径拼写轮换 + 随机
 //   产物名），但在 tsh 语义修复前，其结果仅作参考。**权威验收 = 操作台四步**：
@@ -12,7 +12,7 @@ type tie<tsh>
 //   2) 原样重编（换 -o）→ +0（全命中）；
 //   3) 改一个叶子文件重编 → 恰 +1（其余 3 模块命中）；
 //   4) 带缓存产物 vs --no-cache 产物 certutil SHA256 逐字节一致。
-//   （2026-09-23 p.9216_drv2 实测：+4 / +0 / +1 / DETERMINISM OK 全过）
+//   （2026-09-23 _drv2 实测：+4 / +0 / +1 / DETERMINISM OK 全过）
 // 探针自建/自改 4 文件工程（run 标记随每次运行递增 → 源指纹必变 → 冷启）。
 // 编译一律换 -o 路径：dep_cache_key 含 g_output，单元级缓存每轮必 miss，
 // 保证 kpass_irgen（模块缓存挂点）每轮真实执行。

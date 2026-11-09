@@ -31,7 +31,7 @@ var vm_fret: table<i64> = [];              // 返回 pc 栈
 var vm_fdst: table<i64> = [];              // 返回值目标槽栈
 var vm_fnsz: table<i64> = [];              // 帧槽数栈
 // 数组对象池：vm_aof[i] 是第 i 个数组在 vm_aro 里的起点，vm_aln[i] 是长度。
-// 元素值与类型分两表平行存放；不回收，进程内单调增长（草案 §6 的取舍）。
+// 元素值与类型分两表平行存放；不回收，进程内单调增长（不回收的取舍）。
 var vm_aro: table<i64> = [];
 var vm_art: table<i64> = [];
 var vm_aof: table<i64> = [];
@@ -246,7 +246,7 @@ pub func vm_run() -> i64 {
                 vm_set(base + a, vm_val[base + b] + vm_val[base + c], VT_INT)
                 pc = pc + 1
             } else if vm_typ[base + b] == VT_STR && vm_typ[base + c] == VT_STR {
-                // 字符串是不可变值，拼接结果落进常量池。无回收（草案 §6），
+                // 字符串是不可变值，拼接结果落进常量池。无回收，
                 // 循环内反复拼接会持续增长常量池，属已知代价。
                 var sa = vm_consts[vm_val[base + b]]
                 var sb = vm_consts[vm_val[base + c]]

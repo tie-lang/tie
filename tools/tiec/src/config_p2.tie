@@ -1,5 +1,5 @@
 type tie<class>
-// compiler/config_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// compiler/config_p2.tie —— 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 config.tie。
@@ -32,7 +32,7 @@ func concat_arrays(a: i64, b: i64) -> i64 {
 }
 
 // 单值合并：决定同键下 base 值 bv 与 layer 值 lv 的合并结果。
-// 规则（P3 §5.2）：
+// 规则（§5.2）：
 //   - 双方都是表 → 递归深合并（merge_maps）；
 //   - 双方都是数组 → 追加合并；
 //   - layer 值为字符串 "=" → 重置为空数组（清空父层列表）；
@@ -100,7 +100,7 @@ func merge_maps(b: i64, l: i64) -> i64 {
     return nd
 }
 
-// 构造内置默认配置根（表节点）。D1-D7 域默认值 + profiles 节。
+// 构造内置默认配置根（表节点）。-域默认值 + profiles 节。
 // 返回根节点 id。
 // 布局纪律：所有表均「先收集键值到局部表，最后 commit_map 统一登记」，
 // 保证每个表的键在全局 c_key_flat 中连续——嵌套子表若边构造边 push，
@@ -111,26 +111,26 @@ func build_defaults() -> i64 {
     var tiec_vals: table<i64> = table_new_i64()
     table_push(tiec_keys, "backend")
     table_push(tiec_vals, new_str_node("win32"))
-    // D4 features：空列表（语言特性开关）
+    // features：空列表（语言特性开关）
     var feats = new_node(5)
     c_kids[feats] = len(c_elem_flat)
     c_ovals[feats] = 0
     table_push(tiec_keys, "features")
     table_push(tiec_vals, feats)
-    // D6 link：空列表（系统库）
+    // link：空列表（系统库）
     var links = new_node(5)
     c_kids[links] = len(c_elem_flat)
     c_ovals[links] = 0
     table_push(tiec_keys, "link")
     table_push(tiec_vals, links)
-    // D3 细分：emit 产出形态、bounds_check 越界检查
+    // 细分：emit 产出形态、bounds_check 越界检查
     table_push(tiec_keys, "emit")
     table_push(tiec_vals, new_str_node("exe"))
     var bc_n = new_node(1)
     c_ivals[bc_n] = 0
     table_push(tiec_keys, "bounds_check")
     table_push(tiec_vals, bc_n)
-    // p.9.1.2：编译资源——内存上限（MB，0 = 不限）>-0 时 -O3 降为 O2
+    // 编译资源——内存上限（MB，0 = 不限）>-0 时 -O3 降为 O2
     var ml_n = new_node(2)
     c_ivals[ml_n] = 0
     table_push(tiec_keys, "mem_limit")
@@ -205,7 +205,7 @@ func build_defaults() -> i64 {
     table_push(cache_vals, new_str_node("memory"))
     table_push(cache_keys, "path")
     table_push(cache_vals, new_str_node(".tie-cache"))
-    // p.9.1.3：编译缓存目录（空 = 自动 ~/.tiec-cache）
+    // 编译缓存目录（空 = 自动 ~/.tiec-cache）
     table_push(cache_keys, "dir")
     table_push(cache_vals, new_str_node(""))
     var cache = new_node(6)
@@ -226,7 +226,7 @@ func build_defaults() -> i64 {
     c_ivals[dev_dbg] = 1
     table_push(dev_keys, "debug")
     table_push(dev_vals, dev_dbg)
-    // p.9.20 双轴：llvm_opt（LLVM/clang 轴）+ tiec_opt（tiec 中端轴）
+    // 双轴：llvm_opt（LLVM/clang 轴）+ tiec_opt（tiec 中端轴）
     var dev_llvm = new_node(2)
     c_ivals[dev_llvm] = 0
     table_push(dev_keys, "llvm_opt")
@@ -277,10 +277,10 @@ func build_defaults() -> i64 {
     // ---------- 根 ----------
     var root_keys: table<string> = table_new_string()
     var root_vals: table<i64> = table_new_i64()
-    // D1 target：空 = 本机
+    // target：空 = 本机
     table_push(root_keys, "target")
     table_push(root_vals, new_str_node(""))
-    // D3 双轴优化档（p.9.20）：llvm_opt 默认 2（与 CLI 默认一致）、tiec_opt 默认
+    // 双轴优化档：llvm_opt 默认 2（与 CLI 默认一致）、tiec_opt 默认
     // 0（零 pass，自举不动点不变）；debug：默认 false
     var opt_n = new_node(2)
     c_ivals[opt_n] = 2
@@ -294,7 +294,7 @@ func build_defaults() -> i64 {
     c_ivals[dbg_n] = 0
     table_push(root_keys, "debug")
     table_push(root_vals, dbg_n)
-    // P3 profile：默认 dev（Cargo 风格）
+    // profile：默认 dev（Cargo 风格）
     table_push(root_keys, "profile")
     table_push(root_vals, new_str_node("dev"))
     // 子树引用（值节点已构造并登记，此处只登记键）

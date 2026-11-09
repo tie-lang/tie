@@ -1,7 +1,7 @@
 type tie<class>
 // ============================================================================
 // smtp.tie：标准库——SMTP 发信客户端（命名空间 smtp，纯 tie）
-// SMTP mail-sending client (namespace smtp, pure-tie). p.6.6.8
+// SMTP mail-sending client (namespace smtp, pure-tie). 
 //
 // 数据平面（Data plane）：命令与响应均为 ASCII string（SMTP 协议命令/回复头本是
 // 可打印 ASCII；用户名/密码/主题/正文的 ASCII 场景足够，符合本库保持 string 平面、
@@ -30,10 +30,10 @@ type tie<class>
 //
 // STARTTLS：**占位**（不实现，文档化取舍）。若环境变量 TIE_SMTP_STARTTLS=1 且
 //   EHLO 行含 STARTTLS 能力，标准路径为：发 STARTTLS 收 220 → tls.connect 同
-//   host/pport 建立 TLS 会话 → rd/wr 切换为 tls.send/tls.recv 版本。本轮以实现
-//   明文全量会话为准，STARTTLS 触点用注释标注形如 <STARTTLS-POINT>，待 p.6.6.1
+//   host/pport 建立 TLS 会话 → rd/wr 切换为 tls.send/tls.recv 版本。当前以实现
+//   明文全量会话为准，STARTTLS 触点用注释标注形如 <STARTTLS-POINT>，待 
 //   tls 会话接管（TLS 会话的 recv/send 已就绪：tls.connect/send/recv/close）续接；
-//   说明见回报。tie 暂无环境变量读取原语，env gate 亦留待续接。验收以明文脚本
+//   tie 暂无环境变量读取原语，env gate 暂不启用。验收以明文脚本
 //   会话为准，STARTTLS 探针默认跳过。
 //
 // 语言约束（Language constraints）：
@@ -61,7 +61,7 @@ var g_err: string = ""
 //   -20 send() 建连失败（tcp_connect <0）
 
 // STARTTLS-POINT：TLS 会话句柄（接通后 rd/wr 切换为 tls.send/tls.recv 版本）。
-// 本轮占位未实现，变量保留供 p.6.6.1 续接。
+// 本轮占位未实现，变量保留供 续接。
 var g_tlsx: i64 = -1
 
 // 真实网络收发用底层 socket 句柄（rd_net/wr_net 经模块全局共享，见命名空间内实现）。
@@ -287,7 +287,7 @@ pub func session(rd: fn() -> string, wr: fn(string) -> i64, server: string, ppor
     }
     // STARTTLS-POINT：此处若 TIE_SMTP_STARTTLS=1 且 resp 含 STARTTLS，发 STARTTLS
     // 收 220 → g_tlsx = tls.connect(server, pport) → rd/wr 切换为 tls 版会话。
-    // 待 p.6.6.1 tls 会话接管续接；本轮未实现（文档化取舍）。
+    // 待 tls 会话接管续接；尚未实现（取舍见模块说明）。
     // 3) 可选认证：auth=="none" 或服务端 EHLO 行内无 AUTH → 匿名（直接 MAIL）
     var want_auth: i64 = 1
     if auth == "none" {
@@ -371,7 +371,7 @@ pub func session(rd: fn() -> string, wr: fn(string) -> i64, server: string, ppor
 // ============================================================================
 // 五、真实网络收发（包 std/net；供 send() 使用）
 // ============================================================================
-// STARTTLS-POINT：g_tlsx>=0 时 rd/wr 应切换为 tls.send/tls.recv 版本；本轮未实现。
+// STARTTLS-POINT：g_tlsx>=0 时 rd/wr 应切换为 tls.send/tls.recv 版本；尚未实现。
 
 // 网络读一行（含行尾换行）：逐字节累积直到 0x0A；连接关闭返回现有缓冲或空串。
 func rd_net() -> string {

@@ -1,10 +1,10 @@
 type tie<class>
-// lib/backend/llvmgen_sc.tie —— p.9.17.1 str_char 码点索引缓存 段发射
+// lib/backend/llvmgen_sc.tie —— str_char 码点索引缓存 段发射
 // ============================================================
 // 范式：同 namespace 跨文件（文本内联）——只含函数与注释。
-// 从 llvmgen_p1.tie 拆出（单文件 ≤800 行纪律）。
+// 从 llvmgen_p1.tie 拆出。
 namespace llvmgen {
-// p.9.17.1：str_char 码点索引缓存段（仅 g_sc_enabled 时输出）。
+// str_char 码点索引缓存段（仅 g_sc_enabled 时输出）。
 //   @tie_sc_addr [2 x ptr]           每槽缓存串基址（null = 空）
 //   @tie_sc_len  [2 x i64]           每槽缓存字节长
 //   @tie_sc_n    [2 x i64]           每槽已映射码点数（= 表项数）
@@ -25,7 +25,7 @@ func emit_sc_globals() {
     line("@tie_sc_len = private global [2 x i64] zeroinitializer")
     line("@tie_sc_n = private global [2 x i64] zeroinitializer")
     line("@tie_sc_tab = private global [2 x [131072 x i64]] zeroinitializer")
-    // p.9.21.11（§2.5 用户钦定）：str_len 双槽缓存段——(ptr, blen) 键，命中
+    // （§2.5 用户钦定）：str_len 双槽缓存段——(ptr, blen) 键，命中
     // O(1) 返回缓存码点数，未命中单次 O(blen) 步进计数后入槽；无 CAP 限制
     //（str_len 缓存值仅一个 i64/槽，无 str_char 的 per-string 偏移大表）。
     // 失效复用 @tie_sc_inval（free 钩子，扩为同时清 sl 槽）。

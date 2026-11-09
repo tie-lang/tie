@@ -1,5 +1,5 @@
 type tie<class>
-// lib/ir/tieir_asm_replay.tie —— p.9.21.11 §5.0 拆解：装配重放侧
+// lib/ir/tieir_asm_replay.tie —— §5.0 拆解：装配重放侧
 // ============================================================
 // 自 tieir_asm.tie 拆出（同 namespace 跨文件文本内联；铁律 11 单文件 ≤500
 // 行纪律）：asm_build_seq（装配序匹配 + head/extra/tail 四段）与 asm_replay
@@ -16,7 +16,7 @@ pub func asm_build_seq(order: table<string>) -> i64 {
     var f0 = asm_f_base[0]
     var f0_end = asm_f_base[1]
     var seen_match: bool = false
-    // p.9.21.10 性能：名字匹配从 O(order×records) 字符串扫描（driver 实测
+    // 性能：名字匹配从 O(order×records) 字符串扫描（driver 实测
     // ~1100 万次比较）改为 interner id 直接索引（O(1) 查，索引表 ~interner 容量）。
     var cap = interner.len()
     var order_flag: table<i64> = table_new_i64()
@@ -54,7 +54,7 @@ pub func asm_build_seq(order: table<string>) -> i64 {
         fi0 = fi0 + 1
     }
     // 全部函数记录按名登记（**同名链表**：泛型展开可在多/同模块产生同名函数
-    // ——p.9.21.11 修复：a7d4211 的「name_rec 后写覆盖」单槽表在同名 ≥2 条记录
+    // ——修复：a7d4211 的「name_rec 后写覆盖」单槽表在同名 ≥2 条记录
     // 时第二条永远无法被装配序匹配（driver 实测 assert::assert_eq$i64 未覆盖
     // 降级全量）。改 head/tail 链表（FIFO = 记录升序），每名匹配取链首未用
     // 记录，语义与旧 O(order×records) 线性扫描一致，查名仍 O(1)。
@@ -113,7 +113,7 @@ pub func asm_build_seq(order: table<string>) -> i64 {
         table_push(asm_seq, matched[mi])
         mi = mi + 1
     }
-    // p.9.21.11：irgen 期展开的泛型函数 → extra 段。机制：调用点兜底实例化
+    // irgen 期展开的泛型函数 → extra 段。机制：调用点兜底实例化
     //（instantiate_fn）发生在 irgen 遍历中，clone 追加 g_extra_tops 与注册表
     // 登记都在装配序构建**之后**——装配序快照必然缺名（driver 实测
     // assert::assert_eq$i64 反复覆盖失败）。未匹配的非主片段记录即此类展开：
@@ -163,7 +163,7 @@ pub func asm_build_seq(order: table<string>) -> i64 {
         table_push(asm_seq, tail[ti])
         ti = ti + 1
     }
-    // 覆盖校验（p.9.21.11 重构）：全部记录必经 head/matched/extra/tail 四段
+    // 覆盖校验（重构）：全部记录必经 head/matched/extra/tail 四段
     // 之一（extra 段吸收 irgen 期泛型展开）——不再有「未覆盖」失败路径；
     // 片段记录全集 == 重放函数全集由 asm_from_slices 末尾的函数数校验兜底。
     return 0
@@ -209,9 +209,9 @@ pub func asm_replay() -> i64 {
         table_push(asm_i_gid, -1)
         gi0 = gi0 + 1
     }
-    // p.9.21.11 批量化（撤）：vmap 预填与块记录片段号预计算随 bulk 实验一并
+    // 批量化（撤）：vmap 预填与块记录片段号预计算随 bulk 实验一并
     // 回退（铁律 4）——v3i 逐条 add_operand 版实测 7.0s 全绿，为唯一已验证
-    // 形态；批量方向留待专项勘察（嫌疑 = 大表按值传参整表拷贝，铁律 11 #7）。
+    // 形态；批量方向待专项勘察（嫌疑 = 大表按值传参整表拷贝，铁律 11 #7）。
     var k: i64 = 0
     while k < len(asm_seq) {
         var r = asm_seq[k]
@@ -240,17 +240,17 @@ pub func asm_replay() -> i64 {
             asm_b_gid[brec] = ir.new_block(fid, asm_b_gname[brec])
             b = b + 1
         }
-        // 指令重放见下方全局单趟（p.9.21.10：片段指令流已按 id 序 = 创建序
+        // 指令重放见下方全局单趟（片段指令流已按 id 序 = 创建序
         // 写出，跨函数单趟重放即创建序；建指令即补操作数，无前向引用）
         k = k + 1
     }
-    // 指令全局单趟重放：片段指令流 = id 序（write_mod_slice p.9.21.10 改造），
+    // 指令全局单趟重放：片段指令流 = id 序（write_mod_slice 改造），
     // 建指令即补操作数（ir.add_operand 段连续断言满足）；每块指令在流中连续
     // → 重建后块区间仍连续。vmap 直查（值域是否交错无关）。
-    // p.9.21.11 批量化实验回退（铁律 4）：bulk 表 + ops_append + ops_meta_bulk
+    // 批量化实验回退（铁律 4）：bulk 表 + ops_append + ops_meta_bulk
     // 版在 driver 规模出现 >110s 异常（且与产物缓存命中状态翻摆纠缠，本地
     // 无法稳定归因）；v3i 逐条 add_operand 版实测 7.0s 全绿，回退到已验证
-    // 形态。批量方向（消灭 3M 跨命名空间调用）留待专项勘察：嫌疑 = 大表按值
+    // 形态。批量方向（消灭 3M 跨命名空间调用）待专项勘察：嫌疑 = 大表按值
     // 传参整表拷贝（铁律 11 敌人 #7）与缓存命中翻摆的交互，须在可测环境下
     // 先分账再动手。
     var gi: i64 = 0

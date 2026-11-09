@@ -1,5 +1,5 @@
 type tie<class>
-// lib/backend/llvmgen_inst_gen_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// lib/backend/llvmgen_inst_gen_p2.tie —— 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 llvmgen_inst_gen.tie。
@@ -41,7 +41,7 @@ pub func gen_inst_b_6_and(inst_id: i64) {
         } else if op == 10 {
             opname = "shl"
         } else if op == 11 {
-            // S1.3 B2 右移：有符号 → 算术右移（ashr）；无符号 → 逻辑右移
+            // B2 右移：有符号 → 算术右移（ashr）；无符号 → 逻辑右移
             // （lshr）。u 类型位模式右移必须 lshr（ashr 会符号扩展错误）。
             var ity11 = ir.ins_ty(inst_id)
             if ity11 == TK_U8 || ity11 == TK_U16 || ity11 == TK_U32 || ity11 == TK_U64 {
@@ -51,7 +51,7 @@ pub func gen_inst_b_6_and(inst_id: i64) {
             }
         }
         // 移位计数 ≥ 位宽在 LLVM 是毒值（UB）：生成代码可能挂起/值损坏
-        // （2026-09-02 实测 `1 >> 88` 程序无输出）。语义定界为 JS 式掩码
+        // （实测 `1 >> 88` 程序无输出）。语义定界为 JS 式掩码
         // count & 63（与既有的 tie 侧 `shift < 64` 护栏行为兼容：≥64 一律 0/1..）。
         var ty = llvm_ty(ir.ins_ty(inst_id))
         if op == 10 || op == 11 {
@@ -161,7 +161,7 @@ pub func gen_inst_b_70_call_indirect(inst_id: i64) {
         reg = "%" + to_string(val)
     }
 
-        // call_indirect（S2.2 函数值调用）：操作数 [0]=entry 函数指针 VALUE,
+        // call_indirect（函数值调用）：操作数 [0]=entry 函数指针 VALUE,
         // [1]=返回类型 id IMM, [2]=env VALUE, 然后每参数 [类型 id IMM, 值]。
         // 统一入口签名 fn(ptr env, A...) -> R（无捕获闭包 env = null）。
         // 发射 `call [Ty] %entry(ptr %env, args...)`——entry 是 ptr 值（聚合
@@ -193,7 +193,7 @@ pub func gen_inst_b_73_dyn_call(inst_id: i64) {
         reg = "%" + to_string(val)
     }
 
-        // dyn_call（p.6.6.20 std/sqlite 动态加载）：操作数 [0]=entry 函数指针 VALUE,
+        // dyn_call（std/sqlite 动态加载）：操作数 [0]=entry 函数指针 VALUE,
         // [1]=retmode IMM（0=i32 返回→截断+zext i64；1=完整 i64/指针返回）,
         // 然后每参数 [类型 id IMM, 值]。发射 `call [Ty] %entry(args...)`——entry 是
         // inttoptr 出的 ptr 值（GetProcAddress 地址），无 env（区别于 op70 的
@@ -235,7 +235,7 @@ pub func gen_inst_b_56_str_cat(inst_id: i64) {
     }
 
         // str_cat（字符串拼接）：操作数 [lhs, rhs] → malloc+memcpy 序列。
-        // S2.1：升级为 {ptr,len} 布局——malloc 8 头 + 数据 + \0：
+        // 升级为 {ptr,len} 布局——malloc 8 头 + 数据 + \0：
         //   buf[0..8)  = i64 总长（O(1) len 读取）；buf[8..] = UTF-8 数据；
         //   数据末尾 \0（FFI 边界自动 NUL，旧 strlen/strcmp/printf 兼容）。
         // 对齐 Rust tig_binary_str 的 Add：strlen+strlen → malloc(len1+len2+9)
@@ -255,12 +255,12 @@ pub func gen_inst_b_56_str_cat(inst_id: i64) {
         // 良性越读（自举产物 tiec2b 曾因 1 字节余量撞未映射页 0xC0000005，
         // 漏洞 B 根因）。填充只影响分配大小，{ptr,len} 语义不变。
         var total = reg_add(n1, n2)
-        // SSO（dev33 批次3）：块分配走 @tie_sso_alloc——短串（≤31 字节）从
+        // SSO：块分配走 @tie_sso_alloc——短串（≤31 字节）从
         // 静态池 bump（零 malloc），长串回退 malloc（helper 内部 +41：8 头 +
         // 1 \0 + 32 尾部填充，容纳向量化宽读，漏洞 B 修复）。返回块基址。
         sso_enable()
         var buf = gen_call_ptr("tie_sso_alloc", "i64", total)
-        // 写头部长度（S2.1 长度字段）
+        // 写头部长度（长度字段）
         line("store i64 " + total + ", ptr " + buf)
         // 数据起始 = buf + 8
         var d0 = reg_gep(buf, "8")
@@ -273,17 +273,17 @@ pub func gen_inst_b_56_str_cat(inst_id: i64) {
         line("store i8 0, ptr " + endp)
         // 返回数据指针（ptrtoint i64 指针整数，{ptr,len} 的 ptr 位）
         line(reg + " = ptrtoint ptr " + d0 + " to i64")
-        // p.9.12.7：companion 真 ptr 转换必须在**定义块**内生成（与上方 ptrtoint
+        // companion 真 ptr 转换必须在**定义块**内生成（与上方 ptrtoint
         // 同块）——字符串 phi（分支合流）的 incoming 引用它。旧路径在 phi 处
         // （合并块）临时 inttoptr 会 ① 插在 phi 之前 → LLVM opt 报
         // "PHI nodes not grouped at top of basic block"；② 引用分支块内定义的
         // i64 值在合并块使用 → 多臂合流时该分支块不支配合并块 →
-        // "Instruction does not dominate all uses!"（p.9.12.7 崩源）。
+        // "Instruction does not dominate all uses!"（崩源）。
         // %spN 以结果值 id 定名（非纯数字后缀，renumber 不动；%sp 前缀独用，
         // 不与 %sc/%ext 冲突）；opt 的 InstCombine 折叠 inttoptr(ptrtoint x) → x，
         // 编译产物零性能开销。
         line("%sp" + to_string(ir.get_value(inst_id)) + " = inttoptr i64 " + reg + " to ptr")
-        // p.6.7.5 生命周期确定性：链式临时释放——操作数若是前一 str_cat 的
+        // 生命周期确定性：链式临时释放——操作数若是前一 str_cat 的
         // 结果值（op56 def）且全函数仅本次拼接一处使用（SSA 纯表达式临时，
         // 无其它 load/store/传参引用），则结果就绪后按长度释放其堆缓冲。
         // 计数含本指令自身（lv==rv 同一值两处消费 → uses>1 不释）与其它
@@ -467,7 +467,7 @@ pub func gen_inst_b_36_extern_call(inst_id: i64) {
 
         // extern_call（阶段 A 新布局）：操作数 [0]=符号名池 id, [1]=返回类型IMM,
         // 然后每参数 [类型IMM, 值]。返回类型 = ins_ty（void → call void）。
-        // S2.1：tie 桥返回字符串（ptr）= 无头堆串（桥内 malloc，无长度头）→
+        // tie 桥返回字符串（ptr）= 无头堆串（桥内 malloc，无长度头）→
         // 调用后**补头**（strlen + malloc + memcpy），统一为 {ptr,len} 布局
         // （头部 8 字节 i64 长度 + 数据 + \0），保证 len(s) O(1) 与二进制安全。
         // 判据：ins_ty == TK_STR 且符号 tie_ 前缀（libc 的 malloc/strlen 等
@@ -487,7 +487,7 @@ pub func gen_inst_b_36_extern_call(inst_id: i64) {
         if ir.ins_ty(inst_id) < 0 || ir.ins_ty(inst_id) == TK_VOID {
             line("call void @" + sym + "(" + args + ")")
         } else if ir.ins_ty(inst_id) == TK_STR && !is_table_bridge(sym) {
-            // FFI 接收方向自动扫描（批次5 任务13/14）：extern 返回 string =
+            // FFI 接收方向自动扫描：extern 返回 string =
             // C `char*`（NUL 结尾，无 {ptr,len} 头），调用后统一补头
             // （strlen + malloc + memcpy + 尾 \0）。语义推广到**所有**符号——
             // tie_ 桥与用户 extern（如 getenv）一致；表句柄桥经 is_table_bridge

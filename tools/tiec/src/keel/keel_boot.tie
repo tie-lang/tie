@@ -1,7 +1,7 @@
 type tie<class>
-// compiler/keel/keel_boot.tie —— Keel 龙骨架构 内建引导集（p.7.1.1 骨架层）
+// compiler/keel/keel_boot.tie —— Keel 龙骨架构 内建引导集（骨架层）
 // ============================================================
-// 里程碑：2026.2 路线图 p.7.1.1「Keel 龙骨架构核心微内核化第一步」骨架层。
+// 职责：微内核骨架层。
 // 目标：核心只余机制层，一切行为皆为注册项。本模块 = 内建引导集（boot）：
 // 把编译主流水线的默认形态登记为注册项（pipeline:default），并把 5 槽
 // 前端的 front/中端 irgen/旁路 tieir/后端 emit/link 登记为 pass 注册项。
@@ -11,7 +11,7 @@ type tie<class>
 //   1) 5 个 pass 注册项：
 //        id          "tiec::pass_front" / pass_irgen / pass_tieir / pass_emit / pass_link
 //        kind        "pass"
-//        impl_name   keelboot.pass_* （占位实现函数名，C1 分派键）
+//        impl_name keelboot.pass_* （占位实现函数名，分派键）
 //        deps        指向被依赖的 pass id（依赖顺序 front<irgen<tieir<emit<link）
 //   2) 1 个 pipeline 注册项：
 //        id          "tiec::pipeline_default"
@@ -23,7 +23,7 @@ type tie<class>
 //   g_pass_front/irgen/tieir/emit/link）在注册表世界的登记形态。
 //
 // # 占位实现
-//   本任务只搭骨架，真正的 driver 实现由后续步骤接线（不接 driver）。
+//   此处只搭骨架，driver 实现另行接线（不接 driver）。
 //   故 boot 内放 5 个 noop 占位函数（return 0），impl_name 指向它们，
 //   keelexec 按名分派到它们（管线全绿返回 0）。
 //
@@ -39,7 +39,7 @@ type tie<class>
 
 namespace keelboot {
 
-// ---------- 占位实现（p.7.1.1 骨架：真正的 driver 实现后续接线）----------
+// ---------- 占位实现（骨架：真正的 driver 实现后续接线）----------
 // 5 槽按 compiler/pipeline.tie 的 pass 签名统一 fn() -> i64：0 成功。
 
 // 前端占位：词法 + 语法 + 语义（含 import）。
@@ -102,13 +102,13 @@ pub func boot() -> i64 {
     table_push(pipe_deps, link_id)
     var pipe_id = keelreg.register("tiec::pipeline_default", "pipeline", "", pipe_deps)
 
-    // CLI 子命令注册化（p.7.1.6）：与内核注册项一并登记。
+    // CLI 子命令注册化：与内核注册项一并登记。
     register_cli()
 
     return pipe_id
 }
 
-// p.7.1.6 CLI 子命令注册化：登记 `tie <子命令>` 全部表面（对齐 pkg/main.tie 的
+// CLI 子命令注册化：登记 `tie <子命令>` 全部表面（对齐 pkg/main.tie 的
 // init/add/remove/install/update/build/run/publish/pack/verify/search/info/help）。
 // 每条命令 = 注册项（设计稿 §3：cli:xxx）；keel_cli 承载登记/查表/描述，driver
 // 侧 keelcli_handle 按名分派到实际处理函数（未登记报"未知命令"）。幂等：重复

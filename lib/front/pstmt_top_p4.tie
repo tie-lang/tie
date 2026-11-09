@@ -1,14 +1,14 @@
 type tie<class>
-// lib/front/pstmt_top_p4.tie —— 分片 4（p.9.21.3 单文件 ≤800 行）
+// lib/front/pstmt_top_p4.tie —— 分片 4
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 pstmt_top.tie。
 namespace pstmt_top {
-// `enum Name [<T1, T2>] { VariantA VariantB(i64, string) }`（ADT 枚举，2026-08-15）
+// `enum Name [<, >] { VariantA VariantB(i64, string) }`（ADT 枚举，2026-08-15）
 // 泛型（对齐 struct）：enum 名后紧跟类型参数列表；产出 N_ENUM
 // children = [泛型槽(-1或N_TYPE_PARAMS), EnumVariant...]。
 // 每个变体 = N_ENUM_VARIANT[name=变体名, children=[payload 类型...]]；
-// 无 payload 变体 children 为空。p.9.12.5：变体分隔符放宽为可选——`;` / `,` /
+// 无 payload 变体 children 为空。：变体分隔符放宽为可选——`;` / `,` /
 // 无（空格或直接空位，下一变体名或 '}' 前）三种均可，语义互不影响；原有换行
 // 分隔由 ASI 自动补 `;`（lexer finish_line）照旧工作。payload 类型逐个用
 // pexpr_type.parse_type() 解析（可为内建泛型/struct 引用，一期白名单由语义层
@@ -73,7 +73,7 @@ func parse_enum() -> i64 {
                     }
                 }
             }
-            // p.9.12.5：变体分隔符可选——`;` / `,` / 无（空格或下一变体名/`}` 前
+            // 变体分隔符可选——`;` / `,` / 无（空格或下一变体名/`}` 前
             // 直接空位）三种均可。换行分隔由 ASI 自动补 `;`，此处 eat 即消费；
             // 逗号分隔显式 eat（payload 括号内逗号已被 parse_type 消费完，不会误吞）；
             // 二者都没有则直接进入下一轮循环（同行空格分隔 / `}` 前无分隔符）。

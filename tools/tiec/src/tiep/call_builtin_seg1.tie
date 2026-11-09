@@ -1,13 +1,13 @@
 type tie<class>
-// compiler/interp/call_builtin_seg1.tie —— call_builtin 分派链分段 1（p.9.21 G2 单函数 ≤300 行）
+// compiler/interp/call_builtin_seg1.tie —— call_builtin 分派链分段 1
 // ============================================================
 // 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
-// 与原函数同 namespace，跨文件裸名互调；p.9.17.2 Value 化后未命中改由
+// 与原函数同 namespace，跨文件裸名互调；Value 化后未命中改由
 // 前置名单（interp_call_p2 的 cb_is_seg1）判定，错误统一经 w_err 传播。
 namespace tiep {
 func call_builtin_seg1(name: string, args: table<Value>) -> Value {
     if name == "gensym" {
-        // S3.3 H3 显式卫生：gensym("前缀") → 唯一标识符（intern 池 + 计数器）。
+        // H3 显式卫生：gensym("前缀") → 唯一标识符（intern 池 + 计数器）。
         // 宏体内生成导出/共享名，经插值（$name / $nm 名字位置）使用。
         if len(args) != 1 {
             w_err = "gensym 需要一个字符串前缀参数"
@@ -22,7 +22,7 @@ func call_builtin_seg1(name: string, args: table<Value>) -> Value {
             vval.str_val(args[0]))
     }
     if name == "eval_code" {
-        // S3.3 C3 编译期 eval：eval_code("源码") → code 值（AST 协议文本）。
+        // 编译期 eval：eval_code("源码") → code 值（AST 协议文本）。
         // 编译期代码生成（宏体内用）；源码必须语法合法（解析即校验）。
         if len(args) != 1 {
             w_err = "eval_code 需要一个字符串源码参数"
@@ -41,10 +41,10 @@ func call_builtin_seg1(name: string, args: table<Value>) -> Value {
         return vval.new_code(proto)
     }
     if name == "eval_expr" {
-        // M4（dev33 批次9）：eval_expr("表达式源码") → code 值（根 = 表达式
+        // eval_expr("表达式源码") → code 值（根 = 表达式
         // 子树）。eval_code 只能解析完整程序，表达式需独立入口——包装成
         // `func __tie_wrap__() -> i64 { return ( <expr> ) }` 解析后抽取
-        // return 表达式子树序列化。编译期常量计算宏（任务25）用它注入
+        // return 表达式子树序列化。编译期常量计算宏用它注入
         // 计算结果字面量。
         if len(args) != 1 {
             w_err = "eval_expr 需要一个字符串参数"
@@ -268,13 +268,13 @@ func call_builtin_seg1(name: string, args: table<Value>) -> Value {
         }
         return vval.new_str(r)
     }
-    // ==================== M4 token 流 API（宏环境，dev33 批次9） ====================
+    // ==================== token 流 API（宏环境，） ====================
     // tokenize：源码字符串 → token 流文本（首行 <N>:，随后每行 <tag> <lexeme>，
     // 排除末尾 Eof；lexeme 反斜杠/换行转义——保证每 token 单行且往返一致）。
     if name == "compile_error" {
-        // M4（dev33 批次9 任务27）：宏内主动报编译错误。置 w_err 上抛，
+        // 宏内主动报编译错误。置 w_err 上抛，
         // eval_macro/exec 链传播，mexpand 以**调用点**行列号报「宏展开失败:
-        // 编译错误: <消息>」——编译错误定位到宏调用点（任务27 验收）。
+        // 编译错误: <消息>」——编译错误定位到宏调用点（验收）。
         if len(args) != 1 {
             w_err = "compile_error 需要一个字符串参数"
             return Value.Nil

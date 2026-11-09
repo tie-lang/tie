@@ -1,7 +1,7 @@
 type tie<class>
 // lib/codegen/irgen_fs.tie —— 生成器 L3：文件系统辅助（open/stat/read/write/exists/size/delete/copy/move）
 // ============================================================
-// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 自 irgen_expr.tie 按域拆出。
 // 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
 // 顶层全局 var 与 import 树留在 irgen.tie 主文件。
 namespace irgen {
@@ -339,7 +339,7 @@ func tig_is_dotname(n: i64) -> i64 {
     return tig_or_i1(d1, d2)
 }
 func tig_read_file(p: i64) -> i64 {
-    // r.1.6.2 Linux 分支：open(O_RDONLY) → 循环 read(64KB) 到 EOF → StringBuilder
+    // Linux 分支：open(O_RDONLY) → 循环 read(64KB) 到 EOF → StringBuilder
     // 拼装 → close。UTF-8 路径直通。失败（打不开）→ 空串（对齐 Win32 哨兵）。
     if tig_is_linux() {
         var T64 = types.named(TK_I64)
@@ -455,7 +455,7 @@ func tig_read_file(p: i64) -> i64 {
     return s21_load(sv, types.named(TK_STR))
 }
 func tig_write_file(p: i64, c: i64, append: bool) -> i64 {
-    // r.1.6.2 Linux 分支：open(O_WRONLY|O_CREAT|O_TRUNC / O_APPEND, 0644) →
+    // Linux 分支：open(O_WRONLY|O_CREAT|O_TRUNC / O_APPEND, 0644) →
     // write 单次全量 → close。成功（写满 n 字节）→ true（对齐 Win32 哨兵）。
     if tig_is_linux() {
         var T64 = types.named(TK_I64)
@@ -551,7 +551,7 @@ func tig_attr_invalid(a: i64) -> i64 {
     return tig_icmp_c(a, tig_int_lit_ty(-1, I32), 0)
 }
 func tig_exists_inline(p: i64) -> i64 {
-    // r.1.6.2 Linux：access(p, F_OK=0) == 0 → 存在
+    // Linux：access(p, F_OK=0) == 0 → 存在
     if tig_is_linux() {
         var I32 = types.named(TK_I32)
         return tig_cmp_zero(tig_ext_call2("access", p, types.named(TK_STR),
@@ -560,7 +560,7 @@ func tig_exists_inline(p: i64) -> i64 {
     return tig_not_i1(tig_attr_invalid(tig_file_attr_w(p)))
 }
 func tig_is_dir_inline(p: i64) -> i64 {
-    // r.1.6.2 Linux：stat 成功且 (st_mode & S_IFMT) == S_IFDIR
+    // Linux：stat 成功且 (st_mode & S_IFMT) == S_IFDIR
     if tig_is_linux() {
         var mode = tig_posix_stat_mode(p)  // 失败 → -1
         var bad = tig_icmp_c(mode, tig_int_lit(-1), 0)
@@ -575,7 +575,7 @@ func tig_is_dir_inline(p: i64) -> i64 {
     return tig_and_i1(tig_not_i1(tig_attr_invalid(a)), dirf)
 }
 func tig_is_file_inline(p: i64) -> i64 {
-    // r.1.6.2 Linux：stat 成功且 (st_mode & S_IFMT) == S_IFREG
+    // Linux：stat 成功且 (st_mode & S_IFMT) == S_IFREG
     if tig_is_linux() {
         var mode = tig_posix_stat_mode(p)  // 失败 → -1
         var bad = tig_icmp_c(mode, tig_int_lit(-1), 0)
@@ -590,7 +590,7 @@ func tig_is_file_inline(p: i64) -> i64 {
     return tig_and_i1(tig_not_i1(tig_attr_invalid(a)), tig_not_i1(dirf))
 }
 func tig_size_inline(p: i64) -> i64 {
-    // r.1.6.2 Linux：stat → st_size；失败 → -1（对齐 Win32 哨兵）
+    // Linux：stat → st_size；失败 → -1（对齐 Win32 哨兵）
     if tig_is_linux() {
         return tig_posix_stat_size(p)
     }
@@ -627,7 +627,7 @@ func tig_size_inline(p: i64) -> i64 {
     return s21_load(sv, T64)
 }
 func tig_delete_inline(p: i64) -> i64 {
-    // r.1.6.2 Linux：unlink(p) == 0 → true（目录删除失败，与 DeleteFileW 一致）
+    // Linux：unlink(p) == 0 → true（目录删除失败，与 DeleteFileW 一致）
     if tig_is_linux() {
         var I32 = types.named(TK_I32)
         return tig_cmp_zero(tig_ext_call1("unlink", p, types.named(TK_STR), I32), 0)
@@ -638,7 +638,7 @@ func tig_delete_inline(p: i64) -> i64 {
     return tig_win_ok(tig_ext_call1("DeleteFileW", pw, P8, I32))
 }
 func tig_copy_file(a: i64, b: i64) -> i64 {
-    // r.1.6.2 Linux：POSIX 复制（open/read/write/close）
+    // Linux：POSIX 复制（open/read/write/close）
     if tig_is_linux() {
         return tig_posix_copy_file(a, b)
     }
@@ -655,7 +655,7 @@ func tig_copy_file(a: i64, b: i64) -> i64 {
     return tig_win_ok(r)
 }
 func tig_move_file(a: i64, b: i64) -> i64 {
-    // r.1.6.2 Linux：rename(a, b) == 0 → true
+    // Linux：rename(a, b) == 0 → true
     if tig_is_linux() {
         var I32 = types.named(TK_I32)
         return tig_cmp_zero(tig_ext_call2("rename", a, types.named(TK_STR),

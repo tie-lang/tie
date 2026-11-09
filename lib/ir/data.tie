@@ -1,7 +1,7 @@
 type tie<class>
-// lib/ir/data.tie —— 自举 v2 T2.1：B1 tag 表数据化
+// lib/ir/data.tie —— ：B1 tag 表数据化
 // ============================================================
-// 里程碑：自举 v2 计划 T2.1 模块化地基。把阶段 1 原型中散落的
+// 职责：模块化地基。把早期原型中散落的
 // **硬编码编号表**数据化为统一数据表（TableGen 风格）：
 //   1. AST 节点 tag 表（57 条目：表达式 0-22 / 语句 100-129 /
 //      语句辅助 120-124 / 类型 200-204）——权威定义见
@@ -13,7 +13,7 @@ type tie<class>
 //      函数名 -> 参数个数 / 返回类型（types 自编码）。
 //
 // # 表承载方案（map 不能全局，语言边界约束）
-//   语言级 map 键恒字符串且缺失键崩溃、不可作全局（T0.5 实测），
+//   语言级 map 键恒字符串且缺失键崩溃、不可作全局（实测），
 //   故全部用**模块内全局并行表 + 懒构建**（首次查询时构建，
 //   parser.ensure_tag_names 同款模式；table<string> 不传参，
 //   查询函数自持表实现二分）。
@@ -291,13 +291,13 @@ func ensure_builtins() {
         table_push(bi_ret, ret_of(kinds[i], kws[i]))
         i = i + 1
     }
-    // ---------- 追加内置子表（P0：std/net + p.6.6.20 动态加载原语）----------
+    // ---------- 追加内置子表（std/net + 动态加载原语）----------
     // 条目按字母序追加在主表之后（cstr_to_string < dyn_call < dyn_call_p <
     // get_proc < load_library < net_close < net_tcp_* < net_udp_*），
     // 下标 = 主表长度 + 子表下标（builtin_lookup 未命中主表时二分查此段）。
     // 返回类型（TyKw 索引）：cstr_to_string=Str(13)，close=Bool(10)，两个
-    // recv=Str(13)，其余=I64(3)。p.6.4.5 字节版：recv_bytes 返回 table<i64>
-    //（kind=1 特判）、send_bytes=I64。
+    // recv=Str(13)，其余=(3)。字节版：recv_bytes 返回 table<i64>
+    //（kind=1 特判）、send_bytes=。
     var net_names: table<string> = ["cstr_to_string", "dyn_call", "dyn_call_p",
         "get_proc", "load_library",
         "net_close", "net_tcp_accept",
@@ -317,7 +317,7 @@ func ensure_builtins() {
         }
         i2 = i2 + 1
     }
-    // ---------- 追加内置子表 3（p.6.9.1 stdio 字节原语）----------
+    // ---------- 追加内置子表 3（stdio 字节原语）----------
     // stdin_read(n) → i64 字节表（EOF 空表）；stdout_write_bytes/str → i64。
     // 名字以 s 开头，自然排于 net_* 子表之后（子表保持有序，builtin_lookup
     // 二分前提不变；该函数硬编码的子表长度须同步 +3）。

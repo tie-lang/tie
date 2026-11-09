@@ -5,7 +5,7 @@ namespace tie.support;
 // ============================================================
 // 原居 `driver/util.tie`（flat 顶层函数）。迁入理由（实证）：
 //   · frontend 有 7 处**裸名依赖**这些文本工具（sstate_q1 / consteval 等）；
-//   · 但 frontend 树**不能依赖 driver**（p.9.21.1 依赖方向契约）：LSP（tsp）
+//   · 但 frontend 树**不能依赖 driver**（依赖方向契约）：LSP（tsp）
 //     只编译 `frontend/` 树、不编译 `driver/` ⇒ 这些函数缺失，LSP 编译直接
 //     失败（实测 `E00489 未定义的函数 has_prefix/slice`）。
 //   · 迁到 frontend 后：frontend 自足（这是它们真正的归属——工具只依赖
@@ -34,7 +34,7 @@ pub func strip_type_header(src: string) -> string {
             if str_len(t) == 0 {
                 // 头部区空行：保留
             } else if has_prefix(t, "type tie") {
-                // ★ 保行剥离（2026-10-07）：把声明行**替换为空行**而非删除，使正文
+                // ★ 保行剥离：把声明行**替换为空行**而非删除，使正文
                 //   行号与用户所写的源文件逐行对齐。原先直接删除 ⇒ 正文整体上移
                 //   一行，而诊断行号没有行映射 ⇒ 主文件所有告警/错误行号 −1
                 //   （用户按报的行号改会改错行）。

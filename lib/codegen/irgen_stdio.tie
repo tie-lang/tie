@@ -1,7 +1,7 @@
 type tie<class>
 // lib/codegen/irgen_stdio.tie —— 生成器 L3：标准输入输出辅助（stdin_read、stdout_write_*、read_line）
 // ============================================================
-// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 自 irgen_expr.tie 按域拆出。
 // 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
 // 顶层全局 var 与 import 树留在 irgen.tie 主文件。
 namespace irgen {
@@ -11,7 +11,7 @@ namespace irgen {
 // 收到 → 空表。返回 i64 字节表（元素 0..255）。缓冲/元素缓冲均 malloc 并与
 // s21_tbl_adopt 采纳（48 字节运行时句柄，refcount=1，杜绝旧 32 字节手排越界）。
 func tig_stdin_read(n: i64) -> i64 {
-    // r.1.6.3：Linux 分支——read(fd=0, buf+k, chunk) 直通（POSIX fd 0 =
+    // Linux 分支——read(fd=0, buf+k, chunk) 直通（POSIX fd 0 =
     // stdin，UTF-8 字节，无 CRT 文本翻译）。read 返回 ssize_t：>0 实收；
     // <=0（EOF 0 / 出错 -1）→ 收尾（对齐 Win32 ReadFile 失败/读计数 0）。
     if tig_is_linux() {
@@ -306,7 +306,7 @@ func tig_stdin_read(n: i64) -> i64 {
 // \n→\r\n 翻译（管道重定向时 fd1 为文本模式，会把字节负载里的 \n 翻成 \r\n），
 // 协议输出必须字节精确）。返回实际写入字节数；失败 0。
 func tig_stdout_write_str(s: i64) -> i64 {
-    // r.1.6.3：Linux 分支——write(fd=1, s, len) 直通（POSIX fd 1 = stdout，
+    // Linux 分支——write(fd=1, s, len) 直通（POSIX fd 1 = stdout，
     // 无 CRT _write 的 \n→\r\n 翻译，字节精确——对齐 Win32 用 WriteFile 的
     // 动机）。返回实际写入字节数；失败/0 → 0（对齐 Win32 哨兵）。
     if tig_is_linux() {
@@ -405,7 +405,7 @@ func tig_stdout_write_str(s: i64) -> i64 {
 // 同 tig_byte_write）→ 整块 WriteFile(hStdOut, buf, n)（同 write_str：约束队
 // \n 文本翻译，字节精确）。返回写入字节数；失败 0。
 func tig_stdout_write_bytes(t: i64) -> i64 {
-    // r.1.6.3：Linux 分支——字节表 → u8 连续缓冲 → write(fd=1, nbuf, len)
+    // Linux 分支——字节表 → u8 连续缓冲 → write(fd=1, nbuf, len)
     //（同 write_str：POSIX fd 直写无文本翻译，字节精确）。返回实收；失败 0。
     if tig_is_linux() {
         var T64 = types.named(TK_I64)
@@ -539,14 +539,14 @@ func tig_stdout_write_bytes(t: i64) -> i64 {
     tig_ext_call1("free", nbuf, types.named(TK_STR), -1)
     return s21_load(sv, T64)
 }
-// ==================== p.6.4.10 read_line 内联（stdin 行读取，去 Rust 桥） ====================
+// ==================== read_line 内联（stdin 行读取，去 Rust 桥） ====================
 // read_line() -> string：GetStdHandle(STD_INPUT_HANDLE=-10) + ReadFile 逐字节读到
 // \n（单独）或 EOF（返回已收集串，无输入时空串）。Windows 控制台 ReadFile 也会把
 // 回车 \r\n 带进缓冲，此处规整：\r（13）跳过、\n（10）终结；支持管道（无缓冲）输入
 // 脚本交互（`echo hello | probe` → "hello"）。全 kernel32 符号（is_libc_sym 免
 // interp 链接），零 Rust 桥、零 g_used_interp。
 func tig_read_line() -> i64 {
-    // r.1.6.3：Linux 分支——read(fd=0, &c, 1) 逐字节（POSIX fd 0 = stdin；
+    // Linux 分支——read(fd=0, &c, 1) 逐字节（POSIX fd 0 = stdin；
     // \n 终结 / \r 跳过 / EOF（0/-1）返回已收集串，语义对齐 Win32）。
     if tig_is_linux() {
         var T64 = types.named(TK_I64)

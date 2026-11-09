@@ -1,7 +1,7 @@
 type tie<class>
-// lib/codegen/irgen_vtable.tie —— 生成器"S2.4 vtable / port 对象后端" 子模块
+// lib/codegen/irgen_vtable.tie —— 生成器"vtable / port 对象后端" 子模块
 // ============================================================
-// 从 irgen.tie 拆分而来：把 S2.4 分区（reg_all_vtables / tig_ptr_tuple_ty /
+// 从 irgen.tie 拆分而来：把 分区（reg_all_vtables / tig_ptr_tuple_ty /
 // tig_port_coerce / tig_port_method_call）独立成子文件。纯搬运、不改任何逻辑，
 // 保持逐字一致。
 //
@@ -20,7 +20,7 @@ type tie<class>
 //   - 被搬函数内的裸名调用（tig_tuple_ty / tig_agg_addr / tig_expr /
 //     tig_ext_call1 / tig_int_lit_ty / tig_int_lit 等核心区函数）保持不变
 //     （同 namespace 跨文件仍解析）。
-// 归属纠偏：此前随 S2.4 分区一并移出、实为顶层入口/函数生成主逻辑的
+// 归属纠偏：此前随 分区一并移出、实为顶层入口/函数生成主逻辑的
 // tig_global_var / tig_ns / tig_fn_def 三个函数已迁回 irgen.tie（顶层入口分区），
 // 本文件只保留 4 个 vtable / port 对象后端函数，命名与职责匹配。
 // 依赖约定：ir.* / types / interner / intern / sstate / sgen / sinfer / llvmgen
@@ -29,14 +29,14 @@ type tie<class>
 // 子文件根：driver 二叉依赖树中本文件由 irgen.tie 使可达，无环。
 
 namespace irgen {
-// ==================== S2.4 vtable / port 对象后端 ====================
+// ==================== vtable / port 对象后端 ====================
 // port 对象 LLVM 表示 = 单个 ptr（指向堆上打包对象 {data, vtable}）：
 //   提升（struct → port）：malloc(16) → [0]=struct 槽地址（data，self 按引用）
 //                            → [1]=@vt.<port>.<struct> 全局常量（vtable）
 //   动态调用（port 方法）：data = gep(obj,0)；vtable = gep(obj,1) →
 //                           entry = vtable[方法序号] → call_indirect(70)
 // vtable 全局常量：每个 impl 一个，字段 = 方法实现函数指针（按 port 方法
-// 声明序），llvmgen emit_vtables 输出。与闭包 C2（call_indirect 70）同构：
+// 声明序），llvmgen emit_vtables 输出。与闭包 （call_indirect 70）同构：
 // 方法入口签名 fn(ptr self, args...) -> R，env = data 即 self 槽地址。
 
 // 遍历 impl 记录 → llvmgen.vtable_reg（vt.<port>.<struct> + 方法全名表）
@@ -75,8 +75,8 @@ func tig_ptr_tuple_ty(n: i64) -> i64 {
 }
 
 // 提升代码生成：具体类型值（struct）→ port 对象（打包 {data, vtable}）。
-// 语义（docs/plans/port-model.md §4.1/4.2，I1 隐式 vtable）：
-//   data = struct 实例槽地址（方法 self 按引用接收，与 M2.1.8 一致）
+// 语义：
+//   data = struct 实例槽地址（方法 self 按引用接收，与 一致）
 //   vtable = 全局常量 @vt.<port>.<struct>（llvmgen 已登记）
 //   打包 = malloc(16) + 两字段 store；返回打包对象指针（port 对象 = ptr）。
 // 生命周期归 arena/unsafe（调用方保证：被提升对象存活 ≥ 接口对象使用时间）。

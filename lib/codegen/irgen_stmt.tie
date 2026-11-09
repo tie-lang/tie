@@ -1,14 +1,14 @@
 type tie<class>
 // lib/codegen/irgen_stmt.tie —— 生成器 L4 语句/控制流层 子模块
 // ============================================================
-// 从 irgen.tie 拆分而来：这是 irgen LLVM 风格分层重构的 S5（第五步）。
+// 从 irgen.tie 拆分而来：这是 irgen LLVM 风格分层重构的 （第五步）。
 // 本文件承载 L4 语句/控制流层：语句主调度器 tig_stmt、switch（tig_switch）、
 // for 遍历（tig_for_chars/tig_for_table）、索引读写（tig_index_read/
 // tig_index_assign）、打印（tig_println）、块语句（tig_block_stmts）、
 // 变量引用收集（find_var_refs/collect_var_refs）等。
 //
 // 拆分范式：【同 namespace 跨文件】（文本内联）。
-// 同 irgen_arith.tie（S3）/ irgen_expr.tie（S4）。irgen.tie 顶层 import 本文件
+// 同 irgen_arith.tie/ irgen_expr.tie。irgen.tie 顶层 import 本文件
 // 后，本文件被文本内联进同一编译单元，声明与 irgen.tie 相同的 `namespace irgen`，
 // 同名 namespace 跨文件闭合并集：
 //   - 同 namespace 函数可互相裸名调用（主文件照常裸名调用 tig_stmt 等）；
@@ -18,7 +18,7 @@ type tie<class>
 namespace irgen {
 
 
-// ==================== 循环内字符串自加 StringBuilder 提升（p.6.1.4） ====================
+// ==================== 循环内字符串自加 StringBuilder 提升 ====================
 // 识别 `out = out + seg...`（string 局部变量自加拼接）→ 循环内自动改为
 // StringBuilder 追加（s21_sb_*），循环出口 sb_build 回写 out。根治 str_cat
 // O(n²) 无名分配带来的内存无界增长（每次 + 新分配、旧中间串永不释放）。
@@ -30,7 +30,7 @@ namespace irgen {
 // 语义与原逐段拼接完全等价：最终 out = 全部段的顺序拼接。
 
 
-// ==================== 字节表自加 StringBuilder 提升（cbs，p.6.1.4） ====================
+// ==================== 字节表自加 StringBuilder 提升（cbs） ====================
 // 识别 `t = byte_concat(t, seg...)`（局部字节表变量自加累积）→ 循环内改为
 // 私有累积表 acc 就地追加，循环出口写回 t。根治 byte_concat O(n²) 无名分配
 //（每迭代新建整表 + 旧表永不释放，dpcodec/jcc-pack encode 内存无界增长根因）。
@@ -44,7 +44,7 @@ namespace irgen {
 // 循环出口（break 经 exit 块覆盖）store acc 到 t 槽。语义与原逐段拼接完全等价。
 
 
-// ==================== p.9.11.4 defer 资源释放 ====================
+// ==================== defer 资源释放 ====================
 // defer 在 irgen 侧以「编译期注册表 + 出口发射」实现：
 //   - 每函数维护 g_def_bodies/g_def_flags/g_def_scopes 三表（函数开始置空）。
 //   - 每遇 `defer { body }`：注册 body StmtList 节点 + 分配 bool 标志 alloca

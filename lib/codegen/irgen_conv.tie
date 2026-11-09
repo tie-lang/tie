@@ -1,11 +1,11 @@
 type tie<class>
 // lib/codegen/irgen_conv.tie —— 生成器 L3：数值/字符串转换辅助（parse_float/parse_dec/parse_octal/clen/…）
 // ============================================================
-// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 自 irgen_expr.tie 按域拆出。
 // 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
 // 顶层全局 var 与 import 树留在 irgen.tie 主文件。
 namespace irgen {
-// ==================== 去 Rust 桥：to_string(f64) / parse_float（p.6.4.4） ====================
+// ==================== 去 Rust 桥：to_string(f64) / parse_float ====================
 // f64 → 十进制字符串，替代 Rust 桥 tie_to_string_f64。**避免 CRT snprintf/printf 式变参**：
 // Windows 的 clang 对**手写 IR 的 FP 变参调用**（snprintf(buf,32,"%.17g",double)）在 x64
 // 阴影区传参会错位（实测 double 落错误槽 → 格式化出 1e-322 垃圾），故改用**非变参** CRT
@@ -484,7 +484,7 @@ func sio_trunc_i32(v: i64) -> i64 {
     ir.add_operand(t, v, 0)
     return ir.get_value(t)
 }
-// ==================== p.6.4.2 / p.6.4.3 文件系统原语内联（UTF-16 安全 Win32） ====================
+// ==================== / 文件系统原语内联（UTF-16 安全 Win32） ====================
 func tig_trunc_i32(v: i64) -> i64 {
     var t = ir.new_inst(g_cur_block, 37, types.named(TK_I32))
     ir.add_operand(t, types.named(TK_I64), 2)

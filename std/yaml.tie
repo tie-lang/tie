@@ -47,7 +47,7 @@ type tie<class>
 // 失败约定：parse 返回 -1 且置 y_err_msg；访问器对非法节点 id 返回安全值
 // （0 / 空串 / -1），不崩溃。
 //
-// 性能（r.1.3.2）：预处理/块式/流式全部热路径扫描按**字节索引**（str_byte
+// 性能：预处理/块式/流式全部热路径扫描按**字节索引**（str_byte
 // O(1) + string_builder 批量构建），杜绝逐码点 str_char（O(i)/次，整串扫描
 // 即 O(n²)）。YAML 语法定界符全为 ASCII 单字节，字节语义与码点语义等价；
 // 非 ASCII 内容（UTF-8 多字节）按字节原样复制，结果逐字节一致。字节区间
@@ -80,7 +80,7 @@ namespace yaml {
 // ---------- 字节工具 ----------
 
 // 字节区间 [a, b) 子串（a/b 为**字节**下标，越界收敛；空区间返回空串）。
-// r.1.3.2：字节化扫描的下标均为字节偏移，str.slice 按码点索引不可混用，
+// 字节化扫描的下标均为字节偏移，str.slice 按码点索引不可混用，
 // 故本文件自备字节切片（逐字节拷贝进 StringBuilder，二进制安全）。
 func bslice(s: string, a: i64, b: i64) -> string {
     var n: i64 = len(s)
@@ -141,7 +141,7 @@ func push_str(txt: string) -> i64 {
 
 // 文本 → 非空行表 g_lines（删除整行注释与行内注释；保留行首缩进；空行剔除）。
 // 单遍 O(n)。行内注释判定：不在引号串内，且 `#` 前为行首或空白。
-// r.1.3.2：str_byte 字节扫描（\n/\r/#/引号均为 ASCII 单字节；多字节内容按字节复制）。
+// str_byte 字节扫描（\n/\r/#/引号均为 ASCII 单字节；多字节内容按字节复制）。
 func preprocess(pp: string) {
     var n: i64 = len(pp)
     var i: i64 = 0
@@ -169,7 +169,7 @@ func preprocess(pp: string) {
 }
 
 // 去除一行末尾的行内注释（保留引号串内容）。`#` 前为行首或空白时视作注释起始。
-// r.1.3.2：str_byte 字节扫描（\、"、'、# 均为 ASCII 单字节；引号串内多字节
+// str_byte 字节扫描（\、"、'、# 均为 ASCII 单字节；引号串内多字节
 // 内容按字节复制，与旧逐码点实现逐字节一致）。
 func strip_comment(line: string) -> string {
     var n: i64 = len(line)
@@ -812,7 +812,7 @@ func flow_key(s: string) -> string {
     return str.trim(bslice(s, start, g_fpos))
 }
 
-// 流式引号标量。r.1.3.2：str_byte 字节扫描；多字节内容按字节复制。
+// 流式引号标量。str_byte 字节扫描；多字节内容按字节复制。
 func flow_quoted(s: string, is_double: bool) -> i64 {
     g_fpos = g_fpos + 1 // 开引号
     var n: i64 = len(s)
@@ -1021,7 +1021,7 @@ func is_float_str(s: string) -> bool {
     return i >= n
 }
 
-// 双引号串解码（token 以 `"` 开头）。r.1.3.2：str_byte 字节扫描。
+// 双引号串解码（token 以 `"` 开头）。str_byte 字节扫描。
 func unquote_double(token: string) -> i64 {
     var n: i64 = len(token)
     var i: i64 = 1
@@ -1100,7 +1100,7 @@ func unquote_key(k: string) -> string {
 
 // 在 s 中从反斜杠下标 i（字节索引）处解码一个转义序列，追加到 sb，返回
 // 序列后的字节下标。失败返回 -1（y_err_msg 已置）。
-// r.1.3.2：转义字母/十六进制全为 ASCII 单字节，str_byte 判定（字节等价码点）。
+// 转义字母/十六进制全为 ASCII 单字节，str_byte 判定（字节等价码点）。
 func append_escape(sb: i64, s: string, i: i64) -> i64 {
     var n: i64 = len(s)
     if i + 1 >= n {

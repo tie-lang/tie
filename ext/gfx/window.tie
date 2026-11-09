@@ -1,15 +1,15 @@
 type tie<class, unsafe:mem>
-// ext/gfx/window.tie —— p.6.8.9 Win32 窗口嵌入层 tie 封装（namespace win）
+// ext/gfx/window.tie —— Win32 窗口嵌入层 tie 封装（namespace win）
 // EN: tie-side wrapper for the Win32 window-embedding layer (namespace win).
 //
 // 设计 / Design：
-//   * 本模块把 p.6.8.9 thunk（ext/gfx/win/win.cpp，纯 Win32 C 入口）的 C 面直透为
+//   * 本模块把 thunk（ext/gfx/win/win.cpp，纯 Win32 C 入口）的 C 面直透为
 //     namespace `win` 的函数，探针以 `import "./window.tie" as win` 使用
 //     `win.open(...)`。C 端持有窗口状态机（closed / paint_pending + 后备缓冲副本）；
 //     tie 侧负责标题 UTF-16 编码与像素地址收发。
 //   * 标题：UTF-16LE（含尾双 0）由本模块内联编码（复用 sys/win32.wide_from 同款
 //     码点→代理对拆分逻辑），经 alloc 缓冲指针 + 字节长传给 win_open，调用后 free。
-//   * 呈现：后备缓冲 = p.6.8.8 离屏 Surface（peek 取 BGRA 像素地址）；`win.present`
+//   * 呈现：后备缓冲 = 离屏 Surface（peek 取 BGRA 像素地址）；`win.present`
 //     收该地址 + rowbytes/w/h → win_present 拷留存副本并 InvalidateRect 上屏。
 //   * sleep(fn) 直绑 kernel32 Sleep 供消息泵兜底（探针禁无限等待，p0 级延时）。
 //   * find(cls,title) 直绑 FindWindowW，供探针校验窗口存活/销毁语义。

@@ -1,8 +1,8 @@
 type tie<class, unsafe:ext, unsafe:mem>
-// compiler/interp/call_builtin_seg2.tie —— call_builtin 分派链分段 2（p.9.21 G2 单函数 ≤300 行）
+// compiler/interp/call_builtin_seg2.tie —— call_builtin 分派链分段 2
 // ============================================================
 // 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
-// 与原函数同 namespace，跨文件裸名互调；p.9.17.2 Value 化后未命中改由
+// 与原函数同 namespace，跨文件裸名互调；Value 化后未命中改由
 // 前置名单（interp_call_p2 的 cb_is_seg2）判定，错误统一经 w_err 传播。
 namespace tiep {
 func call_builtin_seg2(name: string, args: table<Value>) -> Value {
@@ -123,7 +123,7 @@ func call_builtin_seg2(name: string, args: table<Value>) -> Value {
     if name == "exec_code" {
         return vval.new_int(exec_code(vval.str_val(args[0])))
     }
-    // p.9.17.4 第二步：JIT 源码库查询——fn_source("name") 返回该顶层函数的
+    // 第二步：JIT 源码库查询——fn_source("name") 返回该顶层函数的
     // 定义源码切片（split_top/flush_statement 捕获的原文）；未命中返回空串
     //（宿主据此判定不可 JIT / 编译失败时回退解释器）。
     if name == "fn_source" {
@@ -133,13 +133,13 @@ func call_builtin_seg2(name: string, args: table<Value>) -> Value {
         }
         return vval.new_str(fn_src_lookup(vval.str_val(args[0])))
     }
-    // ---------- 动态加载原语（p.9.17.4 第一步：编译端 p.6.6.20 四件套移植）----------
+    // ---------- 动态加载原语（第一步：编译端 四件套移植）----------
     // 语言内置原语直调（interp.tie 被 AOT 编译时 irgen 展开为 LoadLibraryW/
     // GetProcAddress/call-ptr，与 std/sqlite.tie 同机制）。语义对齐编译端
     // builtin_expr_seg1：load_library 失败 0；get_proc 失败 0；dyn_call 调
     // int 返回 C 函数、dyn_call_p 调 64 位返回；cstr_to_string NUL 结尾
     // UTF-8 → tie 字符串。第一版 dyn_call 实参限整数（JIT 标量子集；
-    // 字符串/指针跨边界的堆所有权勘察后放开，见 docs/designs/interp-performance.md §4.3.3）。
+    // 字符串/指针跨边界的堆所有权勘察后放开，见 §4.3.3）。
     if name == "load_library" {
         if len(args) != 1 || vval.type_of(args[0]) != W_STR {
             w_err = "load_library 需要一个字符串参数"
@@ -258,7 +258,7 @@ func call_builtin_seg2(name: string, args: table<Value>) -> Value {
     if name == "remove_dir_all" {
         return vval.new_bool(remove_dir_all(vval.str_val(args[0])))
     }
-    // ==================== tsh 脚本语义内建（p.9.4 升级） ====================
+    // ==================== tsh 脚本语义内建（升级） ====================
     // 字符串内建：contains / has_prefix / has_suffix / split_lines / split_char /
     // substr / replace_all / is_empty。
     if name == "contains" {

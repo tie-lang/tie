@@ -1,7 +1,7 @@
 type tie<class>
-// lib/ir/tieir_asm_parse.tie —— p.9.21.11 §5.0 拆解：片段解析侧
+// lib/ir/tieir_asm_parse.tie —— §5.0 拆解：片段解析侧
 // ============================================================
-// 自 tieir_asm.tie 拆出（同 namespace 跨文件；铁律 11 单文件 ≤500 行）：
+// 自 tieir_asm.tie 拆出：
 // asm_parse_slice（v3 片段格式 → 进程内状态表）。全局状态表声明在
 // tieir_asm.tie（同 namespace 共享）。
 import "./ir.tie"
@@ -294,12 +294,12 @@ pub func asm_parse_slice(t: table<i64>, m: i64) -> i64 {
                         asm_flag_catch = true
                     }
                 }
-                // p.9.17.1：str_char 缓存 helper 调用（op 35 载荷）→ sc 段恢复
+                // str_char 缓存 helper 调用（op 35 载荷）→ sc 段恢复
                 //（sc_enable 同时隐含 sso 段——llvmgen emit 侧强制置位）
                 if iop == 35 && (gnm == "tie_sc_off" || gnm == "tie_sl_len") {
                     asm_flag_sc = true
                 }
-                // p.9.21.9 收口：登记族恢复素材收集（去重）
+                // 收口：登记族恢复素材收集（去重）
                 if okd == 3 {
                     asm_push_dedup(gpid, true)
                 }
@@ -321,12 +321,12 @@ pub func asm_parse_slice(t: table<i64>, m: i64) -> i64 {
         ii = ii + 1
     }
     asm_i_base[m + 1] = len(asm_i_op)
-    // 每函数值基址重算（p.9.21.9 收口）：write_mod_slice 的 f_vbase = 选中函数
+    // 每函数值基址重算（收口）：write_mod_slice 的 f_vbase = 选中函数
     // 值空间累计（**含参数**），而解析期「观测最小值」在参数未被任何操作数/
     // 结果引用时会偏大 → 值偏移整体错位（装配报「值操作数引用未登记结果」或
     // 把结果误当参数）。按 vsize = 参数数 + 结果数 逐函数累计精确复现
     //（与 write_mod_slice 的 vcum 同式；每片段从 0 起算）。
-    // p.9.21.10：值基址按**跨度**累计（与 write_mod_slice 的 span 口径对齐）——
+    // 值基址按**跨度**累计（与 write_mod_slice 的 span 口径对齐）——
     // irgen 交错生成时他函数的值插进本函数值域内部（span > count），按 count
     // 累计会让相邻函数的片段值域交叠（vmap 键碰撞 → 装配错值）。
     var cum: i64 = 0

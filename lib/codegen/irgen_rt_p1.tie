@@ -1,10 +1,10 @@
 type tie<class>
-// lib/codegen/irgen_rt_p1.tie —— irgen_rt 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_rt_p1.tie —— irgen_rt 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_rt.tie。
 namespace irgen {
-// S2.3：`expr ?` 解包展开（N_TRY=133）。语义已由 sinfer.infer_try_unwrap
+// `expr ?` 解包展开（N_TRY=133）。语义已由 sinfer.infer_try_unwrap
 // 校验：操作数必须是 Result/Option 形态枚举（含 Ok/Some 与 Err/None 变体），
 // 当前函数返回类型必须是同一枚举实例；解包类型 = Ok/Some 的 payload 类型
 // （ast.node_type(id) 已登记）。IR 布局：tig_agg_addr 落内存 → 槽 0 读 tag →
@@ -64,7 +64,7 @@ func tig_try(id: i64) -> i64 {
     var ld_a = ir.new_inst(g_cur_block, 21, oty)  // load 聚合值
     ir.add_operand(ld_a, eaddr, 0)
     var agg_v = ir.get_value(ld_a)
-    // p.9.11.4 defer：`?` 早退（Err/None 传播到调用方）也覆盖一切提前退出路径，
+    // defer：`?` 早退（Err/None 传播到调用方）也覆盖一切提前退出路径，
     // 在 ret 前运行函数级全部 defer（语义 = 与显式 return 一致）。
     if len(g_def_flags) > 0 {
         if tig_run_defers_all() < 0 {
@@ -92,13 +92,13 @@ func tig_try(id: i64) -> i64 {
         ir.add_operand(ip, pv1, 0)
         return ir.get_value(ip)
     }
-    // f64 payload（p.6.2.1）：槽存 double（8B type-punned）→ load double 直用
+    // f64 payload：槽存 double（8B type-punned）→ load double 直用
     if uty == types.named(TK_F64) {
         var ldf = ir.new_inst(g_cur_block, 21, types.named(TK_F64))
         ir.add_operand(ldf, g1p, 0)
         return ir.get_value(ldf)
     }
-    // table/map payload（p.6.2.1）：槽存 ptrtoint → load i64 → inttoptr 还原 ptr
+    // table/map payload：槽存 ptrtoint → load i64 → inttoptr 还原 ptr
     if types.is_table(uty) || types.is_map(uty) {
         var ld4 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
         ir.add_operand(ld4, g1p, 0)
@@ -120,7 +120,7 @@ func tig_try(id: i64) -> i64 {
     return ir.get_value(ld3)
 }
 
-// p.8.1.5 `?:` 安全默认值（B_ELVIS）：Option<T> ?: T → T。
+// `?:` 安全默认值（B_ELVIS）：Option<T> ?: T → T。
 // Some(v) → v（payload 解包，还原逻辑对齐 tig_try）；None → 右侧默认值。
 // cond_br(some) → some_blk / none_blk → merge phi 汇合（类型 T）。
 func tig_elvis(lhs: i64, rhs: i64) -> i64 {
@@ -298,7 +298,7 @@ func tig_option_pack(oi: i64, tag: i64, pty: i64, pv: i64) -> i64 {
     return ir.get_value(ld)
 }
 
-// p.8.1.5 可空链安全访问（N_SAFE_ACCESS）：
+// 可空链安全访问（N_SAFE_ACCESS）：
 //   a?[i] → Option<table<T>>?[i] → Option<T>（None/越界 → None；Some → 包装）
 //   opt?.field → Option<Struct>?.field → Option<字段类型>
 // 控制流：tag==Some → some_blk（解包载荷 + 访问 + 包装）→ merge；
@@ -515,10 +515,10 @@ func tig_safe_access(id: i64) -> i64 {
     return ir.get_value(phi2)
 }
 
-// S2.3：`panic("消息")` 不可恢复错误语句（N_PANIC=134）→ 打印消息 + 退出。
+// `panic("消息")` 不可恢复错误语句（N_PANIC=134）→ 打印消息 + 退出。
 // 参考 tig_println（call_vararg + 格式串池 id + 消息）与 exit() 先例
 // （tig_ext_call1("exit", ...)，C 运行时 exit() 自带 stdio flush）。
-// 批次 7（任务 18）：可捕获 panic——若处于 catch_panic 捕获域（@tie_panic_active
+// 可捕获 panic——若处于 catch_panic 捕获域（@tie_panic_active
 // 为真），打印消息后 longjmp 回 catch 点（不 exit，宿主继续运行）；否则保持
 // 原语义 printf + exit(1)。可配置目标行为（嵌入式 halt / wasm trap）后续。
 // ★ 终止性失败的**唯一收尾实现**。
@@ -581,7 +581,7 @@ func tig_panic(id: i64) -> i64 {
     return 0
 }
 
-// 批次 7（任务 18）：`catch_panic(f)`——f 为 fn() -> T 闭包值，返回 bool。
+// `catch_panic(f)`——f 为 fn -> T 闭包值，返回 bool。
 // f 内 panic（处于捕获域 @tie_panic_active）→ 打印消息 + longjmp 回跳（不
 // exit）→ 捕获分支返回 true；f 正常返回 → false。宿主据此继续运行。
 // 对齐 clang 对 MSVC setjmp 的生成：`_setjmp(env, frameaddr)`（returns_twice，

@@ -1,7 +1,7 @@
 type tie<class>
-// lib/front/smove.tie —— S1.5 移动语义独立检查 pass
+// lib/front/smove.tie —— 移动语义独立检查 pass
 // ============================================================
-// 里程碑：S1.5 移动语义（docs/plans/ui-framework.md §4.2 + roadmap §S1.5）
+// 职责：移动语义
 //
 // # 职责
 //   移动语义检查 = 变量 live/moved 状态跟踪（编译期）：
@@ -11,7 +11,7 @@ type tie<class>
 //   - 显式复制用 clone/copy（sbuiltin/irgen 支持，见规划 §3.3）
 //
 // # 设计：独立 pass（与 sinfer/scheck 解耦）
-//   本模块不修改 sinfer/scheck（S1.2-1.4 并行会话在编辑），而是作为
+//   本模块不修改 sinfer/scheck（并行会话在编辑），而是作为
 //   semantic 逐函数检查**之后**的独立遍历：读 sstate 全局表（AST 列式表 +
 //   lv_* 变量表 + sg_*/sp_* 签名表 + node_types 类型表），自行递归遍历
 //   函数体，维护 lv_moved 状态并报错。语义正确性依赖前置阶段已完成的
@@ -448,7 +448,7 @@ func check_expr_read(e: i64) -> i64 {
     if tag == S_N_METHOD_CALL {
         return check_method_call(e)
     }
-    // p.9.11.3 try 错误聚合块：表达式位，块体为语句 → 按块遍历移动语义
+    // try 错误聚合块：表达式位，块体为语句 → 按块遍历移动语义
     if tag == S_N_TRY_BLOCK {
         return check_block(sstate.child(e, 0))
     }
@@ -459,13 +459,13 @@ func check_expr_read(e: i64) -> i64 {
 // 调用实参移动处理：用户函数按值传堆参数 → 直接变量实参 mark moved；
 // 复杂实参递归读取检查。内置函数（fn_sig < 0）借用。
 // 借用语义（实参递归读取检查，不 mark moved）：
-//   1) clone/copy（S1.5 显式复制内置）——复制不消耗源；
+//   1) clone/copy（显式复制内置）——复制不消耗源；
 //   2) 跨命名空间调用（full 含 ::，库/模块函数，如 str::find）——
 //      库函数约定只读参数，实参不被移动。这是 std/compiler 迁移的关键：
 //      库内部 `find(lower, c)` 按值传参**不**消耗调用方的 c，
 //      之后 `out = out + c` 才合法。
 // 裸名顶层函数（如用户代码 take_owned(s)）保持移动语义（full 不含 ::）。
-// p.9.11.26 `move x: T` 形参判定：读**声明处**该形参 Param 节点 val 的 bit2
+// `move x: T` 形参判定：读**声明处**该形参 Param 节点 val 的 bit2
 //（位域见 pstmt_top_p3 参数解析：bit0=ref · bit1=immut · bit2=move）。
 // 本函数供调用点判定「该实参的所有权被显式移交」，与既有的 is_move_src
 //（按值类型/属性推断移动源）互补：前者是**声明侧显式约定**，后者是隐式判定。
@@ -488,7 +488,7 @@ func param_is_move(full: string, idx: i64) -> bool {
     return (s_vals[pnode] / 4) % 2 == 1
 }
 
-// p.9.11.26 `immut x: T` 形参判定：读**声明处**该形参 Param 节点 val 的 bit1
+// `immut x: T` 形参判定：读**声明处**该形参 Param 节点 val 的 bit1
 //（位域见 pstmt_top_p3 / scollect：bit0=ref · bit1=immut · bit2=move）。
 //
 // 为什么必须在这里单独查、而不是读 `sp_refs`：形参位域有三位
@@ -640,7 +640,7 @@ func recv_path_name(recv: i64) -> string {
 
 // 方法调用实参处理：接收者（children[slot_off]）按引用不移动；
 // 实参从 slot_off+1 起（同 Call 规则）。
-// S1.5 接收者解析：命名空间点号调用（str.slice / str.trim）必须拼出
+// 接收者解析：命名空间点号调用（str.slice / str.trim）必须拼出
 // 完整签名（str::slice），否则 resolve_call 用裸名解析，命中同文件裸
 // 顶层函数（driver.tie 有裸 slice/trim）后 full 无 "::"，借用特判不生效
 // → 实参被误标 moved。与 sinfer.infer_method_call 对齐：
@@ -859,7 +859,7 @@ func check_fn_walk_in_ns(blk: i64, full: string) -> i64 {
 func check_fn(fn_node: i64) -> i64 {
     sstate.lv_moved_reset()
     var nparams = s_aux[fn_node]
-    // 无函数体声明（如 extern 声明，p.6.1.2）：body 子节点不存在
+    // 无函数体声明（如 extern 声明）：body 子节点不存在
     // （index == nchild），child() 无边界检查——越界读会把相邻/后续节点
     // （import 多时常为其它文件顶层节点）或 arena 尾部未初始化内存
     // 误当函数体扫到（假报错误或 0xC0000005）。声明无需检查体，直接返回

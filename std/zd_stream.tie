@@ -1,7 +1,7 @@
 type tie<class>
 // tlib/std/zd_stream.tie —— zd 流式分块 + 帧边界/CRC + 压缩变体声明（namespace zd_stream；自 tiedb 提炼）
 // ============================================================================
-// 格式契约（zd v2 设计文档 §4.7/§6.6/§10，语言无关）：
+// 格式契约（zd v2 设计说明 §4.7/§6.6/§10，语言无关）：
 //   帧 = [len: u32 BE][payload: len 字节][crc: u32 BE]
 //     len = payload 字节数；crc = CRC32-IEEE(payload)（多项式 0xEDB88320，
 //     反射式逐位，无查表；校验向量 crc32("123456789") == 0xCBF43926）。
@@ -45,7 +45,7 @@ pub func crc32(bytes: table<i64>) -> i64 {
     return c ^ 0xFFFFFFFF
 }
 
-// crc32_str：同一 CRC32-IEEE 算法作用于**字符串载体**（r.1.6.7 字节缓冲抽象）。
+// crc32_str：同一 CRC32-IEEE 算法作用于**字符串载体**（字节缓冲抽象）。
 // 逐位无表实现与表版逐位一致；`str_byte` 单指令（实测 6ns）vs 表 `t[i]`（27–28ns）
 // ⇒ 同一载荷下字符串载体明显更快，且内存 1× vs 8×。
 // 与 `crc32(table<i64>)` **必须逐位同值**（探针 probe_zbuf 交叉断言）。
@@ -69,7 +69,7 @@ pub func crc32_str(s: string) -> i64 {
     return c ^ 0xFFFFFFFF
 }
 
-// ---------- 流式分块帧（r.1.6.7：**字符串载体**） ----------
+// ---------- 流式分块帧（**字符串载体**） ----------
 // 载体说明：payload/帧/流一律用 tie **字符串**（字节密度 1×、`str_byte` 单指令、
 // `sb_append` 按字节 memcpy），替代 `table<i64>`（8×、逐元素索引走容器锁）。
 // **线上字节格式完全不变**（迁移前后逐字节比对通过，见 _local_only/probes/tests/_golden_stream.tie）。

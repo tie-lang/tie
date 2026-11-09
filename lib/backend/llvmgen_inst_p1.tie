@@ -1,5 +1,5 @@
 type tie<class>
-// lib/backend/llvmgen_inst_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/backend/llvmgen_inst_p1.tie —— 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 llvmgen_inst.tie。
@@ -88,7 +88,7 @@ func global_ref(v: i64) -> string {
     if str_len(nm) > 0 && str_char(nm, 0) == "@" {
         nm = l_slice(nm, 1, str_len(nm))
     }
-    // SSO 短串池 + 可捕获 panic 内部符号白名单（dev33 批次 3/7）：不登记进
+    // SSO 短串池 + 可捕获 panic 内部符号白名单：不登记进
     // g_global_names（避免影响普通全局），仅 s21_sso_alloc / catch_panic 内联
     // 生成时按名直引。
     if nm == "s21_sso_pool" || nm == "s21_sso_off" || nm == "s21_sso_malloc_cnt" ||
@@ -99,7 +99,7 @@ func global_ref(v: i64) -> string {
     var i: i64 = 0
     while i < len(g_global_names) {
         if g_global_names[i] == nid {
-            // p.9.12.4：命名空间内 const 全名 "ns::NAME" → LLVM 符号转 $（@ns$NAME）
+            // 命名空间内 const 全名 "ns::NAME" → LLVM 符号转 $（@ns$NAME）
             return "@" + ns_replace(nm)
         }
         i = i + 1
@@ -146,7 +146,7 @@ func value_def(v: i64) -> i64 {
 
 // printf 实参引用：按值定义指令判定类型
 //   const_str(62) → "ptr @.str.N"（格式串 %s 需指针，不走寄存器）
-//   string 类型值（TK_STR，如 get_env 返回/string 变量 load）→ "ptr %N"（T4.5）
+//   string 类型值（TK_STR，如 get_env 返回/string 变量 load）→ "ptr %N"
 //   i64 结果     → "i64 %N"
 //   i32 结果     → 由 call_vararg 分支生成独立 sext（不在本函数内联——
 //                  LLVM 新版本不支持 `sext (i32 %N to i64)` 表达式实参）
@@ -189,11 +189,11 @@ func arg_ref(inst_id: i64, k: i64) -> string {
     return "i64 %" + to_string(v)
 }
 
-// S2.1：tie 桥返回 ptr 但**非字符串**（表/字节表句柄）——不得补头。
+// tie 桥返回 ptr 但**非字符串**（表/字节表句柄）——不得补头。
 // 这类桥在 irgen 用 TK_STR 标注返回值（ptr 槽复用），实际指向桥内表结构，
 // 补头会错乱句柄（tie_table_new 曾致表扩容 LayoutError 崩溃；tie_regex_find_all
 // 漏网曾致 lexer 码点表错乱、自举产物 tiec_v2 编译任何程序产出空 AST）。
-// 批次 7：tie_table_new 已内联（s21_table_new/map_new），从黑名单移除。
+// tie_table_new 已内联（s21_table_new/map_new），从黑名单移除。
 func is_table_bridge(sym: string) -> bool {
     if sym == "tie_list_dir" ||
         sym == "tie_walk_dir" || sym == "tie_byte_read" ||
@@ -386,7 +386,7 @@ func gen_inst(inst_id: i64) {
         gen_inst_b_36_extern_call(inst_id)
         return
     }
-    // r.1.4.4：未支持指令 = **硬错误**（不再静默降级为占位注释继续链接——
+    // 未支持指令 = **硬错误**（不再静默降级为占位注释继续链接——
     // 产物行为不可预测）。登记错误文本（含 op 号/指令 id/所在函数），
     // emit() 末尾与 driver 侧 err_msg() 检测并以 render_error 报错终止编译。
     if str_len(g_llvmgen_err) == 0 {
@@ -401,11 +401,11 @@ func gen_inst(inst_id: i64) {
 func typed_ref(inst_id: i64, k: i64) -> string {
     var v = ir.ins_opnd(inst_id, k)
     // IMM 立即数（kind 2）：直出字面量（extern_call 的 immarg 参数，如
-    // llvm.frameaddress.p0(i32 0)；批次 7 catch_panic 用）
+    // llvm.frameaddress.p0(i32 0)；catch_panic 用）
     if ir.ins_opnd_kind(inst_id, k) == 2 {
         return to_string(v)
     }
-    // S3.2：全局地址（kind 3）优先——ref 全局表实参（如 columnar.set_pair_i64
+    // 全局地址（kind 3）优先——ref 全局表实参（如 columnar.set_pair_i64
     // 传 doc_keys）须输出 @sym 直引；此前漏处理输出 "%N"（N 为 "@name" 池 id，
     // 非本函数定义的值）→ opt 报 use of undefined value
     var kd = ir.ins_opnd_kind(inst_id, k)
@@ -428,14 +428,14 @@ func typed_ref(inst_id: i64, k: i64) -> string {
             return str_data_ref(slot)
         }
         if ir.ins_op(def) == 56 {
-            // p.9.12.7：复用定义块内 companion 真 ptr 寄存器（%spN，与 to_ptr
+            // 复用定义块内 companion 真 ptr 寄存器（%spN，与 to_ptr
             // 同约定）——旧路径在调用点临时 inttoptr（同块虽无支配问题，但
             // 每处调用点重复生成指令）；语义零变化。
             return "%sp" + to_string(v)
         }
         if ir.ins_op(def) == 63 {
-            // const_global（S2.2 函数地址）→ 直引 @sym（ptr 类型）
-            // （批次8 任务23：cb_ptr 回调地址经 extern string/ptr 槽传递）
+            // const_global（函数地址）→ 直引 @sym（ptr 类型）
+            // （cb_ptr 回调地址经 extern string/ptr 槽传递）
             var gsym = intern.lookup(ir.ins_opnd(def, 0))
             return "@" + ns_replace(gsym)
         }
@@ -483,7 +483,7 @@ func reg_load_i64(addr: string) -> string {
 //   const_str(62)  → "@.str.N"（直接引用常量）
 //   str_cat(56)    → inttoptr 新寄存器（str_cat 结果是 i64 指针整数，
 //                    LLVM 不支持内联 inttoptr 表达式实参，须独立指令）
-//   const_global(63) → "@sym"（S2.2 函数地址直引）
+//   const_global(63) → "@sym"（函数地址直引）
 //   其余（string 变量 load / extern 返回）→ "%N"（本身已是 ptr）
 func to_ptr(v: i64) -> string {
     // 形参优先（参数值 id 无定义指令，value_def 返回 -1 会误判）
@@ -498,14 +498,14 @@ func to_ptr(v: i64) -> string {
             return str_data_ref(slot)
         }
         if ir.ins_op(def) == 56 {
-            // p.9.12.7：返回定义块内 companion 真 ptr 寄存器（%spN，op56 发射时
+            // 返回定义块内 companion 真 ptr 寄存器（%spN，op56 发射时
             // 已在同一块内生成）——旧路径在此处（可能为分支合流 phi 的合并块）
             // 临时 inttoptr → PHI 未分组 + 支配违规（多臂合流）；companion 与
             // ptrtoint 同块，支配成立，语义零变化。
             return "%sp" + to_string(v)
         }
         if ir.ins_op(def) == 63 {
-            // const_global（S2.2 函数地址）→ 直引 @sym（ptr 类型）
+            // const_global（函数地址）→ 直引 @sym（ptr 类型）
             var gsym = intern.lookup(ir.ins_opnd(def, 0))
             return "@" + ns_replace(gsym)
         }
@@ -572,7 +572,7 @@ func not_payload_slot(op: i64, k: i64) -> bool {
     return true
 }
 
-// p.6.7.5：str_cat 链式临时释放判定（见 op56）——值 v 须为 op56 定义，且除**本次
+// str_cat 链式临时释放判定（见 op56）——值 v 须为 op56 定义，且除**本次
 // 拼接指令自身**外再无可达引用（纯 SSA 链上中间体：仅被下一段拼接消费，从未
 // store 进槽、从未传参/返回），才在结果就绪后调 @tie_str_free_if_heap 释放。
 // store 进槽/传参/返回值即使只被用一次也不可释（槽/调用方仍持有指针 → UAF）。
@@ -613,7 +613,7 @@ func str_temp_free_pass(inst_id: i64, v: i64, length_ref: string) {
     line("call void @tie_str_free_if_heap(i64 %" + to_string(v) + ", i64 " + length_ref + ")")
 }
 
-// 批次5 任务13/14：extern 返回 char* → 自动扫描。无分支方案：NULL 校验后
+// extern 返回 char* → 自动扫描。无分支方案：NULL 校验后
 // select 一个安全源指针（NULL → 静态空串数据指针，头长 0 → 空串），再统一
 // strlen + malloc + memcpy + 尾 \0，产出 {ptr,len} 布局；reg 为数据指针。
 // 避免注入分支块/phi 带来的 LLVM 指令编号顺序问题（保持直线化、易 opt）。
@@ -633,7 +633,7 @@ func gen_ext_str_scan(reg: string, sym: string, args: string) {
     // 统一扫描：n = strlen(src)；buf = @tie_sso_alloc(n)（短串走静态池零
     // malloc / 长串回退 malloc，块含 8 头 + 1 \0 + 32 尾部填充）；buf[0]=n；
     // memcpy(buf+8, src, n)；buf[8+n]=0；reg = 数据指针 buf+8。
-    //（SSO 短串池 dev33 批次3；+41 尾部填充容纳向量化宽读，漏洞 B 修复）
+    //（SSO 短串池 ；+41 尾部填充容纳向量化宽读，漏洞 B 修复）
     // NULL 时 src=空串数据 len 0 → 产出空串；其余为真实 char* 扫描。
     var rn = gen_call_i64("strlen", "ptr", src)
     sso_enable()
@@ -646,7 +646,7 @@ func gen_ext_str_scan(reg: string, sym: string, args: string) {
     line(reg + " = getelementptr i8, ptr " + bf + ", i64 8")
 }
 
-// T4.5：extern_call 实参引用——tie 运行时桥参数全为字符串（ptr）。
+// extern_call 实参引用——tie 运行时桥参数全为字符串（ptr）。
 // const_str → "ptr @.str.N"；其余（string 变量 load / 上一条指令结果）→ "ptr %N"。
 func ptr_arg_ref(inst_id: i64, k: i64) -> string {
     var v = ir.ins_opnd(inst_id, k)

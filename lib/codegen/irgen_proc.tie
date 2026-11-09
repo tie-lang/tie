@@ -1,19 +1,19 @@
 type tie<class>
 // lib/codegen/irgen_proc.tie —— 生成器 L3：进程/参数/环境辅助（exec_output_*、arg_*、cwd、set_env、sh_op）
 // ============================================================
-// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 自 irgen_expr.tie 按域拆出。
 // 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
 // 顶层全局 var 与 import 树留在 irgen.tie 主文件。
 namespace irgen {
-// ==================== p.6.4.6 进程捕获：exec_output 内联 ====================
-// r.1.6.3：exec_output Linux 分支——POSIX 管道捕获（UTF-8 直通，语义对齐
+// ==================== 进程捕获：exec_output 内联 ====================
+// exec_output Linux 分支——POSIX 管道捕获（UTF-8 直通，语义对齐
 // Win32 版：返回合并 stdout+stderr 的完整输出串；任一环节失败 → 空串）。
 //   pipe(fds) → fork() → 子进程：close(读端)；dup2(写端,1/2)；close(写端)；
 //     execl("/bin/sh","sh","-c",cmd,NULL)（成功不返回；失败 exit(127)）。
 //   父进程：close(写端)；循环 read(读端,4096) 到 EOF（0/-1）→ StringBuilder
 //     拼接；waitpid 回收；close(读端) → 返回输出串。
 // ABI：int fds[2]（8B 裸缓冲，i32@0/i32@4）；pid_t/i32；read 返回 ssize_t i64；
-// execl 为变参但 x86_64 SysV 变参调用约定与定参一致（同 r.1.6.2 注释）。
+// execl 为变参但 x86_64 SysV 变参调用约定与定参一致（同 注释）。
 func tig_exec_output_posix(cmd: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -140,7 +140,7 @@ func tig_exec_output_posix(cmd: i64) -> i64 {
 //   STARTUPINFOW sizeof=104：cb@0、dwFlags@60、hStdInput@80、hStdOutput@88、hStdError@96
 //   PROCESS_INFORMATION sizeof=24：hProcess@0、hThread@8、dwProcessId@16、dwThreadId@20
 func tig_exec_output_inline(cmd: i64) -> i64 {
-    // r.1.6.3：Linux 目标走 POSIX 管道分支（UTF-8 直通）
+    // Linux 目标走 POSIX 管道分支（UTF-8 直通）
     if tig_is_linux() {
         return tig_exec_output_posix(cmd)
     }
@@ -309,7 +309,7 @@ func tig_exec_output_inline(cmd: i64) -> i64 {
     return s21_load(rp, types.named(TK_STR))
 }
 func tig_arg_count() -> i64 {
-    // r.1.6.3：Linux 分支——读 main 入口捕获的全局槽 @__tig_argc（i32，
+    // Linux 分支——读 main 入口捕获的全局槽 @__tig_argc（i32，
     // llvmgen.linux_args_enable 登记 + main 带参签名 + entry store）。
     // 用户参数个数 = argc-1（argv[0] 程序名跳过），极端 <0 → 0（对齐 Win32）。
     if tig_is_linux() {
@@ -341,7 +341,7 @@ func tig_arg_count() -> i64 {
     return res
 }
 func tig_arg_string(i: i64) -> i64 {
-    // r.1.6.3：Linux 分支——argv 全局槽（char**，UTF-8 直通）：
+    // Linux 分支——argv 全局槽（char**，UTF-8 直通）：
     // 用户参数 i → argv[i+1]（argv[0] 程序名跳过）；越界（i<0 || i>=argc-1）
     // → 空串（对齐 Win32）。strlen 定长 + tig_bytes_to_tie 构 tie 串。
     if tig_is_linux() {
@@ -428,7 +428,7 @@ func tig_arg_string(i: i64) -> i64 {
     return s21_load(sv, types.named(TK_STR))
 }
 func tig_cwd() -> i64 {
-    // r.1.6.3：Linux 分支——getcwd(buf, 16384) UTF-8 直通（返回 char* 经
+    // Linux 分支——getcwd(buf, 16384) UTF-8 直通（返回 char* 经
     // extern TK_STR 自动补头，失败 NULL → 空串，对齐 Win32 语义）。
     if tig_is_linux() {
         var P8 = types.ptr_of(types.named(TK_I8))
@@ -450,7 +450,7 @@ func tig_cwd() -> i64 {
     return res
 }
 func tig_set_env(k: i64, v: i64) {
-    // r.1.6.3：Linux 分支——setenv(name, value, overwrite=1) UTF-8 直通
+    // Linux 分支——setenv(name, value, overwrite=1) UTF-8 直通
     //（glibc/musl POSIX 符号；Windows SetEnvironmentVariableW 语义 = 覆盖）。
     if tig_is_linux() {
         var I32 = types.named(TK_I32)

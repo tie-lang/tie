@@ -1,10 +1,10 @@
 type tie<class, unsafe:mem>
-// process.tie：标准库——进程原语（命名空间 process，自举 T0.7）
+// process.tie：标准库——进程原语（命名空间 process，自举 ）
 // 作用：用 extern 声明（链接期 libc 符号）重新实现进程原语，替代/补充
 // 内置 exec_code/exec_output 的 C ABI 桥——0-Rust 路径（阶段 4）的关键证明：
 // tie 程序直接声明并调用 libc 函数，不再依赖 Rust 桥实现。
 //
-// extern 声明（T0.7 语言特性）：`extern fn system(cmd: string) -> i32;`——
+// extern 声明（语言特性）：`extern fn system(cmd: string) -> i32;`——
 // 声明链接期符号 system（libc system，Windows msvcrt 默认已链），无函数体，
 // 编译路径由 IR 层发射 LLVM `declare`，调用点生成普通 call，clang 链接时
 // 自动解析 msvcrt 符号。解释路径不支持调用 extern（报"仅编译路径可用"）。
@@ -26,7 +26,7 @@ type tie<class, unsafe:mem>
 unsafe extern fn system(cmd: string) -> i32;
 
 // ============================================================================
-// p.9.1.1.17 进程超时强杀：kernel32 进程控制直绑（CreateProcessW 系）。
+// 进程超时强杀：kernel32 进程控制直绑（CreateProcessW 系）。
 // 直绑理由：libc _spawn 系返回的"进程句柄"是 int 宽度（HANDLE 截断），无法可靠
 // 传给 WaitForSingleObject/CloseHandle 的 64 位 HANDLE；直接绑定 kernel32 的
 // CreateProcessW/WaitForSingleObject/GetExitCodeProcess/CloseHandle 拿到完整
@@ -77,7 +77,7 @@ pub func exec_output(cmd: string) -> string {
 }
 
 // ============================================================================
-// 双向管道增强（p.9.1.1.16）：spawn 子进程 + stdin 写 + stdout/stderr 读 + 退出码。
+// 双向管道增强：spawn 子进程 + stdin 写 + stdout/stderr 读 + 退出码。
 // 说明：tie 无指针类型，无法解引用 libc `_popen` 返回的 FILE* 读缓冲，故沿用
 // 「重定向 + 临时文件读写回」的等价实现（与 exec_output 一致）提供双向语义。
 // 全部向后兼容：在既有 exec_code/exec_output 上新增函数。
@@ -151,7 +151,7 @@ pub func read_stderr(cmd: string) -> string {
 }
 
 // ============================================================================
-// 进程超时强杀（p.9.1.1.17）：exec_code_timeout / timeout_run 真实现。
+// 进程超时强杀：exec_code_timeout / timeout_run 真实现。
 // CreateProcessW（经 cmd.exe /c 派生子命令）+ WaitForSingleObject(ms) +
 // 超时 TerminateProcess 强杀。返回 (exit_code, timed_out)：
 //   - timed_out=false：进程在 ms 内自然结束，exit_code 为退出码；

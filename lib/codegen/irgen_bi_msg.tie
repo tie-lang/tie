@@ -1,12 +1,12 @@
 type tie<class>
-// lib/codegen/irgen_bi_msg.tie —— 内置生成器：消息系统原语（p.6.4.7）
+// lib/codegen/irgen_bi_msg.tie —— 内置生成器：消息系统原语
 // ============================================================
-// 自 irgen_expr.tie 的 builtin_expr 拆出（p.9.21.2 两步制①）。
+// 自 irgen_expr.tie 的 builtin_expr 拆出。
 // 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
 // 顶层全局 var 与 import 树留在 irgen.tie 主文件。
 namespace irgen {
-// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
-// 内置 `msg_set_lang`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `msg_set_lang`
 pub func bi_msg_set_lang(nm: string, id: i64) -> i64 {
 if nm == "msg_set_lang" {
     tig_msg_reg_globals()
@@ -20,8 +20,8 @@ if nm == "msg_set_lang" {
 }
 }
 
-// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
-// 内置 `msg_get_lang`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `msg_get_lang`
 pub func bi_msg_get_lang(nm: string, id: i64) -> i64 {
 if nm == "msg_get_lang" {
     tig_msg_reg_globals()
@@ -30,8 +30,8 @@ if nm == "msg_get_lang" {
 }
 }
 
-// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
-// 内置 `msg_register`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `msg_register`
 pub func bi_msg_register(nm: string, id: i64) -> i64 {
 if nm == "msg_register" {
     var q1 = tig_expr(call_arg(id, 0))
@@ -52,8 +52,8 @@ if nm == "msg_register" {
 }
 }
 
-// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
-// 内置 `msg_t`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `msg_t`
 pub func bi_msg_t(nm: string, id: i64) -> i64 {
 if nm == "msg_t" {
     tig_msg_reg_globals()
@@ -67,8 +67,8 @@ if nm == "msg_t" {
 }
 }
 
-// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
-// 内置 `msg_t_lang`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `msg_t_lang`
 pub func bi_msg_t_lang(nm: string, id: i64) -> i64 {
 if nm == "msg_t_lang" {
     tig_msg_reg_globals()
@@ -86,8 +86,8 @@ if nm == "msg_t_lang" {
 }
 }
 
-// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
-// 内置 `rand_range`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `rand_range`
 pub func bi_rand_range(nm: string, id: i64) -> i64 {
 if nm == "rand_range" {
     var d1 = tig_expr(call_arg(id, 0))
@@ -103,8 +103,8 @@ if nm == "rand_range" {
 }
 }
 
-// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
-// 内置 `table_at`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `table_at`
 pub func bi_table_at(nm: string, id: i64) -> i64 {
 // table_at：表 + 下标 → 元素（与 t[i] 同语义；元素类型 fallback 判定）
 if nm == "table_at" {
@@ -130,7 +130,7 @@ if nm == "table_at" {
     var ret_ty = types.named(TK_I64)
     var ek2 = types.kind(elem)
     if ek2 == K_STRUCT || ek2 == K_ENUM || ek2 == K_FN || ek2 == K_TUPLE {
-        // P2a 复合元素：返回类型 = 元素类型 id（多字元素类型化 load）
+        // 复合元素：返回类型 = 元素类型 id（多字元素类型化 load）
         ret_ty = elem
     } else if suffix == "string" {
         ret_ty = types.named(TK_STR)
@@ -147,16 +147,16 @@ if nm == "table_at" {
     g_builtin_res = s21_table_at(tb, ti, ok_addr, ret_ty)
     return 0
 }
-// p.8.1.6 表删除/缩表原语：table_pop(t) → 表尾元素（空表返回零值）。
+// 表删除/缩表原语：table_pop(t) → 表尾元素（空表返回零值）。
 // 语义 = tbl_at(len-1, slot) + 非空则 tbl_set_len(len-1)。弹出元素所有权
 // 转移给调用方（rc 不变，与 push 瞬态值转移对称——容器不再持有该元素，
 // 调用方变量赋值免 retain（函数调用 tag 7）、出口 release 恰好 -1 平衡）。
 }
 
-// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
-// 内置 `table_pop`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `table_pop`
 pub func bi_table_pop(nm: string, id: i64) -> i64 {
-// p.8.1.6 表删除/缩表原语：table_pop(t) → 表尾元素（空表返回零值）。
+// 表删除/缩表原语：table_pop(t) → 表尾元素（空表返回零值）。
 // 语义 = tbl_at(len-1, slot) + 非空则 tbl_set_len(len-1)。弹出元素所有权
 // 转移给调用方（rc 不变，与 push 瞬态值转移对称——容器不再持有该元素，
 // 调用方变量赋值免 retain（函数调用 tag 7）、出口 release 恰好 -1 平衡）。
@@ -241,15 +241,15 @@ if nm == "table_pop" {
     g_builtin_res = val
     return 0
 }
-// p.8.1.6 表删除/缩表原语：table_trunc(t, n) → void。
+// 表删除/缩表原语：table_trunc(t, n) → void。
 // 截断到 n（n≤0 → 空表；n≥len → 不变）。深表（元素为表）缩掉的部分逐元素
 // release（引用计数 -1，防缩表悬垂/泄漏）；标量/字符串表直接 set_len。
 }
 
-// p.6.4.7 消息系统原语（纯 tie：运行期全局表内联查表）
-// 内置 `table_trunc`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// 消息系统原语（纯 tie：运行期全局表内联查表）
+// 内置 `table_trunc`
 pub func bi_table_trunc(nm: string, id: i64) -> i64 {
-// p.8.1.6 表删除/缩表原语：table_trunc(t, n) → void。
+// 表删除/缩表原语：table_trunc(t, n) → void。
 // 截断到 n（n≤0 → 空表；n≥len → 不变）。深表（元素为表）缩掉的部分逐元素
 // release（引用计数 -1，防缩表悬垂/泄漏）；标量/字符串表直接 set_len。
 if nm == "table_trunc" {
@@ -349,7 +349,7 @@ if nm == "table_trunc" {
     g_builtin_res = tig_int_lit(0)
     return 0
 }
-// ---------- trm-lite 轻量执行体原语（阶段1块2：spawn/yield/collect）----------
+// ---------- trm-lite 轻量执行体原语（spawn/yield/collect）----------
 }
 
 }

@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/sgen.tie —— 泛型单态化展开器（T3b，2026-08-14）
+// lib/front/sgen.tie —— 泛型单态化展开器（2026-08-14）
 // ============================================================
 // # 职责
 //   泛型系统核心语义的「机制层」：符号 mangling、AST 复制替换（TypeVar → 具体
@@ -10,7 +10,7 @@ type tie<class>
 //   import ./stype.tie（类型解析/匹配；传递可达 ./sstate.tie 与 types 类型系统）。
 //   被 sinfer.tie import（sinfer → sgen → stype → sstate/data）。
 // # 单态化机制概述
-//   模板定义登记在 sstate 的 gt_* 表（T3a），本模块以 mangled 名实例化：
+//   模板定义登记在 sstate 的 gt_* 表，本模块以 mangled 名实例化：
 //     1. mangle：函数/struct 全名 + `$` + 类型实参片段（i64→i64、table<T>→table_T
 //        嵌套递归）；方法模板前缀是模板 struct 时替换为实例化 struct 名。
 //     2. clone_subst：深拷贝模板定义节点树到 sstate 表尾；FnDef/Struct 泛型槽
@@ -25,13 +25,13 @@ type tie<class>
 import "./stype.tie"
 import "./sgen_inst.tie"
 
-// p.9.11.32 别名展开深度护栏（防循环别名；文件顶层变量——命名空间体内
+// 别名展开深度护栏（防循环别名；文件顶层变量——命名空间体内
 // 不允许 var 声明）
 pub var alias_depth: i64 = 0
 
 namespace sgen {
 
-// ==================== 符号 mangling（§generics.md 符号 mangling）====================
+// ==================== 符号 mangling====================
 
 
 // 泛型全名 + 类型实参 → 实例化符号名。
@@ -185,7 +185,7 @@ pub func resolve_int_len_node(id: i64) -> i64 {
 // 调用点显式类型实参、模板体内嵌套 struct 引用实例化共用。
 pub func parse_generic_type_node(tid: i64) -> i64 {
     var tag = s_tags[tid]
-    // p.9.11.34 语义期类型引用：val 直接就是语义类型 id（语义期消糖造节点时用，
+    // 语义期类型引用：val 直接就是语义类型 id（语义期消糖造节点时用，
     // 因为复杂类型无法逆向构造出等价 AST 节点）。
     if tag == S_N_SEM_TYPE {
         return s_vals[tid]
@@ -243,7 +243,7 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
         return types.map_of(v)
     }
     if tag == S_N_FN_TYPE {
-        // S2.2 函数值类型 `fn(A,B)->R`（children=[返回类型]+参数类型...）。
+        // 函数值类型 `fn(A,B)->R`（children=[返回类型]+参数类型...）。
         // 2026-10-13 修复：本解析器此前无 fn 分支，fn 返回类型落到 stype 的
         // parse_type_node——那里能查枚举实例但**无实例化能力**（reg_enum 惰性
         // 注册在 sgen）⇒ `fn() -> Option<i64>` 报「类型 'Option' 未定义」。
@@ -270,7 +270,7 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
     }
     if tag == S_N_STRUCT_TYPE {
         var nm = sstate.name_str(tid)
-        // S1.2 内建不安全类型引用：`ptr<T>` / `slice<T>` / `atomic<T>`
+        // 内建不安全类型引用：`ptr<T>` / `slice<T>` / `atomic<T>`
         // （N_STRUCT_TYPE 承载标识符类型引用，按名特判——不做关键字，
         // 避免与 str.slice 等方法名冲突）
         if nm == "ptr" || nm == "slice" || nm == "atomic" || nm == "guard" {
@@ -291,7 +291,7 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
             // guard<cap>：cap 是能力名（share/mem/ext/lock 标识符），非类型实参
             if nm == "guard" {
                 var capn = sstate.name_str(arg0)
-                // r.1.6.7：域映射走 types 层单一事实源（新增 lock 域 = 绕过运行时表锁）
+                // 域映射走 types 层单一事实源（新增 lock 域 = 绕过运行时表锁）
                 var gidx2 = types.guard_cap_index(capn)
                 if gidx2 < 0 {
                     sm_err_line = s_lines[tid]
@@ -314,7 +314,7 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
             return types.atomic_of(elem)
         }
         var nid = intern.intern(nm)
-        // p.9.11.32 类型别名展开：命中别名注册表 → 目标类型（泛型别名做形参代换）。
+        // 类型别名展开：命中别名注册表 → 目标类型（泛型别名做形参代换）。
         // 挂在 struct/enum/port 查找之前——别名注册表与类型注册表互斥（重复即报错）。
         var alidx = sstate.bs_find(alias_keys, nid)
         if alidx >= 0 {
@@ -323,7 +323,7 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
         var sidx = sstate.bs_find(st_keys, nid)
         var eidx = sstate.bs_find(en_keys, nid)
         var gidx = sstate.gt_find(nm)
-        // S2.4 port 类型引用：st/en/gt 均未命中时查 port 表（port 名 -> 索引）。
+        // port 类型引用：st/en/gt 均未命中时查 port 表（port 名 -> 索引）。
         // port 对象类型（11<<40 | port 索引）可作变量/参数/返回/字段/表元素
         // 类型标注——LLVM 表示 = ptr（指向堆打包 {data,vtable}）。
         var pidx = sstate.port_find(nm)
@@ -343,7 +343,7 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
                     return types.struct_of(si)
                 }
                 if gidx >= 0 && gty_is_struct[gidx] == 2 {
-                    // 泛型 enum 实例化（2026-08-15）：Option<i64> → instantiate_enum
+                    // 泛型 enum 实例化：Option<i64> → instantiate_enum
                     var args = parse_type_args_ast(slot)
                     if len(args) == 0 {
                         return -1
@@ -367,7 +367,7 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
                     return -1
                 }
                 if pidx >= 0 {
-                    // S2.4：port 不接受类型参数（第一版 port 不支持泛型）
+                    // port 不接受类型参数（第一版 port 不支持泛型）
                     sm_err_line = s_lines[tid]
                     sm_err_col = s_cols[tid]
                     sm_err_msg = "port '" + nm + "' 不接受类型参数（第一版 port 不支持泛型）"
@@ -387,7 +387,7 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
             return types.enum_of(en_vals[eidx])
         }
         if pidx >= 0 {
-            // S2.4：port 对象类型引用（`var d: Drawable`）
+            // port 对象类型引用（`var d: Drawable`）
             if sstate.nchild(tid) > 0 {
                 var pslot = sstate.child(tid, 0)
                 if pslot >= 0 && s_tags[pslot] == S_N_TYPE_ARGS {
@@ -651,7 +651,7 @@ pub func match_type_node(tnode: i64, arg_ty: i64, tp_names: table<i64>, bk: ref 
         return match_type_node(sstate.child(tnode, 0), ety, tp_names, bk, bv, call_id)
     }
     if tag == S_N_FN_TYPE {
-        // S2.2 函数值类型模板匹配：`fn(T)->R` 实参必须是 K_FN，且返回类型
+        // 函数值类型模板匹配：`fn(T)->R` 实参必须是 K_FN，且返回类型
         // 与各参数类型逐项 match（返回类型/参数类型可为类型参数引用 → 绑定）。
         // 支撑泛型高阶函数：`func apply<T>(f: fn(T)->T, x: T) -> T`。
         if types.kind(arg_ty) != K_FN {
@@ -718,7 +718,7 @@ pub func infer_type_args(tmpl_node: i64, gti: i64, explicit: table<i64>, param_s
     while j < len(arg_tys) {
         var pi = param_start + j
         if pi >= nparams {
-            // p.8.1.3 变长泛型：形参最后一个为变参（`name: ...T`）→ 剩余实参
+            // 变长泛型：形参最后一个为变参（`name: ...T`）→ 剩余实参
             // 全部匹配变参的元素类型节点（TypeVar T），逐个绑定（冲突由
             // match_type_node 报「推断冲突」）。
             if nparams > 0 {
@@ -787,7 +787,7 @@ pub func infer_type_args_fields(tmpl_node: i64, gti: i64, explicit: table<i64>, 
     return finish_args(gti, tp_names, bk, bv, call_id)
 }
 
-// ---------- p.9.11.32 类型别名展开 ----------
+// ---------- 类型别名展开 ----------
 // 展开深度护栏 alias_depth 在文件顶层（命名空间体内不允许 var）
 
 

@@ -1,5 +1,5 @@
 type tie<tsh>
-// scripts/bootstrap-fp.tsh.tie —— 自举不动点校验（p.9.21：三阶，纯 tie/tshell）
+// scripts/bootstrap-fp.tsh.tie —— 自举不动点校验（三阶，纯 tie/tshell）
 // ============================================================
 // 三阶不动点：tiec(入库) 编 driver → n1 → n2 → n3；SHA(n2)==SHA(n3) 即不动点
 // （certutil 求 SHA256，tie 侧取哈希行比对——fc /b 的返回码不可靠）。
@@ -8,10 +8,10 @@ type tie<tsh>
 // 用法（repo 根）：
 //   tsh_main.exe -f scripts\bootstrap-fp.tsh.tie [输出目录] [fresh]
 // 输出目录默认 ..\_tiec_verify\fp（仓库外侧，避免污染工作树）；也可用环境
-// 变量 TIEC_FP_OUT 指定。**必须带输出目录 + fresh 双参数调用**（见 D4 注意）。
+// 变量 TIEC_FP_OUT 指定。**必须带输出目录 + fresh 双参数调用**（见 注意）。
 // 输出：FIXED-POINT OK（exit 0）/ FIXED-POINT MISMATCH（exit 1）。
 //
-// ⚠ D4（p.9.21.7，tsh REPL v1 语义缺陷）：tsh 的脚本内变量赋值不稳定——
+// ⚠ （tsh REPL v1 语义缺陷）：tsh 的脚本内变量赋值不稳定——
 //   同一轮运行中不同语句对同一变量可能看到不同值（实测：哨兵用默认目录、
 //   编译用参数目录、[4/4] 又用默认目录），`out = arg_at(0)` 在 1 参数布局下
 //   静默失效。**本脚本的全部使用点现调 resolve_out()，不经变量中转**；每次
@@ -24,7 +24,7 @@ var tiec = ".\\compiler\\tiec.exe"
 var src = "compiler\\driver.tie"
 var flags = "-l2 -t0 --no-warn --no-cache"
 
-// 输出目录解析（每次需要处现调，不用变量中转——D4）。
+// 输出目录解析（每次需要处现调，不用变量中转——）。
 // 取值优先级：环境变量 TIEC_FP_OUT > 第 1 脚本参数 > 默认 ..\_tiec_verify\fp。
 func resolve_out(dflt: string) -> string {
     var e = get_env("TIEC_FP_OUT")
@@ -82,7 +82,7 @@ func hash_line(s: string) -> string {
 }
 
 // ---------- 0. 输出目录（mkdir + 哨兵自检） ----------
-// p.9.17.2 修正：原 cmd if not exist/mkdir 组合对正斜杠路径报「命令语法不正确」
+// 修正：原 cmd if not exist/mkdir 组合对正斜杠路径报「命令语法不正确」
 //（tsh 参数路径恒被规范化为正斜杠）——改用底座 mkdir_all 原语（Windows API
 // 直接接受正斜杠），消除对 outdir 斜杠形式的敏感。
 mkdir_all(resolve_out("..\\_tiec_verify\\fp"))
@@ -138,7 +138,7 @@ println("[3/4] n3 完成")
 // 两个实测坑：①不要经 `cmd /c ... | find ... > 文件` 中转——管道加重定向在本
 // 环境产 0 字节文件，直接 exec_output 最稳；②不用 fc /b——exec_code 对 fc 的
 // 返回码不可靠（一致文件也报差异）。③resolve_out 必须内联进命令串——中转
-// 变量（fp_now）会踩 D4 赋值缺陷拿到空值。
+// 变量（fp_now）会踩 赋值缺陷拿到空值。
 var d2 = hash_line(exec_output("certutil -hashfile " + resolve_out("..\\_tiec_verify\\fp") + "\\n2.exe SHA256"))
 var d3 = hash_line(exec_output("certutil -hashfile " + resolve_out("..\\_tiec_verify\\fp") + "\\n3.exe SHA256"))
 if d2 == d3 && str_len(d2) == 64 {

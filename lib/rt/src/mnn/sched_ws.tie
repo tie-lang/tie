@@ -1,21 +1,21 @@
 type tie<class, unsafe:mem, unsafe:ext>
-// core/mnn/sched_ws.tie —— trm-lite 复杂形态 work-stealing 调度器（p.6.5.2 多线程 / p.6.5.3 并入后台回收器 / p.6.5.5 可迁移栈 / p.6.7.8 常驻池 / p.6.7.9 per-P 细锁）
+// core/mnn/sched_ws.tie —— trm-lite 复杂形态 work-stealing 调度器（多线程 / 并入后台回收器 / 可迁移栈 / 常驻池 / per-P 细锁）
 // 多 OS 线程池 + 每线程双端队列 + 任务窃取 + M:N 承托 + **并发三色 GC 后台回收器**：
 //   · 任务承载 = 注册表 g_regs（table<fn() -> i64>）+ 队列元素 regid（table<i64>）
 //   · 每线程双端队列 = g_items 预分配 P×SEG_CAP 槽（段固定不重叠）；owner 段尾
-//     LIFO 自取，他人段头 FIFO 窃取，段满溢出全局 g_ovf（p.6.5.2 定稿）
-//   · **可迁移栈（p.6.5.5）**：tie 任务为 fn() 原子执行体，「可迁移」= 任务与创建
+//     LIFO 自取，他人段头 FIFO 窃取，段满溢出全局 g_ovf（定稿）
+//   · **可迁移栈**：tie 任务为 fn 原子执行体，「可迁移」= 任务与创建
 //     worker 解耦，任意 worker 皆可执行：g_exec_w 登记执行者；g_migrated 计数
 //     （worker≠创建者即迁移）；sweep 仅发生「pending==0 && active==0」窗口（任务
 //     运行期分配/存活对象受保护——GC 根 = 当前运行任务 env）
-//   · **p.6.7.9 per-P 细锁（去全局单 CS）**：每 worker 段独立 CS（g_seg_lks[i]，
+//   · **per-P 细锁（去全局单 CS）**：每 worker 段独立 CS（g_seg_lks[i]，
 //     自取/窃取只锁目标段）、全局溢出队列独立锁 g_ovf_lk、计数+空判断+唤醒收敛
 //     短临界计数锁 g_cnt_lk（不做任何任务数据操作）、寄存器表追加锁 g_regs_lk。
 //     全程**单锁持有**（无嵌套多锁 → 无死锁）；窃取窗口缩小到目标段。锁序纪律：
 //     任意路径同时只持一把锁，跨锁操作逐把入/出。
-//   · 池常驻（p.6.7.8）：起于首次 drain、止于 shutdown；worker/GC 空闲 cv_wait
+//   · 池常驻：起于首次 drain、止于 shutdown；worker/GC 空闲 cv_wait
 //     存活，见 g_shutdown==1 退出。
-//   · 终止协议（p.6.5.2）：worker 仅当全部完成退出；pending/active 同锁原子视图。
+//   · 终止协议：worker 仅当全部完成退出；pending/active 同锁原子视图。
 //   · 同步 primitives 单一声明源 tl_k32（经 tl_sync 命名空间封装）。
 import "./tl_sync.tie"
 import "../gc/gc_tri.tie"
@@ -27,7 +27,7 @@ var g_workers: i64 = 4        // 池大小 P（set_workers 在首个 drain 前�
 var g_cv: i64 = 0             // 条件变量缓冲地址（配 g_cnt_lk）
 var g_state_init: i64 = 0
 
-// p.6.7.9 细锁集合
+// 细锁集合
 var g_cnt_lk: i64 = 0         // 计数/状态锁（pending/active/done/migrated/spi + 空判断 + CV 等待）
 var g_regs_lk: i64 = 0        // 寄存器表追加锁（g_regs/g_orig_w/g_exec_w append）
 var g_ovf_lk: i64 = 0         // 全局溢出队列细锁
@@ -57,7 +57,7 @@ var g_ws_gosched_pend: i64 = 0         // 显式让出待消费数（gosched() �
 
 namespace trm_lite_ws {
 
-// ---------- 细锁封装（p.6.7.9；单锁持有纪律，杜绝多锁嵌套） ----------
+// ---------- 细锁封装（单锁持有纪律，杜绝多锁嵌套） ----------
 func cnt_enter() {
     unsafe {
         tl_sync.cs_enter(g_cnt_lk)
@@ -154,7 +154,7 @@ pub func ensure_state() {
 
 // 池大小（须在首个 drain 前设置；改 P 会重建段表 + 段锁）。
 pub func set_workers(m: i64) {
-    // p.6.7.8：池已常驻后禁止改 P（段表重建与实际线程数失配）。
+    // 池已常驻后禁止改 P（段表重建与实际线程数失配）。
     if m < 1 || m == g_workers || g_pool_up == 1 {
         return
     }
@@ -208,12 +208,12 @@ pub func workers() -> i64 {
     return g_workers
 }
 // 计数锁地址（tl_runtime_ctx 汇总层可按需复用；当前 GC 用自有锁）。
-// p.6.7.9：原全局单 CS 已拆细锁——对外暴露短临界计数锁（最接近原语义的宿主）。
+// 原全局单 CS 已拆细锁——对外暴露短临界计数锁（最接近原语义的宿主）。
 pub func sync_cs() -> i64 {
     return g_cnt_lk
 }
 
-// 入队函数值执行体（含捕获闭包）：p.6.7.9 细锁分步——计数锁取轮转位 →
+// 入队函数值执行体（含捕获闭包）：细锁分步——计数锁取轮转位 →
 // 寄存器锁追加 → 段锁写段（满则溢出锁转溢出表）→ 计数锁 pending++ + 唤醒。
 // 每步一把短锁，杜绝多锁嵌套。任务内再 spawn 亦安全。
 pub func spawn(f: fn() -> i64) -> i64 {
@@ -260,7 +260,7 @@ pub func queued_count() -> i64 {
     return p
 }
 
-// ---------- p.6.7.10 协作抢占（复杂形态）：gosched 显式点 + 时间片检查 ----------
+// ---------- 协作抢占（复杂形态）：gosched 显式点 + 时间片检查 ----------
 // 任务体为 fn() 原子执行体不可硬中断 → 抢占体现为调度点让出（worker 每任务完成
 // 后 after_task(me) 判定）：gosched()（内置，复杂形态指到本函数）置 g_ws_gosched_pend
 // → after_task 让出一次；时间片 g_ws_slice_w[me] 达 WS_SLICE_LIMIT → 清零让出。
@@ -291,16 +291,16 @@ pub func after_task(me: i64) -> i64 {
     return r
 }
 
-// 让出等待：1ms 限时（p.6.7.10）。p.6.7.13 修：不用调度 CV（cv_wait 与 drain/worker
+// 让出等待：1ms 限时。修：不用调度 CV（cv_wait 与 drain/worker
 // 空闲等待共享 g_cv——被 ch_send 等持锁路径并发唤醒存在时序纠缠风险）；纯 Sleep(1)
 // 幂等让出，等价限时且零 CV 交互。
 func give_wait() {
     tl_sync.sleep(1)
 }
 
-// worker 主循环：p.6.7.9 细锁——自己段尾 LIFO（锁自段）→ 窃取他人段头 FIFO
+// worker 主循环：细锁——自己段尾 LIFO（锁自段）→ 窃取他人段头 FIFO
 // （逐目标段短锁）→ 全局溢出队头（溢出锁）→ 计账（计数锁）→ 执行 → done（计数锁）
-// → 空闲 cv_wait（计数锁）。常驻（p.6.7.8）：仅 g_shutdown==1 退出。
+// → 空闲 cv_wait（计数锁）。常驻：仅 g_shutdown==1 退出。
 func worker_main(arg: i64) -> i64 {
     var me = arg
     var last: i64 = 0
@@ -358,7 +358,7 @@ func worker_main(arg: i64) -> i64 {
             g_pending = g_pending - 1
             g_done = g_done + 1
             cnt_leave()
-            // p.6.7.10 调度点让出：显式 gosched 或时间片耗尽 → 1ms 让出（不抢下一单）
+            // 调度点让出：显式 gosched 或时间片耗尽 → 1ms 让出（不抢下一单）
             var gy = after_task(me)
             if gy == 1 {
                 give_wait()
@@ -376,8 +376,8 @@ func worker_main(arg: i64) -> i64 {
     }
 }
 
-// 后台回收器主循环（p.6.5.3）：与 worker 真并发推进三色标记；只有「无任务运行」
-// 窗口才做大批次，sweep 安全。p.6.7.8：常驻——仅 g_shutdown==1 时退出。
+// 后台回收器主循环：与 worker 真并发推进三色标记；只有「无任务运行」
+// 窗口才做大批次，sweep 安全。：常驻——仅 g_shutdown==1 时退出。
 func gc_worker_main(_: i64) -> i64 {
     var last: i64 = 0
     while 1 {
@@ -400,7 +400,7 @@ func gc_worker_main(_: i64) -> i64 {
     }
 }
 
-// 起池（p.6.7.8）：**常驻**——仅首次 drain 创建 P worker + 1 后台回收器。
+// 池的创建：**常驻**——仅首次 drain 创建 P worker + 1 后台回收器。
 func ensure_pool() {
     if g_pool_up == 1 {
         return
@@ -439,9 +439,9 @@ func join_pool() {
     g_pool_up = 0
 }
 
-// 本轮状态复位（drain 收尾：pending==0 无并发窗口，主线程独占；p.6.7.9 逐细锁清）。
+// 本轮状态复位（drain 收尾：pending==0 无并发窗口，主线程独占；逐细锁清）。
 // g_done/g_stolen 跨轮累计（drain 返回本轮增量，观察量取累计）。
-// p.6.7.8：**不再清 g_ths**（线程句柄表是池资产，只随 join_pool 销毁）。
+// **不再清 g_ths**（线程句柄表是池资产，只随 join_pool 销毁）。
 func reset_round() {
     var i: i64 = 0
     while i < len(g_h) {
@@ -468,7 +468,7 @@ func reset_round() {
 }
 
 // 并行 run：P worker 并发执行全部任务（含任务内再 spawn）+ 后台回收器并发
-// 三色标记。p.6.7.8：等待本轮排空后**不做池回收**（池常驻）。返回本轮任务数（增量）。
+// 三色标记。：等待本轮排空后**不做池回收**（池常驻）。返回本轮任务数（增量）。
 pub func drain() -> i64 {
     ensure_state()
     var base: i64 = 0
@@ -486,7 +486,7 @@ pub func drain() -> i64 {
     return r
 }
 
-// 常驻池线程句柄表长度（p.6.7.8 观察量：多轮 drain 不增长）。
+// 常驻池线程句柄表长度（观察量：多轮 drain 不增长）。
 pub func thread_count() -> i64 {
     return len(g_ths)
 }
@@ -504,7 +504,7 @@ pub func stolen_count() -> i64 {
     cnt_leave()
     return s
 }
-// 迁移计数（p.6.5.5：worker≠创建者的执行次数，跨轮累计）
+// 迁移计数（worker≠创建者的执行次数，跨轮累计）
 pub func migrated_count() -> i64 {
     cnt_enter()
     var m = g_migrated
@@ -519,7 +519,7 @@ pub func exec_worker(id: i64) -> i64 {
     }
     return g_exec_w[id]
 }
-// 运行时全局清理（进程收尾）。p.6.7.8/6.7.9：真正池销毁——置停机标记 + 广播唤醒
+// 运行时全局清理（进程收尾）。：真正池销毁——置停机标记 + 广播唤醒
 // （worker/GC 见 1 退出）→ join 全部线程 → 销毁全部细锁（段锁/溢出/计数/寄存器/CV）。
 // 幂等。
 pub func shutdown() {

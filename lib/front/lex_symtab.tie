@@ -1,7 +1,7 @@
 type tie<class>
-// lib/front/lex_symtab.tie —— T2.4 关键字/符号表（模块拆分）
+// lib/front/lex_symtab.tie —— 关键字/符号表（模块拆分）
 // ============================================================
-// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）完整词法器
+// 职责：完整词法器
 // lexer.tie 拆分为 5 模块之一（本文件 = 关键字/符号表，零依赖叶节点）。
 // 表全局变量（kw_keys/kw_vals/sym_keys/sym_vals）按 tie 约束放文件顶层，
 // 本 namespace 内函数裸名访问；由 lex_scan.tie import（传递可达 lexer）。
@@ -10,8 +10,8 @@ type tie<class>
 // namespace 内函数裸名访问（同文件顶层全局，已验证可行）。
 
 // ---------- 关键字/符号排序表（懒构建；键升序 + 二分）----------
-// S3.3 宏/元编程：新增 macro 关键字（in 与 map 之间——'i'<'m' 且 'c'<'p'）。
-// 注意：S2.4 并行分支可能同时改本表（port/impl），合并冲突时保留两份新增。
+// 宏/元编程：新增 macro 关键字（in 与 map 之间——'i'<'m' 且 'c'<'p'）。
+// 注意：并行分支可能同时改本表（port/impl），合并冲突时保留两份新增。
 var kw_keys: table<string>;
 var kw_vals: table<i64>;
 var sym_keys: table<string>;
@@ -21,22 +21,22 @@ namespace lexsym {
 
 // ---------- 关键字表构建与二分 ----------
 // 51+6 项 ASCII/strcmp 升序（TypeKw 值=32，具体类型由 lexeme 区分——同 Rust
-// 单变体）。S1.2 新增：asm（as 后 bool 前）、repr（ref 后 return 前）、
-// unsafe（u8 后 using 前）。S2.3/S2.4 新增：impl（if 后 import 前——'l'<'o'）、
-// panic/port（num 后 pub 前——'a'<'o'<'u'）。S3.3 新增：macro（in 后 map 前）。
-// 批次 2（i128/u128）：i128 在 i16 前（'2'<'6'）、u128 在 u16 前——严格升序。
-// 三期 goto（2026-08-23）：goto 在 func 后 i128 前（'g'<'i'）——严格升序。
-// p.9.11.10/11 two more keyword（严格升序）：
+// 单变体）。新增：asm（as 后 bool 前）、repr（ref 后 return 前）、
+// unsafe（u8 后 using 前）。/新增：impl（if 后 import 前——'l'<'o'）、
+// panic/port（num 后 pub 前——'a'<'o'<'u'）。新增：macro（in 后 map 前）。
+// i128 在 i16 前（'2'<'6'）、u128 在 u16 前——严格升序。
+// 三期 goto：goto 在 func 后 i128 前（'g'<'i'）——严格升序。
+// two more keyword（严格升序）：
 //   immut（i m m u t）在 impl（i m p）前——第三字节 'm'(109)<'p'(112)；
 //   inline（i n l）在 in（i n）后（"in" 为 "inline" 前缀）、macro 前——'i'<'m'。
-// p.9.11.21 interface 关键字（tag 106，严格升序）：
+// interface 关键字（tag 106，严格升序）：
 //   interface（i n t）在 inline（i n l）后——第三字节 't'(116)>'l'(108)；
 //   interface 在 macro（m）前——'i'<'m'。结构性接口（鸭子多态静态检查）。
-// p.9.11 `is` 关键字（tag 119，规范 §3.16 类型判定）：严格升序——
+// `is` 关键字（tag 119，规范 §3.16 类型判定）：严格升序——
 //   is 在 interface（i n < i s，第三字节 'n'<'s'）后、macro（m）前。
-// p.9.11 `reentrant` 关键字（tag 120，规范 §10.7）：严格升序——
+// `reentrant` 关键字（tag 120，规范 §10.7）：严格升序——
 //   reentrant 在 pub（p）后、ref（r e f）前（第三字节 'e'<'f'）。
-// p.9.11 `await` 关键字（tag 121，规范 §10.6）：严格升序——
+// `await` 关键字（tag 121，规范 §10.6）：严格升序——
 //   await 在 async（a s）后（第四字节 'y'<'w'？否：async=a s y n c，await=a w——
 //   第二字节 's'(115)<'w'(119) ⇒ async < await）、bool（b）前。
 func build_kw() {
@@ -92,17 +92,17 @@ pub func kw_lookup(s: string) -> i64 {
 // 49 项 strcmp 升序（'<'=60 < '='=61 < '>'=62，故 '<'组："<"<"<<"<"<<="<"<="，
 // '>'组：">"<">="<">>"<">>="——必须严格升序否则二分错乱，2026-08-11 实测踩坑；
 // `...`（0x2E2E2E）介于 `..`（0x2E2E）与 `/`（0x2F）之间：第三字节 46 > 0 故靠后）
-// S3.3 新增两个符号（严格升序校验）：
+// 新增两个符号（严格升序校验）：
 //   "$"（0x24）：介于 "!="（0x21 0x3D）与 "%"（0x25）之间——0x21<0x24<0x25；
 //   "`"（0x60）：介于 "^="（0x5E 0x3D）与 "{"（0x7B）之间——0x5E<0x60<0x7B。
-// M4（dev33 批次9）新增 "#"（0x23）：介于 "!="（0x21 0x3D）与 "$"（0x24）之间
+// 新增 "#"（0x23）：介于 "!="（0x21 0x3D）与 "$"（0x24）之间
 //   ——0x21<0x23<0x24。tag 91（lex_hash），属性语法 `#[macro]` 起始符。
-// p.9.11.9 checked 运算符号 `*?`/`+?`/`-?`（严格升序插入，二分不破坏）：
+// checked 运算符号 `*?`/`+?`/`-?`（严格升序插入，二分不破坏）：
 //   "*?"（0x2A 0x3F）：介于 "*="（0x2A 0x3D）与 "+"（0x2B）之间——0x3D<0x3F；
 //   "+?"（0x2B 0x3F）：介于 "+="（0x2B 0x3D）与 ","（0x2C）之间——0x3D<0x3F<0x2C 末字节仍 0x2B<0x2C；
 //   "-?"（0x2D 0x3F）：介于 "->"（0x2D 0x3E）与 "."（0x2E）之间——0x3E<0x3F。
 // 三者第二字符均为 '?'，与 `?` 解包/`?.`/`a?[i]` 前缀因首字符不同不冲突。
-// p.9.11.12 @注解符（0x40）：介于 "?"（0x3F）与 "["（0x5B）之间——0x3F<0x40<0x5B。
+// @注解符（0x40）：介于 "?"（0x3F）与 "["（0x5B）之间——0x3F<0x40<0x5B。
 func build_sym() {
     var k: table<string> = ["!", "!=", "#", "$", "%", "%%", "%%=", "%=", "&", "&&", "&=", "(",
         ")", "*", "**", "**?", "*=", "*?", "+", "++", "+=", "+?", ",", "-", "--", "-=", "->", "-?", ".",

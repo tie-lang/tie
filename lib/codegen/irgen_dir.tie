@@ -1,12 +1,12 @@
 type tie<class>
 // lib/codegen/irgen_dir.tie —— 生成器 L3：目录遍历辅助（mkdir_all/remove_dir_all/copy_dir/list_dir/blob_push/walk_dir）
 // ============================================================
-// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 自 irgen_expr.tie 按域拆出。
 // 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
 // 顶层全局 var 与 import 树留在 irgen.tie 主文件。
 namespace irgen {
 func tig_mkdir_all(p: i64) -> i64 {
-    // r.1.6.2 Linux：分隔符循环逻辑与 Win32 共用（issep 已同时识别 / 与 \），
+    // Linux：分隔符循环逻辑与 Win32 共用（issep 已同时识别 / 与 \），
     // 仅建目录调用改走 tig_mkdir_utf8（Linux mkdir UTF-8 直通）。
     var T64 = types.named(TK_I64)
     var pn = s21_str_head_len(p)
@@ -64,7 +64,7 @@ func tig_mkdir_all(p: i64) -> i64 {
     return tig_bool_lit(1)
 }
 func tig_remove_dir_all(p: i64) -> i64 {
-    // r.1.6.2 Linux 分支：迭代 DFS 递归删除（unlink 文件 + 后序 rmdir 目录）。
+    // Linux 分支：迭代 DFS 递归删除（unlink 文件 + 后序 rmdir 目录）。
     // 工作清单（待展开目录）+ 删除清单（后进先出 → 子目录先于父目录 rmdir）。
     if tig_is_linux() {
         var T64 = types.named(TK_I64)
@@ -200,7 +200,7 @@ func tig_remove_dir_all(p: i64) -> i64 {
 // 每个目录：先建 dst 目录，遍历 src 直接条目——文件 CopyFileW，子目录建目并
 // 压入工作清单继续。UTF-16 路径安全。整体成功 → i1 true。
 func tig_copy_dir(a: i64, b: i64) -> i64 {
-    // r.1.6.2 Linux 分支：迭代式递归复制（src/dst 成对工作清单）——opendir/
+    // Linux 分支：迭代式递归复制（src/dst 成对工作清单）——opendir/
     // readdir 遍历（d_type/d_name 直读），子目录 mkdir+压栈，文件走
     // tig_posix_copy_file。路径 join 用 '/'。整体成功 → true。
     if tig_is_linux() {
@@ -438,7 +438,7 @@ func tig_copy_dir(a: i64, b: i64) -> i64 {
     return tig_bool_lit(1)
 }
 func tig_list_dir(p: i64) -> i64 {
-    // r.1.6.2 Linux：opendir/readdir 收集条目名（tig_posix_list_names）
+    // Linux：opendir/readdir 收集条目名（tig_posix_list_names）
     if tig_is_linux() {
         return tig_posix_list_names(p)
     }
@@ -544,7 +544,7 @@ func tig_list_dir(p: i64) -> i64 {
     return s21_load(sv, types.named(TK_STR))
 }
 func tig_walk_dir(p: i64) -> i64 {
-    // r.1.6.2 Linux 分支：迭代 DFS（工作清单）+ opendir/readdir；结果表收集
+    // Linux 分支：迭代 DFS（工作清单）+ opendir/readdir；结果表收集
     // 全部条目完整路径（join 用 '/'）。失败返回空表。
     if tig_is_linux() {
         var T64 = types.named(TK_I64)

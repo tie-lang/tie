@@ -1,12 +1,12 @@
 type tie<class>
-// lib/codegen/irgen_agg_p3.tie —— irgen_agg 分片 3（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_agg_p3.tie —— irgen_agg 分片 3
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_agg.tie。
 namespace irgen {
 // struct 构造调用：StructName(args...) → 聚合值。
 // 布局：alloca 聚合 → 逐字段 store（实参覆盖前 n 个；缺省字段零值——
-// 字段默认字面量未登记，与 Rust 行为差异留待后续）→ load 聚合值。
+// 字段默认字面量未登记，与 Rust 行为存在差异）→ load 聚合值。
 func tig_struct_construct(id: i64, nm: string) -> i64 {
     var nid = interner.intern(nm)
     var sidx = sstate.bs_find(st_keys, nid)
@@ -57,7 +57,7 @@ func tig_struct_construct(id: i64, nm: string) -> i64 {
             //     发射该窄型；否则恒定 i64。**f64/f32 字段的整数字面量默认值
             //     （`var w: f64 = 5`）node_types 会被收窄为浮点 fty，非 int →
             //     发射 i64**——旧逻辑按 fty 类别猜 vt（float fty 一律记 F64），
-            //     把该 i64 误当作 f64，致下方 S1.3 收窄跳过、i64 直 store 到
+            //     把该 i64 误当作 f64，致下方 收窄跳过、i64 直 store 到
             //     double 槽 → opt 崩溃（%2 defined i64 but expected double）。
             //   · FloatLit（tag 1）：恒定 f64。
             //   其余表达式按语义节点类型 fty 记。
@@ -88,7 +88,7 @@ func tig_struct_construct(id: i64, nm: string) -> i64 {
                 vt = fty
             }
         }
-        // S1.3 窄整数字段：无论来源（实参/默认值/零值），store 前统一按字段
+        // 窄整数字段：无论来源（实参/默认值/零值），store 前统一按字段
         // 类型收窄。修复：tig_default_val / 默认字面量对 u32/u16 等返回 i64，
         // 直接 store 到窄字段致 LLVM 类型不匹配（opt: '%X' defined i64 but expected i32）。
         if vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
@@ -99,7 +99,7 @@ func tig_struct_construct(id: i64, nm: string) -> i64 {
             }
             v = cv
         }
-        // P2c：any 字段装箱——实参/默认值是具体类型 → box（对齐 var/return/参数装箱）
+        // any 字段装箱——实参/默认值是具体类型 → box（对齐 var/return/参数装箱）
         if fty == types.named(TK_ANY) && vt >= 0 && vt != types.named(TK_ANY) {
             var bx4 = tig_box_any(v, vt)
             if bx4 < 0 {
@@ -152,7 +152,7 @@ func rp_fld_has_default(si: i64, fi: i64) -> bool {
     return off + fi < len(fld_defs) && fld_defs[off + fi] >= 0
 }
 
-// 字段默认值（含 S1.3 收窄/浮点转整数字面量，对齐 tig_struct_construct）；表字段
+// 字段默认值（含 收窄/浮点转整数字面量，对齐 tig_struct_construct）；表字段
 // 无显式默认 → 有效空表（非 tig_default_val 的 "" 伪句柄）。fele 表元素类型。
 func rp_fld_default_val(si: i64, fi: i64, fty: i64) -> i64 {
     var off = cls_fldoff[si]
@@ -198,7 +198,7 @@ func rp_fld_default_val(si: i64, fi: i64, fty: i64) -> i64 {
             vt = fty
         }
     }
-    // S1.3 收窄：默认字面量按目标字段类型转换（f64 整数字面量默认 → sitofp；窄型 → trunc）
+    // 收窄：默认字面量按目标字段类型转换（f64 整数字面量默认 → sitofp；窄型 → trunc）
     if vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
         (types.is_int(fty) || types.is_float(fty)) && vt != fty {
         v = tig_coerce(v, vt, fty)
@@ -305,7 +305,7 @@ func rp_write(nm: i64, i: i64, v: i64) -> i64 {
     ir.add_operand(rst, agg, 2)
     ir.add_operand(rst, v, 0)
     ir.add_operand(rst, row_p, 0)
-    // 负下标诊断（复用 s21_index_raise，p.9.12.2 裁决）
+    // 负下标诊断（复用 s21_index_raise，裁决）
     var negc = tig_icmp_c(i, tig_int_lit(0), 2)  // i < 0
     var nb = ir.new_block(g_cur_func, interner.intern("rp.n"))
     var mg = ir.new_block(g_cur_func, interner.intern("rp.m"))
@@ -337,8 +337,8 @@ func rp_write(nm: i64, i: i64, v: i64) -> i64 {
 
 // 行池字段写 t[i].f（= 与 op= 复合）：按列句柄定位字段列，grow-set 语义
 //（越界行以默认值补齐——与 rows[id] = e 的行物化一致，各列恒齐平）。
-// 值语义判据与 tig_field_assign 普通路径对齐（窄整数 S1.3 收窄 / any 字段
-// P2c 装箱 / 复合赋值读-改-写）。idxnode = N_INDEX 节点（t[i]），i 取其 child 1。
+// 值语义判据与 tig_field_assign 普通路径对齐（窄整数 收窄 / any 字段
+// 装箱 / 复合赋值读-改-写）。idxnode = N_INDEX 节点（t[i]），i 取其 child 1。
 func rp_field_write(r: i64, fidx: i64, fty: i64, idxnode: i64, op: i64, valnode: i64, fname: string) -> i64 {
     var si = rp_si[r]
     var inode = sstate.child(idxnode, 1)
@@ -350,7 +350,7 @@ func rp_field_write(r: i64, fidx: i64, fty: i64, idxnode: i64, op: i64, valnode:
     if vv < 0 {
         return -1
     }
-    // S1.3 窄整数字段：赋值值按字段类型转换（对齐普通路径）
+    // 窄整数字段：赋值值按字段类型转换（对齐普通路径）
     var vt = ast.node_type(valnode)
     if op < 0 && vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
         (types.is_int(fty) || types.is_float(fty)) && vt != fty {
@@ -360,7 +360,7 @@ func rp_field_write(r: i64, fidx: i64, fty: i64, idxnode: i64, op: i64, valnode:
         }
         vv = cv
     }
-    // P2c：any 字段赋值装箱
+    // any 字段赋值装箱
     if fty == types.named(TK_ANY) && vt >= 0 && vt != types.named(TK_ANY) {
         var bx5 = tig_box_any(vv, vt)
         if bx5 < 0 {
@@ -399,7 +399,7 @@ func rp_field_write(r: i64, fidx: i64, fty: i64, idxnode: i64, op: i64, valnode:
 // 比较第 0 列即可，但为防御仍逐列走 tig_table_compare 的长度短路）+ 逐字段列
 // 比较——每列是普通 table<fty>，复用 tig_table_compare（结构字段列递归、表
 // 字段列深比较、浮点 IEEE oeq、字符串二进制安全均由既有判据覆盖）。
-// 任一侧不是行池变量 → 编译期拒绝：表字面量临时是普通 P2a 行式表（单句柄），
+// 任一侧不是行池变量 → 编译期拒绝：表字面量临时是普通 行式表（单句柄），
 // 与行池列式表示不同，静默比较会按第 0 列错位。
 func tig_rowpool_compare(op: i64, lnode: i64, rnode: i64) -> i64 {
     if ast.s_tag(lnode) != 6 || ast.s_tag(rnode) != 6 {
@@ -581,15 +581,15 @@ func tig_lit_elem_prep(elem: i64, val: i64, v: i64) -> (i64, i64) {
     // table<i64>，若按 elem 选桥会 push_i64(ptr) 类型错（LLVM 拒收）；
     // 且空内层表 `[]` 的 node_types 落 i64 兜底——只要 elem 本身是表，
     // 全部元素一律 push_string（元素全是 ptr）。
-    // S2.4：port 对象元素（table<Drawable>）LLVM 表示 = ptr（堆打包
+    // port 对象元素（table<Drawable>）LLVM 表示 = ptr（堆打包
     // {data,vtable}）——走 string 桥（参数类型 TK_STR = ptr，类型匹配）；
-    // 返回场景（at）由调用处把返回类型标为 K_PORT 本身，避开 S2.1 的
+    // 返回场景（at）由调用处把返回类型标为 K_PORT 本身，避开 的
     // TK_STR 补头逻辑（补头会对 port 对象 ptr 做 strlen → 崩溃）。
     var suffix = bridge_suffix(elem)
     var pty = types.named(TK_I64)
     var elem_k = types.kind(elem)
     if elem_k == K_STRUCT || elem_k == K_ENUM || elem_k == K_FN || elem_k == K_TUPLE || elem == types.named(TK_ANY) {
-        // P2a/P2b 复合元素：槽类型 = 元素类型 id（llvmgen 映射 %struct.X/%enum.X/
+        // 复合元素：槽类型 = 元素类型 id（llvmgen 映射 %struct.X/%enum.X/
         // %fn.N / {i64,i64}），类型化 store/load 多字元素；esz 由 elem_size 精确计算。
         pty = elem
     } else if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
@@ -610,7 +610,7 @@ func tig_lit_elem_prep(elem: i64, val: i64, v: i64) -> (i64, i64) {
         }
     }
     if pty == types.named(TK_ANY) {
-        // P2b 异构元素装箱：元素值 → any {tag, payload}
+        // 异构元素装箱：元素值 → any {tag, payload}
         var vt2 = ast.node_type(val)
         if vt2 >= 0 && vt2 != types.named(TK_ANY) {
             var bx = tig_box_any(v, vt2)
@@ -620,7 +620,7 @@ func tig_lit_elem_prep(elem: i64, val: i64, v: i64) -> (i64, i64) {
             v = bx
         }
     }
-    // r.1.1.4：字面量元素为**别名表值**（变量/下标/字段读，tag≠7/12）→
+    // 字面量元素为**别名表值**（变量/下标/字段读，tag≠7/12）→
     // retain——容器元素持引用，深容器 release 时 -1 守恒（否则内层表所有权
     // 只挂在别名变量上：变量先析构 → 容器深释放读悬垂句柄 → 双重释放
     // 0xC0000374）。瞬态值（调用 tag 7 / 表字面量 tag 12）所有权转移给容器
@@ -639,7 +639,7 @@ func tig_lit_elem_prep(elem: i64, val: i64, v: i64) -> (i64, i64) {
 // 表字面量 → 动态表指针（tie_table_new + 逐元素 push）。
 // 元素类型：语义 node_types 首元素推断；空表 → i64 兜底。
 func tig_table_lit(id: i64) -> i64 {
-    // E3 键值表（map）字面量：任一个 cell 带字符串键（TableCell → TableId，
+    // 键值表（map）字面量：任一个 cell 带字符串键（TableCell → TableId，
     // TableId name = 字符串键池 id >= 0；数字键 name=-1 不算 map）→ 走 map 桥：
     // tie_table_new(16) + 逐对 tie_map_set / tie_map_set_string（键为字符串 ptr）。
     // 对齐 Rust 基线 gen_table_lit_arg / gen_dyn_table_var 的 map 展开（元素 16 字节）。
@@ -692,7 +692,7 @@ func tig_table_lit(id: i64) -> i64 {
             if v < 0 {
                 return -1
             }
-            // P2c：map<any> 值——装箱 + 堆拷贝，值槽存堆指针（any 16 字节
+            // map<any> 值——装箱 + 堆拷贝，值槽存堆指针（any 16 字节
             // 放不进 8 字节值槽；容器布局不变）。值已是 any → 直接堆拷贝。
             if mval_ty == types.named(TK_ANY) {
                 var vt3 = ast.node_type(val)
@@ -727,7 +727,7 @@ func tig_table_lit(id: i64) -> i64 {
         return s21_map_new()
     }
     var elem: i64 = types.named(TK_I64)
-    // P2b 异构表：字面量语义类型（sinfer 已登记 ast.node_type(id) = table<elem>）
+    // 异构表：字面量语义类型（sinfer 已登记 ast.node_type(id) = table<elem>）
     // 是元素类型的权威来源——`[1,"a",true]` → table<any>，取 elem=any 使逐
     // 元素装箱分支命中；若只按首元素推断会取 i64，bool/string 元素跳过装箱
     //（`store i64 %i1` 类型错）。空表 `[]` 的 esz 也由此获得（曾 i64=8 兜底，
@@ -752,7 +752,7 @@ func tig_table_lit(id: i64) -> i64 {
     // 会被当作值引用生成前向引用 %N）
     var size_v = tig_int_lit_ty(size, types.named(TK_I64))
     var T64L = types.named(TK_I64)
-    // r.1.6.7 批量构造（性能）：浅表且非空 → 一次 malloc(n*esz) + n 次直写 +
+    // 批量构造（性能）：浅表且非空 → 一次 malloc(n*esz) + n 次直写 +
     // 一次 adopt（O(1) 覆盖 cap/len/data），取代 n 次 tbl_push（每次 CRITICAL_SECTION
     // 加锁 + ensure + 句柄字段重读 + memcpy + set_len）。
     // **深表（元素为表）保留逐元素 push**——tbl_adopt 只建浅句柄（无深标记），

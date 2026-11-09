@@ -1,5 +1,5 @@
 type tie<class>
-// lib/backend/llvmgen_p1.tie —— llvmgen 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/backend/llvmgen_p1.tie —— llvmgen 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 llvmgen.tie。
@@ -122,8 +122,8 @@ func emit_agg_types() {
         line(eout)
         ei2 = ei2 + 1
     }
-    // fn 函数值类型输出（S2.2）：`%fn.<签名索引> = type { ptr, ptr }`——
-    // 闭包值 = { env 指针, entry 函数指针 }（见 closure-model.md C2）。
+    // fn 函数值类型输出：`%fn.<签名索引> = type { ptr, ptr }`——
+    // 闭包值 = { env 指针, entry 函数指针 }。
     // fn_ret 是 types 命名空间外的全局签名表（fn 类型低负载 = 签名表行号）。
     var nfn = len(fn_ret)
     var fi: i64 = 0
@@ -190,7 +190,7 @@ func emit_globals() {
     while oi < len(ord) {
         var i = ord[oi]
         var nm = intern.lookup(g_global_names[i])
-        // p.9.12.4：命名空间内 const 以全名 "ns::NAME" 登记 → LLVM 符号经
+        // 命名空间内 const 以全名 "ns::NAME" 登记 → LLVM 符号经
         // ns_replace 转 $（@ns$NAME），对齐命名空间函数符号规则
         var lv_nm = ns_replace(nm)
         if g_global_is_table[i] == 1 {
@@ -198,18 +198,18 @@ func emit_globals() {
         } else {
             var ty = llvm_ty(g_global_tys[i])
             var init = "0"
-            // p.9.17.2：聚合类型全局（enum/struct，LLVM 类型名以 % 开头）零初始化
+            // 聚合类型全局（enum/struct，LLVM 类型名以 % 开头）零初始化
             // 必须发 zeroinitializer——整型字面量 0 对聚合类型非法（LLVM 拒绝：
             // "integer constant must have integer type"，实测 @g = global %enum.Value 0）。
             // 零位模式 = Nil/默认变体（tag 0），与运行期 main 入口的初值求值衔接一致。
             if tie.support::has_prefix(ty, "%") {
                 init = "zeroinitializer"
             }
-            // 整数/字符折叠初值（const/var 均采纳；r.1.1.2 起以 inits_ok 区分
+            // 整数/字符折叠初值（const/var 均采纳；起以 inits_ok 区分
             // "折叠出 -1"与"无折叠值"——旧实现把无初值的 signed 全局输出成 -1）。
             // 旧实现仅 ty=="i64" 应用 → i8/i16/i32/u* 等 const 全局恒为 0
             //（GetSystemMetrics(1 的 const i32) 传成 0 一类值破坏 bug）。
-            // 负值守卫（2026-09-04）：原 `>= 0` 使顶层负字面量初值回退 "0"
+            // 负值守卫：原 `>= 0` 使顶层负字面量初值回退 "0"
             //（折叠为 0）；现对**有符号**整型直接输出负字面量，无符号保持零值。
             if i < len(g_global_inits) && g_global_inits_ok[i] == 1 &&
                 (types.is_int(g_global_tys[i]) || g_global_tys[i] == TK_CHAR) {
@@ -260,14 +260,14 @@ func emit_globals() {
                 }
                 init = "null"
             } else if ty == "i1" {
-                // r.1.1.2：bool 折叠初值（true → 1 → "true"；false/无折叠 → "false"）
+                // bool 折叠初值（true → 1 → "true"；false/无折叠 → "false"）
                 if i < len(g_global_inits) && g_global_inits[i] == 1 {
                     init = "true"
                 } else {
                     init = "false"
                 }
             } else if ty == "double" || ty == "float" {
-                // r.1.1.2：浮点折叠初值（字面量原文；无折叠 → 0.0）
+                // 浮点折叠初值（字面量原文；无折叠 → 0.0）
                 init = "0.0"
                 if i < len(g_global_fps) && g_global_fps[i] >= 0 {
                     init = intern.lookup(g_global_fps[i])
@@ -326,12 +326,12 @@ func apply_global_sections() {
 }
 // 输出 SSO 短串池全局段（emit_globals 之后）：仅 g_sso_enabled 时输出。
 //   @s21_sso_pool      = 256KB 静态线性池（.bss，零运行时初始化）
-//   @s21_sso_off       = 当前 bump 偏移（p.6.7.1 起 atomicrmw 单调推进）
+//   @s21_sso_off = 当前 bump 偏移（起 atomicrmw 单调推进）
 //   @s21_sso_malloc_cnt = 池满回退 malloc 的累计次数（验收探针断言 = 0）
 // 并定义短串池分配 helper @tie_sso_alloc(i64 %n) -> ptr：
 //   参数 n = 数据长度（UTF-8 字节）；返回块基址（头位置，调用方写头后取数据）。
 //   块 = n + 41（8 头 + 数据 + \0 + 32 尾部填充，漏洞 B 安全余量不变）。
-//   p.6.7.1 并发安全：bump 改 atomicrmw（off = fetch_add(need)）——各线程拿到
+//   并发安全：bump 改 atomicrmw（off = fetch_add(need)）——各线程拿到
 //   唯一不重叠块偏移（旧值）；本块落池判定用块尾 noff = off+need ≤ CAP。
 //   短串（n ≤ 31 且块尾 ≤ 池容量）→ 池 bump（零 malloc）；否则回退 malloc 计数。
 //   供 llvmgen op56（str_cat）与 gen_ext_str_scan（FFI 收方向）内联调用——
@@ -360,7 +360,7 @@ func emit_sso_globals() {
         line("  %m = call ptr @malloc(i64 %need)")
         line("  ret ptr %m")
         line("}")
-        // p.6.7.5 生命周期确定性：链式临时串释放 helper——str_cat 拼接链
+        // 生命周期确定性：链式临时串释放 helper——str_cat 拼接链
         // （a+b+c 等纯表达式临时，op56 操作数直引前一 str_cat 结果且全函数
         // 仅此一处使用）在结果就绪后调用本函数：数据长 > 31（池外，malloc
         // 回退）→ free(块基址 = 数据指针 - 8)；否则池内短串只读不释放。
@@ -370,7 +370,7 @@ func emit_sso_globals() {
         line("sf.h:")
         line("  %p = inttoptr i64 %dp to ptr")
         line("  %b = getelementptr i8, ptr %p, i64 -8")
-        // p.9.17.1：str_char 缓存失效钩子——malloc 复用同址同长块会让
+        // str_char 缓存失效钩子——malloc 复用同址同长块会让
         // (ptr,len) 键命中陈旧偏移表，free 前清缓存槽根治（仅 sc 启用时）。
         if g_sc_enabled == 1 {
             line("  call void @tie_sc_inval(ptr %p)")
@@ -390,7 +390,7 @@ func emit_sso_globals() {
         line("@tie_panic_active = private global i1 false")
         line("")
     }
-    // p.6.4.5：Winsock2 一次性初始化标志（WSAStartup 幂等守卫）——net_* 内联
+    // Winsock2 一次性初始化标志（WSAStartup 幂等守卫）——net_* 内联
     // IR 经 @g_wsock_init 全局引用；仅内联过 net_*（tig_wsa_init 置位）的程序输出，
     // 纯程序不引入（保持自举 fixpoint）。
     if g_wsock_enabled == 1 {
@@ -533,7 +533,7 @@ func renumber_lines() {
     // 每函数独立重编号：印章序号 +1（映射表跨函数持久，见 g_ren_stamp 注释），
     // 新编号从形参占位基数 g_ren_base 起
     //（普通函数 = g_pcnt：形参值 id 占 0..N-1，定义行保留原样 %0..%N-1，
-    // 指令新编号从 %N 起避免撞号；r.1.6.3 Linux main 带 i32 %0, ptr %1 两个
+    // 指令新编号从 %N 起避免撞号；Linux main 带 i32 %0, ptr %1 两个
     // 附加形参，g_ren_base 由 gen_func 置 2，防止指令重编号为 %0 撞形参）。
     g_ren_fn = g_ren_fn + 1
     g_ren_next = g_ren_base
@@ -662,7 +662,7 @@ func renumber_line(ln: string, t: string) -> string {
     while i < n {
         var b = str_byte(ln, i)
         if b == 37 && i + 1 < n {
-            // 具名族 `%smN` / `%spN`（2026-10-07）：后缀是**构造期 id**（指令 id /
+            // 具名族 `%smN` / `%spN`：后缀是**构造期 id**（指令 id /
             // 值 id），随编译路径变（缓存命中与否）⇒ 必须与 %N 一样按函数重编号，
             // 否则 .ll 字节级不可复现（实测 952 行差异全在此）。prefix 原样保留，
             // 只把后缀数字换成函数内的新号。
@@ -749,7 +749,7 @@ func renumber_line(ln: string, t: string) -> string {
 }
 
 // 指令定义重映射：总是分配新号（查表复用）。
-// 性能重写（p.9.14.3）：印章表方案（见 g_ren_stamp 注释）——旧值 id 全编译
+// 性能重写：印章表方案（见 g_ren_stamp 注释）——旧值 id 全编译
 // 单调递增，旧方案每函数把映射表增长到全局基址（Σ base_k = 平方）；
 // 现跨函数持久 + 每函数印章比对，增长全程仅 O(总指令)。
 func ren_def(old: i64) -> i64 {
@@ -821,7 +821,7 @@ func join_lines() -> string {
 }
 
 func build_inst_blk() {
-    // p.9.21.11 §5.1：归属逻辑统一到 ir.blk_attr_fill（区间回填、表序后者
+    // §5.1：归属逻辑统一到 ir.blk_attr_fill（区间回填、表序后者
     // 覆盖——与原内联回填逐位一致；空 sel 表 = 全部块参与）。
     g_inst_blk = ir.blk_attr_fill(ir.inst_count(), table_new_i64())
     build_fn_inst_ranges()

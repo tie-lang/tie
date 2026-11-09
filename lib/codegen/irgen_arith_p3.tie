@@ -1,5 +1,5 @@
 type tie<class>
-// lib/codegen/irgen_arith_p3.tie —— irgen_arith 分片 3（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_arith_p3.tie —— irgen_arith 分片 3
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_arith.tie。
@@ -15,7 +15,7 @@ func tig_compound_assign(op: i64, lv: i64, rv: i64, ty: i64) -> i64 {
         return ir.get_value(sc)
     }
     var is_f = types.is_float(ty)
-    // p.9.11 `%%=`（浮点）：与二元 `%%` 同构 —— a - floor(a/b)*b（余数符号跟随除数）。
+    // `%%=`（浮点）：与二元 `%%` 同构 —— a - floor(a/b)*b（余数符号跟随除数）。
     // 必须提前返回：frem 的语义与 floor 取余不同（-7.0 frem 3.0 == -1.0，
     // 而 -7.0 %% 3.0 == 2.0），故不能像 `%=` 那样靠一个 opcode 表达。
     if op == 26 && is_f {
@@ -82,16 +82,16 @@ func tig_compound_assign(op: i64, lv: i64, rv: i64, ty: i64) -> i64 {
     ir.add_operand(inst, lv, 0)
     ir.add_operand(inst, rv, 0)
     var res = ir.get_value(inst)
-    // p.9.13.3 `\=`（浮点）：fdiv 结果再取 floor，保持与二元 `\` 的 floor-div 语义一致。
+    // `\=`（浮点）：fdiv 结果再取 floor，保持与二元 `\` 的 floor-div 语义一致。
     if op == 24 && is_f {
         return tig_ext_call1("floor", res, ty, ty)
     }
-    // p.9.0-S.7 `\=`（有符号整数）：截断商 → floor 商，与二元 `\` 同语义（规范 §3.3）。
+    // -S.7 `\=`（有符号整数）：截断商 → floor 商，与二元 `\` 同语义（规范 §3.3）。
     // 无符号/char/trit 在 tig_floor_fix_div 内直接返回截断值（无负值，两者等价）。
     if op == 24 {
         return tig_floor_fix_div(lv, res, rv, ty)
     }
-    // p.9.11 `%%=`（有符号整数）：截断余数 → floor 余数，与二元 `%%` 同语义。
+    // `%%=`（有符号整数）：截断余数 → floor 余数，与二元 `%%` 同语义。
     // 无符号/char/trit 在 tig_floor_fix_mod 内直接返回截断值（无负值，两者等价）。
     if op == 26 {
         return tig_floor_fix_mod(res, rv, ty)
@@ -99,7 +99,7 @@ func tig_compound_assign(op: i64, lv: i64, rv: i64, ty: i64) -> i64 {
     return res
 }
 
-// p.9.13.3 `+` 扩展的辅助：把标量值转成字符串（供 string+标量 拼接）。
+// `+` 扩展的辅助：把标量值转成字符串（供 string+标量 拼接）。
 // 复用语料库里的**值级**转换 helper（它们直接吃 SSA 值，不需要调用节点）：
 //   * 整数（含窄整数/无符号）→ 先拓宽到 i64 再 tig_i64_to_str
 //   * f64/f32 → tig_f64_to_str

@@ -1,7 +1,7 @@
 type tie<class>
-// lib/codegen/irgen_closure.tie —— 生成器 "S2.2 闭包/函数值后端" 子模块
+// lib/codegen/irgen_closure.tie —— 生成器 "闭包/函数值后端" 子模块
 // ============================================================
-// 从 irgen.tie 拆分而来：把 S2.2 分区（闭包/函数值后端）独立成子文件。
+// 从 irgen.tie 拆分而来：把 分区（闭包/函数值后端）独立成子文件。
 // 纯搬运、不改任何逻辑，保持逐字一致。
 
 // 拆分范式：【同 namespace 跨文件】（文本内联）。
@@ -17,12 +17,12 @@ type tie<class>
 
 // 子文件根：driver 二叉依赖树中本文件由 irgen.tie 使可达，无环。
 namespace irgen {
-// ==================== S2.2 闭包/函数值后端 ====================
-// 数据模型（closure-model.md C2）：
+// ==================== 闭包/函数值后端 ====================
+// 数据模型：
 //   fn(A...) -> R 类型 → LLVM 命名结构体 %fn.<签名索引> = { ptr, ptr }
 //   （字段 0 = 环境指针 env，字段 1 = 入口函数指针 entry）
 //   统一入口签名：fn(ptr env, A...) -> R（env 为隐藏第一参数；无捕获 → null）
-//   捕获环境 = tuple 聚合类型（LLVM 内联 {T0, T1, ...}），malloc 分配
+//   捕获环境 = tuple 聚合类型（LLVM 内联 {, , ...}），malloc 分配
 //   （与字符串一致无 GC/free，闭包值可安全逃逸出作用域）
 //   间接调用：opcode 70 call_indirect——entry(env, args...)
 
@@ -73,7 +73,7 @@ func closure_cap_slot_ty(t: i64) -> i64 {
 // 布局规则（对齐 LLVM LangRef 默认 DataLayout，x86_64）：
 //   · 标量：i1/i8=1，i16=2，i32/float=4，i64/double/ptr=8，i128=16
 //   · 数组 [N x T]：N * size(T)（size(T) 已含尾部填充到 align(T)），align = align(T)
-//   · 聚合 {T0..Tn}：逐字段按各自对齐放置，整体按**最大字段对齐**向上取整
+//   · 聚合 {..Tn}：逐字段按各自对齐放置，整体按**最大字段对齐**向上取整
 // 校验手段：LLVM 把 `getelementptr T, ptr null, i32 1` 常量折叠出的值即 size(T)。
 
 // 标量（Named，TyKw 索引 < 100）的 LLVM 尺寸
@@ -293,7 +293,7 @@ func tig_closure_lit(id: i64) -> i64 {
     var p_refs: table<i64> = table_new_i64()
     var has_var: i64 = 0
     // 参数类型收集（N_PARAM：children=[类型]；s_vals = by_ref，s_aux = 变参）
-    // p.6.2.4：变参（`...T`）签名类型 = table<T>（与 sinfer N_FN_LIT 同转换，
+    // 变参（`...T`）签名类型 = table<T>（与 sinfer N_FN_LIT 同转换，
     // 保证 fn_of2 查重命中同一签名）；ref 参数仅表（语义层已校验）。
     var k: i64 = 0
     while k < nparams {
@@ -418,7 +418,7 @@ func tig_closure_lit(id: i64) -> i64 {
     return make_tuple2(env_v, types.named(TK_STR), entry_v, types.named(TK_STR), fnty)
 }
 
-// ==================== (b) 静态空闭包 env（2026-10-02）====================
+// ==================== (b) 静态空闭包 env====================
 // 无捕获闭包原先以 `env = null` 表示，这让释放点必须判空。改为指向一个
 // **每函数一份的静态槽**，其析构入口是 no-op（且**不 free**——槽是静态的）。
 // 收益：释放点无需判空（省 ptrtoint+icmp+br），且 env 恒有效 ⇒ 由函数返回的
@@ -640,18 +640,18 @@ func tig_closure_drop_fn(ci: i64, id: i64, cap_ty: i64, ncap: i64, capoff: i64) 
 // 闭包入口函数生成：clos_<节点id>，签名 fn(ptr env, A...) -> R。
 // 布局：env 参数（param 0）→ 捕获变量绑定 env 字段地址（闭包体引用捕获
 // 变量 = load 字段）；闭包参数 → alloca + store（与 tig_fn_def 一致；
-// p.6.2.4 ref 参数不 alloca，直接绑定参数寄存器——实参已是槽地址）；
+// ref 参数不 alloca，直接绑定参数寄存器——实参已是槽地址）；
 // 闭包体 → tig_block_stmts；尾部补 ret。返回函数 id。
 func tig_closure_entry_fn(ci: i64, id: i64, ret_ty: i64, ptys: table<i64>, p_refs: table<i64>, cap_ty: i64, ncap: i64) -> i64 {
     // 保存外层作用域（入口函数用独立作用域：捕获变量 + 参数登记；生成完
     // 恢复——否则闭包构造点的 tig_var_ref 会查到入口函数的 env 字段地址，
     // 跨函数引用产生 undefined value）。tie 表变量赋值 = 引用，须开新表。
-    // r.1.1.6：**全部 per-function 登记**一并保存/恢复（对齐 tig_fn_def 的每
+    // **全部 per-function 登记**一并保存/恢复（对齐 tig_fn_def 的每
     // 函数重置清单）——否则入口函数继承外层函数的 g_tblcand_allocas 等表：
     // 闭包体尾部 tig_tbl_exit_release 按**外层** value id 取槽地址，落到入口
     // 函数的参数寄存器（env 为参数 0）→ `load ptr, ptr %0` 在 env=null 时
     // 读地址 0 崩溃（0xC0000005；实测闭包字面量作 table_push 实参必崩——
-    // r.1.1.6 最小复现）。g_tv_keys/g_param_nids/g_gt_*/g_sb_*/g_cbs_* 同理会
+    // 最小复现）。g_tv_keys/g_param_nids/g_gt_*/g_sb_*/g_cbs_* 同理会
     // 使闭包内选桥/析构/字符串构建错用外层状态，一并隔离。
     var s_keys = g_sc_keys
     var s_allocas = g_sc_allocas
@@ -668,7 +668,7 @@ func tig_closure_entry_fn(ci: i64, id: i64, ret_ty: i64, ptys: table<i64>, p_ref
     var s_pn = g_param_nids
     var s_spn = g_shared_param_nids
     var s_tc = g_tblcand_allocas
-    // r.1.6.14：值语义出口释放/聚合析构候选同样必须按函数隔离 —— 闭包体尾部
+    // 值语义出口释放/聚合析构候选同样必须按函数隔离 —— 闭包体尾部
     // tig_tbl_exit_release 会遍历这三张表，若沿用外层的表则 value id 属于**外层函数**
     // 的 IR，在本函数里不存在 ⇒ opt 报「use of undefined value」（实测
     // lock_credential.tie 的 no_closure_inherit 在 TIE_TBL_VALUE=1 下 E00883）。
@@ -683,7 +683,7 @@ func tig_closure_entry_fn(ci: i64, id: i64, ret_ty: i64, ptys: table<i64>, p_ref
     var s_sbh = g_sb_hv
     var s_cbsk = g_cbs_keys
     var s_cbsa = g_cbs_acc
-    // p.9.11 reentrant：actor 方法上下文同样按函数隔离——闭包是独立函数，
+    // reentrant：actor 方法上下文同样按函数隔离——闭包是独立函数，
     // g_cur_actor_recval 是 handler 函数的值 id，跨函数引用产生 undefined value。
     var s_arec = g_cur_actor_recval
     var s_aree = g_cur_method_reent
@@ -699,13 +699,13 @@ func tig_closure_entry_fn(ci: i64, id: i64, ret_ty: i64, ptys: table<i64>, p_ref
     g_gt_blks = table_new_i64()
     g_tv_keys = table_new_i64()
     g_tv_elems = table_new_i64()
-    // r.1.6.7：逃逸分析状态同样按「每函数」重置——闭包体/方法体是独立函数，
+    // 逃逸分析状态同样按「每函数」重置——闭包体/方法体是独立函数，
     // 其内候选集与外层互不串用（外层候选在本函数体内不成立：捕获变量的所有权
     // 可能落在另一执行流）。注意此处是**清空**而非保存/恢复：闭包体生成发生在外层
     // 函数的生成过程中，若恢复外层状态会把「已被闭包捕获 ⇒ 可能被并发访问」的表
     // 重新判为独占 —— 方向必须偏向保守。
     esc_reset()
-    // r.1.6.7：显式 lock 凭据**不跨函数继承**——闭包/方法体是独立函数，若沿用
+    // 显式 lock 凭据**不跨函数继承**——闭包/方法体是独立函数，若沿用
     // 外层的去锁状态，而该闭包可能被 spawn / 存全局 ⇒ 在另一执行流里对同一张表
     // 做免锁访问 ⇒ 真实数据竞争。故在此清零。
     // 刻意**不保存/恢复**：闭包体生成发生在外层生成过程中，恢复会把外层的去锁
@@ -730,7 +730,7 @@ func tig_closure_entry_fn(ci: i64, id: i64, ret_ty: i64, ptys: table<i64>, p_ref
     table_push(params, types.named(TK_STR))  // env ptr（隐藏第一参数）
     var k: i64 = 0
     while k < len(ptys) {
-        // p.6.2.4 ref 参数：LLVM 形参声明为 ptr（对齐普通函数 tig_fn_def）
+        // ref 参数：LLVM 形参声明为 ptr（对齐普通函数 tig_fn_def）
         if p_refs[k] == 1 {
             table_push(params, types.named(TK_STR))
         } else {
@@ -757,7 +757,7 @@ func tig_closure_entry_fn(ci: i64, id: i64, ret_ty: i64, ptys: table<i64>, p_ref
         }
     }
     // 闭包参数：alloca + store + scope_put（env 占参数 0，闭包参数从 1 起）
-    // p.6.2.4 ref 参数：绑定参数寄存器（实参槽地址），读取 → load ptr, ptr %N
+    // ref 参数：绑定参数寄存器（实参槽地址），读取 → load ptr, ptr %N
     var i: i64 = 0
     while i < len(ptys) {
         var p = sstate.child(id, sstate.slot_off(id) + 1 + i)
@@ -800,7 +800,7 @@ func tig_closure_entry_fn(ci: i64, id: i64, ret_ty: i64, ptys: table<i64>, p_ref
             ir.add_operand(ret, dv, 0)
         }
     }
-    // 恢复外层作用域与 per-function 登记（入口函数作用域已用尽；r.1.1.6）
+    // 恢复外层作用域与 per-function 登记（入口函数作用域已用尽；）
     g_sc_keys = s_keys
     g_sc_allocas = s_allocas
     g_sc_tys = s_tys
@@ -850,7 +850,7 @@ func tig_call_indirect(id: i64, nm: string) -> i64 {
         fixed_n = nparams - 1
         var_elem = types.table_elem(types.fn_param_of(fv_ty, nparams - 1))
     }
-    // 实参求值（p.6.2.4：ref 实参 → 传槽地址（Var → g_lookup_alloca 的 alloca
+    // 实参求值（ref 实参 → 传槽地址（Var → g_lookup_alloca 的 alloca
     // 槽，重绑定赋值写回调用方）；变参多余实参 → 收集打包为动态表实参）
     var aoff = sstate.slot_off(id)
     var nc = sstate.nchild(id)
@@ -868,7 +868,7 @@ func tig_call_indirect(id: i64, nm: string) -> i64 {
         }
         var av: i64 = -1
         var arg_kind: i64 = 0
-        // ref 实参：Var → 传实参槽地址（对齐 tig_user_call_from T0.3 by_ref）
+        // ref 实参：Var → 传实参槽地址（对齐 tig_user_call_from by_ref）
         if arg_idx < nparams && types.fn_param_ref(fv_ty, arg_idx) == 1 {
             if ast.s_tag(arg_node) == 6 {
                 var anm = interner.intern(sstate.name_str(arg_node))
@@ -883,7 +883,7 @@ func tig_call_indirect(id: i64, nm: string) -> i64 {
         if av < 0 {
             av = tig_expr(arg_node)
         }
-        // P2c any 形参装箱（对齐 tig_user_call_from）
+        // any 形参装箱（对齐 tig_user_call_from）
         if arg_idx < nparams && types.fn_param_of(fv_ty, arg_idx) == types.named(TK_ANY) {
             var ant = ast.node_type(arg_node)
             if ant >= 0 && ant != types.named(TK_ANY) {
@@ -978,12 +978,12 @@ func tig_call_indirect(id: i64, nm: string) -> i64 {
     return ir.get_value(inst)
 }
 
-// P2a 调用表达式 `t[0](5)`：被调者为 fn 值表达式（children[0]）。
+// 调用表达式 `t[0](5)`：被调者为 fn 值表达式（children[0]）。
 // 求被调者 fn 值 → 落 alloca → 提取 env/entry → call_indirect(70)（对齐
 // tig_call_indirect；仅 fn 值来源为表达式而非作用域名字查找）。
 // 对函数值 fv（fty）执行 call_indirect（实参 argvals + 操作数 kind 并行表）。
-// tig_call_expr 与 P1 箭头传参（tig_arrow）共用。返回结果值 id（void → 哑值）。
-// p.6.2.4：变参末位（nparams-1 = table<T>）与 ref 实参（槽地址 → ptr）类型
+// tig_call_expr 与 箭头传参（tig_arrow）共用。返回结果值 id（void → 哑值）。
+// 变参末位（nparams-1 = table<T>）与 ref 实参（槽地址 → ptr）类型
 // 由调用方打包/寻址后在 argvals/argkinds 中反映，此处仅按签名做类型映射。
 func tig_call_fn_value(fv: i64, fty: i64, argvals: table<i64>, argkinds: table<i64>) -> i64 {
     var ret_ty = types.fn_ret_ty(fty)
@@ -1056,7 +1056,7 @@ func tig_call_expr(id: i64) -> i64 {
     if fv < 0 {
         return -1
     }
-    // 实参求值（children[1..]；p.6.2.4：ref 实参 → 传槽地址；变参多余实参
+    // 实参求值（children[1..]；：ref 实参 → 传槽地址；变参多余实参
     // → 收集打包为动态表——与 tig_call_indirect 同策略）
     var nc = sstate.nchild(id)
     var nparams = types.fn_nparams_of(fty)

@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/scheck_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// lib/front/scheck_p2.tie —— 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 scheck.tie。
@@ -15,7 +15,7 @@ func check_arm_patterns_enum(c: i64, subj_ty: i64) -> i64 {
     var i: i64 = 0
     while i < np {
         var p = sstate.child(plist, i)
-        // 批次 7：N_CASE_BIND（`Ok(v)` 解构）→ 变体引用 + 绑定变量名池 id
+        // N_CASE_BIND（`Ok(v)` 解构）→ 变体引用 + 绑定变量名池 id
         var bind_id: i64 = -1
         var vr = p
         if s_tags[p] == N_CASE_BIND {
@@ -89,7 +89,7 @@ func check_arm_patterns_enum(c: i64, subj_ty: i64) -> i64 {
             sm_err_msg = "枚举 '" + ename + "' 没有变体 '" + vname + "'"
             return -1
         }
-        // p.8.1.4：多字段解构绑定变量登记（绑定变量数须 == 变体 payload 字段数；
+        // 多字段解构绑定变量登记（绑定变量数须 == 变体 payload 字段数；
         // 逐个按字段类型 lv_insert）
         if bind_id >= 0 {
             var foff = en_vfldoff[varoff + tag]
@@ -104,14 +104,14 @@ func check_arm_patterns_enum(c: i64, subj_ty: i64) -> i64 {
             var b: i64 = 0
             while b < nfld {
                 sinfer.lv_insert(sstate.child(p, 1 + b), en_ftys[foff + b], 0, -1, 0)
-                // p.9.22.6 全量符号表：解构绑定声明登记（kind 5；绑定名 id 存于
+                // 全量符号表：解构绑定声明登记（kind 5；绑定名 id 存于
                 // N_CASE_BIND 槽位，节点取该绑定节点）。
                 xref.reg_decl(sstate.child(p, 1 + b), 5, en_ftys[foff + b], p)
                 b = b + 1
             }
         }
         // 重复 case 检测（tag 为去重键，对齐字面量 key 风格）。
-        // p.8.1.4：带 when 守卫的 case 不判重（守卫使同变体多分支语义不同，
+        // 带 when 守卫的 case 不判重（守卫使同变体多分支语义不同，
         // 如 `case Circle(r) when r<10:` 与 `case Circle(r):` 共存合法）。
         var key = "e:" + ename + ":" + vname
         if when_n < 0 {
@@ -307,13 +307,13 @@ func check_fn_walk_in_ns(blk: i64, full: string) -> i64 {
     return 0
 }
 
-// S2.2 捕获传播（嵌套闭包，任务21）：闭包 k 的有效捕获 = 直接捕获 ∪ 子闭包
+// 捕获传播（嵌套闭包，）：闭包 k 的有效捕获 = 直接捕获 ∪ 子闭包
 // 传播捕获，再减自身参数/局部（自身参数/局部走本地槽，无需进 env）。
 // 后处理：所有闭包体检查完后调用（cl_params/cl_locals/cl_cap* 均已定型）。
 // 处理顺序：闭包索引越大越内层（FIFO 登记），从内到外收集——内层闭包的有效
 // 捕获先算好，传播给祖先闭包时直接读子闭包已算好的有效段。
-// 例（probe6 三层）：C3 直接捕获 a/b/c → C2 有效 = {a,b}（c 是 C2 局部排除）→
-// C1 有效 = {a}（b 是 C1 局部排除）。闭包值构造点的 gen_var_ref 才找得到外层变量。
+// 例（probe6 三层）：直接捕获 a/b/c → 有效 = {a,b}（c 是 局部排除）→
+// 有效 = {a}（b 是 局部排除）。闭包值构造点的 gen_var_ref 才找得到外层变量。
 func propagate_captures() -> i64 {
     var n = len(g_clo_pending)
     if n == 0 {
@@ -483,7 +483,7 @@ func check_closure_body(ci: i64) -> i64 {
     var s_dyn = lv_dyn
     var s_lp = lp_stack
     var s_lpt = lp_top
-    // p.9.11.11 immut：闭包体重建作用域时重置 immut 集合（闭包无 immut 形参
+    // immut：闭包体重建作用域时重置 immut 集合（闭包无 immut 形参
     // 语法；外层函数 immut 集此刻已随 check_fn 结束而清空——若沿用会残留最后
     // 一个检查函数的陈旧集合导致误报。捕获外层 immut 形参的闭包写**不拦截**，
     // 属已知边界：immut 保证作用于函数体直接写的形参绑定）。
@@ -507,7 +507,7 @@ func check_closure_body(ci: i64) -> i64 {
         table_push(lv_dyn, cl_odyn[ooff + j])
         j = j + 1
     }
-    // p.9.22.6：闭包体 = 新 xref 作用域（owner = 闭包字面量节点）。先装载
+    // 闭包体 = 新 xref 作用域（owner = 闭包字面量节点）。先装载
     // 登记时绑定快照（捕获变量的 use→decl 解析基础；与 cl_o* 快照同语义），
     // 形参/局部随检查过程登记。退出时 pop（与 lv 五表恢复同点）。
     xref.push_scope(fn_node)
@@ -530,7 +530,7 @@ func check_closure_body(ci: i64) -> i64 {
             dyn = 1
         }
         sinfer.lv_insert(pnid, pty, 0, telem, dyn)
-        // p.9.22.6 全量符号表：闭包形参声明登记（kind 6；参数节点同布局）。
+        // 全量符号表：闭包形参声明登记（kind 6；参数节点同布局）。
         xref.reg_decl(pnid, 6, pty, sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + k))
         k = k + 1
     }
@@ -567,7 +567,7 @@ func check_closure_body(ci: i64) -> i64 {
     lv_dyn = s_dyn
     lp_stack = s_lp
     lp_top = s_lpt
-    // p.9.22.6：退出闭包 xref 作用域（与 lv 恢复同点）。
+    // 退出闭包 xref 作用域（与 lv 恢复同点）。
     xref.pop_scope()
     if r < 0 {
         return -1

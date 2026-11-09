@@ -1,20 +1,20 @@
 type tie<class>
-// compiler/interp/interp_macro.tie —— 解释器宏执行分区（S3.3 宏展开执行入口）
+// compiler/interp/interp_macro.tie —— 解释器宏执行分区（宏展开执行入口）
 // ============================================================
-// 里程碑：解耦宏任务（compiler-decouple.md 子任务A 前置步）——把宏执行机制从
+// 说明：把宏执行机制从
 // interp 主文件拆出，收束宏子系统的函数归属。
 // 范式：tie import 是文本内联——被 import 文件全部代码并入编译单元，一切
 // 符号全局可见；**同名 `namespace tiep` 跨文件闭合并集**。故把 interp 主
 // 文件里宏执行入口函数搬家到本文件，interp 主文件 import 本文件即可
 // **零逻辑改动**（对齐 interp_bin / interp_call 既有拆分模式）。
 //
-// # 本文件职责（S3.3 宏/元编程执行入口）
+// # 本文件职责（宏/元编程执行入口）
 //   宏定义注册 / 宏函数执行 / 过程宏执行 / code 值执行，全部以 **AST 协议
 //   文本**为输入（跳过 lexer/parser，不依赖源码解析）：
 //   - eval_proto(proto)      ：宏定义协议文本 → load_ast + 归档 + 顶层注册
 //   - eval_macro(name, args) ：执行宏函数（形参绑定 code 值，body 为宏体）
 //   - eval_macro_proc(...)   ：执行过程宏（形参绑定字符串源码文本）
-//   - exec_code_proto(proto) ：执行 code 值文本（C2 thunk `.call()`）
+//   - exec_code_proto(proto) ：执行 code 值文本（thunk `.call`）
 //   宏执行所需的全局状态（g_hyg_*/g_gensym/g_macro_depth/g_clone_* 等）与
 //   isess/ivalue/sstate 访问均继承自 interp 主文件（import 文本内联，同
 //   namespace 跨文件可见，不自建全局 var，对齐 interp_bin/interp_call）。
@@ -26,7 +26,7 @@ type tie<class>
 
 namespace tiep {
 
-// ==================== S3.3 宏展开执行入口 ====================
+// ==================== 宏展开执行入口 ====================
 
 // 注册宏定义（mexpand 用）：AST 协议文本（根 = 单个声明节点）→ load_ast +
 // 归档 + 顶层注册。成功返回 ""；失败返回错误文本（w_err 同步置位）。
@@ -127,7 +127,7 @@ pub func eval_macro(name: string, args: table<string>) -> string {
     return w_err
 }
 
-// 执行过程宏（M4，dev33 批次9）：#[macro] 标记的宏由 mexpand 把实参子树
+// 执行过程宏：#[macro] 标记的宏由 mexpand 把实参子树
 // 解引用为**源码文本**传入（args = 字符串表），本函数把形参绑定为字符串值
 //（普通宏绑定为 code 值）。宏体用 tokenize/deparse 驱动 token 流变换，须
 // return code 值（eval_expr/eval_code 构造）。与 eval_macro 同构。
@@ -189,9 +189,9 @@ pub func eval_macro_proc(name: string, args: table<string>) -> string {
     return w_err
 }
 
-// 执行 code 值文本（C2 thunk `.call()` / 编译期执行）：协议文本 → 归档 →
+// 执行 code 值文本（thunk `.call` / 编译期执行）：协议文本 → 归档 →
 // 根 StmtList 逐语句执行 / 单表达式求值。返回最后值（void/无值 → Void 值）。
-// 失败置 w_err 返回 Value.Nil（p.9.17.2 拆箱值模型）。
+// 失败置 w_err 返回 Value.Nil（拆箱值模型）。
 func exec_code_proto(proto: string) -> Value {
     w_err = ""
     if sstate.load_ast(proto) < 0 {
@@ -235,8 +235,8 @@ func exec_code_proto(proto: string) -> Value {
     return vval.new_void()
 }
 
-// ==================== M4 token 流工具（宏环境，dev33 批次9） ====================
-// tokenize/deparse/token_* 内置的共享辅助（从 interp_call 归拢——M4 过程宏
+// ==================== token 流工具（宏环境，） ====================
+// tokenize/deparse/token_* 内置的共享辅助（从 interp_call 归拢——过程宏
 // 环境的 token 流解析/转义工具，属宏子系统）。
 
 // 从 eval_expr 的包装程序（s_* 池）抽取 return 表达式子树协议文本。

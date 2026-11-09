@@ -1,10 +1,10 @@
 type tie<logic, unsafe:mem>
-// ext/gfx/port.tie —— p.6.8.11 trm.ui port 抽象面：Window / Painter / EventSource 三件套，
+// ext/gfx/port.tie —— trm.ui port 抽象面：Window / Painter / EventSource 三件套，
 // 双实现（SKIA 真实窗口 / OFFSCREEN 纯离屏）可切换，两实现共享同一命令列表渲染代码路径。
 // EN: trm.ui port surface: a Window / Painter / EventSource trio with a switchable dual
 // implementation (SKIA windowed / OFFSCREEN windowless) sharing one command-list render path.
 //
-// 设计对齐 docs/plans/tucore-arch.md §4（port 抽象 API）。tucore 用语言级 `port` 声明 +
+// 设计对齐 §4（port 抽象 API）。tucore 用语言级 `port` 声明 +
 // 显式 impl + --backend 选实现；tie 暂无 trait/port 关键字（`port` 已被保留为关键字），
 // 故以 **desc 字段 + 分支** 落地：`pt.desc(kind, w, h)` 里首个字段 kind 即 i64 开关
 // （pt.k_offscreen()=0 纯离屏 / pt.k_skia()=1 真实窗口），render 内部按 kind 分支。两实现
@@ -13,7 +13,7 @@ type tie<logic, unsafe:mem>
 //   * OFFSCREEN：无窗口，不 present；渲染结果像素留在 out 表供读取/逐像素断言。
 //   * SKIA：额外形成 Win32 窗口并 present 上屏（冒烟：open→show→update→present→pump→destroy）。
 //
-// ✔ 关键限制（p.6.8.7 记录 + 本文实测）：tie 跨模块不能写 struct 类型（注解/构造/字段
+// ✔ 关键限制（记录 + 本文实测）：tie 跨模块不能写 struct 类型（注解/构造/字段
 //   声明均报错；struct 名全编译单元全局且须定义在模块顶级），Surface/Canvas 只能以
 //   「调用 gfx 返回值推断的局部量」存活。故 port 的 render_pixels 一次调用内自建
 //   surface→渲染→拷像素→release，不跨函数保留；这正是本抽象面在此阶段的落地形态
@@ -28,7 +28,7 @@ import "./gfx.tie" as gfx
 import "./window.tie" as win
 import "./event.tie" as ev
 
-// 注：`port` 是 tie 的保留关键字（tucore 计划的 port 声明语法，见 tucore-arch.md §4），
+// 注：`port` 是 tie 的保留关键字，
 // 故本抽象面命名空间与 import 别名一律用 `pt`（模块文件名仍为 port.tie 以对应文档）。
 // EN: `port` is a reserved tie keyword (planned port-declaration syntax), so this
 // surface's namespace and import alias use `pt` (the module filename stays port.tie).

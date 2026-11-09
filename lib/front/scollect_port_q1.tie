@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/scollect_port_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/front/scollect_port_q1.tie —— 分片 1
 // ============================================================
 // 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 scollect_port.tie。
 // 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
@@ -7,7 +7,7 @@ namespace scollect {
 // impl 块统一处理（collect_top 之后、expand_generics 之前调用）：
 // 此时全部 struct/port 已登记。对每个暂存 N_IMPL：
 //   1. 校验 port/struct 存在
-//   2. 方法 self 参数类型节点改写为 struct 类型（触发 M2.1.8 自动 ref）
+//   2. 方法 self 参数类型节点改写为 struct 类型（触发 自动 ref）
 //   3. 方法改名 <struct 名>::<方法名> → g_extra_tops → collect_fn 登记签名
 //   4. 完整性检查（port 方法全部实现 + 签名匹配）+ reg_impl 登记
 pub func collect_impl_fns() -> i64 {
@@ -172,7 +172,7 @@ pub func collect_struct_fields(si: i64) -> i64 {
         sm_err_msg = "内部错误：struct '" + nm + "' 定义节点未找到"
         return -1
     }
-    // p.6.8.2：传播 repr(C) 显式 C ABI 布局标记（N_STRUCT.val = reprc；1=repr(C)）。
+    // 传播 repr(C) 显式 C ABI 布局标记（N_STRUCT.val = reprc；1=repr(C)）。
     // 默认 struct 亦为 C 自然对齐（LLVM datalayout），此处仅登记显式声明；供
     // irgen 布局表与后续 extern/dynlib 互操作判定使用（本批零行为改变）。
     st_reprc[si] = 0
@@ -263,7 +263,7 @@ pub func collect_all_struct_fields() -> i64 {
 // 收集单个 enum 的变体信息（payload 类型拍平 + 白名单校验 + 槽数 K）。
 // 布局：Enum children = [泛型槽(-1或N_TYPE_PARAMS), EnumVariant...]，
 // 变体从 children[slot_off] 起；EnumVariant children = [payload 类型...]。
-// 白名单（p.8.1.7 放开）：整数族（i8..u64）/ bool / char / trit / string /
+// 白名单（放开）：整数族（i8..u64）/ bool / char / trit / string /
 // f64 / table<T> / map<V>；struct / 嵌套 enum → "变体 'X' 的 payload 暂不支持类型 'Y'"。
 // 槽数 K = 所有变体 payload 字段数的最大值（后端聚合布局：{i64 tag, i64×K}）。
 pub func collect_enum_variants(ei: i64) -> i64 {
@@ -574,13 +574,13 @@ pub func collect_ns(ns_node: i64) -> i64 {
                 return -1
             }
         } else if tag == S_N_PORT {
-            // S2.4：port 声明收集（方法签名登记）
+            // port 声明收集（方法签名登记）
             var rp = collect_port(s)
             if rp < 0 {
                 return -1
             }
         } else if tag == S_N_IMPL {
-            // S2.4：impl 块暂存（struct 可能声明在后，统一处理在
+            // impl 块暂存（struct 可能声明在后，统一处理在
             // collect_top 之后由 semantic 主流程调 collect_impl_fns）
             table_push(g_impl_pending, s)
         } else if tag == S_N_ACTOR {
@@ -592,7 +592,7 @@ pub func collect_ns(ns_node: i64) -> i64 {
                 return -1
             }
         } else if tag == S_N_VAR_DECL {
-            // p.9.12.4：命名空间内 const 常量 → 以命名空间全名登记全局
+            // 命名空间内 const 常量 → 以命名空间全名登记全局
             //（ns::NAME，gb_* 表，与命名空间函数同前缀规则）
             var vfull = sstate.ns_full_name(sstate.name_str(s))
             var rv = collect_global_var(s, vfull)

@@ -1,8 +1,8 @@
 type tie<class>
-// compiler/config.tie —— S3.1 构建配置模块（命名空间 config）
+// compiler/config.tie —— 构建配置模块（命名空间 config）
 // ============================================================
 // 定位：统一构建配置文件 config.data.tie（type tie<data> 角色）的解析、
-// L2 分层合并、P3 profile 激活与访问器。规划见 docs/plans/build-config.md。
+// L2 分层合并、profile 激活与访问器。规划见。
 //
 // 文件格式（tie:data 表字面量）：
 //   [
@@ -43,9 +43,9 @@ type tie<class>
 // 分层（L2，低 → 高）：
 //   内置默认 < 用户 config（~/.config/tie/config.data.tie）
 //   < 项目 config（--config 指定或当前目录 config.data.tie）
-//   < profile 覆盖（P3：顶层 "profile" 键或 CLI --profile，取 profiles.<名> 表合并）
+//   < profile 覆盖（顶层 "profile" 键或 CLI --profile，取 profiles.<名> 表合并）
 //   < CLI 覆盖（driver 侧 apply_cli）。
-// 合并规则（P3，§5.2）：
+// 合并规则（§5.2）：
 //   - 同键双方都是表 → 递归深合并；
 //   - 同键双方都是数组 → 追加合并（父层列表 + 本层列表）；
 //     layer 值为字符串 "=" 时重置为空列表；
@@ -367,7 +367,7 @@ pub func get_list(root: i64, path: string) -> string {
     return out
 }
 
-// ---------- 合并（P3 分层合并引擎） ----------
+// ---------- 合并（分层合并引擎） ----------
 
 
 // 合并两层配置根（顶层均为表）：返回新根节点（不修改原节点）。
@@ -382,7 +382,7 @@ pub func merge(base: i64, layer: i64) -> i64 {
 // ---------- 内置默认 + 分层加载 ----------
 
 
-// 分层加载（L2 + P3）：
+// 分层加载（L2 + ）：
 //   内置默认 < 用户 config（存在才合并）< 项目 config（存在才合并）
 //   < profile 覆盖（cli_profile 非空用 CLI；否则取顶层 "profile" 键；
 //     profiles.<名> 存在才合并）
@@ -419,7 +419,7 @@ pub func load_merge(project_path: string, cli_profile: string) -> i64 {
             return -1
         }
     }
-    // profile 覆盖（P3）：CLI --profile 优先；否则顶层 "profile" 键
+    // profile 覆盖：CLI --profile 优先；否则顶层 "profile" 键
     var prof: string = cli_profile
     if str_len(prof) == 0 {
         prof = get_str(root, "profile")
@@ -433,7 +433,7 @@ pub func load_merge(project_path: string, cli_profile: string) -> i64 {
             }
         }
     }
-    // p.9.20 双轴优化：顶层 `opt` 键已移除（拆 llvm_opt / tiec_opt），
+    // 双轴优化：顶层 `opt` 键已移除（拆 llvm_opt / tiec_opt），
     // 出现即报错提示新键（破坏性变更无兼容期，避免静默沿用旧值）。
     if map_get(root, "opt") >= 0 {
         c_err_msg = "config 顶层 `opt` 键已移除（p.9.20 双轴优化）：改用 llvm_opt（LLVM/clang 轴 0-3）与 tiec_opt（tiec 中端轴 0-3）"

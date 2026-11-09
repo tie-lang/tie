@@ -3,8 +3,8 @@ type tie<class>
 // 内容：最小堆（heap_*）、栈（stack_*）、KMP 字符串匹配（kmp_*）。
 // 底座原语：table_new_i64 / table_push / t[i] 下标读写 / len / str_len /
 //   str_char（码点级）/ 位运算。表操作约束：只追加（table_push）+ 下标赋值
-//   t[i]=v（M4 支持），**无 pop/删除/缩表原语**（见 std/sort.tie 头部注释）——
-//   故 heap_pop / stack_pop 用 `ref table<i64>` 形参（自举 T0.3 by_ref）在
+//   t[i]=v（支持），**无 pop/删除/缩表原语**（见 std/sort.tie 头部注释）——
+//   故 heap_pop / stack_pop 用 `ref table<i64>` 形参（自举 by_ref）在
 //   函数内重建新表并重绑定，写回调用方实参槽，实现"删除元素"语义。
 // 堆约定（最小堆，0 基下标）：t[0] 为堆顶（最小值）；i 的子节点为 2i+1 /
 //   2i+2，父节点为 (i-1)/2。插入 = push 尾部后**上浮**（与父比较交换）；
@@ -18,7 +18,7 @@ type tie<class>
 //   类型，`>>` 生成 **ashr（算术右移）**，仅无符号类型走 lshr——本模块堆下标
 //   运算 (i-1)/2 用除法，不依赖移位，无符号性陷阱。
 // 调用：import 后 coll.heap_push(...) / coll.kmp_find(...)；命名空间内互调为
-//   裸调用。命名规范：命名空间内函数不加 coll_ 前缀（Harbor M2.1.6）。
+//   裸调用。命名规范：命名空间内函数不加 coll_ 前缀（Harbor ）。
 
 import "./sort.tie"
 
@@ -27,8 +27,8 @@ namespace coll {
 
 // 向最小堆 t 插入值 v：追加到尾部后上浮，保持堆序（父 <= 子）。
 // 上浮：从新元素位置开始，与父节点比较，比父小则交换，逐级上移。
-// 修改类函数用 ref 表参数（T0.3）：内容写回调用方实参槽。
-// r.1.1.7：直接 table_push(ref参数, v) + 原地交换（编译器 push 桥按目标表
+// 修改类函数用 ref 表参数：内容写回调用方实参槽。
+// 直接 table_push(ref参数, v) + 原地交换（编译器 push 桥按目标表
 // 元素静态类型选择，同模块混合 i64/string 表不再误选 string 桥）。
 pub func heap_push(t: ref table<i64>, v: i64) {
     table_push(t, v)
@@ -106,7 +106,7 @@ pub func heap_pop(t: ref table<i64>) -> i64 {
             }
         }
     }
-    // 重绑定写回调用方（ref 语义，T0.3）
+    // 重绑定写回调用方（ref 语义）
     t = nt
     return top
 }
@@ -126,8 +126,8 @@ pub func heap_size(t: table<i64>) -> i64 {
 
 // ---------- 栈 ----------
 
-// 入栈：追加到表尾（表尾即栈顶）。修改类函数用 ref 表参数（T0.3）。
-// r.1.1.7：直接 table_push(ref参数, v)（编译器按目标表元素静态类型选桥）。
+// 入栈：追加到表尾（表尾即栈顶）。修改类函数用 ref 表参数。
+// 直接 table_push(ref参数, v)（编译器按目标表元素静态类型选桥）。
 pub func stack_push(t: ref table<i64>, v: i64) {
     table_push(t, v)
 }
@@ -253,9 +253,9 @@ pub func kmp_count(s: string, sub: string) -> i64 {
     return count
 }
 
-// ---------- 高阶函数（P2d，表作末参配合 P1 箭头管道） ----------
-// 约定：表参数放**最后**——`t -> coll.map(f)` = `coll.map(f, t)`（P1 管道）。
-// fn 值参数（S2.2）：命名函数/闭包均可传入；函数内以调用表达式 f(x) 调用。
+// ---------- 高阶函数（表作末参配合 箭头管道） ----------
+// 约定：表参数放**最后**——`t -> coll.map(f)` = `coll.map(f, t)`（管道）。
+// fn 值参数：命名函数/闭包均可传入；函数内以调用表达式 f(x) 调用。
 // 返回新表（原表不变）；元素类型由 table_new_* 显式决定（规避混合表推断）。
 
 // 映射：对 t 每个元素应用 f，返回新表。
@@ -339,7 +339,7 @@ pub func reduce_string(f: fn(string, string) -> string, init: string, t: table<s
     return acc
 }
 
-// ---------- 表操作（P2d-T2） ----------
+// ---------- 表操作（-） ----------
 
 // 反转：返回新表（原表不变）。
 pub func reverse_i64(t: table<i64>) -> table<i64> {
@@ -461,7 +461,7 @@ pub func min_i64(t: table<i64>) -> i64 {
     return m
 }
 
-// ---------- 统计（P2d-D1） ----------
+// ---------- 统计（-） ----------
 // 约定：空表 → 0.0（mean/median/variance/stddev 均返回 0.0）。
 // 中位数复用 std/sort 冒泡（i64→sort_i64，f64→sort_f64）；方差为标准差平方
 //（总体方差 1/n，非样本 1/(n-1)——对全量数据描述性统计的常见选择）。
@@ -580,8 +580,8 @@ pub func stddev_f64(t: table<f64>) -> f64 {
     return sqrt(variance_f64(t))
 }
 
-// ---------- 谓词/查找（P2d-D2） ----------
-// 约定：count_if/any/all 表作末参（P1 管道 `t -> coll.any(f)` 可用）；
+// ---------- 谓词/查找（-） ----------
+// 约定：count_if/any/all 表作末参（管道 `t -> coll.any(f)` 可用）；
 // find_index/contains 线性扫描（无序表即可，O(n)）。
 
 // 计数：f 为真的元素个数。
@@ -694,12 +694,12 @@ pub func contains_string(t: table<string>, value: string) -> bool {
     return find_index_string(t, value) >= 0
 }
 
-// ---------- set 集合（P2e-T1） ----------
+// ---------- set 集合（-） ----------
 // 载体：有序 table<i64> / table<string>（元素唯一、升序）——纯 std 实现，复用
 // std/sort 的二分查找（contains_i64/index_of_i64）与有序插入（insert_sorted_*）。
 // 集合运算（union/intersect/diff）用双指针归并（两表都升序，O(n+m)）。
-// 修改类函数（set_add_*/set_remove_*）用 ref 表参数（T0.3）；set_remove 因无
-// 缩表原语重建新表重绑定（功能所需，r.1.1.7 后不再是为规避 push 推断）。
+// 修改类函数（set_add_*/set_remove_*）用 ref 表参数；set_remove 因无
+// 缩表原语重建新表重绑定（功能所需，后不再是为规避 push 推断）。
 // 注意：tie 的逻辑 && **不短路**，表下标访问用嵌套 if 防护越界（同 heap_pop）。
 
 // 空集合（i64）。
@@ -946,7 +946,7 @@ pub func set_diff_string(a: table<string>, b: table<string>) -> table<string> {
     return r
 }
 
-// ---------- 表运算深化（P2e-T2） ----------
+// ---------- 表运算深化（-） ----------
 // concat 拼接、slice 切片、copy 深拷贝、dedup 去重（保持首次出现顺序）。
 // 全部返回新表（原表不变）；slice 越界截断；dedup 用线性 contains（O(n²)，保序）。
 

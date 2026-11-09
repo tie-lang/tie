@@ -1,7 +1,7 @@
 type tie<class>
-// lib/front/stype.tie —— T2.6 语义类型辅助（模块拆分）
+// lib/front/stype.tie —— 语义类型辅助（模块拆分）
 // ============================================================
-// 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）完整语义分析
+// 职责：完整语义分析
 // 拆分为 8 模块之一（本文件 = 类型节点解析 + 类型兼容/匹配判定）。
 // 对应 proto/semantic.tie 755-857（parse_type_node）+ 1410-1476
 // （types_compatible）+ 1478-1543（types_match）逻辑搬移。
@@ -11,7 +11,7 @@ type tie<class>
 // sm_err_*）+ ../middle/types.tie（类型编码与 TK_* 关键字常量）。
 // 树式无环：由 scollect.tie import（传递可达上层全部）。
 //
-// 库归属（p.9.21 G3）：本文件是**语义层**的 AST→类型 id 映射器（stype 属
+// 库归属：本文件是**语义层**的 AST→类型 id 映射器（stype 属
 // frontend 的 s* 家族，与 sstate/sbuiltin/sinfer/scheck/scollect/sgen/smove 同族），
 // 不是 tie.types 库（tie.types = middle/types.tie 的类型 id 编码）。门禁曾按
 // 文件名前缀把本文件判成 types 库，从而虚报 types → sema / types → ir 两条越界边。
@@ -20,14 +20,14 @@ type tie<class>
 import "../sema/sstate.tie"
 import "../ir/types.tie"
 
-// p.9.11.21 interface 诊断辅助全局（tie 约束：全局变量须在命名空间之前）
+// interface 诊断辅助全局（tie 约束：全局变量须在命名空间之前）
 var g_iface_vio_missing: bool = true;
 
 namespace stype {
 
-// p.9.11 `is` 类型判定 / any 装箱共用的「类型 → 运行期 tag」映射（单源）。
+// `is` 类型判定 / any 装箱共用的「类型 → 运行期 tag」映射（单源）。
 // 与 backend tig_box_any 的装箱约定逐条对齐：标量族 0-4；struct/enum/fn 与
-// 表/映射 = 类型 id（P2c/P2d）。返回 -1 = 该类型不能进 any（装箱同款拒绝面，
+// 表/映射 = 类型 id。返回 -1 = 该类型不能进 any（装箱同款拒绝面，
 // 如 f32/trit/guard），语义层据此拒绝 `is`，后端据此取期望 tag。
 pub func any_expected_tag(vty: i64) -> i64 {
     if vty == types.named(TK_STR) {
@@ -77,7 +77,7 @@ pub func parse_type_node(tid: i64) -> i64 {
     }
     if tag == S_N_STRUCT_TYPE {
         var nm = sstate.name_str(tid)
-        // S1.2 内建不安全类型引用：`ptr<T>` / `slice<T>` / `atomic<T>`
+        // 内建不安全类型引用：`ptr<T>` / `slice<T>` / `atomic<T>`
         // （与 sgen.parse_generic_type_node 同款特判；tuple 字段类型走本路径）
         if nm == "ptr" || nm == "slice" || nm == "atomic" {
             var tslot = sstate.child(tid, 0)
@@ -223,7 +223,7 @@ pub func parse_type_node(tid: i64) -> i64 {
         return types.array_of(elem, nlen)
     }
     if tag == S_N_FN_TYPE {
-        // S2.2 函数值类型 `fn(A,B)->R`（N_FN_TYPE 布局：children=[返回类型]+参数类型...）。
+        // 函数值类型 `fn(A,B)->R`（N_FN_TYPE 布局：children=[返回类型]+参数类型...）。
         // 返回类型 = child(0)，参数 = child(1..n-1)。查重/登记走
         // types.fn_of（按返回类型+参数列表逐一比对，命中复用既有签名）。
         var nf = sstate.nchild(tid)
@@ -249,9 +249,9 @@ pub func parse_type_node(tid: i64) -> i64 {
     return -1
 }
 
-// ---------- S2.4 port 提升/约束判定辅助 ----------
+// ---------- port 提升/约束判定辅助 ----------
 // struct/enum 类型 id 是否实现 port/interface（port 索引）——提升合法性 /
-// 泛型约束校验共用。port（名义）：查显式 impl 记录；p.9.11.21 interface
+// 泛型约束校验共用。port（名义）：查显式 impl 记录；interface
 // （结构性）：命名空间方法签名兼容即实现（鸭子多态，无需显式 impl 块）。
 // 未实现返回 false。
 pub func impl_has_ty(pi: i64, struct_ty: i64) -> bool {
@@ -264,7 +264,7 @@ pub func impl_has_ty(pi: i64, struct_ty: i64) -> bool {
         if sstate.impl_find(pi, si) >= 0 {
             return true
         }
-        // p.9.11.21 interface 结构性实现：签名兼容即实现（首次判定合成
+        // interface 结构性实现：签名兼容即实现（首次判定合成
         // impl 记录 → vtable 生成 / 提升 / 约束校验全复用，后端零改动）
         if sstate.port_is_iface(pi) {
             return iface_struct_has_ty(pi, si)
@@ -272,7 +272,7 @@ pub func impl_has_ty(pi: i64, struct_ty: i64) -> bool {
         return false
     }
     if k == K_ENUM {
-        // p.9.11.21 interface 结构性实现（enum 关联方法，M2.1.8 自动 ref）：
+        // interface 结构性实现（enum 关联方法，自动 ref）：
         // 仅签名兼容判定（enum 不合成 impl 记录——impl 表存 struct 索引，
         // 与 port 现状一致：enum 可满足泛型约束，但不能提升为接口对象）
         if !sstate.port_is_iface(pi) {
@@ -288,7 +288,7 @@ pub func impl_has_ty(pi: i64, struct_ty: i64) -> bool {
 }
 
 
-// p.9.11.21 诊断辅助：第一个不满足 interface 的方法序号（-1 = 全满足；
+// 诊断辅助：第一个不满足 interface 的方法序号（-1 = 全满足；
 // -2 = 非 struct/enum 类型）。g_iface_vio_missing 说明原因：true = 缺少
 // 同名方法，false = 方法存在但签名不匹配（参数/返回类型）。
 pub func iface_first_violation(pi: i64, ty: i64) -> i64 {
@@ -338,9 +338,9 @@ pub func iface_vio_missing() -> bool {
     return g_iface_vio_missing
 }
 
-// ---------- S1.3 窄整数辅助（位宽/符号性） ----------
+// ---------- 窄整数辅助（位宽/符号性） ----------
 // 整数位宽：i8/u8=8 ... i64/u64=64、i128/u128=128；非整数返回 0。
-// 批次 2：i128/u128 → 128（LLVM i128 原生，拓宽/缩窄判定自动覆盖）。
+// i128/u128 → 128（LLVM i128 原生，拓宽/缩窄判定自动覆盖）。
 // pub：sinfer/irgen 在命名空间外调用（窄整数拓宽/缩窄判定）。
 pub func int_width(t: i64) -> i64 {
     if t == TK_I8 || t == TK_U8 {
@@ -391,7 +391,7 @@ pub func types_compatible(a: i64, b: i64) -> bool {
     if b == TK_TEXT && (a == TK_STR || a == TK_CHAR) {
         return true
     }
-    // P2b any 动态类型：目标侧接受一切（装箱）；反向（any→具体）须显式转换
+    // any 动态类型：目标侧接受一切（装箱）；反向（any→具体）须显式转换
     if a == TK_ANY {
         return true
     }
@@ -450,11 +450,11 @@ pub func types_compatible(a: i64, b: i64) -> bool {
         }
         return true
     }
-    // ---------- S1.3 C2 隐式拓宽 ----------
+    // ---------- 隐式拓宽 ----------
     // 同符号整数窄→宽：i8→i16→i32→i64、u8→u16→u32→u64（got 宽度严格小于
-    // want）。同宽度 i↔u 不隐式（C4：必须显式 as_*）。
+    // want）。同宽度 i↔u 不隐式（必须显式 as_*）。
     // u → i 拓宽（目标有符号且严格更宽）：u8/u16/u32 → i64（zext 无损——
-    // i64 值域容纳全部无符号窄值）。反向 i → u 不隐式（负值无法表示，C4）。
+    // i64 值域容纳全部无符号窄值）。反向 i → u 不隐式（负值无法表示）。
     if types.is_int(a) && types.is_int(b) {
         if int_width(b) < int_width(a) && is_signed(a) == is_signed(b) {
             return true
@@ -464,8 +464,8 @@ pub func types_compatible(a: i64, b: i64) -> bool {
         }
         return false
     }
-    // 整数 → 浮点隐式（C2 无损方向：i64 → f64；窄整数 → f32/f64）。
-    // 反向 float → int 不隐式（C4：必须显式 as_*）。
+    // 整数 → 浮点隐式（无损方向：i64 → f64；窄整数 → f32/f64）。
+    // 反向 float → int 不隐式（必须显式 as_*）。
     if types.is_float(a) && types.is_int(b) {
         return true
     }
@@ -478,12 +478,12 @@ pub func types_compatible(a: i64, b: i64) -> bool {
     return false
 }
 
-// S1.3 C2 扩展——整数窄化兼容（U2 通道）：want 与 got 都是整数，且 want 位宽
+// 扩展——整数窄化兼容（U2 通道）：want 与 got 都是整数，且 want 位宽
 // 严格更窄（i64 → u32/u16/u8/i32/i8 等）→ 允许隐式缩窄（语义层放行；IR 层
 // tig_coerce 生成 trunc，值回绕语义）。仅整数族（float/struct/string/any 等
-// 保持严格）；同宽 i↔u 不隐式（C4：必须显式 as_*）。用于函数参数传递与
+// 保持严格）；同宽 i↔u 不隐式（必须显式 as_*）。用于函数参数传递与
 // 变量初始化/赋值处的类型检查（TSHA1 U2：位平面热路径 i64 → u32 签名改造）。
-// 常量表达式（字面量/常量算术）不走窄化：由 types_match 的 C3/O3 范围检查
+// 常量表达式（字面量/常量算术）不走窄化：由 types_match 的 /O3 范围检查
 // 决定——超范围字面量必须报错（`var a: i8 = 200` 仍拒绝），不能因窄化放行
 // 静默截断。窄化只针对运行期值（变量/调用/下标/非纯常量算术等）。
 pub func types_narrow_int(want: i64, got: i64, node: i64) -> bool {
@@ -495,7 +495,7 @@ pub func types_narrow_int(want: i64, got: i64, node: i64) -> bool {
     }
     if node >= 0 {
         var tag = s_tags[node]
-        // 单字面量：C3 范围检查已覆盖（在范围内 types_match 放行，超范围拒绝）
+        // 单字面量：范围检查已覆盖（在范围内 types_match 放行，超范围拒绝）
         if tag == S_N_INT_LIT {
             return false
         }
@@ -507,7 +507,7 @@ pub func types_narrow_int(want: i64, got: i64, node: i64) -> bool {
                 return false
             }
         }
-        // 负字面量（Neg + IntLit）：C3 负常量范围检查已覆盖
+        // 负字面量（Neg + IntLit）：负常量范围检查已覆盖
         if tag == S_N_UNARY {
             var un = sstate.child(node, 0)
             if s_vals[node] == 0 && s_tags[un] == S_N_INT_LIT {
@@ -643,10 +643,10 @@ pub func types_match(want: i64, got: i64, init_node: i64) -> bool {
             }
         }
         if tag == S_N_INT_LIT {
-            // IntLit：整数/浮点标注 + trit（对齐 Rust）+ S1.3 C3 常量缩窄范围
+            // IntLit：整数/浮点标注 + trit（对齐 Rust）+ 常量缩窄范围
             // 检查——窄类型标注的字面量必须在类型范围内（超范围 = 编译错误，
             // 非回绕；防止静默截断）。i64/u64 原生范围不查。
-            // S1.2 A1：atomic<T> 初始化字面量适配元素类型（`var c: atomic<i64> = 0`）
+            // A1：atomic<T> 初始化字面量适配元素类型（`var c: atomic<i64> = 0`）
             if types.kind(want) == K_ATOMIC {
                 want = types.table_elem(want)
             }
@@ -694,9 +694,9 @@ pub func types_match(want: i64, got: i64, init_node: i64) -> bool {
                 return true
             }
         }
-        // S1.3 O3 窄域常量算术：目标窄整数 + 二元运算两侧都是 IntLit 且
+        // O3 窄域常量算术：目标窄整数 + 二元运算两侧都是 IntLit 且
         // 常量都在目标类型范围 → 放行（irgen 按目标类型截断 = 回绕语义，
-        // `var c: i8 = 100 + 100` → -56。与 C3 的单字面量超范围报错区分：
+        // `var c: i8 = 100 + 100` → -56。与 的单字面量超范围报错区分：
         // 表达式在窄域计算，字面量直接标注超范围仍拒绝）。
         if tag == S_N_BINARY {
             if types.is_int(want) && int_width(want) < 64 {
@@ -709,7 +709,7 @@ pub func types_match(want: i64, got: i64, init_node: i64) -> bool {
                 }
             }
         }
-        // S1.3 负数字面量适配：`var g: i8 = -4` → Unary(Neg, IntLit)，
+        // 负数字面量适配：`var g: i8 = -4` → Unary(Neg, IntLit)，
         // 常量取负后仍在目标范围 → 放行（irgen coerce 截断）
         if tag == S_N_UNARY {
             if types.is_int(want) && int_width(want) < 64 {

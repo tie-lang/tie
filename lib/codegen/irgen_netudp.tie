@@ -1,13 +1,13 @@
 type tie<class>
 // lib/codegen/irgen_netudp.tie —— 生成器 L3：UDP 辅助（net_udp_*）
 // ============================================================
-// 自 irgen_expr.tie 按域拆出（p.9.21.2/3：单文件 ≤800 行）。
+// 自 irgen_expr.tie 按域拆出。
 // 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
 // 顶层全局 var 与 import 树留在 irgen.tie 主文件。
 namespace irgen {
 // ---- UDP ----
 // net_udp_bind(port) -> i64：socket(DGRAM)+bind
-// r.1.6.4：Linux 分支——fd 为 POSIX int（bind 传 I32、关闭 close）。
+// Linux 分支——fd 为 POSIX int（bind 传 、关闭 close）。
 func tig_net_udp_bind(pt: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -93,7 +93,7 @@ func tig_net_udp_bind(pt: i64) -> i64 {
     return s21_load(svv, T64)
 }
 // net_udp_send(h, host, port, data) -> i64：resolve + sendto
-// r.1.6.4：Linux 分支——sendto 的 fd 参数传 I32（sockaddr 布局复用 tig_wsa_addr）。
+// Linux 分支——sendto 的 fd 参数传 （sockaddr 布局复用 tig_wsa_addr）。
 func tig_net_udp_send(h: i64, host: i64, pt: i64, data: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -165,7 +165,7 @@ func tig_net_udp_send(h: i64, host: i64, pt: i64, data: i64) -> i64 {
     return s21_load(svv, T64)
 }
 // net_udp_recv(h, max) -> string：recvfrom（ASCII 安全）
-// r.1.6.4：Linux 分支——recvfrom 的 fd 参数传 I32。
+// Linux 分支——recvfrom 的 fd 参数传 。
 func tig_net_udp_recv(h: i64, max: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -205,10 +205,10 @@ func tig_net_udp_recv(h: i64, max: i64) -> i64 {
     var nr = tig_select_i(rgt0, r64, tig_int_lit(0), T64)
     return tig_bytes_to_tie(buf, nr)
 }
-// ---- UDP 字节版（p.6.6.9 std/dns 用）----
+// ---- UDP 字节版（std/dns 用）----
 // net_udp_send_bytes(h, host, port, data:表<i64>) -> i64：resolve + 逐元素取低字节拼
 // 缓冲后 sendto 数据报，返回发送字节数（失败 -1）。
-// r.1.6.4：Linux 分支——sendto 的 fd 参数传 I32（字节拼装循环复用同构）。
+// Linux 分支——sendto 的 fd 参数传 （字节拼装循环复用同构）。
 func tig_net_udp_send_bytes(h: i64, host: i64, pt: i64, data: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)
@@ -339,7 +339,7 @@ func tig_net_udp_send_bytes(h: i64, host: i64, pt: i64, data: i64) -> i64 {
 }
 // net_udp_recv_bytes(h, max) -> 表<i64>：recvfrom 原始字节 → 逐字节装入 i64 元素表
 //    （cap=max, len=实收, data=8×max 元素缓冲, esz=8——仿 tig_byte_read 表格式）
-// r.1.6.4：Linux 分支——recvfrom 的 fd 参数传 I32（表格式构建同 Windows）。
+// Linux 分支——recvfrom 的 fd 参数传 （表格式构建同 Windows）。
 func tig_net_udp_recv_bytes(h: i64, max: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I32 = types.named(TK_I32)

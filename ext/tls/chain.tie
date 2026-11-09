@@ -1,7 +1,7 @@
 type tie<class>
 // ============================================================================
 // chain.tie：ext/tls——X.509 证书链构建与校验（命名空间 chn，纯 tie）
-// 目的：p.6.6.1 AC-5 —— 由叶子证书向上逐级到信任锚，并校验整链。
+// 目的：AC-5 —— 由叶子证书向上逐级到信任锚，并校验整链。
 //
 // == 链表示 ==
 //   证书链 = `table<any>`，元素为各证书的**原始 DER 字节表**（table<i64> 装箱），
@@ -537,7 +537,7 @@ pub func verify(ch: table<any>, roots: table<any>, host: string) -> bool {
 // msg = 握手 transcript 原始字节；sig = 原始签名字节。
 // RFC 8446 §4.4.3：content = 0x20*64 || context || Transcript-Hash，其中 context
 // 为 "TLS 1.3, server CertificateVerify\0"（OpenSSL get_cert_verify_tbs_data 同源；
-// 2026-09-03 实测缺 context 即验签失败）；Transcript-Hash 用套件哈希。各签名
+// 实测缺 context 即验签失败）；Transcript-Hash 用套件哈希。各签名
 // 算法的 mHash/digest 即 Hash(content)。本函数内部做好该封装。
 pub func verify_cver(spki_der: table<i64>, sig_algo_id: i64, msg: table<i64>, sig: table<i64>) -> bool {
     // content = 0x20*64 || "TLS 1.3, server CertificateVerify\0" || SHA-256(msg)

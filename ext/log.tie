@@ -5,11 +5,11 @@ type tie<class>
 // - msg_set_lang(lang)：切换当前语言（如 "zh" / "en"）
 // - msg_register(key, lang, text)：登记 (键, 语言) → 文本（同键同语言覆盖）
 // - msg_t(key)：查询键的翻译（当前语言 → 回退 zh → 键本身，Rust 层实现）
-// - msg_t_lang(key, lang)：按指定语言查询（未命中空串；M4 新增，供自定义回退链）
+// - msg_t_lang(key, lang)：按指定语言查询（未命中空串；新增，供自定义回退链）
 // - msg_get_lang()：查询当前语言
 // 当前语言 + 消息字典存 Rust thread_local（见 tie-interp C ABI 桥）。
 //
-// M4 重构（Harbor M4）：
+// 重构（Harbor ）：
 // - **消息状态用顶层持久变量**（tie 语言自身表达跨函数共享的可变状态，纯 tie）：
 //   msg_level（级别阈值）与 msg_fallbacks（回退语言链）；
 // - 级别体系：debug(0) < info(1) < warn(2) < error(3)，set_level 只输出 >= 阈值；
@@ -30,7 +30,7 @@ import "../std/format.tie"
 using str;
 using format;
 
-// ---- 消息系统状态（M4：顶层持久变量，跨函数共享） ----
+// ---- 消息系统状态（顶层持久变量，跨函数共享） ----
 // 级别阈值：只输出严重度 >= 阈值的消息（0=debug 最详细，1=info 默认，2=warn，3=error）
 var msg_level: i64 = 1
 // 回退语言链（"|" 分隔；查询顺序：当前语言 → 回退链依次 → 键本身；默认 zh）

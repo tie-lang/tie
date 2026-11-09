@@ -1,7 +1,7 @@
-# tie 包管理器演示（M6 E1/E2 + E3/E4）
+# tie 包管理器演示（+ ）
 
 本目录（`examples/demo_pkg/`）是 `tie init` 生成的示例项目，演示包管理器的
-完整能力：**init → add → install → build/run**，以及 E3/E4 的 **git/registry 源、
+完整能力：**init → add → install → build/run**，以及 的 **git/registry 源、
 tie.lock 锁文件、发布/搜索**。
 
 包管理器 CLI 全部由 tie 语言自写（`pkg/` 目录），Rust 侧（`crates/tie`）只做
@@ -55,7 +55,7 @@ tie help
 tie remove lib_colors
 ```
 
-## 三源端到端验收（E3/E4）
+## 三源端到端验收
 
 ### registry 源（本地 HTTP 注册表）
 
@@ -105,7 +105,7 @@ install 时若 tie.lock 存在且与当前 tie.pkg 直接依赖一致 → 直接
 （缓存 `.tie/cache/` 命中不重复拉取）；否则重新解析并覆盖锁文件。`tie update`
 强制重新解析。
 
-### 发布与搜索（E4）
+### 发布与搜索
 
 ```bash
 # 发布：校验 tie.pkg → 打包 .tie/dist/<name>-<version>.tar.gz → git tag/push

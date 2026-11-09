@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/sinfer_ie_ie3.tie —— infer_expr 分支提子函数分片 3（p.9.21 G2 单函数 ≤300 行）
+// lib/front/sinfer_ie_ie3.tie —— infer_expr 分支提子函数分片 3
 // ============================================================
 // 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
 // 分片内函数与原调度器同 namespace，跨文件裸名互调。
@@ -27,7 +27,7 @@ pub func infer_expr_table_lit(id: i64) -> i64 {
             i = i + 1
         }
         if is_map {
-            // map<val_ty>：值类型一致；P2c 异构值（非同类收窄）→ map<any>
+            // map<val_ty>：值类型一致；异构值（非同类收窄）→ map<any>
             var val_ty: i64 = -1
             var i2: i64 = 0
             while i2 < nc {
@@ -43,7 +43,7 @@ pub func infer_expr_table_lit(id: i64) -> i64 {
                         if types.is_float(vt) && types.is_float(val_ty) {
                             val_ty = vt  // 浮点族（f32/f64）收窄
                         } else {
-                            // P2c 异构 map 值（`["k1":1, "k2":"x"]`）→ map<any>
+                            // 异构 map 值（`["k1":1, "k2":"x"]`）→ map<any>
                             // 动态值类型（装箱在 irgen 层完成，对齐 table<any>）
                             val_ty = types.named(TK_ANY)
                         }
@@ -73,14 +73,14 @@ pub func infer_expr_table_lit(id: i64) -> i64 {
             if elem_ty < 0 {
                 elem_ty = vt
             } else {
-                // p.8.2.2：tuple 字面量每次登记独立 tuple 类型 id——结构相等
+                // tuple 字面量每次登记独立 tuple 类型 id——结构相等
                 // 的元组（如 (1,"a") 与 (2,"b")）视为一致，不落 any 异构
                 var tuple_same: bool = false
                 if types.kind(vt) == K_TUPLE && types.kind(elem_ty) == K_TUPLE {
                     tuple_same = stype.tuple_equal(vt, elem_ty)
                 }
                 if !tuple_same && vt != elem_ty && !(types.is_int(vt) && types.is_int(elem_ty)) && !(types.is_float(vt) && types.is_float(elem_ty)) {
-                    // P2b 异构元素：类型不一致（非同类收窄）→ 推断为 any 动态
+                    // 异构元素：类型不一致（非同类收窄）→ 推断为 any 动态
                     // 类型（`[1, "a", true]` → table<any>；装箱在 irgen 层完成）
                     elem_ty = types.named(TK_ANY)
                 }
@@ -165,7 +165,7 @@ pub func infer_expr_fn_lit(id: i64) -> i64 {
             return -1
         }
         // 参数类型收集：children[slot+1 .. slot+1+nparams)，N_PARAM child(0)=pty
-        // p.6.2.4：参数节点 s_vals = ref 标志（1=按引用）、s_aux = 变参标志。
+        // 参数节点 s_vals = ref 标志（1=按引用）、s_aux = 变参标志。
         // 变参（`...T`）签名类型 = table<T>（对齐普通函数 scollect 变参登记）；
         // ref 仅支持表参数（对齐普通函数校验）。
         var ptys: table<i64> = table_new_i64()
@@ -248,7 +248,7 @@ pub func infer_expr_fn_lit(id: i64) -> i64 {
             ni = ni + 1
         }
         table_push(cl_nouter, len(lv_keys))
-        // p.9.22.6 全量符号表：闭包登记时快照 xref 绑定段（捕获变量在闭包
+        // 全量符号表：闭包登记时快照 xref 绑定段（捕获变量在闭包
         // 体内的 use→decl 解析基准；与上方 cl_o* 快照同一时刻、同一语义）。
         xref.snapshot_bind(ci)
         // 闭包局部段起点（检查闭包体时 check_var_decl 动态追加）
@@ -327,7 +327,7 @@ pub func infer_expr_guard_get(id: i64) -> i64 {
             return -1
         }
         var capn = sstate.name_str(sstate.child(id, 0))
-        // r.1.6.7：域映射走 types 层单一事实源（新增 lock 域）
+        // 域映射走 types 层单一事实源（新增 lock 域）
         var cap = types.guard_cap_index(capn)
         if cap < 0 {
             sm_err_line = s_lines[id]
@@ -349,7 +349,7 @@ pub func infer_expr_guard_get(id: i64) -> i64 {
         return gt
 }
 
-// r.1.6.7 `unsafe.revoke(g)` 凭据撤销（§11.6）：撤销该凭据后，由它**传递**派生出的
+// `unsafe.revoke(g)` 凭据撤销（§11.6）：撤销该凭据后，由它**传递**派生出的
 // 凭据一并失效；此后使用这些凭据报诊断。纯编译期语义（凭据无运行时表示）。
 // 流敏感且单调：语句按序推断，撤销点之后的才失效。
 pub func infer_expr_guard_revoke(id: i64) -> i64 {

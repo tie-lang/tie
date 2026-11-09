@@ -1,12 +1,12 @@
 type tie<class>
-// lib/codegen/irgen_bi_num.tie —— 内置生成器：显式数值转换 as_* 与 checked_* 溢出检测（S1.3）
+// lib/codegen/irgen_bi_num.tie —— 内置生成器：显式数值转换 as_* 与 checked_* 溢出检测
 // ============================================================
-// 自 irgen_expr.tie 的 builtin_expr 拆出（p.9.21.2 两步制①）。
+// 自 irgen_expr.tie 的 builtin_expr 拆出。
 // 范式：同 namespace 跨文件（文本内联）——只含函数与注释，
 // 顶层全局 var 与 import 树留在 irgen.tie 主文件。
 namespace irgen {
-// S1.3 checked_* 溢出检测族
-// 内置 `exec_code`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// checked_* 溢出检测族
+// 内置 `exec_code`
 pub func bi_exec_code(nm: string, id: i64) -> i64 {
 if nm == "exec_code" {
     // runtime.a 退役：内联到 libc system（返回 i64，RAX 零扩展保证同旧 tie_exec_code）
@@ -19,8 +19,8 @@ if nm == "exec_code" {
 }
 }
 
-// S1.3 checked_* 溢出检测族
-// 内置 `time_now`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// checked_* 溢出检测族
+// 内置 `time_now`
 pub func bi_time_now(nm: string, id: i64) -> i64 {
 if nm == "time_now" {
     // runtime.a 退役：内联到 libc time(0)（0 = NULL，返回 Unix 秒数）
@@ -29,8 +29,8 @@ if nm == "time_now" {
 }
 }
 
-// S1.3 checked_* 溢出检测族
-// 内置 `get_env`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// checked_* 溢出检测族
+// 内置 `get_env`
 pub func bi_get_env(nm: string, id: i64) -> i64 {
 if nm == "get_env" {
     var gv = tig_expr(call_arg(id, 0))
@@ -81,11 +81,11 @@ if nm == "get_env" {
 }
 }
 
-// S1.3 checked_* 溢出检测族
-// 内置 `exec_output`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// checked_* 溢出检测族
+// 内置 `exec_output`
 pub func bi_exec_output(nm: string, id: i64) -> i64 {
 if nm == "exec_output" {
-    // p.6.4.6：内联 CreatePipe+CreateProcessW+ReadFile 捕获子进程 stdout（零 Rust 桥）。
+    // 内联 CreatePipe+CreateProcessW+ReadFile 捕获子进程 stdout（零 Rust 桥）。
     // 不再经 tig_runtime_call（g_used_interp 桥）→ 不置位，不链接 tie_interp.lib。
     var ev = tig_expr(call_arg(id, 0))
     if ev < 0 {
@@ -96,11 +96,11 @@ if nm == "exec_output" {
 }
 }
 
-// S1.3 checked_* 溢出检测族
-// 内置 `str_len`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// checked_* 溢出检测族
+// 内置 `str_len`
 pub func bi_str_len(nm: string, id: i64) -> i64 {
 if nm == "str_len" {
-    // p.9.21.11（§2.5 用户钦定项，方案 2 双槽缓存）：str_len 旧实现每次调用
+    // （§2.5 用户钦定项，方案 2 双槽缓存）：str_len 旧实现每次调用
     // 内联 4 块步进循环（O(byte_len)/次，混入逐码点遍历即 O(n²)）。改为
     // irgen 只发**一次 call** 到手写 helper @tie_sl_len（llvmgen_sc.tie 发射；
     // (ptr, blen) 双槽键 + O(blen) 步进计数 + 命中 O(1)），`while i <
@@ -125,11 +125,11 @@ if nm == "str_len" {
 }
 }
 
-// S1.3 checked_* 溢出检测族
-// 内置 `char_code`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// checked_* 溢出检测族
+// 内置 `char_code`
 pub func bi_char_code(nm: string, id: i64) -> i64 {
 if nm == "char_code" {
-    // 去 Rust 桥（dev33 批次3 关联）：单字符 → 码点，用已内联的
+    // 去 Rust 桥：单字符 → 码点，用已内联的
     // s21_utf8_char_at(字符, 0)（等价 tie_char_code，纯 tie 生成，不再
     // 链接 tie_interp.lib）。语义：UTF-8 解码单字符首码点 = 该码点。
     var cc_arg = call_arg(id, 0)
@@ -137,7 +137,7 @@ if nm == "char_code" {
     if v < 0 {
         return -1
     }
-    // r.1 复查修复：char_code(<char> 值) —— char 是 i32 标量码点，
+    // 复查修复：char_code(<char> 值) —— char 是 i32 标量码点，
     // 直接 zext i32→i64 返回；仅 string（ptr）走 UTF-8 首码点解码。
     // 此前把 char 值当 ptr 交给 s21_utf8_char_at → opt "i32 used as ptr"。
     if ast.node_type(cc_arg) == types.named(TK_CHAR) {
@@ -150,11 +150,11 @@ if nm == "char_code" {
 }
 }
 
-// S1.3 checked_* 溢出检测族
-// 内置 `str_char`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// checked_* 溢出检测族
+// 内置 `str_char`
 pub func bi_str_char(nm: string, id: i64) -> i64 {
 if nm == "str_char" {
-    // p.9.17.1 重上（码点索引缓存版）：irgen 只发**一次 call** 到手写 helper
+    // 重上（码点索引缓存版）：irgen 只发**一次 call** 到手写 helper
     // @tie_sc_off（llvmgen_sc.tie 发射；双槽 (ptr,len) 键 + 重建循环 + CAP
     // 兜底 legacy 线性步进，n 存循环 phi 的 k = 已写项数——旧实现 phi 差一
     // 根因修正；双槽覆盖交替串对），返回字节偏移后复用既有 s21_utf8_char_at
@@ -221,7 +221,7 @@ if nm == "str_char" {
 }
 }
 
-// 内置 `str_from_code`（p.9.21.2 两步制①：自 builtin_expr 提取）
+// 内置 `str_from_code`
 pub func bi_str_from_code(nm: string, id: i64) -> i64 {
 if nm == "str_from_code" {
     // 去 Rust 桥：码点 → 单字符 UTF-8 字符串，改 irgen 内联生成

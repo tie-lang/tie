@@ -1,5 +1,5 @@
 type tie<logic>
-// ext/gfx/app.tie —— p.6.8.11 主循环与呈现：主循环整合 + 脏矩形重绘 + 帧节流。
+// ext/gfx/app.tie —— 主循环与呈现：主循环整合 + 脏矩形重绘 + 帧节流。
 // EN: trm.ui main loop: pump + event dispatch + dirty-rect redraw gating + frame throttle.
 //
 // 设计 / Design：
@@ -14,13 +14,13 @@ type tie<logic>
 //       - frame_idx：0 起帧号；render_this_frame：本帧是否因脏而渲染（1/0）。
 //       - 返回 1 → 请求下一帧脏（mark_dirty）；返回 99 → 提前 break（broken=1）。
 //     tick 内在闭包里用捕获的真实 Canvas/Surface 绘制（跨模块不能写 gfx struct，见
-//      p.6.8.11 记录），并可用共享 table 与探针交换像素/时间戳。
+//      记录），并可用共享 table 与探针交换像素/时间戳。
 //   * `app.mark_dirty()`：置脏矩形信号（布尔；已被渲染帧消费则清，多次置仍算 1 次）。
 //   * 呈现目标：OFFSCREEN 无窗口（渲染结果留在 surface 供断言）；SKIA 经 hwnd 上屏。
 //
 // ✔ 复杂度：每帧 O(1)（pump/判断/Sleep），事件累计 O(uv 事件数)，禁 O(n²)。
 // ✔ vsync 说明：本子项用 Sleep 节流近似 vsync（Game Loop 每帧 Sleep 补齐）；真正的
-//   DWM/flip 垂直同步 flush 后置（见 p.6.8.11 设计文档，GPU/DWM 后置项）。
+//   DWM/flip 垂直同步 flush 后置（见 设计文档，GPU/DWM 后置项）。
 
 import "./port.tie" as pt
 import "./window.tie" as win

@@ -1,5 +1,5 @@
 type tie<class>
-// lib/codegen/irgen_agg_p1.tie —— irgen_agg 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_agg_p1.tie —— irgen_agg 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_agg.tie。
@@ -251,7 +251,7 @@ func tig_tuple_lit_typed(id: i64, agg: i64) -> i64 {
         ir.add_operand(st, fty, 2)
         ir.add_operand(st, v, 0)
         ir.add_operand(st, gpp, 0)
-        // p.6.1.7-RCA-2【2026-09-06】：tuple **返回**（Return 置 g_ret_tup_tbl）的
+        // -RCA-2【2026-09-06】：tuple **返回**（Return 置 g_ret_tup_tbl）的
         // 表元素 retain 交调用方——仅当元素是**直接变量引用**（tag==6，即 exit_release
         // 会释放的本地槽，如 point_add 的 return (x3,y3)）：retain 给调用方、出口减回。
         // 元素是表达式/调用（tag==7，如 divrem 的 return (trim(q),trim(r0))）→ 返回的
@@ -309,7 +309,7 @@ func tig_field_access(id: i64) -> i64 {
         sm_err_msg = "字段访问 '.' 的对象不是元组/struct/映射记录（类型 " + types.type_name(base_ty) + "，函数 " + g_cur_fn_name + "）"
         return -1
     }
-    // p.9.11.5 记录字段读取：`rec.k` ↔ `rec["k"]`（键化表 map 模型）——
+    // 记录字段读取：`rec.k` ↔ `rec["k"]`（键化表 map 模型）——
     // 字段名作字符串键 → s21_map_get(base, "k")，与下标读（tig_index_read 的
     // map 分支）一致。复合 map 值（map<any>/map<struct>）沿用 map_get 槽语义。
     if bk == K_MAP {
@@ -349,7 +349,7 @@ func tig_field_access(id: i64) -> i64 {
 
 // 字段赋值（FieldAssign 115）：base.field op= value → 地址 + agg_gep + store。
 // 复合赋值（op ≥ 0）先 load 旧值运算再写回（对齐 tig_compound_assign）。
-// P2a：base 为表下标 t[i]（元素 struct/tuple）→ 读-改-写回槽（OOB 安全：
+// base 为表下标 t[i]（元素 struct/tuple）→ 读-改-写回槽（OOB 安全：
 // 读越界→零值、写越界→静默），避免写进 tig_agg_addr 的临时副本丢失。
 func tig_field_assign(id: i64) -> i64 {
     var fname = sstate.name_str(id)
@@ -362,7 +362,7 @@ func tig_field_assign(id: i64) -> i64 {
         sm_err_msg = "字段赋值的目标不是元组/struct（类型 " + types.type_name(base_ty) + "，函数 " + g_cur_fn_name + "）"
         return -1
     }
-    // p.8.2.7 计算属性写：语义层登记 setter（g_cmp_setter[id] > 0）或字段缺失时
+    // 计算属性写：语义层登记 setter（g_cmp_setter[id] > 0）或字段缺失时
     // 按方法约定独立探测（<Struct>::<fname>_set 存在）→ 发射 setter 方法调用
     // （接收者 = base，实参 = value）。setter 通常 void，tig_op_overload 对 void
     // 返回哑值 0，赋值语句丢弃结果。命中计算属性 → 返回其发射值；否则 -2 走普通
@@ -398,7 +398,7 @@ func tig_field_assign(id: i64) -> i64 {
     }
     var fty = agg_field_ty(base_ty, fidx)
     var is_idx = ast.s_tag(base) == 13  // t[i] 下标 base
-    // p.9.12.6 行池字段写 t[i].f（= 与 op=）：按列定位（rp_find）→ 列句柄上
+    // 行池字段写 t[i].f（= 与 op=）：按列定位（rp_find）→ 列句柄上
     // grow-set 字段值（越界行以默认值补齐，与 rows[id] = e 的行物化一致）。
     // 此前行池误走普通表读-改-写回：把整行 R（多字聚合）tbl_set 进第 0 列
     //（单字元素）→ 写坏列句柄、字段值丢失（回归语料 t[0].y = 9 读回 0 的根源）。
@@ -471,7 +471,7 @@ func tig_field_assign(id: i64) -> i64 {
         if vv < 0 {
             return -1
         }
-        // S1.3 窄整数字段：赋值值按字段类型转换（i64 值 → i32 字段）
+        // 窄整数字段：赋值值按字段类型转换（i64 值 → i32 字段）
         var vt = ast.node_type(val)
         if vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
             (types.is_int(fty) || types.is_float(fty)) && vt != fty {
@@ -481,7 +481,7 @@ func tig_field_assign(id: i64) -> i64 {
             }
             vv = cv
         }
-        // P2c：any 字段赋值装箱——值是具体类型 → box（对齐构造/var/return 装箱）
+        // any 字段赋值装箱——值是具体类型 → box（对齐构造/var/return 装箱）
         if fty == types.named(TK_ANY) && vt >= 0 && vt != types.named(TK_ANY) {
             var bx5 = tig_box_any(vv, vt)
             if bx5 < 0 {
@@ -489,20 +489,20 @@ func tig_field_assign(id: i64) -> i64 {
             }
             vv = bx5
         }
-        // p.6.1.8-RCA【2026-09-06】：struct/元组**字段**表赋值缺引用计数——p.6.1.7
+        // -RCA【2026-09-06】：struct/元组**字段**表赋值缺引用计数——
         // 的变量赋值修复未覆盖字段槽：不 retain(新) 则字段只是「借用」源局部（TLS
         // Session 实测：finish13 把 sched_keys 返回的表存入 s.c_key，返回时源局部
         // ca_k 经出口 release 计数到 0 → 字段悬垂 → 应用数据阶段 UAF）。修：store
         // 前 retain(新) 使字段持有自己的引用（RHS 直接构造 table_new_* 所有权已转移
         // 则免；参数 base 借用语义不插桩；下标元素 base 的元素生命周期已持有）。
         // **不 release(旧)**：struct 是值类型、复制别名同一表指针，旧值可能仍被
-        // 另一份 struct 副本引用——提前 release 会提前释放（p.6.1.8 自举验证：
+        // 另一份 struct 副本引用——提前 release 会提前释放（自举验证：
         // release 旧字段使编译器自编译失稳，非不动点）。旧字段泄漏，本设计普遍接受。
         var fld_is_tbl: bool = false
         var fld_new_tbl: bool = false
         if fty >= 0 && types.is_table(fty) {
             fld_is_tbl = true
-            // r.1.1.4：表字面量（tag 12）同 table_new_* 构造是瞬态新表 → 免 retain
+            // 表字面量（tag 12）同 table_new_* 构造是瞬态新表 → 免 retain
             //（所有权随存储转移给字段；字段不 release 旧值，设计已接受）。
             if ast.s_tag(val) == 12 {
                 fld_new_tbl = true
@@ -530,12 +530,12 @@ func tig_field_assign(id: i64) -> i64 {
     return 0
 }
 
-// P2b 装箱：具体值 v（vty）→ any {tag, payload} 16 字节值。
+// 装箱：具体值 v（vty）→ any {tag, payload} 16 字节值。
 // tag 约定：0=i64/整数 1=f64 2=bool 3=string 4=char（payload 直接存/
 // type-punned；bool/char/窄整数提升为 i64）。
-// P2c 复合类型（struct/enum/fn）：tag = 类型 id（复合 id 远大于标量 0-4），
+// 复合类型（struct/enum/fn）：tag = 类型 id（复合 id 远大于标量 0-4），
 // payload = 指向堆上按值拷贝聚合的指针（any 的 8 字节 payload 放不下多字聚合）。
-// 拆箱由 as_*（T3）/switch 类型匹配（T4、P2c 复合 case 绑定）按 tag 提取。
+// 拆箱由 as_*/switch 类型匹配（复合 case 绑定）按 tag 提取。
 func tig_box_any(v: i64, vty: i64) -> i64 {
     var any_ty = types.named(TK_ANY)
     var T64 = types.named(TK_I64)
@@ -563,7 +563,7 @@ func tig_box_any(v: i64, vty: i64) -> i64 {
             pv = s21_zext(v, vty)  // 窄整数 → i64
         }
     } else if types.kind(vty) == K_STRUCT || types.kind(vty) == K_ENUM || types.kind(vty) == K_FN {
-        // P2c 复合装箱：tag = 类型 id（唯一标识，供 switch 类型匹配）；
+        // 复合装箱：tag = 类型 id（唯一标识，供 switch 类型匹配）；
         // 堆分配 type_byte_size 字节按值拷贝聚合，payload = 堆指针（i64）。
         tag = vty
         var sz = tig_int_lit_ty(type_byte_size(vty), T64)
@@ -577,7 +577,7 @@ func tig_box_any(v: i64, vty: i64) -> i64 {
         pv = ir.get_value(pi2)
         pty = T64
     } else if types.is_table(vty) || types.is_map(vty) {
-        // P2d 嵌套表：table/map 值是 ptr（引用类型，句柄在指针后）——tag =
+        // 嵌套表：table/map 值是 ptr（引用类型，句柄在指针后）——tag =
         // 表/映射类型 id，payload = ptrtoint(表 ptr)（8 字节直接容纳，无需堆拷贝）
         tag = vty
         var pi3 = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint → i64
@@ -617,7 +617,7 @@ func tig_box_any(v: i64, vty: i64) -> i64 {
     return ir.get_value(ld)
 }
 
-// P2c map<any>：具体值 → 装箱 → 堆拷贝 16 字节 any 盒 → 返回堆指针。
+// map<any>：具体值 → 装箱 → 堆拷贝 16 字节 any 盒 → 返回堆指针。
 // map 容器条目 16 字节（key@0 8B + value@8 8B），any 值 16 字节放不进 8 字节
 // 值槽——值槽存指向堆上 any 盒的指针（容器布局零改动）。读取侧由消费方
 // s21_load(ptr, any) 还原。堆内存不回收（与 any 复合装箱一致的借用约定）。
@@ -635,12 +635,12 @@ func tig_map_any_heapbox(v: i64, vty: i64) -> i64 {
     return p
 }
 
-// P2b 拆箱：any 值 v → 目标类型 vty（运行时 tag 检查；不匹配 → 运行时错误）。
+// 拆箱：any 值 v → 目标类型 vty（运行时 tag 检查；不匹配 → 运行时错误）。
 // 与 tig_box_any 的 tag 约定对称：0=i64/整数 1=f64 2=bool 3=string 4=char。
 // 结构：any 值落 alloca → 读 tag@[0] → icmp 期望 tag → 匹配块取 payload@[1]
 //（bool/char 槽存 i64，从 i64 槽 load 后 trunc 还原 i1/i32）；不匹配块
 // printf（含期望类型名 + 实际 tag）+ exit(1)（+ 死 br 满足 terminator）。
-// 供 as_* 内置（T3）调用；返回 payload 值 id，调用后 g_cur_block = 匹配块。
+// 供 as_* 内置调用；返回 payload 值 id，调用后 g_cur_block = 匹配块。
 func tig_unbox_any(v: i64, vty: i64, fname: string) -> i64 {
     var any_ty = types.named(TK_ANY)
     var T64 = types.named(TK_I64)
@@ -655,7 +655,7 @@ func tig_unbox_any(v: i64, vty: i64, fname: string) -> i64 {
     } else if vty == types.named(TK_CHAR) {
         exp_tag = 4
     } else if types.is_table(vty) || types.is_map(vty) {
-        // P2d 嵌套表：tag = 表/映射类型 id（payload 存 ptrtoint）
+        // 嵌套表：tag = 表/映射类型 id（payload 存 ptrtoint）
         exp_tag = vty
     }
     // payload 槽 LLVM 类型：f64 存 double、string 存 ptr；bool/char/i64 存 i64
@@ -715,12 +715,12 @@ func tig_unbox_any(v: i64, vty: i64, fname: string) -> i64 {
     var ld1 = ir.new_inst(g_cur_block, 21, plty)
     ir.add_operand(ld1, g1p, 0)
     var pv = ir.get_value(ld1)
-    // P2d 嵌套表：payload 是 ptrtoint(表 ptr) → inttoptr 还原为表值（ptr）
+    // 嵌套表：payload 是 ptrtoint(表 ptr) → inttoptr 还原为表值（ptr）
     if types.is_table(vty) || types.is_map(vty) {
         var ip2 = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
         ir.add_operand(ip2, pv, 0)
         pv = ir.get_value(ip2)
-        // r.1.4.2：as_table_* 返回**别名句柄**，按「表返回函数在 return 处 retain」
+        // as_table_* 返回**别名句柄**，按「表返回函数在 return 处 retain」
         // 契约补 retain——调用方 `var x = as_table_i64(...)` 存变量并登记出口析构，
         // 不 retain 会提前把源表引用减到 0 → 出口析构双重释放（p2d 嵌套表路径
         // 0xC0000374 根因：back_i/m_i/inner_back 与 inner_i 互别名）。

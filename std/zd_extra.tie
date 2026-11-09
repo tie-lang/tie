@@ -5,7 +5,7 @@ type tie<class>
 // decode_i64/write_f64_be/read_f64_be/encode_bool/decode_bool/write_varint/
 // read_varint/u8_at/concat/…），字节一律 table<i64>，错误哨兵 -1。
 //
-// 覆盖四类优化（设计文档 2026-08-31-zd-v2-design.md §5/§6/§4）：
+// 覆盖四类优化：
 //
 //   [flags bit0] 字符串字典/引用：
 //     池段 = encode_string 串接（pool_build）；重复字符串只存一次——查池用
@@ -109,7 +109,7 @@ pub func decode_string_ref(pool: table<i64>, bytes: table<i64>, pos: i64) -> (st
     return (s, p2)
 }
 
-// ==================== 1b. 池哈希索引（p.9.6.2 性能优化） ====================
+// ==================== 1b. 池哈希索引（性能优化） ====================
 // 旧 pool_index 每次查询线性扫全池、逐条 decode_string（O(条目数 × 串长)）；
 // 实测 2000 条池命中 90µs/次（probe_zd_perf poolidx）。本组建**开放寻址哈希索引**
 // （FNV-1a 32 位 + 线性探测），查询均摊 O(1)：

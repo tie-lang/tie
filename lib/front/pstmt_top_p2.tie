@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/pstmt_top_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// lib/front/pstmt_top_p2.tie —— 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 pstmt_top.tie。
@@ -48,7 +48,7 @@ func parse_namespace() -> i64 {
                 }
                 table_push(body_stmts, st)
             } else if tag == lex_pub {
-                // p.9.21.5 II2：pub func / pub const（val bit1 = ispub，
+                // II2：pub func / pub const（val bit1 = ispub，
                 // 常量可见性跟随 L1 梯度）；2026-10-13 增 pub var；
                 // 其余 pub 形态落到 parse_fn_def
                 if putil.peek_n(1) == lex_const {
@@ -86,7 +86,7 @@ func parse_namespace() -> i64 {
                 }
                 table_push(body_stmts, sv)
             } else if tag == lex_unsafe {
-                // S1.2：unsafe fn / unsafe extern（按下一 token 分派）
+                // unsafe fn / unsafe extern（按下一 token 分派）
                 var nxtb = putil.peek_n(1)
                 if nxtb == lex_extern {
                     var st = parse_extern()
@@ -127,21 +127,21 @@ func parse_namespace() -> i64 {
                 }
                 table_push(body_stmts, st)
             } else if tag == lex_port {
-                // S2.4：命名空间内 port 声明
+                // 命名空间内 port 声明
                 var st = parse_port()
                 if st < 0 {
                     return -1
                 }
                 table_push(body_stmts, st)
             } else if tag == lex_interface {
-                // p.9.11.21：命名空间内 interface 声明（结构性接口）
+                // 命名空间内 interface 声明（结构性接口）
                 var st = parse_interface()
                 if st < 0 {
                     return -1
                 }
                 table_push(body_stmts, st)
             } else if tag == lex_impl {
-                // S2.4：命名空间内 impl 块
+                // 命名空间内 impl 块
                 var st = parse_impl()
                 if st < 0 {
                     return -1
@@ -154,7 +154,7 @@ func parse_namespace() -> i64 {
                 }
                 table_push(body_stmts, st)
             } else if tag == lex_const {
-                // p.9.12.4：`const fn` / `const func`（命名空间内）→ const fn 定义；
+                // `const fn` / `const func`（命名空间内）→ const fn 定义；
                 // 否则 const 命名空间常量（以 ns::NAME 全名登记全局符号，
                 // 语义/IR 复用顶层 const 全局通道；引用端 ns::NAME / 裸名 + 前缀补全）
                 if putil.peek_lexeme_n(1) == "fn" || putil.peek_lexeme_n(1) == "func" {
@@ -193,7 +193,7 @@ func parse_namespace() -> i64 {
             if tag == lex_eof {
                 done = true
             } else if tag == lex_pub {
-                // pub 后：pub func / pub import / p.9.21.5 II2 pub const /
+                // pub 后：pub func / pub import / II2 pub const /
                 // 2026-10-13 pub var（val bit1 = ispub，跨文件引用须 pub）
                 if putil.peek_n(1) == lex_import {
                     var st = parse_import()
@@ -233,7 +233,7 @@ func parse_namespace() -> i64 {
                 }
                 table_push(body_stmts, st)
             } else if tag == lex_unsafe {
-                // S1.2：unsafe fn / unsafe extern（按下一 token 分派）
+                // unsafe fn / unsafe extern（按下一 token 分派）
                 var nxts = putil.peek_n(1)
                 if nxts == lex_extern {
                     var st = parse_extern()
@@ -286,21 +286,21 @@ func parse_namespace() -> i64 {
                 }
                 table_push(body_stmts, st)
             } else if tag == lex_port {
-                // S2.4：命名空间内 port 声明
+                // 命名空间内 port 声明
                 var st = parse_port()
                 if st < 0 {
                     return -1
                 }
                 table_push(body_stmts, st)
             } else if tag == lex_interface {
-                // p.9.11.21：命名空间内 interface 声明（结构性接口）
+                // 命名空间内 interface 声明（结构性接口）
                 var st = parse_interface()
                 if st < 0 {
                     return -1
                 }
                 table_push(body_stmts, st)
             } else if tag == lex_impl {
-                // S2.4：命名空间内 impl 块
+                // 命名空间内 impl 块
                 var st = parse_impl()
                 if st < 0 {
                     return -1
@@ -326,7 +326,7 @@ func parse_namespace() -> i64 {
                 }
                 table_push(body_stmts, st)
             } else if tag == lex_const {
-                // p.8.1.1：`const fn` / `const func`（命名空间内）→ const fn 定义；
+                // `const fn` / `const func`（命名空间内）→ const fn 定义；
                 // 否则 const 全局变量
                 if putil.peek_lexeme_n(1) == "fn" || putil.peek_lexeme_n(1) == "func" {
                     var st = parse_fn_def()
@@ -362,8 +362,8 @@ func parse_namespace() -> i64 {
     return n
 }
 
-// extern 函数声明（T0.7）：`[unsafe] extern fn name(a: i64, b: string) -> bool;`
-// S1.2 E3：extern 声明必须带 unsafe 标注（val = 1），调用必须在 unsafe 上下文。
+// extern 函数声明：`[unsafe] extern fn name(a: i64, b: string) -> bool;`
+// extern 声明必须带 unsafe 标注（val = 1），调用必须在 unsafe 上下文。
 func parse_extern() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
@@ -446,15 +446,15 @@ func parse_extern() -> i64 {
     return e
 }
 
-// 类型参数列表（声明点）：`<T1, T2, ...>` → N_TYPE_PARAMS 节点
+// 类型参数列表（声明点）：`<, , ...>` → N_TYPE_PARAMS 节点
 // （children = N_TYPE_PARAM 序列，每个 name 字段 = 类型参数名）。
-// S2.4 泛型约束：`<T: Drawable>` —— N_TYPE_PARAM 增加 children：
+// 泛型约束：`<T: Drawable>` —— N_TYPE_PARAM 增加 children：
 // [约束类型节点或 -1]（第一版单约束：`T: Port`；多约束后置，见
-// port-model.md §2.3）。约束类型节点 = pexpr_type.parse_type 产出的
+//  §2.3）。约束类型节点 = pexpr_type.parse_type 产出的
 // N_STRUCT_TYPE（语义层校验必须是已登记的 port）。
 // 前提：当前 peek 为 '<'（函数名/struct 名后）。函数/struct 名后的 '<'
 // 一定是类型参数列表（非泛型场景不存在），解析失败直接报错，不做 try 回退。
-// p.9.11.32 类型别名：`alias Name = TypeNode;` / `alias Pair<T, U> = (T, U);`
+// 类型别名：`alias Name = TypeNode;` / `alias Pair<T, U> = (T, U);`
 // 纯透明别名：无新类型、无标称区分，语义层（sgen.parse_generic_type_node）
 // 命中别名注册表时展开替换为目标类型（泛型别名做形参代换）。
 // 产出 N_TYPE_ALIAS[name=别名, children=[类型参数(-1 或 N_TYPE_PARAMS), 目标类型节点]]。
@@ -513,7 +513,7 @@ func parse_type_params() -> i64 {
     if !putil.expect_type_gt("类型参数列表后需 '>'") {
         return -1
     }
-    // p.8.2.6 泛型糖之一：**约束简化**。`<T, U: Drawable>` 一条约束作用于
+    // 泛型糖之一：**约束简化**。`<T, U: Drawable>` 一条约束作用于
     // 从上一个约束组之后到当前参数的所有未约束参数（含当前）——不必为每个
     // 参数重复书写 `T: Drawable`。纯书写糖，导出 AST 形态与逐参数写约束
     // 完全一致（为回填参数克隆同名的 N_STRUCT_TYPE 约束节点，不共享节点 id，
@@ -561,7 +561,7 @@ func parse_type_params() -> i64 {
     return n
 }
 
-// p.8.1.3 显式特化实参列表：`<i64>` / `<i64, string>` / `<table<i64>>` → N_TYPE_ARGS
+// 显式特化实参列表：`<i64>` / `<i64, string>` / `<table<i64>>` → N_TYPE_ARGS
 //（与调用点显式类型实参同节点形态；语义层 collect_fn 按 N_TYPE_ARGS 槽识别特化）
 // 值参数（v2）：整型字面量实参 `<1280>`（N_INT_LIT）与类型实参同表混排；语义层
 // 按模板参数 kind 分流。注：常量名值实参 `<CAP_X>` 一期不支持（用字面量；常量名
@@ -607,7 +607,7 @@ func parse_fn_spec_args() -> i64 {
     return n
 }
 
-// 单个类型参数节点：`T` 或 `T: Drawable`（S2.4 约束）+ p.8.2.6 默认类型参数
+// 单个类型参数节点：`T` 或 `T: Drawable`（约束）+ 默认类型参数
 // `T=string` / `T: Drawable = string`。
 // 值参数（容量参数，v2）：`CAP: i64`（内建整型标量关键词标注）→ kind=1（val 字段），
 // 可选默认整值 `CAP: i64 = 1280`（children[1] 存 N_INT_LIT 或 N_VAR(const 名)）。

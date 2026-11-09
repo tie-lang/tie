@@ -1,8 +1,8 @@
 type tie<class>
-// lib/ir/tieir_slice.tie —— p.9.21.6-2 模块级 tieir 片段（模块化缓存写侧）
+// lib/ir/tieir_slice.tie —— -2 模块级 tieir 片段（模块化缓存写侧）
 // ============================================================
 // 把当前单元的 IR 按「来源模块」切分序列化：单模块的函数 + 其块/指令/操作数/
-// 关联符号与导出行。p.9.21.11 起片段为 **v3 紧凑二进制**（u32 小端 + UTF-8
+// 关联符号与导出行。起片段为 **v3 紧凑二进制**（u32 小端 + UTF-8
 // 字符串，见 tieir_fmt_v3.tie 头注）——与全量 v2 .tir 格式分轨，读侧只有
 // 装配器 asm_parse_slice（v3 片段不可经 tieir.read 反序列化）。
 //
@@ -28,7 +28,7 @@ type tie<class>
 //   sig_module）后经 set_fn_mods 注入平行表（表按值传参拷贝，函数数规模）。
 //   未注入或规模不符 → 拒绝写入。
 //
-// # 过滤池说明（p.9.21.8）
+// # 过滤池说明
 //   片段字符串池 = **引用过滤 + 保序压缩**（不再全量快照）：被引用池 id 来自
 //   函数名/块名、符号表选中行（name/sig）、导出表选中行（name/sig）、指令
 //   操作数 kind 3（OK_GLOBAL 全局名）、以及 kind 0 载荷池 id 的操作数①
@@ -36,7 +36,7 @@ type tie<class>
 //   与 llvmgen collect_strings/collect_externs 的消费清单对齐）。写入时全部
 //   池 id 同步重映射到片段内新下标（保序压缩），未标记 id 触响亮失败。
 //
-// # pub 方法全集（增删须同步 ROAD）
+// # pub 方法全集（增删须同步本表与调用方）
 //   set_fn_mods(m)（driver 注入归属）/ write_mod_slice(path, mod_id, src_path,
 //   src_fp) -> bool / err_msg 转承 tieir_ser。
 //
@@ -132,7 +132,7 @@ pub func write_mod_slice(path: string, mod_id: i64, src_path: string, src_fp: st
         ii = ii + 1
     }
     // 每选中函数：v_start（值起点=最小值 id）/ v_max（最大值 id）/ 值数 / 操作数总数
-    // p.9.21.10：值域跨度（max-min+1）替代值数（count）作压缩基数——irgen 交错
+    // 值域跨度（max-min+1）替代值数（count）作压缩基数——irgen 交错
     // 生成时他函数的值会插进本函数值域内部（span > count），按 count 累计的
     // f_vbase 会让相邻函数的片段值域**交叠**（值 id 碰撞 → 装配错值）。
     var f_vstart: table<i64> = table_new_i64()
@@ -167,13 +167,13 @@ pub func write_mod_slice(path: string, mod_id: i64, src_path: string, src_fp: st
         }
         bi = bi + 1
     }
-    // p.9.21.10（D5 根治，方案 A）：指令流改**按指令 id 序（= 创建序）**写，
+    // （根治，方案 A）：指令流改**按指令 id 序（= 创建序）**写，
     // 块归属由「选中块区间回填」唯一确定（勘察：区间互不交叠，每指令恰属
     // 一块；irgen 乱序建块只造成块表序 ≠ id 序，不再需要拒写护栏）。
     // 归属表（inst_total 大小，-1 = 非本模块指令）：同指令被两个选中块同时
     // 认领（= 区间交叠，irgen 缺陷，C' 断言正常应拦截）→ 拒写。
-    // p.9.21.11 §5.1：归属逻辑统一到 ir.blk_attr_fill（区间回填、表序后者
-    // 覆盖）；交叠/越界经访问器读取——片段写要求唯一归属（D5 检测器语义
+    // §5.1：归属逻辑统一到 ir.blk_attr_fill（区间回填、表序后者
+    // 覆盖）；交叠/越界经访问器读取——片段写要求唯一归属（检测器语义
     // 逐位保留：越界/交叠均拒写，错误定位信息一致）。
     var n_inst = ir.inst_count()
     var sel_flag: table<i64> = table_new_i64()
@@ -257,7 +257,7 @@ pub func write_mod_slice(path: string, mod_id: i64, src_path: string, src_fp: st
         }
         i = i + 1
     }
-    // 每函数值基址/操作数基址累计（p.9.21.10：值基址按**跨度**累计）
+    // 每函数值基址/操作数基址累计（值基址按**跨度**累计）
     var f_vbase: table<i64> = table_new_i64()
     var f_obase: table<i64> = table_new_i64()
     var vcum: i64 = 0
@@ -273,7 +273,7 @@ pub func write_mod_slice(path: string, mod_id: i64, src_path: string, src_fp: st
         ocum = ocum + f_opcnt[i]
         i = i + 1
     }
-    // ---- 池过滤（p.9.21.8）：引用收集 → 保序压缩映射 ----
+    // ---- 池过滤：引用收集 → 保序压缩映射 ----
     // 收集范围（与 llvmgen collect_strings/collect_externs 消费清单对齐）：
     //   函数名/块名；符号表选中行 name/sig；导出表选中行 name/sig；
     //   操作数 kind 3（全局名）；kind 0 载荷池 id 的操作数①
@@ -522,7 +522,7 @@ pub func write_mod_slice(path: string, mod_id: i64, src_path: string, src_fp: st
         }
         bi = bi + 1
     }
-    // 指令表（p.9.21.10：按指令 id 序 = 创建序单遍；own = 真归属块新 id——
+    // 指令表（按指令 id 序 = 创建序单遍；own = 真归属块新 id——
     // 与全量 serialize 的规范形态一致，装配重放无前向引用）
     wr_u32(tieir_out, sel_inst_cnt)
     // 每函数操作数游标（重算：走选中函数序，逐步累加）

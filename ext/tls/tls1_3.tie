@@ -1,7 +1,7 @@
 type tie<class>
 // ============================================================================
 // tls1_3.tie：ext/tls——TLS 1.3 客户端记录层与密钥调度（命名空间 tls13，纯 tie）
-// 用途：p.6.6.1 AC-4 —— 与本机 openssl s_server 完成真实握手 + 应用数据回环。
+// 用途：AC-4 —— 与本机 openssl s_server 完成真实握手 + 应用数据回环。
 // 套件仅 TLS_AES_128_GCM_SHA256（0x1301），密钥协商 x25519（RFC 7748）。
 // 全链路以 table<i64> 承载二进制，AES-128-GCM 复用 ext/tls/gcm.tie，
 // SHA-256/HMAC/HKDF 复用 ext/tls/hash.tie，DH 复用 std/x25519。
@@ -41,7 +41,7 @@ func empty() -> table<i64> {
 
 // ---- 随机字节 ----
 
-// n 个 [0,255] 随机字节。r.1.2.1：走 std/csprng 的加密安全源
+// n 个 [0,255] 随机字节。走 std/csprng 的加密安全源
 // （BCryptGenRandom，CSPRNG）——x25519 私钥、ClientHello random、session id
 // 均为密钥材料，不可用 rnd.int 伪随机底座。失败（系统 RNG 不可用）返回空表，
 // 调用方按哨兵拒绝握手，不降级。
@@ -69,7 +69,7 @@ pub func hs_message(mtype: i64, body: table<i64>) -> table<i64> {
 // 构造并返回 (明文记录, 握手结构体, 客户端私钥 hex)。
 // 记录用于直接发送；握手结构体用于 transcript 与 golden 断言。
 pub func make_client_hello(host: string) -> (table<i64>, table<i64>, string) {
-    // 客户端 x25519 密钥对 + ClientHello random + session id（r.1.2.1：CSPRNG）。
+    // 客户端 x25519 密钥对 + ClientHello random + session id（CSPRNG）。
     // 任一随机源失败 → 返回空记录哨兵，调用方拒绝握手（不降级到伪随机）。
     var sk_bytes = rand_bytes(32)
     var rnd32 = rand_bytes(32)
@@ -138,7 +138,7 @@ pub func make_client_hello(host: string) -> (table<i64>, table<i64>, string) {
         table_push(exts, ks[i]); i = i + 1
     }
 
-    // server_name 0x0000（SNI，p.6.1.8）：host 非空时携带——公网服务器（腾讯 CDN/
+    // server_name 0x0000（SNI）：host 非空时携带——公网服务器（腾讯 CDN/
     // 百度/必应等）对无 SNI 的 ClientHello 直接回 alert 70（protocol_version）或
     // 403。结构：type(2) + 总长(2) + list 长(2) + name_type 0x00(1) + name 长(2) +
     // 主机名 ASCII 字节。
@@ -174,7 +174,7 @@ pub func make_client_hello(host: string) -> (table<i64>, table<i64>, string) {
     return (rec, msg, sk_hex)
 }
 
-// ---- Certificate 链解析（r.1.2.2）----
+// ---- Certificate 链解析----
 
 // 解析 TLS 1.3 Certificate 消息体（RFC 8446 §4.4.2）→ 证书链 DER 的 table<any>
 // （leaf 在前，与 chn.build/chn.verify 约定一致）。结构：

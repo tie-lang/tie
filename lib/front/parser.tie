@@ -1,20 +1,20 @@
 type tie<class>
-// lib/front/parser.tie —— 自举 v2 T2.5：完整语法分析器（模块拆分后主入口）
+// lib/front/parser.tie —— ：完整语法分析器（模块拆分后主入口）
 // ============================================================
-// 里程碑：自举 v2 计划 T2.5（.omo/plans/self-hosting-v2.md）。由 T1.2 原型
+// 说明：实现源自早期原型，
 // compiler/proto/parser.tie 升版（6/6 文件 AST 与 Rust 一致），行为基准
 // Rust crates/tie-frontend/src/parser.rs（语法错误消息逐字对齐）。
-// # 模块拆分（2026-08-11）：原 2877 行单文件按「无环 import 树」拆为 4 模块——
+// # 模块拆分：原 2877 行单文件按「无环 import 树」拆为 4 模块——
 //   pst.tie（全局状态）/ putil.tie（token 流/工具/describe）/
 //   pexpr.tie（表达式/类型解析）/ pstmt.tie（语句解析）/
 //   本文件（parse 主入口 + 协议输出 + parse_debug）。
 //   本文件只 import ./pstmt.tie，其余经树传递可达（唯一路径防重复定义）。
 // # 相比原型改造：
-//   - 节点池复用 ast.tie（T2.1，删除 proto 自带 9 表）；
+//   - 节点池复用 ast.tie（删除 proto 自带 9 表）；
 //   - token 流由「协议文本 re-parse」改为 putil.fill_pending 直接消费
-//     lexer 列式表（T2.4 正式版）；
+//     lexer 列式表（正式版）；
 //   - 语法错误消息统一走 errors.tie syn_*（对齐 Rust parser.rs）。
-// # 协议（parse 返回值，T2.6 语义单遍将消费）：
+// # 协议（parse 返回值，语义单遍将消费）：
 //   首行 <N>:（N = 节点总数）
 //   之后每行：<id> <tag> <name_id> <val> <aux> <line> <col> <nchild> <c1> <c2>...
 //   语法错误：ERR:<line> <col> <message>（对齐 Rust「语法错误 @行:列: 消息」）。
@@ -46,7 +46,7 @@ pub func parse(proto_text: string) -> string {
     return bp
 }
 
-// 便捷入口：源码字符串 → 词法 + 语法 → AST 协议文本（T2.6/验收程序用）
+// 便捷入口：源码字符串 → 词法 + 语法 → AST 协议文本（验收程序用）
 pub func parse_src(src: string) -> string {
     var ok = lexer.run_lex(src)
     if !ok {
@@ -58,7 +58,7 @@ pub func parse_src(src: string) -> string {
 }
 
 // 内存版便捷入口：源码字符串 → 词法 + 语法 → AST 节点池（保留在 ast 内存，
-// 不产出协议文本；T5.3 消除 AST 文本协议往返的性能优化）。
+// 不产出协议文本；消除 AST 文本协议往返的性能优化）。
 // 返回 0 成功；-1 失败。失败时错误信息在错误槽位中：
 //   - 词法错误：lexer 的 g_err_line/g_err_col/g_err_msg（run_lex 返回 false）
 //   - 语法错误：putil 的 p_err_line/p_err_col/p_err_msg（parse_program 返回负）

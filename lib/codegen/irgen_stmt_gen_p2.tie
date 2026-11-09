@@ -1,5 +1,5 @@
 type tie<class>
-// lib/codegen/irgen_stmt_gen_p2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_stmt_gen_p2.tie —— 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_stmt_gen.tie。
@@ -10,7 +10,7 @@ pub func tig_stmt_b_106_While(id: i64) -> i64 {
         var cond = sstate.child(id, 0)
         var body = sstate.child(id, 1)
         var label = ast.s_name(id)
-        // p.6.1.4：预扫循环体找可提升的字符串自加变量（静态核对后挂 sb）。
+        // 预扫循环体找可提升的字符串自加变量（静态核对后挂 sb）。
         // sb 以「out 循环前值」为起始段——提升从空 sb 开始，若循环前 out
         // 已有值（前一循环结果/初始精），必须保留（否则多循环链丢结果）。
         var cands = sb_scan(body, cond)
@@ -26,7 +26,7 @@ pub func tig_stmt_b_106_While(id: i64) -> i64 {
             table_push(g_sb_hv, h_sb2)
             cix = cix + 1
         }
-        // p.6.1.4：字节表自加提升——循环前拷贝 t → 私有累积表 acc（唯一引用）
+        // 字节表自加提升——循环前拷贝 t → 私有累积表 acc（唯一引用）
         var cbs_cands = cbs_scan(body, cond)
         var ccix: i64 = 0
         while ccix < len(cbs_cands) {
@@ -53,7 +53,7 @@ pub func tig_stmt_b_106_While(id: i64) -> i64 {
         if cv < 0 {
             return -1
         }
-        // p.6.5.2：条件归一化 i1（`while 1` / 整型条件 → icmp ne 0；
+        // 条件归一化 i1（`while 1` / 整型条件 → icmp ne 0；
         // 旧实现把 i64 直接喂 cond_br，LLVM 校验失败）
         cv = tig_cond_to_bool(cv, ast.node_type(cond))
         var cb = ir.new_inst(g_cur_block, 31, -1)
@@ -72,7 +72,7 @@ pub func tig_stmt_b_106_While(id: i64) -> i64 {
         }
         // exit 块
         g_cur_block = exit_blk
-        // p.9.11.4 defer：while 退出（break/条件 false 汇于 exit_blk）→ 运行本
+        // defer：while 退出（break/条件 false 汇于 exit_blk）→ 运行本
         // 循环体作用域 defer（g_lp_top 此刻 = 本循环体作用域，逆序）
         if len(g_def_flags) > 0 {
             var drr2 = tig_run_defers(g_lp_top)
@@ -80,7 +80,7 @@ pub func tig_stmt_b_106_While(id: i64) -> i64 {
                 return -1
             }
         }
-        // p.6.1.4：提升候选在循环出口 build 回写 out 槽（break/条件 false 全部汇入
+        // 提升候选在循环出口 build 回写 out 槽（break/条件 false 全部汇入
         // exit_blk → 任一出口都拿到最终拼接串；sb 登记同步移除）
         var bix: i64 = 0
         while bix < len(cands) {
@@ -95,7 +95,7 @@ pub func tig_stmt_b_106_While(id: i64) -> i64 {
             }
             bix = bix + 1
         }
-        // p.6.1.4：字节表候选 → acc 写回 t 槽（表句柄 ptr)，移除登记
+        // 字节表候选 → acc 写回 t 槽（表句柄 ptr)，移除登记
         var cbx: i64 = 0
         while cbx < len(cbs_cands) {
             var cid2 = cbs_cands[cbx]
@@ -171,7 +171,7 @@ pub func tig_stmt_b_146(id: i64) -> i64 {
     var tag = ast.s_tag(id)
         // 三期 A 组 `unsafe use g { ... }` 持证越界块（§7.1.1 + unsafe-model §13.4）：
         // 凭据运行期无操作（编译期门禁已由语义层强制），块体正常生成。
-        // r.1.6.7：若 g 的类型是 `guard<lock>` ⇒ 块内表访问走**免锁**入口（显式凭据
+        // 若 g 的类型是 `guard<lock>` ⇒ 块内表访问走**免锁**入口（显式凭据
         // 去锁）。凭据是块的入参身份，退块自动回收（与 guard 生命周期一致）。
         var is_lock = false
         if types.is_lock_guard(esc_guard_use_ty(id)) {
@@ -202,7 +202,7 @@ func esc_guard_use_ty(id: i64) -> i64 {
 pub func tig_stmt_b_147(id: i64) -> i64 {
     var tag = ast.s_tag(id)
         // 三期 A 组 `unsafe with(share) { ... }` 临时凭据块：同上，块体正常生成。
-        // r.1.6.7：`unsafe with(lock) { ... }` ⇒ 块内表访问走**免锁**入口。
+        // `unsafe with(lock) { ... }` ⇒ 块内表访问走**免锁**入口。
         // 能力域名在 children[0]（N_NAMED_TYPE，name = 域名词池 id）。
         var capn = sstate.name_str(sstate.child(id, 0))
         var is_lock = capn == "lock"
@@ -227,7 +227,7 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
         var val = sstate.child(id, 0)
         var op = ast.s_val(id)
         var nid = interner.intern(nm)
-        // p.6.1.4：循环内字符串自加提升——sb 挂起中且为 `out = out + seg...` 形态
+        // 循环内字符串自加提升——sb 挂起中且为 `out = out + seg...` 形态
         // → 段表达式逐个 sb_append（跳过 str_cat 全拷贝与 store；循环出口统一 build）。
         // 前提由 sb_scan 静态核对（局部 string、引用纯净、无其它写/goto）。
         if op < 0 && sb_find(nid) >= 0 && sb_is_self_add(val, nid) {
@@ -244,7 +244,7 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
             }
             return 0
         }
-        // p.6.1.4：循环内字节表自加提升——cbs 挂起中且为 `t = byte_concat(t, seg)`
+        // 循环内字节表自加提升——cbs 挂起中且为 `t = byte_concat(t, seg)`
         // → 段就地追加到私有累积表（跳过整表拷贝+旧表泄漏；t 槽循环后写回）。
         if op < 0 && cbs_find(nid) >= 0 && cbs_is_self_concat(val, nid) {
             var cix2 = cbs_find(nid)
@@ -299,7 +299,7 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
                 return -1
             }
         }
-        // S1.3 C2/C3：赋值值类型 ≠ 目标槽类型（数字族）→ 转换（拓宽/缩窄）
+        // 赋值值类型 ≠ 目标槽类型（数字族）→ 转换（拓宽/缩窄）
         var vt = ast.node_type(val)
         if op < 0 && vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
             (types.is_int(tgt_ty) || types.is_float(tgt_ty)) && vt != tgt_ty {
@@ -309,13 +309,13 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
             }
             vv = cv
         }
-        // p.6.10.2/3：表变量赋值引用计数插桩——仅普通赋值（非复合）、RHS 表类型。
+        // 表变量赋值引用计数插桩——仅普通赋值（非复合）、RHS 表类型。
         //  retain(新)：局部槽/全局槽接收引用时 +1；RHS 为 table_new_* 直接构造则
         //  免（新表所有权已转移给槽）。
         //  release(旧)：局部**非参数**目标覆盖前 -1（参数借用不回收调用方所有权）。
         //  空句柄由 tl_tbl.tbl_release 守卫跳过。
         //
-        // ★★ p.9.16 内存工程【2026-10-08 RCA】：原判据含 `tgt_global <= 0`——即
+        // ★★ 内存工程【2026-10-08 RCA】：原判据含 `tgt_global <= 0`——即
         // **全局目标覆盖时不 release 旧值**，理由是「全局永驻」。该推理只对了一半：
         // 全局**在函数退出时**不能释放（它的生命周期超出函数），但**在赋值覆盖时**
         // 旧值确实被丢弃 ⇒ 必须 -1。漏了这一半 ⇒ 每次「全局表被重新赋值」都泄漏
@@ -326,11 +326,11 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
         // 表重绑成新空表）的根因——也是 release_ast() 单靠「重绑」收不回内存的原因。
         // 修法：与复合赋值（上方 op>=0 分支）同款——全局槽的 load 用操作数 kind 3
         // （OK_GLOBAL 池 id），局部槽用 kind 0（alloca）。
-        // p.6.1.7-RCA【2026-09-05】：旧值必须在 **store 之前** load——旧码在 store 后
+        // -RCA【2026-09-05】：旧值必须在 **store 之前** load——旧码在 store 后
         // 才 load 槽，读到的是**新表**：retain(新)+1 与 release(读到的新)-1 相抵 → 新表
         // 引用计数缺 1（别名方 cur=nxt 仍持有指针）→ 循环内表变量重入时
         // tig_loopvar_release 把它释放到 0 → 下一轮 tbl_at 悬垂/use-after-free
-        // （0xC0000005，编译形态/分配器状态决定是否崩——p.6.1.7 家族总根因）；旧值
+        // （0xC0000005，编译形态/分配器状态决定是否崩——家族总根因）；旧值
         // 同时泄漏。修复：先 load 旧值，release 旧值；顺序 = load旧 → retain新 →
         // store新 → release旧。
         var assign_is_tbl: bool = false
@@ -340,13 +340,13 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
             var vt3 = ast.node_type(val)
             if vt3 >= 0 && types.is_table(vt3) {
                 assign_is_tbl = true
-                // p.6.1.7-RCA-3【2026-09-06】：RHS 是**函数调用**（tag 7）→ 被调方
+                // -RCA-3【2026-09-06】：RHS 是**函数调用**（tag 7）→ 被调方
                 // 已在其 return 路径 retain 并交出所有权（含 table_new 直接构造、用户
                 // 函数、clone/zeros 等纯表返回）→ 这里不再 retain(+1)，否则 base+retain
                 // 双引用、覆盖时只 -1 → 每个欧几里得步的 clone 重赋值泄漏 ~2KB（enode
                 // 失控根因）。仅**变量/别名** RHS（rx=nx、sy1=red，tag 6）仍 retain（两
                 // 槽共享同一表，需各自持引用）。
-                // r.1.1.4：表字面量 RHS（tag 12）同调用是瞬态值（新表 rc=1）→ 免
+                // 表字面量 RHS（tag 12）同调用是瞬态值（新表 rc=1）→ 免
                 // retain（否则每轮 `t = [..]` 重绑定泄漏 1 引用 → 循环内无界增长）。
                 if ast.s_tag(val) == 7 || ast.s_tag(val) == 12 {
                     assign_new_tbl = true
@@ -356,7 +356,7 @@ pub func tig_stmt_b_103_Assign(id: i64) -> i64 {
         if assign_is_tbl && !assign_new_tbl {
             tig_tbl_retain_call(vv)
         }
-        // ★ P2b any 装箱（赋值路径补齐，与 VarDecl 同款）：目标槽是 any 且 RHS 是
+        // ★ any 装箱（赋值路径补齐，与 VarDecl 同款）：目标槽是 any 且 RHS 是
         // 具体类型 → box 为 {tag,payload}。曾缺失 ⇒ 规范 §2.10 的 any 重绑定示例
         //（`v = "text"`）直接 LLVM 类型错（槽型 {i64,i64} vs 未装箱值，新旧编译器
         // 同样失败）。置于 retain 块**之后**：表 RHS 的 retain 须作用于裸句柄
@@ -416,14 +416,14 @@ pub func tig_stmt_b_115_FieldAssign(id: i64) -> i64 {
 
 pub func tig_stmt_b_134_S2(id: i64) -> i64 {
     var tag = ast.s_tag(id)
-        // S2.3：`panic("消息")` 不可恢复错误语句（N_PANIC）→ printf + exit(1)
+        // `panic("消息")` 不可恢复错误语句（N_PANIC）→ printf + exit(1)
         return tig_panic(id)
 }
 
 pub func tig_stmt_b_122_N_STMTLIST(id: i64) -> i64 {
     var tag = ast.s_tag(id)
         // N_STMTLIST 作语句：逐子语句生成（语句位置宏 `$body` 插值块后残留的
-        // 嵌套语句列表——dev33 批次10 任务28 语句级宏）。
+        // 嵌套语句列表——语句级宏）。
         return tig_stmtlist_as_stmt(id)
 }
 

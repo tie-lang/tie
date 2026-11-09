@@ -1,7 +1,7 @@
 type tie<class>
 // compiler/driver/cli_args.tie —— driver CLI 参数与头部扫描子模块
 // ============================================================
-// 从 driver.tie 拆出（p.9.21 方法库化：driver 编排薄壳）。
+// 从 driver.tie 拆出（方法库化：driver 编排薄壳）。
 // 拆分范式：同编译单元跨文件（文本内联）——本文件只含函数与注释，
 // 顶层全局 var 与 import 树均留在 driver.tie 主文件，避免重复定义。
 // 风格 ns：函数在 `namespace driver` 内，一律 pub（driver 库 API 面）；
@@ -54,7 +54,7 @@ pub func usage() -> i64 {
     return 0
 }
 
-// ==================== p.9.20 双轴优化档解析 ====================
+// ==================== 双轴优化档解析 ====================
 // 优化档值解析：严格单字符 '0'..'3'（负例返回 -1）。
 // 定义位置须早于 parse_args（tie 先定义后使用）。
 pub func parse_opt_level(s: string) -> i64 {
@@ -135,7 +135,7 @@ pub func parse_args() -> i64 {
         } else if a == "--check-bounds" {
             g_cli_check_bounds = true
         } else if a == "--esc-audit" {
-            // r.1.6.7：打印每处「独占免锁」判定（变量名/函数/行号）——用于人工
+            // 打印每处「独占免锁」判定（变量名/函数/行号）——用于人工
             // 核对不变量：全局变量 / 函数参数 / 已泄漏变量**从不**出现在快路径。
             g_cli_esc_audit = true
         } else if a == "--compress-data" {
@@ -153,7 +153,7 @@ pub func parse_args() -> i64 {
             g_output = arg_string(i + 1)
             i = i + 1
         } else if str_len(a) >= 2 && str_char(a, 0) == "-" && (str_char(a, 1) == "l" || str_char(a, 1) == "t") {
-            // p.9.20 双轴：-l<0-3> LLVM/clang 轴 / -t<0-3> tiec 中端轴（粘连取值）。
+            // 双轴：-l<0-3> LLVM/clang 轴 / -t<0-3> tiec 中端轴（粘连取值）。
             // 负例（-l9 / -lx / 分离式 -l 2）统一落到下面的明确诊断，不退化成
             // 通用「参数错误」（否则用户无法定位是优化档写错）。
             var lv = parse_opt_level(str.slice(a, 2, str_len(a)))
@@ -173,7 +173,7 @@ pub func parse_args() -> i64 {
                 g_tie_set = true
             }
         } else if tie.support::has_prefix(a, "--visibility=") {
-            // p.9.21.4 II1 可见性梯度（L1 选项菜单）：a1a 全开放 / a1b ns 级
+            // II1 可见性梯度（L1 选项菜单）：a1a 全开放 / a1b ns 级
             // 私有（默认，= 历史行为）/ a1c 包级 / a1d 全私有+显式导出。
             var vs = str.slice(a, 13, str_len(a))
             if vs == "a1a" {
@@ -213,7 +213,7 @@ pub func parse_args() -> i64 {
             }
             g_tie_set = true
         } else if str_len(a) >= 2 && str_char(a, 1) == "O" {
-            // p.9.20：-O* 硬移除（破坏性变更无兼容期），报错提示新用法
+            // -O* 硬移除（破坏性变更无兼容期），报错提示新用法
             dbg_txt(diagcode.render_error(-1, -1, "优化参数 -O* 已移除：拆分为 -l<L>（LLVM/clang 轴）与 -t<T>（tiec 中端轴），例：-l2 -t0；长参 --llvm-opt=<0-3> / --tie-opt=<0-3>"))
             return -1
         } else if a == "--mem-limit" {
@@ -239,7 +239,7 @@ pub func parse_args() -> i64 {
             g_no_warn = true
             g_front_warn = false
         } else if a == "-w" || a == "--warn" {
-            // p.9.14.2 独立警告 pass：-w / --warn 显式开启前端警告检查
+            // 独立警告 pass：-w / --warn 显式开启前端警告检查
             // （默认只报错）。与 --no-warn 相反；两者后出现者生效。
             g_front_warn = true
         } else if a == "-Werror" || a == "--warn-error" {
@@ -305,7 +305,7 @@ pub func parse_args() -> i64 {
         } else if a == "--dump-docs" {
             g_dump_docs = true
         } else if a == "--emit" {
-            // p.9.22：结构化输出规格 <stage>:<fmt>（可重复；此处校验，错即明确诊断）
+            // 结构化输出规格 <stage>:<fmt>（可重复；此处校验，错即明确诊断）
             if i + 1 >= n {
                 return -1
             }
@@ -429,7 +429,7 @@ pub func parse_args() -> i64 {
 // 目标三元组别名归一化（对齐 Rust normalize_target）：已知别名映射，
 // 未知名称原样透传。
 pub func normalize_target(t: string) -> string {
-    // r.1.6.6：空目标 → 本机默认。Windows 主机（OS=Windows_NT 存在）保持空串
+    // 空目标 → 本机默认。Windows 主机（OS=Windows_NT 存在）保持空串
     // （传统 Windows 链接路径，行为零变化）；POSIX 主机默认 Linux 三元组——
     // Linux 自举链（tiec-linux 编译探针/回归程序无 --target 时）走 Linux 平台
     // 分支与链接参数（sockaddr/管道无 Windows 假设）。
@@ -518,7 +518,7 @@ pub func scan_header(src: string) -> i64 {
             // 期望 `<X>` 形式，且无尾随内容
             if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
                 var sub = trim(tie.support::slice(str.clone(rest), 1, str_len(rest) - 1))
-                // S1.4 R2/R3：多角色解析（基础[:参数][, 修饰...]）
+                // R2/R3：多角色解析（基础[:参数][, 修饰...]）
                 if parse_role_decl(sub) == 0 {
                     g_role = g_role_base
                     return 0

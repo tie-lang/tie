@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/sinfer_ret_q2.tie —— 分片 2（p.9.21.3 单文件 ≤800 行）
+// lib/front/sinfer_ret_q2.tie —— 分片 2
 // ============================================================
 // 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 sinfer_ret.tie。
 // 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
@@ -16,7 +16,7 @@ pub func infer_call(id: i64) -> i64 {
         table_push(args, sstate.child(id, off + i))
         i = i + 1
     }
-    // ---------- S1.3 checked_* 溢出检测函数族 ----------
+    // ---------- checked_* 溢出检测函数族 ----------
     // checked_add/sub/mul/div/shl/shr（2 参整数）+ checked_neg（1 参整数）
     // → 返回 (T, bool) 元组（T = 公共宽度类型；bool = 溢出标志）。
     // 先于 builtin_call（返回 -3 会误入用户函数路径报"无签名"）。
@@ -116,10 +116,10 @@ pub func infer_call(id: i64) -> i64 {
         //
         // 与 Rust 判法一致：`addr_of!` / `ptr as usize` / `without_provenance` /
         // `wrapping_offset` 都是安全函数，只有 read/write/alloc 因带前提而 unsafe。
-        // 设计背景见 tie-main/docs/designs/domain-classification.md 与
-        // safe-unsafe-reclassification.md。
+        // 设计背景见 tie-main/ 与
+        // 
         // ---- 双锁判定（2026-10-01 起完整）----
-        // 归属查表：`types.builtin_domain`（与 domain-classification.md 的承载表
+        // 归属查表：`types.builtin_domain`（与 的承载表
         // 逐项对应）。返回 0 = 不在清单内（安全内置，直接放行）。
         var need = types.builtin_domain(fnm)
         if need != 0 {
@@ -180,7 +180,7 @@ pub func infer_call(id: i64) -> i64 {
                 return -1
             }
         }
-        // S1.2 动态返回类型特判（builtin_call 无法静态确定）：
+        // 动态返回类型特判（builtin_call 无法静态确定）：
         // addr_of(x) → ptr<实参类型>；deref(p) → 指针元素类型；
         // slice_of(a, s, n) → slice<元素类型>；ptr_add(p, n) → ptr<元素类型>
         if fnm == "addr_of" {
@@ -236,7 +236,7 @@ pub func infer_call(id: i64) -> i64 {
             return s0
         }
         if fnm == "volatile_load" {
-            // volatile_load(p) → 指针元素类型（任务15：MMIO/硬件寄存器读）
+            // volatile_load(p) → 指针元素类型（MMIO/硬件寄存器读）
             var p0 = infer_expr(args[0])
             if p0 < 0 {
                 return -1
@@ -256,8 +256,8 @@ pub func infer_call(id: i64) -> i64 {
             if a1 < 0 {
                 return -1
             }
-            // S1.2：字符串 → slice<u8>（ptr 即数据指针）；
-            // 任务16：动态表 → slice<元素类型>（irgen 桥：连续缓冲 + 逐元素拷贝）。
+            // 字符串 → slice<u8>（ptr 即数据指针）；
+            // 动态表 → slice<元素类型>（irgen 桥：连续缓冲 + 逐元素拷贝）。
             // 表元素类型：table_elem（typed table<T>）→ var_table_elem（table_new_i64
             // 等语义登记，裸 table 无元素信息）→ u8 兜底。
             var et1: i64 = types.named(TK_U8)
@@ -314,7 +314,7 @@ pub func infer_call(id: i64) -> i64 {
             g_typed = g_typed + 1
             return node_types[id]
         }
-        // p.8.1.6 表删除/缩表原语（动态返回类型特判）：
+        // 表删除/缩表原语（动态返回类型特判）：
         // table_pop(t) → 表元素类型（table<T> → T；裸 table → var_table_elem 兜底
         // → i64）。语义：弹出表尾元素，所有权转移给调用方（rc 不变，与 push 对称）。
         if fnm == "table_pop" {
@@ -433,7 +433,7 @@ pub func infer_call(id: i64) -> i64 {
             g_typed = g_typed + 1
             return types.named(TK_VOID)
         }
-        // as_* 特殊检查（S1.3 数值转换 + P2b any 拆箱重载）：
+        // as_* 特殊检查（数值转换 + any 拆箱重载）：
         // 数字参数 → 数值转换；any 参数 → 拆箱（运行时 tag 检查）。
         // as_bool/as_string/as_char 仅支持 any（无数值转换语义）。
         var as_is_any_only: bool = false
@@ -451,7 +451,7 @@ pub func infer_call(id: i64) -> i64 {
                 return -1
             }
             if a_ty == types.named(TK_ANY) {
-                // P2b：any 拆箱——返回目标类型（br 已由 builtin_call 给定）
+                // any 拆箱——返回目标类型（br 已由 builtin_call 给定）
                 node_types[id] = br
                 g_typed = g_typed + 1
                 return br
@@ -472,7 +472,7 @@ pub func infer_call(id: i64) -> i64 {
             g_typed = g_typed + 1
             return br
         }
-        // P2c：any_tag(x)——参数必须是 any
+        // any_tag(x)——参数必须是 any
         if fnm == "any_tag" {
             var at2 = infer_expr(args[0])
             if at2 < 0 {
@@ -488,7 +488,7 @@ pub func infer_call(id: i64) -> i64 {
             g_typed = g_typed + 1
             return br
         }
-        // P2d-D3：map 高阶——map_keys(m)/map_values(m) 第 1 参必须 map；
+        // -map 高阶——map_keys(m)/map_values(m) 第 1 参必须 map；
         // map_values 返回类型 = table<map 值类型>（动态，覆盖占位 br）
         if fnm == "map_keys" || fnm == "map_values" {
             var mt = infer_expr(args[0])
@@ -647,7 +647,7 @@ pub func infer_call(id: i64) -> i64 {
         g_typed = g_typed + 1
         return types.struct_of(si)
     }
-    // T3b 泛型（2026-08-14）：普通函数/struct 未命中但 gt_* 模板表命中 →
+    // 泛型：普通函数/struct 未命中但 gt_* 模板表命中 →
     // 泛型调用路径（构造或函数，调用点推断 + 单态化展开）
     var full_name = resolve_call_name(fnm)
     var gti = sstate.gt_find(full_name)
@@ -659,7 +659,7 @@ pub func infer_call(id: i64) -> i64 {
     }
     // 用户函数（裸调用解析：顶层 / 当前命名空间补全 / using 前缀补全）
     var sig = sstate.fn_sig(full_name)
-    // p.8.2.2 命名实参：`f(x: 1, y: 2)` → 按形参名重排并改写调用节点 children
+    // 命名实参：`f(x: 1, y: 2)` → 按形参名重排并改写调用节点 children
     if sig >= 0 {
         var rn = reorder_named_args(id, args, full_name, sig, 0)
         if rn < 0 {
@@ -667,7 +667,7 @@ pub func infer_call(id: i64) -> i64 {
         }
     }
     if sig < 0 {
-        // S2.2 闭包函数值调用：函数签名未命中时，若调用名是 fn 类型变量
+        // 闭包函数值调用：函数签名未命中时，若调用名是 fn 类型变量
         // （闭包字面量 / 函数值参数），按函数值调用检查：参数个数、参数
         // 类型逐个匹配，返回类型 = fn 返回类型。
         var fv_nid = intern.intern(fnm)
@@ -679,7 +679,7 @@ pub func infer_call(id: i64) -> i64 {
             // 2026-10-13：**被调也是一种使用**——闭包体内调用捕获的 fn 值必须
             // 在此收录捕获（VAR 分支的捕获分析只扫值节点，被调名不在 child 里，
             // 实测 ncap=0 → irgen 走按名调用报「无签名」）。守卫与 VAR 分支同款。
-            // ★ 安全对齐（2026-10-13）：**仅对局部（lv）来源收录**——全局不入
+            // ★ 安全对齐：**仅对局部（lv）来源收录**——全局不入
             // 捕获集（§5.10；VAR 分支经 lv 未命中走全局路径、无捕获动作）。若
             // 把 gb 来源也收录，会把全局 fn 值按**创建时快照**捕进闭包 ⇒ 全局
             // 重赋值后闭包调用的仍是旧值（活读语义被破坏）。全局 fn 亦非
@@ -735,7 +735,7 @@ pub func infer_call(id: i64) -> i64 {
                     var_elem = types.table_elem(types.fn_param_of(fv_ty, fn_np - 1))
                     want = var_elem
                 }
-                // p.9.11.34 短闭包实参位（上下文消歧）：固定形参位且形参是 fn 类型
+                // 短闭包实参位（上下文消歧）：固定形参位且形参是 fn 类型
                 if (fn_var == 0 || kf < fn_np - 1) && types.is_fn(want) {
                     var lam_fv = try_lambda_arg(id, sstate.slot_off(id) + kf, args[kf], want)
                     if lam_fv >= 0 {
@@ -746,7 +746,7 @@ pub func infer_call(id: i64) -> i64 {
                 if at < 0 {
                     return -1
                 }
-                // p.6.2.4 ref 参数实参校验：必须是可寻址的表/定长数组变量，且类型匹配
+                // ref 参数实参校验：必须是可寻址的表/定长数组变量，且类型匹配
                 if kf < fn_np && types.fn_param_ref(fv_ty, kf) == 1 {
                     if s_tags[args[kf]] != 6 {
                         sm_err_line = s_lines[id]
@@ -790,7 +790,7 @@ pub func infer_call(id: i64) -> i64 {
     if vr < 0 {
         return -1
     }
-    // S1.2 安全边界：unsafe 函数（含 extern）在安全代码中调用 = 编译错误
+    // 安全边界：unsafe 函数（含 extern）在安全代码中调用 = 编译错误
     if sstate.sig_unsafe(sig) == 1 && g_unsafe_depth == 0 {
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
@@ -800,7 +800,7 @@ pub func infer_call(id: i64) -> i64 {
     var req = sg_required[sig]
     var total = sg_nparams[sig]
     var has_var = sstate.fn_has_variadic(sig) == 1
-    // p.8.2.10 展开实参探测：首展开位置 + 是否存在展开。
+    // 展开实参探测：首展开位置 + 是否存在展开。
     var first_spread: i64 = -1
     var cnt_sp: i64 = 0
     var it2: i64 = 0
@@ -860,7 +860,7 @@ pub func infer_call(id: i64) -> i64 {
         } else {
             want = sp_tys[off + j2]
         }
-        // p.8.2.10 展开实参：operand 是表，其元素类型须与变参元素匹配
+        // 展开实参：operand 是表，其元素类型须与变参元素匹配
         if s_tags[args[j2]] == N_SPREAD_ARG {
             var op0 = sstate.child(args[j2], 0)
             var ot = infer_expr(op0)
@@ -887,7 +887,7 @@ pub func infer_call(id: i64) -> i64 {
             j2 = j2 + 1
             continue
         }
-        // p.9.11.34 短闭包实参位（上下文消歧，用户裁决 2026-10-09）：实参是
+        // 短闭包实参位（上下文消歧，用户裁决 2026-10-09）：实参是
         // `ident -> expr` 形态且**固定形参**类型是 fn ⇒ 语义期展开为闭包并
         // 原位替换实参 child。解析期该形态恒按管道解析；此处按形参类型分流
         //（形参 fn 时管道解释不可能成立，消歧确定）。非 fn 形参原样保留
@@ -900,7 +900,7 @@ pub func infer_call(id: i64) -> i64 {
         }
         var at = infer_expr(args[j2])
         if at < 0 {
-            // S2.3 目标类型引导：泛型 enum 构造实参（Result.Err("x") / Option.None）
+            // 目标类型引导：泛型 enum 构造实参（Result.Err("x") / Option.None）
             // 类型参数推断不全时（Err 不含 T / None 无 payload），用形参类型补全。
             // 与 scheck 赋值/return/var 声明三处引导同模式：保存-恢复错误三件套。
             if want_fixed {
@@ -952,7 +952,7 @@ pub func infer_call(id: i64) -> i64 {
                 }
             }
         }
-        // ref 参数实参校验（对齐 Rust T0.3 by_ref）：实参必须是可寻址变量（变量/字段链），
+        // ref 参数实参校验（对齐 Rust by_ref）：实参必须是可寻址变量（变量/字段链），
         // 且必须是动态表（table_new_* 创建）——IR 需取地址写回。L1：**定长数组**
         // ref 实参不作动表要求（数组变量槽地址天然可写回，零拷贝传参）。
         if want_fixed && sp_refs[off + j2] == 1 {

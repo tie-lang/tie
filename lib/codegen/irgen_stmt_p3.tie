@@ -1,10 +1,10 @@
 type tie<class>
-// lib/codegen/irgen_stmt_p3.tie —— 分片 3（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_stmt_p3.tie —— 分片 3
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_stmt.tie。
 namespace irgen {
-// for-in 字符串码点迭代：`for c in s.chars()`（dev33 批次4 语法糖）。
+// for-in 字符串码点迭代：`for c in s.chars`。
 // 布局：循环变量 alloca（TK_STR，单字符）+ 字节位置计数器 alloca（i64）；
 // cond 块：字节位置 < str_len(s) 终结（s21_str_head_len O(1)）；body 块每次
 // 迭代 s21_utf8_char_at 解码码点 → s21_codepoint_to_str 得单字符字符串 → store
@@ -91,7 +91,7 @@ func tig_for_chars(id: i64, iter: i64, body: i64) -> i64 {
     ir.add_operand(sb, cond_blk, 1)
     // exit 块
     g_cur_block = exit_blk
-    // p.9.11.4 defer：for 迭代退出（break/自然结束汇于 exit_blk）→ 运行本
+    // defer：for 迭代退出（break/自然结束汇于 exit_blk）→ 运行本
     // 循环体作用域 defer（g_lp_top 此刻 = 本循环体作用域，逆序）
     if len(g_def_flags) > 0 {
         var drr3 = tig_run_defers(g_lp_top)
@@ -103,7 +103,7 @@ func tig_for_chars(id: i64, iter: i64, body: i64) -> i64 {
     return 0
 }
 
-// p.9.11.16 迭代器协议方法调用：`it.has_next()` / `it.next()`（接收者存槽）。
+// 迭代器协议方法调用：`it.has_next` / `it.next`（接收者存槽）。
 // 复用 struct 方法签名约定（首参 self 自动 ref → 传槽地址；按值 → load）。
 // 返回 call 结果值。
 func tig_iter_call(full: string, recv_ptr: i64, rty: i64) -> i64 {
@@ -147,7 +147,7 @@ func tig_iter_call(full: string, recv_ptr: i64, rty: i64) -> i64 {
     return ir.get_value(inst)
 }
 
-// p.9.11.16 for-in 迭代器协议对象：`for x in it`（it 为 struct 实例，实现
+// for-in 迭代器协议对象：`for x in it`（it 为 struct 实例，实现
 // has_next/next）。接收者求值一次落临时槽（有状态迭代器；表达式接收者只
 // 构造一次）；cond 块：it.has_next() → body；body 块：x = it.next() →
 // store 循环变量 → body 语句；continue → cond（重新 has_next），break → exit。
@@ -367,7 +367,7 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
     if t < 0 {
         return -1
     }
-    // p.9.12.6：iter 是行池变量 → 元素读走 rp_read（逐列取 + 聚合构造）。
+    // iter 是行池变量 → 元素读走 rp_read（逐列取 + 聚合构造）。
     // t（scope 槽）只是第 0 列句柄，tbl_at 会把 R 行按普通表元素读出（错位：
     // 8 字节列缓冲上按 16 字节行读 → 字段错乱）。
     var rp_r: i64 = -1
@@ -446,7 +446,7 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
     }
     var suffix = bridge_suffix(elem)
     var elem_llvm_ty = types.named(TK_I64)
-    // P2a 复合元素（struct/enum/fn）：循环变量类型 = 元素类型 id（多字元素）
+    // 复合元素（struct/enum/fn）：循环变量类型 = 元素类型 id（多字元素）
     var fk2 = types.kind(elem)
     if fk2 == K_STRUCT || fk2 == K_ENUM || fk2 == K_FN || fk2 == K_TUPLE || elem == types.named(TK_ANY) {
         elem_llvm_ty = elem
@@ -503,7 +503,7 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
     g_cur_block = body_blk
     var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
     ir.add_operand(ok_slot, types.named(TK_I8), 2)
-    // r.1.6.7 独占免锁：iter 是裸局部变量且静态证得独占 → 遍历读走免锁。
+    // 独占免锁：iter 是裸局部变量且静态证得独占 → 遍历读走免锁。
     // （for 的 iter 是**只读**位置，esc_scan 的 FOR 分支按只读处理，故遍历本身
     //  不会把候选置死；真正的泄漏点仍由循环子树里的其它语句决定。）
     var iv: i64 = -1
@@ -543,7 +543,7 @@ func tig_for_table(id: i64, iter: i64, body: i64) -> i64 {
     ir.add_operand(sb, cond_blk, 1)
     // exit 块
     g_cur_block = exit_blk
-    // p.9.11.4 defer：for 迭代退出（break/自然结束汇于 exit_blk）→ 运行本
+    // defer：for 迭代退出（break/自然结束汇于 exit_blk）→ 运行本
     // 循环体作用域 defer（g_lp_top 此刻 = 本循环体作用域，逆序）
     if len(g_def_flags) > 0 {
         var drr3 = tig_run_defers(g_lp_top)

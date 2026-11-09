@@ -1,5 +1,5 @@
 type tie<class>
-// lib/codegen/irgen_agg_p2.tie —— irgen_agg 分片 2（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_agg_p2.tie —— irgen_agg 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_agg.tie。
@@ -40,7 +40,7 @@ func enum_variant_tag(ei: i64, vname: string) -> i64 {
 //（scheck 已做同款校验，此处防御性复核）。返回变体 tag 值（0..nvar-1）。
 func enum_case_tag(pat: i64, subj_ty: i64) -> i64 {
     var ei = types.low(subj_ty)
-    // 批次 7：N_CASE_BIND（`case Ok(v)` 解构）→ 取其变体引用子节点
+    // N_CASE_BIND（`case Ok(v)` 解构）→ 取其变体引用子节点
     if ast.s_tag(pat) == N_CASE_BIND {
         pat = sstate.child(pat, 0)
     }
@@ -78,8 +78,8 @@ func enum_case_tag(pat: i64, subj_ty: i64) -> i64 {
     return enum_variant_tag(ei, sstate.name_str(pat))
 }
 
-// 批次 7：枚举变体解构 `case Ok(v)` 的 payload 绑定（在绑定块内调用）。
-// p.8.1.4：多字段解构 `case Both(x, t)`——逐 payload 槽（1..nfld）提取绑定。
+// 枚举变体解构 `case Ok(v)` 的 payload 绑定（在绑定块内调用）。
+// 多字段解构 `case Both(x, t)`——逐 payload 槽（1..nfld）提取绑定。
 // subject 已求值（tig_expr 结果，聚合值）；从槽 j 提取 payload，还原成绑定
 // 变量类型（string/table → inttoptr / f64 → load double / 窄整数 → trunc），
 // 存入新建 alloca 并 scope_put。
@@ -117,12 +117,12 @@ func tig_case_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
             ir.add_operand(ip, pv, 0)
             bv = ir.get_value(ip)
         } else if pty == types.named(TK_F64) {
-            // f64 payload（p.6.2.1）：槽存 double（8B type-punned）→ load double 直用
+            // f64 payload：槽存 double（8B type-punned）→ load double 直用
             var ldf = ir.new_inst(g_cur_block, 21, pty)
             ir.add_operand(ldf, gjp, 0)
             bv = ir.get_value(ldf)
         } else if types.is_table(pty) || types.is_map(pty) {
-            // table/map payload（p.6.2.1）：槽存 ptrtoint → inttoptr 还原 ptr
+            // table/map payload：槽存 ptrtoint → inttoptr 还原 ptr
             var ip2 = ir.new_inst(g_cur_block, 25, pty)  // inttoptr → ptr
             ir.add_operand(ip2, pv, 0)
             bv = ir.get_value(ip2)
@@ -145,7 +145,7 @@ func tig_case_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
     return 0
 }
 
-// P2c：any 主体 struct 解构——`case Point(p):` 命中后调用。subject 是 any 值，
+// any 主体 struct 解构——`case Point(p):` 命中后调用。subject 是 any 值，
 // payload@[1] = 指向堆上按值拷贝的 Point 的指针（i64）→ inttoptr → load struct →
 // 绑定变量 p（alloca + store + scope_put，body 可引用）。
 func tig_case_struct_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
@@ -186,19 +186,19 @@ func tig_case_struct_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
     return 0
 }
 
-// p.9.11.6 表不可变更新 `t with {k: v}` → 新表/新映射（左表不被修改，值语义）。
-// 实现（映射/记录路径；数组 with 因 RHS 是 ident/string 键故不表达，留待）：
+// 表不可变更新 `t with {k: v}` → 新表/新映射（左表不被修改，值语义）。
+// 实现（映射/记录路径；数组 with 因 RHS 是 ident/string 键故不表达）：
 //   1. s21_map_new 建新映射；
 //   2. 拷贝 base 全部键值对（map_keys → 循环 map_get + map_set 入新映射）——
 //      未变部分也逐对复制（裁决：容器为扁平数组无结构化共享，故全复制，
 //      非零拷贝共享）；
 //   3. 应用 with 右侧更新 map 字面量各 (键:值) → map_set 覆盖。
-// 值类型：base 的 map 值类型（scalar/string）；any 走 P2c 装箱路径。
+// 值类型：base 的 map 值类型（scalar/string）；any 走 装箱路径。
 func tig_with(id: i64) -> i64 {
     var base = sstate.child(id, 0)
     var upd = sstate.child(id, 1)
     var T64 = types.named(TK_I64)
-    // p.9.11.33：基为 struct → 结构体不可变更新（须在 tig_expr(base) 之前
+    // 基为 struct → 结构体不可变更新（须在 tig_expr(base) 之前
     // 分派——struct 路径走 tig_agg_addr 取槽，避免非 Var 基表达式双重发射）
     var bt0 = ast.node_type(base)
     if types.kind(bt0) == K_STRUCT {
@@ -325,11 +325,11 @@ func tig_with(id: i64) -> i64 {
     return nm
 }
 
-// p.9.11.33 struct 的 with：`p with {x: 1}` → 值语义复制 + 指定字段覆盖。
+// struct 的 with：`p with {x: 1}` → 值语义复制 + 指定字段覆盖。
 // 发射：alloca 新槽 → 全字段逐个 GEP load/store 拷贝（引用/表字段拷指针 =
 // 编译期共享，未提及字段零额外成本）→ 覆盖字段按记录字面量键定位 GEP store
-//（S1.3 窄整收窄 + any 装箱对齐 tig_struct_construct）→ load 聚合值返回。
-// 右侧恒为记录形态（`with {` 后花括号消歧恒记录，p.9.11.5 同族）。
+//（窄整收窄 + any 装箱对齐 tig_struct_construct）→ load 聚合值返回。
+// 右侧恒为记录形态（`with {` 后花括号消歧恒记录，同族）。
 func tig_with_struct(id: i64, base: i64, upd: i64, bt: i64) -> i64 {
     var nf = cls_nfld[bt - BASE_STRUCT]
     var src = tig_agg_addr(base, bt)
@@ -437,7 +437,7 @@ func elem_llvm_slot(elem: i64) -> i64 {
     return types.named(TK_I64)
 }
 
-// p.9.11.7 切片/区间 `t[1..3]`：base 为表/数组 → 建同元素类型新表 + 复制
+// 切片/区间 `t[1..3]`：base 为表/数组 → 建同元素类型新表 + 复制
 // [start,end) 子区间（左闭右开）；base 为字符串 → 字节子串。端点 -1 表示缺省
 //（start→0、end→len）。越界裁决：**clamp** 到 [0,len]（对齐 str_sub_bytes 内建
 // clamp，与一维下标越界报错不同——切片默认收敛）；负端 clamp 至 0/len；
@@ -596,7 +596,7 @@ func tig_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
             fty = en_ftys[foff + i]
             var arg = sstate.child(id, arg_start + i)
             if fty == types.named(TK_STR) {
-                // string payload（S2.3）：槽是 i64，已按 i64 指针值发射的 string
+                // string payload：槽是 i64，已按 i64 指针值发射的 string
                 // 表达式可直接存储——两类：字符串字面量（const_str 发射为
                 // ptrtoint i64）与字符串拼接（str_cat 输出同为 ptrtoint i64，
                 // 见 llvmgen op==56）；其余 string 变量/调用返回值是 ptr 值，
@@ -616,15 +616,15 @@ func tig_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
                     v = ir.get_value(pi)
                 }
             } else if fty == types.named(TK_F64) {
-                // f64 payload（p.6.2.1）：double 与 i64 槽同宽 8B，type-punned 直存
-                //（对齐 any 装箱 P2b tag=1 的 f64 处理；读侧以 double 还原）
+                // f64 payload：double 与 i64 槽同宽 8B，type-punned 直存
+                //（对齐 any 装箱 tag=1 的 f64 处理；读侧以 double 还原）
                 v = tig_expr(arg)
                 if v < 0 {
                     return -1
                 }
                 st_ty = fty
             } else if types.is_table(fty) || types.is_map(fty) {
-                // table/map payload（p.6.2.1）：值是 ptr → ptrtoint 存 i64 槽
+                // table/map payload：值是 ptr → ptrtoint 存 i64 槽
                 //（与 string 桥同构；读侧按消费方 inttoptr 还原 ptr）
                 v = tig_expr(arg)
                 if v < 0 {

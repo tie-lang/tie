@@ -1,10 +1,10 @@
 type tie<class>
-// lib/ir/ir_meta.tie —— 自举 v2 T2.2：tie-IR 元信息侧表
+// lib/ir/ir_meta.tie —— ：tie-IR 元信息侧表
 // ============================================================
-// 里程碑：自举 v2 计划 T2.2（用户决策 2026-08-10：IR 保留源元数据，
-// pkg 分发从源码切换为二进制 IR——侧表是 .tir 序列化（T6.1）的
+// 说明：IR 保留源元数据，
+// pkg 分发从源码切换为二进制 IR——侧表是 .tir 序列化的
 // 数据源）。本模块与 ir.tie（IR 本体）配套：**本体只管结构，侧表管
-// 元信息**，两者通过指令/符号 id 关联。llvmgen（T2.8）消费本体，
+// 元信息**，两者通过指令/符号 id 关联。llvmgen消费本体，
 // 错误定位/包导出/文档工具链消费本模块。
 //
 // # 侧表清单（全部 id = 下标或经 columnar 排序对）
@@ -15,7 +15,7 @@ type tie<class>
 //   3. export_table：包级公开 API 清单（install/build 链接目标，
 //      .tir 导出节数据源）
 //   4. doc_comment 表：符号/节点 id -> 文档字符串池 id（**词法保留
-//      /// 注释是 T2.4 的事**，本任务先建表结构 + setter/getter）
+//      /// 注释由词法层负责**，此处只建表结构 + setter/getter）
 //   5. 模块头元数据：包名/版本/依赖图/IR 版本/编译器版本
 //   6. dump_meta() -> string：调试输出元信息摘要（--dump-ir-meta 用）
 //
@@ -34,7 +34,7 @@ type tie<class>
 // # 与 Rust ir.rs 的对应（行为基准）
 //   Rust 侧错误定位直接内嵌在生成文本中（gen_runtime_error @4222）；
 //   tie 版改为侧表后由 llvmgen/解释器统一消费，行/列语义一致
-//   （1-based，字节列，见 docs/bench/audit.md T0.2 结论）。
+//   
 //
 // 调用：import 后 ir_meta.set_inst_span(...) / ir_meta.dump_meta()
 // 命名规范：命名空间内函数不加 ir_meta_ 前缀；内部工具私有（非 pub）。
@@ -78,7 +78,7 @@ var meta_pkg_name: i64 = 0;        // 包名（池 id；0 = 未设置）
 var meta_pkg_version: i64 = 0;     // 包版本（池 id，如 "0.1.0"）
 var meta_ir_version: i64 = 0;      // IR 格式版本号（.tir 头校验用）
 var meta_compiler_version: i64 = 0;// 编译器版本（池 id）
-// p.9.20 双轴优化：单元头携带中端轴档位——t 级别决定 tie-IR 是否经 pass
+// 双轴优化：单元头携带中端轴档位——t 级别决定 tie-IR 是否经 pass
 // 改写，pass 管道版本决定 pass 集合/顺序；两者共同构成 .tir 的可复现性
 // 契约（同 (源码, l, t, pass 版本) → 逐字节恒等）。
 var meta_tie_opt: i64 = 0;        // 生效 tiec 中端轴档 t（0-3）
@@ -120,7 +120,7 @@ pub func reset_meta() {
 
 // ---------- inst_span 表（错误定位）----------
 // 语义/IR 生成阶段为每条指令记录源位置；llvmgen 生成运行时错误
-// 消息、T6.1 序列化 span 节时按指令 id 直读。
+// 消息、序列化 span 节时按指令 id 直读。
 
 // 表长对齐到 >= id+1（未设置的槽位保持哨兵）。
 func ensure_span_len(id: i64) {
@@ -297,7 +297,7 @@ pub func exp_col(exp_id: i64) -> i64 {
 }
 
 // ---------- doc_comment 表（节点/符号 -> 文档池 id）----------
-// 表结构 + setter/getter 先行；**词法保留 /// 注释是 T2.4 的任务**，
+// 表结构 + setter/getter 先行；**词法保留 /// 注释由词法层负责**，
 // 届时 lexer 把文档字符串登记进池，frontend 调 set_doc 关联到节点。
 
 pub func set_doc(key: i64, doc_id: i64) {
@@ -355,7 +355,7 @@ pub func get_compiler_version() -> i64 {
     return meta_compiler_version
 }
 
-// 设置生效 tiec 中端轴档 t（p.9.20；0 = 零 pass）。写入 .tir 单元头，
+// 设置生效 tiec 中端轴档 t（0 = 零 pass）。写入 .tir 单元头，
 // 使分发单元的优化档可自证（反序列化侧可校验复现条件）。
 pub func set_tie_opt(v: i64) {
     meta_tie_opt = v

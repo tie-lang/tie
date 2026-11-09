@@ -4,9 +4,9 @@ type tie<class>
 // 模块，编译为单一 trm_lite.a。内置 codegen 以 extern 符号调用
 // trm_lite_sched$spawn_task / trm_lite_sched$queued_* / trm_lite_gc$collect。
 // 用户程序无需 import 本库——tiec 检测到 spawn/yield/collect 内置时自动链接。
-// P2a（2026-08-30）：新增 tl_tbl 字节层表容器（tl_tbl$tbl_*），tiec 检测到
+// 新增 tl_tbl 字节层表容器（tl_tbl$tbl_*），tiec 检测到
 // 表内置时自动链接；tl_tbl 零 table 依赖（纯 unsafe/ptr），自举无环。
-// p.6.7.2：tl_chan 不入本汇总（独立切片 tl_chan_lib.o，避免 tl_runtime.o 单对象
+// tl_chan 不入本汇总（独立切片 tl_chan_lib.o，避免 tl_runtime.o 单对象
 // 捆绑 chan 与复杂形态模块内联的同名 trm_lite_chan$* 链接期多重定义）；
 // 编译 tip：本库不含 chan 时，chan 由独立构建的 tl_chan_lib.o 提供。
 import "../mnn/sched.tie"
@@ -19,7 +19,7 @@ import "../tbl/tl_tbl.tie"
 // （实测 LNK2019 undefined `tl_sync$sleep`）。tl_sync 只依赖 tl_k32（纯 extern 声明），
 // 无循环风险。
 //
-// r.1.7 改多成员归档：**不再在此内联 import tl_sync**，改由归档的独立成员
+// 改多成员归档：**不再在此内联 import tl_sync**，改由归档的独立成员
 // `tl_sync.o` 提供（构建式见 README）。理由：tl_chan_lib.o 同样内联 tl_sync，两者
 // 同档共存会**多重定义**（COFF 链接期 LNK2005；tl_tbl.tie 头注释早已记录同一条
 // 纪律——"库成员不内联 tl_sync"）。rt 自身的 tl_sync 引用由归档成员解析。

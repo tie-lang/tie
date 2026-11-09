@@ -1,10 +1,10 @@
 type tie<class>
-// lib/codegen/irgen_rt_p2.tie —— irgen_rt 分片 2（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_rt_p2.tie —— irgen_rt 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_rt.tie。
 namespace irgen {
-// 批次 8（任务 23）：`cb_ptr(f) -> string`——无捕获闭包/命名函数转 C 回调指针。
+// `cb_ptr(f) -> string`——无捕获闭包/命名函数转 C 回调指针。
 // f 须为无捕获闭包字面量（env=null）或命名函数（无 env）；捕获闭包无法作
 // C 回调（C 函数指针不携带 env）。生成 thunk `cb_<节点id>`：签名 fn(A...) -> R
 //（去掉隐藏 env 参数），体内 call 目标（闭包入口 call clos_<id>(ptr null, A...)；
@@ -138,7 +138,7 @@ func tig_cb_ptr(id: i64) -> i64 {
 
 // `run<Actor>(实参...)` 生成：求值实参（step4 起作初始消息）→ 分配 per-actor
 // record（s21_raw_alloc_str，安全堆 + 尾部填充）→ 初始化消息队列头（原子槽
-// 零初始化；T2 起队列内嵌 record，不再 ch_open 外部通道）→ 返回句柄（record
+// 零初始化；起队列内嵌 record，不再 ch_open 外部通道）→ 返回句柄（record
 // 指针 ptrtoint → i64，K_ACTOR 槽承载）。
 func tig_actor_run(id: i64) -> i64 {
     // 实参求值（丢弃；Step4 起作为初始消息/构造入队）
@@ -160,7 +160,7 @@ func tig_actor_run(id: i64) -> i64 {
         return -1
     }
     var T64 = types.named(TK_I64)
-    // p.9.5.x T2 消息队列固定头（多槽 mailbox + 原子单飞，状态零锁）：
+    // .x 消息队列固定头（多槽 mailbox + 原子单飞，状态零锁）：
     // @0 magic|@8 保留|@16 保留（pending 废弃）|@24 当前 mid|@32 args[0..8)
     // （8 槽当前消息参）|@96 result|@104 done|@112 dispatch_addr|@120 fail
     // |@128 mq_head（原子，已消费计数）|@136 mq_resv（原子，槽预留计数）
@@ -187,7 +187,7 @@ func tig_actor_run(id: i64) -> i64 {
         var fdef = ac_fdefs[fbase + fk]
         var dv: i64 = -1
         if fdef >= 0 {
-            // p.8.3.1：显式字段初值在启动记录时按声明顺序 store；字段初值
+            // 显式字段初值在启动记录时按声明顺序 store；字段初值
             // 已在 scollect 阶段限制为字面量或 const 白名单，复用 struct 构造
             // 的 tig_expr 发射路径。
             dv = tig_expr(fdef)
@@ -195,7 +195,7 @@ func tig_actor_run(id: i64) -> i64 {
                 return -1
             }
         } else if types.is_table(fty) {
-            // ★ p.9.11 修正（actor 表/映射字段缺省——actor_str_probe v4 实锤
+            // ★ 修正（actor 表/映射字段缺省——actor_str_probe v4 实锤
             //   段错误）：无显式初值的表字段发**真实空表**，镜像 struct 构造
             //   路径（irgen_agg_p3 同款）。曾用 tig_default_val(表) → 空字符串
             //   常量指针冒充表句柄，table_push 打在只读串常量上 = 段错误。
@@ -339,7 +339,7 @@ func tig_mq_sync_enter(rec_ptr: i64) {
 
 // 消息槽预留（背压）：等 (resv - head) < MQ_CAP（64）→ CAS 条件递增 resv。
 // 返回槽号（0..63 = r & 63）。背压等待 = tl_sync$sleep(1) 限时轮询
-//（T3 Go 阻塞 send 语义的务实降级：队满阻塞至消费者取走腾位）。
+//（Go 阻塞 send 语义的务实降级：队满阻塞至消费者取走腾位）。
 func tig_mq_reserve(rec_ptr: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var headp = s21_gep(rec_ptr, 128, true)
@@ -466,7 +466,7 @@ func tig_mq_publish(rec_ptr: i64, slot: i64, mi: i64, args: table<i64>, argtys: 
         if byte_off >= 0 && byte_off + 8 <= 64 {
             var dst_addr = s21_gep(slot_base, byte_off, true)            // 槽内常量偏移
             if used == 1 {
-                // 按**参数自身类型**写（架构增强）：原硬编码 T64 ⇒ 只能传 i64。
+                // 按**参数自身类型**写（架构增强）：原硬编码 ⇒ 只能传 i64。
                 s21_store(dst_addr, args[k], pty_k)
             } else {
                 s21_store(dst_addr, c0, T64)                       // 未用尾字填零
@@ -525,12 +525,12 @@ func tig_mq_publish(rec_ptr: i64, slot: i64, mi: i64, args: table<i64>, argtys: 
 
 // actor 消息任务 `actor_task` 生成（fn(ptr rec) -> i64）。**急切生成**：模块
 // 生成开始（tig_ast 内、任何用户函数之前）调用一次，避免指令编号交错。
-// p.9.5.x T2 单消费者串行：本函数是 per-actor **唯一**消费者任务——单飞标志
+// .x 单消费者串行：本函数是 per-actor **唯一**消费者任务——单飞标志
 // mq_act@152 保证同一 actor 任一时刻至多一个消费者任务在跑 → dispatch 天然串行，
 // 状态零锁。循环：队列非空 → 取一条（mq_head@128 游标）→ 拷贝参数到当前消息
 // 槽 @32 → 释放槽（head+1 原子）→ setjmp 捕 panic → dispatch → 写 result/fail
 // → 同步消息置 done@104 → 继续；队列空 → CAS 清单飞(1→0) → 复查队列，非空则
-// CAS 重新激活自己继续、仍空则退出任务。消息每槽独立（T4 async 纯入队不等待）。
+// CAS 重新激活自己继续、仍空则退出任务。消息每槽独立（async 纯入队不等待）。
 func gen_actor_task_eager() {
     if len(ac_keys) == 0 {
         return
@@ -751,12 +751,12 @@ func gen_actor_task_eager() {
     ir.add_operand(ret, zret, 0)
     g_cur_func = saved_func
     g_cur_block = saved_block
-    // p.9.11 `reentrant`（规范 §10.7）：step + nested 排空函数随任务一并生成
+    // `reentrant`（规范 §10.7）：step + nested 排空函数随任务一并生成
     gen_actor_task_step_eager()
     gen_actor_task_nested_eager()
 }
 
-// actor 单步处理 `actor_task_step(ptr rec) -> i64`（p.9.11 reentrant 配套）。
+// actor 单步处理 `actor_task_step(ptr rec) -> i64`（reentrant 配套）。
 // 返回 1 = 队列空 **或** 队头是同步消息（嵌套排空不消费——同步消息的 done@104
 // 单槽语义留给外层等待者，见 gen_actor_sync_call）；0 = 已处理一条。
 // 与 actor_task 主循环处理段同构，两处刻意差异：
@@ -805,7 +805,7 @@ func gen_actor_task_step_eager() {
     var cb0 = ir.new_inst(g_cur_block, 31, -1)
     // ★ 谓词 = icmp eq h,p（空队为真）：true → bempty（ret 1）；false → proc。
     //   曾写反（true→proc）⇒ 空队处理垃圾槽（marks 被踩成指针值）、有消息反而不
-    //   消费（Qrun 恒落 S2 后）——reent_v8 事件日志 + IR 审读定位。
+    //   消费（Qrun 恒落 后）——reent_v8 事件日志 + IR 审读定位。
     ir.add_operand(cb0, emptyp, 0)
     ir.add_operand(cb0, bempty, 1)
     ir.add_operand(cb0, proc, 1)

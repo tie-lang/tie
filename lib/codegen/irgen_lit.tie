@@ -1,7 +1,7 @@
 type tie<class>
 // lib/codegen/irgen_lit.tie —— 生成器 L1 字面量层 子模块
 // ============================================================
-// 从 irgen.tie 拆分而来：这是 irgen LLVM 风格分层重构的 S2 步。
+// 从 irgen.tie 拆分而来：这是 irgen LLVM 风格分层重构的 步。
 // 本文件承载 L1 字面量/常量层：整数（tig_int_lit/tig_int_lit_ty）、字符串
 //（tig_str_lit）、浮点（tig_float_lit/tig_float_lit_ty）、字符（tig_char_lit）、
 // 三进制（tig_trit_lit）、布尔（tig_bool_lit）字面量，外加三目运算
@@ -9,7 +9,7 @@ type tie<class>
 // 它们生成 const_i/const_str/const_f 等常量指令，被上层语句/表达式生成层裸名调用。
 //
 // 拆分范式：【同 namespace 跨文件】（文本内联）。
-// 同 irgen_builder.tie（S1）。irgen.tie 顶层 import 本文件后，本文件被文本内联
+// 同 irgen_builder.tie。irgen.tie 顶层 import 本文件后，本文件被文本内联
 // 进同一编译单元，声明与 irgen.tie 相同的 `namespace irgen`，同名 namespace
 // 跨文件闭合并集：
 //   - 同 namespace 函数可互相裸名调用（主文件照常裸名调用 tig_int_lit 等）；
@@ -30,7 +30,7 @@ func tig_int_lit_ty(val: i64, ty: i64) -> i64 {
     return ir.get_value(inst)
 }
 // 字符串字面量 → const_str 指令（操作数 = 字符串池 id；llvmgen 经 interner 还原文本）。
-// 自举前端把字符串字面量的 lexeme 原样存池（**带引号**，反转义留待消费方），
+// 自举前端把字符串字面量的 lexeme 原样存池（**带引号**，反转义由消费方完成），
 // 故此处先 str_unescape_quoted 去引号 + 反转义，再登记纯文本池 id——
 // 否则生成的 @.str.N 会含 \22 引号（Rust 参考 AST 存去引号文本）。
 // 结果值：const_str 在 llvmgen 生成 `%N = ptrtoint ptr @.str.N to i64`——必须有结果
@@ -47,7 +47,7 @@ func tig_str_lit(name_id: i64) -> i64 {
 func tig_float_lit(name_id: i64) -> i64 {
     return tig_float_lit_ty(name_id, types.named(TK_F64))
 }
-// 按目标类型生成浮点常量（S1.3 f32：`var d = 1.5f32` → const_f float；
+// 按目标类型生成浮点常量（f32：`var d = 1.5f32` → const_f float；
 // llvmgen 按 ins_ty 输出 float/double）
 func tig_float_lit_ty(name_id: i64, ty: i64) -> i64 {
     var inst = ir.new_inst(g_cur_block, 51, ty)  // const_f
@@ -78,7 +78,7 @@ func tig_char_lit(name_id: i64) -> i64 {
         } else if e == "'" {
             ch = "'"
         } else if e == "0" {
-            // r.1.1.8：自举产物中 "\0" 字面量被吞成空串——用 sb_append_byte(0)
+            // 自举产物中 "\0" 字面量被吞成空串——用 sb_append_byte(0)
             // 构建单 NUL 字节字符串（char_code 得码点 0）。须拆语句：嵌套
             // `sb_build(sb_append_byte(...))` 把 void 结果当实参，自举产物
             // 运行时崩溃。
@@ -112,7 +112,7 @@ func tig_ternary(id: i64) -> i64 {
     if cond < 0 {
         return -1
     }
-    // p.6.5.2：条件归一化 i1（整型字面量条件同 while/if 缺陷，统一修）
+    // 条件归一化 i1（整型字面量条件同 while/if 缺陷，统一修）
     cond = tig_cond_to_bool(cond, ast.node_type(cond_nid))
     var then_blk = ir.new_block(g_cur_func, interner.intern("tern.then"))
     var else_blk = ir.new_block(g_cur_func, interner.intern("tern.else"))
@@ -163,14 +163,14 @@ func tig_ternary(id: i64) -> i64 {
 // 字符串字面量 lexeme（带引号）→ 纯文本池 id：去首尾引号 + 反转义
 // （\n \t \r \\ \" \' \0，与词法 scan_string 的转义集一致）。
 // 返回重新 intern 的纯文本池 id。
-// r.1.1.8：`\0` 分支用 sb_append_byte(0) 追加 NUL 字节（自举产物中 `"\0"`
+// `\0` 分支用 sb_append_byte(0) 追加 NUL 字节（自举产物中 `"\0"`
 // 字面量本身被旧编译器吞成空串，`out + "\0"` 恒追加空 → "A\0B" 变 "AB"）。
 // 其余分支保持 `out + c` 码点级拼接（多字节 UTF-8 经 str_cat 字节保真，
 // 逐字节 sb_append_byte 版本被旧种子编译器误编译 → 中文字面量乱码）。
 func str_unescape_quoted(name_id: i64) -> i64 {
     var raw = interner.lookup(name_id)
     var n: i64 = str_len(raw)
-    // p.9.11.19 raw 字符串 r"..."：lexeme 带 'r' 前缀（scan_raw_string 产出，
+    // raw 字符串 r"..."：lexeme 带 'r' 前缀（scan_raw_string 产出，
     // 形态 r"<段>"，段内 `""` 已还原为字面 `"`）——仅去 `r"` 前缀与尾引号，
     // **不反转义**（`\n` 保持两字符；raw = 免转义字面，含 `\` 原样保留）。
     var is_raw: bool = false
@@ -211,7 +211,7 @@ func str_unescape_quoted(name_id: i64) -> i64 {
                 out = out + "'"
                 i = i + 2
             } else if e == "0" {
-                // r.1.1.8：sb_append_byte(0) 字节构建单 NUL 字符串再拼接
+                // sb_append_byte(0) 字节构建单 NUL 字符串再拼接
                 //（须拆语句：嵌套 `sb_build(sb_append_byte(...))` 把 void 结果
                 // 当实参，自举产物运行时崩溃）
                 var nbsb = string_builder()

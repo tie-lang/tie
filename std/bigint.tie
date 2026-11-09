@@ -452,8 +452,8 @@ pub func mul(a: table<i64>, b: table<i64>) -> table<i64> {
 
 pub func divrem(a: table<i64>, b: table<i64>) -> (table<i64>, table<i64>) {
     var z = table_new_i64()
-    // p.6.1.7-RCA-2【2026-09-06】：多 limb 算法（含早退分支/归一化循环）的重局部在
-    // 非 entry 块，编译器出口析构（p.6.10.3）只释放 entry 级表局部 → 每次 divrem 泄漏
+    // -RCA-2【2026-09-06】：多 limb 算法（含早退分支/归一化循环）的重局部在
+    // 非 entry 块，编译器出口析构只释放 entry 级表局部 → 每次 divrem 泄漏
     // V/D/U/q/r0（Euclid 每步 ~215 次 → invmod × 2/点运算 × 256 阶梯 = 内存失控）。
     // 在 entry 预声明同名空表槽（alloca 在 entry，出口析构可覆盖），多 limb 路径原地
     // 赋值复用同一槽 —— 出口析构据此释放最终值，泄漏收敛。pt-局部在此改名避免与预声明
@@ -539,7 +539,7 @@ pub func divrem(a: table<i64>, b: table<i64>) -> (table<i64>, table<i64>) {
             rhat = a2 % vn1s
         }
         var topC: u128 = to_u128(ujn2)
-        // 校正（D3）：至多 2 次，rhat≥B 即终止
+        // 校正至多 2 次，rhat≥B 即终止
         while true {
             var tooBig: bool = qhat > 0xFFFFFFFFu128
             var bigProd: bool = (qhat * vn2s) > ((rhat << 32) + topC)
@@ -552,7 +552,7 @@ pub func divrem(a: table<i64>, b: table<i64>) -> (table<i64>, table<i64>) {
                 break
             }
         }
-        // 乘减（D4）：U[j..j+n] -= qhat*V
+        // 乘减U[j..j+n] -= qhat*V
         var borrow: u128 = to_u128(0)
         var i4: i64 = 0
         while i4 < n {

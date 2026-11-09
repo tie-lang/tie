@@ -1,10 +1,10 @@
 type tie<class>
-// lib/codegen/irgen_arith_p1.tie —— irgen_arith 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_arith_p1.tie —— irgen_arith 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_arith.tie。
 namespace irgen {
-// P1 数据流箭头生成（仅裸 Var 目标到达——调用/下标/字段目标已在解析器脱糖）。
+// 数据流箭头生成（仅裸 Var 目标到达——调用/下标/字段目标已在解析器脱糖）。
 // Fwd(->)：数据=LHS 目标=RHS；Rev(<-)：数据=RHS 目标=LHS。
 // 目标 = 函数类型 → 传参（`f(data)`，data 作唯一实参，tig_call_fn_value）；
 // 目标 = 数据变量 → 赋值 store（对齐 N_ASSIGN 的 tag-103 逻辑）+ 返回数据值。
@@ -47,7 +47,7 @@ func tig_arrow(op: i64, lhs: i64, rhs: i64) -> i64 {
     if dv2 < 0 {
         return -1
     }
-    // S1.3 数字族转换（对齐 N_ASSIGN 的 C2/C3）
+    // 数字族转换（对齐 N_ASSIGN 的 ）
     var vty = ast.node_type(data_n)
     if vty >= 0 && (types.is_int(vty) || types.is_float(vty)) &&
         (types.is_int(tgt_ty2) || types.is_float(tgt_ty2)) && vty != tgt_ty2 {
@@ -104,16 +104,16 @@ func tig_div_zero_check(rv: i64, rty: i64) -> i64 {
 }
 
 func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
-    // P1 数据流箭头：非算术/比较——`x <- data` / `data -> x`（裸 Var 目标）。
+    // 数据流箭头：非算术/比较——`x <- data` / `data -> x`（裸 Var 目标）。
     // 目标 = 函数 → 传参（data 作唯一实参）；= 变量 → 赋值 store + 值。
     if op == B_ARROW_FWD || op == B_ARROW_REV {
         return tig_arrow(op, lhs, rhs)
     }
-    // p.8.1.5 `?:` 安全默认值（Option<T> ?: T）→ cond_br + phi 解包
+    // `?:` 安全默认值（Option<T> ?: T）→ cond_br + phi 解包
     if op == B_ELVIS {
         return tig_elvis(lhs, rhs)
     }
-    // p.8.2.4 运算符重载：任一操作数为用户 struct 且声明对应 op_ 方法 → 发射方法调用
+    // 运算符重载：任一操作数为用户 struct 且声明对应 op_ 方法 → 发射方法调用
     //（调度规则与 sinfer.try_op_overload_binary 一致：左 struct 优先，其次右，两侧内置绝不）。
     if op >= 0 && op <= 10 {
         var olhs_t = ast.node_type(lhs)
@@ -175,7 +175,7 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
             return -1
         }
     }
-    // p.9.11.9 checked 运算（+? -? *? op 21-23）：整数溢出即运行期报错。
+    // checked 运算（+? -? *? op 21-23）：整数溢出即运行期报错。
     // 语义层已保证两侧为整数；此处直接分派（lv/rv 已求值，避免二次求值副作用）。
     if op >= 21 && op <= 23 {
         return tig_check_bin(op, lv, rv, lhs_t, rhs_t)
@@ -183,7 +183,7 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     // 字符串判定（node_types 语义类型；driver 树比较/拼接两侧为 string）
     var lhs_str = lhs_t == types.named(TK_STR)
     var rhs_str = rhs_t == types.named(TK_STR)
-    // p.9.13.3 `+` 扩展：一侧 string、另一侧标量（int/float/bool）→ 把标量侧
+    // `+` 扩展：一侧 string、另一侧标量（int/float/bool）→ 把标量侧
     // 转成字符串再拼接。**顺序严格按左右操作数**（`5 + "x"` 得 "5x"，不是 "x5"）——
     // 两侧各自转字符串，字符串侧原样透传，再 str_cat(lhs_s, rhs_s)。
     // 转换用值级 helper（`tig_scalar_to_str`）直接做，不造调用节点。
@@ -211,7 +211,7 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
         return tig_binary_str(op, lv, rv)
     }
     // 浮点判定（f64/f32 字面量与算术；对齐 Rust：类型以一侧为准，语义已统一）。
-    // f32 算术语义（S1.3，2026-10-09 落实）：操作数提升 f64 计算，结果按语义
+    // f32 算术语义（2026-10-09 落实）：操作数提升 f64 计算，结果按语义
     // 类型回窄——f32+f32 → f32（sinfer rt=lhs）；混 f64 → f64（sinfer 816 行）。
     // 此前操作数/结果类型与语义层脱节（f32 值落 double），任何 f32 算术路径
     // 在 LLVM 层类型错。
@@ -238,7 +238,7 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
             // 映射：数组模式按键有序存储 → zip 对比即按键规范化语义
             return tig_map_compare(op, lhs_t, lv, rv)
         }
-        // p.9.12.6：table<struct> 局部变量是行池（列式表示，scope 槽只是第 0 列
+        // table<struct> 局部变量是行池（列式表示，scope 槽只是第 0 列
         // 句柄）——按普通表比较会把「第 0 列 vs 整行表」错位。走逐列比较。
         var lelem = types.table_elem(lhs_t)
         if lelem > 0 && types.kind(lelem) == K_STRUCT {
@@ -260,14 +260,14 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     } else if op == 3 {
         iop = 3
     } else if op == 24 {
-        // p.9.0-S.7：整除 `\` 的 floor 语义由 tig_floor_divmod 前置处理（见本函数
+        // -S.7：整除 `\` 的 floor 语义由 tig_floor_divmod 前置处理（见本函数
         // 窄整数分支与 i64 分支的拦截）；此处的 sdiv 保留为**防御**——若将来新增
         // 未拦截的调用路径，退化为截断除而非生成非法 IR。
         iop = 3
     } else if op == 4 {
         iop = 4
     } else if op == 26 {
-        // p.9.0-S.7：`%%` 同理由 tig_floor_divmod 前置处理；此处 srem 为防御兜底。
+        // -S.7：`%%` 同理由 tig_floor_divmod 前置处理；此处 srem 为防御兜底。
         iop = 4
     } else if op == 5 {
         iop = 12
@@ -294,7 +294,7 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     } else {
         return -1
     }
-    // S1.3 A1 窄整数运算：任一侧不是 i64 → 按公共宽度生成（窄侧拓宽）。
+    // A1 窄整数运算：任一侧不是 i64 → 按公共宽度生成（窄侧拓宽）。
     // 公共宽度 = 与 sinfer 一致的 L2 字面量上下文推断：字面量侧常量在
     // 对方窄类型范围 → 对方类型；两侧变量 → 宽者；两侧字面量 → i64 默认。
     if types.is_int(lhs_t) && types.is_int(rhs_t) &&
@@ -325,7 +325,7 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
         } else {
             // 两侧字面量：默认 i64——但后缀字面量（i128/u128 等）按宽者
             // （`1i128 << 64`：lhs 明确 i128，common 须 i128，否则 trunc 到
-            // i64 类型错；批次 2 修复）
+            // i64 类型错；修复）
             if stype.int_width(rhs_t) > stype.int_width(lhs_t) {
                 common = rhs_t
             } else if stype.int_width(lhs_t) > stype.int_width(rhs_t) {
@@ -334,7 +334,7 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
                 common = types.named(TK_I64)
             }
         }
-        // p.9.0-S.7：整除 `\` / 成对取余 `%%` 按公共宽度走 floor 语义（规范 §3.3）
+        // -S.7：整除 `\` / 成对取余 `%%` 按公共宽度走 floor 语义（规范 §3.3）
         if op == 24 || op == 26 {
             var lf = tig_widen(lv, lhs_t, common)
             if lf < 0 {
@@ -348,14 +348,14 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
         }
         return tig_narrow_bin(op, iop, lv, rv, lhs_t, rhs_t, common)
     }
-    // p.6.8.1 typed ptr ==/!=（一等指针相等）：指针经 ptrtoint 后整数 icmp。
+    // typed ptr ==/!=（一等指针相等）：指针经 ptrtoint 后整数 icmp。
     // 语义层仅放行 ptr==/ptr!=（见 sinfer 比较分支）；< > <= >= 已被拦截。
     // 指针比较转 i64 整型比较，避免 llvmgen icmp 对 alloca/gep 地址的 cmp_ty
     // 推导偏差（ins_ty 承载元素语义类型非 ptr）——先正确后性能，等值语义无损。
     if types.is_ptr(lhs_t) || types.is_ptr(rhs_t) {
         return tig_binary_ptr(op, lv, rv, lhs_t, rhs_t)
     }
-    // p.9.0-S.7：整除 `\` / 成对取余 `%%` 的 floor 语义（i64 路径；窄整数见上）
+    // -S.7：整除 `\` / 成对取余 `%%` 的 floor 语义（i64 路径；窄整数见上）
     if op == 24 || op == 26 {
         return tig_floor_divmod(op, lv, rv, types.named(TK_I64))
     }
@@ -383,7 +383,7 @@ func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     return ir.get_value(inst)
 }
 
-// 窄整数公共宽度提升（S1.3 A1）：i8+i16 等混合宽度运算，窄侧先拓宽到
+// 窄整数公共宽度提升（A1）：i8+i16 等混合宽度运算，窄侧先拓宽到
 // 公共宽度（有符号 sext / 无符号 zext）。同宽度直传（LLVM 位模式一致）。
 // src 宽于 dst（字面量 i64 → 窄公共宽度）→ trunc 缩窄（常量回绕语义）。
 // 返回新值 id（未拓宽原样返回）。
@@ -393,7 +393,7 @@ func tig_ptrtoint(v: i64) -> i64 {
     return ir.get_value(pi)
 }
 
-// p.6.8.1 typed ptr ==/!=：指针经 ptrtoint 转 i64 后整数 icmp（等值语义无损）。
+// typed ptr ==/!=：指针经 ptrtoint 转 i64 后整数 icmp（等值语义无损）。
 // op 仅 5(==)/6(!=)——语义层已拦截 < > <= >=。左右若是指针则各自 ptrtoint；
 // 非指针侧（理论上不出现）原样保留。
 func tig_binary_ptr(op: i64, lv: i64, rv: i64, lhs_t: i64, rhs_t: i64) -> i64 {
@@ -424,7 +424,7 @@ func tig_widen(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
     var dw = stype.int_width(dst_ty)
     if sw == dw {
         // 同宽不同符号（u128→i128 等）：位模式一致，直传——LLVM 不允许
-        // 同宽 sext/zext（曾生成 zext i128 to i128 类型错；批次 2 修复）
+        // 同宽 sext/zext（曾生成 zext i128 to i128 类型错；修复）
         return v
     }
     if sw > dw {
@@ -445,7 +445,7 @@ func tig_widen(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
     return ir.get_value(z)
 }
 
-// 值类型转换（S1.3 C2/C3/as_* 的 IR 层）：src 类型值 → dst 类型。
+// 值类型转换（as_* 的 IR 层）：src 类型值 → dst 类型。
 // 覆盖：同符号整数拓宽（sext/zext）、缩窄（trunc）、int→float（sitofp）、
 // float→int（fptosi）、f32↔f64（fpext/fptrunc）；同宽 i↔u 位模式一致直传；
 // 字符串/表/聚合类型不做转换（原样返回）。返回新值 id。
@@ -516,7 +516,7 @@ func lit_in_range_irgen(v: i64, ty: i64) -> bool {
     return true
 }
 
-// 窄整数二元运算（S1.3 A1）：整数操作数按公共宽度（宽者）生成算术指令，
+// 窄整数二元运算（A1）：整数操作数按公共宽度（宽者）生成算术指令，
 // 窄侧先 sext/zext 拓宽——LLVM add i8 直接支持但两侧必须同型，i8+i16
 // 混合须先提升。比较（icmp）操作数同样公共宽度，结果仍 i1（LLVM 自动）。
 // 返回结果值 id。
@@ -529,7 +529,7 @@ func tig_narrow_bin(op: i64, iop: i64, lv: i64, rv: i64, lt: i64, rt: i64, commo
     if r2 < 0 {
         return -1
     }
-    // S1.3 B2 移位语义（无 UB）：窄类型移位量 >= 位宽 → 有定义结果。
+    // B2 移位语义（无 UB）：窄类型移位量 >= 位宽 → 有定义结果。
     // 左移（16）→ 0；算术右移（17，有符号）→ 符号位（0 或 -1，用
     // ashr(位宽-1) 求）；逻辑右移 → 0。LLVM shift 该场景 poison，select 保护。
     if op == 16 || op == 17 {
@@ -595,7 +595,7 @@ func tig_cmp_zero(v0: i64, cc: i64) -> i64 {
     return ir.get_value(ic)
 }
 
-// p.6.5.2 修复（直面编译器缺陷）：语句/表达式条件统一归一化为 i1——
+// 修复（直面编译器缺陷）：语句/表达式条件统一归一化为 i1——
 // cond_br 的条件操作数必须是 i1，而字面量/整型条件（`while 1`、`if x` x:i64）
 // 过去把 i64 值直接喂给 cond_br（LLVM 校验失败：-O0 报 invalid redefinition、
 // -O2 报 "defined with type 'i64' but expected 'i1'"）。Bool 型直接用；
@@ -661,7 +661,7 @@ func tig_select_i(cond: i64, tval: i64, fval: i64, ty: i64) -> i64 {
     return ir.get_value(sl)
 }
 
-// ---------- p.9.0-S.7 整除 `\` / 成对取余 `%%` 的 floor 语义（规范 §3.3）----------
+// ---------- -S.7 整除 `\` / 成对取余 `%%` 的 floor 语义（规范 §3.3）----------
 // 规范定义：整除给出**向下取整**的商，`%%` 给出与之配对的余数（余数符号跟随除数），
 // 二者满足 a == (a \ b) * b + (a %% b)。C 风格截断在负数上不满足该式。
 //

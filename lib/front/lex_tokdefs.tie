@@ -1,7 +1,7 @@
 type tie<class>
-// lib/front/lex_tokdefs.tie —— T2.4 token 定义与列式表（模块拆分）
+// lib/front/lex_tokdefs.tie —— token 定义与列式表（模块拆分）
 // ============================================================
-// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）完整词法器
+// 职责：完整词法器
 // lexer.tie 拆分为 5 模块之一（本文件 = tag 常量/字符分类/行列反推/ASI/
 // 列式 token 表/doc 收集）。tag 常量与全局变量（tok_*/doc_*/g_* 来自
 // ./lex_state.tie）按 tie 约束留顶层，namespace lextok 内函数裸名访问。
@@ -62,43 +62,43 @@ pub const lex_asm: i64 = 84;        // asm 关键字（S1.2：asm! 内联汇编�
 pub const lex_panic: i64 = 85;      // panic 关键字（S2.3：panic("消息") 不可恢复错误）
 pub const lex_port: i64 = 86;       // port 关键字（S2.4：接口声明 port Drawable { ... }）
 pub const lex_impl: i64 = 87;       // impl 关键字（S2.4：实现块 impl Drawable for Button { ... }）
-// S3.3 宏/元编程：macro 关键字 + 反引号（准引用）+ $（插值）。
-// 说明：S3.3 与 S2.4 并行开发，tag 编号取 88-90 不冲突；若合并时 S2.4 已占用
+// 宏/元编程：macro 关键字 + 反引号（准引用）+ $（插值）。
+// 说明：与 并行开发，tag 编号取 88-90 不冲突；若合并时 已占用
 // 88/89，以本文件（后合并者）为准调整（保留 lex_port/lex_impl 不变）。
 pub const lex_macro: i64 = 88;      // macro 关键字（S3.3：宏定义 macro name(...) -> code { ... }）
 pub const lex_backtick: i64 = 89;   // ` 反引号（S3.3：准引用 `(expr) / `{ stmts } 构造 code 值）
 pub const lex_dollar: i64 = 90;     // $ 插值符（S3.3：$x 嵌入 / $name 标识符插值，仅准引用内合法）
-// M4 过程宏（dev33 批次9）：# 属性起始符——`#[macro]` 标记宏定义为过程宏
+// 过程宏：# 属性起始符——`#[macro]` 标记宏定义为过程宏
 //（token 流 API 驱动），tag 91 为符号表新增（'#' = 0x23，介于 '!=' 与 '$' 之间）。
 pub const lex_hash: i64 = 91;       // # 哈希符（属性语法 `#[name]`）
 pub const lex_actor: i64 = 92;      // actor 关键字（一期并发：actor 原生语法）
 pub const lex_async: i64 = 93;      // async 关键字（actor 异步投递方法修饰）
 pub const lex_goto: i64 = 94;       // goto 关键字（三期：`unsafe goto #x` 无条件跳转，§7.1.5）
-// P1 数据流箭头 `<-`（镜像 `->`）：符号表新增（'<-' = 0x3C 0x2D，介于 '<' 与 '<<' 之间）
+// 数据流箭头 `<-`（镜像 `->`）：符号表新增（'<-' = 0x3C 0x2D，介于 '<' 与 '<<' 之间）
 pub const lex_larrow: i64 = 95;
-// p.8.2.3 字符串插值起始 '{'：scan_string 插值分支专用 tag——与块/结构体开括号
+// 字符串插值起始 '{'：scan_string 插值分支专用 tag——与块/结构体开括号
 // lex_lbrace 区分（`if s == "a" {` 的块 lbrace 不能误入插值链）；不落符号表，
 // 仅 scan_string 插值分支合成推送。tag 96 位于符号表范围之外，无冲突。
 pub const lex_interp_lbrace: i64 = 96;
-// p.9.13.1 单箭头统一：`=>` 已移除（lex_fatarrow 定案删除，零兼容别名），
+// 单箭头统一：`=>` 已移除（lex_fatarrow 定案删除，零兼容别名），
 // 符号表不再登记 `=>`；lex_scan.scan_symbol 对 `=>` 直接报「已移除，请用 `->`」。
 // 分支臂/返回位/管道统一用 `->`（lex_arrow）。原保留段 tag 97 废弃空闲。
-// p.9.11.6 表不可变更新运算符 `with`（保留字，tag 98；位于符号表范围之外，
+// 表不可变更新运算符 `with`（保留字，tag 98；位于符号表范围之外，
 // 与 lex_interp_lbrace=96 错开；实际映射值在 lex_symtab.build_kw 关键字表登记）。
 // `t with {k: v}` 二元运算符 token，参照单箭头 `->` 新 token 手法。
 pub const lex_with: i64 = 98;
-// p.9.11.9 checked 运算运算符 `+?`/`-?`/`*?`（符号表 3→2→1 最长匹配；
+// checked 运算运算符 `+?`/`-?`/`*?`（符号表 3→2→1 最长匹配；
 // 与 `?` 解包/`?.`/`a?[i]` 前缀不冲突——各自的第二字符不同，最长匹配天然区分）。
 pub const lex_plusq: i64 = 99;    // `+?` checked 加（溢出即运行期报错）
 pub const lex_minusq: i64 = 100;  // `-?` checked 减
 pub const lex_starq: i64 = 101;   // `*?` checked 乘
-// p.9.11.10 `inline` 函数标注保留字（tag 102）；p.9.11.11 `immut` 只读形参保留字。
+// `inline` 函数标注保留字（tag 102）；`immut` 只读形参保留字。
 pub const lex_inline: i64 = 102;  // `inline fn` 内联提示
 pub const lex_immut: i64 = 103;   // `fn f(immut t)` 只读形参修饰
-// p.9.11.12 @注解起始符（tag 104）：`@name` / `@name(args)` 声明前置注解。
+// @注解起始符（tag 104）：`@name` / `@name(args)` 声明前置注解。
 // 映射值登记于 lex_symtab.build_sym（'@' = 0x40，介于 '?' 与 '[' 之间）。
 pub const lex_at: i64 = 104;      // @ 注解符（声明前置元数据）
-// p.9.13.3 整除运算符 `\`（tag 108）与复合赋值 `\=`（tag 109）：符号表新增。
+// 整除运算符 `\`（tag 108）与复合赋值 `\=`（tag 109）：符号表新增。
 // 为何不用 `//`（设计稿原定）：`//` 已是行注释（scan_slash 分派），改注释规则是
 // 破坏性改动。`\`（0x5C）在符号表中完全空闲——介于 "["（0x5B）与 "]"（0x5D）
 // 之间；`\=` 与 `\` 同首字符，按最短优先排在 `\` 之后。字符串内的 `\` 是转义符，
@@ -112,43 +112,43 @@ pub const lex_at: i64 = 104;      // @ 注解符（声明前置元数据）
 //   grep -o ": i64 = [0-9]*" lex_tokdefs.tie | sed 's/: i64 = //' | sort -n | uniq -d
 pub const lex_backslash: i64 = 108;    // `\` 整除（int 截断除 / f64 floor-div）
 pub const lex_backslasheq: i64 = 109;  // `\=` 整除复合赋值
-// p.9.13.3 幂 `**`（tag 110）与 floor 取余 `%%`（tag 111）：符号表新增。
+// 幂 `**`（tag 110）与 floor 取余 `%%`（tag 111）：符号表新增。
 // 排序（严格升序，最短优先）：`*`(0x2A) < `**`(0x2A 0x2A) < `*=`(0x2A 0x3D) < `*?`(0x2A 0x3F)；
 // `%`(0x25) < `%%`(0x25 0x25) < `%=`(0x25 0x3D)。
 // 分配依据：本文件最大值此前为 109（上一行），故取 110/111（见上方 RCA 纪律：先做重号扫描）。
 pub const lex_starstar: i64 = 110;        // `**` 幂（右结合，高于 `*`）
 pub const lex_percentpercent: i64 = 111;  // `%%` floor 取余（与 `\` 成对）
-// p.9.11 `%%=` 复合赋值（tag 118，2026-10-07 补）：规范 §1 运算符表与 §4 示例都写了
+// `%%=` 复合赋值（tag 118，2026-10-07 补）：规范 §1 运算符表与 §4 示例都写了
 // `count %%= 5 // 原地取余并写回`，实现此前缺此 token ⇒ 直接报 E00832。
 // 取号依据：本文件此前最大值 117；已按上方 RCA 纪律做重号扫描（无重复）。
 // 符号表排序（严格升序，最短优先）：`%` < `%%` < `%%=` < `%=`（第 2 字节 0x25 < 0x3D）。
 pub const lex_percentpercenteq: i64 = 118;  // `%%=` floor 取余复合赋值
-// p.9.11 `is` 类型判定（tag 119，规范 §3.16）：`v is i64` 询问动态类型值的实际类型。
+// `is` 类型判定（tag 119，规范 §3.16）：`v is i64` 询问动态类型值的实际类型。
 // 取号依据：本文件此前最大值 118；已按上方 RCA 纪律做重号扫描（无重复）。
 // 关键字插入位置：build_kw 表 "interface" 与 "macro" 之间（strcmp 升序：interface < is < macro）。
 pub const lex_is: i64 = 119;               // `is` 类型判定运算符
-// p.9.11 `reentrant`（tag 120，规范 §10.7 重入）：actor 消息方法修饰符——
+// `reentrant`（tag 120，规范 §10.7 重入）：actor 消息方法修饰符——
 // 默认不重入（单消费者串行，环 A→B→A 死锁）；标注后该方法阻塞于对外同步 RPC
 // 期间允许嵌套处理本 actor 队列中的**异步**消息（同步消息因 done@104 单槽
 // 语义仍排队）。
 pub const lex_reentrant: i64 = 120;        // `reentrant` actor 方法重入修饰
-// p.9.11 `await`（tag 121，规范 §10.6 结果的延后取得）：`var f = w.compute(x)`
+// `await`（tag 121，规范 §10.6 结果的延后取得）：`var f = w.compute(x)`
 // 产生 future<T> 凭据，`var r = await f` 需要时取值（等待 + 结果 + 错误同路径）。
 pub const lex_await: i64 = 121;            // `await` future 取值前缀
-// p.9.13.3 checked 幂 `**?`（tag 112）：与 `**` 同级；int 族溢出即运行期报错
-//（对齐 p.9.11.9 的 `+?`/`-?`/`*?` 族）。符号表排序 `**` < `**?` < `*=`。
+// checked 幂 `**?`（tag 112）：与 `**` 同级；int 族溢出即运行期报错
+//（对齐 的 `+?`/`-?`/`*?` 族）。符号表排序 `**` < `**?` < `*=`。
 pub const lex_starstarq: i64 = 112;       // `**?` checked 幂
-// p.9.11.26 参数传递约定矩阵：`move` 保留字（tag 113）。
+// 参数传递约定矩阵：`move` 保留字（tag 113）。
 // 用于**参数位修饰符** `move x: T`（所有权转移约定，与 `ref`/`immut` 并列）。
 // 取 113 的依据：本文件此前最大值 112（上一行）；关键字侧用 107（alias），
 // 符号侧用到 112，故 113 起空闲（见上方 RCA 纪律：先做重号扫描）。
-// 破坏性评估：`move` 此前**没有任何编译器语义**（language.md §13 记载的
+// 破坏性评估：`move` 此前**没有任何编译器语义**（ 记载的
 // `var b = move a` 用途并未实现——全仓无 move 的 token/节点/处理），且把 move
 // 用作标识符的代码仅 9 处且全在注释/README 中 → 升为保留字无实际影响。
 pub const lex_move: i64 = 113;            // `move` 所有权转移形参修饰
 pub const lex_tilde: i64 = 114;           // `~` 整数按位取反
 pub const lex_dotdoteq: i64 = 115;        // `..=` 闭区间
-// p.9.11.36 `deep` 值语义形参修饰符（tag 116）：与 `immut`（只读引用）对偶。
+// `deep` 值语义形参修饰符（tag 116）：与 `immut`（只读引用）对偶。
 //   `func f(deep p: S)` ⇒ 入口把 p 的**表字段**深拷贝一份，此后函数内对 p 的一切
 //   修改都影响不到调用方（默认的按值传参只拷贝句柄，表仍是共享的）。
 // 取 116 的依据：本文件此前最大值 115（上一行）；已按 RCA 纪律做全文重号扫描
@@ -156,15 +156,15 @@ pub const lex_dotdoteq: i64 = 115;        // `..=` 闭区间
 // tiec/tiu/tlib 全仓**无任何出现**（grep -w = 0），升为保留字无影响。
 pub const lex_deep: i64 = 116;            // `deep` 值语义形参修饰（深拷贝表字段）
 pub const lex_shared: i64 = 117;          // `shared` 显式共享形参修饰（不复制，可选中高性能路径）
-// p.9.11.15 yield 生成器关键字（tag 105）：`func gen() { yield v; ... }`——
+// yield 生成器关键字（tag 105）：`func gen { yield v; ... }`——
 // 含 yield 的函数 = 生成器函数（产出序列，调用返回迭代序列对象/表）。
 pub const lex_yield: i64 = 105;   // yield 关键字（生成器产出语句）
-// p.9.11.21 interface 关键字（tag 106）：`interface Drawable { pub func 签名... }`
-// 结构性接口声明（鸭子多态静态检查；与 S2.4 port 名义接口同登记表，语义
+// interface 关键字（tag 106）：`interface Drawable { pub func 签名... }`
+// 结构性接口声明（鸭子多态静态检查；与 port 名义接口同登记表，语义
 // 区别 = 实现关系判定：有签名兼容方法即实现，无需显式 impl 块）。映射值
 // 登记于 lex_symtab.build_kw（"interface" 在 "inline" 与 "macro" 之间，严格升序）。
 pub const lex_interface: i64 = 106; // interface 关键字（结构性接口声明）
-// p.9.11.32：alias 为真保留字（build_kw 登记；既有代码中以 alias 作标识符的
+// alias 为真保留字（build_kw 登记；既有代码中以 alias 作标识符的
 // 10 处已由 prep/alias_kw_clean.tie 一键改名为 alias_id）
 pub const lex_alias: i64 = 107;   // alias 关键字（p.9.11.32 类型别名）
 
@@ -224,7 +224,7 @@ pub func col_of(pos: i64) -> i64 {
 // ---------- ASI 判定 ----------
 // 是否二元运算符（区间 [lex_plus..lex_question] 内除 Bang/Inc/Dec 外全部是，
 // 与 Rust is_bin_op 对齐；++/-- 特意不算——后缀 i++\n 应补分号）。
-// S2.3 起 '?'（lex_question）也不算：它作为后缀解包符（expr ?）时是语句
+//  '?'（lex_question）也不算：它作为后缀解包符（expr ?）时是语句
 // 结束符，行尾应补分号（`var v = f() ?\nreturn ...` 才能正确断句）；
 // 三目 `cond ? a : b` 在同一行书写，不触发 ASI，不受影响。
 func is_bin_op(tag: i64) -> bool {
@@ -256,16 +256,16 @@ func is_decl_start(tag: i64) -> bool {
     if tag == lex_struct || tag == lex_enum || tag == lex_namespace || tag == lex_import || tag == lex_using {
         return true
     }
-    // S1.2：unsafe fn / repr(C) struct 的 doc 附着
+    // unsafe fn / repr(C) struct 的 doc 附着
     if tag == lex_unsafe || tag == lex_repr {
         return true
     }
-    // S2.4：port 声明 / impl 块的 doc 附着；S3.3：macro 定义
+    // port 声明 / impl 块的 doc 附着；：macro 定义
     // （doc 附着到宏定义声明）
     if tag == lex_port || tag == lex_impl || tag == lex_macro {
         return true
     }
-    // p.9.11.21：interface 声明的 doc 附着（结构性接口）
+    // interface 声明的 doc 附着（结构性接口）
     if tag == lex_interface {
         return true
     }
@@ -354,7 +354,7 @@ pub func collect_doc(txt: string) {
 }
 
 // 把 pending doc 附着到当前声明（ordinal = len(doc_keys)，push 即排序对）。
-// p.9.11.29：同时记录声明起始 token 所在行（decl_line），parser 侧按
+// 同时记录声明起始 token 所在行（decl_line），parser 侧按
 // doc_decl_lines[k] == ast.line(声明节点) 匹配归属。
 func flush_doc(decl_line: i64) {
     if str_len(g_doc_pending) == 0 {
@@ -367,7 +367,7 @@ func flush_doc(decl_line: i64) {
     g_doc_pending = ""
 }
 
-// ---------- p.9.11.29 doc 注册表跨命名空间读取（parser/工具链消费）----------
+// ---------- doc 注册表跨命名空间读取（parser/工具链消费）----------
 // doc 条数。
 pub func doc_entry_count() -> i64 {
     return len(doc_keys)

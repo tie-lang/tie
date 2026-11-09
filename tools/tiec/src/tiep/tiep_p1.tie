@@ -1,5 +1,5 @@
 type tie<class>
-// compiler/interp/interp_p1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// compiler/interp/interp_p1.tie —— 分片 1
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 interp.tie。
@@ -155,7 +155,7 @@ func split_top(src: string) -> table<string> {
 }
 
 // 依据 first_word 把 src[lo:hi) 追加到 g_split_defs（定义词）或 g_split_stmts。
-// p.9.17.4 第二步：顶层 `func` 定义段顺带入 JIT 源码库（名称 + 原文切片）。
+// 第二步：顶层 `func` 定义段顺带入 JIT 源码库（名称 + 原文切片）。
 func flush_statement(src: string, lo: i64, hi: i64, first_word: string, have: bool) {
     if !have {
         return
@@ -171,7 +171,7 @@ func flush_statement(src: string, lo: i64, hi: i64, first_word: string, have: bo
     }
 }
 
-// p.9.17.4 第二步：捕获一个顶层函数定义段（源码原文切片）到 JIT 源码库。
+// 第二步：捕获一个顶层函数定义段（源码原文切片）到 JIT 源码库。
 // 同名重定义追加在尾部（fn_src_lookup 从尾取最新）；名字提取失败则丢弃。
 func fn_src_capture(slice: string) {
     if !g_fn_src_ready {
@@ -237,7 +237,7 @@ func fn_name_of_slice(s: string) -> string {
     return name
 }
 
-// p.9.17.4 第二步：查 JIT 源码库（从尾向前取最新同名）。未命中返回空串。
+// 第二步：查 JIT 源码库（从尾向前取最新同名）。未命中返回空串。
 func fn_src_lookup(name: string) -> string {
     if !g_fn_src_ready {
         return ""
@@ -252,11 +252,11 @@ func fn_src_lookup(name: string) -> string {
     return ""
 }
 
-// p.9.3.9 修复：var **不再**归定义词——顶层 var 声明（含带副作用的 init，
+// 修复：var **不再**归定义词——顶层 var 声明（含带副作用的 init，
 // 如 exec_code/file_read）必须留在语句段（main 体）按源码序执行。此前 var
 // 进定义段 → reg_one_top 在 register_top_level（第一趟）立即求值 init，
 // 全部副作用提前到 main 体语句之前：脚本读不到先前的写、exec_code 表现
-// 为「异步」、变量值「不稳定」（D4/§4 全部玄学的单一根因）。main 体内的
+// 为「异步」、变量值「不稳定」（/§4 全部玄学的单一根因）。main 体内的
 // var 经 exec_stmt_var_decl 落 globals（跨行持久），语义不回退。
 func is_def_word(w: string) -> bool {
     if w == "func" || w == "struct" || w == "enum" || w == "namespace" ||
@@ -368,7 +368,7 @@ func register_top_level() -> string {
             isess.f_put(isess.nname_str(s), s)
             count = count + 1
         } else if t == N_MACRO_DEF {
-            // S3.3：宏定义注册——宏 = 编译期函数（布局同 FnDef 无泛型槽）：
+            // 宏定义注册——宏 = 编译期函数（布局同 FnDef 无泛型槽）：
             // 进 funcs（可被宏体互调/展开调用）+ 宏名单（调用点宏展开分派）。
             isess.f_put(isess.nname_str(s), s)
             isess.m_put(isess.nname_str(s))
@@ -401,7 +401,7 @@ func register_top_level() -> string {
             w_err = "REPL v1 暂不支持 using"
             return w_err
         } else if t == N_EXTERN {
-            // extern 声明（T0.7）：链接期符号，无函数体——只记录名字
+            // extern 声明：链接期符号，无函数体——只记录名字
             isess.e_add(isess.nname_str(s))
         } else {
             w_err = "顶层只允许函数/类/import/using/命名空间/全局变量/extern 声明定义"
@@ -594,7 +594,7 @@ func exec_stmt(id: i64) {
 // VarDecl：children=[ty 或 -1, init]；name=变量名。
 // 顶层（作用域栈空）声明 → globals；嵌套块/函数体 → 当前作用域。
 func exec_stmt_var_decl(id: i64) {
-    // p.9.17.3：变量名以 interned id 参与查找（整数键）；错误文本延迟到冷分支才还原
+    // 变量名以 interned id 参与查找（整数键）；错误文本延迟到冷分支才还原
     var nid = isess.nname(id)
     var ty_node = isess.nchild_at(id, 0)
     var init = isess.nchild_at(id, 1)
@@ -610,7 +610,7 @@ func exec_stmt_var_decl(id: i64) {
     } else {
         val = vval.new_void()
     }
-    // 平衡三进制字面量适配（M4 补齐）：标注 trit 且初始化是 bool 字面量时
+    // 平衡三进制字面量适配：标注 trit 且初始化是 bool 字面量时
     // 转换为 trit（true→+1 / false→-1）——与编译路径的字面量适配语义一致。
     // 注意：tie 的 && 不短路（两侧都求值），必须嵌套 if 防越界访问
     if ty_node >= 0 {

@@ -12,7 +12,7 @@ type tie<class>
 // archive/compiler-v1/lexer.tie 的字符分类；ext/codec/zstd|lz4|brotli.tie 的
 // 32..126 可打印 ASCII 查表 char↔code。
 // 调用：import 后 utf.codepoint(...) / utf.byte_len(...)；命名空间内互调为裸调用。
-// 命名规范：命名空间内函数不加 utf_ 前缀（统一 func 写法，Harbor M2.1.6）。
+// 命名规范：命名空间内函数不加 utf_ 前缀（统一 func 写法，Harbor ）。
 // 码点 → 字符：底座原语 str_from_code（任意合法 Unicode 码点，含中文/emoji；
 // 非法码点返回空串），本模块 from_code 为其封装，与 codepoint（字符 → 码点）对称；
 // utf.to_char 仍保留 ASCII 查表方案（码点 → 可打印 ASCII 单字符，历史约定）。
@@ -108,7 +108,7 @@ func hex2(v: i64) -> string {
 }
 
 // 码点 → LLVM c"..." 风格字节转义序列：UTF-8 编码的**每个字节**输出大写 \XX。
-// 示例：0x56DB（"四"）→ "\E5\9B\9B"；0x41（"A"）→ "\41"。
+// 示例：0x56DB（"四"）→ "\\9B\9B"；0x41（"A"）→ "\41"。
 // 对齐 crates/tie-llvm/src/ir.rs escape_ir_string：非可打印字节输出 \XX 大写十六进制。
 // UTF-8 位运算（逐字节取码点高位 + 0x80 延续位）：
 //   2 字节 = 0xC0|(cp>>6), 0x80|(cp&0x3F)

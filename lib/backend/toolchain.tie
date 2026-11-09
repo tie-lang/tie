@@ -1,13 +1,13 @@
 type tie<class>
-// toolchain.tie：自举 T3.1 —— 工具链驱动模块（命名空间 tc）
+// toolchain.tie：自举 —— 工具链驱动模块（命名空间 tc）
 // ============================================================
 // 对齐 Rust crates/tie-llvm/src/backend.rs：调用 LLVM 工具链
 // （opt / clang / llvm-ar）完成中间优化、链接可执行文件、库编译。
 // 依赖语言底座原语 exec_code / exec_output（C ABI 桥，链接 tie-interp）。
 //
 // 功能：
-//   - 工具发现：TIE_LLVM_HOME\bin → PATH → D:\LLVM\bin → C:\Program Files\LLVM\bin →
-//     C:\LLVM\bin（对齐 Rust find_clang / find_llvm_ar；TIE_LLVM_HOME 由 Rust 侧
+//   - 工具发现：TIE_LLVM_HOME\bin → PATH → LLVM 常见安装目录
+//     （对齐 Rust find_clang / find_llvm_ar；TIE_LLVM_HOME 由 Rust 侧
 //     tie 启动器对随发行版 vendored LLVM（bin\llvm\bin）设置，优先级最高）
 //   - 中间优化（可选）：opt -O{0|1|2} -S in.ll -o out.opt.ll（-l2/-l3 跳过）
 //   - 链接可执行：clang in.opt.ll -o out.exe [--target=T] [interp.lib]
@@ -21,7 +21,7 @@ type tie<class>
 // （cmd 不认 `"C:\path\exe"` 作为命令名）；本环境路径无空格，安全。
 //
 // 调用：import 后 tc.opt(...) / tc.link_exe(...)；命名空间内互调为裸调用。
-// 命名规范：命名空间内函数不加 tc_ 前缀（统一 func 写法，Harbor M2.1.6）。
+// 命名规范：命名空间内函数不加 tc_ 前缀（统一 func 写法，Harbor ）。
 //
 // 注意：本模块**不 import 任何库**（含 std/string.tie）——tie 编译器 import
 // 不去重，std/string.tie 已由 driver → irgen → semantic → parser → lexer →
@@ -31,7 +31,7 @@ type tie<class>
 // 最近一次工具调用的错误消息（stderr 文本；成功时空串）
 pub var tc_err_msg: string = "";
 
-// S1.4 --ffast-math：编译产物启用 fast-math（训练/性能优先；默认关）。
+// --ffast-math：编译产物启用 fast-math（训练/性能优先；默认关）。
 // driver 经 tc.set_fast_math(...) 置位，clang 链接/编译目标文件命令追加 -ffast-math
 //（opt 不接受该旗标，故仅在 clang 阶段应用）。
 var tc_fast_math: bool = false;
@@ -70,7 +70,7 @@ pub func set_native_simd(on: bool) {
     g_native_simd = on
 }
 
-// S1.4：注入 --ffast-math 开关（driver 调用；置位后 opt/clang 追加 -ffast-math）。
+// 注入 --ffast-math 开关（driver 调用；置位后 opt/clang 追加 -ffast-math）。
 pub func set_fast_math(v: bool) {
     tc_fast_math = v
 }
@@ -81,10 +81,10 @@ pub func set_no_warn(v: bool) {
 }
 
 // 工具发现顺序：TIE_LLVM_HOME\bin → PATH 拆分目录 → 固定目录
-// （D:\LLVM\bin → C:\Program Files\LLVM\bin → C:\LLVM\bin）。找不到返回空串。
+// （LLVM 常见安装目录）。找不到返回空串。
 // 实现：get_env("TIE_LLVM_HOME") 非空则先查 {home}\bin\{name}.exe（vendored LLVM
 // 发行目录，Rust 侧 tie 启动器设置；home 假定无空格，命令不加引号）；再按 ';' 拆分
-// PATH 逐目录查。r.1.6.1：候选目录内查工具——Windows 工具带 .exe，Linux 本机工具无后缀。
+// PATH 逐目录查。候选目录内查工具——Windows 工具带 .exe，Linux 本机工具无后缀。
 // 路径分隔符统一用 "/"（Win32 file_exists 接受正斜杠，POSIX 亦然）。
 func tool_probe(dir: string, name: string) -> string {
     var pe = dir + "/" + name + ".exe"
@@ -149,7 +149,7 @@ pub func find_llvm_ar() -> string {
 
 // 按 ';' 拆分 PATH 为目录表（忽略空段）。
 func split_env(path_var: string) -> table<string> {
-    // r.1.6.6：分隔符自适应——Windows PATH 用 ';'，POSIX 用 ':'。含 ';' 按 ';'
+    // 分隔符自适应——Windows PATH 用 ';'，POSIX 用 ':'。含 ';' 按 ';'
     // 拆（Windows 惯例，避免盘符冒号误拆）；否则含 ':' 按 ':' 拆（Linux 自举链）。
     var sep = ";"
     if !has_sub(path_var, ";") && has_sub(path_var, ":") {
@@ -192,7 +192,7 @@ func run(cmd: string) -> i64 {
 }
 
 // 机器码档（clang 的 -O）。三处 clang 调用共用；由 driver 经 set_clang_opt 注入。
-// 背景（2026-10-17 实测）：此前三处都没有 -O ⇒ 机器码是 -O0；同一份优化后 IR
+// 背景（实测）：此前三处都没有 -O ⇒ 机器码是 -O0；同一份优化后 IR
 // 换 -O2，1 亿次算术循环 160ms → 55ms（2.9×），二进制反而更小。默认 0 保持
 // 既有构建速度，发布档用 -c2。
 // 注：状态变量必须放**文件顶层**（namespace 体内禁 var，E00449）。
@@ -286,8 +286,8 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         tc_err_msg = "未找到 clang，请确认 LLVM 已安装并在 PATH 中"
         return -1
     }
-    // r.1.6.1：Linux 目标用 lld 链接（clang 默认 GNU ld 在 Windows 宿主不可用）。
-    // r.1.6.1：Linux 目标用 lld 链接（clang 默认 GNU ld 在 Windows 宿主不可用）。
+    // Linux 目标用 lld 链接（clang 默认 GNU ld 在 Windows 宿主不可用）。
+    // Linux 目标用 lld 链接（clang 默认 GNU ld 在 Windows 宿主不可用）。
     // 自由站立目标同理：*-none-* 在 Windows 宿主会被 clang 转给 gcc 驱动，
     // 统一归一到 linux-gnu 三元组后用 lld 产出 ELF。
     if tc_uefi {
@@ -298,7 +298,7 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     var is_linux = str_len(target) > 0 && has_sub(target, "linux")
     // /STACK:134217728（128MB）：自举链编译器（tiec 编译的 driver）处理大文件
     // （编译 driver 自身）时递归/嵌套调用栈深，默认 1MB 栈会 0xC00000FD 溢出；
-    // S3.3 整合后 interp 深递归使大树检查深度超过 16MB，提至 128MB（命令行
+    // 整合后 interp 深递归使大树检查深度超过 16MB，提至 128MB（命令行
     // 工具虚拟内存充裕，无副作用）。仅 Windows（/Brepro /STACK 为 MSVC 风格）。
     // -fuse-ld=lld 仅对「vendored LLVM」生效：clang 必须来自 TIE_LLVM_HOME
     // 指定的目录（发布包场景，用户无 MSVC → 用随包 lld-link）。
@@ -370,7 +370,7 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         }
     } else if is_linux {
         cmd = cmd + " -Wl,--build-id=none"
-        // r.1.6.6：Linux 目标 LLVM libcall（floor/pow/sqrt 等浮点运算下降为
+        // Linux 目标 LLVM libcall（floor/pow/sqrt 等浮点运算下降为
         // libm 函数）须显式 -lm——glibc 默认不链 libm，缺符号链接失败。
         cmd = cmd + " -lm"
     } else {
@@ -382,11 +382,11 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     // Windows 目标：链接 GDI/用户库（平台适配器 cap_win 等 extern user32/gdi32；
     // 对非 Windows 交叉目标不追加，避免 libuser32 缺失）
     if !tc_uefi && (str_len(target) == 0 || has_sub(target, "windows")) {
-        // p.6.4.1：arg_count/arg_string 内联 CommandLineToArgvW（shell32）；即使
+        // arg_count/arg_string 内联 CommandLineToArgvW（shell32）；即使
         // 程序不链 interp（无 tie_* 桥）也须解析该符号，故恒链 -lshell32。
         cmd = cmd + " -luser32 -lgdi32 -lshell32"
     }
-    // p.6.4.5：程序用了网络原语（net_* 内联 Winsock2）→ 独立链 ws2_32
+    // 程序用了网络原语（net_* 内联 Winsock2）→ 独立链 ws2_32
     // （脱离 tie_interp 后不再借道 interp 的 -lws2_32）。Linux socket 在 libc，不链。
     if need_wsock {
         if !is_linux {
@@ -406,9 +406,9 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         }
         cmd = cmd + " " + lib + " -lws2_32 -luserenv -lntdll -lbcrypt -ladvapi32 -lole32 -lshell32"
     }
-    // trm-lite 阶段1块2：程序用了轻量执行体内置（spawn/yield/collect）或表容器
-    // （P2a：table<T> 运行时已迁 trm-lite tl_tbl）→ 链 trm_lite.a。
-    // p.6.7.2：若本模块已 import 复杂形态（tl_tbl 等桥符号已内联 define，含
+    // trm-lite 程序用了轻量执行体内置（spawn/yield/collect）或表容器
+    // （table<T> 运行时已迁 trm-lite tl_tbl）→ 链 trm_lite.a。
+    // 若本模块已 import 复杂形态（tl_tbl 等桥符号已内联 define，含
     // table 码生成的 extern 引用）→ 不追加 .a（避免多重定义：模块定义 + .a 重复）。
     if need_trmlite {
         if llvmgen.tbl_inlined_check() == 0 {
@@ -421,7 +421,7 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
             cmd = cmd + " " + tlib
         }
     }
-    // 批次 2：i128/u128 除法/取余生成 __divti3/__umodti3 等 compiler-rt 辅助
+    // i128/u128 除法/取余生成 __divti3/__umodti3 等 compiler-rt 辅助
     // 调用——clang 默认不链接 builtins，缺符号（undefined symbol: __divti3）。
     // -rtlib=compiler-rt 让 clang 在资源目录自动定位 builtins 库
     // （clang 22 对 -lclang_rt.builtins-x86_64 带点参数解析错误，弃用）。
@@ -431,7 +431,7 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     return run(cmd)
 }
 
-// 链接动态库（M5 dev33 批次 12）：clang -shared in.opt.ll -o out.dll/.so [--target=T]。
+// 链接动态库：clang -shared in.opt.ll -o out.dll/.so [--target=T]。
 // Windows：dllexport 导出面由 irgen 标记，lld/link 自动导出符号；
 // Linux：-fPIC -shared（ELF 符号默认可见）。
 // need_interp 为 true 时同样链接 tie_interp.lib（桥程序打成动态库）。
@@ -471,17 +471,17 @@ pub func link_shared(input_opt: string, output_so: string, target: string, need_
     if str_len(target) > 0 {
         cmd = cmd + " --target=" + target
     }
-    // r.1.6.6：Linux .so 同样显式 -lm（LLVM 浮点 libcall）
+    // Linux .so 同样显式 -lm（LLVM 浮点 libcall）
     if is_linux {
         cmd = cmd + " -lm"
     }
     // Windows 目标：链接 GDI/用户库（平台适配器 extern user32/gdi32）
     if str_len(target) == 0 || has_sub(target, "windows") {
-        // p.6.4.1：arg_count/arg_string 内联 CommandLineToArgvW（shell32）；即使
+        // arg_count/arg_string 内联 CommandLineToArgvW（shell32）；即使
         // 程序不链 interp（无 tie_* 桥）也须解析该符号，故恒链 -lshell32。
         cmd = cmd + " -luser32 -lgdi32 -lshell32"
     }
-    // p.6.4.5：程序用了网络原语（net_* 内联 Winsock2）→ 独立链 ws2_32
+    // 程序用了网络原语（net_* 内联 Winsock2）→ 独立链 ws2_32
     // （脱离 tie_interp 后不再借道 interp 的 -lws2_32）。
     if need_wsock {
         cmd = cmd + " -lws2_32"
@@ -499,9 +499,9 @@ pub func link_shared(input_opt: string, output_so: string, target: string, need_
         }
         cmd = cmd + " " + lib + " -lws2_32 -luserenv -lntdll -lbcrypt -ladvapi32 -lole32 -lshell32"
     }
-    // trm-lite 阶段1块2：程序用了轻量执行体内置（spawn/yield/collect）或表容器
-    // （P2a：table<T> 运行时已迁 trm-lite tl_tbl）→ 链 trm_lite.a。
-    // p.6.7.2：若本模块已 import 复杂形态（tl_tbl 等桥符号已内联 define，含
+    // trm-lite 程序用了轻量执行体内置（spawn/yield/collect）或表容器
+    // （table<T> 运行时已迁 trm-lite tl_tbl）→ 链 trm_lite.a。
+    // 若本模块已 import 复杂形态（tl_tbl 等桥符号已内联 define，含
     // table 码生成的 extern 引用）→ 不追加 .a（避免多重定义：模块定义 + .a 重复）。
     if need_trmlite {
         if llvmgen.tbl_inlined_check() == 0 {
@@ -514,7 +514,7 @@ pub func link_shared(input_opt: string, output_so: string, target: string, need_
             cmd = cmd + " " + tlib
         }
     }
-    // 批次 2：compiler-rt builtins（i128 除法/取余辅助符号）
+    // compiler-rt builtins（i128 除法/取余辅助符号）
     cmd = cmd + " -rtlib=compiler-rt"
     return run(cmd)
 }
@@ -569,7 +569,7 @@ pub func archive(object: string, lib_path: string) -> i64 {
         tc_err_msg = "未找到 llvm-ar，请确认 LLVM 已安装并在 PATH 中"
         return -1
     }
-    // r.1 复查修复：lib_path 存在且是陈旧非归档产物（如误拷贝的 PE/exe）时，
+    // 复查修复：lib_path 存在且是陈旧非归档产物（如误拷贝的 PE/exe）时，
     // llvm-ar rcs 会先加载它 → "file too small to be an archive"。归档前先删。
     if file_exists(lib_path) {
         file_delete(lib_path)
@@ -603,7 +603,7 @@ func find_trmlite_lib(target: string) -> string {
     if str_len(env) > 0 && file_exists(env) {
         return env
     }
-    // r.1.6.6：Linux 目标优先 trm_lite_linux.a（r.1.6.5 构建约定，pthread/POSIX
+    // Linux 目标优先 trm_lite_linux.a（构建约定，pthread/POSIX
     // 符号版）；路径分隔用 POSIX '/'（自举链在 Linux 上运行，反斜杠无效）。
     if has_sub(target, "linux") {
         var lc = table_new_string()

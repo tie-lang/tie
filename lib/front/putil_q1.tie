@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/putil_q1.tie —— 分片 1（p.9.21.3 单文件 ≤800 行）
+// lib/front/putil_q1.tie —— 分片 1
 // ============================================================
 // 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 putil.tie。
 // 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
@@ -17,7 +17,7 @@ pub func err_protocol() -> string {
     return errors.err_lex_err(p_err_line, p_err_col, p_err_msg)
 }
 
-// ---------- p.8.2.9 控制流条件上下文守卫 ----------
+// ---------- 控制流条件上下文守卫 ----------
 // `while i < n { }` / `if f { }` 等控制流块开括号 `{` 与尾随闭包（通常裸函数
 // 名/裸变量后跟 `{`）在语法上完全同形。控制流条件 parse 期间置本守卫，让
 // pexpr 的尾随闭包判定（maybe_trailing_closure）知晓当前在条件表达式内，
@@ -48,7 +48,7 @@ pub func fill_pending() {
     g_last_tag = -1
     g_last_line = -1
     g_ctl_cond = 0   // p.8.2.9 控制流条件守卫计数清零
-    // S2.2：清空延迟闭包登记（闭包函数体快照，见 defer_closure_*）
+    // 清空延迟闭包登记（闭包函数体快照，见 defer_closure_*）
     g_defer_nodes = table_new_i64()
     g_defer_done = 0   // 已回填游标清零（嵌套闭包防重复回填）
     g_defer_pos = table_new_i64()
@@ -60,7 +60,7 @@ pub func fill_pending() {
     g_defer_err_line = table_new_i64()
     g_defer_err_col = table_new_i64()
     g_defer_err_msg = table_new_i64()
-    // S3.3：清空延迟准引用块登记（块体快照，见 defer_code_*）
+    // 清空延迟准引用块登记（块体快照，见 defer_code_*）
     g_defer_code_nodes = table_new_i64()
     g_defer_code_done = 0   // 已回填游标清零（嵌套准引用防重复回填）
     g_defer_code_pos = table_new_i64()
@@ -261,7 +261,7 @@ pub func expect_type_gt(what: string) -> bool {
 // restore_pos 恢复到保存时刻。泛型调用点 `<` 歧义处理（`a < b` vs `max<i64>(...)`）
 // 用「尝试解析 + 失败回退」：探测期间 split_current_gt 可能原位覆盖 pending 元素
 // 或往队尾 push 虚拟 token，restore 必须整体还原。
-// p.9.14.3 性能重写（O(1)）：旧实现每次复制剩余整个 token 流（4 表 × O(文件)），
+// 性能重写（O(1)）：旧实现每次复制剩余整个 token 流（4 表 × O(文件)），
 // 而探测点 = 每个 '<' / '?' / 泛型调用——O(文件×探测次数) 即 parse build 的平方
 // 主源。现改为「水位线 + 覆盖日志」：save 记 4 个标量 O(1)；restore 逆序回放
 // 本探测的原位覆盖日志 + 水位线截断（表无截断原语，逻辑长度即水位线）。
@@ -412,13 +412,13 @@ pub func defer_code_restore(i: i64) {
     p_err_line = g_defer_code_err_line[i]
     p_err_col = g_defer_code_err_col[i]
     p_err_msg = g_defer_code_err_msg[i]
-    // S3.3：进入准引用块体解析上下文（块内 `func name()` 按函数定义解析；
+    // 进入准引用块体解析上下文（块内 `func name` 按函数定义解析；
     // 块体解析完成后由 parse_deferred_code_blocks 复位）
     g_in_quasi_block = 1
 }
 
 // 准引用上下文中的「名字或插值名」：普通标识符 → 池 id；
-// `$name`（S3.3 标识符插值）→ 返回 "$name" 文本的池 id（构造 code 值时
+// `$name`（标识符插值）→ 返回 "$name" 文本的池 id（构造 code 值时
 // 把 `$` 前缀名替换为变量的字符串值——gensym 结果作函数/变量名）。
 // 只在准引用块（`` `{ ... } `` 延迟解析）与宏体内需要；普通代码里出现
 // `$name` 也解析为插值名，语义层对非宏上下文报错。
@@ -530,7 +530,7 @@ pub func parse_int_lit(lex: string) -> i64 {
     var i = start
     while i < n {
         var c = str_char(lex, i)
-        // p.9.11.19 数字分隔符 `_` 跳过（lexeme 保留 `_`，解析忽略）
+        // 数字分隔符 `_` 跳过（lexeme 保留 `_`，解析忽略）
         if c == "_" {
             i = i + 1
             continue
@@ -548,7 +548,7 @@ pub func parse_int_lit(lex: string) -> i64 {
     return val
 }
 
-// 批次 2：整数字面量溢出检测——parse_int_lit 返回 i64，超范围静默回绕；
+// 整数字面量溢出检测——parse_int_lit 返回 i64，超范围静默回绕；
 // i128/u128 常量经 `add i128 0, i64值` 构造，回绕值符号扩展会得错误高位。
 // 返回 true = 字面量超出 i64 可表示范围（与 parse_int_lit 同款进制/截断逻辑）。
 pub func int_lit_overflow(lex: string) -> bool {
@@ -578,7 +578,7 @@ pub func int_lit_overflow(lex: string) -> bool {
     var i = start
     while i < n {
         var c = str_char(lex, i)
-        // p.9.11.19 数字分隔符 `_` 跳过（与 parse_int_lit 同规则）
+        // 数字分隔符 `_` 跳过（与 parse_int_lit 同规则）
         if c == "_" {
             i = i + 1
             continue
@@ -590,7 +590,7 @@ pub func int_lit_overflow(lex: string) -> bool {
         if d >= base {
             break
         }
-        // 溢出检测：val * base + d > I64_MAX（9223372036854775807）
+        // 溢出检测：val * base + d > _MAX（9223372036854775807）
         if val > (9223372036854775807 - d) / base {
             return true
         }
@@ -600,10 +600,10 @@ pub func int_lit_overflow(lex: string) -> bool {
     return false
 }
 
-// ---------- S1.3 L3 字面量后缀 ----------
+// ---------- L3 字面量后缀 ----------
 // 字面量尾部类型后缀 → TyKw 索引（i8/i16/i32/i64/i128/u8/u16/u32/u64/u128/
 // f32/f64；无后缀返回 -1）。仅匹配精确后缀串（数字后的字母序列）。
-// 批次 2：i128/u128 为 4 字符后缀（123i128 / 7u128）。
+// i128/u128 为 4 字符后缀（123i128 / 7u128）。
 pub func parse_lit_suffix(lex: string) -> i64 {
     var n = str_len(lex)
     if n < 2 {
@@ -659,7 +659,7 @@ pub func parse_lit_suffix(lex: string) -> i64 {
 
 // 剥离字面量尾部类型后缀，返回纯数字文本（无后缀原样返回）。
 // 浮点字面量 lexeme 带 f32/f64 后缀时 llvmgen 无法直接输出，须剥离。
-// 批次 2：i128/u128 为 4 字符后缀（剥离 4 字符）。
+// i128/u128 为 4 字符后缀（剥离 4 字符）。
 pub func strip_lit_suffix(lex: string) -> string {
     var n = str_len(lex)
     var sfx = parse_lit_suffix(lex)
@@ -675,7 +675,7 @@ pub func strip_lit_suffix(lex: string) -> string {
     return lex
 }
 
-// p.9.11.19 去数字分隔符 `_`：浮点字面量文本（LLVM 输出用）剥离 `_`
+// 去数字分隔符 `_`：浮点字面量文本（LLVM 输出用）剥离 `_`
 //（`1_000.5` → `1000.5`；整数 lexeme 保留 `_`，parse_int_lit 解析忽略）。
 // 仅删除 `_` 字符，其余原样。
 pub func strip_underscores(s: string) -> string {

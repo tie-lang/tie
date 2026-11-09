@@ -1,8 +1,8 @@
 type tie<class>
-// compiler/interp/session.tie —— 自举 v2 T4.1：Session（globals + funcs 注册表
+// compiler/interp/session.tie —— ：Session（globals + funcs 注册表
 // + AST 归档池 + 求值环境作用域栈）
 // ============================================================
-// 里程碑：自举 v2 计划 T4.1（.omo/plans/self-hosting-v2.md）——把 Rust 解释器
+// 说明：把 Rust 解释器
 // crates/tie-interp/src/lib.rs 的 Session（1636 行）/ Env（1845 行）移植为
 // tie 语言。Session 是 REPL 持久状态：globals（顶层 var，跨 eval 存活）+
 // funcs（顶层/命名空间函数注册表）+ externs（extern 声明名单）。
@@ -49,7 +49,7 @@ var a_n: i64 = 0;      // 归档节点总数（下一批拷贝的 id 基数）
 pub var a_root: i64 = 0;   // 最近一次归档的根 StmtList 节点 id（reset 置 -1）
 
 // ==================== globals（顶层 var，REPL 持久） ====================
-// p.9.17.3：键用 **interned id**（整数）替代字符串——变量读写是解释器最热的路径，
+// 键用 **interned id**（整数）替代字符串——变量读写是解释器最热的路径，
 // 旧实现每次查找都要与候选名做字符串内容比较（实测 ~143ns/次，且成本随条目数线性
 // 增长）。AST 节点名本就以 interner id 存放（a_names），热路径天然持有 id，无需
 // 文本往返；字符串版 API 仅作兼容薄包装（内部 intern 一次，冷路径用）。
@@ -63,10 +63,10 @@ pub var f_keys: table<string>;
 var f_nids: table<i64>;
 var f_nodes: table<i64>;
 
-// ==================== macros（S3.3 宏注册表：宏名名单） ====================
+// ==================== macros（宏注册表：宏名名单） ====================
 // 宏 = 编译期函数（N_MACRO_DEF，布局同 FnDef 但无泛型槽）。宏定义经
 // register_top_level 注册进 funcs（可调用）+ 本表标记（调用点分派宏展开）。
-// p.9.17.3 后半：m_nids 整数键主表（热查免字符串比较），m_keys 保留显示。
+// 后半：m_nids 整数键主表（热查免字符串比较），m_keys 保留显示。
 var m_keys: table<string>;
 var m_nids: table<i64>;
 
@@ -87,7 +87,7 @@ var env_depth: i64 = 0;     // 活动作用域段数（逻辑栈深；env_soff[0
 pub var env_base: i64 = 0;      // 当前函数作用域起点（跨函数隔离；顶层为 0）
 pub var env_ns: table<string>;  // 当前执行函数的命名空间前缀段（裸调用补全用）
 
-// ==================== by_ref 引用槽栈（T0.3：形参名 → 调用方变量名） ====================
+// ==================== by_ref 引用槽栈（形参名 → 调用方变量名） ====================
 var r_nids: table<i64>;    // 当前函数各 ref 形参名（interned id）
 var r_cnids: table<i64>;   // 对应调用方变量名（interned id；lookup/assign 穿透目标）
 var r_soff: table<i64>;    // 每层引用槽段起点（对齐作用域段方案）
@@ -220,7 +220,7 @@ pub func nname_str(id: i64) -> string {
     return interner.lookup(nid)
 }
 
-// 节点起始行/列（1 起；S3.3 克隆准引用子树保留 span 用）。
+// 节点起始行/列（1 起；克隆准引用子树保留 span 用）。
 pub func nline(id: i64) -> i64 {
     return a_lines[id]
 }
@@ -291,7 +291,7 @@ pub func g_assign(name: string, v: Value) -> i64 {
 }
 
 // ==================== funcs / externs ====================
-// p.9.17.3 后半：函数表键改 interned id（整数键线性扫描，对齐 g_nids/env_nids
+// 后半：函数表键改 interned id（整数键线性扫描，对齐 g_nids/env_nids
 // 先例——热路径 call_fn/gen_method_call 直传 id，免 nname_str 字符串构造与
 // 逐条字符串比较；错误/显示文本只在冷分支 interner.lookup 还原）。
 
@@ -348,7 +348,7 @@ pub func f_get(name: string) -> i64 {
     return f_get_nid(interner.intern(name))
 }
 
-// ==================== macros（S3.3） ====================
+// ==================== macros ====================
 
 // 宏名登记（register_top_level 注册 N_MACRO_DEF 时调用；nid 版主实现，线性去重）。
 pub func m_put_nid(nid: i64) {
@@ -512,7 +512,7 @@ func ref_find_nid(nid: i64) -> i64 {
 // 变量查找（interned id 键）：ref 槽穿透调用方 → 作用域栈 [env_base..顶部] 逆序 → globals。
 // 未命中**置 w_err** 返回 Nil（文本对齐 Rust 变量未声明；调用方按 w_err 判失败）。
 pub func lookup_nid(nid: i64) -> Value {
-    // T0.3 by_ref：引用槽优先——ref 形参从调用方槽取当前值
+    // by_ref：引用槽优先——ref 形参从调用方槽取当前值
     var cnid = ref_find_nid(nid)
     if cnid >= 0 {
         return lookup_caller_nid(cnid)

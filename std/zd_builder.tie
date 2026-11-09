@@ -1,7 +1,7 @@
 type tie<class>
 // tlib/std/zd_builder.tie —— zd 字节构建器 + 批量编解码 + 预分配（自 tiedb 提炼）
 // ============================================================================
-// 目标（specs/2026-08-31-zd-v2-design.md §4，namespace zdb）：
+// 目标：
 //   - 字节构建器（append-only buffer）：一次线性填充，消除逐元素 concat 的
 //     O(n²) 重复分配（concat 每次拷贝已累积主体，N 元素 O(N²) 字节拷贝）；
 //   - 批量字符串/数值数组：构建器一次性写入数组头 + 各元素；decode 先取 n、
@@ -175,7 +175,7 @@ func b_append_array_head(buf: ref table<i64>, n: i64) {
     b_append_be32(buf, n)
 }
 
-// b_append_f64：0xCB + 8 字节位模式直写构建器（M1 bitcast 原语接入，
+// b_append_f64：0xCB + 8 字节位模式直写构建器（bitcast 原语接入，
 // 取代 zd.write_f64_be 的数学分解快路径；同宽 64 位直读）。
 pub func b_append_f64(buf: ref table<i64>, x: f64) {
     table_push(buf, 0xCB)
@@ -187,7 +187,7 @@ pub func b_append_f64(buf: ref table<i64>, x: f64) {
     }
 }
 
-// decode_f64_fast：0xCB + 8 字节位模式 → f64（M1 bitcast 原语接入，
+// decode_f64_fast：0xCB + 8 字节位模式 → f64（bitcast 原语接入，
 // 取代 zd.read_f64_be 的数学分解快路径）。失败 (0.0, -1)。
 pub func decode_f64_fast(t: table<i64>, pos: i64) -> (f64, i64) {
     if zd.u8_at(t, pos) != 0xCB {

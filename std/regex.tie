@@ -1,9 +1,9 @@
 type tie<class>
 // regex.tie：标准库——正则表达式工具（命名空间 regex），纯 tie 自研最小正则引擎。
 // ============================================================
-// 背景（p.6.4 残留清零）：此前 regex_* 五原语（regex_match/find/find_all/group/
+// 背景（残留清零）：此前 regex_* 五原语（regex_match/find/find_all/group/
 // replace）由编译器映射到 tie_regex_* Rust 桥（tie_interp.lib 的 Rust regex crate）。
-// p.6.4.8 已把「字面量 pattern」内联为纯 tie 回溯匹配 VM（compiler/backend/
+// 已把「字面量 pattern」内联为纯 tie 回溯匹配 VM（compiler/backend/
 // irgen_regex.tie，g_used_interp=false）；但「运行期 pattern」（std/regex 包装把
 // pattern 当参数传入）仍回退 rex_bridge_* → Rust 桥。本文件在 std 层自研纯 tie
 // 正则引擎：运行期解析 pattern → 构建指令程序 → 回溯匹配，彻底不再调用 regex_*
@@ -15,14 +15,14 @@ type tie<class>
 //      | 用 SPLIT/JMP 组织，量词 * + ? 也用 SPLIT/JMP 组织（贪婪），捕获组 () 用
 //      SAVE(槽：0/1 保留整体，组 k≥1 用 2k/2k+1)。frag 按「拷贝+重定位」拼接。
 //   2. 匹配：rg_eval 递归回溯求值（leftmost-first，贪婪，显式 SPLIT 回退）。
-//   3. 拼接：find_all/replace/替换展开一律用 StringBuilder（sb_*），p.6.3 教训，
+//   3. 拼接：find_all/replace/替换展开一律用 StringBuilder（sb_*），教训，
 //      严禁 out += x 逐字符。
 //
 // 支持语法子集：字面量、. 、字符类 [] [^]、\d \w \s（+ 大写取反）、量词 * + ?、
 // 锚点 ^ $、分组 ()、交替 |、转义字面量 \. \\ \* 等；替换 $N/$0 捕获引用。
 // 逐字节匹配。
 // 局限：{n,m}、后顾/负向前瞻、\b、完整 Unicode 类不支持；匹配为字节级
-//（\p{L} 为字母子集，见 RX_ULEL）。p.9.1.1.9/.21 已补：正向前瞻 (?=...)、
+//（\p{L} 为字母子集，见 RX_ULEL）。已补：正向前瞻 (?=...)、
 // 回引用 \1..\9、\p{L} 子集、惰性量词 *? +? ??；交替 | 与替换 $N 已支持。
 // 调用：import 后 regex.is_match(s, pattern) / regex.find(...)；命名空间内互调为裸调用。
 // 命名规范：命名空间内私有辅助函数用 rx_/rg_ 前缀（区别于 pub 五函数）。
@@ -38,7 +38,7 @@ const RX_SAVE: i64 = 7;
 const RX_SPLIT: i64 = 8;
 const RX_JMP: i64 = 9;
 const RX_MATCH: i64 = 10;
-// p.9.1.1.9 regex-pro 新增操作码（保持向后兼容；既有 pattern 不含新码）：
+// regex-pro 新增操作码（保持向后兼容；既有 pattern 不含新码）：
 const RX_BACKREF: i64 = 11;  // 回引用（操作数 = 组号 g；比对 2g/2g+1 槽捕获）
 const RX_LA: i64 = 12;       // 正向前瞻（操作数 = [cont, child_start]）
 const RX_LASUCC: i64 = 13;   // 前瞻成功标记（子程序尾部，return true）
@@ -207,7 +207,7 @@ func rx_parse_term(t: ref table<i64>) {
     }
     var bfr = table_new_i64()
     if c == 40 {
-        // '('：可能为捕获组或 p.9.1.1.9 正向前瞻 (?= ...)
+        // '('：可能为捕获组或 正向前瞻 (?= ...)
         if rx_peek(1) == 63 {
             // '(' + '?'
             rx_adv() // '('
@@ -352,7 +352,7 @@ func rx_parse_term(t: ref table<i64>) {
         } else if e == 114 {
             rx_emit_cchar(bfr , 13)
         } else if e >= 49 && e <= 57 {
-            // p.9.1.1.9 回引用 \1..\9（引用已扫描到的捕获组；前瞻引用不支持）
+            // 回引用 \1..\9（引用已扫描到的捕获组；前瞻引用不支持）
             var g = e - 48
             if g > rx_ng {
                 rx_ok = false
@@ -361,7 +361,7 @@ func rx_parse_term(t: ref table<i64>) {
                 rg_a(bfr , g)
             }
         } else if e == 112 {
-            // p.9.1.1.9 Unicode 类 \p{...}：支持 \p{L} / \p{Letter} 子集
+            // Unicode 类 \p{...}：支持 \p{L} / \p{Letter} 子集
             var cat_ok = false
             if rx_cur() == 123 {
                 // '{'
@@ -843,7 +843,7 @@ pub func replace(s: string, pattern: string, repl: string) -> string {
     return sb_build(sb)
 }
 
-// p.9.1.1.21 regex_replace 别名：经典三参名（replace/replace 底层完全一致）。
+// regex_replace 别名：经典三参名（replace/replace 底层完全一致）。
 // fmt 支持 $N/$0 捕获组引用。与编译器内置 regex_replace 同名语义提供记忆点
 //（在此命名空间为 regex.regex_replace；regexpx.regex_replace 亦透传本实现）。
 pub func regex_replace(s: string, pattern: string, fmt: string) -> string {

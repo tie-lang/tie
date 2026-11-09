@@ -1,5 +1,5 @@
 type tie<class>
-// lib/codegen/irgen_arith_p2.tie —— irgen_arith 分片 2（p.9.21.3 单文件 ≤800 行）
+// lib/codegen/irgen_arith_p2.tie —— irgen_arith 分片 2
 // ============================================================
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_arith.tie。
@@ -142,7 +142,7 @@ func tig_checked(nm: string, id: i64) -> i64 {
     return make_tuple2(val, bt, ovf, types.named(TK_BOOL), agg)
 }
 
-// p.9.11.9 checked 二元运算（+? -? *?，op 21/22/23）：同普通整数算术，但**任一
+// checked 二元运算（+? -? *?，op 21/22/23）：同普通整数算术，但**任一
 // 操作数/结果上溢或下溢时运行期报错**（不走静默 wrap）。溢出判定复刻 tig_checked
 // 的比较法（无 with.overflow 内建依赖：有符号 add/sub/mul 的符号位/反算整除，
 // 无符号用 ult/ugt/udiv 反算；sdiv/udiv poison 用 select 已在 tig_is_min 等规避）。
@@ -290,7 +290,7 @@ func tig_check_bin(op: i64, lv: i64, rv: i64, lt: i64, rt: i64) -> i64 {
 // rsem = 语义结果类型（f32+f32 → f32，其余 → f64）——算术结果回窄到 rsem
 //（f32 时 fptrunc），对齐 sinfer_ie_ie1 的浮点统一。比较结果 i1 不受影响。
 func tig_binary_float(op: i64, lv: i64, rv: i64, rsem: i64) -> i64 {
-    // p.9.13.3 整除 `\`（f64 走 floor-div）：floor(a / b) —— 这是 `\` 相对 `/` 的
+    // 整除 `\`（f64 走 floor-div）：floor(a / b) —— 这是 `\` 相对 `/` 的
     // 唯一浮点语义增量（int 族两者同为截断除）。fdiv 后调 libm floor
     //（llvmgen 已无条件 declare `double @floor(double)`）。
     if op == B_IDIV {
@@ -300,7 +300,7 @@ func tig_binary_float(op: i64, lv: i64, rv: i64, rsem: i64) -> i64 {
         var fl = tig_ext_call1("floor", ir.get_value(q), types.named(TK_F64), types.named(TK_F64))
         return tig_coerce(fl, types.named(TK_F64), rsem)
     }
-    // p.9.13.3 `%%`（f64 floor 取余，与 `\` 成对）：`a - floor(a/b)*b`。
+    // `%%`（f64 floor 取余，与 `\` 成对）：`a - floor(a/b)*b`。
     // 与 `/` 的 frem 不同——本例向 -inf 取整，故 -7.0 % 3.0 == -1.0 而
     // -7.0 %% 3.0 == 2.0（数学取余，符号跟随除数）。
     if op == B_FLOORMOD {

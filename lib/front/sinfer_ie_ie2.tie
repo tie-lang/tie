@@ -1,5 +1,5 @@
 type tie<class>
-// lib/front/sinfer_ie_ie2.tie —— infer_expr 分支提子函数分片 2（p.9.21 G2 单函数 ≤300 行）
+// lib/front/sinfer_ie_ie2.tie —— infer_expr 分支提子函数分片 2
 // ============================================================
 // 只含函数与注释：import 树与顶层全局 var 仍留在原主文件；
 // 分片内函数与原调度器同 namespace，跨文件裸名互调。
@@ -25,7 +25,7 @@ pub func infer_expr_ternary(id: i64) -> i64 {
             return -1
         }
         // 两臂类型统一（2026-10-09 修）：数字族（int/float）允许按隐式拓宽方向
-        // 统一到较宽者（C2：同符号窄→宽、u→更宽 i、int→float、f32→f64）——
+        // 统一到较宽者（同符号窄→宽、u→更宽 i、int→float、f32→f64）——
         // 形态对齐二元算术；irgen 侧 tig_ternary 按本类型 tig_coerce 两臂值。
         // 此前「同为 int/float 即放行、类型取 then 臂」会让 LLVM phi 两入边
         // 类型不一致（then 宽 else 窄或反向都坏）。非数字族仍要求完全一致。
@@ -137,10 +137,10 @@ pub func infer_expr_path(id: i64) -> i64 {
     var tag = s_tags[id]
         // Path 名字在 Segment children 中（name 字段为空），拼接完整路径
         var pname = recv_path_name(id)
-        // p.9.12.4：命名空间内 const 以全名登记 gb_*，`ns::NAME` 路径作值
+        // 命名空间内 const 以全名登记 gb_*，`ns::NAME` 路径作值
         // 引用即为该全局常量（i64/string/f64/bool 标量；表/函数路径不在此列）
         var pnid = intern.intern(pname)
-        // p.9.21.5 II2 A2b：ns 常量值引用跟随 L1 梯度（pub const 放行）
+        // II2 A2b：ns 常量值引用跟随 L1 梯度（pub const 放行）
         var vc = sstate.check_const_visibility_nid(pnid, id)
         if vc < 0 {
             return -1
@@ -178,7 +178,7 @@ pub func infer_expr_asm(id: i64) -> i64 {
         while k < nc {
             var op = sstate.child(id, k)
             if s_vals[op] == 3 {
-                // target("arch") 平台条件编译标注（任务17）：非表达式操作数，跳过
+                // target("arch") 平台条件编译标注：非表达式操作数，跳过
                 k = k + 1
                 continue
             }
@@ -334,7 +334,7 @@ pub func infer_expr_with(id: i64) -> i64 {
         if wbase < 0 {
             return -1
         }
-        // p.9.11.33：struct 基 → 结构体不可变更新（值语义复制 + 指定字段覆盖；
+        // struct 基 → 结构体不可变更新（值语义复制 + 指定字段覆盖；
         // 字段名/类型校验在 irgen tig_with_struct 以诊断落位）
         if types.kind(wbase) == K_STRUCT {
             var wupd2 = infer_expr(sstate.child(id, 1))
@@ -581,7 +581,7 @@ pub func infer_expr_field_access(id: i64) -> i64 {
             return -1
         }
         if bk == K_STRUCT {
-            // 成员访问两种语义（p.8.2.7）：存储字段（普通，沿既有路径）/
+            // 成员访问两种语义：存储字段（普通，沿既有路径）/
             // 计算属性（<Struct>::name getter 方法，纯函数读，无需可寻址）。
             // 裁决：**字段优先**（若成员名命中真实字段 → 恒为普通字段，保证
             // 既有字段路径零变化）；字段缺失时才查 getter，命中即计算属性读。
@@ -599,8 +599,8 @@ pub func infer_expr_field_access(id: i64) -> i64 {
                 i = i + 1
             }
             if field_found {
-                // 普通字段路径（既有）：base 必须可寻址（P2a：表下标 t[i] 放行）。
-                // p.9.11.17 fn 类型字段放宽：函数值读取（作被调者，如
+                // 普通字段路径（既有）：base 必须可寻址（表下标 t[i] 放行）。
+                // fn 类型字段放宽：函数值读取（作被调者，如
                 // make_cb().f(7) 改写后的 FieldAccess）不要求基可寻址——读值
                 // 走 tig_agg_addr 表达式落内存；普通字段读取仍要求可寻址。
                 if !sstate.is_addressable(base_node) && s_tags[base_node] != 13 {
@@ -646,7 +646,7 @@ pub func infer_expr_field_access(id: i64) -> i64 {
             return -1
         }
         if bk == K_MAP {
-            // p.9.11.5 记录字段读取：`rec.k` ↔ `rec["k"]` 一致（键化表 map 模型）。
+            // 记录字段读取：`rec.k` ↔ `rec["k"]` 一致（键化表 map 模型）。
             // 字段名作字符串键 → s21_map_get(base, "k")，结果类型 = map 值类型。
             var me = types.table_elem(base)
             if me < 0 {
