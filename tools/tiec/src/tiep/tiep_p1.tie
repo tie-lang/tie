@@ -415,14 +415,21 @@ func reg_one_top(s: i64) -> i64 {
 // 注册顶层定义（func → funcs；顶层持久变量 → globals；命名空间递归注册）。
 // 返回 "已定义 N 个函数"；失败返回错误文本。
 func register_top_level() -> string {
+    // 根节点局部化：import 会把新文件的 AST 追加进归档池并把 a_root 指向它；
+    // 若循环继续读全局 a_root，原文件的遍历会串到被导入文件上。
+    var root = a_root
     var count: i64 = 0
     var i: i64 = 0
-    while i < isess.nchild(a_root) {
-        var s = isess.nchild_at(a_root, i)
+    while i < isess.nchild(root) {
+        var s = isess.nchild_at(root, i)
         var t = isess.ntag(s)
         if t == N_FN_DEF {
-            isess.f_put(isess.nname_str(s), s)
-            count = count + 1
+            var nm = isess.nname_str(s)
+            // 被导入文件不提供入口：main 只认主脚本的那一个。
+            if nm != "main" || g_import_depth == 0 {
+                isess.f_put(nm, s)
+                count = count + 1
+            }
         } else if t == N_MACRO_DEF {
             // 宏定义注册——宏 = 编译期函数（布局同 FnDef 无泛型槽）：
             // 进 funcs（可被宏体互调/展开调用）+ 宏名单（调用点宏展开分派）。
@@ -451,8 +458,10 @@ func register_top_level() -> string {
             w_err = "REPL v1 暂不支持 enum 定义"
             return w_err
         } else if t == N_IMPORT {
-            w_err = "REPL v1 暂不支持 import"
-            return w_err
+            // 递归加载：路径解析与前端同源（lib/support/import_path）。
+            if load_import(s) < 0 {
+                return w_err
+            }
         } else if t == N_USING {
             w_err = "REPL v1 暂不支持 using"
             return w_err

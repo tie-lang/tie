@@ -32,59 +32,12 @@ func path_dir(path: string) -> string {
 // 折叠段（"." 段不删）。
 // 整合说明：s33 分支另有分段栈实现（功能等价），取本循环折叠版。
 func normalize_path(p: string) -> string {
-    var out = p
-    var changed: bool = true
-    while changed {
-        changed = false
-        var n = str_len(out)
-        var i: i64 = 0
-        while i + 3 < n {
-            // 命中 "/../"（段分隔 + 两点 + 斜杠）
-            if str_char(out, i) == "/" && str_char(out, i + 1) == "." &&
-                str_char(out, i + 2) == "." && str_char(out, i + 3) == "/" {
-                // 找 i 之前的最后一个 '/'（被折叠段的起点）
-                var seg_start: i64 = -1
-                var j: i64 = i - 1
-                while j >= 0 {
-                    if str_char(out, j) == "/" {
-                        seg_start = j
-                        break
-                    }
-                    j = j - 1
-                }
-                var remove_start: i64 = 0
-                if seg_start >= 0 {
-                    // 删除 [seg_start+1, i+4)：保留段前 '/'（"a/b/../c" 删
-                    // "b/../" 得 "a/c"——seg_start 指向 "a/" 的 '/'，须 +1）
-                    remove_start = seg_start + 1
-                }
-                // 特例：remove_start == 0 且路径以 "../" 开头 → 根外上溯，
-                // 无法折叠，跳过该处（如 "../lib/x.tie"）
-                if remove_start == 0 && str_len(out) >= 2 &&
-                    str_char(out, 0) == "." && str_char(out, 1) == "." {
-                    i = i + 4
-                    continue
-                }
-                var remove_end = i + 4
-                var prefix = str.slice(out, 0, remove_start)
-                var suffix = str.slice(out, remove_end, str_len(out))
-                out = prefix + suffix
-                changed = true
-                break
-            }
-            i = i + 1
-        }
-    }
-    return out
+    return importpath.normalize(p)
 }
 
 // -B：判定 import 是否为内置库根别名（std、/ext、/rdu、/sys 前缀）。
 func is_lib_alias(path: string) -> bool {
-    if tie.support::has_prefix(path, "/std/") { return true }
-    if tie.support::has_prefix(path, "/ext/") { return true }
-    if tie.support::has_prefix(path, "/rdu/") { return true }
-    if tie.support::has_prefix(path, "/sys/") { return true }
-    return false
+    return importpath.is_lib_alias(path)
 }
 
 // -B：内置库根解析。CLI set_lib_root > TIE_LIB_ROOT 环境变量 >
@@ -93,24 +46,7 @@ func lib_root() -> string {
     if str_len(g_lib_root) > 0 {
         return g_lib_root
     }
-    var ev = get_env("TIE_LIB_ROOT")
-    if str_len(ev) > 0 {
-        g_lib_root = ev
-        return g_lib_root
-    }
-    var home = get_env("USERPROFILE")
-    if str_len(home) == 0 {
-        home = get_env("HOME")
-    }
-    var hn = str_len(home)
-    if hn > 0 && str_char(home, hn - 1) == "/" {
-        home = str.slice(home, 0, hn - 1)
-    }
-    hn = str_len(home)
-    if hn > 0 && str_char(home, hn - 1) == "\\" {
-        home = str.slice(home, 0, hn - 1)
-    }
-    g_lib_root = home + "/.tiec-lib/tlib"
+    g_lib_root = importpath.lib_root()
     return g_lib_root
 }
 

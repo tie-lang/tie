@@ -255,6 +255,7 @@ pub func eval(src: string) -> string {
 // 宿主经 exit_requested()/exit_code_val() 透传为进程退出码。
 pub func eval_script(src: string) -> string {
     w_err = ""
+    reset_imports()
     g_tsh_exit_req = false
     g_tsh_exit_code = 0
     // tie parser 顶层只接受定义语句、且函数体内不允许嵌套 `func` 定义（对齐 eval：
@@ -282,6 +283,8 @@ pub func eval_script(src: string) -> string {
         return w_err
     }
     isess.archive_add()
+    // 本次求值的根：import 会把 a_root 指向被导入文件，主脚本的根须先固定。
+    var main_root = a_root
     env_ns = table_new_string()
     env_base = 0
     // 第一趟：注册顶层定义（函数/命名空间/全局变量/extern；main 也一并注册为函数，
@@ -291,7 +294,7 @@ pub func eval_script(src: string) -> string {
         return w_err
     }
     // 第二趟：执行 main 体（顶层可执行语句）；不压作用域 → var 落 globals
-    var main = find_main()
+    var main = find_main_in(main_root)
     if main < 0 {
         w_err = "内部错误: 包装后的 main 未找到"
         return w_err
@@ -469,6 +472,7 @@ pub func eval_call(name: string, arg: string) -> string {
 }   // namespace tiep
 
 
+import "./tiep_import.tie"
 import "./tiep_p1.tie"
 import "./tiep_p2.tie"
 import "./tiep_p3.tie"

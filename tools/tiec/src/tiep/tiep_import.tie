@@ -1,0 +1,112 @@
+type tie<class>
+// tools/tiec/src/tiep/tiep_import.tie —— 脚本 import 展开（解释器侧）
+// ============================================================
+// 职责：把 import 的文件按编译器前端同一套规则加载进当前会话。
+//
+// 规则（与前端一致，路径解析复用 lib/support/import_path，单一口径）：
+//   - 路径：./ ../ 相对当前文件目录；/std/ /ext/ /rdu/ /sys/ 走库根；
+//     绝对路径原样；归一化统一由 import_path 完成。
+//   - 加载：读文件 → 剥文件头角色声明 → 词法/语法 → 归档 → 注册其顶层定义。
+//   - 去重：同一解析后路径只加载一次（重复导入与循环导入都自然终止）。
+//   - 错误：词法/语法/读取失败均带文件名返回，不再只说「暂不支持 import」。
+//
+// 说明：本文件与 tiep 同 namespace，跨文件裸名互调；只依赖内置库与 lib/*。
+// ============================================================
+
+import "../../../../lib/support/import_path.tie"
+
+// 当前文件目录（随递归下降切换，返回时恢复）。
+var g_import_dir: string = "";
+// 脚本根目录（宿主设置；reset 时恢复到它）。
+var g_script_dir: string = "";
+// 已加载的解析后路径。
+var g_imp_loaded: table<string>;
+var g_imp_loaded_ready: bool = false;
+// 导入深度：0 = 主脚本；>0 = 被导入文件（其 main 不参与注册）。
+pub var g_import_depth: i64 = 0;
+
+namespace tiep {
+
+// 宿主设置脚本所在目录（尾斜杠可无）。
+pub func set_script_dir(d: string) {
+    g_script_dir = d
+    g_import_dir = d
+}
+
+// 每次求值前复位导入状态（去重表清空，目录回到脚本根）。
+pub func reset_imports() {
+    g_imp_loaded = table_new_string()
+    g_imp_loaded_ready = true
+    g_import_dir = g_script_dir
+    g_import_depth = 0
+}
+
+// 路径是否已加载。
+func import_seen(p: string) -> bool {
+    if !g_imp_loaded_ready {
+        g_imp_loaded = table_new_string()
+        g_imp_loaded_ready = true
+    }
+    var i = 0
+    while i < len(g_imp_loaded) {
+        if g_imp_loaded[i] == p {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 记录已加载路径。
+func import_mark(p: string) {
+    table_push(g_imp_loaded, p)
+}
+
+// 加载一个 import 节点；成功 0，失败 -1（w_err 已置，带文件名）。
+func load_import(imp_node: i64) -> i64 {
+    var raw = isess.nname_str(imp_node)
+    if str_len(raw) == 0 {
+        return 0
+    }
+    var full = importpath.resolve(raw, g_import_dir)
+    if import_seen(full) {
+        return 0
+    }
+    import_mark(full)
+
+    var src = file_read(full)
+    if str_len(src) == 0 {
+        w_err = "导入文件读取失败: '" + full + "'"
+        return -1
+    }
+    var body = strip_role_header(src)
+    if !lexer.run_lex(body) {
+        w_err = "词法错误（" + full + "）@" + to_string(g_err_line) + ":" +
+            to_string(g_err_col) + ": " + g_err_msg
+        return -1
+    }
+    var proto = parser.parse("")
+    if has_str_prefix(proto, "ERR:") {
+        w_err = "语法错误（" + full + "）" + proto
+        return -1
+    }
+    if sstate.load_ast(proto) < 0 {
+        w_err = "内部错误: AST 协议加载失败（" + full + "）"
+        return -1
+    }
+    isess.archive_add()
+
+    // 递归：以被导入文件目录为基准；返回后恢复原目录，原文件遍历不受影响。
+    var saved = g_import_dir
+    g_import_dir = importpath.dir_of(full)
+    g_import_depth = g_import_depth + 1
+    var rc = register_top_level()
+    g_import_depth = g_import_depth - 1
+    g_import_dir = saved
+    if w_err != "" {
+        return -1
+    }
+    return 0
+}
+
+}

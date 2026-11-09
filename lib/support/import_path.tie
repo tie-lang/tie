@@ -1,0 +1,175 @@
+type tie<class>
+// lib/support/import_path.tie —— import 路径解析（单一出处）
+// ============================================================
+// 职责：把 import 里写的路径解析成可读文件路径。规则与编译器前端完全一致，
+// 供语义分析与解释器（tiep）共用，避免两处实现漂移。
+//
+// 规则：
+//   "./x"、"../x"  相对当前文件所在目录，展开后归一化；
+//   "/std/" "/ext/" "/rdu/" "/sys/"  内置库根别名，拼库根；
+//   其余（含绝对路径）  原样归一化。
+// 库根优先级：set_lib_root（CLI）> TIE_LIB_ROOT 环境变量 > ~/.tiec-lib/tlib。
+//
+// 归一化 = 反复折叠 "/段/../"；根外上溯（"../lib/x"）无法折叠时保留原样。
+// ============================================================
+
+import "/std/string.tie" as str
+
+// 库根缓存（namespace 体内不允许 var，故置顶层）。
+var g_ip_lib_root: string = "";
+
+namespace importpath {
+
+// CLI 注入库根（--lib-root）。
+pub func set_lib_root(p: string) {
+    g_ip_lib_root = p
+}
+
+// 内置库根：CLI > 环境变量 > 用户默认库目录。
+pub func lib_root() -> string {
+    if str_len(g_ip_lib_root) > 0 {
+        return g_ip_lib_root
+    }
+    var ev = get_env("TIE_LIB_ROOT")
+    if str_len(ev) > 0 {
+        g_ip_lib_root = ev
+        return g_ip_lib_root
+    }
+    var home = get_env("USERPROFILE")
+    if str_len(home) == 0 {
+        home = get_env("HOME")
+    }
+    var hn = str_len(home)
+    if hn > 0 && str_char(home, hn - 1) == "/" {
+        home = str.slice(home, 0, hn - 1)
+    }
+    hn = str_len(home)
+    if hn > 0 && str_char(home, hn - 1) == "\\" {
+        home = str.slice(home, 0, hn - 1)
+    }
+    g_ip_lib_root = home + "/.tiec-lib/tlib"
+    return g_ip_lib_root
+}
+
+// 前缀判定（码点语义）。
+func has_prefix(s: string, p: string) -> bool {
+    var ns = str_len(s)
+    var np = str_len(p)
+    if np > ns {
+        return false
+    }
+    var i = 0
+    while i < np {
+        if str_char(s, i) != str_char(p, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 是否内置库根别名（/std/ /ext/ /rdu/ /sys/）。
+pub func is_lib_alias(path: string) -> bool {
+    if has_prefix(path, "/std/") { return true }
+    if has_prefix(path, "/ext/") { return true }
+    if has_prefix(path, "/rdu/") { return true }
+    if has_prefix(path, "/sys/") { return true }
+    return false
+}
+
+// 折叠 "/段/../"。从根外上溯的 "../" 保留（无法折叠）。
+pub func normalize(p: string) -> string {
+    var out = p
+    var changed: bool = true
+    while changed {
+        changed = false
+        var n = str_len(out)
+        var i: i64 = 0
+        while i + 3 < n {
+            if str_char(out, i) == "/" && str_char(out, i + 1) == "." &&
+                str_char(out, i + 2) == "." && str_char(out, i + 3) == "/" {
+                // 被折叠段的起点 = i 之前最后一个 '/'
+                var seg_start: i64 = -1
+                var j = i - 1
+                while j >= 0 {
+                    if str_char(out, j) == "/" {
+                        seg_start = j
+                        break
+                    }
+                    j = j - 1
+                }
+                var remove_start: i64 = 0
+                if seg_start >= 0 {
+                    remove_start = seg_start + 1
+                }
+                // 路径以 "../" 开头且无可折叠段 → 跳过，保留原样
+                if remove_start == 0 && str_len(out) >= 2 &&
+                    str_char(out, 0) == "." && str_char(out, 1) == "." {
+                    i = i + 4
+                    continue
+                }
+                var remove_end = i + 4
+                var prefix = str.slice(out, 0, remove_start)
+                var suffix = str.slice(out, remove_end, str_len(out))
+                out = prefix + suffix
+                changed = true
+                break
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// 取目录段（保留尾斜杠，供相对路径拼接）。无目录分隔符返回空串。
+pub func dir_of(path: string) -> string {
+    var n = str_len(path)
+    var i = n - 1
+    while i >= 0 {
+        var c = str_char(path, i)
+        if c == "/" || c == "\\" {
+            return str.slice(path, 0, i + 1)
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// 解析 import 路径：cur_dir 为当前文件所在目录（尾斜杠可有可无）。
+pub func resolve(path: string, cur_dir: string) -> string {
+    if has_prefix(path, "./") {
+        return normalize(cur_dir + str.slice(path, 2, str_len(path)))
+    }
+    if has_prefix(path, "../") {
+        // 去掉 cur_dir 末尾斜杠，再去掉最后一段目录
+        var d = cur_dir
+        var dn = str_len(d)
+        while dn > 0 {
+            if str_char(d, dn - 1) == "/" {
+                dn = dn - 1
+            } else {
+                break
+            }
+        }
+        var cut: i64 = -1
+        var i = dn - 1
+        while i >= 0 {
+            if str_char(d, i) == "/" {
+                cut = i + 1
+                break
+            }
+            i = i - 1
+        }
+        var parent = ""
+        if cut >= 0 {
+            parent = str.slice(d, 0, cut)
+        }
+        return normalize(parent + str.slice(path, 3, str_len(path)))
+    }
+    if is_lib_alias(path) {
+        return normalize(lib_root() + path)
+    }
+    return normalize(path)
+}
+
+}

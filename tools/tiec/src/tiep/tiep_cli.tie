@@ -20,6 +20,25 @@ func main() -> i64 {
         return 2
     }
     var path = arg_string(0)
+    // 脚本目录：import 的相对路径以它为基准
+    var dir = ""
+    var k = 0
+    var cut = -1
+    var pn = str_len(path)
+    while k < pn {
+        var c = str_char(path, k)
+        if c == "/" || c == "\\" {
+            cut = k
+        }
+        k = k + 1
+    }
+    k = 0
+    while k <= cut {
+        dir = dir + str_char(path, k)
+        k = k + 1
+    }
+    tiep.set_script_dir(dir)
+
     var src = file_read(path)
     if src == "" {
         println("读取失败：" + path)
