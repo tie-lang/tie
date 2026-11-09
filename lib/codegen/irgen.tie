@@ -800,6 +800,61 @@ func gen_one_lazy_init(nid: i64, node: i64, ty: i64) -> i64 {
     return 0
 }
 
+// ---------- 空表全局的可达裁剪（p.9.14 性能） ----------
+// 清单定案：初值为空且完全未被引用、非导出、无按名查找标记的表全局，不生成
+// 建表代码。空表无副作用 ⇒ 不改变可观测语义；@g 槽仍是合法 null 全局，
+// 只是没有运行期建表 store（未引用 ⇒ 无人读取，不触发空指针崩溃）。
+// 判据一律保守：pub（gb_const bit1）/ #[used|keep|no_mangle|export_name|
+// link_section]（llvmgen 属性位）/ --dll-export 名单 / 动态库模式 /
+// 命名空间限定名 / 非空的初值 / 任一语义树同名引用 → 退回独立建表。
+func tig_global_dead_empty(gi: i64) -> bool {
+    var nid = gb_keys[gi]
+    if (gb_const[gi] & 2) != 0 {
+        return false
+    }
+    if g_dynlib {
+        return false
+    }
+    var gname = intern.lookup(nid)
+    // 命名空间限定名：引用可能以裸名或路径名出现，路径名池 id 与裸名不同，
+    // 保守起见命名空间的全局整类不裁（性能收益让位于正确性）。
+    var ci: i64 = 0
+    while ci < str_len(gname) {
+        if str_byte(gname, ci) == 58 {
+            return false
+        }
+        ci = ci + 1
+    }
+    if str_len(g_dll_export) > 0 && dll_export_hit(gname) {
+        return false
+    }
+    var ai: i64 = 0
+    while ai < len(llvmgen.g_gattr_names) {
+        if llvmgen.g_gattr_names[ai] == nid && llvmgen.g_gattr_bits[ai] != 0 {
+            return false
+        }
+        ai = ai + 1
+    }
+    // 初值必须为空：省略初值，或空表字面量 []（tag 12 且 nc == 0）
+    var ginit_node = g_ginit_node_of(nid)
+    if ginit_node >= 0 {
+        if ast.s_tag(ginit_node) != 12 || sstate.nchild(ginit_node) != 0 {
+            return false
+        }
+    }
+    // 全语义树扫描（ast.s_n 含语义期新建节点）：除声明节点本身
+    //（N_VAR_DECL=100）外任何同名节点都算引用——同名局部遮蔽也保守保留。
+    var n = ast.s_n
+    var k: i64 = 0
+    while k < n {
+        if ast.s_tag(k) != 100 && ast.s_name(k) == nid {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
 // ---------- 全局表初始化（--shared 缺陷修复）----------
 // 普通 exe 在 main 入口对所有模块表全局预建表句柄（@g = global ptr null → store
 // 新表句柄；缺此则 len(g) 对 null 崩溃 0xC0000005）。--shared 库无 main → 该初始化
@@ -819,6 +874,11 @@ pub func gen_global_tbl_init() -> i64 {
         }
         var gte = gb_telem[gi]
         if gte >= 0 {
+            // 可达裁剪：零引用空表全局不生成建表代码（清单 p.9.14）
+            if tig_global_dead_empty(gi) {
+                gi = gi + 1
+                continue
+            }
             // p.9.12.6 边界：全局行池 table<R> v1 不支持（列式行池需每字段列 @g 全局）
             if types.kind(gte) == K_STRUCT {
                 sm_err_msg = "行池 table<R> 全局变量 v1 暂不支持（p.9.12.6 边界；仅局部行池可用）"
