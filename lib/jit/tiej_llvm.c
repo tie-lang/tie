@@ -14,6 +14,12 @@
 //   tj_err_clear()                       -> void
 //   tj_abi_version()                     -> 整数（宿主启动时校验）
 //
+// 能力（ABI 3）：
+//   - 会话挂**进程符号解析**：JIT 代码可直接调用宿主进程已链接的符号
+//     （libc、trm_lite 运行时），不必手工登记每个外部函数；
+//   - 调用编组交给 JIT 侧生成的包装函数（按 tie 签名逐参编组），
+//     垫片不再受「≤5 个标量参数」限制。
+//
 // 构建（tiej 仓根；产物进 _local_only/bin，不进源码树）：
 //   clang -shared -O2 src/platform/tiej_llvm.c \
 //         -I D:/LLVM/include -L D:/LLVM/lib -lLLVM-C \
@@ -26,6 +32,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #include <llvm-c/Core.h>
 #include <llvm-c/Error.h>
@@ -41,7 +48,7 @@
 #define TJ_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define TJ_ABI_VERSION 1
+#define TJ_ABI_VERSION 3
 
 static _Thread_local char g_err[1024];
 
@@ -103,6 +110,16 @@ TJ_EXPORT int64_t tj_jit_open(void) {
         free(j);
         return 0;
     }
+    // 进程符号解析：让 JIT 代码直接引用宿主已链接的符号（libc / trm_lite）。
+    // 解析失败不致命——纯自包含函数仍可运行，只是外部符号会在链接期报错。
+    LLVMOrcDefinitionGeneratorRef gen = NULL;
+    LLVMErrorRef ge = LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
+        &gen, 0, NULL, NULL);
+    if (!ge && gen) {
+        LLVMOrcJITDylibAddGenerator(LLVMOrcLLJITGetMainJITDylib(j->jit), gen);
+    } else if (ge) {
+        LLVMConsumeError(ge);
+    }
     return (int64_t)(intptr_t)j;
 }
 
@@ -128,6 +145,7 @@ TJ_EXPORT int64_t tj_jit_add_ir(int64_t jit, const char *ir, int64_t len) {
     LLVMOrcThreadSafeContextRef tsc = LLVMOrcCreateNewThreadSafeContext();
     LLVMOrcThreadSafeModuleRef tsm = LLVMOrcCreateNewThreadSafeModule(m, tsc);
     LLVMErrorRef e = LLVMOrcLLJITAddLLVMIRModule(j->jit, LLVMOrcLLJITGetMainJITDylib(j->jit), tsm);
+    LLVMOrcDisposeThreadSafeContext(tsc);
     if (e) {
         tj_err_llvm(e);
         return 4;
@@ -148,6 +166,32 @@ TJ_EXPORT int64_t tj_jit_lookup(int64_t jit, const char *name) {
         return 0;
     }
     return (int64_t)addr;
+}
+
+// f64 位模式 → 十进制文本（JIT 包装统一用 i64 槽返回，宿主再经文本入口还原
+// 为浮点；%.17g 保证 IEEE754 往返无损）。返回线程局部缓冲，调用方复制后即失效。
+// 十进制文本 → LLVM IR 的 double 字面量（%.17e，IR 可直接解析）。
+TJ_EXPORT const char *tj_f64_ir(const char *text) {
+    static _Thread_local char b[64];
+    double d = strtod(text ? text : "0", NULL);
+    snprintf(b, sizeof(b), "%.17e", d);
+    return b;
+}
+
+// 十进制文本 → f64 位模式（宿主把命令行文本变成 JIT 参数槽）。
+TJ_EXPORT int64_t tj_f64_bits(const char *text) {
+    double d = strtod(text ? text : "0", NULL);
+    int64_t b;
+    memcpy(&b, &d, sizeof(b));
+    return b;
+}
+
+TJ_EXPORT const char *tj_f64_text(int64_t bits) {
+    static _Thread_local char b[64];
+    double d;
+    memcpy(&d, &bits, sizeof(d));
+    snprintf(b, sizeof(b), "%.17g", d);
+    return b;
 }
 
 TJ_EXPORT void tj_jit_close(int64_t jit) {

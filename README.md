@@ -66,8 +66,9 @@ _local_only/bin/backend_probe.exe
 
 `lib/ir` + `lib/backend` + `lib/jit` + `tools/tiej` 另有一条 JIT 通道：
 源码 → 进程内前端与 irgen → LLVM 文本 → LLJIT → 按符号调用，不落中间文件、
-不调外部编译器。当前边界：标量函数，最多 5 个 i64 参数；JIT 沙箱不链接表
-运行时，含表/spawn 的函数会被拒绝。
+不调外部编译器。实参在编译期内联为 IR 常量，支持任意个数与 `i64`/`f64`/`bool`/`ptr`
+混合签名；JIT 会话挂进程符号解析。表与 spawn 等运行时能力需要 JIT 运行时
+模块（trm_lite 导出面），尚未接通。
 
 ## 许可
 

@@ -15,6 +15,10 @@ var g_add: i64 = 0
 var g_look: i64 = 0
 var g_close: i64 = 0
 var g_err: i64 = 0
+var g_f2t: i64 = 0
+var g_f2b: i64 = 0
+var g_f2i: i64 = 0
+
 
 func ensure() -> bool {
     unsafe {
@@ -30,6 +34,9 @@ func ensure() -> bool {
         g_look = get_proc(g_dll, "tj_jit_lookup")
         g_close = get_proc(g_dll, "tj_jit_close")
         g_err = get_proc(g_dll, "tj_last_error")
+        g_f2t = get_proc(g_dll, "tj_f64_text")
+        g_f2b = get_proc(g_dll, "tj_f64_bits")
+        g_f2i = get_proc(g_dll, "tj_f64_ir")
         return g_open != 0 && g_add != 0 && g_look != 0 && g_close != 0 && g_err != 0
     }
 }
@@ -76,6 +83,36 @@ pub func lookup(jit: i64, name: string) -> i64 {
             return 0
         }
         return dyn_call_p(g_look, jit, name, 0, 0, 0)
+    }
+}
+
+// 十进制文本 → LLVM IR double 字面量。
+pub func f64_ir(s: string) -> string {
+    unsafe {
+        if !ensure() {
+            return "0.00000000000000000e+00"
+        }
+        return cstr_to_string(dyn_call_p(g_f2i, s, 0, 0, 0, 0))
+    }
+}
+
+// 十进制文本 → f64 位模式（wrapper 参数槽用 i64 承载浮点）。
+pub func f64_bits(s: string) -> i64 {
+    unsafe {
+        if !ensure() {
+            return 0
+        }
+        return dyn_call_p(g_f2b, s, 0, 0, 0, 0)
+    }
+}
+
+// f64 位模式 → 十进制文本（JIT 包装统一用 i64 槽返回，宿主再经文本入口还原）。
+pub func f64_text(bits: i64) -> string {
+    unsafe {
+        if !ensure() {
+            return ""
+        }
+        return cstr_to_string(dyn_call_p(g_f2t, bits, 0, 0, 0, 0))
     }
 }
 

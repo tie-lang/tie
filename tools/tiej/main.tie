@@ -1,13 +1,13 @@
 type tie<logic, unsafe:mem, unsafe:ext>
 import "../../lib/ir/ir.tie"
+import "../../lib/sema/sstate.tie"
+import "../../lib/front/context.tie"
+import "../../lib/ir/context.tie"
 import "../../lib/support/text.tie"
 import "../../lib/backend/render.tie"
 import "../../lib/jit/llvmc.tie"
 import "/std/prelude.tie"
 using lang;
-import "../../lib/sema/sstate.tie"
-import "../../lib/front/context.tie"
-import "../../lib/ir/context.tie"
 import "../../lib/front/cfg_preproc.tie"
 import "../../lib/front/api.tie"
 import "../../lib/front/parser.tie"
@@ -17,12 +17,18 @@ namespace tie.tool.tiej;
 // ============================================================
 // 用法（仓根）：
 //   tiec tools/tiej/main.tie -o _local_only/bin/tiej.exe
-//   tiej --selftest                        后端自检（手构 IR，验垫片与调用链）
-//   tiej <源文件> <函数名> [i64 参数...]    编译并调用（最多 5 个参数）
+//   tiej --selftest
+//   tiej <源文件> <函数名> [--sig 类型表] [--ret 类型] [实参...]
+//
+// 参数编组：实参在编译期已知，直接内联为目标函数的 IR 常量实参，
+// 调用包装 `tiej_wrap` 为零参数——因此不受寄存器/参数个数限制，
+// 也无需宿主分配缓冲。类型表与返回类型：
+//   i64 | bool | f64 | ptr       （ptr = 直接给指针数值，表/字符串句柄）
+//   省略 --sig 时按实参个数全用 i64；省略 --ret 时按 i64。
 //
 // 编译全程在进程内：parse_ast → check_ast → tig_ast → render，不落中间文件、
-// 不调外部编译器。边界：只支持纯标量函数——JIT 沙箱不链接表/运行时，含表、
-// spawn、字符串插值运行时桥的函数会在 irgen 或链接期被拒绝。
+// 不调外部编译器。JIT 会话挂进程符号解析，可直接调用宿主已链接的
+// libc / trm_lite 符号。
 // ============================================================
 
 func chk(ok: bool, tag: string) -> bool {
@@ -33,7 +39,6 @@ func chk(ok: bool, tag: string) -> bool {
     }
     return ok
 }
-
 
 // 垫片自检：只验 DLL 可装载、LLJIT 会话可开。完整链路（IR 装载 → 查符号 →
 // 调用）由源码模式覆盖，不再用手构 IR 做第二套验证。
@@ -72,8 +77,70 @@ func dir_of(path: string) -> string {
     return ""
 }
 
-// 源码 → IR → JIT → 调用。argv 已按顺序解析为整数。
-func run_source(path: string, fname: string, argv: table<i64>) -> i64 {
+// 按逗号切分（类型表 / 实参列表）。
+func split_commas(s: string) -> table<string> {
+    var out = table_new_string()
+    var cur = ""
+    var i = 0
+    var n = str_len(s)
+    while i < n {
+        if str_char(s, i) == "," {
+            table_push(out, cur)
+            cur = ""
+        } else {
+            cur = cur + str_char(s, i)
+        }
+        i = i + 1
+    }
+    if str_len(cur) > 0 {
+        table_push(out, cur)
+    }
+    return out
+}
+
+// 单个实参 → 目标函数的 IR 常量实参（含类型前缀）。
+func arg_ir(kind: string, raw: string) -> string {
+    if kind == "f64" {
+        return "double " + tie.jit::f64_ir(raw)
+    }
+    if kind == "bool" {
+        if to_i64(raw) != 0 {
+            return "i1 true"
+        }
+        return "i1 false"
+    }
+    if kind == "ptr" {
+        return "inttoptr (i64 " + to_string(to_i64(raw)) + " to ptr)"
+    }
+    return "i64 " + to_string(to_i64(raw))
+}
+
+// 生成零参数调用包装：实参内联为常量，返回值统一收成 i64
+// （f64 结果按位 cast，宿主经 f64_text 还原）。
+func wrapper_ir(target: string, sig: table<string>, args: table<string>, ret: string) -> string {
+    var call_args = ""
+    var i = 0
+    while i < len(sig) && i < len(args) {
+        if i > 0 {
+            call_args = call_args + ", "
+        }
+        call_args = call_args + arg_ir(sig[i], args[i])
+        i = i + 1
+    }
+    if ret == "f64" {
+        return "define i64 @tiej_wrap() {\nentry:\n  %r = call double @" + target +
+            "(" + call_args + ")\n  %b = bitcast double %r to i64\n  ret i64 %b\n}\n"
+    }
+    if ret == "void" {
+        return "define i64 @tiej_wrap() {\nentry:\n  call void @" + target +
+            "(" + call_args + ")\n  ret i64 0\n}\n"
+    }
+    return "define i64 @tiej_wrap() {\nentry:\n  %r = call i64 @" + target +
+        "(" + call_args + ")\n  ret i64 %r\n}\n"
+}
+
+// 源码 → IR → 包装 → JIT → 调用。
+func run_source(path: string, fname: string, sig: table<string>, args: table<string>, ret: string) -> i64 {
     var src = file_read(path)
     if str_len(src) == 0 {
         println("读取失败：" + path)
@@ -83,9 +150,9 @@ func run_source(path: string, fname: string, argv: table<i64>) -> i64 {
     sstate.ctx_new()
     ir.ctx_new()
     irgen.unit_reset()
-    // JIT 沙箱无表运行时：关掉越界检查，避免生成对运行时的依赖。
+    // JIT 沙箱不保证表运行时齐备：关掉越界检查，避免生成额外运行时依赖。
     irgen.set_check_bounds(false)
-    // 目标函数列入导出白名单：否则未引用函数会被根集合裁剪，JIT 查不到符号。
+    // 目标函数列入导出白名单，否则未引用函数被根集合裁剪，JIT 查不到符号。
     irgen.set_dll_export(fname)
 
     if tie.front::parse(clean, 0, 0) < 0 {
@@ -99,7 +166,7 @@ func run_source(path: string, fname: string, argv: table<i64>) -> i64 {
         return 1
     }
     if irgen.tig_ast() != 0 {
-        println("[irgen] 生成失败（该函数可能依赖表/运行时，JIT 只支持纯标量函数）")
+        println("[irgen] 生成失败")
         return 1
     }
     var ll = tie.backend::render(ir.ctx_current())
@@ -107,6 +174,7 @@ func run_source(path: string, fname: string, argv: table<i64>) -> i64 {
         println("[backend] " + tie.backend::last_error())
         return 1
     }
+    ll = ll + "\n" + wrapper_ir(fname, sig, args, ret)
 
     if !tie.jit::available() {
         println("缺少 tiej_llvm.dll：clang -shared -O2 lib/jit/tiej_llvm.c -I <LLVM>/include -L <LLVM>/lib -lLLVM-C -o _local_only/bin/tiej_llvm.dll")
@@ -123,53 +191,67 @@ func run_source(path: string, fname: string, argv: table<i64>) -> i64 {
         tie.jit::close(j)
         return 1
     }
-    var addr = tie.jit::lookup(j, fname)
+    var addr = tie.jit::lookup(j, "tiej_wrap")
     if addr == 0 {
-        println("[jit] 找不到函数符号：" + fname)
+        println("[jit] 包装未生成：" + tie.jit::last_error())
         tie.jit::close(j)
         return 1
     }
-    var p0: i64 = 0
-    var p1: i64 = 0
-    var p2: i64 = 0
-    var p3: i64 = 0
-    var p4: i64 = 0
-    if len(argv) > 0 { p0 = argv[0] }
-    if len(argv) > 1 { p1 = argv[1] }
-    if len(argv) > 2 { p2 = argv[2] }
-    if len(argv) > 3 { p3 = argv[3] }
-    if len(argv) > 4 { p4 = argv[4] }
-    var res: i64 = 0
+    var bits: i64 = 0
     unsafe {
-        res = dyn_call_p(addr, p0, p1, p2, p3, p4)
+        bits = dyn_call_p(addr, 0, 0, 0, 0, 0)
     }
     tie.jit::close(j)
-    println(fname + " = " + to_string(res))
+    if ret == "void" {
+        println(fname + " = (void)")
+    } else if ret == "f64" {
+        println(fname + " = " + tie.jit::f64_text(bits))
+    } else {
+        println(fname + " = " + to_string(bits))
+    }
     return 0
 }
 
 func main() {
     var n = arg_count()
     if n == 0 || arg_string(0) == "--selftest" {
-        var rc = selftest()
-        exit(rc)
+        exit(selftest())
     }
     if n < 2 {
-        println("用法: tiej <源文件> <函数名> [i64 参数...]（最多 5 个）")
+        println("用法: tiej <源文件> <函数名> [--sig 类型表] [--ret 类型] [实参...]")
+        println("      类型: i64 | bool | f64 | ptr；省略 --sig 时全 i64")
         println("      tiej --selftest")
         exit(2)
     }
     var path = arg_string(0)
     var fname = arg_string(1)
-    if n > 7 {
-        println("参数过多：JIT 调用最多 5 个 i64 参数")
-        exit(2)
-    }
-    var argv = table_new_i64()
+    var sig = table_new_string()
+    var args = table_new_string()
+    var ret = "i64"
     var i = 2
     while i < n {
-        table_push(argv, to_i64(arg_string(i)))
-        i = i + 1
+        var a = arg_string(i)
+        if a == "--sig" && i + 1 < n {
+            sig = split_commas(arg_string(i + 1))
+            i = i + 2
+        } else if a == "--ret" && i + 1 < n {
+            ret = arg_string(i + 1)
+            i = i + 2
+        } else {
+            table_push(args, a)
+            i = i + 1
+        }
     }
-    exit(run_source(path, fname, argv))
+    if len(sig) == 0 {
+        var k = 0
+        while k < len(args) {
+            table_push(sig, "i64")
+            k = k + 1
+        }
+    }
+    if len(sig) != len(args) {
+        println("实参个数与类型表不一致：" + to_string(len(args)) + " vs " + to_string(len(sig)))
+        exit(2)
+    }
+    exit(run_source(path, fname, sig, args, ret))
 }
