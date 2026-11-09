@@ -102,23 +102,28 @@ pub func stage_of(st: string) -> i64 {
 
 // ==================== 落盘分派（薄壳） ====================
 
-// 单规格落盘。only_diag = 1（解析失败路径）时只跑 diag。
+// 单规格落盘。mode 语义：
+//   0 = 成功路径，全部阶段（tokens/ast/symtab/diag）
+//   1 = 解析失败路径，**只跑 diag**（无 AST，tokens/ast/symtab 无从谈起）
+//   2 = 语义失败路径，跑 diag + tokens + ast（解析已成功、AST 在内存；
+//       这三样都只依赖 parser AST，语义报错不妨碍它们）——跳过 symtab
+//       （其内容依赖语义解析结果，报错时不可信）。
 // 返回 0 成功/跳过；-1 落盘失败（打印已出）。
-pub func dump_one(st: string, fmt: string, only_diag: i64) -> i64 {
+pub func dump_one(st: string, fmt: string, mode: i64) -> i64 {
     if st == "diag" {
         build_diag()
     } else if st == "tokens" {
-        if only_diag == 1 {
+        if mode == 1 {
             return 0
         }
         build_tokens()
     } else if st == "ast" {
-        if only_diag == 1 {
+        if mode == 1 {
             return 0
         }
         build_ast()
     } else if st == "symtab" {
-        if only_diag == 1 {
+        if mode != 0 {
             return 0
         }
         build_sym()
@@ -162,14 +167,15 @@ pub func spec_record_bytes(st: string) -> table<i64> {
     return zd_record(stage_of(st))
 }
 
-// 跑全部 --emit 请求（前端出口调用；only_diag = 1 为解析失败路径）。
-pub func run_emit_dumps(only_diag: i64) -> i64 {
+// 跑全部 --emit 请求（前端出口调用）。mode 见 dump_one：0 成功 / 1 解析失败 /
+// 2 语义失败（AST 在，照出 tokens+ast）。
+pub func run_emit_dumps(mode: i64) -> i64 {
     if len(g_emit_specs) == 0 {
         return 0
     }
     var i: i64 = 0
     while i < len(g_emit_specs) {
-        dump_one(spec_stage(g_emit_specs[i]), spec_fmt(g_emit_specs[i]), only_diag)
+        dump_one(spec_stage(g_emit_specs[i]), spec_fmt(g_emit_specs[i]), mode)
         i = i + 1
     }
     return 0

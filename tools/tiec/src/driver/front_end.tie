@@ -53,9 +53,14 @@ pub func frontend(src: string, base_dir: string) -> i64 {
         // 语义失败——错误槽落定（同解析路径，无条件）。
         dbgem.set_err_proto(sem)
         if len(g_emit_specs) > 0 {
-            dbgem.run_emit_dumps(1)
+            // 语义失败 ≠ 解析失败：AST 已经解析出来了，tokens/ast 照样能出
+            // （LSP 要靠它们做语义着色/折叠/符号索引；若此处置为「只出 diag」，
+            // 编辑中稍有报错语义 token 就整片缺失，使用处标识符全部失去高亮）。
+            dbgem.run_emit_dumps(2)
         }
-        return -1
+        // 返回 -2 = 「语义失败但 AST 可用」；-1 保留给解析失败（无 AST）。
+        // 调用方按此决定是否发 tokens/ast（serve.tie 的分析路径用得到）。
+        return 0 - 2
     }
     // 语义警告改结构化事件直发（driver 从 semantic.warn_* 直读渲染，
     // 不再解析 OK 协议中的 ;W: 文本段）。
@@ -69,8 +74,9 @@ pub func frontend(src: string, base_dir: string) -> i64 {
     // library/class 伴生 .sym.zd（--no-sym 关闭；采集未开时跳过）
     dbgem.run_sidecar()
     // -Werror：有任何警告即中止，不进入中端/后端（不产出任何中间产物与可执行文件）。
+    // 返回 -2：AST 可用（同语义失败口径），只是被警告门禁拦下。
     if warn_gate() != 0 {
-        return -1
+        return 0 - 2
     }
     return 0
 }

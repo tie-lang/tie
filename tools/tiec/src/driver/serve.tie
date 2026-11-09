@@ -481,7 +481,8 @@ func sv_analyze(p: table<i64>) -> i64 {
         clean = prelude_inject(clean, g_role, pruned)
         rc = frontend(clean, base)
     }
-    // 发帧：成功按掩码；失败必发 diag（含 211 渲染文本）
+    // 发帧：成功按掩码；语义失败（rc = -2，AST 可用）发 tokens/ast + diag；
+    // 解析失败（rc = -1，无 AST）只发 diag。
     if rc == 0 {
         if (stages & 1) != 0 {
             tinker.send_append(3, 1, "tokens", dbgem.spec_record_bytes("tokens"))
@@ -491,6 +492,19 @@ func sv_analyze(p: table<i64>) -> i64 {
         }
         if (stages & 4) != 0 {
             tinker.send_append(3, 3, "symtab", dbgem.spec_record_bytes("symtab"))
+        }
+        if (stages & 8) != 0 {
+            tinker.send_append(3, 4, "diag", dbgem.spec_record_bytes("diag"))
+        }
+    } else if rc == 0 - 2 {
+        // 语义报错但解析已成功：AST 在内存，tokens/ast 只依赖 parser AST，照发。
+        // symtab 依赖语义解析结果，报错时不可信，跳过（tsp 侧会回退 AST 浅扫描建索引）。
+        // 不这么做的话，编辑中稍有报错语义 token 就整片缺失，使用处标识符全部失去高亮。
+        if (stages & 1) != 0 {
+            tinker.send_append(3, 1, "tokens", dbgem.spec_record_bytes("tokens"))
+        }
+        if (stages & 2) != 0 {
+            tinker.send_append(3, 2, "ast", dbgem.spec_record_bytes("ast"))
         }
         if (stages & 8) != 0 {
             tinker.send_append(3, 4, "diag", dbgem.spec_record_bytes("diag"))
