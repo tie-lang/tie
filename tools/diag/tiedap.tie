@@ -31,7 +31,7 @@ type tie<logic>
 // 用法: `tiedap.exe` （stdin 服务，VS Code debugServer 拉起）。
 // 验收：scripts/verify-tiedap.ps1。
 
-import "../interp/tiep/tiep.tie"
+import "../../lib/interp/tiep/tiep.tie"
 
 // ---------------- 全局状态 ----------------
 var td_seq: i64 = 1;            // 出站消息序列号
@@ -598,13 +598,15 @@ func handle(req_seq: i64, cmd: string, body: string) {
         var sb_ = string_builder()
         sb_append(sb_, "[")
         if vr == 1 {
-            var nkeys = len(g_keys)
+            var names = tiep.g_names()
+            var nkeys = len(names)
             var i: i64 = 0
             while i < nkeys {
                 if i == 0 { sb_append(sb_, "{") } else { sb_append(sb_, ",{") }
-                sb_append(sb_, "\"name\":\"" + jesc(g_keys[i]) +
-                    "\",\"value\":\"" + jesc(vval.to_print_string(g_vals[i])) +
-                    "\",\"type\":\"" + jesc(vval.type_name(g_vals[i])) + "\"}")
+                var gv = tiep.g_lookup_global(names[i])
+                sb_append(sb_, "\"name\":\"" + jesc(names[i]) +
+                    "\",\"value\":\"" + jesc(vval.to_print_string(gv)) +
+                    "\",\"type\":\"" + jesc(vval.type_name(gv)) + "\"}")
                 i = i + 1
             }
         }

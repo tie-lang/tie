@@ -283,6 +283,17 @@ pub func g_assign_nid(nid: i64, v: Value) -> i64 {
 pub func g_declare(name: string, v: Value) {
     g_declare_nid(interner.intern(name), v)
 }
+// 全局名快照（调试器遍历用；与全局值表下标对齐）。
+pub func g_names() -> table<string> {
+    var out = table_new_string()
+    var i = 0
+    while i < len(g_nids) {
+        table_push(out, interner.lookup(g_nids[i]))
+        i = i + 1
+    }
+    return out
+}
+
 pub func g_lookup(name: string) -> Value {
     return g_lookup_nid(interner.intern(name))
 }
