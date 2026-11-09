@@ -348,6 +348,17 @@ pub func f_get(name: string) -> i64 {
     return f_get_nid(interner.intern(name))
 }
 
+// 已注册函数的全名快照（供 using 引入裸名；顺序不保证）。
+pub func f_names() -> table<string> {
+    var out = table_new_string()
+    var i = 0
+    while i < len(f_nids) {
+        table_push(out, interner.lookup(f_nids[i]))
+        i = i + 1
+    }
+    return out
+}
+
 // ==================== macros ====================
 
 // 宏名登记（register_top_level 注册 N_MACRO_DEF 时调用；nid 版主实现，线性去重）。
