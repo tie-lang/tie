@@ -180,7 +180,10 @@ pub func kpass_irgen() -> i64 {
     //（单元级缓存与产物链路零改动）。
     // t1 起才做片段写入与命中检查：逐文件指纹 + 片段落盘属单遍线性成本，
     // t0（零 pass 直出、最快反馈）跳过它；聚合产物缓存仍恒开。
-    if cache_enabled() && tier_frag_cache() {
+    // 含只读折叠全局的单元禁用片段跨单元复用（清单 p.9.14）：共享句柄的
+    // 只读性由本单元的使用白名单保证，片段被别的单元复用后写面不可判定。
+    // 装配路径本就跳过 irgen，不会产出折叠全局；此处只挡片段写入/命中。
+    if cache_enabled() && tier_frag_cache() && !irgen.ro_fold_used() {
         var af = mod_attribution_fill()
         if af == 0 {
             var mc = mod_cache_update()

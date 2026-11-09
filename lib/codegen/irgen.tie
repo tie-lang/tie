@@ -408,6 +408,7 @@ pub func unit_reset() {
     rp_allocas = []
     g_eq_keys = table_new_i64()
     g_eq_names = table_new_i64()
+    g_ro_fold_used = false
     // 命名计数器（参与符号名后缀）：不归零则本单元哨兵从上一单元的计数接着编
     //（实测 comprehension.tie 的 @tl_loopf_main_274… 而非 _1…，产物逐字节不等）。
     g_tf_ctr = 0
@@ -800,59 +801,180 @@ func gen_one_lazy_init(nid: i64, node: i64, ty: i64) -> i64 {
     return 0
 }
 
-// ---------- 空表全局的可达裁剪（p.9.14 性能） ----------
-// 清单定案：初值为空且完全未被引用、非导出、无按名查找标记的表全局，不生成
-// 建表代码。空表无副作用 ⇒ 不改变可观测语义；@g 槽仍是合法 null 全局，
-// 只是没有运行期建表 store（未引用 ⇒ 无人读取，不触发空指针崩溃）。
-// 判据一律保守：pub（gb_const bit1）/ #[used|keep|no_mangle|export_name|
-// link_section]（llvmgen 属性位）/ --dll-export 名单 / 动态库模式 /
-// 命名空间限定名 / 非空的初值 / 任一语义树同名引用 → 退回独立建表。
-func tig_global_dead_empty(gi: i64) -> bool {
+// ---------- 空表全局：可达裁剪 + 只读折叠（清单 p.9.14） ----------
+// 一次性分类（父索引 + 使用位置白名单）：
+//   0 = 正常独立建表；1 = 零引用空表（不生成建表代码）；2 = 只读空表
+//   （按元素类型分组共享一个**真实**零长度表句柄）。
+// 正确性红线：折叠后的空必须是 len==0 的真实句柄（48 字节表头、锁已初始化），
+// 不能是 null——tbl_at 读 lock@32 并进临界区；纯 .rodata 常量带不了 CS 缓冲
+// （实测），故按定案方案 A 在 main 入口按元素类型各建一个真实表。
+// 只读性由白名单保证：len / 下标读 / for in / == != 四种位置才放行，其余
+// （一切调用实参含 eq.ptr_same 显式身份比较、ref 借用、下标/字段写）一律
+// 退回独立建表；asm! 单元整单元不折。含折叠全局的单元禁用片段跨单元复用
+// （cache_drv.tier_frag_cache 查 g_ro_fold_used）；装配路径本就跳过 irgen，
+// 不会产出折叠全局。
+pub var g_ro_fold_used: bool = false;
+
+// 单元级折叠标记查询：driver 侧按函数读取（命名空间限定变量读不支持）。
+pub func ro_fold_used() -> bool {
+    return g_ro_fold_used
+}
+
+// 空表全局基础资格（不含引用分析）：返回 esz>0 表示候选，0 = 不具备。
+// 判据一律保守：pub / #[used|keep|no_mangle|export_name|link_section] /
+// --dll-export 名单 / 动态库模式 / 命名空间限定名 / 非空初值 / lazy 表 /
+// 全局行池 → 退回独立建表。
+func tig_global_empty_base(gi: i64) -> i64 {
     var nid = gb_keys[gi]
     if (gb_const[gi] & 2) != 0 {
-        return false
+        return 0
     }
     if g_dynlib {
-        return false
+        return 0
     }
     var gname = intern.lookup(nid)
-    // 命名空间限定名：引用可能以裸名或路径名出现，路径名池 id 与裸名不同，
-    // 保守起见命名空间的全局整类不裁（性能收益让位于正确性）。
     var ci: i64 = 0
     while ci < str_len(gname) {
         if str_byte(gname, ci) == 58 {
-            return false
+            return 0
         }
         ci = ci + 1
     }
     if str_len(g_dll_export) > 0 && dll_export_hit(gname) {
-        return false
+        return 0
     }
     var ai: i64 = 0
     while ai < len(llvmgen.g_gattr_names) {
         if llvmgen.g_gattr_names[ai] == nid && llvmgen.g_gattr_bits[ai] != 0 {
-            return false
+            return 0
         }
         ai = ai + 1
     }
-    // 初值必须为空：省略初值，或空表字面量 []（tag 12 且 nc == 0）
     var ginit_node = g_ginit_node_of(nid)
     if ginit_node >= 0 {
         if ast.s_tag(ginit_node) != 12 || sstate.nchild(ginit_node) != 0 {
-            return false
+            return 0
         }
     }
-    // 全语义树扫描（ast.s_n 含语义期新建节点）：除声明节点本身
-    //（N_VAR_DECL=100）外任何同名节点都算引用——同名局部遮蔽也保守保留。
+    if ir.lazy_has(interner.intern("@" + gname)) {
+        return 0
+    }
+    var gte = gb_telem[gi]
+    if gte < 0 || types.kind(gte) == K_STRUCT {
+        return 0
+    }
+    return elem_size(gte)
+}
+
+// 单个引用位置是否只读（白名单）。pm = 语义树父节点索引。
+func tig_global_use_readonly(k: i64, pm: table<i64>) -> bool {
+    var par = pm[k]
+    if par < 0 {
+        return false
+    }
+    var ptag = ast.s_tag(par)
+    // len(g)：内建长度读（唯一放行的调用实参）
+    if ptag == 7 && sstate.name_str(par) == "len" {
+        return true
+    }
+    // g[i] 下标读；写目标（N_INDEX_ASSIGN / N_FIELD_ASSIGN）与字段访问
+    // （可能是 t[i].f = v 的中间节点）一律拒绝
+    if ptag == 13 && sstate.child(par, 0) == k {
+        var gp = pm[par]
+        if gp >= 0 {
+            var gt = ast.s_tag(gp)
+            if gt == 116 || gt == 115 || gt == 15 {
+                return false
+            }
+        }
+        return true
+    }
+    // == / != 内容相等（身份比较是函数调用，不在白名单内）
+    if ptag == 9 && (ast.s_val(par) == 5 || ast.s_val(par) == 6) {
+        return true
+    }
+    // for x in g：迭代只读
+    if ptag == 107 && sstate.child(par, 0) == k {
+        return true
+    }
+    return false
+}
+
+// 一次性分类：构建父索引 + 单遍扫描全体 Var 引用（O(节点数 + 全局数)），
+// 避免每个全局各扫一遍语义树。
+func tig_global_classify() -> table<i64> {
+    var G = len(gb_keys)
+    var cls: table<i64> = table_new_i64()
+    var eszs: table<i64> = table_new_i64()
+    var refs: table<i64> = table_new_i64()
+    var bads: table<i64> = table_new_i64()
+    var have = false
+    var gi: i64 = 0
+    while gi < G {
+        var e = tig_global_empty_base(gi)
+        table_push(eszs, e)
+        table_push(cls, 0)
+        table_push(refs, 0)
+        table_push(bads, 0)
+        if e > 0 {
+            have = true
+        }
+        gi = gi + 1
+    }
+    if !have {
+        return cls
+    }
+    // 父节点索引（ast.s_n 含语义期新建节点）
     var n = ast.s_n
+    var pm: table<i64> = table_new_i64()
     var k: i64 = 0
     while k < n {
-        if ast.s_tag(k) != 100 && ast.s_name(k) == nid {
-            return false
+        table_push(pm, -1)
+        k = k + 1
+    }
+    var p: i64 = 0
+    while p < n {
+        var nc = sstate.nchild(p)
+        var c: i64 = 0
+        while c < nc {
+            var ch = sstate.child(p, c)
+            if ch >= 0 && ch < n {
+                pm[ch] = p
+            }
+            c = c + 1
+        }
+        p = p + 1
+    }
+    // 引用统计 + asm! 单元探测：按名查 gb_keys（升序，二分）
+    var asm_present = false
+    k = 0
+    while k < n {
+        if ast.s_tag(k) == 131 {
+            asm_present = true  // asm! 内联汇编的写面不可静态分析
+        }
+        if ast.s_tag(k) == 6 {
+            var gid = sstate.bs_find(gb_keys, ast.s_name(k))
+            if gid >= 0 && eszs[gid] > 0 {
+                refs[gid] = refs[gid] + 1
+                if !tig_global_use_readonly(k, pm) {
+                    bads[gid] = 1
+                }
+            }
         }
         k = k + 1
     }
-    return true
+    gi = 0
+    while gi < G {
+        if eszs[gi] > 0 {
+            if refs[gi] == 0 {
+                cls[gi] = 1  // 零引用 → 可达裁剪
+            } else if bads[gi] == 0 && !asm_present {
+                cls[gi] = 2  // 全部只读 → 折叠
+            }
+        }
+        gi = gi + 1
+    }
+    return cls
 }
 
 // ---------- 全局表初始化（--shared 缺陷修复）----------
@@ -864,8 +986,52 @@ func tig_global_dead_empty(gi: i64) -> bool {
 // 发射到当前 g_cur_block。返回 0 / -1（错误已置 sm_err_msg）。
 pub func gen_global_tbl_init() -> i64 {
     var saved_fn = g_cur_fn_name
+    var cls = tig_global_classify()
+    var T64 = types.named(TK_I64)
+    var TSTR = types.named(TK_STR)
+    // 只读折叠：按元素类型（⇒ esz 与深表标记一致）分组，每组只建一个真实
+    // 零长度表句柄，所有 cls==2 全局共享。句柄 rc=1、锁已初始化、len=0，
+    // 全局不参与出口析构 ⇒ 进程级常驻；只读白名单保证无人写入。
+    var sh_tys: table<i64> = table_new_i64()
+    var sh_vals: table<i64> = table_new_i64()
+    var fi: i64 = 0
+    while fi < len(gb_keys) {
+        if cls[fi] == 2 {
+            var fte = gb_telem[fi]
+            var hit: i64 = -1
+            var si: i64 = 0
+            while si < len(sh_tys) {
+                if sh_tys[si] == fte {
+                    hit = si
+                }
+                si = si + 1
+            }
+            if hit < 0 {
+                var fsz_v = tig_int_lit_ty(elem_size(fte), T64)
+                var fhv = s21_table_new_ty(fte, fsz_v)
+                if fhv < 0 {
+                    return -1
+                }
+                table_push(sh_tys, fte)
+                table_push(sh_vals, fhv)
+                hit = len(sh_tys) - 1
+                g_ro_fold_used = true
+            }
+            var fst = ir.new_inst(g_cur_block, 22, -1)  // store
+            ir.add_operand(fst, TSTR, 2)
+            ir.add_operand(fst, sh_vals[hit], 0)
+            ir.add_operand(fst, interner.intern("@" + intern.lookup(gb_keys[fi])), 3)
+        }
+        fi = fi + 1
+    }
     var gi: i64 = 0
     while gi < len(gb_keys) {
+        // cls==1：零引用空表全局不生成建表代码（清单 p.9.14）
+        // cls==2：已指向分组共享句柄，跳过独立建表
+        if cls[gi] != 0 {
+            gi = gi + 1
+            continue
+        }
         // lazy 表由 tie_lazy_<name>() 在首次读时建表；这里若也建一个空表并
         // store 到 @g，会与惰性初值竞争（还泄漏一个空表句柄），必须跳过。
         if ir.lazy_has(interner.intern("@" + intern.lookup(gb_keys[gi]))) {
@@ -874,12 +1040,6 @@ pub func gen_global_tbl_init() -> i64 {
         }
         var gte = gb_telem[gi]
         if gte >= 0 {
-            // 可达裁剪：零引用空表全局不生成建表代码（清单 p.9.14）
-            if tig_global_dead_empty(gi) {
-                gi = gi + 1
-                continue
-            }
-            // p.9.12.6 边界：全局行池 table<R> v1 不支持（列式行池需每字段列 @g 全局）
             if types.kind(gte) == K_STRUCT {
                 sm_err_msg = "行池 table<R> 全局变量 v1 暂不支持（p.9.12.6 边界；仅局部行池可用）"
                 return -1
