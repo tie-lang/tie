@@ -263,7 +263,63 @@ func is_def_word(w: string) -> bool {
         w == "import" || w == "using" || w == "extern" {
         return true
     }
+    // 文件头角色声明（type tie<tsc> 等）属定义侧：它若落到语句段，会被包进
+    // 合成出的 main 体，而头部声明在函数体内不合法 → 脚本整体报语法错误。
+    if w == "type" {
+        return true
+    }
     return false
+}
+
+// 前缀比较（码点语义）。
+func has_prefix_c(s: string, p: string) -> bool {
+    var ns = str_len(s)
+    var np = str_len(p)
+    if np > ns {
+        return false
+    }
+    var i = 0
+    while i < np {
+        if str_char(s, i) != str_char(p, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 剥离文件头角色声明（type tie<...>）：主语言 parser 不接受它——角色识别是
+// 编译器驱动层的事，而脚本宿主按脚本处理，故抹掉该行内容（用等长空格替换，
+// 换行保留 ⇒ 报错行号不变）。头部声明只可能出现在文件前若干行。
+func strip_role_header(src: string) -> string {
+    var n = str_len(src)
+    var out = src
+    var i = 0
+    var seen = 0
+    while seen < 20 && i < n {
+        var j = i
+        while j < n && str_char(src, j) != "\n" {
+            j = j + 1
+        }
+        var a = i
+        while a < j && is_ws_c(str_char(src, a)) {
+            a = a + 1
+        }
+        var head = slice_str(src, a, j)
+        if has_prefix_c(head, "type tie<") {
+            var k = a
+            while k < j {
+                out = slice_str(out, 0, k) + " " + slice_str(out, k + 1, str_len(out))
+                k = k + 1
+            }
+        }
+        if j >= n {
+            break
+        }
+        i = j + 1
+        seen = seen + 1
+    }
+    return out
 }
 
 func is_cont_char(c: string) -> bool {

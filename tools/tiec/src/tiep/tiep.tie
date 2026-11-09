@@ -264,7 +264,7 @@ pub func eval_script(src: string) -> string {
     // 再把①作顶层、②包装进 `func main()`——函数定义全在顶层注册（跨行持久、
     // 声明先于调用成立），语句在 main 体内按序执行（不压作用域 → 顶层 var 落
     // globals，可跨函数共享）。
-    var parts = split_top(src)
+    var parts = split_top(strip_role_header(src))
     var combined = parts[0] + "\nfunc main() {\n" + parts[1] + "\n}\n"
     var ok1 = lexer.run_lex(combined)
     if !ok1 {
@@ -337,6 +337,12 @@ pub func eval_script(src: string) -> string {
     return ""
 }
 
+
+// 上一句求值是否出错（错误文本由 eval / eval_script 返回）。
+// 脚本宿主据此区分「脚本结果」与「脚本错误」——两者都走同一个返回通道。
+pub func has_err() -> bool {
+    return w_err != ""
+}
 
 // 脚本退出已请求（tshell 宿主经 backend_interp 读取）。
 pub func exit_requested() -> bool {

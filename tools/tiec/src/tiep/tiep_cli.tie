@@ -1,0 +1,47 @@
+type tie<logic>
+// tools/tiec/src/tiep/tiep_cli.tie —— tie 脚本执行入口
+// ============================================================
+// 职责：按文件执行 tsc 脚本。读文件 → 注入脚本参数 → 求值 → 输出结果或错误 →
+//   返回退出码（脚本内 exit(n) 可指定）。
+// 用法：tiep.exe <脚本路径> [参数...]
+//   脚本内取参数：arg_count() / arg_string(i)（参数表由本入口注入）。
+//   退出码：0 正常 / 1 脚本错误 / 2 用法或读文件失败 / 其它 = 脚本自定。
+//
+// 脚本语法与主语言一致（求值复用主语言前端与语义），因此本入口只负责
+// 「取文件、传参、转发结果」三件事，不解释脚本内容。
+// ============================================================
+
+import "./tiep.tie"
+
+func main() -> i64 {
+    var n = arg_count()
+    if n < 1 {
+        println("用法：tiep <脚本路径> [参数...]")
+        return 2
+    }
+    var path = arg_string(0)
+    var src = file_read(path)
+    if src == "" {
+        println("读取失败：" + path)
+        return 2
+    }
+
+    // 脚本参数：命令行上路径之后的部分
+    var args = table_new_string()
+    var i = 1
+    while i < n {
+        table_push(args, arg_string(i))
+        i = i + 1
+    }
+    tiep.set_script_args(args)
+
+    var out = tiep.eval_script(src)
+    if tiep.has_err() {
+        println(out)
+        return 1
+    }
+    if out != "" {
+        println(out)
+    }
+    return tiep.exit_code_val()
+}
