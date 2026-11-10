@@ -84,8 +84,15 @@ pub func parse_program() -> i64 {
         // 识别为修饰符。用 lex_ident 而非新保留字，保证同名标识符（局部变量、
         // 函数参数等）在其它位置继续可用——上下文关键字不侵占用户命名空间。
         g_pending_var_mod = 0
+        // module namespace：与 lazy/eager 同为上下文关键字，不进保留字表，
+        // 只在顶层且紧跟 namespace 时升级，避免侵占同名标识符。
+        var is_mod_ns = false
         if putil.peek_tag() == lex_ident {
             var lx = putil.peek_lexeme()
+            if lx == "module" && putil.peek_n(1) == lex_namespace {
+                putil.advance()
+                is_mod_ns = true
+            }
             if lx == "lazy" || lx == "eager" {
                 var nxt = putil.peek_n(1)
                 var is_imp = nxt == lex_import
@@ -259,6 +266,11 @@ pub func parse_program() -> i64 {
             var s = parse_namespace()
             if s < 0 {
                 return -1
+            }
+            // 上下文关键字 module 命中时把该命名空间升级为模块命名空间：
+            // 标志写进 N_NAMESPACE 的 val 槽，语义层据此决定是否走文本内联。
+            if is_mod_ns {
+                ast.set_val(s, 1)
             }
             ast.collect_stmt(stmts, s)
         } else if tag == lex_actor {

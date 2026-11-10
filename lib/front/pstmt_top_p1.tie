@@ -609,10 +609,9 @@ func parse_import() -> i64 {
             return -1
         }
     }
-    // 选择性导入：`import "path".{a, b}`——路径后可跟 `.{` 逗号分隔
-    // 标识符列表。选中名作为 N_IMPORT 的子节点（N_VAR，name = 名字池 id）随
-    // AST 进 sstate，semantic.expand_one_import 按此过滤登记（子节点为空 =
-    // 普通 import 全量可见）。
+    // 选择性导入：`import "path".{a, b}` / `import "path".{a.b.c, d}`
+    // ——选中名可为点分全名（模块命名空间），子节点 N_VAR 的 name 存全名池 id。
+    // 语义层按「顶层声明名 / 命名空间点分全名」匹配；子节点为空 = 全量可见。
     var sel: table<i64> = table_new_i64()
     if putil.eat(lex_dot) {
         if !putil.expect(lex_lbrace, "'{'") {
@@ -620,11 +619,19 @@ func parse_import() -> i64 {
         }
         var dsel = false
         while !dsel {
-            var snm = putil.expect_ident()
-            if snm < 0 {
+            var seg = putil.expect_ident()
+            if seg < 0 {
                 return -1
             }
-            table_push(sel, ast.new_node(N_VAR, snm, -1, -1, putil.peek_line(), putil.peek_col()))
+            var full = interner.lookup(seg)
+            while putil.eat(lex_dot) {
+                seg = putil.expect_ident()
+                if seg < 0 {
+                    return -1
+                }
+                full = full + "." + interner.lookup(seg)
+            }
+            table_push(sel, ast.new_node(N_VAR, interner.intern(full), -1, -1, putil.peek_line(), putil.peek_col()))
             if putil.eat(lex_comma) {
                 // 继续
             } else {

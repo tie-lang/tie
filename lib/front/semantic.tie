@@ -40,6 +40,12 @@ pub var g_lib_root: string = "";
 pub var g_cfg_env_target: string = "";
 pub var g_cfg_env_profile: string = "";
 
+// 当前文件的基础角色：driver 经 semantic.set_file_role 单点注入；被导入文件
+// 由 expand_one_import 用 sstate.scan_file_role 临时切换（defer 恢复）。
+pub var g_file_role: string = "";
+// import 展开栈：检测循环依赖（目标仍在展开中又被导入）。
+pub var g_imp_stack: table<string>;
+
 // 泛型预扫描展开状态：g_extra_tops 已扫描位置游标（新展开的函数
 // 追加到 g_extra_tops 末尾，主循环从该位置续扫）
 pub var g_scan_extra_last: i64 = 0;

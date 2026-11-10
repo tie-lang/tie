@@ -51,6 +51,22 @@ pub func set_cfg_env(target: string, profile: string) {
     g_cfg_env_profile = profile
 }
 
+// 文件角色注入：driver 在头部扫描后调用（与 set_cfg_env 同为单点注入）。
+pub func set_file_role(r: string) {
+    g_file_role = r
+}
+
+// 模块命名空间允许的角色：产出可独立编译代码、且不经解释器执行的基础角色。
+// pass 形态（ui/db/port/zd/tsh）与解释执行（tsc）不进编译器前端；此判据是
+// 防御性校验，防止这些角色将来接入前端时误用模块命名空间。
+pub func role_allows_module_ns(r: string) -> bool {
+    if r == "lib" { return true }
+    if r == "class" { return true }
+    if r == "type" { return true }
+    if r == "logic" { return true }
+    return false
+}
+
 // 解析 import 路径：相对当前文件目录（处理 "./" 与 "../"）；
 // 结果统一经 normalize_path 归一化（去重键一致，见 normalize_path 注释）。
 pub func resolve_import_path(path: string) -> string {

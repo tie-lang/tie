@@ -927,6 +927,46 @@ pub func scan_file_caps(src: string) -> i64 {
     return out
 }
 
+// 读文件头的基础角色名（只看 `type tie<...>` 的第一段）。扫描口径与
+// scan_file_caps / driver.scan_header 一致：前 20 行、首个非空非声明行即停。
+// frontend 不能反向依赖 driver 的角色注册表，故此处只认出角色名文本；
+// 角色语义（白名单、参数、修饰）仍归 driver，两边职责不重叠。
+pub func scan_file_role(src: string) -> string {
+    var n = str_len(src)
+    var pos: i64 = 0
+    var line_no: i64 = 1
+    while pos < n && line_no <= 20 {
+        var ln_e = pos
+        while ln_e < n && str_char(src, ln_e) != "\n" {
+            ln_e = ln_e + 1
+        }
+        var ln = trim(str.slice(src, pos, ln_e))
+        if str_len(ln) > 0 {
+            if tie.support::has_prefix(str.clone(ln), "type tie") {
+                var lt = tie.support::find_char(str.clone(ln), "<")
+                var gt = tie.support::find_char(str.clone(ln), ">")
+                if lt < 0 || gt <= lt + 1 {
+                    return "type"
+                }
+                var inner = tie.support::slice(str.clone(ln), lt + 1, gt)
+                var comma = tie.support::find_char(str.clone(inner), ",")
+                if comma >= 0 {
+                    inner = tie.support::slice(str.clone(inner), 0, comma)
+                }
+                var colon = tie.support::find_char(str.clone(inner), ":")
+                if colon >= 0 {
+                    inner = tie.support::slice(str.clone(inner), 0, colon)
+                }
+                return trim(inner)
+            }
+            return "logic"
+        }
+        pos = ln_e + 1
+        line_no = line_no + 1
+    }
+    return "logic"
+}
+
 // 编译单元起点调用：清空函数级域表与文件级位集，避免同一进程连续编译多个文件时
 // 旧节点 id 残留（节点池 id 在新 AST 里会重用 ⇒ 会串到新文件的函数上）。
 pub func compile_unit_reset() {

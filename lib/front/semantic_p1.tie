@@ -156,6 +156,21 @@ func expand_one_import(imp_node: i64) -> i64 {
         sm_err_msg = "内置库根缺失: '" + lib_root() + "'（运行 scripts/fetch-lib.ps1 或设置 TIE_LIB_ROOT / --lib-root）"
         return -1
     }
+    // 循环依赖：目标仍在当前展开栈中 ⇒ 编译期响亮拒绝；合法的钻石依赖由
+    // imported_has 去重，不在此列。
+    var si: i64 = 0
+    while si < len(g_imp_stack) {
+        if g_imp_stack[si] == full {
+            sm_err_line = s_lines[imp_node]
+            sm_err_col = s_cols[imp_node]
+            sm_err_msg = "import 循环依赖：'" + full + "' 正在展开中又被导入"
+            return -1
+        }
+        si = si + 1
+    }
+    var stack_depth = len(g_imp_stack)
+    table_push(g_imp_stack, full)
+    defer { table_trunc(g_imp_stack, stack_depth) }
     if imported_has(full) {
         // 别名 × 已加载文件（2026-10-12 增名修复二）：重复导入直接跳过时别名
         // 仍须可用——按词干定位已加载文件的根，登记 别名 → 该文件顶层命名空间
@@ -236,6 +251,11 @@ func expand_one_import(imp_node: i64) -> i64 {
         sm_err_msg = "导入文件 '" + full + "' 的 #cfg 预处理失败: " + src_c
         return -1
     }
+    // 被导入文件的角色按它自己的头部声明切过去（defer 覆盖全部 return 路径），
+    // 供模块命名空间的角色判据使用；主文件角色由 driver 单点注入。
+    var saved_imp_role = g_file_role
+    defer { g_file_role = saved_imp_role }
+    g_file_role = sstate.scan_file_role(src_c)
     var saved_imp_fc = sstate.file_caps()
     // 用 defer 覆盖本函数的**全部** return 路径：本函数 return 点多（文件不存在、
     // 解析失败、别名重复、append 失败…），逐点恢复必漏。
@@ -291,6 +311,28 @@ func expand_one_import(imp_node: i64) -> i64 {
     // 有别名时，把被导入文件顶层 namespace 的段名替换为别名（f2 作为唯一入口）。
     var alias_id = s_aux[imp_node]
     var new_root = len(s_tags) - 1
+    // 模块命名空间的角色判据（被导入文件）：N_NAMESPACE.val == 1 为模块标志。
+    var mn: i64 = 0
+    while mn < sstate.nchild(new_root) {
+        var mnode = sstate.child(new_root, mn)
+        if s_tags[mnode] == S_N_NAMESPACE && s_vals[mnode] == 1 {
+            if !role_allows_module_ns(g_file_role) {
+                sm_err_line = s_lines[imp_node]
+                sm_err_col = s_cols[imp_node]
+                sm_err_msg = "角色 '" + g_file_role + "' 不允许声明模块命名空间"
+                return -1
+            }
+        }
+        if g_file_role == "lib" && s_tags[mnode] == S_N_FN_DEF {
+            if intern.lookup(s_names[mnode]) == "main" {
+                sm_err_line = s_lines[imp_node]
+                sm_err_col = s_cols[imp_node]
+                sm_err_msg = "lib 角色文件不允许定义 main（库不承载程序入口）"
+                return -1
+            }
+        }
+        mn = mn + 1
+    }
     // 别名改名传播（修复：别名 × 分片库命名空间分裂）：记录被改名 ns 的原名
     // 段 id，供递归展开的分片（多文件共享同名 namespace）继承改名。
     var rn_orig: table<i64> = table_new_i64()
@@ -371,7 +413,8 @@ func expand_one_import(imp_node: i64) -> i64 {
             table_push(sel_names, s_names[sn])
             k2 = k2 + 1
         }
-        // 顶层名表（非 import 顶层；平行 flags）
+        // 顶层名表（非 import 顶层；平行 flags）。命名空间节点用点分全名
+        // 作可选名，普通顶层声明用裸名——与 import 侧的点分选择列表同形态。
         var tops: table<i64> = table_new_i64()
         var tnames: table<i64> = table_new_i64()
         var flags: table<i64> = table_new_i64()
@@ -380,7 +423,22 @@ func expand_one_import(imp_node: i64) -> i64 {
             var s = sstate.child(new_root, k)
             if s_tags[s] != S_N_IMPORT {
                 table_push(tops, s)
-                table_push(tnames, s_names[s])
+                var nm = s_names[s]
+                if s_tags[s] == S_N_NAMESPACE {
+                    var nsname = ""
+                    var nseg = s_aux[s]
+                    var q: i64 = 0
+                    while q < nseg {
+                        var sg = sstate.child(s, q)
+                        if q > 0 {
+                            nsname = nsname + "."
+                        }
+                        nsname = nsname + intern.lookup(s_names[sg])
+                        q = q + 1
+                    }
+                    nm = intern.intern(nsname)
+                }
+                table_push(tnames, nm)
                 table_push(flags, 0)
             }
             k = k + 1
@@ -532,6 +590,29 @@ func alias_propagate(fr: i64, alias_id: i64, rn_orig: table<i64>) -> i64 {
 // import 展开总入口：主文件顶层进 g_extra_tops，import 递归展开
 func expand_imports() -> i64 {
     g_imported = table_new_string()
+    g_imp_stack = table_new_string()
+    // 主文件的模块命名空间角色判据（被导入文件在 expand_one_import 里判）。
+    var mn: i64 = 0
+    while mn < sstate.nchild(g_root) {
+        var mnode = sstate.child(g_root, mn)
+        if s_tags[mnode] == S_N_NAMESPACE && s_vals[mnode] == 1 {
+            if !role_allows_module_ns(g_file_role) {
+                sm_err_line = s_lines[mnode]
+                sm_err_col = s_cols[mnode]
+                sm_err_msg = "角色 '" + g_file_role + "' 不允许声明模块命名空间"
+                return -1
+            }
+        }
+        if g_file_role == "lib" && s_tags[mnode] == S_N_FN_DEF {
+            if intern.lookup(s_names[mnode]) == "main" {
+                sm_err_line = s_lines[mnode]
+                sm_err_col = s_cols[mnode]
+                sm_err_msg = "lib 角色文件不允许定义 main（库不承载程序入口）"
+                return -1
+            }
+        }
+        mn = mn + 1
+    }
     // 导入时机标记随单元复位：常驻服务编译下一单元时不得残留上一单元的
     // lazy/eager 文件标记，否则会把无关模块判成全量物化或放弃导出面。
     sstate.reset_file_import_mod()
