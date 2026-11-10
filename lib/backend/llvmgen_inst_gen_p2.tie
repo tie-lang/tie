@@ -473,7 +473,8 @@ pub func gen_inst_b_36_extern_call(inst_id: i64) {
         // 判据：ins_ty == TK_STR 且符号 tie_ 前缀（libc 的 malloc/strlen 等
         // 不以 tie_ 开头，绝不误补头）。补头后 reg 仍为数据指针（值 id 不变）。
         var sid = ir.ins_opnd(inst_id, 0)
-        var sym = intern.lookup(sid)
+        // 符号名转义：命名空间全名 a::b → a$b，与 define / declare 同一规则。
+        var sym = ns_replace(intern.lookup(sid))
         var args = ""
         var k: i64 = 2
         while k + 1 < cnt {
