@@ -7,6 +7,19 @@ type tie<class>
 // 宏展开自身的错误通道（不再借用解释器的全局）。失败时由执行器返回值同步。
 var g_macro_err: string = "";
 namespace mexpand {
+// 执行器结果按 OK:/ERR: 前缀分流：失败写入本模块错误通道，成功剥前缀返回载荷。
+// 未带前缀视为协议违约，原样作为错误响亮失败，绝不静默当作成功。
+func exec_result(r: string) -> string {
+    if tie.support::has_prefix(str.clone(r), "ERR:") {
+        g_macro_err = tie.support::slice(str.clone(r), 4, str_len(r))
+        return ""
+    }
+    if tie.support::has_prefix(str.clone(r), "OK:") {
+        return tie.support::slice(str.clone(r), 3, str_len(r))
+    }
+    g_macro_err = r
+    return ""
+}
 // 池快照：s_* 池 9 列 + node_types + s_n（节点总数）深拷贝到 g_pool_*。
 func pool_save() {
     g_pool_tags = copy_i64(s_tags)
@@ -229,12 +242,11 @@ func register_macros(exec_proto: fn(string) -> string) -> i64 {
             sm_err_msg = "宏定义序列化失败: " + g_macro_err
             return -1
         }
-        var r = exec_proto(proto)
-        if str_len(r) > 0 { g_macro_err = r }
+        var r = exec_result(exec_proto(proto))
         if g_macro_err != "" {
             sm_err_line = s_lines[node]
             sm_err_col = s_cols[node]
-            sm_err_msg = "宏 '" + interner.lookup(g_macro_keys[i]) + "' 注册失败: " + r
+            sm_err_msg = "宏 '" + interner.lookup(g_macro_keys[i]) + "' 注册失败: " + g_macro_err
             return -1
         }
         i = i + 1
@@ -296,12 +308,11 @@ func expand_one(call_id: i64, exec_macro: fn(string, table<string>) -> string, e
             table_push(argstrs, src)
             k2 = k2 + 1
         }
-        var rp = exec_proc(name, argstrs)
-            if str_len(rp) > 0 { g_macro_err = rp }
+        var rp = exec_result(exec_proc(name, argstrs))
         if g_macro_err != "" {
             sm_err_line = s_lines[call_id]
             sm_err_col = s_cols[call_id]
-            sm_err_msg = "过程宏 '" + name + "' 展开失败: " + rp
+            sm_err_msg = "过程宏 '" + name + "' 展开失败: " + g_macro_err
             return -1
         }
         return finish_expand(call_id, name, rp)
@@ -327,12 +338,11 @@ func expand_one(call_id: i64, exec_macro: fn(string, table<string>) -> string, e
         k = k + 1
     }
     // 执行宏（编译期；宏体错误在此暴露）
-    var result = exec_macro(name, args)
-        if str_len(result) > 0 { g_macro_err = result }
+    var result = exec_result(exec_macro(name, args))
     if g_macro_err != "" {
         sm_err_line = s_lines[call_id]
         sm_err_col = s_cols[call_id]
-        sm_err_msg = "宏 '" + name + "' 展开失败: " + result
+        sm_err_msg = "宏 '" + name + "' 展开失败: " + g_macro_err
         return -1
     }
     return finish_expand(call_id, name, result)

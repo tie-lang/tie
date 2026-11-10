@@ -10,16 +10,24 @@ import "../../../../lib/front/api.tie"
 namespace driver {
 
 // 执行器包装：命名空间函数不能作值传递（E00393），同文件裸名包装可作值。
+// 解释器成功/失败共用同一返回通道（成功也可能是非空的 code 协议文本），
+// 故装配层统一成 OK:/ERR: 前缀协议，lib/macro 按前缀分流，不再借用 w_err。
 func fe_eval_proto(proto: string) -> string {
-    return interp::eval_proto(proto)
+    var r = interp::eval_proto(proto)
+    if interp::has_err() { return "ERR:" + r }
+    return "OK:" + r
 }
 
 func fe_eval_macro(name: string, args: table<string>) -> string {
-    return interp::eval_macro(name, args)
+    var r = interp::eval_macro(name, args)
+    if interp::has_err() { return "ERR:" + r }
+    return "OK:" + r
 }
 
 func fe_eval_macro_proc(name: string, args: table<string>) -> string {
-    return interp::eval_macro_proc(name, args)
+    var r = interp::eval_macro_proc(name, args)
+    if interp::has_err() { return "ERR:" + r }
+    return "OK:" + r
 }
 
 pub func frontend(src: string, base_dir: string) -> i64 {
