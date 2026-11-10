@@ -1,0 +1,83 @@
+type tie<class>
+// 模块产物分离：主 IR 由正常编译链完整生成后，把模块函数的 define 块
+// 抽成独立 .ll，主 IR 只留 declare；链接期 clang 合并多个 .ll。
+// 模块边界由 LLVM 链接保证，主单元不持有模块实现。
+import "../support/text.tie"
+import "./modstate.tie"
+namespace modunit;
+
+func sym_hit(syms: table<string>, s: string) -> bool {
+    var i: i64 = 0
+    while i < len(syms) {
+        if syms[i] == s {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+pub func split_main_ir(ll: string, out_prefix: string) -> string {
+    var syms = modstate.syms()
+    var lines = tie.support::split_char(ll, "\n")
+    // 主 .ll 可达近万行，逐行字符串累加是 O(n²)：一律走 sb 通道。
+    var head = string_builder()
+    var mods = string_builder()
+    var main = string_builder()
+    var mod_count: i64 = 0
+    var i: i64 = 0
+    while i < len(lines) {
+        var ln = lines[i]
+        if tie.support::has_prefix(str.clone(ln), "define ") {
+            var at = tie.support::find_char(str.clone(ln), "@")
+            var lp = tie.support::find_char(str.clone(ln), "(")
+            var sym = ""
+            if at >= 0 && lp > at {
+                sym = tie.support::slice(str.clone(ln), at + 1, lp)
+            }
+            var mline = ln
+            if tie.support::has_prefix(str.clone(mline), "define internal ") {
+                mline = "define " + tie.support::slice(str.clone(mline), 16, str_len(mline))
+            }
+            var block = string_builder()
+            sb_append(block, mline + "\n")
+            i = i + 1
+            while i < len(lines) {
+                sb_append(block, lines[i] + "\n")
+                if lines[i] == "}" {
+                    break
+                }
+                i = i + 1
+            }
+            i = i + 1
+            var btext = sb_build(block)
+            if sym_hit(syms, sym) {
+                sb_append(mods, btext)
+                mod_count = mod_count + 1
+                var brace = tie.support::find_char(str.clone(ln), "{")
+                var sig = tie.support::slice(str.clone(ln), 7, brace)
+                if tie.support::has_prefix(str.clone(sig), "internal ") {
+                    sig = tie.support::slice(str.clone(sig), 9, str_len(sig))
+                }
+                modstate.add_decl("declare " + sig + "\n")
+            } else {
+                sb_append(main, btext)
+            }
+            continue
+        }
+        // 私有字符串常量是文件局部符号，两个 .ll 各一份安全；外部可写全局
+        // 若真的重复，链接期 clang 会报重复定义（响亮失败，不会静默给错误结果）。
+        sb_append(head, ln + "\n")
+        sb_append(main, ln + "\n")
+        i = i + 1
+    }
+    if mod_count > 0 {
+        var out = out_prefix + "0.ll"
+        if !file_write(out, sb_build(head) + sb_build(mods)) {
+            modstate.set_err("模块 IR 写盘失败: " + out)
+            return ""
+        }
+        modstate.add_ll(out)
+    }
+    return sb_build(main) + "\n" + modstate.declares_text()
+}

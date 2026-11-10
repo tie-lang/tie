@@ -546,6 +546,14 @@ pub func kpass_emit() -> i64 {
     // IR 文件路径（统一由 driver.ir_path 给；--emit-ir 落用户路径，
     // 否则落**进程私有**临时名——见 ir_priv_prefix 注释）
     var ir_path = ir_path()
+    if modstate.has_modules() {
+        var split_ll = modunit.split_main_ir(ll_text, ir_path + ".mod")
+        if str_len(split_ll) == 0 {
+            dbg_txt("模块编译失败: " + modstate.err())
+            return 1
+        }
+        ll_text = split_ll
+    }
     unsafe {
         var t4 = clock()
     }
@@ -926,7 +934,14 @@ pub func compile_logic(ir_path: string, opt_path: string, target: string) -> i64
             tc.set_entry_sym("main")
         }
     }
-    var bres = tc.link_exe(opt_path, link_out, target, g_used_interp, g_used_trmlite, g_used_wsock)
+    var link_inputs = opt_path
+    var mps = modstate.ll_paths()
+    var mii: i64 = 0
+    while mii < len(mps) {
+        link_inputs = link_inputs + " " + mps[mii]
+        mii = mii + 1
+    }
+    var bres = tc.link_exe(link_inputs, link_out, target, g_used_interp, g_used_trmlite, g_used_wsock)
     if bres != 0 {
         dbg_txt(diagcode.render_error(-1, -1, "后端失败: " + tc_err_msg))
         return 1

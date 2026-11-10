@@ -316,6 +316,27 @@ func expand_one_import(imp_node: i64) -> i64 {
     while mn < sstate.nchild(new_root) {
         var mnode = sstate.child(new_root, mn)
         if s_tags[mnode] == S_N_NAMESPACE && s_vals[mnode] == 1 {
+            // 模块命名空间：登记导出函数的链接符号，产物层据此分离 .ll。
+            modstate.add_file(full)
+            var nsp = ""
+            var nseg = s_aux[mnode]
+            var q: i64 = 0
+            while q < nseg {
+                if q > 0 {
+                    nsp = nsp + "$"
+                }
+                nsp = nsp + intern.lookup(s_names[sstate.child(mnode, q)])
+                q = q + 1
+            }
+            var mbody = sstate.child(mnode, nseg)
+            var bi: i64 = 0
+            while bi < sstate.nchild(mbody) {
+                var mf = sstate.child(mbody, bi)
+                if s_tags[mf] == S_N_FN_DEF {
+                    modstate.add_sym(nsp + "$" + intern.lookup(s_names[mf]))
+                }
+                bi = bi + 1
+            }
             if !role_allows_module_ns(g_file_role) {
                 sm_err_line = s_lines[imp_node]
                 sm_err_col = s_cols[imp_node]
@@ -616,6 +637,7 @@ func alias_propagate(fr: i64, alias_id: i64, rn_orig: table<i64>) -> i64 {
 // import 展开总入口：主文件顶层进 g_extra_tops，import 递归展开
 func expand_imports() -> i64 {
     g_imported = table_new_string()
+    modstate.reset()
     g_imp_stack = table_new_string()
     // 主文件的模块命名空间角色判据（被导入文件在 expand_one_import 里判）。
     var mn: i64 = 0

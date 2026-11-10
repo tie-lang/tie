@@ -1,0 +1,65 @@
+type tie<class>
+// 模块边界状态（零依赖叶子）：语义层登记、代码生成层查询、装配层消费。
+// 单独成文件是为了避免 lib/front 与 lib/codegen 互相 import 成环。
+// 顶层 var 置于 namespace 之前（namespace 体内禁 var），同文件内函数裸名访问。
+var g_ms_files: table<string> = [];
+var g_ms_ll_paths: table<string> = [];
+var g_ms_decls: table<string> = [];
+var g_ms_syms: table<string> = [];
+var g_ms_err: string = "";
+namespace modstate;
+
+pub func reset() {
+    g_ms_files = table_new_string()
+    g_ms_ll_paths = table_new_string()
+    g_ms_decls = table_new_string()
+    g_ms_syms = table_new_string()
+    g_ms_err = ""
+}
+
+pub func add_file(p: string) {
+    var i: i64 = 0
+    while i < len(g_ms_files) {
+        if g_ms_files[i] == p {
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_ms_files, p)
+}
+
+pub func has_modules() -> bool {
+    return len(g_ms_files) > 0
+}
+pub func add_ll(p: string) {
+    table_push(g_ms_ll_paths, p)
+}
+pub func ll_paths() -> table<string> {
+    return g_ms_ll_paths
+}
+pub func add_decl(d: string) {
+    table_push(g_ms_decls, d)
+}
+pub func add_sym(s: string) {
+    table_push(g_ms_syms, s)
+}
+
+pub func syms() -> table<string> {
+    return g_ms_syms
+}
+
+pub func declares_text() -> string {
+    var out = ""
+    var i: i64 = 0
+    while i < len(g_ms_decls) {
+        out = out + g_ms_decls[i]
+        i = i + 1
+    }
+    return out
+}
+pub func set_err(s: string) {
+    g_ms_err = s
+}
+pub func err() -> string {
+    return g_ms_err
+}
