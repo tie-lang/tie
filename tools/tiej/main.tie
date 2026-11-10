@@ -63,9 +63,9 @@ func run_source(b: string) -> i64 {
     if g_tiej_macro_on {
         interp::reset()
     }
-    // 越界检查暂关：JIT 表运行时尚未接通，开启会引入当前无法满足的
-    // 运行时符号依赖。表运行时打通后此处改为 true。
-    var compiled = tie.compile::compile_source(path, fname, false,
+    // 越界检查与 AOT 一样常开：表运行时符号已由宿主导出表提供，
+    // JIT 代码不再需要靠关闭检查来规避运行时依赖。
+    var compiled = tie.compile::compile_source(path, fname, true,
                                                 tiej_eval_proto, tiej_eval_macro, tiej_eval_proc)
     if !tie.support::has_prefix(compiled, "OK:") {
         println(tie.support::slice(compiled, 4, str_len(compiled)))
