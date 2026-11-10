@@ -1,0 +1,105 @@
+type tie<logic>
+// tools/ci/dep_check.tie —— tools 零相互依赖门禁（薄壳）
+// ============================================================
+// 递归扫描 tools/ 与 lib/ 下所有 .tie 文件，逐条把 import 交给
+// lib/support/arch_guard.tie 判定。违例打印文件、行号、import 原文与原因，
+// 退出码 1；无违例退出码 0。
+// 本文件只 import 内置库与 lib/，自身遵守同一套规则。
+import "../../lib/support/arch_guard.tie"
+import "../../lib/support/text.tie"
+import "/std/prelude.tie"
+using lang;
+namespace tie.ci;
+
+func is_tie(name: string) -> bool {
+    var n = str_len(name)
+    if n < 4 {
+        return false
+    }
+    return tie.support::slice(name, n - 4, n) == ".tie"
+}
+
+// 文件名 → 所在目录（保留尾斜杠，供 resolve 拼接相对路径）。
+func cur_dir_of(f: string) -> string {
+    var i = str_len(f) - 1
+    while i >= 0 {
+        if str_char(f, i) == "/" {
+            return tie.support::slice(f, 0, i + 1)
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// 只认顶层 import 行的四种形态（含时机前缀与 pub 重导出）。
+func is_import_line(ln: string) -> bool {
+    if tie.support::has_prefix(ln, "import ") { return true }
+    if tie.support::has_prefix(ln, "lazy import ") { return true }
+    if tie.support::has_prefix(ln, "eager import ") { return true }
+    if tie.support::has_prefix(ln, "pub import ") { return true }
+    return false
+}
+
+// 取 import 行的第一个双引号串；无引号返回空串。
+func import_text(ln: string) -> string {
+    if !is_import_line(ln) {
+        return ""
+    }
+    var q1 = tie.support::find_char(ln, "\"")
+    if q1 < 0 {
+        return ""
+    }
+    var rest = tie.support::slice(ln, q1 + 1, str_len(ln))
+    var q2 = tie.support::find_char(rest, "\"")
+    if q2 < 0 {
+        return ""
+    }
+    return tie.support::slice(rest, 0, q2)
+}
+
+func scan_dir(dir: string, ref out: table<string>) {
+    var names = list_dir(dir)
+    var i: i64 = 0
+    while i < len(names) {
+        var p = dir + "/" + names[i]
+        if file_is_dir(p) {
+            scan_dir(p, out)
+        } else if is_tie(names[i]) {
+            table_push(out, p)
+        }
+        i = i + 1
+    }
+}
+
+func main() {
+    var files = table_new_string()
+    scan_dir("tools", files)
+    scan_dir("lib", files)
+    var bad: i64 = 0
+    var i: i64 = 0
+    while i < len(files) {
+        var f = files[i]
+        var src = file_read(f)
+        var lines = tie.support::split_char(src, "\n")
+        var cur = cur_dir_of(f)
+        var j: i64 = 0
+        while j < len(lines) {
+            var ln = tie.support::trim(lines[j])
+            var imp = import_text(ln)
+            if str_len(imp) > 0 {
+                var why = tie.archguard::classify(f, imp, cur)
+                if str_len(why) > 0 {
+                    println(f + ":" + to_string(j + 1) + ": import \"" + imp + "\" —— " + why)
+                    bad = bad + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    println("依赖扫描：" + to_string(len(files)) + " 个文件，" + to_string(bad) + " 处违例")
+    if bad > 0 {
+        exit(1)
+    }
+    exit(0)
+}

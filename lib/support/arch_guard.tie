@@ -1,0 +1,67 @@
+type tie<lib>
+// lib/support/arch_guard.tie —— tools 依赖方向的判定逻辑
+// ============================================================
+// 规则：内置库别名 / lib/ 路径 / 同一 tools 项目内的分片允许；
+// 指向其它 tools 项目的 import 禁止；lib 反向 import tools 禁止。
+// 判定一律先把 import 文本经 import_path.tie 的 resolve 归一化到
+// 仓根相对路径，再比对目录段，不做原始字符串前缀猜测。
+// 返回值：空串 = 允许，非空 = 违例原因（可直接打印）。
+import "./import_path.tie"
+import "./text.tie"
+namespace tie.archguard;
+
+// Windows 反斜杠归一为正斜杠，保证目录段比对只有一种形态。
+func to_slash(s: string) -> string {
+    var sb = string_builder()
+    var i: i64 = 0
+    while i < str_len(s) {
+        var c = str_char(s, i)
+        if c == "\\" {
+            sb_append(sb, "/")
+        } else {
+            sb_append(sb, c)
+        }
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+pub func resolve(imp: string, cur_dir: string) -> string {
+    return to_slash(importpath.resolve(imp, cur_dir))
+}
+
+// 取 tools/<项目> 的项目段；非 tools 路径返回空串。
+func project_of(p: string) -> string {
+    if !tie.support::has_prefix(p, "tools/") {
+        return ""
+    }
+    var rest = tie.support::slice(p, 6, str_len(p))
+    var cut = tie.support::find_char(rest, "/")
+    if cut < 0 {
+        return rest
+    }
+    return tie.support::slice(rest, 0, cut)
+}
+
+pub func classify(src: string, imp: string, cur_dir: string) -> string {
+    if importpath.is_lib_alias(imp) {
+        return ""
+    }
+    var r = resolve(imp, cur_dir)
+    var src_lib = tie.support::has_prefix(src, "lib/")
+    var src_proj = project_of(src)
+    if tie.support::has_prefix(r, "tools/") {
+        var tgt_proj = project_of(r)
+        if src_lib {
+            return "lib 反向 import tools（目标 " + tgt_proj + "）"
+        }
+        if str_len(src_proj) == 0 {
+            return "非 tools 文件 import tools 项目（目标 " + tgt_proj + "）"
+        }
+        if tgt_proj != src_proj {
+            return "跨 tools 项目依赖（" + src_proj + " → " + tgt_proj + "）"
+        }
+        return ""
+    }
+    return ""
+}
