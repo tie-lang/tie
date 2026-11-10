@@ -662,6 +662,11 @@ pub func mod_slice_key(p: string, fp: string, topt: i64) -> string {
     // TIEC_INC=1：把**同一次计算**的 raw 与 key 一起打印（排查键漂移用；
     // 逐字段打印容易漏字段，曾经漏掉 Q 段）。
     if get_env("TIEC_INC") == "1" {
+        // 模块接口指纹（导出面声明文本的 hash）：只作增量诊断，**不参与键**。
+        // 产物含模块实现，接口指纹替换整单元键会在实现变化时误命中错误产物。
+        if modstate.has_modules() {
+            dbg_txt("MODIFACE " + to_string(str_hash(modstate.declares_text())))
+        }
         dbg_txt("MODRAW " + p + " => " + key + " rawlen=" + to_string(str_len(raw)) +
             " ftlen=" + to_string(str_len(g_features)) +
             " rootlen=" + to_string(str_len(g_input)) + " | " + raw)
