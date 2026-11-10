@@ -19,6 +19,7 @@ func sym_hit(syms: table<string>, s: string) -> bool {
 
 pub func split_main_ir(ll: string, out_prefix: string) -> string {
     var syms = modstate.syms()
+    var all = modstate.all_syms()
     var lines = tie.support::split_char(ll, "\n")
     // 主 .ll 可达近万行，逐行字符串累加是 O(n²)：一律走 sb 通道。
     var head = string_builder()
@@ -36,8 +37,19 @@ pub func split_main_ir(ll: string, out_prefix: string) -> string {
                 sym = tie.support::slice(str.clone(ln), at + 1, lp)
             }
             var mline = ln
-            if tie.support::has_prefix(str.clone(mline), "define internal ") {
-                mline = "define " + tie.support::slice(str.clone(mline), 16, str_len(mline))
+            if sym_hit(syms, sym) {
+                // pub 导出函数：去掉 internal，成为模块对外的链接符号。
+                if tie.support::has_prefix(str.clone(mline), "define internal ") {
+                    mline = "define " + tie.support::slice(str.clone(mline), 16, str_len(mline))
+                }
+            } else if sym_hit(all, sym) {
+                // 非 pub 辅助函数：强制 internal，模块 .ll 内可见、链接期外部不可见。
+                // （lib/class 角色关闭了裁剪，llvmgen 不会自动标 internal。）
+                if tie.support::has_prefix(str.clone(mline), "define ") {
+                    if !tie.support::has_prefix(str.clone(mline), "define internal ") {
+                        mline = "define internal " + tie.support::slice(str.clone(mline), 7, str_len(mline))
+                    }
+                }
             }
             var block = string_builder()
             sb_append(block, mline + "\n")
@@ -51,15 +63,17 @@ pub func split_main_ir(ll: string, out_prefix: string) -> string {
             }
             i = i + 1
             var btext = sb_build(block)
-            if sym_hit(syms, sym) {
+            if sym_hit(all, sym) {
                 sb_append(mods, btext)
                 mod_count = mod_count + 1
-                var brace = tie.support::find_char(str.clone(ln), "{")
-                var sig = tie.support::slice(str.clone(ln), 7, brace)
-                if tie.support::has_prefix(str.clone(sig), "internal ") {
-                    sig = tie.support::slice(str.clone(sig), 9, str_len(sig))
+                if sym_hit(syms, sym) {
+                    var brace = tie.support::find_char(str.clone(ln), "{")
+                    var sig = tie.support::slice(str.clone(ln), 7, brace)
+                    if tie.support::has_prefix(str.clone(sig), "internal ") {
+                        sig = tie.support::slice(str.clone(sig), 9, str_len(sig))
+                    }
+                    modstate.add_decl("declare " + sig + "\n")
                 }
-                modstate.add_decl("declare " + sig + "\n")
             } else {
                 sb_append(main, btext)
             }

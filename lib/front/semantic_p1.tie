@@ -333,7 +333,11 @@ func expand_one_import(imp_node: i64) -> i64 {
             while bi < sstate.nchild(mbody) {
                 var mf = sstate.child(mbody, bi)
                 if s_tags[mf] == S_N_FN_DEF {
-                    modstate.add_sym(nsp + "$" + intern.lookup(s_names[mf]))
+                    var fsym = nsp + "$" + intern.lookup(s_names[mf])
+                    modstate.add_all(fsym)
+                    if (s_vals[mf] & 1) != 0 {
+                        modstate.add_sym(fsym)
+                    }
                 }
                 bi = bi + 1
             }
