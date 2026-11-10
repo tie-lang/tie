@@ -7,28 +7,28 @@ tie 是一门静态类型的系统编程语言。本仓是它的核心实现：�
 
 源文件首行用 `type tie<角色>` 声明用途：
 
-| 角色 | 用途 |
-| --- | --- |
+| 角色      | 用途                       |
+| ------- | ------------------------ |
 | `logic` | 可执行程序：编译成原生产物，`main` 为入口 |
-| `tsc` | 脚本：由解释器直接执行，无需编译 |
-| `class` | 库与编译器自身：不注入脚本前置，不承载程序入口 |
+| `tsc`   | 脚本：由解释器直接执行，无需编译         |
+| `class` | 库与编译器自身：不注入脚本前置，不承载程序入口  |
 
 其余角色（`type` / `data` / `tsh` / `ui` / `db` / `port`）按各自工具链处理。
 
 ## 仓库内容
 
-| 路径 | 说明 |
-| --- | --- |
-| `std/` `sys/` `ext/` `rdu/` | 标准库、平台库、扩展库、嵌入式库 |
-| `lib/` | 编译器的分层实现：前端、IR、代码生成、后端、JIT、诊断、运行时 |
-| `tools/tiec` | 编译器：`logic` 源码 → 原生产物 |
-| `tools/tiej` | JIT 驱动：源码 → 进程内编译 → LLJIT → 按符号调用 |
-| `tools/tiep` | 重型 tsc 解释器：执行 `tsc` 脚本 |
-| `tools/tiel` | 轻量级嵌入式 tsc 解释器：可嵌入宿主，也提供命令行 |
-| `tools/diag` | 崩溃诊断、剖析器、DAP 调试适配器 |
-| `tools/release` | 发行说明生成器 |
-| `tools/ci` | 依赖方向门禁 |
-| `examples/` | 示例程序 |
+| 路径                          | 说明                                |
+| --------------------------- | --------------------------------- |
+| `std/` `sys/` `ext/` `rdu/` | 标准库、平台库、扩展库、嵌入式库                  |
+| `lib/`                      | 可共用代码：前端、IR、代码生成、后端、JIT、诊断、运行时    |
+| `tools/tiec`                | 编译器：`logic` 源码 → 原生产物             |
+| `tools/tiej`                | JIT 驱动：源码 → 进程内编译 → LLJIT → 按符号调用 |
+| `tools/tiep`                | 重型 tsc 解释器：执行 `tsc` 脚本            |
+| `tools/tiel`                | 轻量级嵌入式 tsc 解释器：可嵌入宿主              |
+| `tools/diag`                | 崩溃诊断、剖析器、DAP 调试适配器                |
+| `tools/release`             | 发行说明生成器                           |
+| `tools/ci`                  | 依赖方向门禁                            |
+| `examples/`                 | 示例程序                              |
 
 ## 环境要求
 
@@ -74,25 +74,28 @@ build/tiej --selftest
 
 ### tshell
 
-tshell 是 tie 语言的命令行壳：`set` 写入的环境变量会被子进程继承，`exec`
-执行外部命令，`cd` 切换目录。同样的步骤也可以写成 `.tsh.tie` 脚本。
+tshell 是 tie 语言的命令行壳：同一套解析里可直接求值 tie 表达式，也可执行
+内建命令与外部命令（`exec`），并支持目录切换（`cd`）、环境变量（`set`）与
+变量展开（`{NAME}`）。同样的步骤也可以写成 `.tsh.tie` 脚本。
 
 ```
 tsh> cd /path/to/tie
 tsh> set TIE_LIB_ROOT .
+tsh> var TIEC = "/path/to/tiec"
 tsh> exec mkdir build
 tsh> cd lib/rt
-tsh> exec /path/to/tiec src/trm_lite.run.tie -o trm_lite.a --no-warn
+tsh> exec {TIEC} src/trm_lite.run.tie -o trm_lite.a --no-warn
 tsh> cd ../..
 tsh> set TIE_TRM_LITE_LIB lib/rt/trm_lite.a
-tsh> exec /path/to/tiec tools/tiec/src/driver.tie -l2 -t0 --no-warn --no-cache -o build/tiec
+tsh> exec {TIEC} tools/tiec/src/driver.tie -l2 -t0 --no-warn --no-cache -o build/tiec
 tsh> exec clang -shared -O2 lib/jit/tiej_llvm.c -I /path/to/llvm/include -L /path/to/llvm/lib -lLLVM-C -o build/tiej_llvm.dll
 tsh> exec python tools/tiej/gen_exports.py lib/rt/trm_lite.a build/tiej_exports.def
 tsh> exec build/tiec tools/tiej/main.tie -o build/tiej --link-arg -Wl,/DEF:build/tiej_exports.def
 tsh> exec build/tiej --selftest
 ```
 
-`TIEC` 用绝对路径（构建运行时需要在子目录内执行）。
+`var NAME = "值"` 定义 REPL 变量，命令里用 `{NAME}` 展开（`cd` 之后仍可用）；
+`set NAME VALUE` 设置环境变量并由子进程继承，会话内可用 `{get_env("NAME")}` 取回。
 
 ### 各步骤说明
 
