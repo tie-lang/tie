@@ -1,0 +1,184 @@
+type tie<lib>
+// lib/jit/marshal.tie —— JIT 调用包装的实参/返回值编组
+// ============================================================
+// 把「类型表 + 实参文本」编成 LLVM IR 的常量实参与零参数调用包装。
+// 包装恒为 `define i64 @tiej_wrap()`：返回值统一收成 i64 槽，f64 按位
+// cast、宿主再经文本入口还原，故不受 dyn_call_p 的参数个数限制。
+//
+// 类型白名单：实参 i64 / bool / f64 / ptr；返回 i64 / bool / f64 / ptr / void。
+// 所有越界输入的失败都走 "ERR:" 协议响亮返回：未知类型、非法数字文本、
+// 类型表与实参个数不符、目标名为空。绝不静默退化成 i64 或静默截断文本。
+
+import "/std/string.tie"
+import "../support/text.tie"
+import "./llvmc.tie"
+
+namespace tie.marshal;
+
+func mar_digit(c: string) -> bool {
+    if c == "0" { return true }
+    if c == "1" { return true }
+    if c == "2" { return true }
+    if c == "3" { return true }
+    if c == "4" { return true }
+    if c == "5" { return true }
+    if c == "6" { return true }
+    if c == "7" { return true }
+    if c == "8" { return true }
+    if c == "9" { return true }
+    return false
+}
+
+// 十进制整数文本（可带负号），逐码点校验；不借 to_i64 的内建检查，
+// 以便把失败转成可读诊断而不是直接让进程中招。
+func mar_int_ok(s: string) -> bool {
+    var n = str_len(s)
+    if n == 0 {
+        return false
+    }
+    var i: i64 = 0
+    if str_char(s, 0) == "-" {
+        i = 1
+    }
+    if i >= n {
+        return false
+    }
+    while i < n {
+        if !mar_digit(str_char(s, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 十进制浮点文本：-?d+(.d*)?([eE][+-]?d+)? 或 -?.d+([eE][+-]?d+)?。
+// strtod 会静默吞掉尾部垃圾、接受空串为 0，故先做严格形态校验。
+func mar_float_ok(s: string) -> bool {
+    var n = str_len(s)
+    if n == 0 {
+        return false
+    }
+    var i: i64 = 0
+    if str_char(s, 0) == "-" || str_char(s, 0) == "+" {
+        i = 1
+    }
+    var before: i64 = 0
+    while i < n && mar_digit(str_char(s, i)) {
+        before = before + 1
+        i = i + 1
+    }
+    var after: i64 = 0
+    if i < n && str_char(s, i) == "." {
+        i = i + 1
+        while i < n && mar_digit(str_char(s, i)) {
+            after = after + 1
+            i = i + 1
+        }
+    }
+    if before == 0 && after == 0 {
+        return false
+    }
+    if i < n && (str_char(s, i) == "e" || str_char(s, i) == "E") {
+        i = i + 1
+        if i < n && (str_char(s, i) == "+" || str_char(s, i) == "-") {
+            i = i + 1
+        }
+        var exp: i64 = 0
+        while i < n && mar_digit(str_char(s, i)) {
+            exp = exp + 1
+            i = i + 1
+        }
+        if exp == 0 {
+            return false
+        }
+    }
+    return i == n
+}
+
+pub func kind_ok(k: string) -> bool {
+    if k == "i64" { return true }
+    if k == "bool" { return true }
+    if k == "f64" { return true }
+    if k == "ptr" { return true }
+    return false
+}
+
+pub func ret_ok(r: string) -> bool {
+    if r == "i64" { return true }
+    if r == "bool" { return true }
+    if r == "f64" { return true }
+    if r == "ptr" { return true }
+    if r == "void" { return true }
+    return false
+}
+
+// 单个实参 → IR 常量实参（带类型前缀）。返回 OK:/ERR: 协议文本。
+pub func arg_ir(kind: string, raw: string) -> string {
+    if !kind_ok(kind) {
+        return "ERR:不支持的实参类型：" + kind
+    }
+    if kind == "f64" {
+        if !mar_float_ok(raw) {
+            return "ERR:实参不是十进制浮点文本：" + raw
+        }
+        return "OK:double " + tie.jit::f64_ir(raw)
+    }
+    if !mar_int_ok(raw) {
+        return "ERR:实参不是十进制整数文本：" + raw
+    }
+    if kind == "bool" {
+        if to_i64(raw) != 0 {
+            return "OK:i1 true"
+        }
+        return "OK:i1 false"
+    }
+    if kind == "ptr" {
+        return "OK:inttoptr (i64 " + to_string(to_i64(raw)) + " to ptr)"
+    }
+    return "OK:i64 " + to_string(to_i64(raw))
+}
+
+// 生成零参数调用包装。返回 OK:/ERR: 协议文本，OK 载荷为完整 IR 文本。
+pub func wrapper_ir(target: string, sig: table<string>, args: table<string>, ret: string) -> string {
+    if !ret_ok(ret) {
+        return "ERR:不支持的返回类型：" + ret
+    }
+    if str_len(target) == 0 {
+        return "ERR:目标函数名为空"
+    }
+    if len(sig) != len(args) {
+        return "ERR:实参个数与类型表不一致：" + to_string(len(args)) + " vs " + to_string(len(sig))
+    }
+    var call_args = ""
+    var i: i64 = 0
+    while i < len(sig) {
+        var r = arg_ir(sig[i], args[i])
+        if tie.support::has_prefix(r, "ERR:") {
+            return r
+        }
+        if i > 0 {
+            call_args = call_args + ", "
+        }
+        call_args = call_args + tie.support::slice(r, 3, str_len(r))
+        i = i + 1
+    }
+    if ret == "f64" {
+        return "OK:define i64 @tiej_wrap() {\nentry:\n  %r = call double @" + target +
+            "(" + call_args + ")\n  %b = bitcast double %r to i64\n  ret i64 %b\n}\n"
+    }
+    if ret == "void" {
+        return "OK:define i64 @tiej_wrap() {\nentry:\n  call void @" + target +
+            "(" + call_args + ")\n  ret i64 0\n}\n"
+    }
+    if ret == "bool" {
+        return "OK:define i64 @tiej_wrap() {\nentry:\n  %r = call i1 @" + target +
+            "(" + call_args + ")\n  %z = zext i1 %r to i64\n  ret i64 %z\n}\n"
+    }
+    if ret == "ptr" {
+        return "OK:define i64 @tiej_wrap() {\nentry:\n  %r = call ptr @" + target +
+            "(" + call_args + ")\n  %p = ptrtoint ptr %r to i64\n  ret i64 %p\n}\n"
+    }
+    return "OK:define i64 @tiej_wrap() {\nentry:\n  %r = call i64 @" + target +
+        "(" + call_args + ")\n  ret i64 %r\n}\n"
+}

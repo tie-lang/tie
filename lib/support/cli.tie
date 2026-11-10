@@ -1,0 +1,283 @@
+type tie<lib>
+// lib/support/cli.tie —— 命令行选项解析（长度前缀编码串协议）
+// ============================================================
+// 解析结果以「长度前缀编码串」承载：库不把行池结构跨界传递，也不要求
+// 调用方直接读进程参数表；每个字段经访问器按名取回。
+//
+// 编码格式：count ":" (len ":" value)*
+//   count / len 为十进制文本；value 的长度按码点计，与 str_char / slice
+//   的码点语义一致。字段序列按 (键, 值) 成对排列，列表字段的值本身是
+//   一段编码串（嵌套），故任意文本（含冒号、换行）都可无损承载。
+//
+// 违约（非数字、长度越界、尾部残留、参数缺失、未知选项）一律写入 err
+// 字段并由调用方响亮打印；不静默退化为默认值，也不把错误结果当正常值。
+
+import "/std/string.tie"
+import "./text.tie"
+
+namespace tie.cli;
+
+func is_digit(c: string) -> bool {
+    if c == "0" { return true }
+    if c == "1" { return true }
+    if c == "2" { return true }
+    if c == "3" { return true }
+    if c == "4" { return true }
+    if c == "5" { return true }
+    if c == "6" { return true }
+    if c == "7" { return true }
+    if c == "8" { return true }
+    if c == "9" { return true }
+    return false
+}
+
+// 表 → 编码串。大参数表也只做一次线性累积，不逐段拼接全串。
+pub func encode(items: table<string>) -> string {
+    var sb = string_builder()
+    sb_append(sb, to_string(len(items)) + ":")
+    var i: i64 = 0
+    while i < len(items) {
+        var s = items[i]
+        sb_append(sb, to_string(str_len(s)) + ":" + s)
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// 编码串是否合法。非法一律返回 false，由调用方转成响亮诊断。
+pub func wellformed(blob: string) -> bool {
+    var n = str_len(blob)
+    var pos: i64 = 0
+    var txt = ""
+    while pos < n {
+        var c = str_char(blob, pos)
+        if c == ":" {
+            break
+        }
+        if !is_digit(c) {
+            return false
+        }
+        txt = txt + c
+        pos = pos + 1
+    }
+    if pos >= n || str_len(txt) == 0 {
+        return false
+    }
+    pos = pos + 1
+    var count = to_i64(txt)
+    var i: i64 = 0
+    while i < count {
+        txt = ""
+        while pos < n {
+            var c = str_char(blob, pos)
+            if c == ":" {
+                break
+            }
+            if !is_digit(c) {
+                return false
+            }
+            txt = txt + c
+            pos = pos + 1
+        }
+        if pos >= n || str_len(txt) == 0 {
+            return false
+        }
+        pos = pos + 1
+        var l = to_i64(txt)
+        if pos + l > n {
+            return false
+        }
+        pos = pos + l
+        i = i + 1
+    }
+    return pos == n
+}
+
+// 编码串 → 表。非法串返回空表（调用方应先 wellformed，再按空表报错）。
+pub func decode(blob: string) -> table<string> {
+    var out = table_new_string()
+    if !wellformed(blob) {
+        return out
+    }
+    var head = ""
+    var p: i64 = 0
+    while str_char(blob, p) != ":" {
+        head = head + str_char(blob, p)
+        p = p + 1
+    }
+    var count = to_i64(head)
+    var pos = p + 1
+    var i: i64 = 0
+    while i < count {
+        var lt = ""
+        while str_char(blob, pos) != ":" {
+            lt = lt + str_char(blob, pos)
+            pos = pos + 1
+        }
+        pos = pos + 1
+        var l = to_i64(lt)
+        table_push(out, tie.support::slice(blob, pos, pos + l))
+        pos = pos + l
+        i = i + 1
+    }
+    return out
+}
+
+// 按名取字段值；不存在返回空串。字段数必须为偶数（成对）。
+pub func get_field(blob: string, key: string) -> string {
+    var f = decode(blob)
+    if len(f) % 2 != 0 {
+        return ""
+    }
+    var i: i64 = 0
+    while i + 1 < len(f) {
+        if f[i] == key {
+            return f[i + 1]
+        }
+        i = i + 2
+    }
+    return ""
+}
+
+// 按名取列表字段（值为嵌套编码串）。
+pub func list(blob: string, key: string) -> table<string> {
+    return decode(get_field(blob, key))
+}
+
+pub func flag(blob: string, key: string) -> bool {
+    return get_field(blob, key) == "1"
+}
+
+// 进程参数 → 编码串。只在入口调用一次，库内其余逻辑不碰进程状态。
+pub func from_process() -> string {
+    var a = table_new_string()
+    var i: i64 = 0
+    while i < arg_count() {
+        table_push(a, arg_string(i))
+        i = i + 1
+    }
+    return encode(a)
+}
+
+func error_blob(msg: string) -> string {
+    var f = table_new_string()
+    table_push(f, "mode")
+    table_push(f, "error")
+    table_push(f, "err")
+    table_push(f, msg)
+    return encode(f)
+}
+
+func usage_blob() -> string {
+    var f = table_new_string()
+    table_push(f, "mode")
+    table_push(f, "usage")
+    table_push(f, "usage")
+    table_push(f, "用法: tiej <源文件> <函数名> [--sig 类型表] [--ret 类型] [实参...]\n" +
+        "      类型: i64 | bool | f64 | ptr；省略 --sig 时全 i64\n" +
+        "      tiej --selftest")
+    return encode(f)
+}
+
+// 逗号切分：与按字符切分的差别只在末尾空段——末尾空段不产出元素，
+// 中间空段保留。用 split_char 复刻逐字符实现的行为，避免两处语义漂移。
+func split_arg_list(s: string) -> table<string> {
+    var parts = tie.support::split_char(s, ",")
+    var out = table_new_string()
+    var n = len(parts)
+    var i: i64 = 0
+    while i + 1 < n {
+        table_push(out, parts[i])
+        i = i + 1
+    }
+    if n > 0 && str_len(parts[n - 1]) > 0 {
+        table_push(out, parts[n - 1])
+    }
+    return out
+}
+
+// 解析命令行。返回编码串：mode = selftest / usage / error / run。
+// run 模式携带 path / fname / ret / sig / args / macro 六个字段。
+pub func parse(argv: string) -> string {
+    if !wellformed(argv) {
+        return error_blob("CLI 参数编码串格式违约")
+    }
+    var a = decode(argv)
+    // 开关可在任意位置出现：先全量剥离，再按位置解析，避免开关占掉
+    // 源文件/函数名的位置参数槽。
+    var rest = table_new_string()
+    var macro_on = "0"
+    var mi: i64 = 0
+    while mi < len(a) {
+        if a[mi] == "--macro" {
+            macro_on = "1"
+        } else {
+            table_push(rest, a[mi])
+        }
+        mi = mi + 1
+    }
+    a = rest
+    var n = len(a)
+    if n == 0 || a[0] == "--selftest" {
+        var f = table_new_string()
+        table_push(f, "mode")
+        table_push(f, "selftest")
+        return encode(f)
+    }
+    if n < 2 {
+        return usage_blob()
+    }
+    var path = a[0]
+    var fname = a[1]
+    var sig = table_new_string()
+    var args = table_new_string()
+    var ret = "i64"
+    var i: i64 = 2
+    while i < n {
+        var opt = a[i]
+        if opt == "--sig" {
+            if i + 1 >= n {
+                return error_blob("选项 --sig 缺少值")
+            }
+            sig = split_arg_list(a[i + 1])
+            i = i + 2
+        } else if opt == "--ret" {
+            if i + 1 >= n {
+                return error_blob("选项 --ret 缺少值")
+            }
+            ret = a[i + 1]
+            i = i + 2
+        } else if tie.support::has_prefix(opt, "--") {
+            return error_blob("未知选项：" + opt)
+        } else {
+            table_push(args, opt)
+            i = i + 1
+        }
+    }
+    if len(sig) == 0 {
+        var k: i64 = 0
+        while k < len(args) {
+            table_push(sig, "i64")
+            k = k + 1
+        }
+    }
+    if len(sig) != len(args) {
+        return error_blob("实参个数与类型表不一致：" + to_string(len(args)) + " vs " + to_string(len(sig)))
+    }
+    var f = table_new_string()
+    table_push(f, "mode")
+    table_push(f, "run")
+    table_push(f, "path")
+    table_push(f, path)
+    table_push(f, "fname")
+    table_push(f, fname)
+    table_push(f, "ret")
+    table_push(f, ret)
+    table_push(f, "sig")
+    table_push(f, encode(sig))
+    table_push(f, "args")
+    table_push(f, encode(args))
+    table_push(f, "macro")
+    table_push(f, macro_on)
+    return encode(f)
+}

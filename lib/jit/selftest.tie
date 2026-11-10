@@ -1,0 +1,32 @@
+type tie<lib>
+// lib/jit/selftest.tie —— 垫片装载与 JIT 会话自检
+// ============================================================
+// 只验 DLL 可装载、LLJIT 会话可开。完整链路（IR 装载 → 查符号 → 调用）
+// 由源码模式覆盖，不另用手构 IR 做第二套验证。
+import "/std/string.tie"
+import "./llvmc.tie"
+namespace tie.jittest;
+
+pub func chk(ok: bool, tag: string) -> bool {
+    if ok {
+        println("[PASS] " + tag)
+    } else {
+        println("[FAIL] " + tag)
+    }
+    return ok
+}
+
+pub func run() -> i64 {
+    if !chk(tie.jit::available(), "tiej_llvm.dll available") {
+        println("构建垫片：clang -shared -O2 lib/jit/tiej_llvm.c -I <LLVM>/include -L <LLVM>/lib -lLLVM-C -o _local_only/bin/tiej_llvm.dll")
+        return 1
+    }
+    var j = tie.jit::open()
+    if !chk(j != 0, "open") {
+        println("[jit] " + tie.jit::last_error())
+        return 1
+    }
+    tie.jit::close(j)
+    println("tiej selftest: PASS（垫片装载；完整链路见源码模式）")
+    return 0
+}

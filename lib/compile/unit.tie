@@ -1,0 +1,56 @@
+type tie<lib>
+// lib/compile/unit.tie —— 进程内单编译单元（源码 → LLVM IR 文本）
+// ============================================================
+// 读源码、复位单元状态、parse → check → irgen → render，产出可直接交给
+// LLJIT 的 IR 文本。不落中间文件、不调外部编译器。
+//
+// 宏执行器（ep / em / eproc）以函数值形参注入：本库不认识任何 tools，
+// 也不决定宿主是否具备宏展开能力。越界检查与导出白名单由调用方注入，
+// 使同一编译段可用于默认沙箱与开启检查的 JIT 表运行时两条路径。
+//
+// 返回 "OK:" + IR 文本 / "ERR:" + 可直接打印的诊断文本。
+import "../ir/ir.tie"
+import "../sema/sstate.tie"
+import "../front/context.tie"
+import "../ir/context.tie"
+import "../support/text.tie"
+import "../support/import_path.tie"
+import "../backend/render.tie"
+import "../front/cfg_preproc.tie"
+import "../front/api.tie"
+import "../front/parser.tie"
+import "../codegen/irgen.tie"
+namespace tie.compile;
+
+pub func compile_source(immut path: string, immut fname: string, check_bounds: bool,
+                        ep: fn(string) -> string,
+                        em: fn(string, table<string>) -> string,
+                        eproc: fn(string, table<string>) -> string) -> string {
+    var src = file_read(path)
+    if str_len(src) == 0 {
+        return "ERR:读取失败：" + path
+    }
+    var clean = tie.support::strip_type_header(src)
+    sstate.ctx_new()
+    ir.ctx_new()
+    irgen.unit_reset()
+    irgen.set_check_bounds(check_bounds)
+    // 目标函数列入导出白名单，否则未引用函数被根集合裁剪，JIT 查不到符号。
+    irgen.set_dll_export(fname)
+    if tie.front::parse(clean, 0, 0) < 0 {
+        return "ERR:[parse] " + parser.ast_err_protocol()
+    }
+    var serr = tie.front::check(importpath.dir_of(path), false, 0, ep, em, eproc)
+    // 成功返回 "OK:N"，失败才是 "ERR:…"——按前缀判定，不按长度。
+    if tie.support::has_prefix(serr, "ERR:") {
+        return "ERR:[sem] " + serr
+    }
+    if irgen.tig_ast() != 0 {
+        return "ERR:[irgen] 生成失败"
+    }
+    var ll = tie.backend::render(ir.ctx_current())
+    if str_len(ll) == 0 {
+        return "ERR:[backend] " + tie.backend::last_error()
+    }
+    return "OK:" + ll
+}

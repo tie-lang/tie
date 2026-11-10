@@ -1,0 +1,43 @@
+type tie<lib, unsafe:mem, unsafe:ext>
+// lib/jit/session.tie —— 一次 JIT 会话的完整生命周期
+// ============================================================
+// 收拢「可用性检查 → open → add_ir → lookup → 调用 → close」六步，
+// 失败统一返回 "ERR:" + 可直接打印的诊断文本；成功返回 "OK:" + i64 位串。
+// close 由 defer 兜底，任何提前返回都不会泄漏 LLJIT 会话。
+import "/std/string.tie"
+import "./llvmc.tie"
+namespace tie.jitsession;
+
+pub func available() -> bool {
+    return tie.jit::available()
+}
+
+pub func run(ll: string, wrap: string) -> string {
+    if !tie.jit::available() {
+        return "ERR:缺少 tiej_llvm.dll：clang -shared -O2 lib/jit/tiej_llvm.c -I <LLVM>/include -L <LLVM>/lib -lLLVM-C -o _local_only/bin/tiej_llvm.dll"
+    }
+    var j = tie.jit::open()
+    if j == 0 {
+        return "ERR:[jit] " + tie.jit::last_error()
+    }
+    defer {
+        tie.jit::close(j)
+    }
+    if tie.jit::add_ir(j, ll) != 0 {
+        return "ERR:[jit] " + tie.jit::last_error()
+    }
+    var addr = tie.jit::lookup(j, wrap)
+    if addr == 0 {
+        return "ERR:[jit] 包装未生成：" + tie.jit::last_error()
+    }
+    var bits: i64 = 0
+    unsafe {
+        bits = dyn_call_p(addr, 0, 0, 0, 0, 0)
+    }
+    return "OK:" + to_string(bits)
+}
+
+// f64 结果按位收在 i64 槽里，由调用方按需还原为十进制文本。
+pub func f64_text(bits: i64) -> string {
+    return tie.jit::f64_text(bits)
+}
