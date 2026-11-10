@@ -82,20 +82,22 @@ tshell 是 tie 语言的命令行壳：同一套解析里可直接求值 tie 表
 tsh> cd /path/to/tie
 tsh> set TIE_LIB_ROOT .
 tsh> var TIEC = "/path/to/tiec"
-tsh> exec mkdir build
+tsh> mkdir build
 tsh> cd lib/rt
 tsh> exec {TIEC} src/trm_lite.run.tie -o trm_lite.a --no-warn
 tsh> cd ../..
 tsh> set TIE_TRM_LITE_LIB lib/rt/trm_lite.a
 tsh> exec {TIEC} tools/tiec/src/driver.tie -l2 -t0 --no-warn --no-cache -o build/tiec
-tsh> exec clang -shared -O2 lib/jit/tiej_llvm.c -I /path/to/llvm/include -L /path/to/llvm/lib -lLLVM-C -o build/tiej_llvm.dll
-tsh> exec python tools/tiej/gen_exports.py lib/rt/trm_lite.a build/tiej_exports.def
-tsh> exec build/tiec tools/tiej/main.tie -o build/tiej --link-arg -Wl,/DEF:build/tiej_exports.def
-tsh> exec build/tiej --selftest
+tsh> clang -shared -O2 lib/jit/tiej_llvm.c -I /path/to/llvm/include -L /path/to/llvm/lib -lLLVM-C -o build/tiej_llvm.dll
+tsh> python tools/tiej/gen_exports.py lib/rt/trm_lite.a build/tiej_exports.def
+tsh> build/tiec tools/tiej/main.tie -o build/tiej --link-arg -Wl,/DEF:build/tiej_exports.def
+tsh> build/tiej --selftest
 ```
 
-`var NAME = "值"` 定义 REPL 变量，命令里用 `{NAME}` 展开（`cd` 之后仍可用）；
-`set NAME VALUE` 设置环境变量并由子进程继承，会话内可用 `{get_env("NAME")}` 取回。
+外部命令直接写即可（解析顺序是 tie 表达式 → 内建命令 → 外部命令），不必加
+`exec`；只有命令名本身是变量或表达式时才用 `exec {…}`。`var NAME = "值"` 定义的
+变量在 `cd` 之后仍可用 `{NAME}` 展开；`set NAME VALUE` 设置环境变量并由子进程
+继承，会话内可用 `get_env("NAME")` 取回。
 
 ### 各步骤说明
 
