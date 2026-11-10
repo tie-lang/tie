@@ -7,6 +7,7 @@ var g_ms_ll_paths: table<string> = [];
 var g_ms_decls: table<string> = [];
 var g_ms_syms: table<string> = [];
 var g_ms_all: table<string> = [];
+var g_ms_prefixes: table<string> = [];
 var g_ms_err: string = "";
 namespace modstate;
 
@@ -16,6 +17,7 @@ pub func reset() {
     g_ms_decls = table_new_string()
     g_ms_syms = table_new_string()
     g_ms_all = table_new_string()
+    g_ms_prefixes = table_new_string()
     g_ms_err = ""
 }
 
@@ -44,6 +46,25 @@ pub func add_decl(d: string) {
 }
 pub func add_sym(s: string) {
     table_push(g_ms_syms, s)
+}
+
+pub func add_prefix(p: string) {
+    table_push(g_ms_prefixes, p)
+}
+
+// 符号是否属于某个模块命名空间（按前缀 + 分隔符判定，不做模糊匹配）。
+pub func is_mod_sym(s: string) -> bool {
+    var i: i64 = 0
+    while i < len(g_ms_prefixes) {
+        var pre = g_ms_prefixes[i] + "$"
+        if str_len(s) > str_len(pre) {
+            if tie.support::has_prefix(str.clone(s), pre) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
 }
 
 pub func add_all(s: string) {

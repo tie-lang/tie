@@ -79,8 +79,43 @@ pub func split_main_ir(ll: string, out_prefix: string) -> string {
             }
             continue
         }
-        // 私有字符串常量是文件局部符号，两个 .ll 各一份安全；外部可写全局
-        // 若真的重复，链接期 clang 会报重复定义（响亮失败，不会静默给错误结果）。
+        // 模块命名空间的全局定义随模块 .ll 走；主 .ll 只留 external 声明，
+        // 避免两个 .ll 重复定义。tie 的全局初始化集中在主入口（按 external
+        // 符号引用），链接后仍是同一份全局，语义不变。
+        if tie.support::has_prefix(str.clone(ln), "@") {
+            var gsym = ""
+            var sp = tie.support::slice(str.clone(ln), 1, str_len(ln))
+            var eqp = tie.support::find_char(str.clone(sp), " ")
+            if eqp > 0 {
+                gsym = tie.support::slice(str.clone(sp), 0, eqp)
+            }
+            if str_len(gsym) > 0 && modstate.is_mod_sym(gsym) {
+                // 行格式固定：`@sym = global <ty> <init>`；按 `= global ` 定长偏移
+                // 解析类型，不依赖子串搜索（text 库只有单字符 find_char）。
+                var s2 = tie.support::slice(str.clone(sp), eqp + 1, str_len(sp))
+                if tie.support::has_prefix(str.clone(s2), "= global ") {
+                    var tyrest = tie.support::slice(str.clone(s2), 9, str_len(s2))
+                    var tyend = tie.support::find_char(str.clone(tyrest), " ")
+                    var gty = tyrest
+                    if tyend > 0 {
+                        gty = tie.support::slice(str.clone(tyrest), 0, tyend)
+                    }
+                    var comma = tie.support::find_char(str.clone(gty), ",")
+                    if comma > 0 {
+                        gty = tie.support::slice(str.clone(gty), 0, comma)
+                    }
+                    if str_len(gty) > 0 && tie.support::find_char(str.clone(gty), "[") < 0 {
+                        sb_append(mods, ln + "\n")
+                        mod_count = mod_count + 1
+                        sb_append(main, "@" + gsym + " = external global " + gty + "\n")
+                        i = i + 1
+                        continue
+                    }
+                }
+                modstate.set_err("模块全局类型暂不支持产物分离: " + ln)
+                return ""
+            }
+        }
         sb_append(head, ln + "\n")
         sb_append(main, ln + "\n")
         i = i + 1
