@@ -12,6 +12,7 @@ type tie<class>
 import "../front/semantic.tie"
 import "../front/consteval.tie"
 import "./rt_abi.tie"
+import "../compile/modstate.tie"
 import "./irgen_str.tie"
 import "./irgen_vtable.tie"
 import "./irgen_closure.tie"
@@ -474,6 +475,12 @@ pub func tig_ast() -> i64 {
     i = 0
     while i < n {
         var s = g_extra_tops[i]
+        if modstate.is_mod_root(s) {
+            // 模块命名空间的实现由独立编译单元产出 .ll；主单元只保留
+            // declare（导出面已并入 g_extern_ids，走 op36）。
+            i = i + 1
+            continue
+        }
         if ast.s_tag(s) == 101 {
             // 顶层函数：全名 = 裸名
             var r = tig_fn_def(s, "")

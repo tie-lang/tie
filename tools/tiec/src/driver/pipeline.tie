@@ -547,12 +547,10 @@ pub func kpass_emit() -> i64 {
     // 否则落**进程私有**临时名——见 ir_priv_prefix 注释）
     var ir_path = ir_path()
     if modstate.has_modules() {
-        var split_ll = modunit.split_main_ir(ll_text, ir_path + ".mod")
-        if str_len(split_ll) == 0 {
+        if modunit.compile_modules(ir_path + ".mod") != 0 {
             dbg_txt("模块编译失败: " + modstate.err())
             return 1
         }
-        ll_text = split_ll
     }
     unsafe {
         var t4 = clock()

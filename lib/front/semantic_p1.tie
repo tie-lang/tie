@@ -318,14 +318,19 @@ func expand_one_import(imp_node: i64) -> i64 {
         if s_tags[mnode] == S_N_NAMESPACE && s_vals[mnode] == 1 {
             // 模块命名空间：登记导出函数的链接符号，产物层据此分离 .ll。
             modstate.add_file(full)
+            modstate.mark_root(mnode)
             var nsp = ""
+            var nsp_ir = ""
             var nseg = s_aux[mnode]
             var q: i64 = 0
             while q < nseg {
                 if q > 0 {
                     nsp = nsp + "$"
+                    nsp_ir = nsp_ir + "::"
                 }
-                nsp = nsp + intern.lookup(s_names[sstate.child(mnode, q)])
+                var segn = intern.lookup(s_names[sstate.child(mnode, q)])
+                nsp = nsp + segn
+                nsp_ir = nsp_ir + segn
                 q = q + 1
             }
             modstate.add_prefix(nsp)
@@ -338,6 +343,7 @@ func expand_one_import(imp_node: i64) -> i64 {
                     modstate.add_all(fsym)
                     if (s_vals[mf] & 1) != 0 {
                         modstate.add_sym(fsym)
+                        modstate.add_sym_ir(nsp_ir + "::" + intern.lookup(s_names[mf]))
                     }
                 }
                 bi = bi + 1

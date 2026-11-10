@@ -8,20 +8,42 @@ var g_ms_decls: table<string> = [];
 var g_ms_syms: table<string> = [];
 var g_ms_all: table<string> = [];
 var g_ms_prefixes: table<string> = [];
+var g_ms_compiling: bool = false;
+var g_ms_roots: table<i64> = [];
+var g_ms_syms_ir: table<string> = [];
 var g_ms_err: string = "";
 namespace modstate;
 
+// 编译模块期间冻结：模块自身的 expand_imports 也会调用 reset/收集，
+// 若不冻结会把主单元已收集的模块文件、符号与命名空间前缀清空。
+pub func begin_compile() {
+    g_ms_compiling = true
+}
+
+pub func end_compile() {
+    g_ms_compiling = false
+}
+
 pub func reset() {
+    if g_ms_compiling {
+        return
+    }
     g_ms_files = table_new_string()
     g_ms_ll_paths = table_new_string()
     g_ms_decls = table_new_string()
     g_ms_syms = table_new_string()
     g_ms_all = table_new_string()
     g_ms_prefixes = table_new_string()
+    g_ms_compiling = false
+    g_ms_roots = table_new_i64()
+    g_ms_syms_ir = table_new_string()
     g_ms_err = ""
 }
 
 pub func add_file(p: string) {
+    if g_ms_compiling {
+        return
+    }
     var i: i64 = 0
     while i < len(g_ms_files) {
         if g_ms_files[i] == p {
@@ -30,6 +52,10 @@ pub func add_file(p: string) {
         i = i + 1
     }
     table_push(g_ms_files, p)
+}
+
+pub func files() -> table<string> {
+    return g_ms_files
 }
 
 pub func has_modules() -> bool {
@@ -44,11 +70,66 @@ pub func ll_paths() -> table<string> {
 pub func add_decl(d: string) {
     table_push(g_ms_decls, d)
 }
+pub func mark_root(id: i64) {
+    if g_ms_compiling {
+        return
+    }
+    table_push(g_ms_roots, id)
+}
+
+// irgen 用：模块命名空间节点是否为主单元的模块边界（实现不进主 IR）。
+pub func is_mod_root(id: i64) -> bool {
+    if g_ms_compiling {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(g_ms_roots) {
+        if g_ms_roots[i] == id {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+pub func add_sym_ir(s: string) {
+    if g_ms_compiling {
+        return
+    }
+    table_push(g_ms_syms_ir, s)
+}
+
+// IR 全名（a::b）是否属于模块导出面。与 is_mod_sym（$ 形式）分工：
+// 前者给代码生成判定「不是 interp 桥」，后者给链接符号判定。
+pub func is_mod_sym_ir(s: string) -> bool {
+    if g_ms_compiling {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(g_ms_syms_ir) {
+        if g_ms_syms_ir[i] == s {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+pub func syms_ir() -> table<string> {
+    return g_ms_syms_ir
+}
+
 pub func add_sym(s: string) {
+    if g_ms_compiling {
+        return
+    }
     table_push(g_ms_syms, s)
 }
 
 pub func add_prefix(p: string) {
+    if g_ms_compiling {
+        return
+    }
     table_push(g_ms_prefixes, p)
 }
 
@@ -68,6 +149,9 @@ pub func is_mod_sym(s: string) -> bool {
 }
 
 pub func add_all(s: string) {
+    if g_ms_compiling {
+        return
+    }
     table_push(g_ms_all, s)
 }
 

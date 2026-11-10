@@ -99,7 +99,9 @@ func tig_struct_byref(arg_node: i64, agg_ty: i64, value: i64) -> i64 {
 // 操作数布局：[0]=符号池id, [1]=返回类型id(IMM), 然后每参数 [类型id(IMM), 值]。
 // is_libc：true = libc 符号（不置 g_used_interp）；false = tie_interp 桥。
 func tig_ext_call_typed(sym: string, argtys: table<i64>, argv: table<i64>, ret_ty: i64) -> i64 {
-    if !is_libc_sym(sym) {
+    // 模块导出面是本项目自己的独立编译单元产物，不是 tie_interp 桥：
+    // 不能置 g_used_interp，否则会要求链接 interp 静态库。
+    if !is_libc_sym(sym) && !modstate.is_mod_sym_ir(sym) {
         g_used_interp = true
     }
     // 2026-10-12：用户 extern 直调 Winsock 符号 → 置位 g_used_wsock

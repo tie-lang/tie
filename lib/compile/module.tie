@@ -1,10 +1,40 @@
 type tie<class>
-// 模块产物分离：主 IR 由正常编译链完整生成后，把模块函数的 define 块
-// 抽成独立 .ll，主 IR 只留 declare；链接期 clang 合并多个 .ll。
-// 模块边界由 LLVM 链接保证，主单元不持有模块实现。
+// 模块独立编译单元：每个模块源文件单独跑完整前端与代码生成，产出自洽的
+// .ll（含自己的 declare、类型、全局与初始化），不是从主 IR 里切出来的。
+// 主单元产物只保留 declare，链接期由 clang 合并多个 .ll。
+import "../front/api.tie"
+import "../front/parser.tie"
+import "../codegen/irgen.tie"
+import "../backend/render.tie"
+import "../backend/llvmgen.tie"
+import "../ir/context.tie"
+import "../sema/sstate.tie"
 import "../support/text.tie"
 import "./modstate.tie"
 namespace modunit;
+
+// 模块编译单元不接受编译期宏：显式拒绝，不静默放过。
+func mrj_proto(p: string) -> string {
+    return "ERR: 模块编译单元不支持编译期宏展开"
+}
+func mrj_macro(n: string, a: table<string>) -> string {
+    return "ERR: 模块编译单元不支持编译期宏展开"
+}
+func mrj_proc(n: string, a: table<string>) -> string {
+    return "ERR: 模块编译单元不支持编译期宏展开"
+}
+
+func mod_dir_of(p: string) -> string {
+    var i = str_len(p) - 1
+    while i >= 0 {
+        var c = str_char(p, i)
+        if c == "/" || c == "\\" {
+            return tie.support::slice(str.clone(p), 0, i + 1)
+        }
+        i = i - 1
+    }
+    return ""
+}
 
 func sym_hit(syms: table<string>, s: string) -> bool {
     var i: i64 = 0
@@ -17,116 +47,125 @@ func sym_hit(syms: table<string>, s: string) -> bool {
     return false
 }
 
-pub func split_main_ir(ll: string, out_prefix: string) -> string {
-    var syms = modstate.syms()
+// 逐个模块文件独立编译为 .ll：三层复位（sstate / ir / llvmgen）缺一不可，
+// 漏掉 llvmgen.reset_global_regs 会让 render 读到主单元残留的全局登记范围，
+// 表现成 ir_insts_op 越界。
+pub func compile_modules(out_prefix: string) -> i64 {
+    var files = modstate.files()
+    if len(files) == 0 {
+        return 0
+    }
+    var pubs = modstate.syms()
     var all = modstate.all_syms()
-    var lines = tie.support::split_char(ll, "\n")
-    // 主 .ll 可达近万行，逐行字符串累加是 O(n²)：一律走 sb 通道。
-    var head = string_builder()
-    var mods = string_builder()
-    var main = string_builder()
-    var mod_count: i64 = 0
+    modstate.begin_compile()
+    // 专用模块上下文：ctx_new 把主单元状态存进根上下文，之后每个模块复用
+    // 这一个槽（ctx_reset 重建 168 张表），避免 ctx_new 反复复制整套状态。
+    var mid = sstate.ctx_new()
     var i: i64 = 0
-    while i < len(lines) {
-        var ln = lines[i]
-        if tie.support::has_prefix(str.clone(ln), "define ") {
-            var at = tie.support::find_char(str.clone(ln), "@")
-            var lp = tie.support::find_char(str.clone(ln), "(")
-            var sym = ""
-            if at >= 0 && lp > at {
-                sym = tie.support::slice(str.clone(ln), at + 1, lp)
-            }
-            var mline = ln
-            if sym_hit(syms, sym) {
-                // pub 导出函数：去掉 internal，成为模块对外的链接符号。
-                if tie.support::has_prefix(str.clone(mline), "define internal ") {
-                    mline = "define " + tie.support::slice(str.clone(mline), 16, str_len(mline))
+    while i < len(files) {
+        var p = files[i]
+        var src = file_read(p)
+        if str_len(src) == 0 {
+            modstate.set_err("模块文件读取失败: " + p)
+            return -1
+        }
+        var clean = tie.support::strip_type_header(src)
+        // 用「单元级复位」复用同一进程，不切 sstate 上下文：ctx_new 每次复制
+        // 整套状态表，模块数多时会把构建拖到分钟级；compile_unit_reset 是
+        // 项目里常驻服务复用的既定入口。主单元的链接标记先存后恢复。
+        var sv_interp = g_used_interp
+        var sv_trm = g_used_trmlite
+        var sv_ws = g_used_wsock
+        if sstate.ctx_current() != 0 {
+            sstate.ctx_bind(0)
+        }
+        sstate.ctx_reset(mid)
+        sstate.ctx_bind(mid)
+        irgen.unit_reset()
+        llvmgen.unit_reset()
+        llvmgen.reset_global_regs()
+        llvmgen.set_prune_dead(false)
+        llvmgen.set_entry("")
+        if tie.front::parse(clean, 0, 0) < 0 {
+            modstate.set_err("模块解析失败: " + p)
+            return -1
+        }
+        var serr = tie.front::check(mod_dir_of(p), false, 0, mrj_proto, mrj_macro, mrj_proc)
+        if tie.support::has_prefix(str.clone(serr), "ERR:") {
+            modstate.set_err("模块语义失败: " + p + " " + serr)
+            return -1
+        }
+        if irgen.tig_ast() != 0 {
+            modstate.set_err("模块 IR 生成失败: " + p)
+            return -1
+        }
+        var ll = tie.backend::render(ir.ctx_current())
+        if str_len(ll) == 0 {
+            modstate.set_err("模块后端失败: " + p + " " + tie.backend::last_error())
+            return -1
+        }
+        // 模块 .ll 重写：pub 去掉 internal 作为对外符号并生成 declare；
+        // 非 pub 强制 internal，成为模块内部实现。
+        var lines = tie.support::split_char(ll, "\n")
+        var out = string_builder()
+        var k: i64 = 0
+        while k < len(lines) {
+            var ln = lines[k]
+            if tie.support::has_prefix(str.clone(ln), "define ") {
+                var at = tie.support::find_char(str.clone(ln), "@")
+                var lp = tie.support::find_char(str.clone(ln), "(")
+                var sym = ""
+                if at >= 0 && lp > at {
+                    sym = tie.support::slice(str.clone(ln), at + 1, lp)
                 }
-            } else if sym_hit(all, sym) {
-                // 非 pub 辅助函数：强制 internal，模块 .ll 内可见、链接期外部不可见。
-                // （lib/class 角色关闭了裁剪，llvmgen 不会自动标 internal。）
-                if tie.support::has_prefix(str.clone(mline), "define ") {
-                    if !tie.support::has_prefix(str.clone(mline), "define internal ") {
-                        mline = "define internal " + tie.support::slice(str.clone(mline), 7, str_len(mline))
+                var mline = ln
+                if sym_hit(pubs, sym) {
+                    if tie.support::has_prefix(str.clone(mline), "define internal ") {
+                        mline = "define " + tie.support::slice(str.clone(mline), 16, str_len(mline))
                     }
-                }
-            }
-            var block = string_builder()
-            sb_append(block, mline + "\n")
-            i = i + 1
-            while i < len(lines) {
-                sb_append(block, lines[i] + "\n")
-                if lines[i] == "}" {
-                    break
-                }
-                i = i + 1
-            }
-            i = i + 1
-            var btext = sb_build(block)
-            if sym_hit(all, sym) {
-                sb_append(mods, btext)
-                mod_count = mod_count + 1
-                if sym_hit(syms, sym) {
                     var brace = tie.support::find_char(str.clone(ln), "{")
                     var sig = tie.support::slice(str.clone(ln), 7, brace)
                     if tie.support::has_prefix(str.clone(sig), "internal ") {
                         sig = tie.support::slice(str.clone(sig), 9, str_len(sig))
                     }
                     modstate.add_decl("declare " + sig + "\n")
-                }
-            } else {
-                sb_append(main, btext)
-            }
-            continue
-        }
-        // 模块命名空间的全局定义随模块 .ll 走；主 .ll 只留 external 声明，
-        // 避免两个 .ll 重复定义。tie 的全局初始化集中在主入口（按 external
-        // 符号引用），链接后仍是同一份全局，语义不变。
-        if tie.support::has_prefix(str.clone(ln), "@") {
-            var gsym = ""
-            var sp = tie.support::slice(str.clone(ln), 1, str_len(ln))
-            var eqp = tie.support::find_char(str.clone(sp), " ")
-            if eqp > 0 {
-                gsym = tie.support::slice(str.clone(sp), 0, eqp)
-            }
-            if str_len(gsym) > 0 && modstate.is_mod_sym(gsym) {
-                // 行格式固定：`@sym = global <ty> <init>`；按 `= global ` 定长偏移
-                // 解析类型，不依赖子串搜索（text 库只有单字符 find_char）。
-                var s2 = tie.support::slice(str.clone(sp), eqp + 1, str_len(sp))
-                if tie.support::has_prefix(str.clone(s2), "= global ") {
-                    var tyrest = tie.support::slice(str.clone(s2), 9, str_len(s2))
-                    var tyend = tie.support::find_char(str.clone(tyrest), " ")
-                    var gty = tyrest
-                    if tyend > 0 {
-                        gty = tie.support::slice(str.clone(tyrest), 0, tyend)
-                    }
-                    var comma = tie.support::find_char(str.clone(gty), ",")
-                    if comma > 0 {
-                        gty = tie.support::slice(str.clone(gty), 0, comma)
-                    }
-                    if str_len(gty) > 0 && tie.support::find_char(str.clone(gty), "[") < 0 {
-                        sb_append(mods, ln + "\n")
-                        mod_count = mod_count + 1
-                        sb_append(main, "@" + gsym + " = external global " + gty + "\n")
-                        i = i + 1
-                        continue
+                } else if sym_hit(all, sym) {
+                    if tie.support::has_prefix(str.clone(mline), "define ") {
+                        if !tie.support::has_prefix(str.clone(mline), "define internal ") {
+                            mline = "define internal " + tie.support::slice(str.clone(mline), 7, str_len(mline))
+                        }
                     }
                 }
-                modstate.set_err("模块全局类型暂不支持产物分离: " + ln)
-                return ""
+                sb_append(out, mline + "\n")
+                k = k + 1
+                while k < len(lines) {
+                    sb_append(out, lines[k] + "\n")
+                    if lines[k] == "}" {
+                        break
+                    }
+                    k = k + 1
+                }
+                k = k + 1
+                continue
             }
+            sb_append(out, ln + "\n")
+            k = k + 1
         }
-        sb_append(head, ln + "\n")
-        sb_append(main, ln + "\n")
+        g_used_interp = sv_interp
+        g_used_trmlite = sv_trm
+        g_used_wsock = sv_ws
+        var dst = out_prefix + to_string(i) + ".ll"
+        if !file_write(dst, sb_build(out)) {
+            modstate.set_err("模块 IR 写盘失败: " + dst)
+            return -1
+        }
+        modstate.add_ll(dst)
         i = i + 1
     }
-    if mod_count > 0 {
-        var out = out_prefix + "0.ll"
-        if !file_write(out, sb_build(head) + sb_build(mods)) {
-            modstate.set_err("模块 IR 写盘失败: " + out)
-            return ""
-        }
-        modstate.add_ll(out)
-    }
-    return sb_build(main) + "\n" + modstate.declares_text()
+    sstate.ctx_bind(0)
+    modstate.end_compile()
+    return 0
 }
+
+// 主单元产物：删掉模块函数的 define 块（改由模块 .ll 提供），模块全局定义
+// 改写成 external 声明（模块 .ll 持有定义），其余行原样保留。
