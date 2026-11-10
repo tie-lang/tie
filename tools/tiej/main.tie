@@ -5,24 +5,51 @@ import "../../lib/jit/selftest.tie"
 import "../../lib/jit/session.tie"
 import "../../lib/macro/reject.tie"
 import "../../lib/compile/unit.tie"
+import "../../lib/interp/interp.tie"
 import "/std/prelude.tie"
 using lang;
+var g_tiej_macro_on: bool = false;
 namespace tie.tool.tiej;
 // tiej 命令行入口：只做模式分派、库调用转发、输出与退出码。
 // 功能实现全部在 lib/ —— CLI 解析、IR 编组、编译段、JIT 会话、自检、宏拒绝。
 // 三个执行器包装属工具专有装配：命名空间函数不能作值传递，
 // 只能以同文件裸名包装注入编译段。
+//
+// 默认不展开编译期宏，执行器恒走拒绝实现；--macro 时改用解释器执行器。
+// 解释器静态链接进宿主，故产物含 lib/interp 与体积开销与是否带 --macro 无关；
+// 开关只改变行为，不改变可观测语义与默认路径的拒绝结果。
 
-func jit_no_proto(proto: string) -> string {
-    return tie.macroreject::proto(proto)
+func tiej_eval_proto(proto: string) -> string {
+    if !g_tiej_macro_on {
+        return tie.macroreject::proto(proto)
+    }
+    var r = interp::eval_proto(proto)
+    if interp::has_err() {
+        return "ERR:" + r
+    }
+    return "OK:" + r
 }
 
-func jit_no_macro(name: string, args: table<string>) -> string {
-    return tie.macroreject::expand(name, args)
+func tiej_eval_macro(name: string, args: table<string>) -> string {
+    if !g_tiej_macro_on {
+        return tie.macroreject::expand(name, args)
+    }
+    var r = interp::eval_macro(name, args)
+    if interp::has_err() {
+        return "ERR:" + r
+    }
+    return "OK:" + r
 }
 
-func jit_no_proc(name: string, args: table<string>) -> string {
-    return tie.macroreject::expand_proc(name, args)
+func tiej_eval_proc(name: string, args: table<string>) -> string {
+    if !g_tiej_macro_on {
+        return tie.macroreject::expand_proc(name, args)
+    }
+    var r = interp::eval_macro_proc(name, args)
+    if interp::has_err() {
+        return "ERR:" + r
+    }
+    return "OK:" + r
 }
 
 func run_source(b: string) -> i64 {
@@ -31,10 +58,15 @@ func run_source(b: string) -> i64 {
     var ret = tie.cli::get_field(b, "ret")
     var sig = tie.cli::list(b, "sig")
     var args = tie.cli::list(b, "args")
+    // 解释器会话须在编译段之前复位：宏展开期间的执行器复用同一套
+    // 归档池、值池与卫生计数，跨请求残留会让第二次展开读到旧状态。
+    if g_tiej_macro_on {
+        interp::reset()
+    }
     // 越界检查暂关：JIT 表运行时尚未接通，开启会引入当前无法满足的
     // 运行时符号依赖。表运行时打通后此处改为 true。
     var compiled = tie.compile::compile_source(path, fname, false,
-                                                jit_no_proto, jit_no_macro, jit_no_proc)
+                                                tiej_eval_proto, tiej_eval_macro, tiej_eval_proc)
     if !tie.support::has_prefix(compiled, "OK:") {
         println(tie.support::slice(compiled, 4, str_len(compiled)))
         return 1
@@ -76,9 +108,6 @@ func main() {
         println(tie.cli::get_field(b, "err"))
         exit(2)
     }
-    if tie.cli::flag(b, "macro") {
-        println("[macro] 编译期宏执行器尚未接入")
-        exit(2)
-    }
+    g_tiej_macro_on = tie.cli::flag(b, "macro")
     exit(run_source(b))
 }
