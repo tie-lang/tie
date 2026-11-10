@@ -348,9 +348,6 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         if str_len(tc_entry_sym) > 0 {
             cmd = cmd + " -Wl,/entry:" + tc_entry_sym
         }
-        if str_len(tc_link_extra) > 0 {
-            cmd = cmd + " " + tc_link_extra
-        }
     } else if tc_freestanding {
         // 自由站立：不链 CRT/系统库，-static -no-pie 产出 ET_EXEC ELF。
         // 入口符号默认由 driver 注入（main 或 --entry）；链接脚本按需追加。
@@ -364,9 +361,6 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         }
         if str_len(tc_link_script) > 0 {
             cmd = cmd + " -Wl,-T," + tc_link_script
-        }
-        if str_len(tc_link_extra) > 0 {
-            cmd = cmd + " " + tc_link_extra
         }
     } else if is_linux {
         cmd = cmd + " -Wl,--build-id=none"
@@ -427,6 +421,11 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     // （clang 22 对 -lclang_rt.builtins-x86_64 带点参数解析错误，弃用）。
     if !tc_uefi {
         cmd = cmd + " -rtlib=compiler-rt"
+    }
+    // --link-arg：额外链接参数在命令末尾统一追加，覆盖可执行产物、
+    // 动态库、本机与自由站立全部形态；放在末尾避免与内置链接器旗标相互覆盖。
+    if str_len(tc_link_extra) > 0 {
+        cmd = cmd + " " + tc_link_extra
     }
     return run(cmd)
 }
@@ -516,6 +515,11 @@ pub func link_shared(input_opt: string, output_so: string, target: string, need_
     }
     // compiler-rt builtins（i128 除法/取余辅助符号）
     cmd = cmd + " -rtlib=compiler-rt"
+    // --link-arg：额外链接参数在命令末尾统一追加，覆盖可执行产物、
+    // 动态库、本机与自由站立全部形态；放在末尾避免与内置链接器旗标相互覆盖。
+    if str_len(tc_link_extra) > 0 {
+        cmd = cmd + " " + tc_link_extra
+    }
     return run(cmd)
 }
 

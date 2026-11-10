@@ -915,12 +915,15 @@ pub func compile_logic(ir_path: string, opt_path: string, target: string) -> i64
     if pre_l != "" {
         link_out = pre_l + ".exe.tmp"
     }
-    // 自由站立构建：注入入口符号/链接脚本/额外链接参数（裸机与固件形态）。
+    // 额外链接参数对所有目标生效：--link-arg 是通用链接期通道，
+    // 不能只在自由站立形态下透传，否则普通可执行产物无法注入
+    // 导出定义、链接脚本之外的链接器输入。
+    tc.set_link_extra(g_link_extra)
+    // 自由站立构建：注入入口符号/链接脚本（裸机与固件形态）。
     // 未指定 --entry 时以 main 为入口（tie 主函数按 C 入口发射）。
     if g_freestanding {
         tc.set_freestanding(true)
         tc.set_link_script(g_link_script)
-        tc.set_link_extra(g_link_extra)
         if g_uefi {
             tc.set_uefi(true)
         }
