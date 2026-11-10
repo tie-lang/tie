@@ -407,10 +407,12 @@ func expand_one_import(imp_node: i64) -> i64 {
     var nsel = sstate.nchild(imp_node)
     if nsel > 0 {
         var sel_names: table<i64> = table_new_i64()
+        var sel_bind: table<i64> = table_new_i64()
         var k2: i64 = 0
         while k2 < nsel {
             var sn = sstate.child(imp_node, k2)
             table_push(sel_names, s_names[sn])
+            table_push(sel_bind, s_vals[sn])
             k2 = k2 + 1
         }
         // 顶层名表（非 import 顶层；平行 flags）。命名空间节点用点分全名
@@ -452,6 +454,30 @@ func expand_one_import(imp_node: i64) -> i64 {
                 if tnames[j] == sel_names[i2] {
                     flags[j] = 1
                     found = true
+                    // `模块名 as 前缀`：登记「绑定前缀 → 命名空间注册全名」映射，
+                    // 由 sinfer/irgen 的 ns_rename_target 回退解析，不改 AST 段数
+                    // （body 由 child(ns, nsegs) 取，改段数会取错节点）。
+                    if sel_bind[i2] >= 0 && s_tags[tops[j]] == S_N_NAMESPACE {
+                        var bn = intern.lookup(sel_bind[i2])
+                        var target = ""
+                        var qn: i64 = 0
+                        var nseg2 = s_aux[tops[j]]
+                        while qn < nseg2 {
+                            if qn > 0 {
+                                target = target + "::"
+                            }
+                            target = target + intern.lookup(s_names[sstate.child(tops[j], qn)])
+                            qn = qn + 1
+                        }
+                        if str_len(sstate.ns_rename_target(bn)) > 0 {
+                            g_cur_dir = saved_dir
+                            sm_err_line = s_lines[imp_node]
+                            sm_err_col = s_cols[imp_node]
+                            sm_err_msg = "import 别名 '" + bn + "' 重复（编译单元内 import 别名必须唯一）"
+                            return -1
+                        }
+                        sstate.ns_rename_add(bn, target)
+                    }
                     j = len(tnames)
                 }
                 j = j + 1

@@ -631,7 +631,17 @@ func parse_import() -> i64 {
                 }
                 full = full + "." + interner.lookup(seg)
             }
-            table_push(sel, ast.new_node(N_VAR, interner.intern(full), -1, -1, putil.peek_line(), putil.peek_col()))
+            var bind_id = -1
+            if putil.eat(lex_as) {
+                if putil.peek_tag() == lex_ident {
+                    bind_id = interner.intern(putil.peek_lexeme())
+                    putil.advance()
+                } else {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "as 后必须是别名标识符，实际是 " + putil.describe(putil.peek_tag()))
+                    return -1
+                }
+            }
+            table_push(sel, ast.new_node(N_VAR, interner.intern(full), bind_id, -1, putil.peek_line(), putil.peek_col()))
             if putil.eat(lex_comma) {
                 // 继续
             } else {
