@@ -51,7 +51,7 @@ tie 是一门静态类型的系统编程语言。本仓是它的核心实现：�
 
 ## 构建
 
-以下命令均在仓库根执行。Windows 产物带 `.exe` / `.dll` 后缀，Linux 去掉后缀并把 `.dll` 换成 `.so`。
+以下命令按 Windows 书写；Linux 去掉 `.exe` 后缀、把 `.dll` 换成 `.so`。命令均在仓库根执行。
 
 ### bash / POSIX shell
 
@@ -66,7 +66,7 @@ mkdir -p build
 export TIE_TRM_LITE_LIB=$PWD/lib/rt/trm_lite.a
 
 # 2. 编译器
-"$TIEC" tools/tiec/src/driver.tie -l2 -t0 --no-warn --no-cache -o build/tiec
+"$TIEC" tools/tiec/src/driver.tie -l2 -t0 --no-warn --no-cache -o build/tiec.exe
 
 # 3. LLVM-C 垫片
 clang -shared -O2 lib/jit/tiej_llvm.c \
@@ -75,11 +75,11 @@ clang -shared -O2 lib/jit/tiej_llvm.c \
 
 # 4. JIT 驱动（导出定义让进程内 JIT 解析到宿主运行时符号）
 python tools/tiej/gen_exports.py lib/rt/trm_lite.a build/tiej_exports.def
-build/tiec tools/tiej/main.tie -o build/tiej \
+build/tiec.exe tools/tiej/main.tie -o build/tiej.exe \
       --link-arg "-Wl,/DEF:build/tiej_exports.def"
 
 # 5. 验证
-build/tiej --selftest
+build/tiej.exe --selftest
 ```
 
 ### tshell
@@ -97,11 +97,11 @@ tsh> cd lib/rt
 tsh> exec {TIEC} src/trm_lite.run.tie -o trm_lite.a --no-warn
 tsh> cd ../..
 tsh> set TIE_TRM_LITE_LIB lib/rt/trm_lite.a
-tsh> exec {TIEC} tools/tiec/src/driver.tie -l2 -t0 --no-warn --no-cache -o build/tiec
+tsh> exec {TIEC} tools/tiec/src/driver.tie -l2 -t0 --no-warn --no-cache -o build/tiec.exe
 tsh> clang -shared -O2 lib/jit/tiej_llvm.c -I /path/to/llvm/include -L /path/to/llvm/lib -lLLVM-C -o build/tiej_llvm.dll
 tsh> python tools/tiej/gen_exports.py lib/rt/trm_lite.a build/tiej_exports.def
-tsh> build/tiec tools/tiej/main.tie -o build/tiej --link-arg -Wl,/DEF:build/tiej_exports.def
-tsh> build/tiej --selftest
+tsh> build/tiec.exe tools/tiej/main.tie -o build/tiej.exe --link-arg -Wl,/DEF:build/tiej_exports.def
+tsh> build/tiej.exe --selftest
 ```
 
 外部命令直接写即可（解析顺序是 tie 表达式 → 内建命令 → 外部命令），不必加
@@ -123,19 +123,19 @@ tsh> build/tiej --selftest
 ### 平台差异
 
 - Windows：产物为 `.exe` / `.dll`，导出定义用 `-Wl,/DEF:...` 注入。
-- Linux：产物无后缀，垫片为 `.so`（加 `-fPIC`）；让可执行产物导出运行时
+- Linux：产物不加后缀，垫片为 `.so`（加 `-fPIC`）；让可执行产物导出运行时
   符号改用 `--link-arg "-Wl,--export-dynamic"`。
 
 ## 运行
 
 ```bash
 # 程序（logic 角色）
-build/tiec examples/hello.tie -o build/hello
-build/hello
+build/tiec.exe examples/hello.tie -o build/hello.exe
+build/hello.exe
 
 # JIT：编译并直接调用函数
-build/tiej examples/hello.tie main
-build/tiej --macro examples/hello.tie main
+build/tiej.exe examples/hello.tie main
+build/tiej.exe --macro examples/hello.tie main
 ```
 
 `tiej` 用 `--sig i64,f64,bool --ret f64` 指定类型表与返回类型，省略时全部按
@@ -145,19 +145,19 @@ build/tiej --macro examples/hello.tie main
 ## 其它工具
 
 ```bash
-build/tiec tools/tiep/main.tie -o build/tiep
-build/tiec tools/tiel/src/shell.tie -o build/tiel
-build/tiec tools/diag/crashdiag.tie -o build/crashdiag
-build/tiec tools/release/notes.tie -o build/notes
-build/tiec tools/ci/dep_check.tie -o build/dep_check
+build/tiec.exe tools/tiep/main.tie -o build/tiep.exe
+build/tiec.exe tools/tiel/src/shell.tie -o build/tiel.exe
+build/tiec.exe tools/diag/crashdiag.tie -o build/crashdiag.exe
+build/tiec.exe tools/release/notes.tie -o build/notes.exe
+build/tiec.exe tools/ci/dep_check.tie -o build/dep_check.exe
 ```
 
 脚本（tsc 角色）由解释器直接执行，无需编译：
 
 ```bash
-build/tiep script.tie [参数...]
-build/tiel script.tie
-build/tiel --check script.tie
+build/tiep.exe script.tie [参数...]
+build/tiel.exe script.tie
+build/tiel.exe --check script.tie
 ```
 
 `tiel` 也可作为库嵌入：源码级 `import "tools/tiel/src/tiel.tie"`，或用
@@ -165,16 +165,16 @@ build/tiel --check script.tie
 
 ## 测试
 
-回归脚本用 tshell 运行，需要 `tshell` 与已构建的 `tiec`：
+回归脚本用 tshell 运行，需要 `tshell` 与已构建的 `tiec`（脚本内部走 `cmd`，限 Windows）：
 
 ```bash
-tsh -f tools/tiec/scripts/regress-s21.tsh.tie build/tiec
+tsh -f tools/tiec/scripts/regress-s21.tsh.tie ".\build\tiec.exe"
 ```
 
 依赖方向门禁（只允许内置库、`lib/` 与同一工具项目内的分片）：
 
 ```bash
-build/dep_check
+build/dep_check.exe
 ```
 
 ## 许可
