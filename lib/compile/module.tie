@@ -47,6 +47,95 @@ func sym_hit(syms: table<string>, s: string) -> bool {
     return false
 }
 
+// 从模块源解析 module namespace 前缀（点分 → '$'）。一个文件可有多个。
+func mod_prefixes(src: string) -> table<string> {
+    var out = table_new_string()
+    var lines = tie.support::split_char(src, "\n")
+    var i: i64 = 0
+    while i < len(lines) {
+        var ln = tie.support::trim(lines[i])
+        if tie.support::has_prefix(ln, "module namespace ") {
+            var rest = tie.support::slice(ln, 17, str_len(ln))
+            var cut = tie.support::find_char(rest, "{")
+            if cut < 0 {
+                cut = str_len(rest)
+            }
+            var name = tie.support::trim(tie.support::slice(rest, 0, cut))
+            var sb = string_builder()
+            var k: i64 = 0
+            while k < str_len(name) {
+                var c = str_char(name, k)
+                if c == "." {
+                    sb_append(sb, "$")
+                } else {
+                    sb_append(sb, c)
+                }
+                k = k + 1
+            }
+            table_push(out, sb_build(sb))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 取全局定义行 `= global ` 之后的类型文本：按括号深度切到顶层空格，
+// 支持 { ... } / [ ... ] 聚合与 %struct.X 具名类型。
+func take_global_ty(s: string) -> string {
+    var depth: i64 = 0
+    var i: i64 = 0
+    var n = str_len(s)
+    while i < n {
+        var c = str_char(s, i)
+        if c == "{" || c == "[" || c == "(" {
+            depth = depth + 1
+        } else if c == "}" || c == "]" || c == ")" {
+            depth = depth - 1
+        } else if c == " " && depth == 0 {
+            return tie.support::slice(s, 0, i)
+        }
+        i = i + 1
+    }
+    return s
+}
+
+func mod_own_sym(sym: string, prefixes: table<string>) -> bool {
+    var i: i64 = 0
+    while i < len(prefixes) {
+        if tie.support::has_prefix(sym, prefixes[i] + "$") {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 模块单元里 import 进来的普通库全局：定义归主单元，改发 external 声明，
+// 避免链接期重复定义（同一 import 树在主单元与模块单元各编译一次）。
+// 返回空串表示不处理该行（非全局定义 / 模块自身全局 / private 常量）。
+func extern_global_line(ln: string, prefixes: table<string>) -> string {
+    var sp = tie.support::find_char(ln, " ")
+    if sp < 2 {
+        return ""
+    }
+    var sym = tie.support::slice(ln, 1, sp)
+    if tie.support::has_prefix(sym, "llvm.") {
+        return ""
+    }
+    var rest = tie.support::slice(ln, sp + 1, str_len(ln))
+    if !tie.support::has_prefix(rest, "= global ") {
+        return ""
+    }
+    if mod_own_sym(sym, prefixes) {
+        return ""
+    }
+    var gty = take_global_ty(tie.support::slice(rest, 9, str_len(rest)))
+    if str_len(gty) == 0 {
+        return ""
+    }
+    return "@" + sym + " = external global " + gty
+}
+
 // 逐个模块文件独立编译为 .ll：三层复位（sstate / ir / llvmgen）缺一不可，
 // 漏掉 llvmgen.reset_global_regs 会让 render 读到主单元残留的全局登记范围，
 // 表现成 ir_insts_op 越界。
@@ -108,9 +197,19 @@ pub func compile_modules(out_prefix: string) -> i64 {
         // 非 pub 强制 internal，成为模块内部实现。
         var lines = tie.support::split_char(ll, "\n")
         var out = string_builder()
+        var prefixes = mod_prefixes(clean)
         var k: i64 = 0
         while k < len(lines) {
             var ln = lines[k]
+            // import 进来的普通库全局改发 external：定义只留主单元。
+            if str_len(ln) > 0 && str_char(ln, 0) == "@" {
+                var gl = extern_global_line(ln, prefixes)
+                if str_len(gl) > 0 {
+                    sb_append(out, gl + "\n")
+                    k = k + 1
+                    continue
+                }
+            }
             if tie.support::has_prefix(str.clone(ln), "define ") {
                 var at = tie.support::find_char(str.clone(ln), "@")
                 var lp = tie.support::find_char(str.clone(ln), "(")
