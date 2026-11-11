@@ -275,6 +275,13 @@ pub func parse_unary() -> i64 {
                     return -1
                 }
             } else {
+                // `a.<关键字>::f()`：命名空间段撞关键字。给出准确诊断，
+                // 否则会被误读成字段访问语法错误（关键字不是标识符 token）。
+                if putil.peek_n(1) == lex_dcolon {
+                    putil.set_err(putil.peek_line(), putil.peek_col(),
+                        "'" + putil.peek_lexeme() + "' 是关键字，不能作命名空间段")
+                    return -1
+                }
                 putil.set_err(putil.peek_line(), putil.peek_col(), "字段访问 '.' 后必须是字段名/方法名/数字下标，实际是 " + putil.describe(putil.peek_tag()))
                 return -1
             }
