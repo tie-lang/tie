@@ -696,6 +696,18 @@ func extern_decl(sym: string) -> string {
 // 用户 `unsafe extern fn getenv(name) -> string`（返回 char*）
 // 必须在模块头声明 `declare ptr @getenv(ptr)`，否则 opt 报 use of undefined value。
 // 返回 ""（符号未被调用 / 已在模块头无条件 declare，无需再声明）。
+// extern declare 的类型渲染：函数值展开为结构体字面量。
+// 跨编译单元的 declare 可能落在「没有该具名类型定义」的单元里（模块导出面
+// 的 declare 由调用点反推、在主单元发射，而 %fn.N 的类型定义随函数体留在
+// 模块单元），引用具名类型会让 opt 判为非法函数实参类型。结构体字面量与
+// %fn.N 结构等价，ABI 完全一致。
+func llvm_ty_decl(t: i64) -> string {
+    if types.kind(t) == K_FN {
+        return "{ ptr, ptr }"
+    }
+    return llvm_ty(t)
+}
+
 func user_extern_decl(sym: string) -> string {
     // 模块头已无条件 declare 的 libc 符号（emit() 头部段）——若再从调用签名
     // 重复声明，会因签名不一致（如 exit 头为 i32、调用处推导为 i64）报
@@ -743,7 +755,7 @@ func user_extern_decl(sym: string) -> string {
             var ret = "void"
             var rty = ir.ins_ty(i)
             if rty >= 0 && rty != TK_VOID {
-                ret = llvm_ty(rty)
+                ret = llvm_ty_decl(rty)
             }
             // 参数类型表（操作数 2,4,6... 的 IMM 类型 id → LLVM 类型）
             var args = ""
@@ -754,7 +766,7 @@ func user_extern_decl(sym: string) -> string {
                 if !first {
                     args = args + ", "
                 }
-                args = args + llvm_ty(ir.ins_opnd(i, k))
+                args = args + llvm_ty_decl(ir.ins_opnd(i, k))
                 first = false
                 k = k + 2
             }
