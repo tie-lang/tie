@@ -1,10 +1,12 @@
 type tie<lib>
-// lib/jit/selftest.tie —— 垫片装载与 JIT 会话自检
+// lib/jit/selftest.tie —— JIT 完整链路自检
 // ============================================================
-// 只验 DLL 可装载、LLJIT 会话可开。完整链路（IR 装载 → 查符号 → 调用）
-// 由源码模式覆盖，不另用手构 IR 做第二套验证。
+// 覆盖 ABI 校验 → open → add_ir → lookup → dyn_call_p → close 六步，
+// 用一段最小 LLVM IR 驱动会话层完成，不依赖编译段，保持 jit 库只依赖
+// 内置库与 lib/jit 的依赖边界。
 import "/std/string.tie"
 import "./llvmc.tie"
+import "./session.tie"
 namespace tie.jittest;
 
 pub func chk(ok: bool, tag: string) -> bool {
@@ -17,16 +19,17 @@ pub func chk(ok: bool, tag: string) -> bool {
 }
 
 pub func run() -> i64 {
-    if !chk(tie.jit::available(), "tiej_llvm.dll available") {
-        println("构建垫片：clang -shared -O2 lib/jit/tiej_llvm.c -I <LLVM>/include -L <LLVM>/lib -lLLVM-C -o _local_only/bin/tiej_llvm.dll")
-        return 1
-    }
-    var j = tie.jit::open()
-    if !chk(j != 0, "open") {
+    if !chk(tie.jit::available(), "LLVM-C 运行时与 ABI 校验") {
         println("[jit] " + tie.jit::last_error())
+        println("请用 python tools/tiej/build.py 重新构建产物")
         return 1
     }
-    tie.jit::close(j)
-    println("tiej selftest: PASS（垫片装载；完整链路见源码模式）")
+    var ll = "define i64 @tiej_selftest() {\n  ret i64 42\n}\n"
+    var r = tie.jitsession::run(ll, "tiej_selftest")
+    if !chk(r == "OK:42", "IR 装载 → 查符号 → 调用 → 会话关闭") {
+        println("[jit] " + r)
+        return 1
+    }
+    println("tiej selftest: PASS（完整 JIT 链路）")
     return 0
 }

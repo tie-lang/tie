@@ -43,15 +43,21 @@ tie 是一门静态类型的系统编程语言。本仓是它的核心实现：�
 ## 环境要求
 
 - Windows x86-64 或 Linux x86-64
-- LLVM 工具链：`clang`、`opt`、`llvm-ar`、`llvm-nm`
+- LLVM 工具链：`clang`、`opt`、`llvm-ar`、`llvm-nm`，以及 LLVM-C 的头文件与
+  导入库（`LLVM-C.lib` / `libLLVM-C.so`）
 - 一个可用的 `tiec` 作为引导编译器：从 Releases 下载，或使用系统中已安装的版本
 - 可选：`tshell`（tie 语言的命令行壳），用于第二种构建方式
+- Python 3：生成 JIT 导出定义、构建 JIT 驱动、运行 JIT 回归
+
+`tiej` 运行期只需要 LLVM-C 运行库（Windows 为 `LLVM-C.dll`，Linux 为
+`libLLVM-C.so`），把它所在目录加入 `PATH` / `LD_LIBRARY_PATH` 即可。产物不
+需要额外的编译器进程，也不需要随附任何自研垫片动态库。
 
 下文用 `TIEC` 表示引导编译器路径，`LLVM_PREFIX` 表示 LLVM 安装根。
 
 ## 构建
 
-以下命令按 Windows 书写；Linux 去掉 `.exe` 后缀、把 `.dll` 换成 `.so`。命令均在仓库根执行。
+以下命令按 Windows 书写；Linux 去掉 `.exe` 后缀。命令均在仓库根执行，平台差异由构建脚本自动处理。
 
 ### bash / POSIX shell
 
@@ -68,18 +74,8 @@ export TIE_TRM_LITE_LIB=$PWD/lib/rt/trm_lite.a
 # 2. 编译器
 "$TIEC" tools/tiec/src/driver.tie -l2 -t0 --no-warn --no-cache -o build/tiec.exe
 
-# 3. LLVM-C 垫片
-clang -shared -O2 lib/jit/tiej_llvm.c \
-      -I "$LLVM_PREFIX/include" -L "$LLVM_PREFIX/lib" -lLLVM-C \
-      -o build/tiej_llvm.dll
-
-# 4. JIT 驱动（导出定义让进程内 JIT 解析到宿主运行时符号）
-python tools/tiej/gen_exports.py lib/rt/trm_lite.a build/tiej_exports.def
-build/tiec.exe tools/tiej/main.tie -o build/tiej.exe \
-      --link-arg "-Wl,/DEF:build/tiej_exports.def"
-
-# 5. 验证
-build/tiej.exe --selftest
+# 3. JIT 驱动：垫片对象、导出定义与链接一次完成
+python tools/tiej/build.py --tiec build/tiec.exe --llvm-prefix "$LLVM_PREFIX" --selftest
 ```
 
 ### tshell
@@ -98,10 +94,7 @@ tsh> exec {TIEC} src/trm_lite.run.tie -o trm_lite.a --no-warn
 tsh> cd ../..
 tsh> set TIE_TRM_LITE_LIB lib/rt/trm_lite.a
 tsh> exec {TIEC} tools/tiec/src/driver.tie -l2 -t0 --no-warn --no-cache -o build/tiec.exe
-tsh> clang -shared -O2 lib/jit/tiej_llvm.c -I /path/to/llvm/include -L /path/to/llvm/lib -lLLVM-C -o build/tiej_llvm.dll
-tsh> python tools/tiej/gen_exports.py lib/rt/trm_lite.a build/tiej_exports.def
-tsh> build/tiec.exe tools/tiej/main.tie -o build/tiej.exe --link-arg -Wl,/DEF:build/tiej_exports.def
-tsh> build/tiej.exe --selftest
+tsh> python tools/tiej/build.py --tiec build/tiec.exe --llvm-prefix /path/to/llvm --selftest
 ```
 
 外部命令直接写即可（解析顺序是 tie 表达式 → 内建命令 → 外部命令），不必加
@@ -115,16 +108,23 @@ tsh> build/tiej.exe --selftest
    链接时必须能找到它，所以运行时先于编译器构建。
 2. **编译器**：用引导编译器编译仓内编译器源码，得到与本仓同步的 `tiec`。
    `-l2` 为后端优化档、`-t0` 为中端档；`--no-cache` 保证不复用旧产物。
-3. **垫片**：`lib/jit/tiej_llvm.c` 是 LLVM-C 薄封装，导出面固定、参数不超过
-   5 个标量。
-4. **JIT 驱动**：导出定义由运行时静态库符号表自动生成（含分配器）。
-   它是构建期产物；JIT 运行期不依赖任何外部编译器进程。
+3. **JIT 驱动**：`tools/tiej/build.py` 把 `lib/jit/tiej_llvm.c` 编成静态对象
+   链进 `tiej`，并从 `trm_lite.a` 的符号表生成导出定义（含宿主分配器）。
+   对象与导出定义都是构建期产物；JIT 运行期不启动任何编译器进程，也不装载
+   自研垫片动态库。LLVM-C 垫片自身的导出面固定为不超过 5 个标量参数，这是
+   宿主 `dyn_call_p` 的历史约束，与 `tiej` 能调用的函数签名无关——实参由 JIT
+   侧生成的零参数包装函数承载。
+4. **自检**：`--selftest` 走完整的 ABI 校验 → 会话创建 → IR 装载 → 查符号 →
+   调用 → 关闭链路。
 
 ### 平台差异
 
-- Windows：产物为 `.exe` / `.dll`，导出定义用 `-Wl,/DEF:...` 注入。
-- Linux：产物不加后缀，垫片为 `.so`（加 `-fPIC`）；让可执行产物导出运行时
-  符号改用 `--link-arg "-Wl,--export-dynamic"`。
+- Windows：产物为 `.exe`；`build.py` 生成 `.def` 导出定义并用
+  `-Wl,/DEF:...` 注入，运行需要 `LLVM-C.dll` 在 `PATH` 中。
+- Linux：产物不加后缀，垫片对象加 `-fPIC`；可执行产物导出运行时符号改用
+  `-Wl,--export-dynamic`，运行需要能定位 `libLLVM-C.so`。
+
+平台判定与上述链接参数都由 `build.py` 自动完成，无需手工切换。
 
 ## 运行
 
@@ -169,6 +169,13 @@ build/tiel.exe --check script.tie
 
 ```bash
 tsh -f tools/tiec/scripts/regress-s21.tsh.tie ".\build\tiec.exe"
+```
+
+JIT 驱动回归覆盖标量、混合签名、表运行时、越界检查与编译期宏，逐项比对
+输出与退出码，并确认产物不含自研垫片名：
+
+```bash
+python tools/tiej/regress.py build/tiej.exe --llvm-prefix "$LLVM_PREFIX"
 ```
 
 依赖方向门禁（只允许内置库、`lib/` 与同一工具项目内的分片）：

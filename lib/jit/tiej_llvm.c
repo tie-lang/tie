@@ -5,7 +5,7 @@
 //   - 句柄统一 int64_t（宿主不碰 LLVM 类型）；
 //   - 错误统一为 tj_last_error()（线程局部，宿主复制后调 tj_err_clear）。
 //
-// 与 tie 侧的唯一契约（tiej/src/jit/llvmc.tie 镜像）：
+// 与 tie 侧的唯一契约（lib/jit/tjdecl.tie 镜像）：
 //   tj_jit_open()                        -> jit 句柄（0 = 失败）
 //   tj_jit_add_ir(jit, ir, len)          -> 0 成功 / 非 0 见 last_error
 //   tj_jit_lookup(jit, name)             -> 函数地址（0 = 失败）
@@ -13,6 +13,7 @@
 //   tj_last_error()                      -> const char*
 //   tj_err_clear()                       -> void
 //   tj_abi_version()                     -> 整数（宿主启动时校验）
+//   tj_f64_ir / tj_f64_bits / tj_f64_text -> 十进制文本与位模式互换
 //
 // 能力（ABI 3）：
 //   - 会话挂**进程符号解析**：JIT 代码可直接调用宿主进程已链接的符号
@@ -20,10 +21,17 @@
 //   - 调用编组交给 JIT 侧生成的包装函数（按 tie 签名逐参编组），
 //     垫片不再受「≤5 个标量参数」限制。
 //
-// 构建（tiej 仓根；产物进 _local_only/bin，不进源码树）：
-//   clang -shared -O2 src/platform/tiej_llvm.c \
-//         -I D:/LLVM/include -L D:/LLVM/lib -lLLVM-C \
-//         -o _local_only/bin/tiej_llvm.dll
+// 两种构建形态：
+//   1. 静态链入宿主（tiej 默认）：定义 TJ_STATIC，TJ_EXPORT 为空，编成 .o
+//      后与 LLVM-C 导入库一起链进 tiej 可执行产物。tie 侧用 unsafe extern fn
+//      直接调用这些符号，运行期不再装载任何自研垫片 DLL。
+//      clang -c -O2 -DTJ_STATIC -I <LLVM>/include lib/jit/tiej_llvm.c -o build/tiej_llvm.o
+//   2. 独立动态库（备用，供独立探针使用）：不定义 TJ_STATIC。
+//      clang -shared -O2 -fPIC lib/jit/tiej_llvm.c \
+//            -I <LLVM>/include -L <LLVM>/lib -lLLVM-C -o build/tiej_llvm.dll
+//
+// LLVM 侧只链 LLVM-C 这一个导入库 / DLL；本机 LLVM 安装未提供静态组件库，
+// 把整套 LLVM 静态链入产物不是这套构建支持的形态。
 //
 // 说明：本文件不 import 任何 tie 仓源码——tiej 与 tiec/tief 的唯一数据面是
 // tieir；本垫片只依赖 LLVM-C 的公开头文件与导入库。
@@ -42,7 +50,11 @@
 #include <llvm-c/Support.h>
 #include <llvm-c/Target.h>
 
-#ifdef _WIN32
+// 静态链入宿主时不需要导出修饰：符号由 clang 链接期解析，若仍带
+// __declspec(dllexport) 会把 tj_* 塞进可执行产物的导出表，属于无意义的外露。
+#ifdef TJ_STATIC
+#define TJ_EXPORT
+#elif defined(_WIN32)
 #define TJ_EXPORT __declspec(dllexport)
 #else
 #define TJ_EXPORT __attribute__((visibility("default")))

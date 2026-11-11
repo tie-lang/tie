@@ -6,6 +6,11 @@ ast 是语法树契约层：节点标签常量、节点池、列式镜像表与�
 codegen 共同依赖；sema 是语义状态层：符号表、签名表、局部变量表与查询函数，由 front
 写入、由 codegen 读取；codegen 是「AST → tie-IR」的中层，位于前端之后、后端之前；
 backend 只剩「tie-IR → LLVM IR 文本」的发射层。
+
+compile 与 macro 是横切装配层：进程内编译段与宏执行器要消费几乎全部层，
+放进自下而上的层序表没有意义，其方向由 tools/ci/dep_check.tie 的架构守卫
+（tools 项目零相互依赖、lib 不反向 import tools）覆盖。本守卫遇到指向这两层
+的边直接放行，只检查层序表内各层之间的方向。
 退出码 1 表示存在非法边。"""
 import os, re, sys
 
@@ -38,6 +43,9 @@ ALLOWED = {
 # 可见性显式化的产物。
 EXCEPTIONS = {}
 
+# 横切装配层：不属于层序表，见文件头说明。
+CROSS_LAYER = {"compile", "macro"}
+
 def layer_of(path):
     rel = os.path.relpath(path, LIB).replace("\\", "/")
     return rel.split("/")[0] if "/" in rel else ""
@@ -61,6 +69,8 @@ def main():
                 if not tgt.startswith(LIB + os.sep):
                     continue
                 tl = layer_of(tgt)
+                if tl in CROSS_LAYER:
+                    continue
                 if tl and tl not in ALLOWED[lay]:
                     rel = os.path.relpath(p, ROOT).replace("\\", "/")
                     if (rel, imp) in EXCEPTIONS:

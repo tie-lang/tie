@@ -1,125 +1,128 @@
-type tie<class, unsafe:mem, unsafe:ext>
+type tie<lib, unsafe:mem, unsafe:ext>
+import "/std/string.tie"
+import "./tjdecl.tie"
 namespace tie.jit;
-// llvmc.tie —— LLVM-C 薄垫片（tiej_llvm.dll）的 tie 绑定
+// lib/jit/llvmc.tie —— LLVM-C 垫片的 tie 绑定（extern 直连）
 // ============================================================
-// 垫片源码：lib/jit/tiej_llvm.c；构建产物：_local_only/bin/tiej_llvm.dll
-// 垫片导出面（C ABI，全部 ≤5 参）：
-//   tj_abi_version() / tj_jit_open() / tj_jit_add_ir(jit, ir, len)
-//   tj_jit_lookup(jit, name) / tj_jit_close(jit) / tj_last_error()
-// 本文件只做：加载、过程地址缓存、dyn_call_p 封装、错误串复制。
-// 解耦：不 import 任何编译器源码；输入是 LLVM IR 文本（后续由 tieir 生成）。
+// 垫片源码 lib/jit/tiej_llvm.c 在构建期以 -DTJ_STATIC 编成静态对象，与
+// LLVM-C 导入库一起链进 tiej 可执行产物。tie 侧用 unsafe extern fn 直接
+// 调用 C 符号，运行期不再 LoadLibrary 任何自研垫片 DLL，符号缺失或 ABI
+// 漂移在构建期 / 启动期就会暴露，不做静默降级。
+//
+// 公共面保持 available / open / add_ir / lookup / f64_* / close / last_error
+// 不变，session 与 marshal 的调用点无需改动。错误串取回后立刻清空线程局部
+// 缓冲，避免上一次失败被下一次调用重复读出。
+//
+// 解耦：本库只依赖内置库与 lib/jit，输入是 LLVM IR 文本，不认识编译器源码。
 
-var g_dll: i64 = 0
-var g_open: i64 = 0
-var g_add: i64 = 0
-var g_look: i64 = 0
-var g_close: i64 = 0
-var g_err: i64 = 0
-var g_f2t: i64 = 0
-var g_f2b: i64 = 0
-var g_f2i: i64 = 0
+var g_ready: bool = false
+var g_abi_err: string = ""
 
-
+// 宿主与垫片的 ABI 版本必须一致。版本漂移属于构建错配，直接拒绝执行。
 func ensure() -> bool {
-    unsafe {
-        if g_dll != 0 {
-            return true
-        }
-        g_dll = load_library("tiej_llvm.dll")
-        if g_dll == 0 {
-            return false
-        }
-        g_open = get_proc(g_dll, "tj_jit_open")
-        g_add = get_proc(g_dll, "tj_jit_add_ir")
-        g_look = get_proc(g_dll, "tj_jit_lookup")
-        g_close = get_proc(g_dll, "tj_jit_close")
-        g_err = get_proc(g_dll, "tj_last_error")
-        g_f2t = get_proc(g_dll, "tj_f64_text")
-        g_f2b = get_proc(g_dll, "tj_f64_bits")
-        g_f2i = get_proc(g_dll, "tj_f64_ir")
-        return g_open != 0 && g_add != 0 && g_look != 0 && g_close != 0 && g_err != 0
+    if g_ready {
+        return true
     }
+    var v: i64 = 0
+    unsafe {
+        v = tj_abi_version()
+    }
+    if v != 3 {
+        g_abi_err = "LLVM-C 垫片 ABI 版本不符：期望 3，实际 " + to_string(v)
+        return false
+    }
+    unsafe {
+        tj_err_clear()
+    }
+    g_ready = true
+    return true
 }
 
-// 垫片是否可用（DLL 缺失时返回 false，调用方据此降级/报错）。
+// 垫片是否可用（ABI 不符返回 false，调用方据此给出诊断）。
 pub func available() -> bool {
     return ensure()
 }
 
 // 最近一次失败的错误串（无错误返回空串）。
 pub func last_error() -> string {
-    unsafe {
-        if !ensure() {
-            return "tiej_llvm.dll 不可用"
-        }
-        return cstr_to_string(dyn_call_p(g_err, 0, 0, 0, 0, 0))
+    if !ensure() {
+        return g_abi_err
     }
+    var s = ""
+    unsafe {
+        s = tj_last_error()
+        tj_err_clear()
+    }
+    return s
 }
 
 // 新建 JIT 会话；0 = 失败。
 pub func open() -> i64 {
+    if !ensure() {
+        return 0
+    }
     unsafe {
-        if !ensure() {
-            return 0
-        }
-        return dyn_call_p(g_open, 0, 0, 0, 0, 0)
+        tj_err_clear()
+        return tj_jit_open()
     }
 }
 
 // 加入一段 LLVM IR 文本；0 = 成功。
 pub func add_ir(jit: i64, ir: string) -> i64 {
+    if !ensure() {
+        return 1
+    }
     unsafe {
-        if !ensure() {
-            return 1
-        }
-        return dyn_call_p(g_add, jit, ir, len(ir), 0, 0)
+        tj_err_clear()
+        return tj_jit_add_ir(jit, ir, len(ir))
     }
 }
 
 // 查符号地址；0 = 未找到（错误串见 last_error）。
 pub func lookup(jit: i64, name: string) -> i64 {
+    if !ensure() {
+        return 0
+    }
     unsafe {
-        if !ensure() {
-            return 0
-        }
-        return dyn_call_p(g_look, jit, name, 0, 0, 0)
+        tj_err_clear()
+        return tj_jit_lookup(jit, name)
     }
 }
 
 // 十进制文本 → LLVM IR double 字面量。
 pub func f64_ir(s: string) -> string {
+    if !ensure() {
+        return ""
+    }
     unsafe {
-        if !ensure() {
-            return "0.00000000000000000e+00"
-        }
-        return cstr_to_string(dyn_call_p(g_f2i, s, 0, 0, 0, 0))
+        return tj_f64_ir(s)
     }
 }
 
 // 十进制文本 → f64 位模式（wrapper 参数槽用 i64 承载浮点）。
 pub func f64_bits(s: string) -> i64 {
+    if !ensure() {
+        return 0
+    }
     unsafe {
-        if !ensure() {
-            return 0
-        }
-        return dyn_call_p(g_f2b, s, 0, 0, 0, 0)
+        return tj_f64_bits(s)
     }
 }
 
-// f64 位模式 → 十进制文本（JIT 包装统一用 i64 槽返回，宿主再经文本入口还原）。
+// f64 位模式 → 十进制文本（JIT 包装统一用 i64 槽返回）。
 pub func f64_text(bits: i64) -> string {
+    if !ensure() {
+        return ""
+    }
     unsafe {
-        if !ensure() {
-            return ""
-        }
-        return cstr_to_string(dyn_call_p(g_f2t, bits, 0, 0, 0, 0))
+        return tj_f64_text(bits)
     }
 }
 
 pub func close(jit: i64) {
-    unsafe {
-        if ensure() {
-            dyn_call_p(g_close, jit, 0, 0, 0, 0)
+    if ensure() {
+        unsafe {
+            tj_jit_close(jit)
         }
     }
 }

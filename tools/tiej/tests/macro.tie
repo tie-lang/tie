@@ -1,0 +1,37 @@
+type tie<logic>
+// 编译期宏探针：函数式宏、声明式宏、卫生临时变量。
+// tiec 编译运行与 tiej --macro 调用应得到同样的数值。
+
+macro fldbl(x: code) -> code {
+    return `( ($x) * 2 )
+}
+
+macro dbl(x) {
+    x * 2
+}
+
+macro bump(x) {
+    var __r = x
+    __r = __r + 1
+}
+
+pub func use_fldbl() -> i64 {
+    return fldbl(21)
+}
+
+pub func use_dbl() -> i64 {
+    return dbl(21)
+}
+
+pub func hygiene() -> i64 {
+    var __r = 99
+    bump(5)
+    bump(7)
+    return __r
+}
+
+func main() {
+    println("fldbl=" + to_string(use_fldbl()))
+    println("dbl=" + to_string(use_dbl()))
+    println("hygiene=" + to_string(hygiene()))
+}

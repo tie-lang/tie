@@ -1,0 +1,21 @@
+type tie<lib, unsafe:ext>
+// lib/jit/tjdecl.tie —— LLVM-C 垫片的 C 符号声明（全编译单元唯一）
+// ============================================================
+// tie 要求 extern 声明为顶层裸名，且同一编译单元内不得重复声明，故本文件
+// 不设 namespace，独立承载 lib/jit/tiej_llvm.c 的固定导出面。
+//
+// 符号在构建期由 clang 链接解析：缺失会直接导致链接失败，不会退化成运行期
+// 的动态查找。string 实参传的是数据指针（const char*）；返回 char* 的三个
+// 函数由后端自动补 {ptr,len} 头，调用方拿到的是标准 tie string。
+//
+// 契约版本由 tj_abi_version() 暴露，宿主启动时校验，版本漂移即响亮拒绝。
+unsafe extern fn tj_abi_version() -> i64;
+unsafe extern fn tj_err_clear();
+unsafe extern fn tj_last_error() -> string;
+unsafe extern fn tj_jit_open() -> i64;
+unsafe extern fn tj_jit_add_ir(jit: i64, ir: string, n: i64) -> i64;
+unsafe extern fn tj_jit_lookup(jit: i64, name: string) -> i64;
+unsafe extern fn tj_jit_close(jit: i64);
+unsafe extern fn tj_f64_ir(s: string) -> string;
+unsafe extern fn tj_f64_bits(s: string) -> i64;
+unsafe extern fn tj_f64_text(bits: i64) -> string;

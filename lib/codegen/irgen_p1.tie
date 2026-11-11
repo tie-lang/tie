@@ -461,6 +461,16 @@ func is_wsock_sym(sym: string) -> bool {
 
 // 符号是否为 libc（llvmgen 无条件 declare 的符号；不触发 tie_interp 链接）
 func is_libc_sym(sym: string) -> bool {
+    // tiej 的 LLVM-C 垫片（lib/jit/tiej_llvm.c）以静态对象链入宿主，符号由
+    // 构建期 clang 链接解析。这里按导出面逐个登记：未登记会被
+    // tig_ext_call_typed 误判成 tie_interp 桥、置 g_used_interp，进而在链接期
+    // 索取并不存在的 tie_interp.lib（同 std/process.tie 记的 TerminateProcess 坑）。
+    if sym == "tj_abi_version" || sym == "tj_err_clear" || sym == "tj_last_error" ||
+        sym == "tj_jit_open" || sym == "tj_jit_add_ir" || sym == "tj_jit_lookup" ||
+        sym == "tj_jit_close" || sym == "tj_f64_ir" || sym == "tj_f64_bits" ||
+        sym == "tj_f64_text" {
+        return true
+    }
     if sym == "printf" || sym == "strlen" || sym == "strcmp" {
         return true
     }
