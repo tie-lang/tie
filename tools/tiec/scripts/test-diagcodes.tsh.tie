@@ -43,11 +43,13 @@ var sorted = sort_strings(golden)
 for gn in sorted {
     if has_suffix(gn, ".tie") && !has_suffix(gn, ".stderr") {
         i = i + 1
-        out = exec_output("cmd /c " + tiec + " " + GoldenDir + "\\" + gn + " 2>&1")
-        skipF = contains(out, "编译成功") && !contains(out, "error[E")
-        if skipF {
-            // 过时 golden：现行编译器已接受（编译成功）→ 跳过
-        } else {
+        // 过时 golden 判定用退出码：编译器接受该语料即 rc=0。不能匹配
+        // 「编译成功」文本——cmd 管道会把 UTF-8 输出按本地代码页转码，
+        // 中文匹配必然失败，会把过时语料误报成 NO-CODE。
+        rc = exec_code("cmd /c " + tiec + " " + GoldenDir + "\\" + gn + " >nul 2>&1")
+        skipF = rc == 0
+        if !skipF {
+            out = exec_output("cmd /c " + tiec + " " + GoldenDir + "\\" + gn + " 2>&1")
             total = total + 1
             if !contains(out, "error[E") {
                 println("[test-diagcodes] NO-CODE: " + gn)
@@ -64,7 +66,8 @@ for gn in sorted {
 
 // ---------- (2) 警告语料 ----------
 file_write(warnSrc, warnText)
-out = exec_output("cmd /c " + tiec + " " + warnSrc + " 2>&1")
+// -w 开启警告收集：默认只报错，不加该开关时警告语料永远没有输出。
+out = exec_output("cmd /c " + tiec + " -w " + warnSrc + " 2>&1")
 for wc in wcodes {
     wname = wc
     if contains(out, "warning[" + wname + "]") {
