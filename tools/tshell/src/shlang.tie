@@ -20,9 +20,9 @@ type tie<logic>
 import "./sh_util.tie"
 import "./command.tie"
 import "./backend_interp.tie"
-import "../../tiej/src/core/execrun.tie"
-import "../../tiej/src/core/fsglob.tie"
-import "../../tiec/compiler/tiep/vval.tie"
+import "./core/execrun.tie"
+import "./core/fsglob.tie"
+import "../../../lib/interp/interp.tie"
 
 // 行结果（结构化）。
 struct LineRes {
@@ -44,11 +44,12 @@ namespace shlang {
 // ==================== 求值（结构化状态） ====================
 
 // 求值一段 tie 源码：返回 (结果文本, 错误文本)。成功时错误为空。
-// 结构化判据 = tiep 的 w_err（eval 以 w_err 非空表示失败），不再嗅探文案。
+// 结构化判据 = lib/interp 的 has_err()；错误文本由 eval 直接返回，
+// 不再嗅探文案，也不再依赖独立的 vval 模块。
 pub func eval_expr(src: string) -> (string, string) {
     var out = backend_interp.b_eval(src)
-    if vval.w_err != "" {
-        return ("", vval.w_err)
+    if interp::has_err() {
+        return ("", out)
     }
     return (out, "")
 }
@@ -1424,7 +1425,7 @@ func filter_rows(inp: table<string>, toks: table<string>) -> string {
     for line in inp {
         var _set = backend_interp.b_eval("x = \"" + escape_q(line) + "\"")
         var rv = backend_interp.b_eval(body)
-        if vval.w_err == "" && sh_util.u_trim(rv) == "true" {
+        if !interp::has_err() && sh_util.u_trim(rv) == "true" {
             table_push(out, line)
         }
     }

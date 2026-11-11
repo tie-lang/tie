@@ -1,0 +1,359 @@
+type tie<class, unsafe:mem>
+// term.tie —— 终端原语（设计稿 §4.3）
+// ============================================================
+// 逐键读取（Windows 控制台 ReadConsoleInputW；POSIX termios raw + 自解析
+// ESC 序列）、VT 处理开启（Windows ENABLE_VIRTUAL_TERMINAL_PROCESSING；
+// POSIX 恒真）、尺寸探测（Windows CSBI；POSIX 暂 80 缺省）、TTY 判据。
+// 非 TTY（管道/重定向）由调用方降级为逐行读取（tty_ok 判据）。
+//
+// 键协议（key_read 返回 i64）：
+//   >= 32    Unicode 码点（可打印字符，UTF-8 解码后）
+//   13/10    Enter；8/127 Backspace；3 Ctrl-C；4 Ctrl-D；9 Tab；27 Esc（裸）
+//   其它 C0  原样透传（Ctrl 组合）
+//   -1 Up  -2 Down  -3 Left  -4 Right  -5 Home  -6 End  -7 Delete
+//   -8 PageUp  -9 PageDown
+
+#cfg(os=windows)
+unsafe extern fn GetStdHandle(nStdHandle: i32) -> ptr<u8>;
+unsafe extern fn GetConsoleMode(hConsoleHandle: i64, lpMode: ptr<u8>) -> i32;
+unsafe extern fn SetConsoleMode(hConsoleHandle: i64, dwMode: u32) -> i32;
+unsafe extern fn ReadConsoleInputW(hConsoleInput: i64, lpBuffer: ptr<u8>, nLength: u32, lpNumberOfEventsRead: ptr<u8>) -> i32;
+unsafe extern fn GetConsoleScreenBufferInfo(hConsoleOutput: i64, lpConsoleScreenBufferInfo: ptr<u8>) -> i32;
+var g_win_old_mode: i64 = 0;
+var g_win_raw: bool = false;
+#else
+unsafe extern fn isatty(fd: i32) -> i32;
+unsafe extern fn tcgetattr(fd: i32, termios_p: ptr<u8>) -> i32;
+unsafe extern fn tcsetattr(fd: i32, optional_actions: i32, termios_p: ptr<u8>) -> i32;
+unsafe extern fn read(fd: i32, buf: ptr<u8>, count: i64) -> i64;
+var g_px_lflag: i64 = 0;
+var g_px_vmin: i64 = 0;
+var g_px_vtime: i64 = 0;
+var g_px_saved: bool = false;
+#end
+
+namespace term {
+
+// ---- 公共小工具 ----
+
+unsafe fn zalloc(n: i64) -> ptr<u8> {
+    var p = alloc(n)
+    var i: i64 = 0
+    while i < n {
+        deref_write(ptr_add(p, i), to_u8(0))
+        i = i + 1
+    }
+    return p
+}
+
+unsafe fn rd_u32(p: ptr<u8>, off: i64) -> i64 {
+    return to_i64(deref(ptr_add(p, off))) |
+        (to_i64(deref(ptr_add(p, off + 1))) << 8) |
+        (to_i64(deref(ptr_add(p, off + 2))) << 16) |
+        (to_i64(deref(ptr_add(p, off + 3))) << 24)
+}
+
+unsafe fn rd_u16(p: ptr<u8>, off: i64) -> i64 {
+    return to_i64(deref(ptr_add(p, off))) |
+        (to_i64(deref(ptr_add(p, off + 1))) << 8)
+}
+
+unsafe fn wr_u32(p: ptr<u8>, off: i64, v: i64) {
+    deref_write(ptr_add(p, off), to_u8(v & 0xFF))
+    deref_write(ptr_add(p, off + 1), to_u8((v >> 8) & 0xFF))
+    deref_write(ptr_add(p, off + 2), to_u8((v >> 16) & 0xFF))
+    deref_write(ptr_add(p, off + 3), to_u8((v >> 24) & 0xFF))
+}
+
+// ==================== 公共入口 ====================
+
+// stdin 是否终端（控制台/TTY）。
+pub func tty_ok() -> bool {
+    unsafe {
+        #cfg(os=windows)
+        var h = ptr_to_int(GetStdHandle(to_i32(-10)))
+        var m = alloc(4)
+        return GetConsoleMode(h, m) != 0
+        #else
+        return isatty(0) == 1
+        #end
+    }
+}
+
+// 开启 VT 处理（提示符着色/光标控制；POSIX 恒成功）。
+pub func vt_on() -> bool {
+    unsafe {
+        #cfg(os=windows)
+        var h = ptr_to_int(GetStdHandle(to_i32(-11)))
+        var m = alloc(4)
+        if GetConsoleMode(h, m) == 0 {
+            return false
+        }
+        var cur = rd_u32(m, 0)
+        return SetConsoleMode(h, to_u32(cur | 0x4)) != 0
+        #else
+        return true
+        #end
+    }
+}
+
+// 编辑读取模式：关回显/行输入/预处理（Ctrl-C 作为键进入编辑器）。
+pub func raw_on() -> bool {
+    unsafe {
+        #cfg(os=windows)
+        if g_win_raw {
+            return true
+        }
+        var h = ptr_to_int(GetStdHandle(to_i32(-10)))
+        var m = alloc(4)
+        if GetConsoleMode(h, m) == 0 {
+            return false
+        }
+        g_win_old_mode = rd_u32(m, 0)
+        var nm = g_win_old_mode & 0xFFFFFFF8  // 清 PROCESSED(1)|ECHO(2)|LINE(4)
+        if SetConsoleMode(h, to_u32(nm)) == 0 {
+            return false
+        }
+        g_win_raw = true
+        return true
+        #else
+        if g_px_saved {
+            return true
+        }
+        var t = zalloc(60)
+        if tcgetattr(0, t) != 0 {
+            return false
+        }
+        g_px_lflag = rd_u32(t, 12)
+        g_px_vmin = to_i64(deref(ptr_add(t, 22)))
+        g_px_vtime = to_i64(deref(ptr_add(t, 23)))
+        var nl = g_px_lflag & 0xFFFFFFF4  // 清 ISIG(1)|ICANON(2)|ECHO(8)
+        wr_u32(t, 12, nl)
+        deref_write(ptr_add(t, 22), to_u8(1))  // VMIN = 1
+        deref_write(ptr_add(t, 23), to_u8(0))  // VTIME = 0
+        if tcsetattr(0, 0, t) != 0 {
+            return false
+        }
+        g_px_saved = true
+        return true
+        #end
+    }
+}
+
+// 恢复进入编辑模式前的终端状态。
+pub func raw_off() {
+    unsafe {
+        #cfg(os=windows)
+        if !g_win_raw {
+            return
+        }
+        var h = ptr_to_int(GetStdHandle(to_i32(-10)))
+        SetConsoleMode(h, to_u32(g_win_old_mode))
+        g_win_raw = false
+        #else
+        if !g_px_saved {
+            return
+        }
+        var t = zalloc(60)
+        if tcgetattr(0, t) == 0 {
+            wr_u32(t, 12, g_px_lflag)
+            deref_write(ptr_add(t, 22), to_u8(g_px_vmin))
+            deref_write(ptr_add(t, 23), to_u8(g_px_vtime))
+            tcsetattr(0, 0, t)
+        }
+        g_px_saved = false
+        #end
+    }
+}
+
+// 阻塞取一键（协议见文件头）。
+pub func key_read() -> i64 {
+    unsafe {
+        #cfg(os=windows)
+        var h = ptr_to_int(GetStdHandle(to_i32(-10)))
+        var buf = alloc(20)
+        var got = alloc(4)
+        while true {
+            wr_u32(got, 0, 0)
+            if ReadConsoleInputW(h, buf, to_u32(1), got) == 0 {
+                return -100
+            }
+            if rd_u16(buf, 0) != 1 {
+                continue  // 非键盘事件
+            }
+            if rd_u32(buf, 4) == 0 {
+                continue  // 抬起
+            }
+            var vk = rd_u16(buf, 10)
+            if vk == 0x26 {
+                return -1
+            }
+            if vk == 0x28 {
+                return -2
+            }
+            if vk == 0x25 {
+                return -3
+            }
+            if vk == 0x27 {
+                return -4
+            }
+            if vk == 0x24 {
+                return -5
+            }
+            if vk == 0x23 {
+                return -6
+            }
+            if vk == 0x2E {
+                return -7
+            }
+            if vk == 0x21 {
+                return -8
+            }
+            if vk == 0x22 {
+                return -9
+            }
+            var ch = rd_u16(buf, 14)
+            if ch != 0 {
+                return ch
+            }
+            // 无字符的键（修饰键等）：继续
+        }
+        #else
+        var b1 = zalloc(1)
+        while true {
+            var n = read(0, b1, 1)
+            if n == 1 {
+                break
+            }
+            if n < 0 {
+                return -100
+            }
+        }
+        var c0 = to_i64(deref(b1))
+        if c0 != 27 {
+            // UTF-8 解码（>0x7F 时续读完整码点）
+            if c0 < 0x80 {
+                return c0
+            }
+            var need = 1
+            var cp = c0 & 0x1F
+            if c0 >= 0xF0 {
+                need = 3
+                cp = c0 & 0x07
+            } else if c0 >= 0xE0 {
+                need = 2
+                cp = c0 & 0x0F
+            }
+            var bb = zalloc(1)
+            var kk: i64 = 0
+            while kk < need {
+                if read(0, bb, 1) != 1 {
+                    return -100
+                }
+                cp = (cp << 6) | (to_i64(deref(bb)) & 0x3F)
+                kk = kk + 1
+            }
+            return cp
+        }
+        // ESC 序列（挂起等待后续字节；裸 ESC 时吞掉下一键——v1 约定）
+        var b2 = zalloc(1)
+        if read(0, b2, 1) != 1 {
+            return 27
+        }
+        var c1 = to_i64(deref(b2))
+        if c1 != 91 {  // '['
+            return c1
+        }
+        var b3 = zalloc(1)
+        if read(0, b3, 1) != 1 {
+            return 27
+        }
+        var c2 = to_i64(deref(b3))
+        if c2 == 65 {
+            return -1
+        }
+        if c2 == 66 {
+            return -2
+        }
+        if c2 == 67 {
+            return -4
+        }
+        if c2 == 68 {
+            return -3
+        }
+        if c2 == 72 {
+            return -5
+        }
+        if c2 == 70 {
+            return -6
+        }
+        if c2 == 51 {  // "3~" DELETE
+            var b4 = zalloc(1)
+            read(0, b4, 1)
+            return -7
+        }
+        if c2 == 53 {  // "5~" PAGEUP
+            var b5 = zalloc(1)
+            read(0, b5, 1)
+            return -8
+        }
+        if c2 == 54 {  // "6~" PAGEDOWN
+            var b6 = zalloc(1)
+            read(0, b6, 1)
+            return -9
+        }
+        return 27
+        #end
+    }
+}
+
+// stdout 是否终端（管道/重定向 ⇒ false；着色输出面的守门判据）。
+pub func out_tty() -> bool {
+    unsafe {
+        #cfg(os=windows)
+        var h = ptr_to_int(GetStdHandle(to_i32(-11)))
+        var m = alloc(4)
+        return GetConsoleMode(h, m) != 0
+        #else
+        return isatty(1) == 1
+        #end
+    }
+}
+
+// 当前光标列（GetConsoleScreenBufferInfo.dwCursorPosition.X；posix 返回 -1）。
+pub func cursor_col() -> i64 {
+    unsafe {
+        #cfg(os=windows)
+        var h = ptr_to_int(GetStdHandle(to_i32(-11)))
+        var csbi = alloc(22)
+        if GetConsoleScreenBufferInfo(h, csbi) == 0 {
+            return -1
+        }
+        return rd_u16(csbi, 4)
+        #else
+        return -1
+        #end
+    }
+}
+
+// 终端列数（探测失败 80）。
+pub func term_cols() -> i64 {
+    unsafe {
+        #cfg(os=windows)
+        var h = ptr_to_int(GetStdHandle(to_i32(-11)))
+        var csbi = alloc(22)
+        if GetConsoleScreenBufferInfo(h, csbi) == 0 {
+            return 80
+        }
+        var x = rd_u16(csbi, 0)
+        if x <= 0 {
+            return 80
+        }
+        return x
+        #else
+        return 80
+        #end
+    }
+}
+
+}   // namespace term

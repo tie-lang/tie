@@ -1,3 +1,3 @@
 @echo off
-"%~dp0src\tsh_main.exe" %*
+"%~dp0..\..\build\tsh.exe" %*
 

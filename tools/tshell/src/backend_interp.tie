@@ -1,11 +1,11 @@
 type tie<logic>
 // src/backend_interp.tie —— 求值后端委托（interp 后端，现役默认）
 // --------------------------------------------------------------
-// REPL 求值内核**只对接不实现**（架构 §2）：tie 表达式/脚本由 tiec 自举解释器的
-// `interp.eval` 求值。本模块薄委托，隔离 tiec 依赖到单点，便于按 `set eval-backend`
-// 切 trm 引擎后端（observe，p.9.3.5）。依赖 tiec 与 tshell 为同一工作区兄弟目录。
+// REPL 求值内核**只对接不实现**：tie 表达式/脚本由本仓 lib/interp 求值。
+// 本模块薄委托，把求值后端隔离到单点，便于按配置切换为 JIT 后端。
+// 合仓后只依赖仓内 lib/，不再指向任何兄弟仓。
 
-import "../../tiec/compiler/tiep/tiep.tie"
+import "../../../lib/interp/interp.tie"
 
 namespace backend_interp {
 
@@ -16,33 +16,33 @@ pub func b_backend() -> string {
 
 // 求值一段 tie 源码，返回结果文本（错误亦以文本返回）。
 pub func b_eval(src: string) -> string {
-    return tiep.eval(src)
+    return interp::eval(src)
 }
 
 // 整文件脚本求值（tsh 角色，p.9.4）：整文件 parse + 顺序求值（函数跨行持久、
 // 多行块、条件 exit(n) 生效）。返回结果文本（错误亦以文本返回）。
 pub func b_eval_script(src: string) -> string {
-    return tiep.eval_script(src)
+    return interp::eval_script(src)
 }
 
 // 注入脚本参数（跳过 -f <path> 前缀；脚本内 arg_count/arg_at 读取）。
 pub func b_set_script_args(t: table<string>) {
-    tiep.set_script_args(t)
+    interp::set_script_args(t)
 }
 
 // 脚本是否请求退出（exit(n) 触发）。
 pub func b_exit_requested() -> bool {
-    return tiep.exit_requested()
+    return interp::exit_requested()
 }
 
 // 脚本请求的退出码（exit(n)；主进程透传，缺省 0）。
 pub func b_exit_code() -> i64 {
-    return tiep.exit_code_val()
+    return interp::exit_code_val()
 }
 
 // 重置求值会话（清空 interp 的 globals+funcs）。
 pub func b_reset() {
-    tiep.reset()
+    interp::reset()
 }
 
 }   // namespace backend_interp

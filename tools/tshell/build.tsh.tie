@@ -10,16 +10,18 @@ type tie<tsh>
 // (bare exit is unusable inside control blocks and exit(N) is unwired), so
 // on the tiec-missing / compile-fail path this logs the problem but the
 // process still returns 0 (build.ps1 used `exit 1` there).
+// 从仓根运行：tsh -f tools/tshell/build.tsh.tie
+// 合仓后只依赖仓内 tiec 与 lib/，产物统一进 build/，源码树只放 .tie。
 var root = cwd()
-var tiec = path_join(root, "..\\tiec\\compiler\\tiec.exe")
-if !file_exists(tiec) { println("[build] tiec stage0 not found: " + tiec) }
-if !file_exists(tiec) { println("[build] please clone tie-lang/tiec as a sibling of this repo.") }
+var tiec = path_join(root, "build\\tiec.exe")
+if !file_exists(tiec) { println("[build] 未找到仓内编译器：" + tiec) }
+if !file_exists(tiec) { println("[build] 请先按仓根 README 的步骤构建 build/tiec.exe") }
 var opts = ""
 if get_env("TIE_BUILD_NOCACHE") == "1" { opts = "--no-cache " }
-var outdir = path_join(root, "_local_only\\bin")
+var outdir = path_join(root, "build")
 var _mk = mkdir_all(outdir)
-println("[build] compiling src/tsh_main.tie")
-var rc1 = exec_code("cd /d \"" + root + "\" && ..\\tiec\\compiler\\tiec.exe " + opts + "\"src/tsh_main.tie\" -o \"_local_only/bin/tsh_main.exe\"")
-if rc1 != 0 { println("[build] compile failed: src/tsh_main.tie (rc=" + to_string(rc1) + ")") }
-println("[build] done: _local_only\\bin\\tsh_main.exe (standalone)")
+println("[build] compiling tools/tshell/src/tsh_main.tie")
+var rc1 = exec_code("cd /d \"" + root + "\" && build\\tiec.exe " + opts + "\"tools/tshell/src/tsh_main.tie\" -o \"build/tsh.exe\"")
+if rc1 != 0 { println("[build] compile failed: tools/tshell/src/tsh_main.tie (rc=" + to_string(rc1) + ")") }
+println("[build] done: build\\tsh.exe")
 exit 0

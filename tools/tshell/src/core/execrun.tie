@@ -1,0 +1,1308 @@
+type tie<class, unsafe:mem>
+// execrun.tie —— tiej 执行域：命令行执行引擎（直启 / 直通 / 捕获 / 管道 / 重定向 / 复合链）
+// ============================================================
+// 设计依据：《tshell 命令行与脚本设计 v2》§3.2（语义矩阵）/ §3.5（直通与捕获）/ §4.2（执行域）。
+// 定位（2026-10-15 用户裁定）：落点 tiej —— tsh 角色的运行时组件（tshell 绑定 tiej，
+// 执行域引擎先行落地）。`->` / `<-` / `2->` 等表面语法由壳的词法前置层组装为
+// Seg / joins 结构后调用本模块（步骤 3 接通）；本模块只提供引擎能力，不做行切分。
+//
+// 平台：Windows 与 POSIX 单源双实现（#cfg 按目标裁剪；导入文件同样生效）。
+//   - Windows：CreateProcessW 直启；cwd 经 lpCurrentDirectory 直传（不拼接
+//     `cd /d … && …` 前缀串——从根上消除旧 exec 家族「外部命令全灭」缺陷）；
+//     子进程 std 经 STARTF_USESTDHANDLES 精确接线；句柄继承用「即时置位」
+//     纪律（spawn 前准备、spawn 后清除），避免管道端点泄漏进无关子进程。
+//   - POSIX（同批）：fork + chdir + dup2 + execv；PATH 检索在用户态完成。
+// 无 shell 借用：&& / || / ; / 管道 / 重定向全部在引擎内实现（不经 cmd.exe / sh）。
+//
+// 已知限制（步骤 2 务实定界，后续批次治理，登记在案）：
+//   - 双流捕获顺序读（stdout 读尽再读 stderr）：两流同时超出管道缓冲的极端
+//     场景存在阻塞风险（单流捕获 / 直通不受影响）；
+//   - 投喂（feed）为顺序写：超大输入 + 超大输出组合同理；
+//   - 启动失败 = started=false + rc=-1（消除静默吞错；诊断由调用方按 words 渲染）。
+// 符号登记（已落，tiec 2026-10-15）：POSIX 侧 chdir / execv / pipe2 / _exit 已在
+// is_libc_sym 白名单（Windows 侧 GetConsoleMode 等此前已登记）。
+// 布局：extern 与数据类型在本文件顶部（namespace 外）；平台块以 #cfg 裁剪。
+//
+// 调用（示意）：
+//   import "./core/execrun.tie"
+//   var r = execrun.capture(["git", "log", "--oneline"], cwd(), "")
+//   if !r.started { println("无法启动: " + r.err) }
+
+// ==================== 数据类型（平台无关） ====================
+
+// 段规格：一条命令 + 其输入/输出/错误接线（词表由调用方切分保证）。
+struct Seg {
+    var words: table<string> = table_new_string()  // 命令词（words[0] = 程序）
+    var cwd: string = ""            // 子进程工作目录（"" = 继承父 cwd）
+    var in_file: string = ""        // `<- file`：文件作 stdin（"" = 无）
+    var out_file: string = ""       // `-> file` / `->> file`（"" = 无）
+    var out_append: bool = false    // ->> 追加（false = 覆盖）
+    var err_file: string = ""       // `2-> file`（"" = 无）
+    var err_merge: bool = false     // `2-> stdout`：stderr 合流 stdout
+    var cap_out: bool = false       // 捕获 stdout
+    var cap_err: bool = false       // 捕获 stderr
+    var has_feed: bool = false      // 是否有 stdin 投喂（值文本进其 stdin）
+    var feed: string = ""           // 投喂内容（UTF-8）
+}
+
+// 段结果。
+struct Res {
+    var rc: i64 = -1            // 退出码；启动失败 = -1；未运行（跳过）= -1
+    var out: string = ""        // 捕获的 stdout（未捕获 = ""）
+    var err: string = ""        // 捕获的 stderr（未捕获 = ""）
+    var started: bool = false   // 进程是否成功启动
+    var skipped: bool = false   // &&/|| 链中因前段 rc 被跳过
+}
+
+unsafe extern fn fflush(stream: i64) -> i32;
+
+#cfg(os=windows)
+// ==================== Win32 符号（kernel32，链接默认解析） ====================
+unsafe extern fn CreateProcessW(lpApplicationName: ptr<u8>, lpCommandLine: ptr<u8>,
+    lpProcessAttributes: i64, lpThreadAttributes: i64, bInheritHandles: i32,
+    dwCreationFlags: u32, lpEnvironment: i64, lpCurrentDirectory: ptr<u8>,
+    lpStartupInfo: ptr<u8>, lpProcessInformation: ptr<u8>) -> i32;
+unsafe extern fn CreatePipe(hReadPipe: ptr<i64>, hWritePipe: ptr<i64>, lpPipeAttributes: i64, nSize: u32) -> i32;
+unsafe extern fn SetHandleInformation(hObject: i64, dwMask: u32, dwFlags: u32) -> i32;
+unsafe extern fn CreateFileW(lpFileName: ptr<u8>, dwDesiredAccess: u32, dwShareMode: u32,
+    lpSecurityAttributes: i64, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: i64) -> i64
+unsafe extern fn ReadFile(hFile: i64, lpBuffer: ptr<u8>, nNumberOfBytesToRead: u32,
+    lpNumberOfBytesRead: ptr<u32>, lpOverlapped: i64) -> i32;
+unsafe extern fn WriteFile(hFile: i64, lpBuffer: ptr<u8>, nNumberOfBytesToWrite: u32,
+    lpNumberOfBytesWritten: ptr<u32>, lpOverlapped: i64) -> i32;
+unsafe extern fn WaitForSingleObject(hHandle: i64, dwMilliseconds: u32) -> u32;
+unsafe extern fn GetExitCodeProcess(hProcess: i64, lpExitCode: ptr<u32>) -> i32;
+unsafe extern fn CloseHandle(hObject: i64) -> i32;
+unsafe extern fn GetStdHandle(nStdHandle: i32) -> ptr<u8>;
+#else
+// ==================== POSIX 符号（libc） ====================
+unsafe extern fn fork() -> i32;
+unsafe extern fn pipe2(pipefd: ptr<u8>, flags: i32) -> i32;
+unsafe extern fn dup2(oldfd: i32, newfd: i32) -> i32;
+unsafe extern fn execv(path: ptr<u8>, argv: ptr<u8>) -> i32;
+unsafe extern fn chdir(path: string) -> i32;
+unsafe extern fn waitpid(pid: i32, status: ptr<u32>, options: i32) -> i32;
+unsafe extern fn read(fd: i32, buf: ptr<u8>, count: i64) -> i64;
+unsafe extern fn write(fd: i32, buf: ptr<u8>, count: i64) -> i64;
+unsafe extern fn open(path: string, flags: i32, mode: i32) -> i32;
+unsafe extern fn close(fd: i32) -> i32;
+unsafe extern fn access(path: string, mode: i32) -> i32;
+unsafe extern fn getenv(name: string) -> ptr<u8>;
+unsafe extern fn _exit(ec: i32);
+#end
+
+namespace execrun {
+
+// ==================== 公共：小端整数读写（两平台共用） ====================
+
+unsafe fn wr_u32(p: ptr<u8>, off: i64, v: i64) {
+    deref_write(ptr_add(p, off), to_u8(v & 0xFF))
+    deref_write(ptr_add(p, off + 1), to_u8((v >> 8) & 0xFF))
+    deref_write(ptr_add(p, off + 2), to_u8((v >> 16) & 0xFF))
+    deref_write(ptr_add(p, off + 3), to_u8((v >> 24) & 0xFF))
+}
+
+unsafe fn rd_u32(p: ptr<u8>, off: i64) -> i64 {
+    return to_i64(deref(ptr_add(p, off))) |
+        (to_i64(deref(ptr_add(p, off + 1))) << 8) |
+        (to_i64(deref(ptr_add(p, off + 2))) << 16) |
+        (to_i64(deref(ptr_add(p, off + 3))) << 24)
+}
+
+unsafe fn rd_u64(p: ptr<u8>, off: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        v = v | (to_i64(deref(ptr_add(p, off + k))) << (8 * k))
+        k = k + 1
+    }
+    return v
+}
+
+unsafe fn wr_u64(p: ptr<u8>, off: i64, v: i64) {
+    var k: i64 = 0
+    while k < 8 {
+        deref_write(ptr_add(p, off + k), to_u8((v >> (8 * k)) & 0xFF))
+        k = k + 1
+    }
+}
+
+#cfg(os=windows)
+// ==================== Windows 平台实现 ====================
+// （宽串 / 句柄 / 管道 / 文件 / 读写 / 等待 / 命令行引号 / 启动）
+
+// ---- 内部：宽串/缓冲（自包含，参照 sys/win32.tie 范式） ----
+
+// tie 字符串 → alloc 的 UTF-16LE C 串（含尾双 0）。
+unsafe fn wstr(s: string) -> ptr<u8> {
+    var n = str_len(s)
+    var p: ptr<u8> = alloc(n * 4 + 4)
+    var o: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var cp = char_code(str_char(s, i))
+        if cp > 0xFFFF {
+            var v = cp - 0x10000
+            var hi = 0xD800 + (v >> 10)
+            var lo = 0xDC00 + (v & 0x3FF)
+            deref_write(ptr_add(p, o), to_u8(hi & 0xFF))
+            deref_write(ptr_add(p, o + 1), to_u8((hi >> 8) & 0xFF))
+            deref_write(ptr_add(p, o + 2), to_u8(lo & 0xFF))
+            deref_write(ptr_add(p, o + 3), to_u8((lo >> 8) & 0xFF))
+            o = o + 4
+        } else {
+            deref_write(ptr_add(p, o), to_u8(cp & 0xFF))
+            deref_write(ptr_add(p, o + 1), to_u8((cp >> 8) & 0xFF))
+            o = o + 2
+        }
+        i = i + 1
+    }
+    deref_write(ptr_add(p, o), to_u8(0))
+    deref_write(ptr_add(p, o + 1), to_u8(0))
+    return p
+}
+
+// 零填充 alloc。
+unsafe fn zalloc(n: i64) -> ptr<u8> {
+    var p = alloc(n)
+    var i: i64 = 0
+    while i < n {
+        deref_write(ptr_add(p, i), to_u8(0))
+        i = i + 1
+    }
+    return p
+}
+
+// ---- 句柄/管道/文件原语 ----
+
+unsafe fn x_close(h: i64) {
+    if h > 0 {
+        CloseHandle(h)
+    }
+}
+
+// 置继承位（仅 spawn 前瞬时置位；spawn 后即清，防泄漏进无关子进程）。
+unsafe fn x_inh(h: i64) {
+    if h > 0 {
+        SetHandleInformation(h, to_u32(1), to_u32(1))
+    }
+}
+
+unsafe fn x_uninh(h: i64) {
+    if h > 0 {
+        SetHandleInformation(h, to_u32(1), to_u32(0))
+    }
+}
+
+// 建管道 → (读端, 写端)；两端默认不可继承（由调用方按需 x_inh）。
+unsafe fn x_pipe() -> (i64, i64) {
+    var r: i64 = 0
+    var w: i64 = 0
+    var ok = CreatePipe(addr_of(r), addr_of(w), 0, to_u32(0))
+    if ok == 0 {
+        return (0, 0)
+    }
+    return (r, w)
+}
+
+// 打开输出文件（继承句柄）；append=true 为追加。失败 0。
+unsafe fn x_open_write(path: string, append: bool) -> i64 {
+    var sa = zalloc(24)
+    wr_u32(sa, 0, 24)
+    wr_u32(sa, 16, 1)  // bInheritHandle = TRUE
+    var wp = wstr(path)
+    var acc: u32 = to_u32(0x40000000)  // GENERIC_WRITE
+    var disp: u32 = to_u32(2)          // CREATE_ALWAYS（覆盖）
+    if append {
+        acc = to_u32(4)  // FILE_APPEND_DATA
+        disp = to_u32(4)  // OPEN_ALWAYS
+    }
+    var h = CreateFileW(wp, acc, to_u32(1), ptr_to_int(sa), disp, to_u32(0x80), 0)  // share=READ, attrs=NORMAL
+    if h == 0 || h == -1 {
+        return 0
+    }
+    return h
+}
+
+// 打开输入文件（继承句柄，只读）。失败 0。
+unsafe fn x_open_read(path: string) -> i64 {
+    var sa = zalloc(24)
+    wr_u32(sa, 0, 24)
+    wr_u32(sa, 16, 1)
+    var wp = wstr(path)
+    var h = CreateFileW(wp, to_u32(0x80000000), to_u32(3), ptr_to_int(sa), to_u32(3), to_u32(0x80), 0)  // READ; share=RW; OPEN_EXISTING
+    if h == 0 || h == -1 {
+        return 0
+    }
+    return h
+}
+
+// 阻塞读到 EOF → 字符串（字节级；UTF-8 原样）。
+unsafe fn x_read_all(h: i64) -> string {
+    var sb = string_builder()
+    if h <= 0 {
+        return sb_build(sb)
+    }
+    var buf = alloc(8192)
+    var got: u32 = to_u32(0)
+    while true {
+        got = to_u32(0)
+        var ok = ReadFile(h, buf, to_u32(8192), addr_of(got), 0)
+        if ok == 0 {
+            break
+        }
+        var n = to_i64(got)
+        if n == 0 {
+            break
+        }
+        var i: i64 = 0
+        while i < n {
+            sb_append_byte(sb, to_i64(deref(ptr_add(buf, i))))
+            i = i + 1
+        }
+    }
+    return sb_build(sb)
+}
+
+// 全量写（循环直至写完；部分写重试）。返回是否全部写出。
+unsafe fn x_write_all(h: i64, s: string) -> bool {
+    if h <= 0 {
+        return false
+    }
+    var n = len(s)  // 字节数
+    if n == 0 {
+        return true
+    }
+    var p = alloc(n + 1)
+    var got: u32 = to_u32(0)
+    var off: i64 = 0
+    while off < n {
+        var rem = n - off
+        var j: i64 = 0
+        while j < rem {
+            deref_write(ptr_add(p, j), to_u8(str_byte(s, off + j)))
+            j = j + 1
+        }
+        got = to_u32(0)
+        var ok = WriteFile(h, p, to_u32(rem), addr_of(got), 0)
+        if ok == 0 {
+            return false
+        }
+        var w = to_i64(got)
+        if w == 0 {
+            return false
+        }
+        off = off + w
+    }
+    return true
+}
+
+// 等待进程并取退出码（随后关闭进程句柄）。失败 -1。
+unsafe fn x_wait(h: i64) -> i64 {
+    if h <= 0 {
+        return -1
+    }
+    WaitForSingleObject(h, to_u32(4294967295))  // INFINITE
+    var ec: u32 = to_u32(0)
+    var okc = GetExitCodeProcess(h, addr_of(ec))
+    CloseHandle(h)
+    if okc == 0 {
+        return -1
+    }
+    return to_i64(ec)
+}
+
+// ---- 命令行引号（MS CRT 解析规则的可逆算法；不经 shell，仅需 argv 还原） ----
+
+func quote_arg(w: string) -> string {
+    var need = false
+    var n = str_len(w)
+    if n == 0 {
+        need = true
+    }
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(w, i)
+        if c == " " || c == "\t" || c == "\"" {
+            need = true
+        }
+        i = i + 1
+    }
+    if !need {
+        return w
+    }
+    var sb = string_builder()
+    sb_append(sb, "\"")
+    var bs: i64 = 0  // 连续反斜杠计数
+    i = 0
+    while i < n {
+        var c2 = str_char(w, i)
+        if c2 == "\\" {
+            bs = bs + 1
+        } else if c2 == "\"" {
+            var k: i64 = 0
+            while k < bs * 2 + 1 {
+                sb_append(sb, "\\")
+                k = k + 1
+            }
+            bs = 0
+            sb_append(sb, "\"")
+        } else {
+            var k2: i64 = 0
+            while k2 < bs {
+                sb_append(sb, "\\")
+                k2 = k2 + 1
+            }
+            bs = 0
+            sb_append(sb, c2)
+        }
+        i = i + 1
+    }
+    while bs > 0 {
+        sb_append(sb, "\\")
+        bs = bs - 1
+    }
+    sb_append(sb, "\"")
+    return sb_build(sb)
+}
+
+func build_cmdline(words: table<string>) -> string {
+    var sb = string_builder()
+    var first = true
+    for w in words {
+        if !first {
+            sb_append(sb, " ")
+        }
+        sb_append(sb, quote_arg(w))
+        first = false
+    }
+    return sb_build(sb)
+}
+
+// ---- 启动原语 ----
+
+// 直启一个进程。
+//   words：命令词；cwd：工作目录（"" = 继承）；
+//   hin/hout/herr：子进程 std 句柄；-1 = 继承父对应 std；-3 = 继承父 stdout
+//     （仅 err_merge 用：与子 stdout 同目标）；其余 >0 = 显式句柄；
+//   use_h：是否启用 STARTF_USESTDHANDLES（直通模式 = false，子进程取控制台默认）。
+// 返回 (ok, hProcess)。句柄继承位由本函数在 spawn 前瞬时置位、随后清除。
+unsafe fn x_spawn(words: table<string>, cwd: string, hin: i64, hout: i64, herr: i64, use_h: bool) -> (bool, i64) {
+    var cl = build_cmdline(words)
+    var _fl = fflush(0)
+    var wcl = wstr(cl)
+    var wcwd: ptr<u8> = int_to_ptr(0)
+    if str_len(cwd) > 0 {
+        wcwd = wstr(cwd)
+    }
+    var si = zalloc(104)  // STARTUPINFOW（x64）
+    var pi = zalloc(24)   // PROCESS_INFORMATION
+    if use_h {
+        var rhi = hin
+        var rho = hout
+        var rhe = herr
+        if rhi == -1 {
+            rhi = ptr_to_int(GetStdHandle(to_i32(-10)))
+        }
+        if rho == -1 {
+            rho = ptr_to_int(GetStdHandle(to_i32(-11)))
+        }
+        if rhe == -1 {
+            rhe = ptr_to_int(GetStdHandle(to_i32(-12)))
+        }
+        if rhe == -3 {
+            if rho != -3 {
+                rhe = rho
+            } else {
+                rhe = ptr_to_int(GetStdHandle(to_i32(-11)))
+            }
+        }
+        x_inh(rhi)
+        x_inh(rho)
+        x_inh(rhe)
+        wr_u32(si, 0, 104)
+        wr_u32(si, 60, 0x100)  // STARTF_USESTDHANDLES
+        wr_u64(si, 80, rhi)
+        wr_u64(si, 88, rho)
+        wr_u64(si, 96, rhe)
+        var okb = CreateProcessW(int_to_ptr(0), wcl, 0, 0, 1, to_u32(0), 0, wcwd, si, pi)
+        x_uninh(rhi)
+        x_uninh(rho)
+        if rhe != rho {
+            x_uninh(rhe)
+        }
+        if okb == 0 {
+            return (false, 0)
+        }
+        var hp0 = rd_u64(pi, 0)
+        var ht0 = rd_u64(pi, 8)
+        CloseHandle(ht0)
+        return (true, hp0)
+    }
+    // 直通：不设 USESTDHANDLES——子进程取控制台默认 std
+    wr_u32(si, 0, 104)
+    var okc = CreateProcessW(int_to_ptr(0), wcl, 0, 0, 1, to_u32(0), 0, wcwd, si, pi)
+    if okc == 0 {
+        return (false, 0)
+    }
+    var hp1 = rd_u64(pi, 0)
+    var ht1 = rd_u64(pi, 8)
+    CloseHandle(ht1)
+    return (true, hp1)
+}
+#else
+// ==================== POSIX 平台实现（linux 目标） ====================
+// 无 shell 借用：fork + chdir + dup2 + execv；PATH 检索在用户态完成（access X_OK）。
+// fd 卫生：管道一律 pipe2(O_CLOEXEC) 创建（dup2 目标自动清 CLOEXEC）——子进程 exec
+// 时其余端点自动关闭，杜绝跨子进程端点泄漏（对齐 Win 侧「即时继承位」纪律）。
+
+unsafe fn x_close(h: i64) {
+    if h > 2 {
+        close(to_i32(h))
+    }
+}
+
+// 继承位：POSIX 无对应机制（dup2 在子进程内显式接线）——空实现（对齐 Win 调用面）。
+unsafe fn x_inh(h: i64) {
+}
+
+unsafe fn x_uninh(h: i64) {
+}
+
+// 管道（两端 O_CLOEXEC）→ (读端, 写端)。失败 (0, 0)。
+unsafe fn x_pipe() -> (i64, i64) {
+    var buf = alloc(8)
+    var ok = pipe2(buf, to_i32(0x80000))  // O_CLOEXEC
+    if ok != 0 {
+        return (0, 0)
+    }
+    return (rd_u32(buf, 0), rd_u32(buf, 4))
+}
+
+// 打开输出文件（O_CLOEXEC）。append=true 追加。失败 0。
+unsafe fn x_open_write(path: string, append: bool) -> i64 {
+    var flags: i64 = 0x80241  // O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC
+    if append {
+        flags = 0x80441  // O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC
+    }
+    var h = open(path, to_i32(flags), to_i32(0x1A4))  // 0644
+    if h < 0 {
+        return 0
+    }
+    return h
+}
+
+// 打开输入文件（只读，O_CLOEXEC）。失败 0。
+unsafe fn x_open_read(path: string) -> i64 {
+    var h = open(path, to_i32(0x80000), to_i32(0))  // O_RDONLY|O_CLOEXEC（mode 忽略）
+    if h < 0 {
+        return 0
+    }
+    return h
+}
+
+// 阻塞读到 EOF → 字符串（字节级；UTF-8 原样）。
+unsafe fn x_read_all(h: i64) -> string {
+    var sb = string_builder()
+    if h <= 0 {
+        return sb_build(sb)
+    }
+    var buf = alloc(8192)
+    while true {
+        var n = read(to_i32(h), buf, 8192)
+        if n <= 0 {
+            break
+        }
+        var i: i64 = 0
+        while i < n {
+            sb_append_byte(sb, to_i64(deref(ptr_add(buf, i))))
+            i = i + 1
+        }
+    }
+    return sb_build(sb)
+}
+
+// 全量写（循环直至写完；部分写重试）。返回是否全部写出。
+unsafe fn x_write_all(h: i64, s: string) -> bool {
+    if h <= 0 {
+        return false
+    }
+    var n = len(s)
+    if n == 0 {
+        return true
+    }
+    var p = alloc(n + 1)
+    var off: i64 = 0
+    while off < n {
+        var rem = n - off
+        var j: i64 = 0
+        while j < rem {
+            deref_write(ptr_add(p, j), to_u8(str_byte(s, off + j)))
+            j = j + 1
+        }
+        var w = write(to_i32(h), p, rem)
+        if w <= 0 {
+            return false
+        }
+        off = off + w
+    }
+    return true
+}
+
+// 等待子进程（waitpid）并解码退出码。非正常退出（信号）失败 -1。
+unsafe fn x_wait(h: i64) -> i64 {
+    if h <= 0 {
+        return -1
+    }
+    var st: u32 = to_u32(0)
+    var rc = waitpid(to_i32(h), addr_of(st), to_i32(0))
+    if rc < 0 {
+        return -1
+    }
+    var sv = to_i64(st)
+    if (sv & 0x7F) != 0 {
+        return -1
+    }
+    return (sv >> 8) & 0xFF
+}
+
+// 命令解析：含 '/' 直接用；否则沿 PATH 检索（access X_OK；字节级切分）。
+unsafe fn resolve_cmd(w0: string) -> string {
+    if len(w0) == 0 {
+        return ""
+    }
+    var has_slash = false
+    var z: i64 = 0
+    var zn = len(w0)
+    while z < zn {
+        if str_byte(w0, z) == 47 {  // '/'
+            has_slash = true
+        }
+        z = z + 1
+    }
+    if has_slash {
+        return w0
+    }
+    var pp = getenv("PATH")
+    if ptr_to_int(pp) == 0 {
+        return ""
+    }
+    var pth = cstr_read(pp)
+    var n = len(pth)
+    var sb = string_builder()
+    var i: i64 = 0
+    while i <= n {
+        if i == n || str_byte(pth, i) == 58 {  // ':' 或结尾
+            var seg = sb_build(sb)
+            if len(seg) > 0 {
+                var cand = seg + "/" + w0
+                if access(cand, to_i32(1)) == 0 {  // X_OK
+                    return cand
+                }
+            }
+            sb = string_builder()
+        } else {
+            sb_append_byte(sb, str_byte(pth, i))
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// C 串（ptr）→ tie 字符串（读至 NUL）。
+unsafe fn cstr_read(p: ptr<u8>) -> string {
+    var sb = string_builder()
+    var i: i64 = 0
+    while true {
+        var b = to_i64(deref(ptr_add(p, i)))
+        if b == 0 {
+            break
+        }
+        sb_append_byte(sb, b)
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// 直启一个进程（fork + dup2 接线 + chdir + execv）。语义与 Win 侧一致。
+unsafe fn x_spawn(words: table<string>, cwd: string, hin: i64, hout: i64, herr: i64, use_h: bool) -> (bool, i64) {
+    var w0 = words[0]
+    var path = resolve_cmd(w0)
+    if str_len(path) == 0 {
+        return (false, 0)
+    }
+    // argv：每词 UTF-8 字节 + NUL；指针数组 + 尾 NULL
+    var nw = len(words)
+    var argv = alloc((nw + 1) * 8)
+    var k: i64 = 0
+    while k < nw {
+        var w = words[k]
+        var wl = len(w)
+        var b = alloc(wl + 1)
+        var j: i64 = 0
+        while j < wl {
+            deref_write(ptr_add(b, j), to_u8(str_byte(w, j)))
+            j = j + 1
+        }
+        deref_write(ptr_add(b, wl), to_u8(0))
+        wr_u64(argv, k * 8, ptr_to_int(b))
+        k = k + 1
+    }
+    wr_u64(argv, nw * 8, 0)
+    var pc = alloc(len(path) + 1)
+    var z: i64 = 0
+    while z < len(path) {
+        deref_write(ptr_add(pc, z), to_u8(str_byte(path, z)))
+        z = z + 1
+    }
+    deref_write(ptr_add(pc, len(path)), to_u8(0))
+    var _fl2 = fflush(0)
+    var pid = fork()
+    if pid == 0 {
+        // 子进程：cwd → 句柄接线 → exec
+        if str_len(cwd) > 0 {
+            var cr = chdir(cwd)
+            if cr != 0 {
+                _exit(to_i32(127))
+            }
+        }
+        if use_h {
+            if hin != -1 {
+                var t1 = hin
+                if t1 == -3 {
+                    t1 = 1
+                }
+                dup2(to_i32(t1), to_i32(0))
+            }
+            if hout != -1 {
+                dup2(to_i32(hout), to_i32(1))
+            }
+            if herr != -1 {
+                var t3 = herr
+                if t3 == -3 {
+                    t3 = 1
+                }
+                dup2(to_i32(t3), to_i32(2))
+            }
+        }
+        execv(pc, argv)
+        _exit(to_i32(127))
+    }
+    if pid < 0 {
+        return (false, 0)
+    }
+    return (true, to_i64(pid))
+}
+#end
+
+// ==================== 进程环境 ====================
+// 直通语言内置（get_env/set_env）——tiec `cd12711` 已修 Windows 实时块读取，
+// 与 SetEnvironmentVariableW 写入成对（子进程继承同源：Win32 环境块）。
+
+// 读进程环境。缺失 → 空串。
+pub func env_get(name: string) -> string {
+    return get_env(name)
+}
+
+// 写进程环境（覆盖语义；子进程继承）。
+pub func env_put(name: string, value: string) {
+    var _e = set_env(name, value)
+}
+
+// ==================== 公共组合面 ====================
+
+// 单段执行：按 Seg 规格接线（重定向 / 捕获 / 投喂 / 直通），返回结果。
+pub func run_one(sg: Seg) -> Res {
+    var res = Res()
+    if len(sg.words) == 0 {
+        return res
+    }
+    var hin: i64 = -1
+    var hout: i64 = -1
+    var herr: i64 = -1
+    var feed_w: i64 = 0  // 父侧写端（投喂用）
+    var feed_r: i64 = 0  // 子侧读端
+    var capo_r: i64 = 0  // 父侧读端（捕获 stdout）
+    var capo_w: i64 = 0  // 子侧写端
+    var cape_r: i64 = 0
+    var cape_w: i64 = 0
+    var fin_i: i64 = 0
+    var fin_o: i64 = 0
+    var fin_e: i64 = 0
+    unsafe {
+        if str_len(sg.in_file) > 0 {
+            fin_i = x_open_read(sg.in_file)
+            if fin_i == 0 {
+                res.started = false
+                return res
+            }
+            hin = fin_i
+        } else if sg.has_feed {
+            var (pfr, pfw) = x_pipe()
+            feed_r = pfr
+            feed_w = pfw
+            if feed_r == 0 {
+                res.started = false
+                return res
+            }
+            hin = feed_r
+        }
+        if str_len(sg.out_file) > 0 {
+            fin_o = x_open_write(sg.out_file, sg.out_append)
+            if fin_o == 0 {
+                x_close(feed_r)
+                x_close(feed_w)
+                x_close(fin_i)
+                res.started = false
+                return res
+            }
+            hout = fin_o
+        } else if sg.cap_out {
+            var (pcr, pcw) = x_pipe()
+            capo_r = pcr
+            capo_w = pcw
+            if capo_r == 0 {
+                res.started = false
+                return res
+            }
+            hout = capo_w
+        }
+        if str_len(sg.err_file) > 0 {
+            fin_e = x_open_write(sg.err_file, false)
+            if fin_e == 0 {
+                x_close(feed_r)
+                x_close(feed_w)
+                x_close(fin_i)
+                res.started = false
+                return res
+            }
+            herr = fin_e
+        } else if sg.err_merge {
+            if hout != -1 {
+                herr = hout
+            } else {
+                herr = -3  // 与父 stdout 合流
+            }
+        } else if sg.cap_err {
+            var (per, pew) = x_pipe()
+            cape_r = per
+            cape_w = pew
+            if cape_r == 0 {
+                res.started = false
+                return res
+            }
+            herr = cape_w
+        }
+    }
+    var use_h = (hin != -1) || (hout != -1) || (herr != -1)
+    var sp_ok = false
+    var sp_hp: i64 = 0
+    unsafe {
+        var (sok1, shp1) = x_spawn(sg.words, sg.cwd, hin, hout, herr, use_h)
+        sp_ok = sok1
+        sp_hp = shp1
+    }
+    res.started = sp_ok
+    var hp = sp_hp
+    unsafe {
+        // 父侧：关子侧端点副本 + 文件句柄
+        x_close(feed_r)
+        x_close(capo_w)
+        x_close(cape_w)
+        x_close(fin_i)
+        x_close(fin_o)
+        x_close(fin_e)
+        // 投喂（先写完关写端 → 子进程见 EOF）
+        if sg.has_feed {
+            if feed_w > 0 {
+                x_write_all(feed_w, sg.feed)
+                x_close(feed_w)
+            }
+        }
+        // 捕获（顺序读；见头部限制说明）
+        if sg.cap_out {
+            if capo_r > 0 {
+                res.out = x_read_all(capo_r)
+                x_close(capo_r)
+            }
+        }
+        if sg.cap_err {
+            if cape_r > 0 {
+                res.err = x_read_all(cape_r)
+                x_close(cape_r)
+            }
+        }
+        if res.started {
+            res.rc = x_wait(hp)
+        } else {
+            res.rc = -1
+        }
+    }
+    return res
+}
+
+// 单命令前台直通（控制台继承；cwd 直启）。返回退出码。
+pub func run(words: table<string>, cwd: string) -> i64 {
+    var sg = Seg()
+    sg.words = words
+    sg.cwd = cwd
+    var r = run_one(sg)
+    return r.rc
+}
+
+// 单命令捕获：stdout / stderr 分开回收；input 投喂 stdin（"" 不投喂）。
+pub func capture(words: table<string>, cwd: string, input: string) -> Res {
+    var sg = Seg()
+    sg.words = words
+    sg.cwd = cwd
+    sg.cap_out = true
+    sg.cap_err = true
+    if str_len(input) > 0 {
+        sg.has_feed = true
+        sg.feed = input
+    }
+    return run_one(sg)
+}
+
+// 重定向执行：out_file（"" 无）为 stdout 目标（append 追加）；err_file / err_merge
+// 为 stderr 目标（二者仅取一）。返回结果（rc 为主）。
+pub func redir(words: table<string>, cwd: string, out_file: string, append: bool,
+    err_file: string, err_merge: bool) -> Res {
+    var sg = Seg()
+    sg.words = words
+    sg.cwd = cwd
+    sg.out_file = out_file
+    sg.out_append = append
+    sg.err_file = err_file
+    sg.err_merge = err_merge
+    return run_one(sg)
+}
+
+// ==================== 段编码（跨函数边界） ====================
+// p.9.12.6 边界：行池 table<R>（R 为 struct）不能作函数形参 —— 多段 API 的段列表
+// 以「编码串」跨界：每个段 = 一个 string（长度前缀字段流，任意字节安全）。
+// 字段顺序（编码/解码严格一致）：
+//   wc | word×wc | cap_out | cap_err | err_merge | out_append | has_feed
+//   | cwd | in_file | out_file | err_file | feed
+// 调用方构建 Seg（类型化）后经 enc() 编码；引擎内部解码使用。
+
+pub func enc_field(s: string) -> string {
+    return to_string(len(s)) + ":" + s
+}
+
+pub func enc_flag(b: bool) -> string {
+    if b {
+        return "1"
+    }
+    return "0"
+}
+
+// Seg → 编码串。
+pub func enc(sg: Seg) -> string {
+    var sb = string_builder()
+    sb_append(sb, enc_field(to_string(len(sg.words))))
+    for w in sg.words {
+        sb_append(sb, enc_field(w))
+    }
+    sb_append(sb, enc_field(enc_flag(sg.cap_out)))
+    sb_append(sb, enc_field(enc_flag(sg.cap_err)))
+    sb_append(sb, enc_field(enc_flag(sg.err_merge)))
+    sb_append(sb, enc_field(enc_flag(sg.out_append)))
+    sb_append(sb, enc_field(enc_flag(sg.has_feed)))
+    sb_append(sb, enc_field(sg.cwd))
+    sb_append(sb, enc_field(sg.in_file))
+    sb_append(sb, enc_field(sg.out_file))
+    sb_append(sb, enc_field(sg.err_file))
+    sb_append(sb, enc_field(sg.feed))
+    return sb_build(sb)
+}
+
+// 取一个长度前缀字段 → (字段, 新游标)。
+pub func fld(encs: string, pos: i64) -> (string, i64) {
+    var i = pos
+    var n = len(encs)
+    var digs = ""
+    while i < n && str_char(encs, i) != ":" {
+        digs = digs + str_char(encs, i)
+        i = i + 1
+    }
+    i = i + 1
+    var ln = parse_int(digs)
+    var sb = string_builder()
+    var k: i64 = 0
+    while k < ln {
+        sb_append_byte(sb, str_byte(encs, i + k))
+        k = k + 1
+    }
+    return (sb_build(sb), i + ln)
+}
+
+pub func fld_flag(f: string) -> bool {
+    if len(f) > 0 && str_byte(f, 0) == 49 {
+        return true
+    }
+    return false
+}
+
+// 编码串 → Seg。
+func seg_decode(encs: string) -> Seg {
+    var sg = Seg()
+    var pos: i64 = 0
+    var (f0, p0) = fld(encs, pos)
+    pos = p0
+    var wc = parse_int(f0)
+    var w: table<string> = []
+    var k: i64 = 0
+    while k < wc {
+        var (ww, pk) = fld(encs, pos)
+        pos = pk
+        table_push(w, ww)
+        k = k + 1
+    }
+    sg.words = w
+    var (fa, pa) = fld(encs, pos)
+    pos = pa
+    sg.cap_out = fld_flag(fa)
+    var (fb, pb) = fld(encs, pos)
+    pos = pb
+    sg.cap_err = fld_flag(fb)
+    var (fc, pc) = fld(encs, pos)
+    pos = pc
+    sg.err_merge = fld_flag(fc)
+    var (fd, pd) = fld(encs, pos)
+    pos = pd
+    sg.out_append = fld_flag(fd)
+    var (fe, pe) = fld(encs, pos)
+    pos = pe
+    sg.has_feed = fld_flag(fe)
+    var (ff, pf) = fld(encs, pos)
+    pos = pf
+    sg.cwd = ff
+    var (fg, pg) = fld(encs, pos)
+    pos = pg
+    sg.in_file = fg
+    var (fh, ph) = fld(encs, pos)
+    pos = ph
+    sg.out_file = fh
+    var (fi2, pi2) = fld(encs, pos)
+    pos = pi2
+    sg.err_file = fi2
+    var (fj, pj) = fld(encs, pos)
+    pos = pj
+    sg.feed = fj
+    return sg
+}
+
+// Res ↔ 编码串（同 p.9.12.6 边界：多结果表以编码串跨界）。
+// 字段顺序：rc | started | skipped | out | err。
+pub func res_enc(r: Res) -> string {
+    var sb = string_builder()
+    sb_append(sb, enc_field(to_string(r.rc)))
+    sb_append(sb, enc_field(enc_flag(r.started)))
+    sb_append(sb, enc_field(enc_flag(r.skipped)))
+    sb_append(sb, enc_field(r.out))
+    sb_append(sb, enc_field(r.err))
+    return sb_build(sb)
+}
+
+pub func res_decode(encs: string) -> Res {
+    var r = Res()
+    var pos: i64 = 0
+    var (fr, pr) = fld(encs, pos)
+    pos = pr
+    r.rc = parse_int(fr)
+    var (fs, ps) = fld(encs, pos)
+    pos = ps
+    r.started = fld_flag(fs)
+    var (fk, pk) = fld(encs, pos)
+    pos = pk
+    r.skipped = fld_flag(fk)
+    var (fo, po) = fld(encs, pos)
+    pos = po
+    r.out = fo
+    var (fe2, pe2) = fld(encs, pos)
+    pos = pe2
+    r.err = fe2
+    return r
+}
+
+// 多段进程管道：seg[0].stdout → seg[1].stdin → …（并发起、按段序等待）。
+// 接线约定：seg[0] 的 in_file / feed 与 seg[n-1] 的 out_file / cap_out / cap_err
+// 生效；中间段仅取 words / cwd 与 stderr 配置（其 cap_* 忽略）。segs = 编码串表。
+// 返回逐段结果的编码串表（res_decode 还原；捕获文本仅在末段）。
+pub func run_pipeline(segs: table<string>) -> table<string> {
+    var n = len(segs)
+    var out: table<string> = []
+    if n == 0 {
+        return out
+    }
+    if n == 1 {
+        table_push(out, res_enc(run_one(seg_decode(segs[0]))))
+        return out
+    }
+    unsafe {
+        // 全部管道先建（两端都暂不置继承位；spawn 前才置、spawn 后即清）
+        var prs: table<i64> = []
+        var pws: table<i64> = []
+        var k: i64 = 0
+        while k < n - 1 {
+            var (kp_r, kp_w) = x_pipe()
+            table_push(prs, kp_r)
+            table_push(pws, kp_w)
+            k = k + 1
+        }
+        var oks: table<i64> = []
+        var procs: table<i64> = []
+        var feed_ws: table<i64> = []
+        var feed_rs: table<i64> = []
+        var capo_rs: table<i64> = []
+        var capo_ws: table<i64> = []
+        var cape_rs: table<i64> = []
+        var cape_ws: table<i64> = []
+        var fin_is: table<i64> = []
+        var fin_os: table<i64> = []
+        var fin_es: table<i64> = []
+        var i: i64 = 0
+        while i < n {
+            var sg = seg_decode(segs[i])
+            var hin: i64 = -1
+            var hout: i64 = -1
+            var herr: i64 = -1
+            var fw: i64 = 0
+            var fr: i64 = 0
+            var cr: i64 = 0
+            var cw: i64 = 0
+            var er: i64 = 0
+            var ew: i64 = 0
+            var fi: i64 = 0
+            var fo: i64 = 0
+            var fe: i64 = 0
+            if i > 0 {
+                hin = prs[i - 1]
+                x_inh(hin)
+            } else {
+                if str_len(sg.in_file) > 0 {
+                    fi = x_open_read(sg.in_file)
+                    hin = fi
+                } else if sg.has_feed {
+                    var (pfr2, pfw2) = x_pipe()
+                    fr = pfr2
+                    fw = pfw2
+                    hin = fr
+                }
+            }
+            if i < n - 1 {
+                hout = pws[i]
+                x_inh(hout)
+            } else {
+                if str_len(sg.out_file) > 0 {
+                    fo = x_open_write(sg.out_file, sg.out_append)
+                    hout = fo
+                } else if sg.cap_out {
+                    var (pcr2, pcw2) = x_pipe()
+                    cr = pcr2
+                    cw = pcw2
+                    hout = cw
+                }
+            }
+            if str_len(sg.err_file) > 0 {
+                fe = x_open_write(sg.err_file, false)
+                herr = fe
+            } else if sg.err_merge {
+                if hout != -1 {
+                    herr = hout
+                } else {
+                    herr = -3
+                }
+            } else if sg.cap_err && i == n - 1 {
+                var (per2, pew2) = x_pipe()
+                er = per2
+                ew = pew2
+                herr = ew
+            }
+            var use_h = (hin != -1) || (hout != -1) || (herr != -1)
+            var (sp2_ok, sp2_hp) = x_spawn(sg.words, sg.cwd, hin, hout, herr, use_h)
+            if sp2_ok {
+                table_push(oks, 1)
+            } else {
+                table_push(oks, 0)
+            }
+            table_push(procs, sp2_hp)
+            table_push(feed_ws, fw)
+            table_push(feed_rs, fr)
+            table_push(capo_rs, cr)
+            table_push(capo_ws, cw)
+            table_push(cape_rs, er)
+            table_push(cape_ws, ew)
+            table_push(fin_is, fi)
+            table_push(fin_os, fo)
+            table_push(fin_es, fe)
+            // spawn 后清除本段置过的继承位（防泄漏进后续 spawn）
+            if i > 0 {
+                x_uninh(hin)
+            }
+            if i < n - 1 {
+                x_uninh(hout)
+            }
+            i = i + 1
+        }
+        // 关父侧全部管道端点（子侧副本已随 spawn 继承）+ 文件句柄
+        k = 0
+        while k < n - 1 {
+            x_close(prs[k])
+            x_close(pws[k])
+            k = k + 1
+        }
+        i = 0
+        while i < n {
+            x_close(feed_rs[i])
+            x_close(capo_ws[i])
+            x_close(cape_ws[i])
+            x_close(fin_is[i])
+            x_close(fin_os[i])
+            x_close(fin_es[i])
+            i = i + 1
+        }
+        // 投喂（仅首段可能）
+        i = 0
+        while i < n {
+            var fwi = feed_ws[i]
+            if fwi > 0 {
+                var fsg = seg_decode(segs[i])
+                x_write_all(fwi, fsg.feed)
+                x_close(fwi)
+            }
+            i = i + 1
+        }
+        // 捕获（仅末段）
+        var lout = ""
+        var lerr = ""
+        var li = n - 1
+        if capo_rs[li] > 0 {
+            lout = x_read_all(capo_rs[li])
+            x_close(capo_rs[li])
+        }
+        if cape_rs[li] > 0 {
+            lerr = x_read_all(cape_rs[li])
+            x_close(cape_rs[li])
+        }
+        // 等待（按段序）；结果按段序组装
+        i = 0
+        while i < n {
+            var r = Res()
+            if oks[i] != 0 {
+                r.started = true
+                r.rc = x_wait(procs[i])
+            } else {
+                r.started = false
+                r.rc = -1
+            }
+            if i == li {
+                r.out = lout
+                r.err = lerr
+            }
+            table_push(out, res_enc(r))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// 两段管道便捷：a.stdout → b.stdin；b 输出捕获。返回 (a 结果, b 结果)。
+pub func pipe2(a: table<string>, b: table<string>, cwd: string) -> (Res, Res) {
+    var sa = Seg()
+    sa.words = a
+    sa.cwd = cwd
+    var sb = Seg()
+    sb.words = b
+    sb.cwd = cwd
+    sb.cap_out = true
+    var segs: table<string> = [enc(sa), enc(sb)]
+    var rs = run_pipeline(segs)
+    if len(rs) < 2 {
+        return (Res(), Res())
+    }
+    var ra = res_decode(rs[0])
+    var rb = res_decode(rs[1])
+    return (ra, rb)
+}
+
+// 复合链：segs（编码串表）之间以 joins 连接执行（rc 驱动，POSIX 同构语义）。
+//   joins[0] 忽略；joins[i]（i≥1）= seg[i-1] → seg[i] 的连接：
+//     1 = && (前段成功才跑)  2 = || (前段失败才跑)  3 = ; (恒跑)  4 = 进程管道
+// 相邻 join==4 的段自动组成一个管道单元（单元 rc = 末段 rc）。
+// 被跳过的段：skipped=true、rc=-1；被跳过不更新「前段 rc」。
+// 返回逐段结果的编码串表（res_decode 还原）。
+pub func chain(segs: table<string>, joins: table<i64>) -> table<string> {
+    var n = len(segs)
+    var out: table<string> = []
+    if n == 0 {
+        return out
+    }
+    var prev_rc: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        // 单元 = i..j（join==4 相连）
+        var j = i
+        while j + 1 < n {
+            if join_at(joins, j + 1) == 4 {
+                j = j + 1
+            } else {
+                break
+            }
+        }
+        // 是否执行本单元
+        var runit = true
+        if i > 0 {
+            var op = join_at(joins, i)
+            if op == 1 && prev_rc != 0 {
+                runit = false
+            }
+            if op == 2 && prev_rc == 0 {
+                runit = false
+            }
+        }
+        if runit {
+            if j > i {
+                var pk: table<string> = []
+                var k = i
+                while k <= j {
+                    table_push(pk, segs[k])
+                    k = k + 1
+                }
+                var rk = run_pipeline(pk)
+                k = 0
+                while k < len(rk) {
+                    table_push(out, rk[k])
+                    k = k + 1
+                }
+                var lr1 = res_decode(out[len(out) - 1])
+                prev_rc = lr1.rc
+            } else {
+                table_push(out, res_enc(run_one(seg_decode(segs[i]))))
+                var lr2 = res_decode(out[len(out) - 1])
+                prev_rc = lr2.rc
+            }
+        } else {
+            var m = i
+            while m <= j {
+                var r = Res()
+                r.skipped = true
+                table_push(out, res_enc(r))
+                m = m + 1
+            }
+        }
+        i = j + 1
+    }
+    return out
+}
+
+// joins 越界取 0（视为无连接）。
+func join_at(joins: table<i64>, i: i64) -> i64 {
+    if i < 0 || i >= len(joins) {
+        return 0
+    }
+    return joins[i]
+}
+
+}   // namespace execrun

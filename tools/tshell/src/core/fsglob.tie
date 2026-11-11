@@ -1,0 +1,307 @@
+type tie<class>
+// fsglob.tie —— 文件通配（显式函数 glob；设计稿 §5.1②）
+// ============================================================
+// 定位：运行时提供**显式函数** `glob("*.txt")` 供 tie 程序调用；壳层词法前置层
+// 对未引号词做展开（引号内阻断），不接隐式 glob 语义。
+// 语法：`*` 段内任意串（不跨 '/'）、`?` 单字符、`**` 跨段递归（零或多级目录）。
+// 约定：'/' 为分隔；以 '.' 开头的项不被 `*`/`?` 匹配（模式段以 '.' 开头除外，
+// bash 惯例）；Windows 下匹配大小写不敏感（对齐文件系统语义）；结果排序。
+// 匹配基于 list_dir / file_is_dir（内置）；相对模式按进程 cwd 解析。
+namespace fsglob {
+
+// 字符分类辅助（小写化：Windows 大小写不敏感）。
+func fold(c: i64, ci: bool) -> i64 {
+    if ci && c >= 65 && c <= 90 {
+        return c + 32
+    }
+    return c
+}
+
+func is_ci() -> bool {
+    return get_env("OS") == "Windows_NT"
+}
+
+// 段匹配：pat 对 name（`*`/`?`，带回溯；点文件规则）。
+pub func seg_match(pat: string, name: string) -> bool {
+    var ci = is_ci()
+    var pn = len(pat)
+    var nn = len(name)
+    // 点文件规则：模式不以 '.' 开头则不匹配以 '.' 开头的名字
+    if nn > 0 && str_byte(name, 0) == 46 {
+        if pn == 0 || str_byte(pat, 0) != 46 {
+            return false
+        }
+    }
+    var pi: i64 = 0
+    var ni: i64 = 0
+    var star: i64 = -1
+    var mark: i64 = 0
+    while ni < nn {
+        if pi < pn {
+            var pc = str_byte(pat, pi)
+            if pc == 42 {  // '*'
+                star = pi
+                mark = ni
+                pi = pi + 1
+                continue
+            }
+            if pc == 63 || fold(pc, ci) == fold(str_byte(name, ni), ci) {  // '?' 或字面
+                pi = pi + 1
+                ni = ni + 1
+                continue
+            }
+        }
+        if star >= 0 {
+            pi = star + 1
+            mark = mark + 1
+            ni = mark
+            continue
+        }
+        return false
+    }
+    while pi < pn && str_byte(pat, pi) == 42 {
+        pi = pi + 1
+    }
+    return pi == pn
+}
+
+// 是否含通配符。
+func has_magic(seg: string) -> bool {
+    var i: i64 = 0
+    var n = len(seg)
+    while i < n {
+        var c = str_byte(seg, i)
+        if c == 42 || c == 63 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 排序（简单选择排序；结果规模小）。
+func sort_asc(ref t: table<string>) {
+    var n = len(t)
+    var i: i64 = 0
+    while i < n {
+        var k = i
+        var j = i + 1
+        while j < n {
+            if str_lt(t[j], t[k]) {
+                k = j
+            }
+            j = j + 1
+        }
+        if k != i {
+            var tmp = t[i]
+            t[i] = t[k]
+            t[k] = tmp
+        }
+        i = i + 1
+    }
+}
+
+// 字节序比较（<）。
+func str_lt(a: string, b: string) -> bool {
+    var na = len(a)
+    var nb = len(b)
+    var m = na
+    if nb < m {
+        m = nb
+    }
+    var i: i64 = 0
+    while i < m {
+        var ca = str_byte(a, i)
+        var cb = str_byte(b, i)
+        if ca != cb {
+            return ca < cb
+        }
+        i = i + 1
+    }
+    return na < nb
+}
+
+// 模式 → 段（'/' 切分；'' 段丢弃）。
+func split_segs(pattern: string) -> table<string> {
+    var out: table<string> = []
+    var sb = string_builder()
+    var n = len(pattern)
+    var i: i64 = 0
+    while i <= n {
+        if i == n || str_byte(pattern, i) == 47 {
+            var s = sb_build(sb)
+            if len(s) > 0 {
+                table_push(out, s)
+            }
+            sb = string_builder()
+        } else {
+            sb_append_byte(sb, str_byte(pattern, i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 递归遍历：dir 下按 segs[k..] 匹配（dir="" 表示当前目录；结果前缀 acc）。
+func walk(dir: string, acc: string, segs: table<string>, k: i64, ref out: table<string>) {
+    var n = len(segs)
+    if k >= n {
+        return
+    }
+    var seg = segs[k]
+    var last = k == n - 1
+    if seg == "**" {
+        // `**` = 零或多级目录：零级继续匹配 rest；一级 = 逐个下探子目录再试 **。
+        // 不进入点目录（.git 等）、不产出点项（对齐 `*` 的点文件规则）。
+        if last {
+            // 末段 `**`：递归列出全部（文件+目录，跳过点项）
+            var e0 = list_entries(dir)
+            var z: i64 = 0
+            while z < len(e0) {
+                var nz = e0[z]
+                if str_byte(nz, 0) != 46 {
+                    var fz = join2(dir, nz)
+                    var az = join2(acc, nz)
+                    table_push(out, az)
+                    if file_is_dir(fz) {
+                        walk(fz, az, segs, k, out)
+                    }
+                }
+                z = z + 1
+            }
+            return
+        }
+        walk(dir, acc, segs, k + 1, out)  // 零级
+        var entries = list_entries(dir)
+        var i: i64 = 0
+        while i < len(entries) {
+            var nm = entries[i]
+            if str_byte(nm, 0) != 46 {
+                var full = join2(dir, nm)
+                if file_is_dir(full) {
+                    walk(full, join2(acc, nm), segs, k, out)  // 下探一级，** 仍待匹配
+                }
+            }
+            i = i + 1
+        }
+        return
+    }
+    var entries2 = list_entries(dir)
+    var j: i64 = 0
+    while j < len(entries2) {
+        var nm2 = entries2[j]
+        if seg_match(seg, nm2) {
+            var full2 = join2(dir, nm2)
+            var afull2 = join2(acc, nm2)
+            if last {
+                table_push(out, afull2)
+            } else if file_is_dir(full2) {
+                walk(full2, afull2, segs, k + 1, out)
+            }
+        }
+        j = j + 1
+    }
+}
+
+func join2(dir: string, name: string) -> string {
+    if len(dir) == 0 {
+        return name
+    }
+    return dir + "/" + name
+}
+
+// list_dir 的安全包装（目录不存在 → 空表）。
+func list_entries(dir: string) -> table<string> {
+    var d = dir
+    if len(d) == 0 {
+        d = "."
+    }
+    if !file_is_dir(d) {
+        var e: table<string> = []
+        return e
+    }
+    var raw = list_dir(d)
+    var out: table<string> = []
+    for e in raw {
+        if e != "." && e != ".." {
+            table_push(out, e)
+        }
+    }
+    return out
+}
+
+// ==================== 公共入口 ====================
+
+// glob(pattern)：返回排序后的匹配路径表（'/' 分隔；无匹配 = 空表）。
+// 含通配符的末段匹配文件与目录（`*` 可命中子目录名）；`**` 递归。
+pub func glob(pattern: string) -> table<string> {
+    var out = table_new_string()
+    if len(pattern) == 0 {
+        return out
+    }
+    var segs = split_segs(pattern)
+    if len(segs) == 0 {
+        return out
+    }
+    // 前导根：绝对（含 ':' 盘符 或 以 '/' 开头）时把根段并入 dir，其余为模式段
+    var dir = ""
+    var k0: i64 = 0
+    var first = segs[0]
+    var abs = false
+    if str_byte(pattern, 0) == 47 {
+        abs = true
+        dir = "/"
+        k0 = 1
+    } else if len(pattern) >= 2 && str_byte(pattern, 1) == 58 {  // 'X:'
+        abs = true
+        dir = sh_sub(pattern, 0, 2)
+        k0 = 1
+    }
+    // 绝对模式下把非通配前缀段并入 dir
+    if abs {
+        while k0 < len(segs) {
+            if has_magic(segs[k0]) || segs[k0] == "**" {
+                break
+            }
+            dir = join2(dir, segs[k0])
+            k0 = k0 + 1
+        }
+    }
+    // 尾段纯字面量：直接存在性检查
+    var rest: table<string> = []
+    var m = k0
+    while m < len(segs) {
+        table_push(rest, segs[m])
+        m = m + 1
+    }
+    if len(rest) == 0 {
+        // 无通配段（全字面）：存在即返回
+        if file_exists(dir) || file_is_dir(dir) {
+            table_push(out, dir)
+        }
+        return out
+    }
+    // 末段无魔法且根已固定：字面拼接存在性
+    var lastseg = rest[len(rest) - 1]
+    if !has_magic(lastseg) && lastseg != "**" {
+        // 仍走统一走查（保证大小写/点规则一致），但可短路：
+        walk(dir, dir, rest, 0, out)
+    } else {
+        walk(dir, dir, rest, 0, out)
+    }
+    sort_asc(out)
+    return out
+}
+
+// 子串（码点安全简化：仅用于 ASCII 根段 "X:"——直接用字节切片）。
+func sh_sub(s: string, a: i64, b: i64) -> string {
+    var sb = string_builder()
+    var i = a
+    while i < b {
+        sb_append_byte(sb, str_byte(s, i))
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+}   // namespace fsglob

@@ -38,6 +38,7 @@ tie 是一门静态类型的系统编程语言。本仓是它的核心实现：�
 | `tools/diag`                | 崩溃诊断、剖析器、DAP 调试适配器                |
 | `tools/release`             | 发行说明生成器                           |
 | `tools/ci`                  | 依赖方向门禁                            |
+| `tools/tshell`              | 命令行壳：REPL、脚本运行时、系统命令与值管道     |
 | `examples/`                 | 示例程序                              |
 
 ## 环境要求
@@ -150,6 +151,7 @@ build/tiec.exe tools/tiel/src/shell.tie -o build/tiel.exe
 build/tiec.exe tools/diag/crashdiag.tie -o build/crashdiag.exe
 build/tiec.exe tools/release/notes.tie -o build/notes.exe
 build/tiec.exe tools/ci/dep_check.tie -o build/dep_check.exe
+build/tiec.exe tools/tshell/src/tsh_main.tie -o build/tsh.exe
 ```
 
 脚本（tsc 角色）由解释器直接执行，无需编译：
