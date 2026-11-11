@@ -1,0 +1,70 @@
+type tie<logic>
+import "./repl.tie"
+import "./command.tie"
+import "./render.tie"
+import "./backend_interp.tie"
+import "./session.tie"
+import "./lineedit.tie"
+import "./complete.tie"
+import "./run.tie"
+import "./zd.tie"
+import "./srv.tie"
+// src/tsh_main.tie —— tshell 装配器最小实现（L4 宿主入口），默认全量装配
+// --------------------------------------------------------------
+// 独立 tshell（standalone = 默认全量装配）入口。装配 repl/command/pipeline/render
+// （p.9.3.1）+ lineedit/complete/session（p.9.3.2）+ run 脚本运行时（p.9.3.3）。
+// CLI 分派：无参 → 交互 REPL；-e expr → 单行；-f / 裸路径 → 脚本；--stdio → srv。
+//
+// EN: standalone shell entry (L4 host). Assembles p.9.3.1-3 modules. CLI dispatch:
+// no-arg REPL, -e expr, -f/path script, --stdio protocol service.
+
+func main() -> i64 {
+    session.ss_load()
+    shlang.sl_init()
+    session.ss_env_load()
+    var mode = run.rn_args()
+    var m0 = mode[0]
+    if m0 == "e" {
+        var out = run.rn_eval_expr(mode[1])
+        render.r_emit(out)
+        return 0
+    }
+    if m0 == "f" {
+        return run.rn_run_script(mode[1])
+    }
+    if m0 == "script" {
+        return run.rn_run_script(mode[1])
+    }
+    if m0 == "stdio" {
+        return srv.srv_stdio()
+    }
+    // interactive REPL（TTY ⇒ 行编辑器；非 TTY ⇒ 逐行直读降级）
+    println("tshell 0.1")
+    var rc_out = run.rn_run_rc()
+    if rc_out != "" {
+        render.r_emit(rc_out)
+    }
+    while !command.ex_req() {
+        var pr = shlang.prompt_prefix() + command.prompt_dir() + "> "
+        if shlang.rc_last() != 0 {
+            pr = "! " + pr
+        }
+        var line = ""
+        if lineedit.le_active() {
+            line = lineedit.le_read(pr)
+        } else {
+            print(pr)
+            line = read_line()
+        }
+        var out = repl.repl_handle(line)
+        session.ss_add(line)
+        if out != "" {
+            render.r_emit(out)
+        } else if !command.ex_req() {
+            render.r_emit_line("")
+        }
+    }
+    lineedit.le_shutdown()
+    session.ss_save()
+    return 0
+}

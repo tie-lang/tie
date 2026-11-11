@@ -1,0 +1,138 @@
+type tie<logic>
+import "./zd.tie"
+import "./sh_util.tie"
+import "./repl.tie"
+import "./render.tie"
+// src/srv.tie —— 双形态协议服务模块（L3，p.9.3.4）
+// --------------------------------------------------------------
+// 双形态：① 同进程 zd 内存总线（tedit 嵌入形态默认）——本批落协议最小实现
+// （zd 帧编解码 + 本服务封装），对接方式见 docs/srv.md；② 子进程 `--stdio`：
+// stdin 读帧 → 求值 → stdout 写帧（tink 帧协议：长度前缀 + CRC32），作为子进程/
+// 远程/WASM 逃生口。stdin/stdout 字节原语（stdin_read/stdout_write_bytes）由汇编
+// 路径提供。
+//
+// EN: dual-form protocol service (L3). (1) same-process zd in-memory bus for tedit
+// embedding (minimal codec here). (2) --stdio tink-frame service over stdin/stdout:
+// read frame → eval → write frame.
+
+namespace srv {
+
+// 从 stdin 精确读 n 字节，返回字节表；EOF（读不足即失败时不补零）返回空表。
+func stdin_exact(n: i64) -> table<i64> {
+    var acc = table_new_i64()
+    var got: i64 = 0
+    while got < n {
+        var chunk = stdin_read(n - got)
+        var c = chunk_len(chunk)
+        if c == 0 {
+            // EOF 或空读：无法凑足
+            return table_new_i64()
+        }
+        for b in chunk {
+            table_push(acc, b)
+            got = got + 1
+        }
+    }
+    return acc
+}
+
+func chunk_len(t: table<i64>) -> i64 {
+    var n: i64 = 0
+    for _b in t { n = n + 1 }
+    return n
+}
+
+// 读一帧：返回 payload 字节表；EOF 返回空表。
+func read_frame() -> table<i64> {
+    var head = stdin_exact(4)
+    if chunk_len(head) < 4 {
+        return table_new_i64()   // EOF
+    }
+    var n: i64 = 0
+    n = (n << 8) | (at06(head, 0) & 0xFF)
+    n = (n << 8) | (at06(head, 1) & 0xFF)
+    n = (n << 8) | (at06(head, 2) & 0xFF)
+    n = (n << 8) | (at06(head, 3) & 0xFF)
+    var payload = stdin_exact(n)
+    if n > 0 && chunk_len(payload) < n {
+        return table_new_i64()   // 帧体不完整
+    }
+    var crc = stdin_exact(4)
+    if chunk_len(crc) < 4 {
+        return table_new_i64()   // 帧尾不完整
+    }
+    var frame = table_new_i64()
+    for b in head { table_push(frame, b) }
+    for b in payload { table_push(frame, b) }
+    for b in crc { table_push(frame, b) }
+    if zd.z_decode(frame, 0) >= 0 && zd.z_ok() {
+        return zd.z_payload()
+    }
+    return table_new_i64()
+}
+
+func at06(t: table<i64>, idx: i64) -> i64 {
+    var i: i64 = 0
+    for b in t {
+        if i == idx { return b }
+        i = i + 1
+    }
+    return 0
+}
+
+// 字节表 → 文本（UTF-8 假定；出错回退取低字节拼串）。
+func bytes_to_str(bytes: table<i64>) -> string {
+    var out = ""
+    for b in bytes {
+        var low = b & 0xFF
+        if low == 0 {
+            break
+        }
+        out = out + code_to_str(low)
+    }
+    return out
+}
+
+func code_to_str(cp: i64) -> string {
+    // 常见 ASCII 直接映射；非 ASCII 以 0x? 占位（本批 stdio 通道按文本 expr 用）。
+    if cp < 128 {
+        return chr(cp)
+    }
+    return "?"
+}
+
+func chr(cp: i64) -> string {
+    var ch_str = str_from_code(cp)
+    return ch_str
+}
+
+// 文本 → 字节表（每个码位字节；ASCII 场景精确）。
+func str_to_bytes(s: string) -> table<i64> {
+    var out = table_new_i64()
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var bv = char_code(str_char(s, i))
+        table_push(out, bv)
+        i = i + 1
+    }
+    return out
+}
+
+// `--stdio` 服务主循环：读帧 → 求值 → 写帧。
+pub func srv_stdio() -> i64 {
+    while true {
+        var payload = read_frame()
+        if chunk_len(payload) == 0 {
+            break   // EOF
+        }
+        var expr = bytes_to_str(payload)
+        var result = repl.repl_handle(expr)
+        var outbytes = str_to_bytes(result)
+        var frame = zd.z_encode(outbytes)
+        var _w = stdout_write_bytes(frame)
+    }
+    return 0
+}
+
+}   // namespace srv

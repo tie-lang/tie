@@ -1,0 +1,32 @@
+type tie<logic>
+import "./sh_util.tie"
+import "./render.tie"
+import "./command.tie"
+import "./shlang.tie"
+import "./backend_interp.tie"
+// src/repl.tie —— REPL 模块（L0）：求值循环 · 分派（步骤 3：交词法前置层）
+// --------------------------------------------------------------
+// 一行输入交 shlang（词法前置层 + 双语境 + 执行域）：切分/箭头体系/复合链/
+// 直通与捕获在 shlang 内完成；结果为**结构化状态**（LineRes：text + rc），
+// 不再按错误文案嗅探。退出经 command.req_exit 标志（:quit / exit）。
+//
+// EN: REPL loop — delegates each line to shlang (lexer front layer + dual
+// context + execution domain); structured LineRes result, no error-text sniffing.
+
+namespace repl {
+
+// 处理一行输入，返回要打印的文本（"" 则 REPL 补空行）。exit 时置 command 标志。
+pub func repl_handle(line: string) -> string {
+    var t = sh_util.u_trim(line)
+    if t == "" {
+        return ""
+    }
+    if t == ":quit" || t == ":q" || t == "exit" {
+        command.req_exit()
+        return ""
+    }
+    var r = shlang.sl_run(t)
+    return r.out
+}
+
+}   // namespace repl

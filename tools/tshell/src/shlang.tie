@@ -1,0 +1,1452 @@
+type tie<logic>
+// src/shlang.tie —— 词法前置层 + 分派 + 执行器（设计稿 §5.1/§5.2；步骤 3）
+// ============================================================
+// 职责：
+//   1. 切分（词法前置层）：字节级引号感知；`->` / `->>` / `<-` / `2->` 与
+//      `&&` / `||` / `;` 结构识别；`{ … }` 代码位（配对计数）与 `h"…"` 插值词；
+//      `|` 在命令语境给出可操作提示（命令语境不表示管道）；
+//   2. 双语境判定（§3.3）：行首词（内建 / 含路径分隔 / PATH 命中可执行）⇒ 命令
+//      语境；否则语言语境（整行求值）；`{ … }` 包裹强制表达式语境；`exec` 强制
+//      命令语境（`exec {expr} …` = 动态命令：先求值再重跑）；
+//   3. 执行（§3.2/§3.5）：内建 → 外部（tiej execrun 引擎）；`->` 数据流
+//      （进程管道 / 重定向 / 输入），`&&` / `||` / `;` rc 驱动；直通与捕获按
+//      「是否处于需要结果的位置」分模——连续外部段走引擎真管道（并发 + 流式），
+//      段组末尾处于行尾且无重定向时直通（子进程继承终端）；
+//   4. rc 跟踪：每段 rc 注入会话变量 `rc`（`{rc}` 代码位可读）；失败不静默；
+//   5. 结构化求值状态：经 tiep 的 `w_err` 判定成败（废除错误文案嗅探）。
+//
+// 语言面（脚本内 `var x <- cmd`、`n -> env.NAME`、env 完整语义）为设计稿遗留
+// 开口 #1，待裁定后另行接入；本层只做壳面（命令语境）。
+import "./sh_util.tie"
+import "./command.tie"
+import "./backend_interp.tie"
+import "../../tiej/src/core/execrun.tie"
+import "../../tiej/src/core/fsglob.tie"
+import "../../tiec/compiler/tiep/vval.tie"
+
+// 行结果（结构化）。
+struct LineRes {
+    var out: string = ""
+    var rc: i64 = 0
+}
+
+var g_rc_seen: bool = false   // 会话 rc 变量是否已声明（tiep 重声明 no-op 规避）
+var g_rc_last: i64 = 0        // 会话最近 rc（跨行；同步去重用）
+var g_alias_names: table<string> = []   // 别名（name/value 平行表；config.td 装载）
+var g_alias_values: table<string> = []
+var g_prompt_prefix: string = "tie:"    // 提示符前缀（config: prompt.prefix）
+var g_strict: bool = false              // 严格模式（config: strict=true；命令失败即中止）
+var g_alias_depth: i64 = 0              // 别名展开递归深度护栏
+var g_cap_mode: bool = false            // 捕获模式（`var x <- …`：末段强制捕获不直通）
+
+namespace shlang {
+
+// ==================== 求值（结构化状态） ====================
+
+// 求值一段 tie 源码：返回 (结果文本, 错误文本)。成功时错误为空。
+// 结构化判据 = tiep 的 w_err（eval 以 w_err 非空表示失败），不再嗅探文案。
+pub func eval_expr(src: string) -> (string, string) {
+    var out = backend_interp.b_eval(src)
+    if vval.w_err != "" {
+        return ("", vval.w_err)
+    }
+    return (out, "")
+}
+
+// rc 注入会话变量（表达式位 {rc} 可读；顶层 var 跨行持久）。
+// ⚠ tiep 会话中 `var` 重声明为静默 no-op ⇒ 首次 var、其后赋值。
+func sess_set_rc(v: i64) {
+    if g_rc_seen {
+        var _a = backend_interp.b_eval("rc = " + to_string(v))
+    } else {
+        var _i = backend_interp.b_eval("var rc = " + to_string(v))
+        g_rc_seen = true
+    }
+}
+
+// 前缀判等（字节级）。
+func has_pref(s: string, pre: string) -> bool {
+    if len(pre) > len(s) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(pre) {
+        if str_byte(s, i) != str_byte(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ==================== 词法前置层 ====================
+
+// 算子种类（字节级）：1=-> 2=->> 3=<- 4=2-> 5=&& 6=|| 7=; 8=|；0=非算子。
+func op_at(t: string, i: i64) -> i64 {
+    var n = len(t)
+    var c = str_byte(t, i)
+    if c == 45 {  // '-'
+        if i + 1 < n && str_byte(t, i + 1) == 62 {  // '>'
+            if i + 2 < n && str_byte(t, i + 2) == 62 {  // '>>'
+                return 2
+            }
+            return 1
+        }
+    }
+    if c == 50 {  // '2'
+        if i + 2 < n && str_byte(t, i + 1) == 45 && str_byte(t, i + 2) == 62 {
+            return 4
+        }
+    }
+    if c == 60 {  // '<'
+        if i + 1 < n && str_byte(t, i + 1) == 45 {
+            return 3
+        }
+    }
+    if c == 38 {  // '&'
+        if i + 1 < n && str_byte(t, i + 1) == 38 {
+            return 5
+        }
+    }
+    if c == 124 {  // '|'
+        if i + 1 < n && str_byte(t, i + 1) == 124 {
+            return 6
+        }
+        return 8
+    }
+    if c == 59 {  // ';'
+        return 7
+    }
+    return 0
+}
+
+func op_len(k: i64) -> i64 {
+    if k == 1 || k == 3 || k == 5 || k == 6 {
+        return 2
+    }
+    if k == 2 || k == 4 {
+        return 3
+    }
+    return 1
+}
+
+func op_text(k: i64) -> string {
+    if k == 1 {
+        return "->"
+    }
+    if k == 2 {
+        return "->>"
+    }
+    if k == 3 {
+        return "<-"
+    }
+    if k == 4 {
+        return "2->"
+    }
+    if k == 5 {
+        return "&&"
+    }
+    if k == 6 {
+        return "||"
+    }
+    if k == 7 {
+        return ";"
+    }
+    return "|"
+}
+
+// `{ … }` 配对扫描（i 指向 '{'）：返回 (花括号内文, 新游标)。引号内不计数。
+func scan_braces(t: string, i: i64) -> (string, i64) {
+    var n = len(t)
+    var sb = string_builder()
+    var depth: i64 = 0
+    while i < n {
+        var c = str_byte(t, i)
+        if c == 34 {  // '"'：原样吞字符串（转义保留）
+            sb_append_byte(sb, c)
+            i = i + 1
+            while i < n {
+                var c2 = str_byte(t, i)
+                sb_append_byte(sb, c2)
+                i = i + 1
+                if c2 == 92 && i < n {
+                    sb_append_byte(sb, str_byte(t, i))
+                    i = i + 1
+                    continue
+                }
+                if c2 == 34 {
+                    break
+                }
+            }
+            continue
+        }
+        if c == 123 {  // '{'
+            depth = depth + 1
+            if depth > 1 {
+                sb_append_byte(sb, c)
+            }
+            i = i + 1
+            continue
+        }
+        if c == 125 {  // '}'
+            depth = depth - 1
+            if depth == 0 {
+                return (sb_build(sb), i + 1)
+            }
+            sb_append_byte(sb, c)
+            i = i + 1
+            continue
+        }
+        sb_append_byte(sb, c)
+        i = i + 1
+    }
+    return (sb_build(sb), i)  // 未闭合：宽容（求值时报错）
+}
+
+// `h"…"` 插值词扫描（i 指向 'h'）：返回 (h"…" 原文含引号, 新游标)。
+func scan_hstr(t: string, i: i64) -> (string, i64) {
+    var n = len(t)
+    var sb = string_builder()
+    sb_append_byte(sb, 104)  // 'h'
+    sb_append_byte(sb, 34)   // '"'
+    i = i + 2
+    while i < n {
+        var c = str_byte(t, i)
+        sb_append_byte(sb, c)
+        i = i + 1
+        if c == 92 && i < n {
+            sb_append_byte(sb, str_byte(t, i))
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            break
+        }
+    }
+    return (sb_build(sb), i)
+}
+
+// 词法主函数：行 → (词文本表, 种类表, 元信息表)。
+// 词 meta 位：1=代码位 2=h 插值词 4=引号包裹。
+pub func lex_line(t: string) -> (table<string>, table<i64>, table<i64>) {
+    var tx: table<string> = []
+    var tk: table<i64> = []
+    var tm: table<i64> = []
+    var n = len(t)
+    var i: i64 = 0
+    while i < n {
+        var c = str_byte(t, i)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            i = i + 1
+            continue
+        }
+        var ok = op_at(t, i)
+        if ok > 0 {
+            table_push(tx, op_text(ok))
+            table_push(tk, ok)
+            table_push(tm, 0)
+            i = i + op_len(ok)
+            continue
+        }
+        // h"…" 插值词
+        if c == 104 && i + 1 < n && str_byte(t, i + 1) == 34 {
+            var (tokh, nih) = scan_hstr(t, i)
+            table_push(tx, tokh)
+            table_push(tk, 0)
+            table_push(tm, 2)
+            i = nih
+            continue
+        }
+        // { … } 代码位
+        if c == 123 {
+            var (inner, nib) = scan_braces(t, i)
+            table_push(tx, inner)
+            table_push(tk, 0)
+            table_push(tm, 1)
+            i = nib
+            continue
+        }
+        // 普通词（引号感知；反斜杠转义）
+        var sb = string_builder()
+        var meta: i64 = 0
+        while i < n {
+            var c2 = str_byte(t, i)
+            if c2 == 34 {  // 双引号：\\ 与 \" 转义，其余字面
+                meta = meta | 4
+                i = i + 1
+                while i < n {
+                    var c3 = str_byte(t, i)
+                    if c3 == 92 && i + 1 < n {
+                        sb_append_byte(sb, str_byte(t, i + 1))
+                        i = i + 2
+                        continue
+                    }
+                    if c3 == 34 {
+                        i = i + 1
+                        break
+                    }
+                    sb_append_byte(sb, c3)
+                    i = i + 1
+                }
+                continue
+            }
+            if c2 == 39 {  // 单引号：全字面
+                meta = meta | 4
+                i = i + 1
+                while i < n {
+                    var c4 = str_byte(t, i)
+                    if c4 == 39 {
+                        i = i + 1
+                        break
+                    }
+                    sb_append_byte(sb, c4)
+                    i = i + 1
+                }
+                continue
+            }
+            if c2 == 92 {  // 顶格转义
+                if i + 1 < n {
+                    sb_append_byte(sb, str_byte(t, i + 1))
+                    i = i + 2
+                } else {
+                    i = i + 1
+                }
+                continue
+            }
+            if c2 == 32 || c2 == 9 || c2 == 10 || c2 == 13 {
+                break
+            }
+            if op_at(t, i) > 0 {
+                break
+            }
+            sb_append_byte(sb, c2)
+            i = i + 1
+        }
+        var wv = sb_build(sb)
+        if len(wv) > 0 {
+            table_push(tx, wv)
+            table_push(tk, 0)
+            table_push(tm, meta)
+        }
+    }
+    return (tx, tk, tm)
+}
+
+// 行完整性：引号闭合且花括号平衡（行编辑器续行判定）。
+pub func line_balanced(line: string) -> bool {
+    var n = len(line)
+    var i: i64 = 0
+    var q: i64 = 0
+    var depth: i64 = 0
+    while i < n {
+        var c = str_byte(line, i)
+        if q != 0 {
+            if q == 39 {
+                if c == 39 {
+                    q = 0
+                }
+            } else {
+                if c == 92 && i + 1 < n {
+                    i = i + 2
+                    continue
+                }
+                if c == 34 {
+                    q = 0
+                }
+            }
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            q = 34
+            i = i + 1
+            continue
+        }
+        if c == 39 {
+            q = 39
+            i = i + 1
+            continue
+        }
+        if c == 123 || c == 40 || c == 91 {  // { ( [
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if c == 125 || c == 41 || c == 93 {  // } ) ]
+            if depth > 0 {
+                depth = depth - 1
+            }
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    return q == 0 && depth == 0
+}
+
+// ==================== 双语境判定 ====================
+
+// 词是否使行落入命令语境（内建 / 谓词 / 路径分隔 / 存在 / PATH 命中 + 常见扩展）。
+pub func looks_like_command(w: string) -> bool {
+    if len(w) == 0 {
+        return false
+    }
+    if command.c_is_builtin(w) {
+        return true
+    }
+    if w == "filter" || w == "count" || w == "parse" {
+        return true
+    }
+    var has_sep = false
+    var z: i64 = 0
+    var zn = len(w)
+    while z < zn {
+        var c = str_byte(w, z)
+        if c == 47 || c == 92 {
+            has_sep = true
+        }
+        z = z + 1
+    }
+    if has_sep {
+        return file_exists(w)
+    }
+    if file_exists(w) || file_exists(w + ".exe") || file_exists(w + ".cmd") || file_exists(w + ".bat") {
+        return true
+    }
+    // PATH 扫描：Windows 用 ';'（盘符 ':' 不可当分隔！），POSIX 用 ':'。
+    var sep: i64 = 58
+    if get_env("OS") == "Windows_NT" {
+        sep = 59
+    }
+    var pp = get_env("PATH")
+    var n = len(pp)
+    var sb = string_builder()
+    var i: i64 = 0
+    while i <= n {
+        var brk = false
+        if i == n {
+            brk = true
+        } else {
+            var c2 = str_byte(pp, i)
+            if c2 == sep {
+                brk = true
+            }
+        }
+        if brk {
+            var seg = sb_build(sb)
+            if len(seg) > 0 {
+                if file_exists(seg + "/" + w) || file_exists(seg + "/" + w + ".exe") ||
+                   file_exists(seg + "/" + w + ".cmd") || file_exists(seg + "/" + w + ".bat") {
+                    return true
+                }
+            }
+            sb = string_builder()
+        } else {
+            sb_append_byte(sb, str_byte(pp, i))
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ==================== 段列表（平坦平行表） ====================
+
+// 段打包：当前段累计 → 词表编码串。
+// 词编码：count 字段 + 每词 enc_field(标志 + 文本)，标志 'c'=代码位 / 'n'=普通。
+func seg_pack(sw: table<string>, sc: table<i64>, in_f: string, out_f: string, app: bool,
+    err_f: string, merge: bool, op: i64) -> (string, string, string, i64, string, i64, i64) {
+    var sb = string_builder()
+    sb_append(sb, execrun.enc_field(to_string(len(sw))))
+    var i: i64 = 0
+    for w in sw {
+        var fl = "n"
+        if sc[i] == 1 {
+            fl = "c"
+        } else if sc[i] == 2 {
+            fl = "q"
+        }
+        sb_append(sb, execrun.enc_field(fl + w))
+        i = i + 1
+    }
+    var ap: i64 = 0
+    if app {
+        ap = 1
+    }
+    var mg: i64 = 0
+    if merge {
+        mg = 1
+    }
+    return (sb_build(sb), in_f, out_f, ap, err_f, mg, op)
+}
+
+// 词表解码 → (词表, 代码位表)。
+func seg_words_decode(encw: string) -> (table<string>, table<i64>) {
+    var ws: table<string> = []
+    var cs: table<i64> = []
+    var pos: i64 = 0
+    var (f0, p0) = execrun.fld(encw, pos)
+    pos = p0
+    var wc = parse_int(f0)
+    var k: i64 = 0
+    while k < wc {
+        var (fw, pk) = execrun.fld(encw, pos)
+        pos = pk
+        var wkind: i64 = 0
+        if len(fw) > 0 && str_byte(fw, 0) == 99 {  // 'c'
+            wkind = 1
+        } else if len(fw) > 0 && str_byte(fw, 0) == 113 {  // 'q'
+            wkind = 2
+        }
+        var body = sh_util.u_sub(fw, 1, str_len(fw))
+        table_push(ws, body)
+        table_push(cs, wkind)
+        k = k + 1
+    }
+    return (ws, cs)
+}
+
+// 路径样判定（重定向目标 vs 命令）。
+func is_file_like(w: string) -> bool {
+    var n = len(w)
+    var i: i64 = 0
+    while i < n {
+        var c = str_byte(w, i)
+        if c == 46 || c == 47 || c == 92 {  // '.' '/' '\\'
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ==================== 行入口 ====================
+
+// 会话最近 rc（提示符状态信号用）。
+pub func rc_last() -> i64 {
+    return g_rc_last
+}
+
+// 提示符前缀（config: prompt.prefix；缺省 "tie:"）。
+pub func prompt_prefix() -> string {
+    return g_prompt_prefix
+}
+
+// 会话启动初始化（tsh_main 在 REPL 前调用）：装载 config.td 的别名/提示符/严格位。
+pub func sl_init() {
+    var cfg = session.ss_load_cfg()
+    reload_aliases(cfg)
+    var pp = session.ss_cfg_get(cfg, "prompt.prefix")
+    if len(pp) > 0 {
+        g_prompt_prefix = pp
+    }
+    var st = session.ss_cfg_get(cfg, "strict")
+    if st == "true" || st == "1" {
+        g_strict = true
+    }
+}
+
+// 从配置行装载别名（alias.name=value）。
+func reload_aliases(cfg: table<string>) {
+    g_alias_names = []
+    g_alias_values = []
+    for r in cfg {
+        if has_pref(r, "alias.") {
+            var eq = eq_at(r)
+            if eq > 6 {
+                table_push(g_alias_names, sh_util.u_sub(r, 6, eq))
+                table_push(g_alias_values, sh_util.u_sub(r, eq + 1, str_len(r)))
+            }
+        }
+    }
+}
+
+// 别名重载（alias 命令写入配置后调用）。
+pub func aliases_reload() {
+    reload_aliases(session.ss_load_cfg())
+}
+
+func eq_at(r: string) -> i64 {
+    var n = str_len(r)
+    var i: i64 = 0
+    while i < n {
+        if str_char(r, i) == "=" {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+func alias_lookup(name: string) -> string {
+    var i: i64 = 0
+    for nm in g_alias_names {
+        if nm == name {
+            return g_alias_values[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// env 引用（`env.IDENT`）。
+func is_env_ref(w: string) -> bool {
+    if str_len(w) < 5 {
+        return false
+    }
+    if !has_pref(w, "env.") {
+        return false
+    }
+    return ident_ok(sh_util.u_sub(w, 4, str_len(w)))
+}
+
+// 标识符校验（ASCII）。
+func ident_ok(n: string) -> bool {
+    var l = str_len(n)
+    if l == 0 {
+        return false
+    }
+    var i: i64 = 0
+    while i < l {
+        var c = str_byte(n, i)
+        var is_al = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+        var is_dg = c >= 48 && c <= 57
+        if i == 0 && !is_al {
+            return false
+        }
+        if !is_al && !is_dg {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// `var NAME <- <命令/文件>`：捕获右端输出为文本注入会话变量（去尾部换行）。
+func var_capture(tx: table<string>, tk: table<i64>, tm: table<i64>) -> LineRes {
+    var res = LineRes()
+    var name = tx[1]
+    if !ident_ok(name) {
+        res.out = "tshell: 捕获变量名非法: '" + name + "'"
+        res.rc = 2
+        return strict_apply(res)
+    }
+    // 单文件字面量：直接读文件
+    if len(tx) == 4 && tk[3] == 0 && tm[3] == 0 && is_file_like(tx[3]) {
+        var fp = tx[3]
+        if file_exists(command.cwd_join(fp)) {
+            var fdata = file_read(command.cwd_join(fp))
+            res.out = inject_var(name, strip_tail_nl(fdata))
+            res.rc = 0
+            return strict_apply(res)
+        }
+    }
+    var rest = reconstruct_rest(tx, tk, tm, 3)
+    g_cap_mode = true
+    var cr = sl_run(rest)
+    g_cap_mode = false
+    if cr.rc != 0 && len(cr.out) == 0 {
+        res.out = "tshell: 捕获失败（rc=" + to_string(cr.rc) + "）"
+        res.rc = cr.rc
+        return strict_apply(res)
+    }
+    res.out = inject_var(name, strip_tail_nl(cr.out))
+    res.rc = cr.rc
+    return strict_apply(res)
+}
+
+// 注入会话变量（首写 var、其后赋值——tiep 重声明 no-op 纪律）。
+func inject_var(name: string, val: string) -> string {
+    var lit = "var " + name + " = \"" + esc_q(val) + "\""
+    var _r = backend_interp.b_eval(lit)
+    return ""
+}
+
+// tie 字面量转义（\ " 换行）。
+func esc_q(s: string) -> string {
+    var out = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\\" {
+            out = out + "\\\\"
+        } else if c == "\"" {
+            out = out + "\\\""
+        } else if c == "\n" {
+            out = out + "\\n"
+        } else if c == "\r" {
+            out = out + "\\r"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 去尾部换行（\n / \r）。
+func strip_tail_nl(s: string) -> string {
+    var out = s
+    while true {
+        var l = str_len(out)
+        if l == 0 {
+            return out
+        }
+        var c = str_char(out, l - 1)
+        if c == "\n" || c == "\r" {
+            out = sh_util.u_sub(out, 0, l - 1)
+        } else {
+            return out
+        }
+    }
+    return out
+}
+
+// `… -> env.NAME`：左端求值（tie 表达式；失败回落命令捕获）→ set_env + 落盘。
+func env_export(tx: table<string>, tk: table<i64>, tm: table<i64>, vend: i64) -> LineRes {
+    var res = LineRes()
+    var name = sh_util.u_sub(tx[vend], 4, str_len(tx[vend]))
+    var left = reconstruct_range(tx, tk, tm, 0, vend - 1)
+    left = sh_util.u_trim(left)
+    // 左端不含算子/引号外多余结构时先按 tie 表达式；失败回落命令捕获
+    var (vd, verr) = eval_expr(left)
+    var val = vd
+    if len(verr) > 0 {
+        g_cap_mode = true
+        var cr = sl_run(left)
+        g_cap_mode = false
+        if cr.rc != 0 {
+            res.out = "tshell: env 导出失败（左端既非表达式也非可运行命令）: " + left
+            res.rc = 1
+            return strict_apply(res)
+        }
+        val = cr.out
+    }
+    var _sv = command.env_export_do(name, val)
+    res.out = ""
+    res.rc = 0
+    return strict_apply(res)
+}
+
+// 严格模式守卫（config: strict=true）：命令失败即中止（供脚本/管道驱动使用）。
+// 覆盖 sl_run 的主要出口（含「无法启动」与语言语境失败路径）。
+func strict_apply(r: LineRes) -> LineRes {
+    if g_strict && r.rc != 0 {
+        command.ex_set(r.rc)
+        command.req_exit()
+        r.out = r.out + "\ntshell: 严格模式：命令失败（rc=" + to_string(r.rc) + "），中止"
+    }
+    return r
+}
+
+// 处理一行：返回结构化结果（text 为待渲染文本；rc 为最终退出码）。
+pub func sl_run(line: string) -> LineRes {
+    var res = LineRes()
+    var t = sh_util.u_trim(line)
+    if len(t) == 0 {
+        return res
+    }
+    var (tx, tk, tm) = lex_line(t)
+    if len(tx) == 0 {
+        return res
+    }
+    // `var NAME <- <命令/文件>`：捕获（语言级形态、运行时实现；设计 §3.2）
+    if tk[0] == 0 && tm[0] == 0 && tx[0] == "var" && len(tx) >= 3 {
+        if tk[1] == 0 && tm[1] == 0 && tk[2] == 3 {
+            return var_capture(tx, tk, tm)
+        }
+    }
+    // `… -> env.NAME`：导出（送出语义）
+    var vend = len(tx) - 1
+    if len(tx) >= 3 && tk[vend] == 0 && tm[vend] == 0 && tk[vend - 1] == 1 && is_env_ref(tx[vend]) {
+        return env_export(tx, tk, tm, vend)
+    }
+    // 别名展开（首词为普通词；递归深度护栏）
+    if tk[0] == 0 && tm[0] == 0 && g_alias_depth < 8 {
+        var av = alias_lookup(tx[0])
+        if len(av) > 0 {
+            g_alias_depth = g_alias_depth + 1
+            var r3 = sl_run(av + reconstruct_rest(tx, tk, tm, 1))
+            g_alias_depth = g_alias_depth - 1
+            return r3
+        }
+    }
+    var k0 = tk[0]
+    var forced_cmd = false
+    var start: i64 = 0
+    // exec 强制命令语境（剥前缀）
+    if k0 == 0 && tm[0] == 0 && tx[0] == "exec" {
+        forced_cmd = true
+        start = 1
+        if start >= len(tx) {
+            res.out = "tshell: exec 用法: exec <命令…> 或 exec {表达式}"
+            res.rc = 2
+            return res
+        }
+        // 动态命令：exec {expr} …（先求值再整行重跑）
+        if tk[start] == 0 && tm[start] == 1 {
+            var (vd, verr) = eval_expr(tx[start])
+            if len(verr) > 0 {
+                res.out = "tshell: 表达式求值失败: " + verr
+                res.rc = 1
+                return res
+            }
+            var nl = vd
+            var w = start + 1
+            while w < len(tx) {
+                nl = nl + " " + tx[w]
+                w = w + 1
+            }
+            return sl_run(nl)
+        }
+    }
+    // 双语境判定（§3.3）
+    var is_cmd = false
+    if forced_cmd {
+        is_cmd = true
+    } else if k0 == 0 && tm[0] == 1 {
+        // `{ … }` 包裹强制表达式语境（整行单代码位；其后若还有内容按整行处理）
+        if len(tx) == 1 {
+            var (vd3, verr3) = eval_expr(tx[0])
+            if len(verr3) > 0 {
+                res.out = verr3
+                res.rc = 1
+                return strict_apply(res)
+            }
+            res.out = vd3
+            res.rc = 0
+            return res
+        }
+        is_cmd = false
+    } else if k0 == 0 {
+        is_cmd = looks_like_command(tx[0])
+    }
+    if !is_cmd {
+        // 语言语境：整行求值
+        var (vd2, verr2) = eval_expr(t)
+        if len(verr2) > 0 {
+            res.out = lang_fail_diag(tx, verr2)
+            res.rc = 1
+            return strict_apply(res)
+        }
+        if has_pref(vd2, "已定义") {
+            vd2 = ""
+        }
+        res.out = vd2
+        res.rc = 0
+        return res
+    }
+    return strict_apply(run_command(tx, tk, tm, start))
+}
+
+// 语言语境失败诊断：首词像命令却求值失败 ⇒ 命令未找到（含检索结论与纠错）；
+// 否则原样给出求值错误。
+func lang_fail_diag(tx: table<string>, verr: string) -> string {
+    var w0 = tx[0]
+    // 赋值形（第二词 `=`）保持原始求值错误（"变量未声明"更贴切，不转命令诊断）
+    if len(tx) > 1 && tx[1] == "=" {
+        return verr
+    }
+    var looks = false
+    if len(tx) > 1 && tx[1] != "|" && tx[1] != "&&" && tx[1] != "||" && tx[1] != ";" {
+        looks = true
+    }
+    // 单词未声明：按「未知命令」诊断（外部查找失败含 PATH 检索结论；§5.2）
+    if sh_util.u_contains(verr, "未声明") {
+        looks = true
+    }
+    if len(w0) > 0 && looks {
+        var hint = command.c_did_you_mean(w0)
+        if len(hint) > 0 {
+            return "tshell: 命令未找到: '" + w0 + "'（已检索 PATH）; did you mean '" + hint + "'?"
+        }
+        return "tshell: 命令未找到: '" + w0 + "'（已检索 PATH）"
+    }
+    return verr
+}
+
+// 词解析：代码位（kind=1）与 h 插值求值；未引号普通词（kind=0）做 glob 展开
+// （含 `*`/`?` 且有命中才替换；引号词与命令词不做）。返回 (词表, 错误文本)。
+func resolve_words(ws: table<string>, cs: table<i64>) -> (table<string>, string) {
+    var mid: table<string> = []
+    var marks: table<i64> = []  // 1=代码位结果 2=引号词 0=普通
+    var wi: i64 = 0
+    for wd in ws {
+        if cs[wi] == 1 {
+            // `{env.NAME}` 读环境变量（设计 §3.2：读 {env.PATH}）——经 command.env_get
+            // 直读（Windows 实时块；tie get_env 内置读 CRT 快照，旧账）
+            if is_env_ref(wd) {
+                table_push(mid, execrun.env_get(sh_util.u_sub(wd, 4, str_len(wd))))
+                table_push(marks, 1)
+                wi = wi + 1
+                continue
+            }
+            var expr = wd
+            var (vd, ve) = eval_expr(expr)
+            if len(ve) > 0 {
+                var emp: table<string> = []
+                return (emp, ve)
+            }
+            table_push(mid, vd)
+            table_push(marks, 1)
+        } else {
+            table_push(mid, wd)
+            if cs[wi] == 2 {
+                table_push(marks, 2)
+            } else {
+                table_push(marks, 0)
+            }
+        }
+        wi = wi + 1
+    }
+    var out: table<string> = []
+    var mi: i64 = 0
+    // help 的实参不做 glob（`help *` 需要字面 `*`；引号写法照常阻断）
+    var no_glob = len(ws) > 0 && ws[0] == "help"
+    for wd2 in mid {
+        // 首词（命令词）不做 glob；引号词/代码位结果不做
+        if mi > 0 && marks[mi] == 0 && !no_glob && (has_byte(wd2, 42) || has_byte(wd2, 63)) {
+            var ms = fsglob.glob(wd2)
+            if len(ms) > 0 {
+                for mm in ms {
+                    table_push(out, mm)
+                }
+                mi = mi + 1
+                continue
+            }
+        }
+        table_push(out, wd2)
+        mi = mi + 1
+    }
+    return (out, "")
+}
+
+// 从 tok 序列 [from, to) 重建为行（代码位重包花括号、引号词重包引号）。
+func reconstruct_rest(tx: table<string>, tk: table<i64>, tm: table<i64>, from: i64) -> string {
+    return reconstruct_range(tx, tk, tm, from, len(tx))
+}
+
+func reconstruct_range(tx: table<string>, tk: table<i64>, tm: table<i64>, from: i64, to: i64) -> string {
+    var out = ""
+    var i = from
+    while i < to {
+        var piece = ""
+        if tk[i] == 0 {
+            if tm[i] == 1 {
+                piece = "{" + tx[i] + "}"
+            } else if tm[i] == 2 {
+                piece = tx[i]
+            } else if (tm[i] & 4) != 0 {
+                piece = "\"" + tx[i] + "\""
+            } else {
+                piece = tx[i]
+            }
+        } else {
+            piece = op_text(tk[i])
+        }
+        out = out + " " + piece
+        i = i + 1
+    }
+    return out
+}
+
+// 字节包含判定。
+func has_byte(s: string, b: i64) -> bool {
+    var i: i64 = 0
+    var n = len(s)
+    while i < n {
+        if str_byte(s, i) == b {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ==================== 命令语境：解析 + 执行 ====================
+
+func run_command(tx: table<string>, tk: table<i64>, tm: table<i64>, start: i64) -> LineRes {
+    var res = LineRes()
+    var n = len(tx)
+    // ---- 解析：段（平坦平行表） ----
+    var s_words: table<string> = []
+    var s_in: table<string> = []
+    var s_out: table<string> = []
+    var s_app: table<i64> = []
+    var s_err: table<string> = []
+    var s_merge: table<i64> = []
+    var s_op: table<i64> = []
+    var seg_w: table<string> = []
+    var seg_c: table<i64> = []
+    var seg_in = ""
+    var seg_out = ""
+    var seg_app = false
+    var seg_err = ""
+    var seg_merge = false
+    var pending: i64 = 0
+    var i = start
+    while i < n {
+        var kd = tk[i]
+        if kd == 0 {
+            // 传统重定向记号的可操作提示（§5.4；引号词/代码位不误报）
+            if tm[i] == 0 && len(seg_w) > 0 {
+                if tx[i] == ">" {
+                    res.out = "tshell: 检测到 '>'——重定向请用 '->'（覆盖）或 '->>'（追加）；数据流向右侧"
+                    res.rc = 2
+                    return res
+                }
+                if tx[i] == ">>" {
+                    res.out = "tshell: 检测到 '>>'——追加重定向请用 '->>'"
+                    res.rc = 2
+                    return res
+                }
+                if tx[i] == "<" {
+                    res.out = "tshell: 检测到 '<'——输入请用 '<-'（文件内容作 stdin）"
+                    res.rc = 2
+                    return res
+                }
+                if tx[i] == "2>" {
+                    res.out = "tshell: 检测到 '2>'——stderr 重定向请用 '2->'（文件或 stdout 合流）"
+                    res.rc = 2
+                    return res
+                }
+            }
+            table_push(seg_w, tx[i])
+            if tm[i] == 1 || tm[i] == 2 {
+                table_push(seg_c, 1)  // 标记待求值（代码位 / h 插值）
+            } else if (tm[i] & 4) != 0 {
+                table_push(seg_c, 2)  // 引号词（glob 阻断）
+            } else {
+                table_push(seg_c, 0)
+            }
+            i = i + 1
+            continue
+        }
+        if kd == 8 {  // '|'
+            res.out = "tshell: 命令语境中 '|' 不表示管道——数据流请用 '->'（'|' 为语言语境集合并）"
+            res.rc = 2
+            return res
+        }
+        if kd == 1 || kd == 2 {  // -> / ->>
+            if i + 1 >= n || tk[i + 1] != 0 {
+                res.out = "tshell: '" + op_text(kd) + "' 后缺少目标（文件或命令）"
+                res.rc = 2
+                return res
+            }
+            if is_file_like(tx[i + 1]) {
+                seg_out = tx[i + 1]
+                seg_app = kd == 2
+                i = i + 2
+                continue
+            }
+            // 数据管道：闭合当前段，下一段以 op=4 续
+            if len(seg_w) == 0 {
+                res.out = "tshell: '->' 左侧缺少命令"
+                res.rc = 2
+                return res
+            }
+            var (we1, if1, of1, ap1, ef1, mg1, oq1) = seg_pack(seg_w, seg_c, seg_in, seg_out, seg_app, seg_err, seg_merge, pending)
+            table_push(s_words, we1)
+            table_push(s_in, if1)
+            table_push(s_out, of1)
+            table_push(s_app, ap1)
+            table_push(s_err, ef1)
+            table_push(s_merge, mg1)
+            table_push(s_op, oq1)
+            seg_w = []
+            seg_c = []
+            seg_in = ""
+            seg_out = ""
+            seg_app = false
+            seg_err = ""
+            seg_merge = false
+            pending = 4
+            i = i + 1
+            continue
+        }
+        if kd == 4 {  // 2->
+            if i + 1 >= n || tk[i + 1] != 0 {
+                res.out = "tshell: '2->' 后缺少目标（文件或 stdout）"
+                res.rc = 2
+                return res
+            }
+            var tgt = tx[i + 1]
+            if tgt == "stdout" {
+                seg_merge = true
+            } else if tgt == "stderr" {
+                res.out = "tshell: '2-> stderr' 无合流意义（已在其上）；仅支持 '2-> stdout' 或文件"
+                res.rc = 2
+                return res
+            } else {
+                seg_err = tgt
+            }
+            i = i + 2
+            continue
+        }
+        if kd == 3 {  // <-
+            if i + 1 >= n || tk[i + 1] != 0 {
+                res.out = "tshell: '<-' 后缺少文件"
+                res.rc = 2
+                return res
+            }
+            if len(seg_w) == 0 {
+                res.out = "tshell: '<-' 左侧缺少命令"
+                res.rc = 2
+                return res
+            }
+            seg_in = tx[i + 1]
+            i = i + 2
+            continue
+        }
+        if kd == 5 || kd == 6 || kd == 7 {  // && || ;
+            if len(seg_w) == 0 {
+                res.out = "tshell: 意外的 '" + op_text(kd) + "'（左侧缺少命令）"
+                res.rc = 2
+                return res
+            }
+            var (we2, if2, of2, ap2, ef2, mg2, oq2) = seg_pack(seg_w, seg_c, seg_in, seg_out, seg_app, seg_err, seg_merge, pending)
+            table_push(s_words, we2)
+            table_push(s_in, if2)
+            table_push(s_out, of2)
+            table_push(s_app, ap2)
+            table_push(s_err, ef2)
+            table_push(s_merge, mg2)
+            table_push(s_op, oq2)
+            seg_w = []
+            seg_c = []
+            seg_in = ""
+            seg_out = ""
+            seg_app = false
+            seg_err = ""
+            seg_merge = false
+            if kd == 5 {
+                pending = 1
+            } else if kd == 6 {
+                pending = 2
+            } else {
+                pending = 3
+            }
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    // 收尾段
+    if len(seg_w) > 0 {
+        var (we3, if3, of3, ap3, ef3, mg3, oq3) = seg_pack(seg_w, seg_c, seg_in, seg_out, seg_app, seg_err, seg_merge, pending)
+        table_push(s_words, we3)
+        table_push(s_in, if3)
+        table_push(s_out, of3)
+        table_push(s_app, ap3)
+        table_push(s_err, ef3)
+        table_push(s_merge, mg3)
+        table_push(s_op, oq3)
+    }
+    var m = len(s_words)
+    if m == 0 {
+        res.out = "tshell: 命令为空"
+        res.rc = 2
+        return res
+    }
+    // ---- 执行：逐单元（&& / || / ; rc 驱动） ----
+    var rc_prev: i64 = 0
+    var final_text = ""
+    var final_rc: i64 = 0
+    var u = 0
+    while u < m {
+        // 单元范围 [u..v]（段间 op==4 属单元内）
+        var v = u
+        while v + 1 < m && s_op[v + 1] == 4 {
+            v = v + 1
+        }
+        var skip = false
+        if u > 0 {
+            var op = s_op[u]
+            if op == 1 && rc_prev != 0 {
+                skip = true
+            }
+            if op == 2 && rc_prev == 0 {
+                skip = true
+            }
+        }
+        if !skip {
+            // 逐段执行 [u..v]
+            var carry = ""
+            var carry_valid = false
+            var k3 = u
+            while k3 <= v {
+                var (ws, cs) = seg_words_decode(s_words[k3])
+                // 词解析：代码位 / h 插值求值 + glob 展开（filter 谓词体除外）
+                var rerr = ""
+                var skip_code = false
+                if len(ws) > 0 && ws[0] == "filter" {
+                    skip_code = true
+                }
+                var rw: table<string> = []
+                if !skip_code {
+                    var (rw0, e0) = resolve_words(ws, cs)
+                    rw = rw0
+                    rerr = e0
+                } else {
+                    rw = ws
+                }
+                if len(rerr) > 0 {
+                    res.out = "tshell: 表达式求值失败: " + rerr
+                    res.rc = 1
+                    return res
+                }
+                if len(rw) == 0 {
+                    res.out = "tshell: 空命令段"
+                    res.rc = 2
+                    return res
+                }
+                // 输入文件预检（区分「输入文件缺失」与「命令不存在」）
+                if len(s_in[k3]) > 0 {
+                    if !file_exists(command.cwd_join(s_in[k3])) {
+                        res.out = "tshell: 输入文件不存在: " + s_in[k3]
+                        res.rc = 1
+                        return res
+                    }
+                }
+                // 段类型：内建 / 谓词 / 外部
+                var head = rw[0]
+                // alias 命令（壳级；配置持久 + 即时装载）
+                if head == "alias" && k3 == v {
+                    res.out = alias_cmd(rw)
+                    res.rc = 0
+                    return res
+                }
+                var is_builtin = command.c_is_builtin(head)
+                var is_pred = head == "filter" || head == "count" || head == "parse"
+                if is_builtin || is_pred {
+                    // ---- 内建 / 谓词：进程内 ----
+                    var in_rows: table<string> = []
+                    if len(s_in[k3]) > 0 {
+                        var fdata = file_read(command.cwd_join(s_in[k3]))
+                        in_rows = sh_util.u_lines(fdata)
+                    } else if carry_valid {
+                        in_rows = sh_util.u_lines(carry)
+                    }
+                    var btxt = ""
+                    var rc_b: i64 = 0
+                    if head == "count" {
+                        btxt = to_string(sh_util.u_len(in_rows))
+                    } else if head == "parse" {
+                        btxt = sh_util.u_join(in_rows, "\n")
+                    } else if head == "filter" {
+                        btxt = filter_rows(in_rows, rw)
+                    } else {
+                        btxt = command.c_exec(rw)
+                        rc_b = command.rc_get()
+                    }
+                    // 输出重定向（内建）：写文件
+                    if len(s_out[k3]) > 0 {
+                        if s_app[k3] == 1 {
+                            file_append(command.cwd_join(s_out[k3]), btxt + "\n")
+                        } else {
+                            file_write(command.cwd_join(s_out[k3]), btxt + "\n")
+                        }
+                    }
+                    carry = btxt
+                    carry_valid = true
+                    rc_prev = rc_b
+                    if !g_rc_seen || g_rc_last != rc_b {
+                        sess_set_rc(rc_b)
+                        g_rc_seen = true
+                        g_rc_last = rc_b
+                    }
+                } else {
+                    // ---- 外部段组：连续外部 + 数据链 → 引擎真管道 ----
+                    var g = k3
+                    while g + 1 <= v && s_op[g + 1] == 4 {
+                        // 检查 g+1 段是否为外部（提前解析其首词）
+                        var (wsp, csp) = seg_words_decode(s_words[g + 1])
+                        if len(wsp) == 0 {
+                            break
+                        }
+                        var hp = wsp[0]
+                        if csp[0] == 1 {
+                            // 代码位首词：先求值判定
+                            var (vdp, verr5) = eval_expr(hp)
+                            if len(verr5) == 0 {
+                                hp = vdp
+                            }
+                        }
+                        if command.c_is_builtin(hp) || hp == "filter" || hp == "count" || hp == "parse" {
+                            break
+                        }
+                        g = g + 1
+                    }
+                    // 组建引擎段表
+                    var encs: table<string> = []
+                    var kk = k3
+                    while kk <= g {
+                        var (ws2, cs2) = seg_words_decode(s_words[kk])
+                        var (rw2, rerr6) = resolve_words(ws2, cs2)
+                        if len(rerr6) > 0 {
+                            res.out = "tshell: 表达式求值失败: " + rerr6
+                            res.rc = 1
+                            return res
+                        }
+                        var sg = Seg()
+                        sg.words = rw2
+                        sg.cwd = command.cwd_get()
+                        if len(s_in[kk]) > 0 {
+                            sg.in_file = command.cwd_join(s_in[kk])
+                        }
+                        if len(s_out[kk]) > 0 {
+                            sg.out_file = command.cwd_join(s_out[kk])
+                        }
+                        if s_app[kk] == 1 {
+                            sg.out_append = true
+                        }
+                        if len(s_err[kk]) > 0 {
+                            sg.err_file = command.cwd_join(s_err[kk])
+                        }
+                        if s_merge[kk] == 1 {
+                            sg.err_merge = true
+                        }
+                        if kk == k3 && carry_valid && len(s_in[kk]) == 0 {
+                            sg.has_feed = true
+                            sg.feed = carry
+                        }
+                        if kk == g && (g < v || g_cap_mode) {
+                            sg.cap_out = true  // 段组未完或捕获模式 ⇒ 捕获（不直通）
+                        }
+                        table_push(encs, execrun.enc(sg))
+                        kk = kk + 1
+                    }
+                    var rs = execrun.run_pipeline(encs)
+                    var lr = execrun.res_decode(rs[len(rs) - 1])
+                    rc_prev = lr.rc
+                    if !g_rc_seen || g_rc_last != rc_prev {
+                        sess_set_rc(rc_prev)
+                        g_rc_seen = true
+                        g_rc_last = rc_prev
+                    }
+                    if lr.started {
+                        if g < v || g_cap_mode {
+                            carry = lr.out
+                            carry_valid = true
+                        } else {
+                            carry = ""
+                            carry_valid = false
+                        }
+                    } else {
+                        res.out = "tshell: 无法启动 '" + rw[0] + "'（不在 PATH 或不可执行）"
+                        res.rc = rc_prev
+                        return res
+                    }
+                    if g > k3 {
+                        k3 = g
+                    }
+                }
+                k3 = k3 + 1
+            }
+            if v == m - 1 {
+                final_text = carry
+                final_rc = rc_prev
+            }
+        }
+        u = v + 1
+    }
+    res.out = final_text
+    res.rc = final_rc
+    if len(res.out) == 0 && res.rc != 0 {
+        res.out = "tshell: 退出码 " + to_string(res.rc)
+    }
+    return res
+}
+
+// alias 命令：无参列出；`alias name=value`（或 name value…）定义并持久。
+func alias_cmd(args: table<string>) -> string {
+    if len(args) <= 1 {
+        if len(g_alias_names) == 0 {
+            return "（无别名；用法: alias name=value —— 例: alias ll=ls src）"
+        }
+        var rows: table<string> = []
+        var i: i64 = 0
+        for nm in g_alias_names {
+            table_push(rows, "alias " + nm + "=" + g_alias_values[i])
+            i = i + 1
+        }
+        return command.hl_lines(rows)
+    }
+    // name=value 或 name value…
+    var joined = ""
+    var j: i64 = 1
+    while j < len(args) {
+        if j > 1 {
+            joined = joined + " "
+        }
+        joined = joined + args[j]
+        j = j + 1
+    }
+    var eq = eq_at(joined)
+    if eq <= 0 {
+        return "alias: 用法: alias name=value（例: alias ll=ls src）"
+    }
+    var name = sh_util.u_sub(joined, 0, eq)
+    var value = sh_util.u_trim(sh_util.u_sub(joined, eq + 1, str_len(joined)))
+    if len(value) == 0 {
+        return "alias: 值不能为空"
+    }
+    var cfg = session.ss_load_cfg()
+    var cfg2 = session.ss_alias(cfg, name, value)
+    session.ss_save_cfg(cfg2)
+    aliases_reload()
+    return "alias " + name + "=" + value
+}
+
+// ---- 谓词：filter（逐行绑定 x 求值谓词体，真则保留） ----
+
+func filter_rows(inp: table<string>, toks: table<string>) -> string {
+    var body = ""
+    var bn: i64 = 0
+    for t2 in toks {
+        if bn == 0 {
+            bn = bn + 1
+            continue
+        }
+        if bn > 1 {
+            body = body + " "
+        }
+        body = body + t2
+        bn = bn + 1
+    }
+    body = sh_util.u_trim(body)
+    if len(body) >= 2 && str_byte(body, 0) == 123 && str_byte(body, len(body) - 1) == 125 {
+        body = sh_util.u_sub(body, 1, str_len(body) - 1)
+        body = sh_util.u_trim(body)
+    }
+    var out: table<string> = []
+    var _xi = backend_interp.b_eval("var x = \"\"")
+    for line in inp {
+        var _set = backend_interp.b_eval("x = \"" + escape_q(line) + "\"")
+        var rv = backend_interp.b_eval(body)
+        if vval.w_err == "" && sh_util.u_trim(rv) == "true" {
+            table_push(out, line)
+        }
+    }
+    return sh_util.u_join(out, "\n")
+}
+
+func escape_q(s: string) -> string {
+    var out = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\"" {
+            out = out + "\\\""
+        } else if c == "\\" {
+            out = out + "\\\\"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+}   // namespace shlang

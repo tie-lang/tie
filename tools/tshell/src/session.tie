@@ -1,0 +1,272 @@
+type tie<logic>
+import "./sh_util.tie"
+import "../../tiej/src/core/execrun.tie"
+// src/session.tie —— 会话模块（L2，p.9.3.2）：历史持久化 · 配置（td 资产）· 别名
+// --------------------------------------------------------------
+// 架构 §8：td 资产（可读可校验，同源双态纪律）位于 ~/.tshell/：history 历史会话、
+// config.td 配置（变量/别名/渲染/补全开关/执行后端）。热加载：用户操作即写文件
+// （配置纪律）。本模块做惰性读写（首次使用记数 → 退出/变更时 save）。
+//
+// EN: session module (L2) — history persistence, td config asset, aliases, under
+// ~/.tshell/. Lazy I/O; writes on change/exit (config discipline).
+
+// 顶部全局：历史与目录（全局表须以字面量 [] 初始化）。
+var g_hist: table<string> = []
+var g_home: string = ""
+
+namespace session {
+
+// 计算 ~ 目录（%USERPROFILE% 优先，回退 %HOME%）。
+pub func ss_home() -> string {
+    if g_home != "" {
+        return g_home
+    }
+    var u = get_env("USERPROFILE")
+    if u == "" {
+        u = get_env("HOME")
+    }
+    if u == "" {
+        u = "."
+    }
+    g_home = u
+    return g_home
+}
+
+// 历史文件路径。
+func hist_path() -> string {
+    return ss_home() + "/.tshell/history"
+}
+
+// 配置文件路径。
+pub func cfg_path() -> string {
+    return ss_home() + "/.tshell/config.td"
+}
+
+// 追加一行历史（去重相邻重复）；记录数上限 2000。
+pub func ss_add(line: string) {
+    if sh_util.u_trim(line) == "" {
+        return
+    }
+    var last = ss_last()
+    if last == line {
+        return
+    }
+    table_push(g_hist, line)
+    trim_hist()
+}
+
+// 历史去尾上限。
+func trim_hist() {
+    var n: i64 = 0
+    for _x in g_hist { n = n + 1 }
+    while n > 2000 {
+        // 丢弃最旧：重建除首行外
+        var out = table_new_string()
+        var first = true
+        for x in g_hist {
+            if first {
+                first = false
+            } else {
+                table_push(out, x)
+            }
+        }
+        g_hist = out
+        n = 0
+        var n2: i64 = 0
+        for _y in g_hist { n2 = n2 + 1 }
+        n = n2
+    }
+}
+
+// 最近一行（空则空串）。
+func ss_last() -> string {
+    var n: i64 = 0
+    for _x in g_hist { n = n + 1 }
+    if n == 0 {
+        return ""
+    }
+    var i: i64 = 0
+    for x in g_hist {
+        if i == n - 1 {
+            return x
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 历史行集合。
+pub func ss_lines() -> table<string> {
+    return g_hist
+}
+
+// 从 ~/.tshell/history 加载历史。
+pub func ss_load() {
+    var p = hist_path()
+    if !file_exists(p) {
+        return
+    }
+    var content = file_read(p)
+    var rows = sh_util.u_lines(content)
+    g_hist = table_new_string()
+    for r in rows {
+        if sh_util.u_trim(r) != "" {
+            table_push(g_hist, r)
+        }
+    }
+}
+
+// 写回历史到 ~/.tshell/history（惰性：仅在调用时写）。
+pub func ss_save() {
+    var dir = ss_home() + "/.tshell"
+    if !file_is_dir(dir) {
+        var _mk = mkdir_all(dir)
+    }
+    var body = sh_util.u_join(g_hist, "\n")
+    if sh_util.u_len(g_hist) > 0 {
+        body = body + "\n"
+    }
+    file_write(hist_path(), body)
+}
+
+// ---- 环境面（env.td 落盘；config: env.persist=false 关闭落盘）----
+
+// env.td 路径。
+pub func env_path() -> string {
+    return ss_home() + "/.tshell/env.td"
+}
+
+// 落盘开关（默认开；config: env.persist=false 关闭）。
+pub func env_persist() -> bool {
+    var cfg = ss_load_cfg()
+    return ss_cfg_get(cfg, "env.persist") != "false"
+}
+
+// 写环境：进程块（execrun.env_put：Windows 实时块）+ （开关开时）落盘 env.td。
+pub func ss_env_set(name: string, value: string) {
+    execrun.env_put(name, value)
+    if !env_persist() {
+        return
+    }
+    var lines: table<string> = []
+    var found = false
+    var p = env_path()
+    if file_exists(p) {
+        var rows = sh_util.u_lines(file_read(p))
+        for r in rows {
+            var eq = find_eq(r)
+            if eq > 0 && sh_util.u_sub(r, 0, eq) == name {
+                table_push(lines, name + "=" + value)
+                found = true
+            } else if sh_util.u_trim(r) != "" {
+                table_push(lines, r)
+            }
+        }
+    }
+    if !found {
+        table_push(lines, name + "=" + value)
+    }
+    var body = sh_util.u_join(lines, "\n")
+    if sh_util.u_len(lines) > 0 {
+        body = body + "\n"
+    }
+    var dir = ss_home() + "/.tshell"
+    if !file_is_dir(dir) {
+        var _mk = mkdir_all(dir)
+    }
+    file_write(env_path(), body)
+}
+
+// 启动装载（env.persist=false 时跳过）。
+pub func ss_env_load() {
+    if !env_persist() {
+        return
+    }
+    var p = env_path()
+    if !file_exists(p) {
+        return
+    }
+    var rows = sh_util.u_lines(file_read(p))
+    for r in rows {
+        var eq = find_eq(r)
+        if eq > 0 {
+            var nm = sh_util.u_sub(r, 0, eq)
+            var vl = sh_util.u_sub(r, eq + 1, str_len(r))
+            execrun.env_put(nm, vl)
+        }
+    }
+}
+
+// ---- 配置（td 资产；文本文件形态，键=值 行）----
+// 读取配置为键值表（"key=value" → key/value 两平行表，实现层约定简单）。
+pub func ss_load_cfg() -> table<string> {
+    var out = table_new_string()
+    var p = cfg_path()
+    if file_exists(p) {
+        var rows = sh_util.u_lines(file_read(p))
+        for r in rows {
+            if sh_util.u_trim(r) != "" {
+                table_push(out, r)
+            }
+        }
+    }
+    return out
+}
+
+// 写配置。
+pub func ss_save_cfg(lines: table<string>) {
+    var body = sh_util.u_join(lines, "\n")
+    if sh_util.u_len(lines) > 0 {
+        body = body + "\n"
+    }
+    file_write(cfg_path(), body)
+}
+
+// 从配置行（key=value）查询 key → value（无则空串）。
+pub func ss_cfg_get(cfg: table<string>, key: string) -> string {
+    for r in cfg {
+        var eq = find_eq(r)
+        if eq > 0 {
+            var k = sh_util.u_sub(r, 0, eq)
+            if k == key {
+                return sh_util.u_sub(r, eq + 1, str_len(r))
+            }
+        }
+    }
+    return ""
+}
+
+// 别名：存到配置（alias.name=cmdline）。别名查询遍历配置。
+pub func ss_alias(cfg: table<string>, name: string, value: string) -> table<string> {
+    var key = "alias." + name
+    // 编辑 cfg（改 key=value 行或追加）
+    var out = table_new_string()
+    var found = false
+    for r in cfg {
+        var eq = find_eq(r)
+        if eq > 0 && sh_util.u_sub(r, 0, eq) == key {
+            table_push(out, key + "=" + value)
+            found = true
+        } else {
+            table_push(out, r)
+        }
+    }
+    if !found {
+        table_push(out, key + "=" + value)
+    }
+    return out
+}
+
+func find_eq(r: string) -> i64 {
+    var n = str_len(r)
+    var i: i64 = 0
+    while i < n {
+        if str_char(r, i) == "=" {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+}   // namespace session

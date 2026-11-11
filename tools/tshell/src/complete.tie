@@ -1,0 +1,77 @@
+type tie<logic>
+import "./sh_util.tie"
+import "./command.tie"
+// src/complete.tie —— 补全模块（L2，p.9.3.2）：可插拔补全源与候选生成
+// --------------------------------------------------------------
+// 架构 §7 补全综合顺序：内建命令 → PATH 可执行 → tie 标识符（当前作用域）→
+// 文件路径 →（td/zd 资产，扩展点）。本先行批实现可独立验证的基础源：
+// 内建命令 + 当前目录文件路径；PATH 可执行源留作注册点（首次使用惰性加载），
+// tie 标识符源依赖作用域反射（待 trm）为扩展槽位。候选按前缀前缀匹配返回。
+//
+// EN: completion module (L2) — pluggable completion sources + candidate
+// generation. This batch ships cwd file-path + builtin-command base sources;
+// PATH/identifier sources are declared registration points (deferred).
+
+namespace complete {
+
+// 对整行在光标 pos 处的待补全 token 生成候选（string 表）。
+// 简化：以最后一个空白为界，取当前 token 前缀 t。
+pub func cpl_candidates(line: string, pos: i64) -> table<string> {
+    var t = token_at(line, pos)
+    var out = table_new_string()
+    add_cwd(out, t)
+    add_builtin(out, t)
+    return out
+}
+
+// 取 pos 处（含）的当前 token 前缀。
+func token_at(line: string, pos: i64) -> string {
+    var n = str_len(line)
+    if pos > n { pos = n }
+    var st: i64 = pos
+    while st > 0 {
+        var c = str_char(line, st - 1)
+        if c == " " || c == "\t" || c == "|" {
+            break
+        }
+        st = st - 1
+    }
+    return sh_util.u_sub(line, st, pos)
+}
+
+// 源 1：当前目录文件/子目录名（前缀匹配）。
+func add_cwd(ref out: table<string>, prefix: string) {
+    var entries = list_dir(".")
+    for e in entries {
+        if e == "." || e == ".." {
+            continue
+        }
+        if sh_util.u_starts(e, prefix) {
+            table_push(out, e)
+        }
+    }
+}
+
+// 源 2：内建命令（前缀匹配）。
+func add_builtin(ref out: table<string>, prefix: string) {
+    var names = command.c_builtins()
+    for n in names {
+        if sh_util.u_starts(n, prefix) {
+            table_push(out, n)
+        }
+    }
+}
+
+// —— 补全源注册点（扩展接口的契约占位；实际源由生态组件/trm 注册）——
+// 当前实现内建了 cwd + builtin 两源；PATH 源 / tie 标识符源在此留位，后续按
+// 「补全源注册接口」（对齐 tedit 贡献点思路）接入。判定命中数供 REPL 决定：
+// 1 个→直接补全；多个→列候选。
+pub func cpl_count(cands: table<string>) -> i64 {
+    var n: i64 = 0
+    for _c in cands {
+        n = n + 1
+    }
+    return n
+}
+
+}   // namespace complete

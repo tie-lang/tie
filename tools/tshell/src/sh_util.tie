@@ -1,0 +1,231 @@
+type tie<logic>
+// src/sh_util.tie —— tshell 基础工具函数（纯函数，无内部状态）
+// --------------------------------------------------------------
+// 字符串/表操作工具。tie 表长度不能用 `len(t)` 参与整数比较（编译路径对动态表
+// len 的 LLVM 类型 `ptr` 下沉有缺陷），故统一用 `for x in t` 迭代并自维护 i64 计数。
+//
+// EN: tshell base helpers (pure). NOTE: dynamic-table len() cannot be compared
+// as i64 (tie lowers it to `ptr`); iterate with `for x in t` + manual counters.
+
+namespace sh_util {
+
+// 去除首尾空白（空格/\t/\r/\n）。
+// 显示宽度：宽字符（CJK 等常用区）2，其余 1；Tab 记 4。
+pub func ch_width(s: string) -> i64 {
+    if str_len(s) == 0 {
+        return 0
+    }
+    var cp = char_code(s)
+    if cp == 9 {
+        return 4
+    }
+    if cp < 0x1100 {
+        return 1
+    }
+    if (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0x303E) ||
+       (cp >= 0x3041 && cp <= 0x33FF) || (cp >= 0x3400 && cp <= 0x4DBF) ||
+       (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xA000 && cp <= 0xA4CF) ||
+       (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+       (cp >= 0xFE30 && cp <= 0xFE4F) || (cp >= 0xFF00 && cp <= 0xFF60) ||
+       (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x20000 && cp <= 0x3FFFD) {
+        return 2
+    }
+    return 1
+}
+
+// 字符串显示宽度。
+pub func str_width(s: string) -> i64 {
+    var w: i64 = 0
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        w = w + ch_width(str_char(s, i))
+        i = i + 1
+    }
+    return w
+}
+
+pub func u_trim(s: string) -> string {
+    var n = str_len(s)
+    var lo: i64 = 0
+    var hi: i64 = n
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c != " " && c != "\t" && c != "\r" && c != "\n" {
+            break
+        }
+        i = i + 1
+    }
+    lo = i
+    i = n
+    while i > lo {
+        var c = str_char(s, i - 1)
+        if c != " " && c != "\t" && c != "\r" && c != "\n" {
+            break
+        }
+        i = i - 1
+    }
+    hi = i
+    var out = ""
+    var j: i64 = lo
+    while j < hi {
+        out = out + str_char(s, j)
+        j = j + 1
+    }
+    return out
+}
+
+// hay 是否包含 needle（子串）。
+pub func u_contains(hay: string, needle: string) -> bool {
+    var hn = str_len(hay)
+    var nn = str_len(needle)
+    if nn == 0 {
+        return true
+    }
+    if nn > hn {
+        return false
+    }
+    var i: i64 = 0
+    var nend = hn - nn + 1
+    while i < nend {
+        var j: i64 = 0
+        var match = true
+        while j < nn {
+            if str_char(hay, i + j) != str_char(needle, j) {
+                match = false
+                break
+            }
+            j = j + 1
+        }
+        if match {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// s 是否以 pre 开头。
+pub func u_starts(s: string, pre: string) -> bool {
+    var sn = str_len(s)
+    var pn = str_len(pre)
+    if pn > sn {
+        return false
+    }
+    var i: i64 = 0
+    while i < pn {
+        if str_char(s, i) != str_char(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 按空白切分（简易引号感知）。返回 string 表。
+pub func u_split_ws(s: string) -> table<string> {
+    var out = table_new_string()
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        while i < n && is_space(str_char(s, i)) {
+            i = i + 1
+        }
+        if i >= n {
+            break
+        }
+        var tok = ""
+        var q = ""
+        while i < n {
+            var c = str_char(s, i)
+            if q == "" && (c == "\"" || c == "'") {
+                q = c
+            } else if q != "" && c == q {
+                q = ""
+            } else if q == "" && is_space(c) {
+                break
+            } else {
+                tok = tok + c
+            }
+            i = i + 1
+        }
+        table_push(out, tok)
+        i = i + 1
+    }
+    return out
+}
+
+func is_space(c: string) -> bool {
+    return c == " " || c == "\t" || c == "\r" || c == "\n"
+}
+
+// 以 sep 连接表元素。
+pub func u_join(tbl: table<string>, sep: string) -> string {
+    var out = ""
+    var first = true
+    for x in tbl {
+        if !first {
+            out = out + sep
+        }
+        out = out + x
+        first = false
+    }
+    return out
+}
+
+// 按 '\n' 切分子串（去行尾 '\r'）。
+pub func u_lines(s: string) -> table<string> {
+    var out = table_new_string()
+    var cur = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\n" {
+            table_push(out, trim_cr(cur))
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    if cur != "" {
+        table_push(out, trim_cr(cur))
+    }
+    return out
+}
+
+func trim_cr(s: string) -> string {
+    var n = str_len(s)
+    if n > 0 && str_char(s, n - 1) == "\r" {
+        return u_sub(s, 0, n - 1)
+    }
+    return s
+}
+
+// 表元素计数（string 表）。
+pub func u_len(t: table<string>) -> i64 {
+    var n: i64 = 0
+    for _x in t {
+        n = n + 1
+    }
+    return n
+}
+
+// 子串 s[lo:hi)（0 起）。
+pub func u_sub(s: string, lo: i64, hi: i64) -> string {
+    var out = ""
+    var i: i64 = lo
+    var n = str_len(s)
+    if hi > n {
+        return s
+    }
+    while i < hi {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+}   // namespace sh_util

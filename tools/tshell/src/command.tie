@@ -1,0 +1,950 @@
+type tie<logic>
+import "./sh_util.tie"
+import "./backend_interp.tie"
+import "./session.tie"
+import "./observe.tie"
+import "../../tiej/src/core/execrun.tie"
+import "../../tiej/src/core/term.tie"
+// src/command.tie —— 命令模块（L1）：解析（tie→内建→外部）+ 内建命令集 + 纠错
+// --------------------------------------------------------------
+// 解析优先级（架构 §4）：① tie 表达式 → ② 内建命令（短一致命名）→ ③ 外部命令
+// → ④ 拼写纠错（did-you-mean）。本模块只实现「命令语义」；求值与管道交给
+// repl/pipeline；外部命令经 **tiej 执行域引擎**（execrun：CreateProcessW 直启、
+// cwd 经 lpCurrentDirectory 直传——不拼接 cd 前缀；启动失败有明确诊断不静默）。
+//
+// EN: command module — parsing priority (tie expr → builtin → external →
+// did-you-mean). External commands run through the tiej execution engine
+// (execrun: direct CreateProcessW with lpCurrentDirectory; no `cd` prefix,
+// explicit startup-failure diagnostics).
+//
+// 状态（文件顶层全局，供本命名空间函数裸名访问）：虚拟 cwd / 退出标志。
+
+var g_cwd: string = ""
+var g_exit: bool = false
+var g_exit_code: i64 = 0   // 显式退出码（exit <N>，默认 0）
+var g_rc: i64 = 0          // 最近一条内建命令的退出码（0=成功；复合链/rc 变量用）
+var g_col_on: bool = false      // 着色开关（stdout 是否终端；懒探测）
+var g_col_probe: bool = false   // 探测一次性标记
+var g_path_cache: table<string> = []   // PATH 可执行名缓存（补全/高亮共用）
+var g_path_ready: bool = false
+
+namespace command {
+
+// 内建命令名注册表（顺序即帮助顺序）。
+func builtin_names() -> table<string> {
+    var t = table_new_string()
+    table_push(t, "cd")
+    table_push(t, "pwd")
+    table_push(t, "ls")
+    table_push(t, "cat")
+    table_push(t, "echo")
+    table_push(t, "mv")
+    table_push(t, "cp")
+    table_push(t, "rm")
+    table_push(t, "set")
+    table_push(t, "source")
+    table_push(t, "exec")
+    table_push(t, "history")
+    table_push(t, "alias")
+    table_push(t, "observe")
+    table_push(t, "help")
+    table_push(t, "exit")
+    return t
+}
+
+// 判断 tok 是否为内建命令。
+pub func c_is_builtin(tok: string) -> bool {
+    var names = builtin_names()
+    for n in names {
+        if n == tok {
+            return true
+        }
+    }
+    return false
+}
+
+// 内建命令名表（供 complete 补全源）。
+pub func c_builtins() -> table<string> {
+    return builtin_names()
+}
+
+// 取 args[idx]（越界空串）。
+pub func args_at(args: table<string>, idx: i64) -> string {
+    var i: i64 = 0
+    for a in args {
+        if i == idx {
+            return a
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 设置退出标志（exit 命令 / REPL :quit 触发）。
+pub func req_exit() {
+    g_exit = true
+}
+
+// 读取退出标志。
+pub func ex_req() -> bool {
+    return g_exit
+}
+
+// env 导出（`… -> env.NAME`）：进程块 + 落盘（session 按 env.persist 决定）。
+// 返回 0（成功）；失败路径由调用方渲染。
+pub func env_export_do(name: string, value: string) -> i64 {
+    session.ss_env_set(name, value)
+    return 0
+}
+
+// 读取显式退出码（脚本退出时透传给 tshell 进程；默认 0）。
+pub func ex_code() -> i64 {
+    return g_exit_code
+}
+
+// 设置显式退出码（严格模式中止路径用）。
+pub func ex_set(n: i64) {
+    g_exit_code = n
+}
+
+// 最近内建命令退出码（shlang 复合链 / rc 变量读取）。
+pub func rc_get() -> i64 {
+    return g_rc
+}
+
+// 当前虚拟工作目录（原始值；空串 = 尚未设置 ⇒ 外部命令继承进程 cwd）。
+pub func cwd_get() -> string {
+    return g_cwd
+}
+
+// 相对路径 → 按当前虚拟 cwd 拼接（重定向/输入文件目标用；绝对路径原样）。
+pub func cwd_join(rel: string) -> string {
+    return join_cwd(cwd_norm(g_cwd), rel)
+}
+
+// 当前目录尾名（提示符用；根/空 → 原样/代表串）。
+pub func prompt_dir() -> string {
+    var p = cwd_norm(g_cwd)
+    var n = str_len(p)
+    var start: i64 = 0
+    var i = n - 1
+    while i >= 0 {
+        var c = str_char(p, i)
+        if c == "/" || c == "\\" {
+            start = i + 1
+            break
+        }
+        i = i - 1
+    }
+    var tail = sh_util.u_sub(p, start, n)
+    if str_len(tail) == 0 {
+        return p
+    }
+    return tail
+}
+
+// exit [<N>]：置退出标志并把代码设为 N（缺省 0）。N 解析失败按 0。
+func cmd_exit(args: table<string>) -> string {
+    g_exit = true
+    g_exit_code = 0
+    if sh_util.u_len(args) >= 1 {
+        var n = parse_int(args[0])
+        if str_len(args[0]) > 0 {
+            g_exit_code = n
+        }
+    }
+    return ""
+}
+
+// ---- 语法高亮（输出面/行编辑共用；非 TTY 自动关闭；管道输出保持原字节） ----
+
+// 着色开关（stdout 是否终端；进程内缓存一次）。
+pub func u_col_enabled() -> bool {
+    if !g_col_probe {
+        g_col_probe = true
+        g_col_on = term.out_tty()
+    }
+    return g_col_on
+}
+
+// 着色包装（关时原样返回；sgr 为 SGR 参数文本）。
+pub func u_c(sgr: string, s: string) -> string {
+    if !u_col_enabled() {
+        return s
+    }
+    var ESC = str_from_code(27)
+    return ESC + "[" + sgr + "m" + s + ESC + "[0m"
+}
+
+pub func u_bold(s: string) -> string { return u_c("1", s) }
+pub func u_dim(s: string) -> string { return u_c("2", s) }
+pub func u_cyan(s: string) -> string { return u_c("36", s) }
+pub func u_yellow(s: string) -> string { return u_c("33", s) }
+pub func u_blue(s: string) -> string { return u_c("34", s) }
+pub func u_green(s: string) -> string { return u_c("1;32", s) }
+pub func u_red(s: string) -> string { return u_c("31", s) }
+
+// PATH 可执行名缓存（懒建；补全与高亮共用；os 感知分隔符）。
+pub func path_exes() -> table<string> {
+    if g_path_ready {
+        return g_path_cache
+    }
+    g_path_ready = true
+    var sep: i64 = 58
+    if get_env("OS") == "Windows_NT" {
+        sep = 59
+    }
+    var pp = get_env("PATH")
+    var n = len(pp)
+    var sb = string_builder()
+    var i: i64 = 0
+    while i <= n {
+        var brk = false
+        if i == n {
+            brk = true
+        } else {
+            var c2 = str_byte(pp, i)
+            if c2 == sep {
+                brk = true
+            }
+        }
+        if brk {
+            var seg = sb_build(sb)
+            if len(seg) > 0 && file_is_dir(seg) {
+                var es = list_dir(seg)
+                for e in es {
+                    if len(e) > 4 {
+                        var tail = sh_util.u_sub(e, str_len(e) - 4, str_len(e))
+                        if tail == ".exe" || tail == ".cmd" || tail == ".bat" || tail == ".com" {
+                            table_push(g_path_cache, sh_util.u_sub(e, 0, str_len(e) - 4))
+                        }
+                    }
+                }
+            }
+            sb = string_builder()
+        } else {
+            sb_append_byte(sb, str_byte(pp, i))
+        }
+        i = i + 1
+    }
+    return g_path_cache
+}
+
+// 名字是否 PATH 可执行。
+func path_exe_exists(w: string) -> bool {
+    var es = path_exes()
+    for e in es {
+        if e == w {
+            return true
+        }
+    }
+    return false
+}
+
+// 谓词/内建判定（高亮命令位用）。
+func hl_is_cmdword(w: string) -> bool {
+    if c_is_builtin(w) {
+        return true
+    }
+    if w == "filter" || w == "count" || w == "parse" {
+        return true
+    }
+    return false
+}
+
+// 操作符识别（码点级；返回长度，0=非操作符）。
+func hl_op_len(s: string, i: i64) -> i64 {
+    var n = str_len(s)
+    var c = str_char(s, i)
+    if c == "-" {
+        if i + 1 < n && str_char(s, i + 1) == ">" {
+            if i + 2 < n && str_char(s, i + 2) == ">" {
+                return 3
+            }
+            return 2
+        }
+    }
+    if c == "<" {
+        if i + 1 < n && str_char(s, i + 1) == "-" {
+            return 2
+        }
+    }
+    if c == "2" {
+        if i + 2 < n && str_char(s, i + 1) == "-" && str_char(s, i + 2) == ">" {
+            return 3
+        }
+    }
+    if c == "&" {
+        if i + 1 < n && str_char(s, i + 1) == "&" {
+            return 2
+        }
+    }
+    if c == "|" {
+        if i + 1 < n && str_char(s, i + 1) == "|" {
+            return 2
+        }
+        return 1
+    }
+    if c == ";" {
+        return 1
+    }
+    return 0
+}
+
+// 单行语法高亮渲染：返回 (着色文本, 光标可见列)。cur<0 = 输出面（不计列）。
+// 命令位 = 行首或数据流算子（-> && || ; |）之后；内建/谓词亮绿、可执行青；
+// 字符串品红、代码位 {…} 蓝、算子黄。
+pub func hl_line(s: string, cur: i64) -> (string, i64) {
+    // 快速路径：关闭着色时原样返回（仍计光标列，供行编辑模型定位）
+    if !u_col_enabled() {
+        var w0: i64 = 0
+        if cur > 0 {
+            var wj: i64 = 0
+            var lim = cur
+            if str_len(s) < lim {
+                lim = str_len(s)
+            }
+            while wj < lim {
+                w0 = w0 + sh_util.ch_width(str_char(s, wj))
+                wj = wj + 1
+            }
+        }
+        return (s, w0)
+    }
+    var ESC = str_from_code(27)
+    var C_RESET = ESC + "[0m"
+    var C_CMD = ESC + "[1;32m"
+    var C_EXE = ESC + "[36m"
+    var C_OP = ESC + "[33m"
+    var C_STR = ESC + "[35m"
+    var C_BRACE = ESC + "[34m"
+    var sb = string_builder()
+    var n = str_len(s)
+    var i: i64 = 0
+    var col: i64 = 0
+    var cmd_pos = true
+    while i < n {
+        var c = str_char(s, i)
+        if c == " " || c == "\t" {
+            sb_append(sb, c)
+            i = i + 1
+            continue
+        }
+        var opl = hl_op_len(s, i)
+        if opl > 0 {
+            sb_append(sb, C_OP)
+            var oc0 = c
+            var q: i64 = 0
+            while q < opl {
+                var oc = str_char(s, i)
+                sb_append(sb, oc)
+                if i < cur {
+                    col = col + sh_util.ch_width(oc)
+                }
+                i = i + 1
+                q = q + 1
+            }
+            sb_append(sb, C_RESET)
+            if oc0 == "-" && opl == 2 {
+                cmd_pos = true
+            } else if oc0 == "&" || oc0 == "|" || oc0 == ";" {
+                cmd_pos = true
+            } else {
+                cmd_pos = false
+            }
+            continue
+        }
+        if c == "\"" || c == "'" {
+            var qch = c
+            sb_append(sb, C_STR)
+            sb_append(sb, c)
+            if i < cur {
+                col = col + sh_util.ch_width(c)
+            }
+            i = i + 1
+            while i < n {
+                var sc = str_char(s, i)
+                sb_append(sb, sc)
+                if i < cur {
+                    col = col + sh_util.ch_width(sc)
+                }
+                i = i + 1
+                if sc == "\\" && qch == "\"" && i < n {
+                    var ec = str_char(s, i)
+                    sb_append(sb, ec)
+                    if i < cur {
+                        col = col + sh_util.ch_width(ec)
+                    }
+                    i = i + 1
+                    continue
+                }
+                if sc == qch {
+                    break
+                }
+            }
+            sb_append(sb, C_RESET)
+            cmd_pos = false
+            continue
+        }
+        if c == "{" {
+            var depth: i64 = 0
+            sb_append(sb, C_BRACE)
+            while i < n {
+                var bc = str_char(s, i)
+                sb_append(sb, bc)
+                if i < cur {
+                    col = col + sh_util.ch_width(bc)
+                }
+                i = i + 1
+                if bc == "{" {
+                    depth = depth + 1
+                } else if bc == "}" {
+                    depth = depth - 1
+                    if depth == 0 {
+                        break
+                    }
+                }
+            }
+            sb_append(sb, C_RESET)
+            cmd_pos = false
+            continue
+        }
+        var i0 = i
+        while i < n {
+            var wc = str_char(s, i)
+            if wc == " " || wc == "\t" || wc == "\"" || wc == "'" || wc == "{" {
+                break
+            }
+            if hl_op_len(s, i) > 0 {
+                break
+            }
+            i = i + 1
+        }
+        var word = sh_util.u_sub(s, i0, i)
+        var wcmd = false
+        if cmd_pos {
+            if hl_is_cmdword(word) {
+                sb_append(sb, C_CMD)
+                wcmd = true
+            } else if path_exe_exists(word) {
+                sb_append(sb, C_EXE)
+                wcmd = true
+            }
+        }
+        var wj2 = i0
+        while wj2 < i {
+            var wch = str_char(s, wj2)
+            sb_append(sb, wch)
+            if wj2 < cur {
+                col = col + sh_util.ch_width(wch)
+            }
+            wj2 = wj2 + 1
+        }
+        if wcmd {
+            sb_append(sb, C_RESET)
+        }
+        cmd_pos = false
+    }
+    return (sb_build(sb), col)
+}
+
+// 行表高亮拼接（history/alias/文件输出面用）。
+pub func hl_lines(ts: table<string>) -> string {
+    var out = ""
+    var first = true
+    for ln in ts {
+        if !first {
+            out = out + "\n"
+        }
+        var (hl, _c) = hl_line(ln, -1)
+        out = out + hl
+        first = false
+    }
+    return out
+}
+
+// 文件名是否 tie 源（.tie 后缀）。
+func is_tie_name(n: string) -> bool {
+    var l = str_len(n)
+    if l < 4 {
+        return false
+    }
+    return sh_util.u_sub(n, l - 4, l) == ".tie"
+}
+
+// 主入口：按 tokens 分派内建命令，返回输出文本。未知命令返回 "?"。
+pub func c_exec(toks: table<string>) -> string {
+    g_rc = 0
+    if sh_util.u_len(toks) == 0 {
+        return ""
+    }
+    var cmd = toks[0]
+    var args = sub_toks(toks)
+    if cmd == "cd" {
+        return cmd_cd(args)
+    }
+    if cmd == "pwd" {
+        return cwd_norm(g_cwd)
+    }
+    if cmd == "ls" {
+        return cmd_ls(args)
+    }
+    if cmd == "cat" {
+        return cmd_cat(args)
+    }
+    if cmd == "echo" {
+        return sh_util.u_join(args, " ")
+    }
+    if cmd == "exit" {
+        return cmd_exit(args)
+    }
+    if cmd == "help" {
+        return cmd_help(args)
+    }
+    if cmd == "mv" {
+        return cmd_fs("move", args)
+    }
+    if cmd == "cp" {
+        return cmd_fs("copy", args)
+    }
+    if cmd == "rm" {
+        return cmd_fs("del", args)
+    }
+    if cmd == "source" {
+        return cmd_source(args)
+    }
+    if cmd == "history" {
+        return hl_lines(session.ss_lines())
+    }
+    if cmd == "observe" {
+        return cmd_observe(args)
+    }
+    if cmd == "set" {
+        return cmd_set(args)
+    }
+    if cmd == "exec" {
+        return run_external(sh_util.u_join(args, " "))
+    }
+    g_rc = 1
+    return "?"
+}
+
+func cmd_set(args: table<string>) -> string {
+    if sh_util.u_len(args) < 2 {
+        return "set <NAME> <VALUE>"
+    }
+    // set eval-backend interp|trm —— 委托 observe（p.9.3.5）
+    if args[0] == "eval-backend" {
+        return observe.o_set_backend(args[1])
+    }
+    set_env(args[0], args[1])
+    return ""
+}
+
+// observe 观测前端：backend（查询当前后端）| disasm | step | dynload（接口等待）。
+func cmd_observe(args: table<string>) -> string {
+    if sh_util.u_len(args) == 0 {
+        return "observables: backend | disasm | step | dynload（正在 using interp 后端）"
+    }
+    var sub = args[0]
+    if sub == "backend" {
+        return "eval-backend: " + observe.o_backend()
+    }
+    if sub == "disasm" {
+        return observe.o_disasm(args_at(args, 1))
+    }
+    if sub == "step" {
+        return observe.o_step(args_at(args, 1))
+    }
+    if sub == "dynload" {
+        return observe.o_dynload(args_at(args, 1))
+    }
+    return "observe: unknown subcommand '" + sub + "'"
+}
+
+// 帮助（三档）：help 总览 / help <命令> 单项 / help * 全量逐项（cmd 风格）。
+func cmd_help(args: table<string>) -> string {
+    if sh_util.u_len(args) == 0 {
+        return u_bold("tshell 内建命令:") + " cd pwd ls cat echo mv cp rm set source exec history alias observe help exit\n" +
+            "  help <命令> 查看单项用法与示例； help * 打印全部逐项帮助（cmd 风格全量表）\n" +
+            "  符号: [ ] 可选 · < > 必填占位 · | 二选一 · … 可重复（help * 开头有详解）\n" +
+            "  数据流: '->'（管道/送出）'->>'（追加）'<-'（输入）'2->'（错误）；复合: '&&' '||' ';'\n" +
+            "  外部命令经 PATH 检索直启；别名见 'alias'；变量面（rc/argv/代码位）见 help *。"
+    }
+    if args_at(args, 0) == "*" {
+        return help_all()
+    }
+    return help_one(args_at(args, 0))
+}
+
+// 一行说明（索引与单项首行共用）。
+func help_desc(cmd: string) -> string {
+    if cmd == "cd" {
+        return "切换当前目录（无参显示当前）"
+    }
+    if cmd == "pwd" {
+        return "显示当前目录"
+    }
+    if cmd == "ls" {
+        return "列出目录内容"
+    }
+    if cmd == "cat" {
+        return "打印文件内容"
+    }
+    if cmd == "echo" {
+        return "回显参数（代码位/h 插值在此求值）"
+    }
+    if cmd == "mv" {
+        return "移动/重命名文件"
+    }
+    if cmd == "cp" {
+        return "复制文件"
+    }
+    if cmd == "rm" {
+        return "删除文件"
+    }
+    if cmd == "set" {
+        return "设置环境变量 / 求值后端"
+    }
+    if cmd == "source" {
+        return "求值 tie 源文件（入当前会话）"
+    }
+    if cmd == "exec" {
+        return "强制命令语境执行（支持动态命令）"
+    }
+    if cmd == "history" {
+        return "列出会话历史"
+    }
+    if cmd == "alias" {
+        return "列出/定义别名（持久 config.td）"
+    }
+    if cmd == "observe" {
+        return "求值后端观测面（backend/disasm/step/dynload）"
+    }
+    if cmd == "help" {
+        return "帮助总览 / 单项 / 全量"
+    }
+    if cmd == "exit" {
+        return "退出会话（可选退出码）"
+    }
+    return ""
+}
+
+// 单项帮助：说明 + 用法 + 示例。
+func help_one(cmd: string) -> string {
+    var d = help_desc(cmd)
+    if d == "" {
+        return "help: 未知命令 '" + cmd + "'（help 查看内建列表；help * 全量逐项）"
+    }
+    if cmd == "cd" {
+        return u_bold("cd") + " — " + d + "\n  " + u_cyan("用法:") + " cd [dir]\n  " + u_dim("例:") + " cd ../tiec"
+    }
+    if cmd == "pwd" {
+        return u_bold("pwd") + " — " + d + "\n  " + u_cyan("用法:") + " pwd\n  " + u_dim("例:") + " pwd"
+    }
+    if cmd == "ls" {
+        return u_bold("ls") + " — " + d + "\n  " + u_cyan("用法:") + " ls [dir]\n  " + u_dim("例:") + " ls src"
+    }
+    if cmd == "cat" {
+        return u_bold("cat") + " — " + d + "\n  " + u_cyan("用法:") + " cat <file>\n  " + u_dim("例:") + " cat tpkg.config.td"
+    }
+    if cmd == "echo" {
+        return u_bold("echo") + " — " + d + "\n  " + u_cyan("用法:") + " echo <词…>\n  " + u_dim("例:") + " echo h\"共 {1 + 1} 个\""
+    }
+    if cmd == "mv" {
+        return u_bold("mv") + " — " + d + "\n  " + u_cyan("用法:") + " mv <src> <dst>\n  " + u_dim("例:") + " mv a.txt b.txt"
+    }
+    if cmd == "cp" {
+        return u_bold("cp") + " — " + d + "\n  " + u_cyan("用法:") + " cp <src> <dst>\n  " + u_dim("例:") + " cp a.txt b.txt"
+    }
+    if cmd == "rm" {
+        return u_bold("rm") + " — " + d + "\n  " + u_cyan("用法:") + " rm <file>\n  " + u_dim("例:") + " rm tmp.txt"
+    }
+    if cmd == "set" {
+        return u_bold("set") + " — " + d + "\n  " + u_cyan("用法:") + " set <NAME> <VALUE>  |  set eval-backend interp|trm\n  " + u_dim("例:") + " set MYVAR 1"
+    }
+    if cmd == "source" {
+        return u_bold("source") + " — " + d + "\n  " + u_cyan("用法:") + " source <file.tie>\n  " + u_dim("例:") + " source rc.tie"
+    }
+    if cmd == "exec" {
+        return u_bold("exec") + " — " + d + "\n  " + u_cyan("用法:") + " exec <命令…>  |  exec {表达式}（动态命令）\n  " + u_dim("例:") + " exec {cmdvar} --help"
+    }
+    if cmd == "history" {
+        return u_bold("history") + " — " + d + "\n  " + u_cyan("用法:") + " history\n  " + u_dim("例:") + " history"
+    }
+    if cmd == "alias" {
+        return u_bold("alias") + " — " + d + "\n  " + u_cyan("用法:") + " alias  |  alias name=value\n  " + u_dim("例:") + " alias ll=ls -> count"
+    }
+    if cmd == "observe" {
+        return u_bold("observe") + " — " + d + "\n  " + u_cyan("用法:") + " observe [backend|disasm|step|dynload]\n  " + u_dim("例:") + " observe backend"
+    }
+    if cmd == "help" {
+        return u_bold("help") + " — " + d + "\n  " + u_cyan("用法:") + " help  |  help <命令>  |  help *\n  " + u_dim("例:") + " help *"
+    }
+    if cmd == "exit" {
+        return u_bold("exit") + " — " + d + "\n  " + u_cyan("用法:") + " exit [N]\n  " + u_dim("例:") + " exit 0"
+    }
+    return "help: 未知命令 '" + cmd + "'"
+}
+
+// 全量逐项帮助（cmd 风格）：索引 → 逐项 → 总则（记号/外部/变量面/别名）。
+func help_all() -> string {
+    var names = builtin_names()
+    var out = "tshell 内建命令逐项帮助（单项: help <命令>）\n"
+    out = out + "\n【符号约定】\n"
+    out = out + "  [x]       可选部分——可省略。例: cd [dir]（cd 或 cd 某目录，都合法）\n"
+    out = out + "  <x>       必填占位——换成实际值。例: cat <file>（file 处写真实文件名）\n"
+    out = out + "  a | b     二选一。例: set eval-backend interp|trm（选其一）\n"
+    out = out + "  x…        可重复。例: echo <词…>（任意多个词）\n"
+    out = out + "  '->' 等   字面记号——原样输入，不是占位（引号只是本文档的强调写法）\n"
+    out = out + "  合读示例: mv <src> <dst> 即『mv 空格 源 空格 目标』，如 mv a.txt b.txt。\n"
+    out = out + "\n【索引】\n"
+    for n in names {
+        out = out + "  " + pad_name(n) + help_desc(n) + "\n"
+    }
+    out = out + "\n【逐项】\n"
+    for n2 in names {
+        out = out + "\n" + help_one(n2) + "\n"
+    }
+    out = out + "\n【记号与复合】\n"
+    out = out + "  '->' 送出（管道；右端为文件则重定向写入）   '->>' 追加重定向\n"
+    out = out + "  '<-' 输入来源（文件内容作 stdin）   '2->' 错误通道（文件；'2-> stdout' 合流）\n"
+    out = out + "  '&&' 成功续跑   '||' 失败续跑   ';' 顺序执行（rc 驱动；被跳过段不算结果）\n"
+    out = out + "  命令语境 '|' 不是管道（会提示改用 '->'；集合并仅语言语境）\n"
+    out = out + "\n【外部命令】\n"
+    out = out + "  首词含路径分隔或 PATH 命中即可执行（直启、无 shell 借用）；\n"
+    out = out + "  启动失败给出检索结论（'无法启动 …（不在 PATH 或不可执行）'）。\n"
+    out = out + "\n【变量面】\n"
+    out = out + "  {表达式} 代码位（求值为单个参数）； h\"…{…}…\" 插值；\n"
+    out = out + "  {rc} 最近退出码； {argv[1..]} 脚本参数（argv[0]=脚本路径）。\n"
+    out = out + "\n【别名】\n"
+    out = out + "  alias name=value 持久于 ~/.tshell/config.td；下一行即生效（含 '->' 等算子）。\n"
+    return out
+}
+
+// 名称列对齐（索引用）。
+func pad_name(n: string) -> string {
+    var out = n
+    while str_len(out) < 10 {
+        out = out + " "
+    }
+    return out
+}
+
+func cmd_cd(args: table<string>) -> string {
+    var dest = cwd_norm(g_cwd)
+    if sh_util.u_len(args) > 0 {
+        dest = join_cwd(dest, args[0])
+    }
+    if !file_is_dir(dest) {
+        g_rc = 1
+        return "cd: no such directory: " + dest
+    }
+    g_cwd = dest
+    return ""
+}
+
+func cmd_ls(args: table<string>) -> string {
+    var dir = cwd_norm(g_cwd)
+    if sh_util.u_len(args) > 0 {
+        dir = join_cwd(dir, args[0])
+    }
+    var cols = table_new_string()
+    var entries = list_dir(dir)
+    for e in entries {
+        if e != "." && e != ".." {
+            table_push(cols, e)
+        }
+    }
+    return sh_util.u_join(cols, "\n")
+}
+
+func cmd_cat(args: table<string>) -> string {
+    if sh_util.u_len(args) < 1 {
+        g_rc = 1
+        return "cat <file>"
+    }
+    var path = join_cwd(cwd_norm(g_cwd), args[0])
+    if !file_exists(path) {
+        g_rc = 1
+        return "cat: no such file: " + args[0]
+    }
+    var content = file_read(path)
+    // tie 源文件：终端下逐行语法高亮（管道/重定向由 u_col_enabled 守门保持原字节）
+    if u_col_enabled() && is_tie_name(args[0]) {
+        return hl_lines(sh_util.u_lines(content))
+    }
+    return content
+}
+
+// mv/cp/rm：直接经文件系统内置（不再经 cmd 内部命令——move/copy/del 非可执行体）。
+func cmd_fs(op: string, args: table<string>) -> string {
+    if sh_util.u_len(args) < 2 && op != "del" {
+        g_rc = 1
+        return op + " <src> <dst>"
+    }
+    var src = join_cwd(cwd_norm(g_cwd), args[0])
+    var dst = ""
+    if sh_util.u_len(args) >= 2 {
+        dst = join_cwd(cwd_norm(g_cwd), args[1])
+    }
+    if op == "move" {
+        if !file_move(src, dst) {
+            g_rc = 1
+            return "mv: 失败: " + args[0] + " -> " + args[1]
+        }
+        return ""
+    }
+    if op == "copy" {
+        if !file_copy(src, dst) {
+            g_rc = 1
+            return "cp: 失败: " + args[0] + " -> " + args[1]
+        }
+        return ""
+    }
+    if !file_delete(src) {
+        g_rc = 1
+        return "rm: 失败: " + args[0]
+    }
+    return ""
+}
+
+func cmd_source(args: table<string>) -> string {
+    if sh_util.u_len(args) < 1 {
+        g_rc = 1
+        return "source <file.tie>"
+    }
+    var path = join_cwd(cwd_norm(g_cwd), args[0])
+    if !file_exists(path) {
+        g_rc = 1
+        return "source: no such file: " + args[0]
+    }
+    return backend_interp.b_eval(file_read(path))
+}
+
+// ---- 外部命令 ----
+pub func run_external(cmdline: string) -> string {
+    return sh_util.u_trim(run_in_dir(cmdline))
+}
+
+// 经 tiej 执行域引擎执行：词表切分（引号感知）→ capture（cwd 直启，无 cd 前缀）。
+// 启动失败（不在 PATH / 不可执行）返回明确诊断——不静默。
+func run_in_dir(cmdline: string) -> string {
+    var toks = sh_util.u_split_ws(cmdline)
+    if sh_util.u_len(toks) == 0 {
+        return ""
+    }
+    var r = execrun.capture(toks, cwd_norm(g_cwd), "")
+    if !r.started {
+        return "tshell: 无法启动 '" + toks[0] + "'（不在 PATH 或不可执行）"
+    }
+    return r.out + r.err
+}
+
+// ---- did-you-mean（朴素编辑距离）----
+pub func c_did_you_mean(word: string) -> string {
+    var names = builtin_names()
+    var best = ""
+    var bestd: i64 = 99
+    for n in names {
+        if n == word {
+            continue
+        }
+        var d = edit_dist(word, n)
+        if d < bestd {
+            bestd = d
+            best = n
+        }
+    }
+    if bestd <= 2 {
+        return best
+    }
+    return ""
+}
+
+func edit_dist(a: string, b: string) -> i64 {
+    var an = str_len(a)
+    var bn = str_len(b)
+    var i: i64 = 0
+    var j: i64 = 0
+    var cost: i64 = 0
+    while i < an && j < bn {
+        if str_char(a, i) == str_char(b, j) {
+            i = i + 1
+            j = j + 1
+        } else {
+            cost = cost + 1
+            i = i + 1
+            j = j + 1
+        }
+    }
+    if i < an { cost = cost + (an - i) }
+    if j < bn { cost = cost + (bn - j) }
+    return cost
+}
+
+// ---- 路径工具 ----
+func cwd_norm(cwd: string) -> string {
+    if cwd == "" {
+        return cwd_or_dot()
+    }
+    return cwd
+}
+
+func cwd_or_dot() -> string {
+    var w = cwd()
+    if w == "" {
+        return "."
+    }
+    return w
+}
+
+func join_cwd(base: string, rel: string) -> string {
+    if rel == "" {
+        return base
+    }
+    if is_abs(rel) {
+        return rel
+    }
+    if base == "." || base == "" {
+        return rel
+    }
+    var bn = str_len(base)
+    var lastc = str_char(base, bn - 1)
+    if lastc == "/" || lastc == "\\" {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+func is_abs(p: string) -> bool {
+    var n = str_len(p)
+    if n == 0 { return false }
+    var c0 = str_char(p, 0)
+    if c0 == "/" || c0 == "\\" {
+        return true
+    }
+    if n >= 2 && str_char(p, 0) >= "A" && str_char(p, 0) <= "Z" && str_char(p, 1) == ":" {
+        return true
+    }
+    if n >= 2 && str_char(p, 0) >= "a" && str_char(p, 0) <= "z" && str_char(p, 1) == ":" {
+        return true
+    }
+    return false
+}
+
+// tokens 去掉首元素（参数视图）。
+func sub_toks(toks: table<string>) -> table<string> {
+    var out = table_new_string()
+    var first = true
+    for x in toks {
+        if first {
+            first = false
+        } else {
+            table_push(out, x)
+        }
+    }
+    return out
+}
+
+}   // namespace command

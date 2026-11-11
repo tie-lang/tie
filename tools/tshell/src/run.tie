@@ -1,0 +1,471 @@
+type tie<logic>
+import "./sh_util.tie"
+import "./command.tie"
+import "./repl.tie"
+import "./session.tie"
+import "./render.tie"
+import "./shlang.tie"
+import "./backend_interp.tie"
+// src/run.tie —— 脚本运行时模块（L0，p.9.3.3）：-e / -f / 脚本 / shebang
+// --------------------------------------------------------------
+// 脚本与交互同引擎（架构 §6「脚本即交互」）：以同一 REPL 分派逐行执行——tie 表达式、
+// 内建命令、值管道在主循环首层生效；脚本文件整文件按 tie 程序跑并注入壳服务
+//（argv/env/cwd/退出码）。shebang（#!/usr/bin/env tshell）支持去首行；**Windows 平台
+// 限制**：系统不原生支持 shebang，须显式 `tshell script.tie`（或配置关联）。
+//
+// EN: script runtime (run module). Script and interactive share the same
+// dispatcher (design §6 "scripts are interactive"). shebang line is stripped;
+// Windows does not natively honor shebang — invoke `tshell script.tie` explicitly.
+
+namespace run {
+
+// 解析命令行参数：-e <expr> / -f <file>（或裸脚本路径）。返回模式：
+// 约定以 table<string> 传 [mode, value]；mode: "repl"|"e"|"f"|"script"。
+pub func rn_args() -> table<string> {
+    var out = table_new_string()
+    var i: i64 = 0
+    var argc = args_n()
+    if argc == 0 {
+        table_push(out, "repl")
+        return out
+    }
+    var a0 = arg_string(0)
+    if a0 == "-e" {
+        table_push(out, "e")
+        table_push(out, args_at(1))
+        return out
+    }
+    if a0 == "-f" {
+        table_push(out, "f")
+        table_push(out, args_at(1))
+        return out
+    }
+    if a0 == "--stdio" {
+        table_push(out, "stdio")
+        return out
+    }
+    // 其它视为脚本路径
+    table_push(out, "script")
+    table_push(out, a0)
+    return out
+}
+
+func args_n() -> i64 { return arg_count() }
+func args_at(i: i64) -> string {
+    if i < 0 || i >= arg_count() { return "" }
+    return arg_string(i)
+}
+
+// tie 风格 argv 注入（§3.2 特殊变量；argv[0]=脚本路径，[1..]=参数）。
+func inject_argv(path: string, sargs: table<string>) {
+    var lit = "var argv = [\"" + esc_lit(path) + "\""
+    for a in sargs {
+        lit = lit + ", \"" + esc_lit(a) + "\""
+    }
+    lit = lit + "]"
+    var _r = backend_interp.b_eval(lit)
+}
+
+// tie 字符串字面量转义（\ " 换行）。
+func esc_lit(s: string) -> string {
+    var out = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\\" {
+            out = out + "\\\\"
+        } else if c == "\"" {
+            out = out + "\\\""
+        } else if c == "\n" {
+            out = out + "\\n"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 单行求值（-e "expr"）：交共享分派，返回输出文本。
+// rc 启动脚本（~/.tshell/rc.tie；tie 脚本形态）——REPL 前由宿主执行；
+// 用于会话变量/函数预置（别名走 config.td 的 alias.* 面）。无文件返回空串。
+pub func rn_run_rc() -> string {
+    var p = session.ss_home() + "/.tshell/rc.tie"
+    if !file_exists(p) {
+        return ""
+    }
+    return backend_interp.b_eval_script(file_read(p))
+}
+
+pub func rn_eval_expr(expr: string) -> string {
+    return repl.repl_handle(expr)
+}
+
+// 执行脚本文件（-f / 裸路径）：整文件语义（p.9.4）。整文件 parse + 顺序求值，
+// 函数跨行持久、多行 if/while/for 块、字符串/目录/参数/hash 内建、条件 exit(n)
+// 全部生效；脚本内 exit(非0) → 进程返回该退出码（失败契约）。
+pub func rn_run_script(path: string) -> i64 {
+    if path == "" {
+        print_err("[tshell] 脚本路径为空\n")
+        return 1
+    }
+    if !file_exists(path) {
+        print_err("[tshell] 脚本文件不存在: " + path + "\n")
+        return 1
+    }
+    var content = file_read(path)
+    if sh_util.u_starts(sh_util.u_trim(content), "#!") {
+        // 去 shebang 首行（Windows 平台限制：须显式 tshell 调用）
+        content = strip_shebang(content)
+    }
+    // 去 tsh 角色头部声明（`type tie<tsh>`）——纯角色声明语法，非可求值语句。
+    content = strip_role_header(content)
+    // 收集脚本参数（跳过 `-f <path>` 或裸脚本路径前缀）：argv[0] 为 -f 时
+    // 从下标 2 起，否则（裸路径）从下标 1 起。
+    var sargs = table_new_string()
+    var off: i64 = 1
+    if arg_string(0) == "-f" {
+        off = 2
+    }
+    var ai: i64 = off
+    while ai < arg_count() {
+        table_push(sargs, arg_string(ai))
+        ai = ai + 1
+    }
+    backend_interp.b_set_script_args(sargs)
+    // 注入 tie 风格 argv（§3.2 特殊变量：argv[0]=脚本路径，[1..]=参数；{
+    // 脚本内 argv[1] / h"…{argv[1]}…" 可读）。
+    inject_argv(path, sargs)
+    // 顶层裸 `exit [N]`（旧式命令形）归一化为 `exit(N)` 表达式形——全文件求值时
+    // `exit 7` 非合法 tie 语法；新契约统一为 `exit(n)`。父表达式形 exit(...) 原样透传。
+    content = normalize_exit_calls(content)
+    // 混合脚本判定：任一块为命令语境 ⇒ 行级分派；否则整文件求值（纯 tie 语义
+    // 完全保留：全套两趟注册、先调用后定义等均不变）。
+    if !script_has_command(content) {
+        var out0 = backend_interp.b_eval_script(content)
+        if backend_interp.b_exit_requested() {
+            return backend_interp.b_exit_code()
+        }
+        if out0 != "" {
+            if sh_util.u_starts(out0, "tshell: command not found") {
+                print_err(out0 + "\n")
+            } else {
+                println(out0)
+            }
+        }
+        return 0
+    }
+    return run_mixed(content)
+}
+
+// ==================== 混合脚本：行级分派（语言级形态的运行时实现） ====================
+// 块规则：按「引号/括号再平衡」聚合为逻辑块；块按首词判定——
+//   · `var NAME <- …`（捕获）、`… -> env.NAME`（导出）、命令语境首词 ⇒ 交引擎
+//   · 其余 ⇒ tie 求值（b_eval；混合脚本按序求值：先定义后使用）
+// 赋值守卫：第二词为 `=` / `<-` 的行一律按 tie（防 `count = 3` 误判为命令）。
+
+// 任一块为命令语境？
+func script_has_command(content: string) -> bool {
+    var lines = sh_util.u_lines(content)
+    var pending = ""
+    for ln in lines {
+        if len(pending) > 0 {
+            pending = pending + "\n" + ln
+        } else {
+            pending = ln
+        }
+        if shlang.line_balanced(pending) {
+            if chunk_is_command(pending) {
+                return true
+            }
+            pending = ""
+        }
+    }
+    return false
+}
+
+// 逻辑块是否命令语境。
+func chunk_is_command(ch: string) -> bool {
+    var t = sh_util.u_trim(ch)
+    if len(t) == 0 {
+        return false
+    }
+    var (tx2, tk2, tm2) = shlang.lex_line(t)
+    if len(tx2) == 0 {
+        return false
+    }
+    // `var NAME <- …` ⇒ 捕获（命令）
+    if tk2[0] == 0 && tm2[0] == 0 && tx2[0] == "var" && len(tx2) >= 3 {
+        if tk2[2] == 3 {
+            return true
+        }
+        return false
+    }
+    // `… -> env.NAME` ⇒ 导出（命令）
+    var vl = len(tx2) - 1
+    if len(tx2) >= 3 && tk2[vl] == 0 && tm2[vl] == 0 && tk2[vl - 1] == 1 {
+        if sh_util.u_starts(tx2[vl], "env.") {
+            return true
+        }
+    }
+    // 赋值守位：第二词 `=` / `<-` ⇒ tie
+    if len(tx2) >= 2 && tk2[1] == 3 {
+        return false
+    }
+    if len(tx2) >= 2 && tk2[1] == 0 && tx2[1] == "=" {
+        return false
+    }
+    if tk2[0] != 0 {
+        return false
+    }
+    return shlang.looks_like_command(tx2[0])
+}
+
+// 混合脚本主循环。
+func run_mixed(content: string) -> i64 {
+    var lines = sh_util.u_lines(content)
+    var pending = ""
+    var last_val = ""
+    for ln in lines {
+        if len(pending) > 0 {
+            pending = pending + "\n" + ln
+        } else {
+            pending = ln
+        }
+        if !shlang.line_balanced(pending) {
+            continue
+        }
+        var chunk = pending
+        pending = ""
+        if sh_util.u_trim(chunk) == "" {
+            continue
+        }
+        if chunk_is_command(chunk) {
+            var cr = shlang.sl_run(shutil_trim_keep(chunk))
+            if len(cr.out) > 0 {
+                render.r_emit(cr.out)
+            }
+        } else {
+            var out = backend_interp.b_eval(chunk)
+            if backend_interp.b_exit_requested() {
+                return backend_interp.b_exit_code()
+            }
+            if sh_util.u_starts(out, "已定义") {
+                out = ""
+            }
+            if out != "" {
+                last_val = out
+            }
+        }
+    }
+    if sh_util.u_trim(pending) != "" {
+        var out2 = backend_interp.b_eval(pending)
+        if backend_interp.b_exit_requested() {
+            return backend_interp.b_exit_code()
+        }
+        if sh_util.u_starts(out2, "已定义") {
+            out2 = ""
+        }
+        if out2 != "" {
+            last_val = out2
+        }
+    }
+    if last_val != "" {
+        if sh_util.u_starts(last_val, "tshell: command not found") {
+            print_err(last_val + "\n")
+        } else {
+            println(last_val)
+        }
+    }
+    return 0
+}
+
+// 去首尾空白但保留内部换行。
+func shutil_trim_keep(s: string) -> string {
+    return sh_util.u_trim(s)
+}
+
+// 去 tsh 角色头部声明行：连续前导空白行后的 `type tie` 或 `type tie<...>` 声明。
+// 仅剥首个非空行；该行是脚本角色头，非可执行语句（tiec 已据其分派到 tshell）。
+func strip_role_header(content: string) -> string {
+    var lines = sh_util.u_lines(content)
+    var out = table_new_string()
+    var first: i64 = 0
+    var n = sh_util.u_len(lines)
+    // 跳到首个非空白行
+    while first < n && sh_util.u_trim(lines[first]) == "" {
+        first = first + 1
+    }
+    var trimmed = ""
+    if first < n {
+        trimmed = sh_util.u_trim(lines[first])
+    }
+    if sh_util.u_starts(trimmed, "type tie") {
+        // 剥该行
+        var i: i64 = 0
+        while i < n {
+            if i != first {
+                table_push(out, lines[i])
+            }
+            i = i + 1
+        }
+        return sh_util.u_join(out, "\n")
+    }
+    return content
+}
+
+// 单行脚本执行：优先 builtin 函数式调用（`ls()`/`cd(dir)`），再交共享分派。
+func run_line(ln: string) -> string {
+    var t = sh_util.u_trim(ln)
+    if t == "" {
+        return ""
+    }
+    // builtin 函数式调用 `name(arg1, arg2)`
+    if is_builtin_call(t) {
+        return builtin_call(t)
+    }
+    return repl.repl_handle(t)
+}
+
+// 判断是否为 `builtin(...)` 形式。
+func is_builtin_call(t: string) -> bool {
+    var n = str_len(t)
+    if n < 3 { return false }
+    var lastc = str_char(t, n - 1)
+    if lastc != ")" { return false }
+    var name = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(t, i)
+        if c == "(" {
+            break
+        }
+        name = name + c
+        i = i + 1
+    }
+    if i >= n { return false }
+    return command.c_is_builtin(name)
+}
+
+// 执行 `name(arg1, arg2)` → 参数按逗号切分传入 command。
+func builtin_call(t: string) -> string {
+    var name = ""
+    var inner = ""
+    var n = str_len(t)
+    var i: i64 = 0
+    while i < n && str_char(t, i) != "(" {
+        name = name + str_char(t, i)
+        i = i + 1
+    }
+    i = i + 1 // 跳 '('
+    var grab = false
+    while i < n {
+        var c = str_char(t, i)
+        if c == ")" {
+            grab = true
+            break
+        }
+        inner = inner + c
+        i = i + 1
+    }
+    var toks = table_new_string()
+    table_push(toks, sh_util.u_trim(name))
+    // 逗号切分参数（无引号感知的简化：按逗号拆分）
+    if sh_util.u_trim(inner) != "" {
+        var parts = split_commas(inner)
+        for p in parts {
+            table_push(toks, strip_quotes(sh_util.u_trim(p)))
+        }
+    }
+    return command.c_exec(toks)
+}
+
+func split_commas(s: string) -> table<string> {
+    var out = table_new_string()
+    var cur = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == "," {
+            table_push(out, cur)
+            cur = ""
+        } else {
+            cur = cur + str_char(s, i)
+        }
+        i = i + 1
+    }
+    table_push(out, cur)
+    return out
+}
+
+func strip_quotes(s: string) -> string {
+    var n = str_len(s)
+    if n >= 2 && ((str_char(s, 0) == "\"" && str_char(s, n - 1) == "\"") ||
+                  (str_char(s, 0) == "'" && str_char(s, n - 1) == "'")) {
+        return sh_util.u_sub(s, 1, n - 1)
+    }
+    return s
+}
+
+// 去 shebang 首行。
+func strip_shebang(content: string) -> string {
+    var lines = sh_util.u_lines(content)
+    var out = table_new_string()
+    var first = true
+    for ln in lines {
+        if first {
+            first = false
+            continue
+        }
+        table_push(out, ln)
+    }
+    return sh_util.u_join(out, "\n")
+}
+
+// 顶层裸 exit 命令归一化：整行 trim 后恰为 `exit` 或 `exit <十进制整数>`
+// 的顶层语句改写为 exit(0) / exit(N)；`exit(...)` 表达式形原样透传。
+func normalize_exit_calls(content: string) -> string {
+    var lines = sh_util.u_lines(content)
+    var out = table_new_string()
+    for ln in lines {
+        out = normalize_one_exit_line(ln, out)
+    }
+    return sh_util.u_join(out, "\n")
+}
+
+func normalize_one_exit_line(ln: string, ref out: table<string>) -> table<string> {
+    var t = sh_util.u_trim(ln)
+    if t == "exit" {
+        table_push(out, "exit(0)")
+        return out
+    }
+    var n = str_len(t)
+    if n > 4 && sh_util.u_starts(t, "exit") && str_char(t, 4) == " " {
+        var arg = sh_util.u_trim(sh_util.u_sub(t, 5, n))
+        if is_digits(arg) {
+            table_push(out, "exit(" + arg + ")")
+            return out
+        }
+    }
+    table_push(out, ln)
+    return out
+}
+
+func is_digits(s: string) -> bool {
+    var n = str_len(s)
+    if n == 0 {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c < "0" || c > "9" {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+}   // namespace run

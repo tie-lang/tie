@@ -1,0 +1,986 @@
+type tie<logic>
+import "./sh_util.tie"
+import "./command.tie"
+import "./session.tie"
+import "./shlang.tie"
+import "../../tiej/src/core/term.tie"
+// src/lineedit.tie —— 行编辑模块（L2，p.9.3.2）：tie 自研行编辑状态机
+// --------------------------------------------------------------
+// 两层次：**状态模型**（插入/退格/删除/左右/Home/End/历史上下；本先行批原有，
+// 签名保持）+ **tty 驱动层**（2026-10-16 接入：term 终端原语逐键驱动、VT 重绘、
+// Tab 补全、Ctrl-C 清行、引用不平衡自动续行 `....> `；同日深化：**Ctrl-R 历史
+// 反搜**、**括号/引号自动配对**（含跳过右半与成对删除）、**语法高亮**（命令位/
+// 算子/字符串/代码位着色）、**数据流算子补全**（`-`+Tab → `->` 等））。
+// 架构 §7 自研纪律：零外部 readline。非 tty 输入（管道/脚本）自动降级为
+// read_line 直读（le_active 判据；`-f`/`-e`/srv 路径不经本模块）。
+//
+// EN: line-editing module — state model (as before) + tty driver layer:
+// per-key events from term primitives, VT redraw, Tab completion (builtin ->
+// PATH -> paths), Ctrl-C clears the line, quote-aware continuation.  Non-tty
+// input degrades to read_line.
+
+// 编辑状态（文件顶层全局，命名空间内裸名访问）：
+var g_buf: string = ""
+var g_cur: i64 = 0          // 光标在 buffer 中的位置（码点索引）
+var g_hist_idx: i64 = 0     // 当前历史游标（-1 = 不在历史回放中）
+var g_hist_now: string = "" // 进入历史回放时的原始输入缓存
+var g_vt: bool = false        // VT 可用（le_read 探测；不可用则降级朴素渲染）
+var g_ml_rows: i64 = 0        // 上次渲染占用的行数（0=无区域；多行视图用）
+var g_ml_cline: i64 = 0       // 上次渲染后光标所在行（区域归位基准）
+var g_hl_off: bool = false    // config: ui.hl=false ⇒ 关闭高亮与两遍实测渲染（朴素重绘安全阀）
+var g_hl_load: bool = false   // 配置读取一次性标记
+
+namespace lineedit {
+
+// ==================== 状态模型（先行批原有 API） ====================
+
+// 复位编辑缓冲。
+pub func le_reset() {
+    g_buf = ""
+    g_cur = 0
+    g_hist_idx = -1
+    g_hist_now = ""
+}
+
+// 取得当前缓冲文本。
+pub func le_get() -> string {
+    return g_buf
+}
+
+// 取得光标位置。
+pub func le_cursor() -> i64 {
+    return g_cur
+}
+
+// 设置缓冲与光标（补全替换用）。
+pub func le_set(b: string, c: i64) {
+    g_buf = b
+    g_cur = c
+}
+
+// 光标右移一格。
+pub func le_right() {
+    var n = str_len(g_buf)
+    if g_cur < n {
+        g_cur = g_cur + 1
+    }
+}
+
+// 光标左移一格。
+pub func le_left() {
+    if g_cur > 0 {
+        g_cur = g_cur - 1
+    }
+}
+
+// 光标移到行首。
+pub func le_home() {
+    g_cur = 0
+}
+
+// 光标移到行尾。
+pub func le_end() {
+    g_cur = str_len(g_buf)
+}
+
+// 在光标处插入字符 ch。
+pub func le_insert(ch: string) {
+    if g_cur <= 0 {
+        g_buf = ch + g_buf
+    } else if g_cur >= str_len(g_buf) {
+        g_buf = g_buf + ch
+    } else {
+        var left = sub(g_buf, 0, g_cur)
+        var right = sub(g_buf, g_cur, str_len(g_buf))
+        g_buf = left + ch + right
+    }
+    g_cur = g_cur + 1
+}
+
+// 删除光标前一字符（退格）。
+pub func le_backspace() {
+    if g_cur <= 0 {
+        return
+    }
+    if g_cur >= str_len(g_buf) {
+        g_buf = sub(g_buf, 0, g_cur - 1)
+    } else {
+        var left = sub(g_buf, 0, g_cur - 1)
+        var right = sub(g_buf, g_cur, str_len(g_buf))
+        g_buf = left + right
+    }
+    g_cur = g_cur - 1
+}
+
+// 删除光标处字符（Delete）。
+pub func le_delete() {
+    var n = str_len(g_buf)
+    if g_cur >= n {
+        return
+    }
+    if g_cur + 1 >= n {
+        g_buf = sub(g_buf, 0, g_cur)
+    } else {
+        var left = sub(g_buf, 0, g_cur)
+        var right = sub(g_buf, g_cur + 1, n)
+        g_buf = left + right
+    }
+}
+
+// 历史回放：向上（更旧）。传入历史表（string 表）。
+pub func le_hist_up(hist: table<string>) {
+    var n = hist_count(hist)
+    if n == 0 {
+        return
+    }
+    if g_hist_idx == -1 {
+        g_hist_now = g_buf
+        g_hist_idx = n - 1
+    } else if g_hist_idx > 0 {
+        g_hist_idx = g_hist_idx - 1
+    } else {
+        return
+    }
+    g_buf = at_n(hist, g_hist_idx)
+    g_cur = str_len(g_buf)
+}
+
+// 历史回放：向下（更新）。回到原始输入后复位。
+pub func le_hist_down(hist: table<string>) {
+    var n = hist_count(hist)
+    if n == 0 || g_hist_idx == -1 {
+        return
+    }
+    g_hist_idx = g_hist_idx + 1
+    if g_hist_idx < n {
+        g_buf = at_n(hist, g_hist_idx)
+    } else {
+        g_buf = g_hist_now
+        g_hist_idx = -1
+    }
+    g_cur = str_len(g_buf)
+}
+
+// 提交当前行：清空缓冲，返回文本（历史记录由调用方负责）。
+pub func le_accept() -> string {
+    var line = g_buf
+    le_reset()
+    g_ml_rows = 0
+    g_ml_cline = 0
+    return line
+}
+
+// ==================== tty 驱动层（2026-10-16 接入） ====================
+
+// 是否启用行编辑（TTY 判据；非 tty 上层降级 read_line）。
+pub func le_active() -> bool {
+    return term.tty_ok()
+}
+
+// 高亮/实测渲染开关（config: ui.hl=false 关闭；懒读一次）。
+func hl_check() {
+    if g_hl_load {
+        return
+    }
+    g_hl_load = true
+    var cfg = session.ss_load_cfg()
+    if session.ss_cfg_get(cfg, "ui.hl") == "false" {
+        g_hl_off = true
+    }
+}
+
+// 会话收尾（恢复终端状态）。
+pub func le_shutdown() {
+    term.raw_off()
+}
+
+// ESC 字符（tie 字面量无 \x 转义，按码点构造）。
+func esc_s() -> string {
+    return str_from_code(27)
+}
+
+// ---- 补全（内建 → PATH 可执行 → 文件路径；惰性） ----
+
+func starts_with(s: string, pre: string) -> bool {
+    if len(pre) > len(s) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(pre) {
+        if str_byte(s, i) != str_byte(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 首词候选：内建/谓词 → PATH 可执行。
+func cands_first(word: string) -> table<string> {
+    var out: table<string> = []
+    var bs = command.c_builtins()
+    for b in bs {
+        if starts_with(b, word) {
+            table_push(out, b)
+        }
+    }
+    var ps: table<string> = ["filter", "count", "parse"]
+    for px in ps {
+        if starts_with(px, word) {
+            table_push(out, px)
+        }
+    }
+    if len(out) == 0 {
+        for e2 in command.path_exes() {
+            if starts_with(e2, word) {
+                table_push(out, e2)
+            }
+        }
+    }
+    return out
+}
+
+// 非首词候选：文件路径（含 '/' 时列该目录，否则列 cwd）。
+func cands_path(word: string) -> table<string> {
+    var out: table<string> = []
+    var slash: i64 = -1
+    var n = str_len(word)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(word, i)
+        if c == "/" || c == "\\" {
+            slash = i
+        }
+        i = i + 1
+    }
+    var dirp = "."
+    var base = word
+    if slash >= 0 {
+        dirp = sub(word, 0, slash)
+        if len(dirp) == 0 {
+            dirp = "/"
+        }
+        base = sub(word, slash + 1, n)
+    }
+    if !file_is_dir(dirp) {
+        return out
+    }
+    var es = list_dir(dirp)
+    for e in es {
+        if e == "." || e == ".." {
+            continue
+        }
+        if starts_with(e, base) {
+            if slash >= 0 {
+                table_push(out, dirp + "/" + e)
+            } else {
+                table_push(out, e)
+            }
+        }
+    }
+    return out
+}
+
+// 公共前缀（字节级）。
+func common_prefix(cs: table<string>) -> string {
+    if len(cs) == 0 {
+        return ""
+    }
+    var pre = cs[0]
+    var i: i64 = 1
+    while i < len(cs) {
+        var s = cs[i]
+        var m = len(pre)
+        if len(s) < m {
+            m = len(s)
+        }
+        var k: i64 = 0
+        while k < m && str_byte(s, k) == str_byte(pre, k) {
+            k = k + 1
+        }
+        pre = sh_util.u_sub(pre, 0, k)
+        i = i + 1
+    }
+    return pre
+}
+
+// ---- 多行编辑视图（续行不再分段递归；缓冲含 \n 时启用） ----
+
+// 缓冲是否含换行。
+func has_nl() -> bool {
+    var n = str_len(g_buf)
+    var i: i64 = 0
+    while i < n {
+        if str_char(g_buf, i) == "\n" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 行拆分：返回 (行文本表, 每行起始索引表)。
+func ml_lines() -> (table<string>, table<i64>) {
+    var lines: table<string> = []
+    var starts: table<i64> = []
+    var n = str_len(g_buf)
+    var cl = ""
+    var i: i64 = 0
+    table_push(starts, 0)
+    while i < n {
+        var c = str_char(g_buf, i)
+        if c == "\n" {
+            table_push(lines, cl)
+            cl = ""
+            table_push(starts, i + 1)
+        } else {
+            cl = cl + c
+        }
+        i = i + 1
+    }
+    table_push(lines, cl)
+    return (lines, starts)
+}
+
+// 光标所在行定位：返回 (行号, 行起始, 行长)。
+func ml_locate() -> (i64, i64, i64) {
+    var n = str_len(g_buf)
+    var cl: i64 = 0
+    var st: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(g_buf, i)
+        if c == "\n" {
+            if g_cur <= i {
+                return (cl, st, i - st)
+            }
+            cl = cl + 1
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return (cl, st, n - st)
+}
+
+// 行前缀：行 0 = 提示符；续行 = `....> `。
+func ml_pref(i: i64, prompt: string) -> string {
+    if i == 0 {
+        return prompt
+    }
+    return "....> "
+}
+
+// 区域归位：光标行按记录上移 + 清屏至底（REPL 输入区下方恒空，[J 安全）。
+func ml_area_reset() {
+    print("\r")
+    if g_ml_cline > 0 {
+        print(esc_s() + "[" + to_string(g_ml_cline) + "A")
+    }
+    print(esc_s() + "[J")
+}
+
+// 光标移至区域末行行首（提交/反搜/清行前调用）。
+func ml_bottom() {
+    print("\r")
+    var n = g_ml_rows - 1 - g_ml_cline
+    if n > 0 {
+        print(esc_s() + "[" + to_string(n) + "B")
+    }
+    if g_ml_rows > 0 {
+        g_ml_cline = g_ml_rows - 1
+    }
+}
+
+// 多行重绘（两遍实测：遍1 量光标实际列，遍2 完整高亮渲染后定位）。
+func draw_ml(prompt: string) {
+    var (lines, starts) = ml_lines()
+    var nlines = len(lines)
+    var (cl, st, ln) = ml_locate()
+    var col = g_cur - st
+    if col < 0 {
+        col = 0
+    }
+    if col > ln {
+        col = ln
+    }
+    // 遍1（测量）
+    ml_area_reset()
+    var li: i64 = 0
+    while li < cl {
+        print(ml_pref(li, prompt) + lines[li] + "\r\n")
+        li = li + 1
+    }
+    print(ml_pref(cl, prompt) + sh_util.u_sub(lines[cl], 0, col))
+    var c_target = term.cursor_col()
+    // 遍2（正式）
+    print("\r")
+    if cl > 0 {
+        print(esc_s() + "[" + to_string(cl) + "A")
+    }
+    print(esc_s() + "[J")
+    var lj: i64 = 0
+    while lj < nlines {
+        var (hseg, _hc) = command.hl_line(lines[lj], -1)
+        if lj < nlines - 1 {
+            print(ml_pref(lj, prompt) + hseg + "\r\n")
+        } else {
+            print(ml_pref(lj, prompt) + hseg)
+        }
+        lj = lj + 1
+    }
+    // 定位 (cl, c_target)
+    var upn = nlines - 1 - cl
+    if upn > 0 {
+        print(esc_s() + "[" + to_string(upn) + "A")
+    }
+    if c_target >= 0 {
+        print("\r")
+        if c_target > 0 {
+            print(esc_s() + "[" + to_string(c_target) + "C")
+        }
+    } else {
+        var mcol = sh_util.str_width(ml_pref(cl, prompt)) + sh_util.str_width(sh_util.u_sub(lines[cl], 0, col))
+        print("\r")
+        if mcol > 0 {
+            print(esc_s() + "[" + to_string(mcol) + "C")
+        }
+    }
+    g_ml_rows = nlines
+    g_ml_cline = cl
+}
+
+// 行间移动（dir=-1 上 / 1 下；列保持、超长夹取）。
+func ml_move(dir: i64) {
+    var (lines, starts) = ml_lines()
+    var nlines = len(lines)
+    var (cl, st, ln) = ml_locate()
+    var col = g_cur - st
+    if col < 0 {
+        col = 0
+    }
+    if col > ln {
+        col = ln
+    }
+    var tl = cl + dir
+    if tl < 0 || tl >= nlines {
+        return
+    }
+    var tmax = str_len(lines[tl])
+    var ncol = col
+    if ncol > tmax {
+        ncol = tmax
+    }
+    le_set(g_buf, starts[tl] + ncol)
+}
+
+// VT 重绘：清行 → 提示符 + 高亮缓冲（command.hl_line 共享高亮）→ 清尾 → 光标归位；非 VT 降级朴素重绘。
+func draw(prompt: string) {
+    hl_check()
+    if g_vt && !g_hl_off {
+        if has_nl() {
+            draw_ml(prompt)
+            return
+        }
+        // 单行实测定位（与字体/控制台字形宽度无关）：
+        // 遍1 明色前缀 → 量 c_mid；遍2 完整高亮 → 量 c_end；
+        // 左移 (c_end - c_mid) 精确落回前缀末。控制台不可查（posix）时回退模型列。
+        ml_area_reset()
+        var pfx = sub(g_buf, 0, g_cur)
+        print(prompt + pfx)
+        var c_mid = term.cursor_col()
+        var (hb, hcol) = command.hl_line(g_buf, g_cur)
+        print("\r" + esc_s() + "[K" + prompt + hb)
+        if c_mid >= 0 {
+            var c_end = term.cursor_col()
+            var back = c_end - c_mid
+            if back > 0 {
+                print(esc_s() + "[" + to_string(back) + "D")
+            }
+        } else {
+            print("\r")
+            print(esc_s() + "[" + to_string(sh_util.str_width(prompt) + hcol) + "C")
+        }
+        g_ml_rows = 1
+        g_ml_cline = 0
+    } else {
+        print("\r" + prompt + g_buf)
+    }
+}
+
+// ---- Ctrl-R 历史反搜（2026-10-16 深化） ----
+
+// 子串位置（码点索引；-1 无）。byte 级滑窗。
+func find_sub(hay: string, needle: string) -> i64 {
+    var hn = str_len(hay)
+    var nn = str_len(needle)
+    if nn == 0 || nn > hn {
+        return -1
+    }
+    var i: i64 = 0
+    while i + nn <= hn {
+        var j: i64 = 0
+        var ok = true
+        while j < nn {
+            if str_char(hay, i + j) != str_char(needle, j) {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if ok {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 反搜显示行（单次写；命中段高亮——匹配处亮绿加粗，其余常态）。
+func redraw_search(pat: string, hit: string) {
+    var line = "\r"
+    if g_vt {
+        line = line + esc_s() + "[K"
+    }
+    var shown = hit
+    var idx = find_sub(hit, pat)
+    if idx >= 0 {
+        var pre = sh_util.u_sub(hit, 0, idx)
+        var mid = sh_util.u_sub(hit, idx, idx + str_len(pat))
+        var post = sh_util.u_sub(hit, idx + str_len(pat), str_len(hit))
+        shown = pre + command.u_c("1;32", mid) + post
+    }
+    print(line + "(反搜)" + pat + ": " + shown)
+}
+
+// 自 from（不含）向更旧找含 pat 的历史行 → (行, 下标)；无命中 ("", -1)。
+func search_from(hist: table<string>, pat: string, from: i64) -> (string, i64) {
+    var i = from - 1
+    while i >= 0 {
+        if sh_util.u_contains(hist[i], pat) {
+            return (hist[i], i)
+        }
+        i = i - 1
+    }
+    return ("", -1)
+}
+
+// 反搜子循环：返回 (接受的行, true) 或 ("", false)=取消。
+pub func hist_search(hist: table<string>) -> (string, bool) {
+    var pat = ""
+    var idx = len(hist)
+    var hit = ""
+    redraw_search(pat, hit)
+    while true {
+        var k = term.key_read()
+        if k == 27 || k == 3 {
+            return ("", false)
+        }
+        if k == 13 || k == 10 {
+            if len(hit) > 0 {
+                return (hit, true)
+            }
+            return ("", false)
+        }
+        if k == 18 {  // 再按 Ctrl-R：向更旧一条
+            var (h2, i2) = search_from(hist, pat, idx)
+            if i2 >= 0 {
+                hit = h2
+                idx = i2
+            }
+            redraw_search(pat, hit)
+            continue
+        }
+        if k == 8 || k == 127 {  // 缩小模式
+            if str_len(pat) > 0 {
+                pat = sh_util.u_sub(pat, 0, str_len(pat) - 1)
+            }
+            var (h3, i3) = search_from(hist, pat, len(hist))
+            hit = h3
+            idx = i3
+            redraw_search(pat, hit)
+            continue
+        }
+        if k >= 32 {  // 扩展模式
+            pat = pat + str_from_code(k)
+            var (h4, i4) = search_from(hist, pat, len(hist))
+            hit = h4
+            idx = i4
+            redraw_search(pat, hit)
+            continue
+        }
+    }
+    return ("", false)
+}
+
+// Tab 补全：改 g_buf/g_cur；返回 true 表示缓冲已更新。
+func complete() -> bool {
+    var cur = g_cur
+    // 当前词首（空格界）
+    var ws_i = cur
+    while ws_i > 0 {
+        if str_char(g_buf, ws_i - 1) == " " {
+            break
+        }
+        ws_i = ws_i - 1
+    }
+    var word = sub(g_buf, ws_i, cur)
+    // 数据流算子补全：片段仅由 `- < > 2` 构成且含 `-`/`<`/`>` 至少之一
+    if len(word) > 0 {
+        var okshape = true
+        var has_arrow = false
+        var wi: i64 = 0
+        while wi < str_len(word) {
+            var pc = str_char(word, wi)
+            if pc != "-" && pc != "<" && pc != ">" && pc != "2" {
+                okshape = false
+            }
+            if pc == "-" || pc == "<" || pc == ">" {
+                has_arrow = true
+            }
+            wi = wi + 1
+        }
+        if okshape && has_arrow {
+            var ops: table<string> = ["->", "->>", "<-", "2->"]
+            var ocands: table<string> = []
+            for op in ops {
+                if starts_with(op, word) {
+                    table_push(ocands, op)
+                }
+            }
+            if len(ocands) == 1 {
+                var nw = sub(g_buf, 0, ws_i) + ocands[0] + " " + sub(g_buf, cur, str_len(g_buf))
+                le_set(nw, ws_i + str_len(ocands[0]) + 1)
+                return true
+            }
+            if len(ocands) > 1 {
+                var ocp = common_prefix(ocands)
+                if str_len(ocp) > str_len(word) {
+                    var fullop = ocp == "->" || ocp == "->>" || ocp == "<-" || ocp == "2->"
+                    var tail = sub(g_buf, cur, str_len(g_buf))
+                    if fullop {
+                        tail = " " + tail
+                    }
+                    var nw2 = sub(g_buf, 0, ws_i) + ocp + tail
+                    var nc2 = ws_i + str_len(ocp)
+                    if fullop {
+                        nc2 = nc2 + 1
+                    }
+                    le_set(nw2, nc2)
+                    return true
+                }
+                print("\r\n")
+                var oline = ""
+                for oc2 in ocands {
+                    oline = oline + oc2 + "  "
+                }
+                println(oline)
+                return true
+            }
+        }
+    }
+    var cands: table<string> = []
+    if ws_i == 0 {
+        cands = cands_first(word)
+    } else {
+        cands = cands_path(word)
+    }
+    if len(cands) == 0 {
+        return false
+    }
+    if len(cands) == 1 {
+        var nb = sub(g_buf, 0, ws_i) + cands[0] + sub(g_buf, cur, str_len(g_buf))
+        le_set(nb, ws_i + str_len(cands[0]))
+        return true
+    }
+    var cp = common_prefix(cands)
+    if str_len(cp) > str_len(word) {
+        var nb2 = sub(g_buf, 0, ws_i) + cp + sub(g_buf, cur, str_len(g_buf))
+        le_set(nb2, ws_i + str_len(cp))
+        return true
+    }
+    // 已到公共前缀：列出候选
+    print("\r\n")
+    var line = ""
+    var cnt: i64 = 0
+    for c2 in cands {
+        line = line + c2 + "  "
+        cnt = cnt + 1
+        if cnt % 4 == 0 {
+            println(line)
+            line = ""
+        }
+    }
+    if len(line) > 0 {
+        println(line)
+    }
+    return true
+}
+
+// 读一行（可编辑）。返回行文本（可能含内嵌换行 = 续行拼接）。
+pub func le_read(prompt: string) -> string {
+    return le_read_pre(prompt, "")
+}
+
+// 光标处的引号态（0 无 / 34 双引号 / 39 单引号；双引号内 \ 转义跳过）。
+func quote_state_at(cur: i64) -> i64 {
+    var q: i64 = 0
+    var i: i64 = 0
+    var n = str_len(g_buf)
+    while i < cur && i < n {
+        var c = str_char(g_buf, i)
+        if q == 0 {
+            if c == "\"" {
+                q = 34
+            } else if c == "'" {
+                q = 39
+            }
+        } else if q == 39 {
+            if c == "'" {
+                q = 0
+            }
+        } else {
+            if c == "\\" {
+                i = i + 2
+                continue
+            }
+            if c == "\"" {
+                q = 0
+            }
+        }
+        i = i + 1
+    }
+    return q
+}
+
+// 带前置累积文本的读取：续行平衡按「前缀 + 本段」整体判定。
+pub func le_read_pre(prompt: string, pre: string) -> string {
+    g_vt = term.vt_on()
+    term.raw_on()
+    le_reset()
+    var hist: table<string> = session.ss_lines()
+    draw(prompt)
+    while true {
+        var k = term.key_read()
+        if k == 13 || k == 10 {  // 回车：平衡即提交；否则追加续行（多行视图内继续编辑）
+            if shlang.line_balanced(g_buf) {
+                ml_bottom()
+                print("\r\n")
+                return le_accept()
+            }
+            le_set(g_buf + "\n", str_len(g_buf) + 1)
+            draw(prompt)
+            continue
+        }
+        if k == 18 {  // Ctrl-R：历史反搜（先归位到区域末行；接受的行按回车提交路径）
+            if g_vt {
+                ml_bottom()
+            }
+            var (mline, mok) = hist_search(hist)
+            if mok {
+                le_set(mline, str_len(mline))
+                if shlang.line_balanced(g_buf) {
+                    print("\r\n")
+                    return le_accept()
+                }
+                le_set(g_buf + "\n", str_len(g_buf) + 1)
+                draw(prompt)
+                continue
+            }
+            draw(prompt)
+            continue
+        }
+        if k == 3 {  // Ctrl-C：清行（先归位末行，再整区清理）
+            if g_vt {
+                ml_bottom()
+            }
+            print("^C\r\n")
+            if g_vt && g_ml_rows > 1 {
+                print("\r")
+                print(esc_s() + "[" + to_string(g_ml_rows) + "A")
+                print(esc_s() + "[J")
+            }
+            le_reset()
+            g_ml_rows = 0
+            g_ml_cline = 0
+            draw(prompt)
+            continue
+        }
+        if k == 4 {  // Ctrl-D：空行 = EOF 语义
+            if str_len(g_buf) == 0 {
+                print("\r\n")
+                return ""
+            }
+            continue
+        }
+        if k == 9 {  // Tab 补全
+            var _c = complete()
+            draw(prompt)
+            continue
+        }
+        if k == 8 || k == 127 {  // Backspace（光标两侧恰为一对时成对删除）
+            var pairdel = false
+            if g_cur > 0 && g_cur < str_len(g_buf) {
+                var pv = str_char(g_buf, g_cur - 1)
+                var nx = str_char(g_buf, g_cur)
+                if (pv == "(" && nx == ")") || (pv == "[" && nx == "]") || (pv == "{" && nx == "}") ||
+                   (pv == "\"" && nx == "\"") || (pv == "'" && nx == "'") {
+                    pairdel = true
+                }
+            }
+            if pairdel {
+                le_delete()
+                le_backspace()
+            } else {
+                le_backspace()
+            }
+            draw(prompt)
+            continue
+        }
+        if k == -7 {  // Delete
+            le_delete()
+            draw(prompt)
+            continue
+        }
+        if k == -3 {  // Left
+            le_left()
+            draw(prompt)
+            continue
+        }
+        if k == -4 {  // Right
+            le_right()
+            draw(prompt)
+            continue
+        }
+        if k == -5 {  // Home：多行=行首；否则全缓冲首
+            if has_nl() {
+                var (_hcl, hst, _hln) = ml_locate()
+                le_set(g_buf, hst)
+            } else {
+                le_home()
+            }
+            draw(prompt)
+            continue
+        }
+        if k == -6 {  // End：多行=行尾；否则全缓冲尾
+            if has_nl() {
+                var (_ecl, est, eln) = ml_locate()
+                le_set(g_buf, est + eln)
+            } else {
+                le_end()
+            }
+            draw(prompt)
+            continue
+        }
+        if k == -1 {  // Up：多行内上移；否则历史
+            if has_nl() {
+                ml_move(-1)
+            } else {
+                le_hist_up(hist)
+            }
+            draw(prompt)
+            continue
+        }
+        if k == -2 {  // Down：多行内下移；否则历史
+            if has_nl() {
+                ml_move(1)
+            } else {
+                le_hist_down(hist)
+            }
+            draw(prompt)
+            continue
+        }
+        if k >= 32 {  // 可打印字符（自动配对/跳过右半）
+            var ch = str_from_code(k)
+            var cur2 = le_cursor()
+            var n2 = str_len(g_buf)
+            var nxt = ""
+            if cur2 < n2 {
+                nxt = str_char(g_buf, cur2)
+            }
+            var prv = ""
+            if cur2 > 0 {
+                prv = str_char(g_buf, cur2 - 1)
+            }
+            if nxt != "" {
+                if (ch == ")" && nxt == ")") || (ch == "]" && nxt == "]") || (ch == "}" && nxt == "}") ||
+                   (ch == "\"" && nxt == "\"") || (ch == "'" && nxt == "'") {
+                    le_right()
+                    draw(prompt)
+                    continue
+                }
+            }
+            // 引号内：不自动配对（`(` `{` `'` 在串内是字面；引号则用于闭串/字面）
+            if quote_state_at(cur2) != 0 {
+                le_insert(ch)
+                draw(prompt)
+                continue
+            }
+            var pairr = ""
+            if ch == "(" {
+                pairr = ")"
+            }
+            if ch == "[" {
+                pairr = "]"
+            }
+            if ch == "{" {
+                pairr = "}"
+            }
+            if ch == "\"" {
+                pairr = "\""
+            }
+            if ch == "'" {
+                if prv == "" || prv == " " || prv == "\t" || prv == "-" || prv == ">" || prv == "(" ||
+                   prv == "[" || prv == "{" {
+                    pairr = "'"
+                }
+            }
+            if pairr != "" {
+                le_insert(ch)
+                le_insert(pairr)
+                le_left()
+                draw(prompt)
+                continue
+            }
+            le_insert(ch)
+            draw(prompt)
+            continue
+        }
+        // 其他键（PgUp/PgDn/未知 C0）：忽略
+    }
+    return ""
+}
+
+// ---- 内部（先行批原有） ----
+
+func sub(s: string, lo: i64, hi: i64) -> string {
+    var out = ""
+    var i: i64 = lo
+    var n = str_len(s)
+    if hi > n { hi = n }
+    while i < hi {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+func hist_count(hist: table<string>) -> i64 {
+    var n: i64 = 0
+    for _x in hist {
+        n = n + 1
+    }
+    return n
+}
+
+func at_n(hist: table<string>, idx: i64) -> string {
+    var i: i64 = 0
+    for x in hist {
+        if i == idx {
+            return x
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+}   // namespace lineedit

@@ -1,0 +1,109 @@
+type tie<logic>
+import "./sh_util.tie"
+// src/render.tie —— 渲染模块（L2/L1 值→文本输出；输出流可注入）
+// --------------------------------------------------------------
+// 把命令/管道输出（tie 值 → 文本）渲染到外部输出流。默认 println 直出（流式逐行，
+// 不整块缓冲）；`r_table` 对结构化行做列对齐表格渲染。输出流可注入以满足嵌入形态
+// （进程外由 srv 接管 stdout；tedit 由协议总线接管）。
+
+namespace render {
+
+// 逐行发射文本（流式）。
+pub func r_emit(out_text: string) {
+    var lines = sh_util.u_lines(out_text)
+    for ln in lines {
+        println(ln)
+    }
+}
+
+// 发射单行。
+pub func r_emit_line(s: string) {
+    println(s)
+}
+
+// 表元素计数（i64 表；规避动态表 len() 类型缺陷）。
+pub func t_cnt(t: table<i64>) -> i64 {
+    var n: i64 = 0
+    for _x in t {
+        n = n + 1
+    }
+    return n
+}
+
+// 结构化行表对齐渲染：rows 每元素 "c1<sep>c2..."，两遍（统计列宽 → 对齐直出）。
+pub func r_table(rows: table<string>, sep: string) {
+    var widths = table_new_i64()
+    for r in rows {
+        var cells = split_cells(r, sep)
+        var ci: i64 = 0
+        for c in cells {
+            var w = str_len(c)
+            if ci >= t_cnt(widths) {
+                table_push(widths, w)
+            } else if w > table_at(widths, ci) {
+                widths[ci] = w
+            }
+            ci = ci + 1
+        }
+    }
+    for r in rows {
+        var cells = split_cells(r, sep)
+        var out = ""
+        var ci: i64 = 0
+        for c in cells {
+            var wnow = str_len(c)
+            var width = table_at(widths, ci)
+            out = out + c
+            if ci + 1 < t_cnt(widths) {
+                var pad: i64 = width - wnow
+                var p: i64 = 0
+                while p < pad {
+                    out = out + " "
+                    p = p + 1
+                }
+                out = out + sep
+            }
+            ci = ci + 1
+        }
+        println(sh_util.u_trim(out))
+    }
+}
+
+// 按 sep 拆列。
+func split_cells(r: string, sep: string) -> table<string> {
+    var out = table_new_string()
+    var cur = ""
+    var n = str_len(r)
+    var i: i64 = 0
+    var ssep = str_len(sep)
+    while i < n {
+        if ssep > 0 && match_at(r, i, sep) {
+            table_push(out, cur)
+            cur = ""
+            i = i + ssep
+            continue
+        }
+        cur = cur + str_char(r, i)
+        i = i + 1
+    }
+    table_push(out, cur)
+    return out
+}
+
+func match_at(s: string, pos: i64, pat: string) -> bool {
+    var pn = str_len(pat)
+    var n = str_len(s)
+    if pos + pn > n {
+        return false
+    }
+    var i: i64 = 0
+    while i < pn {
+        if str_char(s, pos + i) != str_char(pat, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+}   // namespace render
