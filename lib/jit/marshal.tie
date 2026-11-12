@@ -134,7 +134,9 @@ pub func arg_ir(kind: string, raw: string) -> string {
         return "OK:i1 false"
     }
     if kind == "ptr" {
-        return "OK:inttoptr (i64 " + to_string(to_i64(raw)) + " to ptr)"
+        // call 实参必须是「类型 值」两段；漏掉前导 ptr 会让 LLVM 解析器
+        // 在 inttoptr 处报 expected type（此前 ptr 实参从未被真正走到）。
+        return "OK:ptr inttoptr (i64 " + to_string(to_i64(raw)) + " to ptr)"
     }
     return "OK:i64 " + to_string(to_i64(raw))
 }

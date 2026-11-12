@@ -149,8 +149,10 @@ build/tiej.exe --repl
 
 `tshell` 可以把求值后端切到 JIT：`set eval-backend jit` 后用
 `jit-call <源文件> <函数> [实参...] [--sig ...] [--ret ...]` 把标量函数交给
-同一进程内的 JIT 会话；表达式与整文件脚本仍由 `lib/interp` 求值（解释器
-`Value` 与 JIT 的 i64 槽之间的值表示边界尚未打通）。构建带 JIT 后端的 tsh
+同一进程内的 JIT 会话。实参类型与返回类型都支持 `str`：字符串按运行时数据
+指针传（两侧共用同一段内存，长度头在指针前 8 字节），返回时宿主按长度头重建
+`string`，因此 JIT 函数可以直接收发 tie 字符串。表达式与整文件脚本仍由
+`lib/interp` 求值（`Value` 的其它复合载荷尚差一层句柄重解释）。构建带 JIT 后端的 tsh
 时设置 `LLVM_PREFIX`，`tools/tshell/build.tsh.tie` 会自动附加
 `tiej_llvm.o`、运行时导出定义与 `-lLLVM-C`；不设置则构建为纯 interp 装配。
 tiej 本身不依赖 tshell，两种入口都可独立运行。

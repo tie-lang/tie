@@ -56,6 +56,34 @@ pub func b_reset() {
     interp::reset()
 }
 
+// ==================== 宿主值 ↔ JIT 槽 ====================
+// 宿主 string 的运行时表示是 [8 字节 i64 长度头][UTF-8 字节][0]，数据指针可由
+// ptr_to_int 取出；JIT 侧按 string 形参收下同一指针，两侧共用同一段内存，
+// 因此字符串实参不需要拷贝。返回侧反向：JIT 交回数据指针，宿主按 p-8 的
+// 长度头逐字节重建 string（string 无引用计数，不存在所有权转移问题）。
+unsafe func rd_i64_at(p: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        var b = deref(int_to_ptr(p + k))
+        v = v | (to_i64(b) << (k * 8))
+        k = k + 1
+    }
+    return v
+}
+
+unsafe func str_of_ptr(p: i64) -> string {
+    var n = rd_i64_at(p - 8)
+    var h = string_builder()
+    var k: i64 = 0
+    while k < n {
+        var b = deref(int_to_ptr(p + k))
+        sb_append_byte(h, to_i64(b))
+        k = k + 1
+    }
+    return sb_build(h)
+}
+
 // 显式 JIT 调用：编译源文件里的函数到会话并调用，命中缓存时跳过重编。
 pub func b_jit_call(path: string, fname: string, sig: table<string>,
                     args: table<string>, ret: string) -> string {
@@ -80,7 +108,27 @@ pub func b_jit_call(path: string, fname: string, sig: table<string>,
     if !tie.support::has_prefix(lr, "OK:") {
         return lr
     }
-    var r = tie.jitsession::call(uid, sig, args, ret)
+    // str 实参按 ptr 传宿主数据指针；str 返回按指针重建宿主 string。
+    var jsig = table_new_string()
+    var jargs = table_new_string()
+    var ai: i64 = 0
+    while ai < len(sig) {
+        if sig[ai] == "str" {
+            table_push(jsig, "ptr")
+            var sp: i64 = 0
+            unsafe { sp = ptr_to_int(args[ai]) }
+            table_push(jargs, to_string(sp))
+        } else {
+            table_push(jsig, sig[ai])
+            table_push(jargs, args[ai])
+        }
+        ai = ai + 1
+    }
+    var cret = ret
+    if ret == "str" {
+        cret = "ptr"
+    }
+    var r = tie.jitsession::call(uid, jsig, jargs, cret)
     if !tie.support::has_prefix(r, "OK:") {
         return r
     }
@@ -90,6 +138,11 @@ pub func b_jit_call(path: string, fname: string, sig: table<string>,
     }
     if ret == "void" {
         return "OK:(void)"
+    }
+    if ret == "str" {
+        var out = ""
+        unsafe { out = str_of_ptr(bits) }
+        return "OK:" + out
     }
     return "OK:" + to_string(bits)
 }
