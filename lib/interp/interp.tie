@@ -109,6 +109,13 @@ pub var g_fn_src_names: table<string>; // 顶层函数名
 pub var g_fn_src_texts: table<string>; // 对应定义源码切片（原文）
 pub var g_fn_src_ready: bool = false;  // 惰性初始化守卫
 
+// ==================== 类型化结果槽 ====================
+// eval 返回文本的同时，把最后一个表达式语句的值原样留在 w_ret_val，供
+// eval_value 取回类型化结果（JIT 与解释执行之间的值边界用）。w_ret_ok 为假
+// 表示没有可用值（错误路径、纯定义、无值语句）。
+pub var w_ret_val: Value = Value.Nil;
+pub var w_ret_ok: bool = false;
+
 namespace interp {
 
 // ==================== 入口 ====================
@@ -161,6 +168,8 @@ pub func script_args() -> table<string> {
 // 求值一段代码：顶层定义注册，否则包装为 main 体执行，返回格式化结果或错误。
 pub func eval(src: string) -> string {
     w_err = ""
+    w_ret_ok = false
+    w_ret_val = vval.new_void()
     // 第二步：顶层函数源码捕获（split_top 扫描的副作用——把
     // 定义段里的 func 源码切片存入 JIT 源码库；结果丢弃，主流程不变）。
     split_top(src)
@@ -221,6 +230,8 @@ pub func eval(src: string) -> string {
         }
         if g_flow == FL_RETURN {
             // return 传播到顶层（用户输入 `return 5`）：取其值
+            w_ret_val = g_flow_val
+            w_ret_ok = true
             return vval.to_repl_string(g_flow_val)
         }
         if g_flow == FL_BREAK {
@@ -240,9 +251,24 @@ pub func eval(src: string) -> string {
     }
     // 正常结束：返回最后表达式语句的值（void/纯声明 → 空串）
     if has_last {
+        w_ret_val = last
+        w_ret_ok = true
         return vval.to_repl_string(last)
     }
     return ""
+}
+
+// 取回类型化结果：执行同一段源码，返回最后一个表达式语句的值（无值 → void）。
+// 错误契约与 eval 一致（失败时 has_err() 为真，返回 void 占位）。
+pub func eval_value(src: string) -> Value {
+    var _text = interp::eval(src)
+    var v: Value = w_ret_val
+    return v
+}
+
+// 上一次 eval/eval_value 是否产出了有效值。
+pub func last_value_ok() -> bool {
+    return w_ret_ok
 }
 
 // ==================== 整文件脚本求值（tsh 角色） ====================

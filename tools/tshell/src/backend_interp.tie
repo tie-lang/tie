@@ -27,6 +27,12 @@ pub func b_eval(src: string) -> string {
 }
 
 // 整文件脚本求值（函数跨行持久、多行块、条件 exit(n) 生效）。
+// 求值并返回类型化结果（Value）：错误时 has_err() 为真，值为 void。
+// 供需要值而非文本的宿主调用点使用（JIT 与解释执行之间的值边界）。
+pub func b_eval_value(src: string) -> Value {
+    return interp::eval_value(src)
+}
+
 pub func b_eval_script(src: string) -> string {
     if g_backend == "jit" {
         return backend_jit.b_eval_script(src)
