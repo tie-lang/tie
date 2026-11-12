@@ -1,36 +1,40 @@
-type tie<class>
-// compiler/interp/vval.tie —— 第一步：拆箱值模型（Value enum，双形态共存）
+type tie<class, unsafe:mem>
+// lib/interp/vval.tie —— 解释器值模型（Value enum，载荷为运行时宿主对象）
 // ============================================================
-// 说明：值表示选型 = 案 A enum 标签联合）。
-// 本文件是**新增**的平行实现：既有 `ivalue`（value.tie，id + 平行表盒装）完全不动，
-// 本模块以 tie 原生 ADT 表达值，供第一步做 parity 门禁与语言前提验证；第二步
-// （热路径切换）再把调用点从 `ivalue.*` 迁到 `vval.*`。
-//
-// # 为什么是 enum 而不是 NaN-boxing（设计 §4.2.1 二）
-//   tie 原生 ADT 在 LLVM 层是静态结构体 {i64 tag, i64×K 槽}，零堆分配；实测：
-//   构造+解构一轮 332ns vs 盒装 621ns（1.87×），且 enum 与 i64 传递耗时在噪声内
-//   相等（传递无惩罚）——NaN-boxing 赖以胜出的「省字节」在此换不来可测收益，
-//   却要手工位运算 + f64 NaN 空间论证，故否决。
-//
-// # 表示（标量内联 + 复合值留槽）
+// 表示（标量内联 + 复合值=运行时宿主对象）：
 //   Nil                     无值
 //   Int(i64)                整数
 //   Flt(f64)                浮点（原生 f64 载荷，无需手工 bitcast）
 //   Bool(i64) 0/1           布尔
 //   Trit(i64) -1/0/1        平衡三进制
 //   Chr(i64)                字符码点
-//   Rng(i64, i64, i64)       范围起点/终点/闭区间标志（**内联**）
-//   Str(i64)                文本槽（w_svals 下标）
-//   Tbl(i64)                表描述符槽（w_koff/w_kcnt 下标；元素在 w_kids）
+//   Rng(i64, i64, i64)      范围起点/终点/闭区间标志（内联）
+//   Str(string)             文本（宿主 string，长度头 + UTF-8 数据）
+//   Tbl(table<Value>)       表（宿主表句柄，元素直存 Value）
 //   Map(i64)                键值表描述符槽（键在 w_mkeys，值在 w_mvals）
-//   Code(i64)               宏/准引用文本槽（w_svals 下标）
-//   Rng 三个 i64 载荷 ⇒ 每值按 enum 最大变体布局内联。
+//   Code(string)            宏/准引用文本（宿主 string）
 //
-// # 与 ivalue 的关系
-//   标量不再入池（消灭每值 7 次 table_push 与后续表寻址）；复合值仍走「描述符槽 +
-//   扁平元素表」，扁平表的元素类型由 i64（节点 id）改为 **Value（值直存）**——
-//   省掉一层 id 间接。表/映射的**值语义仍靠 (koff, kcnt) 区间快照手工实现**（tie
-//   原生表是引用语义、push 原地改，不能直接拿来当不可变快照）。
+// # 为什么 Tbl 是 table<Value> 而不是槽下标
+//   解释器与 JIT 编译产物共用同一套运行时对象表示：string 是 [8 字节长度头][UTF-8]，
+//   表是 48 字节句柄 {cap, len, data, esz, lock, refcount}（lib/rt/src/tbl/tl_tbl.tie）。
+//   值里直接存宿主对象，跨 JIT / 解释边界就不需要再转换。
+//
+// # 表句柄的持有约定（实测结论，见 _local_only/pv6.tie）
+//   tie 编译器**不会**为枚举载荷里的表句柄自动 retain/release：枚举值的复制是纯
+//   位拷贝。一旦承载该表的局部变量离开作用域，句柄引用计数归零即被释放，而值里
+//   仍留着悬垂句柄（实测 300 次构造后 257 个值损坏）。
+//   故本模块自建一条约定：**每个 Value.Tbl 在构造时由本模块 retain 一次**，此后
+//   该值持有的这一份引用不随任何局部变量消亡；解释器值池常驻会话，不逐值释放。
+//   string 无需此约定——实测 3000 个枚举内 string 值无一损坏（string 不做引用计数
+//   释放，拼接只产新串）。
+//
+// # 表的值语义
+//   tie 原生表是引用语义（push 原地改）。解释器对外提供**值语义**（旧值视图冻结），
+//   故 push / 改元素一律复制出新表；句柄引用计数由构造时的 retain 保活。
+//
+// # 键值表
+//   仍用「描述符槽 + 扁平键值表」：键是 interner id（编译器内部量），不跨 JIT 边界，
+//   故不改成宿主对象，保持既有语义与成本。
 //
 // # 命名与常量纪律
 //   顶层常量加 W_ 前缀（`ivalue` 的 T_* 与本模块 import 内联后同作用域，重名即
@@ -64,20 +68,17 @@ enum Value {
     Trit(i64)
     Chr(i64)
     Rng(i64, i64, i64)
-    Str(i64)
-    Tbl(i64)
+    Str(string)
+    Tbl(table<Value>)
     Map(i64)
-    Code(i64)
+    Code(string)
 }
 
-// ==================== 复合值存储（标量不入池） ====================
-// 描述符槽：表与键值表共用（与 ivalue 同布局，便于第二步对齐）。
-var w_koff: table<i64>;        // 段起点（w_kids / w_mkeys+w_mvals 偏移）
+// ==================== 键值表存储（描述符槽） ====================
+var w_koff: table<i64>;        // 段起点（w_mkeys / w_mvals 偏移）
 var w_kcnt: table<i64>;        // 段元素个数
-var w_kids: table<Value>;      // 表元素扁平表（**值直存**）
 var w_mkeys: table<i64>;       // 键值表键（interner id，升序段）
 var w_mvals: table<Value>;     // 键值表值扁平表
-var w_svals: table<string>;    // 文本槽（Str / Code）
 
 // 键值表写入的键槽（沿用 ivalue 的 g_ms_key 范式：混合实参嵌套调用会错位，
 // 故键走全局槽、值走参数）。w_ms_key 由调用方在 map_set 前设置。
@@ -85,36 +86,74 @@ pub var w_ms_key: i64 = 0;
 
 // 错误槽。**刻意不叫 g_err**：`ivalue`（value.tie）已有同名顶层变量，而本模块与它
 // 需在同一二进制内共存（parity 门禁同时引入两者），import 内联后同作用域重名即
-// 重复定义报错。第二步（统一值模型）时两者合一。
+// 重复定义报错。
 pub var w_err: string = "";
 
+// 句柄字段偏移（与 lib/rt/src/tbl/tl_tbl.tie 的 48 字节句柄一致）
+const W_HOFF_RC: i64 = 40;
+
 namespace vval {
+
+// ==================== 句柄引用计数（跨边界对象所有权） ====================
+// 逐字节读 i64：deref 对 ptr<u8> 是单字节存取（同 tl_tbl 的 r_i64 写法）。
+unsafe fn w_r_i64(p: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        var b = deref(int_to_ptr(p + k))
+        v = v | (b << (k * 8))
+        k = k + 1
+    }
+    return v
+}
+
+unsafe fn w_w_i64(p: i64, v: i64) -> i64 {
+    var k: i64 = 0
+    while k < 8 {
+        var b: i64 = (v >> (k * 8)) & 255
+        var q = int_to_ptr(p + k)
+        deref_write(q, b)
+        k = k + 1
+    }
+    return 0
+}
+
+// 表句柄引用计数 +1（本模块为值持有的一份引用）。
+unsafe func wrap_table(t: table<Value>) -> table<Value> {
+    var h = ptr_to_int(t)
+    if h != 0 {
+        var rc = w_r_i64(h + W_HOFF_RC) + 1
+        w_w_i64(h + W_HOFF_RC, rc)
+    }
+    return t
+}
+
+// 表句柄当前引用计数（诊断与探针用；0 句柄返回 0）。
+pub unsafe func table_refcount(t: table<Value>) -> i64 {
+    var h = ptr_to_int(t)
+    if h == 0 {
+        return 0
+    }
+    return w_r_i64(h + W_HOFF_RC)
+}
 
 // ==================== 会话重置 ====================
 
 pub func reset() {
     w_koff = table_new_i64()
     w_kcnt = table_new_i64()
-    w_kids = {}
     w_mkeys = table_new_i64()
     w_mvals = {}
-    w_svals = table_new_string()
     w_err = ""
 }
 
-// ==================== 描述符槽 ====================
+// ==================== 描述符槽（键值表用） ====================
 
 // 新描述符槽（koff=段起点，kcnt=0），返回槽下标。
 func new_slot() -> i64 {
     table_push(w_koff, 0)
     table_push(w_kcnt, 0)
     return len(w_koff) - 1
-}
-
-// 新文本槽，返回槽下标。
-func new_text(s: string) -> i64 {
-    table_push(w_svals, s)
-    return len(w_svals) - 1
 }
 
 // ==================== 构造 ====================
@@ -142,20 +181,23 @@ pub func new_char(cp: i64) -> Value {
     return Value.Chr(cp)
 }
 
+// 文本值：直接持有宿主 string（无需再进文本槽）。
 pub func new_str(s: string) -> Value {
-    return Value.Str(new_text(s))
+    return Value.Str(s)
 }
 
 pub func new_range(s: i64, e: i64, inclusive: i64) -> Value {
     return Value.Rng(s, e, inclusive)
 }
 
-// 空表值（后续 push 产生新描述符槽；语义对齐 ivalue.new_table）。
+// 空表值。
 pub func new_table() -> Value {
-    var n = new_slot()
-    w_koff[n] = len(w_kids)
-    w_kcnt[n] = 0
-    return Value.Tbl(n)
+    var t: table<Value> = {}
+    var w: table<Value> = t
+    unsafe {
+        w = wrap_table(t)
+    }
+    return Value.Tbl(w)
 }
 
 // 空键值表值。
@@ -170,8 +212,30 @@ pub func new_void() -> Value {
     return Value.Nil
 }
 
+// 宏/准引用文本值。
 pub func new_code(proto: string) -> Value {
-    return Value.Code(new_text(proto))
+    return Value.Code(proto)
+}
+
+// ==================== 跨边界构造（JIT 侧对象 → 解释器值） ====================
+
+// 宿主 string → 值（string 侧无引用计数，直接持有）。
+pub func from_host_string(s: string) -> Value {
+    return Value.Str(s)
+}
+
+// 宿主表 → 值：调用方交出句柄的一次所有权（本模块 retain 后持有）。
+pub func from_host_table(t: table<Value>) -> Value {
+    var w: table<Value> = t
+    unsafe {
+        w = wrap_table(t)
+    }
+    return Value.Tbl(w)
+}
+
+// 值 → 宿主 string（非文本值返回空串）。
+pub func to_host_string(v: Value) -> string {
+    return str_val(v)
 }
 
 // ==================== 访问 ====================
@@ -241,8 +305,7 @@ pub func type_name(v: Value) -> string {
     return "void"
 }
 
-// 整数载荷（非整数值为 0——与 ivalue.int_val 的 id 语义不同：vval 是值，
-// 故非整数返回 0 而非越界读表）。
+// 整数载荷（非整数值为 0）。
 pub func int_val(v: Value) -> i64 {
     switch v {
         case Value.Int(x):
@@ -267,13 +330,13 @@ pub func float_val(v: Value) -> f64 {
     }
 }
 
-// 字符串值文本（Str / Code 槽取文本；其余空串）。
+// 字符串值文本（Str / Code 直接取宿主 string；其余空串）。
 pub func str_val(v: Value) -> string {
     switch v {
         case Value.Str(x):
-            return w_svals[x]
+            return x
         case Value.Code(x):
-            return w_svals[x]
+            return x
         default:
             return ""
     }
@@ -283,7 +346,7 @@ pub func str_val(v: Value) -> string {
 pub func code_str(v: Value) -> string {
     switch v {
         case Value.Code(x):
-            return w_svals[x]
+            return x
         default:
             return ""
     }
@@ -331,8 +394,8 @@ pub func is_truthy(v: Value) -> bool {
 // 元素个数。
 pub func elem_count(v: Value) -> i64 {
     switch v {
-        case Value.Tbl(k):
-            return w_kcnt[k]
+        case Value.Tbl(t):
+            return len(t)
         case Value.Map(k):
             return w_kcnt[k]
         default:
@@ -340,47 +403,37 @@ pub func elem_count(v: Value) -> i64 {
     }
 }
 
-// 第 i 个元素（表）：越界返回 Nil（对齐 ivalue.elem_at 的 -1 哨兵语义——
-// 调用方在越界前已自检，此处只作防御）。
+// 第 i 个元素（表）：越界返回 Nil（调用方在越界前已自检，此处只作防御）。
 pub func elem_at(v: Value, i: i64) -> Value {
     switch v {
-        case Value.Tbl(k):
+        case Value.Tbl(t):
             if i < 0 {
                 return Value.Nil
             }
-            if i >= w_kcnt[k] {
+            if i >= len(t) {
                 return Value.Nil
             }
-            return w_kids[w_koff[k] + i]
+            return t[i]
         default:
             return Value.Nil
     }
 }
 
 // 表尾追加：返回**新表值**（旧值视图冻结——值语义）。
-// 尾复用（与 ivalue 同范式，§16）：源段末尾正好落在 w_kids 末尾时共享起点只追加；
-// 段创建时都在 [0, len(w_kids)) 内且连续，追加只影响 ≥ len(w_kids) 的位置，
-// 任何既有段的视图都在其左，故旧值视图天然冻结。
+// 复制旧元素到新表后追加，最后为新句柄 retain 一次（见文件头持有约定）。
 pub func table_push_val(tv: Value, elem: Value) -> Value {
     switch tv {
-        case Value.Tbl(tid):
-            var off = w_koff[tid]
-            var cnt = w_kcnt[tid]
-            var n = new_slot()
-            if off + cnt == len(w_kids) {
-                w_koff[n] = off
-                table_push(w_kids, elem)
-                w_kcnt[n] = cnt + 1
-                return Value.Tbl(n)
-            }
-            w_koff[n] = len(w_kids)
+        case Value.Tbl(old):
+            var n: table<Value> = {}
             var i: i64 = 0
-            while i < cnt {
-                table_push(w_kids, w_kids[off + i])
+            while i < len(old) {
+                table_push(n, old[i])
                 i = i + 1
             }
-            table_push(w_kids, elem)
-            w_kcnt[n] = cnt + 1
+            table_push(n, elem)
+            unsafe {
+                n = wrap_table(n)
+            }
             return Value.Tbl(n)
         default:
             return tv
@@ -390,21 +443,20 @@ pub func table_push_val(tv: Value, elem: Value) -> Value {
 // 表第 i 个元素替换为新值：返回新表值（越界由调用方校验）。
 pub func table_set_at(tv: Value, i: i64, elem: Value) -> Value {
     switch tv {
-        case Value.Tbl(tid):
-            var n = new_slot()
-            var off = w_koff[tid]
-            var cnt = w_kcnt[tid]
-            w_koff[n] = len(w_kids)
+        case Value.Tbl(old):
+            var n: table<Value> = {}
             var k: i64 = 0
-            while k < cnt {
+            while k < len(old) {
                 if k == i {
-                    table_push(w_kids, elem)
+                    table_push(n, elem)
                 } else {
-                    table_push(w_kids, w_kids[off + k])
+                    table_push(n, old[k])
                 }
                 k = k + 1
             }
-            w_kcnt[n] = cnt
+            unsafe {
+                n = wrap_table(n)
+            }
             return Value.Tbl(n)
         default:
             return tv
@@ -551,18 +603,18 @@ pub func to_print_string(v: Value) -> string {
         case Value.Chr(x):
             return utf_char_of(x)
         case Value.Str(x):
-            return w_svals[x]
+            return x
         case Value.Rng(a, b, c):
             if c != 0 {
                 return to_string(a) + "..=" + to_string(b)
             }
             return to_string(a) + ".." + to_string(b)
-        case Value.Tbl(k):
-            return table_print(k)
+        case Value.Tbl(t):
+            return table_print(t)
         case Value.Map(k):
             return map_print(k)
         case Value.Code(x):
-            return "<code: " + w_svals[x] + ">"
+            return "<code: " + x + ">"
         default:
             return ""
     }
@@ -582,13 +634,12 @@ pub func to_repl_string(v: Value) -> string {
 }
 
 // 表 → "[a, b]"。
-func table_print(k: i64) -> string {
-    var off = w_koff[k]
-    var cnt = w_kcnt[k]
+func table_print(t: table<Value>) -> string {
+    var cnt = len(t)
     var out: string = "["
     var i: i64 = 0
     while i < cnt {
-        out = out + to_print_string(w_kids[off + i])
+        out = out + to_print_string(t[i])
         if i + 1 < cnt {
             out = out + ", "
         }
