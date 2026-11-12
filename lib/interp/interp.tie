@@ -377,6 +377,12 @@ pub func g_lookup_global(name: string) -> Value {
     return isess.g_lookup(name)
 }
 
+// 宿主注入一个全局绑定（已声明则覆盖）。REPL 把 JIT 调用得到的复合值
+// 注入表达式作用域；之后的 tie 表达式可直接引用该名。
+pub func bind_global(name: string, v: Value) -> i64 {
+    return isess.g_bind(name, v)
+}
+
 // 上一句求值是否出错（错误文本由 eval / eval_script 返回）。
 // 脚本宿主据此区分「脚本结果」与「脚本错误」——两者都走同一个返回通道。
 pub func has_err() -> bool {

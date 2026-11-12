@@ -40,6 +40,23 @@ pub func b_jit_value_text() -> string {
     return vval.to_repl_string(w_jit_val)
 }
 
+// tbl 实参缓存槽：JIT 侧只能接受 ptr，故把文本实参（"1,2,3"）解析成宿主
+// table<i64> 后以句柄传入。该表存在模块级槽里，保证调用期间不被释放；
+// 每次调用重建它，故仅支持一个 tbl 实参。被调方若长期持有句柄需自行 retain。
+pub var w_call_args: table<i64> = {}
+
+// 把最近一次 jit-call 的表返回值绑成解释器全局变量（REPL 表达式可直接引用）。
+pub func b_bind_jit_value(name: string) -> string {
+    if vval.type_of(w_jit_val) != vval.W_TABLE {
+        return "ERR:没有可绑定的表值（先用 --ret tbl 调用）"
+    }
+    if str_len(name) == 0 {
+        return "ERR:绑定名为空"
+    }
+    var _rc = interp::bind_global(name, w_jit_val)
+    return "OK:" + name
+}
+
 pub func b_backend() -> string {
     return "jit"
 }
@@ -124,12 +141,32 @@ pub func b_jit_call(path: string, fname: string, sig: table<string>,
     var jsig = table_new_string()
     var jargs = table_new_string()
     var ai: i64 = 0
+    var tbl_used = false
     while ai < len(sig) {
         if sig[ai] == "str" {
             table_push(jsig, "ptr")
             var sp: i64 = 0
             unsafe { sp = ptr_to_int(args[ai]) }
             table_push(jargs, to_string(sp))
+        } else if sig[ai] == "tbl" {
+            if tbl_used {
+                return "ERR:仅支持一个 tbl 实参"
+            }
+            tbl_used = true
+            w_call_args = table_new_i64()
+            var parts = tie.support::split_char(args[ai], ",")
+            var pi: i64 = 0
+            while pi < len(parts) {
+                var pt = tie.support::trim(parts[pi])
+                if str_len(pt) > 0 {
+                    table_push(w_call_args, to_i64(pt))
+                }
+                pi = pi + 1
+            }
+            table_push(jsig, "ptr")
+            var tp: i64 = 0
+            unsafe { tp = ptr_to_int(w_call_args) }
+            table_push(jargs, to_string(tp))
         } else {
             table_push(jsig, sig[ai])
             table_push(jargs, args[ai])

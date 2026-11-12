@@ -44,6 +44,7 @@ func builtin_names() -> table<string> {
     table_push(t, "set")
     table_push(t, "jit-call")
     table_push(t, "jit-value")
+    table_push(t, "jit-bind")
     table_push(t, "source")
     table_push(t, "exec")
     table_push(t, "history")
@@ -488,6 +489,9 @@ pub func c_exec(toks: table<string>) -> string {
     if cmd == "jit-call" {
         return cmd_jit_call(args)
     }
+    if cmd == "jit-bind" {
+        return cmd_jit_bind(args)
+    }
     if cmd == "jit-value" {
         return backend_interp.b_jit_value_text()
     }
@@ -552,7 +556,7 @@ func split_csv(s: string) -> table<string> {
     return out
 }
 
-// jit-call <源文件> <函数> [实参...] [--sig i64,f64] [--ret i64|f64|void]
+// jit-call <源文件> <函数> [实参...] [--sig i64,f64,str,tbl] [--ret i64|f64|str|tbl|void]
 // 只在 set eval-backend jit 之后可用；把标量函数交给进程内 JIT 会话执行。
 func cmd_jit_call(args: table<string>) -> string {
     if sh_util.u_len(args) < 2 {
@@ -592,6 +596,15 @@ func cmd_jit_call(args: table<string>) -> string {
 // jit-value —— 打印上一次 jit-call 以 tbl 返回的复合值（表）。
 func cmd_jit_value(args: table<string>) -> string {
     return backend_interp.b_jit_value_text()
+}
+
+// jit-bind <名> —— 把上一次 jit-call 的表返回值绑成变量，
+// 之后的 tie 表达式可直接引用该名。
+func cmd_jit_bind(args: table<string>) -> string {
+    if sh_util.u_len(args) < 1 {
+        return "jit-bind <名字>"
+    }
+    return backend_interp.b_bind_jit_value(sh_util.u_trim(args[0]))
 }
 
 func cmd_set(args: table<string>) -> string {

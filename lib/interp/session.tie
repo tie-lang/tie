@@ -279,6 +279,19 @@ pub func g_assign_nid(nid: i64, v: Value) -> i64 {
     return 0
 }
 
+// 宿主注入绑定：已声明则覆盖，未声明则登记。
+// REPL 把 JIT 调用得到的复合值注入表达式作用域用；不走重复声明校验。
+pub func g_bind(name: string, v: Value) -> i64 {
+    var nid = interner.intern(name)
+    var i = g_find_nid(nid)
+    if i < 0 {
+        g_declare_nid(nid, v)
+        return 0
+    }
+    g_vals[i] = v
+    return 0
+}
+
 // 字符串兼容薄包装（冷路径：REPL 绑定 / 脚本参数注入等文本入口）。
 pub func g_declare(name: string, v: Value) {
     g_declare_nid(interner.intern(name), v)
