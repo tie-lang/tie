@@ -1,0 +1,143 @@
+type tie<class, unsafe:mem>
+// lib/rt/src/value_bridge.tie —— 共享运行时对象层（跨 JIT / 解释器边界的对象访问器）
+// ============================================================
+// 目的：JIT 编译产物与被解释执行的两侧共用同一套运行时对象表示——
+//   * string  = 指向 [8 字节 i64 字节长度][UTF-8 数据][\0] 的数据段指针，
+//               长度头紧贴数据段之前（布局定义见 lib/codegen/irgen_str.tie）
+//   * table<T>= 48 字节句柄 {cap@0, len@8, data@16, esz@24, lock@32, refcount@40}
+//               （布局定义见 lib/rt/src/tbl/tl_tbl.tie）
+// 本文件只提供**跨边界访问器**，不新造对象模型、不引入第二套对象头。
+//
+// 符号面：本文件刻意**不使用 namespace** —— 顶层函数产出平坦 C 符号
+// （tie_vb_*），JIT 侧可写 `unsafe extern fn tie_vb_value_len(p: i64) -> i64`
+// 直调，无需 import 源码。符号随 trm_lite.a 进 tiej 的导出表
+// （tools/tiej/gen_exports.py 扫描 --defined-only 全量导出）。
+//
+// 能力面：全部访问器为 unsafe func（裸指针读写），调用方自行持 mem 凭据。
+//
+// 归属规则（谁释放）：
+//   * tie_vb_string_from_ptr / tie_vb_string_from_bytes 一律**拷贝字节**产新
+//     string，不接管实参指针——实参可能指在对方模块的 SSO 静态池里，free 会
+//     立刻踩崩。
+//   * tie_vb_handle_retain / tie_vb_handle_release 直通 tl_tbl 引用计数：
+//     跨边界交出表句柄 = 一次所有权转移，接收方 retain 或 release。
+//
+// 不提供 drop_session：当前解释器与 JIT 单元均无会话级对象池，句柄归各自
+// 持有者；等真出现会话池再补，避免落一个永远为空的空实现。
+
+import "./tbl/tl_tbl.tie"
+
+// 字符串长度头宽度（字节）
+const VB_STR_HEAD: i64 = 8
+
+// 句柄字段偏移（与 tl_tbl 保持一致）
+const VB_OFF_LEN: i64 = 8
+const VB_OFF_ESZ: i64 = 24
+const VB_OFF_RC: i64 = 40
+
+// i64 逐字节读取：deref 对 ptr<u8> 是单字节存取（同 tl_tbl 的 r_i64）。
+unsafe fn vb_r_i64(p: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        var b = deref(int_to_ptr(p + k))
+        v = v | (b << (k * 8))
+        k = k + 1
+    }
+    return v
+}
+
+// 单字节读取（string 数据段逐字节拷贝用）。
+unsafe fn vb_r_byte(p: i64) -> i64 {
+    return deref(int_to_ptr(p))
+}
+
+// ==================== string 侧 ====================
+
+// string 数据指针 → 字节长度（读 p-8 长度头）。p == 0 返回 0。
+pub unsafe func tie_vb_value_len(p: i64) -> i64 {
+    if p == 0 {
+        return 0
+    }
+    return vb_r_i64(p - VB_STR_HEAD)
+}
+
+// string → 数据指针（与 JIT 侧 ptr_to_int 同值）。
+pub func tie_vb_value_ptr(s: string) -> i64 {
+    return ptr_to_int(s)
+}
+
+// 原始 UTF-8 指针 → 新的 tie string（长度取 p-8 长度头；**拷贝**，不接管指针）。
+pub unsafe func tie_vb_string_from_ptr(p: i64) -> string {
+    var n = tie_vb_value_len(p)
+    if n <= 0 {
+        return ""
+    }
+    var h = string_builder()
+    var i: i64 = 0
+    while i < n {
+        sb_append_byte(h, vb_r_byte(p + i))
+        i = i + 1
+    }
+    return sb_build(h)
+}
+
+// 原始 UTF-8 指针 + 显式字节长度 → 新的 tie string（不经长度头，供外部
+// 分配器产出的缓冲区使用）。
+pub unsafe func tie_vb_string_from_bytes(p: i64, n: i64) -> string {
+    if n <= 0 {
+        return ""
+    }
+    var h = string_builder()
+    var i: i64 = 0
+    while i < n {
+        sb_append_byte(h, vb_r_byte(p + i))
+        i = i + 1
+    }
+    return sb_build(h)
+}
+
+// ==================== table 侧 ====================
+
+// 表句柄 → 元素个数；0 句柄返回 0。
+pub unsafe func tie_vb_handle_len(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    return vb_r_i64(h + VB_OFF_LEN)
+}
+
+// 表句柄 → 元素字节宽（含深表标记位）。
+pub unsafe func tie_vb_handle_esz(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    return vb_r_i64(h + VB_OFF_ESZ)
+}
+
+// 表句柄 → 当前引用计数；0 句柄返回 0。
+pub unsafe func tie_vb_handle_refcount(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    return vb_r_i64(h + VB_OFF_RC)
+}
+
+// 表句柄保留一次（+1），返回自增后的引用计数。
+pub unsafe func tie_vb_handle_retain(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    tl_tbl.tbl_retain(h)
+    return vb_r_i64(h + VB_OFF_RC)
+}
+
+// 表句柄释放一次（-1），返回剩余引用计数（0 = 已释放）。
+// 与 tl_tbl.tbl_release 同语义：归零时释放 data + lock + 句柄；
+// 深表逐元素递归释放。0 句柄安全跳过。
+pub unsafe func tie_vb_handle_release(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    return tl_tbl.tbl_release(h)
+}

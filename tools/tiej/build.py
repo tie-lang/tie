@@ -92,8 +92,10 @@ def main() -> int:
         parts.append("-Wl,-rpath," + str(llvm / "lib"))
     link_arg = " ".join(parts)
 
+    # 编译缓存只对 .tie 源码取指纹，看不见对象文件、导出定义这些链接输入；
+    # 只改运行时库时缓存仍判命中，产物会停留在旧导出集，故此处强制关闭缓存。
     run([str(Path(args.tiec).resolve()), "tools/tiej/main.tie", "-o", str(exe),
-         "--link-arg", link_arg], env=env, label="编译并链接 tiej")
+         "--no-cache", "--link-arg", link_arg], env=env, label="编译并链接 tiej")
 
     print("[build] 产物：%s" % exe)
     if args.selftest:
