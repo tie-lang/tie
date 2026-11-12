@@ -27,8 +27,8 @@ func ensure() -> bool {
     unsafe {
         v = tj_abi_version()
     }
-    if v != 3 {
-        g_abi_err = "LLVM-C 垫片 ABI 版本不符：期望 3，实际 " + to_string(v)
+    if v != 4 {
+        g_abi_err = "LLVM-C 垫片 ABI 版本不符：期望 4，实际 " + to_string(v)
         return false
     }
     unsafe {
@@ -116,6 +116,49 @@ pub func f64_text(bits: i64) -> string {
     }
     unsafe {
         return tj_f64_text(bits)
+    }
+}
+
+// ---- 按单元 ResourceTracker（会话化用）--------------------------------
+// 一个 LLJIT 会话可装载多个编译单元，每个单元持有独立 RT；移除一个单元
+// 不会波及同会话里的其它单元。所有符号仍在 main JITDylib，lookup 路径不变。
+pub func rt_create(jit: i64) -> i64 {
+    if !ensure() {
+        return 0
+    }
+    unsafe {
+        tj_err_clear()
+        return tj_rt_create(jit)
+    }
+}
+
+pub func rt_add_ir(jit: i64, rt: i64, ir: string) -> i64 {
+    if !ensure() {
+        return 1
+    }
+    unsafe {
+        tj_err_clear()
+        return tj_rt_add_ir(jit, rt, ir, len(ir))
+    }
+}
+
+pub func rt_remove(rt: i64) -> i64 {
+    if !ensure() {
+        return 1
+    }
+    unsafe {
+        tj_err_clear()
+        return tj_rt_remove(rt)
+    }
+}
+
+pub func rt_lookup(jit: i64, name: string) -> i64 {
+    if !ensure() {
+        return 0
+    }
+    unsafe {
+        tj_err_clear()
+        return tj_rt_lookup(jit, name)
     }
 }
 

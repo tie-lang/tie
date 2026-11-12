@@ -1,11 +1,20 @@
 type tie<lib, unsafe:mem, unsafe:ext>
-// lib/jit/session.tie —— 一次 JIT 会话的完整生命周期
+// lib/jit/session.tie —— JIT 会话公共面（壳无关）
 // ============================================================
-// 收拢「可用性检查 → open → add_ir → lookup → 调用 → close」六步，
-// 失败统一返回 "ERR:" + 可直接打印的诊断文本；成功返回 "OK:" + i64 位串。
-// close 由 defer 兜底，任何提前返回都不会泄漏 LLJIT 会话。
+// 两条路径共用本库：
+//   1) 一次性路径 run()：可用性检查 → open → add_ir → lookup → 调用 → close，
+//      close 由 defer 兜底；
+//   2) 持久会话 open/load/call/drop/stats/close：一个 LLJIT 会话装载多个
+//      编译单元，单元各自持有 ResourceTracker，命中缓存时跳过重新编译与装载。
+// 本库只接收编译好的 IR 文本，不认识源码、CLI、REPL 或任何壳；源码编译由
+// 宿主完成（lib/jit 按依赖门禁不能 import lib/compile）。
+// 失败统一返回 "ERR:" + 可直接打印的诊断文本；成功返回 "OK:" + 载荷。
 import "/std/string.tie"
+import "../support/text.tie"
 import "./llvmc.tie"
+import "./unit.tie"
+import "./cache.tie"
+import "./marshal.tie"
 namespace tie.jitsession;
 
 pub func available() -> bool {
@@ -40,4 +49,222 @@ pub func run(ll: string, wrap: string) -> string {
 // f64 结果按位收在 i64 槽里，由调用方按需还原为十进制文本。
 pub func f64_text(bits: i64) -> string {
     return tie.jit::f64_text(bits)
+}
+
+// ---- 持久会话状态（本文件内的全局平行表，避免跨文件值语义写回陷阱）----
+var g_jit: i64 = 0
+var g_seq: i64 = 0
+var g_clock: i64 = 0
+var g_hits: i64 = 0
+var g_misses: i64 = 0
+var g_uid: table<string> = []
+var g_prefix: table<string> = []
+var g_fname: table<string> = []
+var g_rt: table<i64> = []
+var g_addr: table<i64> = []
+var g_lru: table<i64> = []
+var g_live: table<i64> = []
+
+func find_uid(uid: string) -> i64 {
+    var i: i64 = 0
+    while i < len(g_uid) {
+        if g_live[i] == 1 && g_uid[i] == uid {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 打开（或复用）LLJIT 会话；0 = 失败。
+pub func open() -> i64 {
+    if g_jit != 0 {
+        return g_jit
+    }
+    if !tie.jit::available() {
+        return 0
+    }
+    var j = tie.jit::open()
+    if j == 0 {
+        return 0
+    }
+    g_jit = j
+    return j
+}
+
+// 装载一个编译单元。宿主负责编译并给出 uid / prefix / 目标函数名。
+// 命中同 uid 时只更新 LRU，不重新编译、不重新装载。
+pub func load(ir: string, uid: string, prefix: string, fname: string) -> string {
+    if g_jit == 0 {
+        return "ERR:会话未打开"
+    }
+    var hit = find_uid(uid)
+    if hit >= 0 {
+        g_hits = g_hits + 1
+        g_clock = g_clock + 1
+        g_lru[hit] = g_clock
+        return "OK:" + uid
+    }
+    g_misses = g_misses + 1
+    if tie.jitcache::live_count(g_live) >= tie.jitcache::cap() {
+        var v = tie.jitcache::victim(g_lru, g_live)
+        if v >= 0 {
+            tie.jit::rt_remove(g_rt[v])
+            g_live[v] = 0
+        }
+    }
+    var rt = tie.jit::rt_create(g_jit)
+    if rt == 0 {
+        return "ERR:[jit] 创建单元 RT 失败：" + tie.jit::last_error()
+    }
+    var le = tie.jit::rt_add_ir(g_jit, rt, ir)
+    if le != 0 {
+        var lmsg = tie.jit::last_error()
+        tie.jit::rt_remove(rt)
+        return "ERR:[jit] 装载单元失败(" + to_string(le) + ")：" + lmsg
+    }
+    // 预热 materialize：目标符号地址随单元缓存，后续调用只生成 wrapper。
+    var addr = tie.jit::rt_lookup(g_jit, tie.jitunit::target_sym(prefix, fname))
+    var amsg = tie.jit::last_error()
+    if addr == 0 {
+        tie.jit::rt_remove(rt)
+        return "ERR:[jit] 目标符号未生成：" + amsg
+    }
+    g_clock = g_clock + 1
+    var slot = tie.jitcache::free_slot(g_live)
+    if slot < 0 {
+        table_push(g_uid, uid)
+        table_push(g_prefix, prefix)
+        table_push(g_fname, fname)
+        table_push(g_rt, rt)
+        table_push(g_addr, addr)
+        table_push(g_lru, g_clock)
+        table_push(g_live, 1)
+    } else {
+        g_uid[slot] = uid
+        g_prefix[slot] = prefix
+        g_fname[slot] = fname
+        g_rt[slot] = rt
+        g_addr[slot] = addr
+        g_lru[slot] = g_clock
+        g_live[slot] = 1
+    }
+    return "OK:" + uid
+}
+
+// 调用已装载单元：生成唯一符号名的 wrapper，用临时 RT 装载，调用后立即释放。
+pub func call(uid: string, sig: table<string>, args: table<string>, ret: string) -> string {
+    if g_jit == 0 {
+        return "ERR:会话未打开"
+    }
+    var i = find_uid(uid)
+    if i < 0 {
+        return "ERR:未知单元：" + uid
+    }
+    g_seq = g_seq + 1
+    var wrap_name = tie.jitunit::wrap_symbol(g_seq)
+    var target = tie.jitunit::target_sym(g_prefix[i], g_fname[i])
+    var w = tie.marshal::wrapper_ir_named(target, sig, args, ret, wrap_name)
+    if !tie.support::has_prefix(w, "OK:") {
+        return w
+    }
+    var wrap_ir = tie.marshal::extern_decl(target, sig, ret) +
+        tie.support::slice(w, 3, str_len(w))
+    var rt = tie.jit::rt_create(g_jit)
+    if rt == 0 {
+        return "ERR:[jit] 创建包装 RT 失败：" + tie.jit::last_error()
+    }
+    var ae = tie.jit::rt_add_ir(g_jit, rt, wrap_ir)
+    if ae != 0 {
+        var amsg = tie.jit::last_error()
+        tie.jit::rt_remove(rt)
+        return "ERR:[jit] 装载包装失败(" + to_string(ae) + ")：" + amsg
+    }
+    var addr = tie.jit::rt_lookup(g_jit, wrap_name)
+    var lmsg = tie.jit::last_error()
+    var bits: i64 = 0
+    if addr != 0 {
+        unsafe {
+            bits = dyn_call_p(addr, 0, 0, 0, 0, 0)
+        }
+    }
+    // rt_remove 会清空线程局部错误串，故诊断文本一律先取再用。
+    var er = tie.jit::rt_remove(rt)
+    var rmsg = tie.jit::last_error()
+    if addr == 0 {
+        return "ERR:[jit] 包装未生成：" + lmsg
+    }
+    if er != 0 {
+        return "ERR:[jit] 释放包装失败：" + rmsg
+    }
+    g_clock = g_clock + 1
+    g_lru[i] = g_clock
+    return "OK:" + to_string(bits)
+}
+
+// 卸载单元：移除该单元的 RT，同会话的其它单元不受影响。
+pub func drop(uid: string) -> string {
+    var i = find_uid(uid)
+    if i < 0 {
+        return "ERR:未知单元：" + uid
+    }
+    var er = tie.jit::rt_remove(g_rt[i])
+    g_live[i] = 0
+    if er != 0 {
+        return "ERR:[jit] " + tie.jit::last_error()
+    }
+    return "OK:" + uid
+}
+
+// 宿主据此判断是否还需要重新编译：命中时可以直接把空 IR 传给 load。
+pub func has(uid: string) -> bool {
+    return find_uid(uid) >= 0
+}
+
+// 活动单元 id，逗号分隔。供宿主实现 list 命令。
+pub func list_uids() -> string {
+    var out = ""
+    var i: i64 = 0
+    while i < len(g_uid) {
+        if g_live[i] == 1 {
+            if str_len(out) > 0 {
+                out = out + ","
+            }
+            out = out + g_uid[i]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+pub func stats() -> string {
+    return "units=" + to_string(tie.jitcache::live_count(g_live)) +
+        " hits=" + to_string(g_hits) + " misses=" + to_string(g_misses)
+}
+
+// 关闭会话：逐个释放存活单元的 RT，再销毁 LLJIT；状态就地清空以待复用。
+pub func close() -> string {
+    var i: i64 = 0
+    while i < len(g_rt) {
+        if g_live[i] == 1 {
+            tie.jit::rt_remove(g_rt[i])
+        }
+        g_live[i] = 0
+        g_rt[i] = 0
+        g_addr[i] = 0
+        g_lru[i] = 0
+        g_uid[i] = ""
+        g_prefix[i] = ""
+        g_fname[i] = ""
+        i = i + 1
+    }
+    if g_jit != 0 {
+        tie.jit::close(g_jit)
+    }
+    g_jit = 0
+    g_seq = 0
+    g_clock = 0
+    g_hits = 0
+    g_misses = 0
+    return "OK:closed"
 }

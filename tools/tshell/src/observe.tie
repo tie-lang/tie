@@ -35,11 +35,15 @@ pub func o_set_backend(name: string) -> string {
         set_cfg("interp")
         return "eval-backend: interp（现役，tie-interp 快速路径）"
     }
+    if n == "jit" {
+        set_cfg("jit")
+        return "eval-backend: jit（进程内 JIT 会话；表达式求值仍委托 lib/interp，标量函数经 jit-call 走 JIT）"
+    }
     if n == "trm" {
         set_cfg("trm")
         return "eval-backend: trm（配置位已记；真接依赖 trm 引擎 Backend 接口，随 p.7.3 接入）"
     }
-    return "eval-backend: 未知后端 '" + n + "'（可选 interp | trm）"
+    return "eval-backend: 未知后端 '" + n + "'（可选 interp | jit | trm）"
 }
 
 // 把当前后端写回配置（td 资产）。

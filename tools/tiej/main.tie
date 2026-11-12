@@ -3,6 +3,7 @@ import "../../lib/support/cli.tie"
 import "../../lib/jit/marshal.tie"
 import "../../lib/jit/selftest.tie"
 import "../../lib/jit/session.tie"
+import "../../lib/jit/unit.tie"
 import "../../lib/macro/reject.tie"
 import "../../lib/compile/unit.tie"
 import "../../lib/interp/interp.tie"
@@ -52,6 +53,198 @@ func tiej_eval_proc(name: string, args: table<string>) -> string {
     return "OK:" + r
 }
 
+// ---- 自带 REPL：不依赖 tshell 或任何外部壳，tiej 单进程即可运行 --------
+var g_repl_quit: bool = false
+var g_rp_path: table<string> = []
+var g_rp_fname: table<string> = []
+var g_rp_uid: table<string> = []
+var g_rp_live: table<i64> = []
+
+func split_words(s: string) -> table<string> {
+    var out = table_new_string()
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        while i < n && str_char(s, i) == " " {
+            i = i + 1
+        }
+        if i >= n {
+            break
+        }
+        var st = i
+        while i < n && str_char(s, i) != " " {
+            i = i + 1
+        }
+        table_push(out, tie.support::slice(s, st, i))
+    }
+    return out
+}
+
+func has_repl_arg() -> bool {
+    var i: i64 = 0
+    while i < arg_count() {
+        if arg_string(i) == "--repl" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 记录「源文件 + 目标函数 → 单元 id」，供 drop 按路径定位。
+func repl_remember(path: string, fname: string, uid: string) {
+    var i: i64 = 0
+    while i < len(g_rp_uid) {
+        if g_rp_live[i] == 1 && g_rp_path[i] == path && g_rp_fname[i] == fname {
+            g_rp_uid[i] = uid
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_rp_path, path)
+    table_push(g_rp_fname, fname)
+    table_push(g_rp_uid, uid)
+    table_push(g_rp_live, 1)
+}
+
+func repl_call(w: table<string>) -> string {
+    var items = table_new_string()
+    var i: i64 = 1
+    while i < len(w) {
+        table_push(items, w[i])
+        i = i + 1
+    }
+    var b = tie.cli::parse(tie.cli::encode(items))
+    if tie.cli::get_field(b, "mode") != "run" {
+        var msg = tie.cli::get_field(b, "err")
+        if str_len(msg) == 0 {
+            msg = tie.cli::get_field(b, "usage")
+        }
+        return "ERR:" + msg
+    }
+    var path = tie.cli::get_field(b, "path")
+    var fname = tie.cli::get_field(b, "fname")
+    var ret = tie.cli::get_field(b, "ret")
+    var sig = tie.cli::list(b, "sig")
+    var args = tie.cli::list(b, "args")
+    g_tiej_macro_on = tie.cli::flag(b, "macro")
+    if g_tiej_macro_on {
+        interp::reset()
+    }
+    var src = file_read(path)
+    if str_len(src) == 0 {
+        return "ERR:读取失败：" + path
+    }
+    var opts = "bounds=1;macro="
+    if g_tiej_macro_on {
+        opts = opts + "1"
+    } else {
+        opts = opts + "0"
+    }
+    var uid = tie.jitunit::unit_id(src, opts, fname)
+    var prefix = tie.jitunit::prefix_for(uid)
+    // 缓存命中时不必重新编译：load 收到空 IR 也只会走命中分支。
+    var ll = ""
+    if !tie.jitsession::has(uid) {
+        var c = tie.compile::compile_source(path, fname, prefix, true,
+                                            tiej_eval_proto, tiej_eval_macro, tiej_eval_proc)
+        if !tie.support::has_prefix(c, "OK:") {
+            return c
+        }
+        ll = tie.support::slice(c, 3, str_len(c))
+    }
+    var lr = tie.jitsession::load(ll, uid, prefix, fname)
+    if !tie.support::has_prefix(lr, "OK:") {
+        return lr
+    }
+    var r = tie.jitsession::call(uid, sig, args, ret)
+    if !tie.support::has_prefix(r, "OK:") {
+        return r
+    }
+    repl_remember(path, fname, uid)
+    var bits = to_i64(tie.support::slice(r, 3, str_len(r)))
+    if ret == "void" {
+        return "OK:(void)"
+    }
+    if ret == "f64" {
+        return "OK:" + tie.jitsession::f64_text(bits)
+    }
+    return "OK:" + to_string(bits)
+}
+
+func repl_drop(w: table<string>) -> string {
+    if len(w) < 2 {
+        return "ERR:drop 需要源文件路径"
+    }
+    var path = w[1]
+    var fname = ""
+    if len(w) >= 3 {
+        fname = w[2]
+    }
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(g_rp_uid) {
+        if g_rp_live[i] == 1 && g_rp_path[i] == path {
+            if str_len(fname) == 0 || g_rp_fname[i] == fname {
+                var d = tie.jitsession::drop(g_rp_uid[i])
+                if !tie.support::has_prefix(d, "OK:") {
+                    return d
+                }
+                g_rp_live[i] = 0
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+    return "OK:dropped " + to_string(n)
+}
+
+func repl_line(line: string) -> string {
+    var w = split_words(line)
+    if len(w) == 0 {
+        return ""
+    }
+    var cmd = w[0]
+    if cmd == "quit" {
+        g_repl_quit = true
+        return "OK:bye"
+    }
+    if cmd == "stats" {
+        return "OK:" + tie.jitsession::stats()
+    }
+    if cmd == "list" {
+        return "OK:" + tie.jitsession::list_uids()
+    }
+    if cmd == "drop" {
+        return repl_drop(w)
+    }
+    if cmd == "call" {
+        return repl_call(w)
+    }
+    return "ERR:未知命令：" + cmd
+}
+
+func repl() -> i64 {
+    if tie.jitsession::open() == 0 {
+        println("ERR:LLVM-C 运行时不可用（ABI 版本或垫片缺失）")
+        return 1
+    }
+    println("tiej repl ready（call/drop/list/stats/quit；空行或 quit 退出）")
+    g_repl_quit = false
+    while !g_repl_quit {
+        var line = read_line()
+        if str_len(line) == 0 {
+            break
+        }
+        var out = repl_line(line)
+        if str_len(out) > 0 {
+            println(out)
+        }
+    }
+    tie.jitsession::close()
+    return 0
+}
+
 func run_source(b: string) -> i64 {
     var path = tie.cli::get_field(b, "path")
     var fname = tie.cli::get_field(b, "fname")
@@ -65,7 +258,7 @@ func run_source(b: string) -> i64 {
     }
     // 越界检查与 AOT 一样常开：表运行时符号已由宿主导出表提供，
     // JIT 代码不再需要靠关闭检查来规避运行时依赖。
-    var compiled = tie.compile::compile_source(path, fname, true,
+    var compiled = tie.compile::compile_source(path, fname, "", true,
                                                 tiej_eval_proto, tiej_eval_macro, tiej_eval_proc)
     if !tie.support::has_prefix(compiled, "OK:") {
         println(tie.support::slice(compiled, 4, str_len(compiled)))
@@ -95,6 +288,9 @@ func run_source(b: string) -> i64 {
 }
 
 func main() {
+    if has_repl_arg() {
+        exit(repl())
+    }
     var b = tie.cli::parse(tie.cli::from_process())
     var mode = tie.cli::get_field(b, "mode")
     if mode == "selftest" {

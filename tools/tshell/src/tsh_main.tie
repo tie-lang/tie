@@ -3,6 +3,7 @@ import "./repl.tie"
 import "./command.tie"
 import "./render.tie"
 import "./backend_interp.tie"
+import "./observe.tie"
 import "./session.tie"
 import "./lineedit.tie"
 import "./complete.tie"
@@ -20,6 +21,8 @@ import "./srv.tie"
 
 func main() -> i64 {
     session.ss_load()
+    // 启动时按持久配置恢复求值后端分发层，避免重启后配置与运行态不一致。
+    backend_interp.set_backend(observe.o_backend())
     shlang.sl_init()
     session.ss_env_load()
     var mode = run.rn_args()

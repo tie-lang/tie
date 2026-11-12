@@ -21,6 +21,26 @@ func last_seg(s: string) -> string {
 pub var g_sym_src: table<i64> = [];
 pub var g_sym_out: table<i64> = [];
 
+// 单元自有函数的发射前缀：多个编译单元共用一个 LLJIT 会话时，external
+// 同名符号会冲突，故在生成期给自有函数统一改名。空字符串 = 不改，
+// 此时发射结果与原先逐字节一致（普通单单元产物走这条路径）。
+pub var g_sym_prefix: string = "";
+
+pub func set_sym_prefix(s: string) {
+    g_sym_prefix = s
+}
+
+// 白名单与入口判定按源码原名书写，比较前先去掉单元前缀。
+pub func strip_sym_prefix(s: string) -> string {
+    var p = str_len(g_sym_prefix)
+    if p > 0 && str_len(s) > p {
+        if str.slice(s, 0, p) == g_sym_prefix {
+            return str.slice(s, p, str_len(s))
+        }
+    }
+    return s
+}
+
 // 预计算全部函数的发射符号（含入口名、export_name、no_mangle 规则），
 // 供定义（gen_func）与调用点（gen_inst_b_35_call）统一取值。
 pub func build_sym_map() {
@@ -40,6 +60,11 @@ pub func build_sym_map() {
             out = intern.lookup(ir.func_attr_arg(i))
         } else if (fat & 1) == 1 {
             out = last_seg(nm)
+        }
+        // 定义与全部调用点都经 sym_of_name 取发射符号，故只需在此处改一次；
+        // 外部 declare 不经此映射，保持原名以命中进程符号解析。
+        if str_len(g_sym_prefix) > 0 {
+            out = g_sym_prefix + out
         }
         table_push(g_sym_src, nid)
         table_push(g_sym_out, interner.intern(out))
@@ -66,17 +91,19 @@ func dll_export_hit_sym(sym: string) -> bool {
     if str_len(g_dll_export) == 0 {
         return false
     }
+    // 白名单按源码原名书写；sym 可能带单元前缀，比较前先去掉。
+    var cmp = strip_sym_prefix(sym)
     var m = str_len(g_dll_export)
     var st: i64 = 0
     var j: i64 = 0
     while j <= m {
         if j == m || str_byte(g_dll_export, j) == 44 {
             var seg = j - st
-            if seg == str_len(sym) {
+            if seg == str_len(cmp) {
                 var eq = true
                 var k: i64 = 0
                 while k < seg {
-                    if str_byte(g_dll_export, st + k) != str_byte(sym, k) {
+                    if str_byte(g_dll_export, st + k) != str_byte(cmp, k) {
                         eq = false
                         break
                     }
@@ -98,8 +125,9 @@ func dll_export_hit_sym(sym: string) -> bool {
 // 函数地址（ptrtoint）、call 目标都会自动保住对应符号，编译器无需自己
 // 证明可达性。判据只取编译器能静态证明的信息，证明不了的一律当根。
 func is_export_root(fid: i64, sym: string) -> bool {
-    // 入口：main 或 --entry 指定的函数，链接器必须按名找到
-    if sym == "main" {
+    // 入口：main 或 --entry 指定的函数，链接器必须按名找到。
+    // 带单元前缀时按去前缀后的原名判定。
+    if strip_sym_prefix(sym) == "main" {
         return true
     }
     if str_len(g_entry_name) > 0 {

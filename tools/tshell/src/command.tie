@@ -42,6 +42,7 @@ func builtin_names() -> table<string> {
     table_push(t, "cp")
     table_push(t, "rm")
     table_push(t, "set")
+    table_push(t, "jit-call")
     table_push(t, "source")
     table_push(t, "exec")
     table_push(t, "history")
@@ -483,6 +484,9 @@ pub func c_exec(toks: table<string>) -> string {
     if cmd == "cd" {
         return cmd_cd(args)
     }
+    if cmd == "jit-call" {
+        return cmd_jit_call(args)
+    }
     if cmd == "pwd" {
         return cwd_norm(g_cwd)
     }
@@ -529,13 +533,70 @@ pub func c_exec(toks: table<string>) -> string {
     return "?"
 }
 
+func split_csv(s: string) -> table<string> {
+    var out = table_new_string()
+    var n = str_len(s)
+    var st: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        if i == n || str_char(s, i) == "," {
+            table_push(out, sh_util.u_sub(s, st, i))
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// jit-call <源文件> <函数> [实参...] [--sig i64,f64] [--ret i64|f64|void]
+// 只在 set eval-backend jit 之后可用；把标量函数交给进程内 JIT 会话执行。
+func cmd_jit_call(args: table<string>) -> string {
+    if sh_util.u_len(args) < 2 {
+        return "jit-call <源文件> <函数> [实参...] [--sig ...] [--ret ...]"
+    }
+    var path = args[0]
+    var fname = args[1]
+    var ret = "i64"
+    var sig_csv = ""
+    var rest = table_new_string()
+    var i: i64 = 2
+    while i < sh_util.u_len(args) {
+        if args[i] == "--ret" && i + 1 < sh_util.u_len(args) {
+            ret = args[i + 1]
+            i = i + 2
+        } else if args[i] == "--sig" && i + 1 < sh_util.u_len(args) {
+            sig_csv = args[i + 1]
+            i = i + 2
+        } else {
+            table_push(rest, args[i])
+            i = i + 1
+        }
+    }
+    var sig = table_new_string()
+    if sig_csv != "" {
+        sig = split_csv(sig_csv)
+    } else {
+        var k: i64 = 0
+        while k < sh_util.u_len(rest) {
+            table_push(sig, "i64")
+            k = k + 1
+        }
+    }
+    return backend_interp.b_jit_call(path, fname, sig, rest, ret)
+}
+
 func cmd_set(args: table<string>) -> string {
     if sh_util.u_len(args) < 2 {
         return "set <NAME> <VALUE>"
     }
-    // set eval-backend interp|trm —— 委托 observe（p.9.3.5）
+    // set eval-backend interp|jit|trm —— 写配置并切换求值后端分发层。
     if args[0] == "eval-backend" {
-        return observe.o_set_backend(args[1])
+        var r = observe.o_set_backend(args[1])
+        var n = sh_util.u_trim(args[1])
+        if n == "interp" || n == "jit" {
+            backend_interp.set_backend(n)
+        }
+        return r
     }
     set_env(args[0], args[1])
     return ""

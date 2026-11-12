@@ -1,0 +1,28 @@
+type tie<lib>
+// lib/jit/unit.tie —— 单元身份与符号命名（纯函数，不持有状态）
+// ============================================================
+// 会话层只接收编译好的 IR 文本：源码读取、哈希与签名解析留在宿主侧，
+// 因为 lib/jit 按依赖门禁不能 import lib/compile。
+import "/std/string.tie"
+import "/std/blake3.tie"
+import "../support/text.tie"
+namespace tie.jitunit;
+
+// 单元身份 = blake3(源码内容 + 编译选项 + 目标名)。源码或选项一变即失效。
+pub func unit_id(src: string, opts: string, fname: string) -> string {
+    return blake3::blake3_256(src + "|" + opts + "|" + fname)
+}
+
+// 单元自有函数前缀：取哈希前 8 位，保证不同单元的 external 符号不撞名。
+pub func prefix_for(uid: string) -> string {
+    return "u" + tie.support::slice(uid, 0, 8) + "_"
+}
+
+pub func target_sym(prefix: string, fname: string) -> string {
+    return prefix + fname
+}
+
+// 每次调用的 wrapper 用唯一符号名，避免同一 JITDylib 里重复定义。
+pub func wrap_symbol(seq: i64) -> string {
+    return "tiej_wrap_" + to_string(seq)
+}

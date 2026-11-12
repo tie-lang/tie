@@ -17,6 +17,17 @@ pub func render(ctx: i64) -> string {
     return llvmgen.emit()
 }
 
+// 单元自有函数的发射前缀：工具在 render 之前注入，空串表示普通单单元产物。
+pub func set_sym_prefix(s: string) {
+    llvmgen.set_sym_prefix(s)
+}
+
+// 进程内编译段在一个进程里连续编译多个单元时必须复位后端累加器；
+// 一次性 CLI 每进程只编一个单元，看不出差别，会话化则会串状态。
+pub func unit_reset() {
+    llvmgen.unit_reset()
+}
+
 pub func last_error() -> string {
     if str_len(g_err) > 0 {
         return g_err

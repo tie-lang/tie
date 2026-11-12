@@ -21,7 +21,15 @@ if get_env("TIE_BUILD_NOCACHE") == "1" { opts = "--no-cache " }
 var outdir = path_join(root, "build")
 var _mk = mkdir_all(outdir)
 println("[build] compiling tools/tshell/src/tsh_main.tie")
-var rc1 = exec_code("cd /d \"" + root + "\" && build\\tiec.exe " + opts + "\"tools/tshell/src/tsh_main.tie\" -o \"build/tsh.exe\"")
+// JIT 后端需要进程内 LLVM-C 垫片对象；LLVM_PREFIX 未设置时退化为纯 interp
+// 装配（backend_jit 的 extern 在链接期才需要，故必须显式链入）。
+var llvm = get_env("LLVM_PREFIX")
+var link_extra = ""
+if llvm != "" {
+    // 宿主必须导出运行时符号与分配器，JIT 代码才能经进程符号解析命中。
+    link_extra = " --link-arg \"-Wl,/DEF:build\\tiej_exports.def build\\tiej_llvm.o -L" + llvm + "\\lib -lLLVM-C\""
+}
+var rc1 = exec_code("cd /d \"" + root + "\" && build\\tiec.exe " + opts + "\"tools/tshell/src/tsh_main.tie\" -o \"build/tsh.exe\"" + link_extra)
 if rc1 != 0 { println("[build] compile failed: tools/tshell/src/tsh_main.tie (rc=" + to_string(rc1) + ")") }
 println("[build] done: build\\tsh.exe")
 exit 0

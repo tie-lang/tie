@@ -139,13 +139,58 @@ pub func arg_ir(kind: string, raw: string) -> string {
     return "OK:i64 " + to_string(to_i64(raw))
 }
 
+func ty_llvm(k: string) -> string {
+    if k == "f64" {
+        return "double"
+    }
+    if k == "bool" {
+        return "i1"
+    }
+    if k == "ptr" {
+        return "ptr"
+    }
+    return "i64"
+}
+
+// 会话路径里 wrapper 是独立 IR 模块，目标函数必须显式 declare，否则
+// LLVMParseIRInContext 会以「use of undefined value」拒绝整个模块。
+// 一次性路径把 wrapper 追加到编译产物文本之后，目标函数已有 define，无需此行。
+pub func extern_decl(target: string, sig: table<string>, ret: string) -> string {
+    var r = "i64"
+    if ret == "void" {
+        r = "void"
+    } else {
+        r = ty_llvm(ret)
+    }
+    var ps = ""
+    var i: i64 = 0
+    while i < len(sig) {
+        if i > 0 {
+            ps = ps + ", "
+        }
+        ps = ps + ty_llvm(sig[i])
+        i = i + 1
+    }
+    return "declare " + r + " @" + target + "(" + ps + ")\n"
+}
+
 // 生成零参数调用包装。返回 OK:/ERR: 协议文本，OK 载荷为完整 IR 文本。
+// 一次性路径固定用 tiej_wrap；会话路径改用 wrapper_ir_named 给出唯一符号名，
+// 避免多个 wrapper 在同一 JITDylib 里撞名。
 pub func wrapper_ir(target: string, sig: table<string>, args: table<string>, ret: string) -> string {
+    return wrapper_ir_named(target, sig, args, ret, "tiej_wrap")
+}
+
+pub func wrapper_ir_named(target: string, sig: table<string>, args: table<string>,
+                          ret: string, wrap_name: string) -> string {
     if !ret_ok(ret) {
         return "ERR:不支持的返回类型：" + ret
     }
     if str_len(target) == 0 {
         return "ERR:目标函数名为空"
+    }
+    if str_len(wrap_name) == 0 {
+        return "ERR:包装符号名为空"
     }
     if len(sig) != len(args) {
         return "ERR:实参个数与类型表不一致：" + to_string(len(args)) + " vs " + to_string(len(sig))
@@ -163,22 +208,23 @@ pub func wrapper_ir(target: string, sig: table<string>, args: table<string>, ret
         call_args = call_args + tie.support::slice(r, 3, str_len(r))
         i = i + 1
     }
+    var head = "OK:define i64 @" + wrap_name + "() {\nentry:\n"
     if ret == "f64" {
-        return "OK:define i64 @tiej_wrap() {\nentry:\n  %r = call double @" + target +
+        return head + "  %r = call double @" + target +
             "(" + call_args + ")\n  %b = bitcast double %r to i64\n  ret i64 %b\n}\n"
     }
     if ret == "void" {
-        return "OK:define i64 @tiej_wrap() {\nentry:\n  call void @" + target +
+        return head + "  call void @" + target +
             "(" + call_args + ")\n  ret i64 0\n}\n"
     }
     if ret == "bool" {
-        return "OK:define i64 @tiej_wrap() {\nentry:\n  %r = call i1 @" + target +
+        return head + "  %r = call i1 @" + target +
             "(" + call_args + ")\n  %z = zext i1 %r to i64\n  ret i64 %z\n}\n"
     }
     if ret == "ptr" {
-        return "OK:define i64 @tiej_wrap() {\nentry:\n  %r = call ptr @" + target +
+        return head + "  %r = call ptr @" + target +
             "(" + call_args + ")\n  %p = ptrtoint ptr %r to i64\n  ret i64 %p\n}\n"
     }
-    return "OK:define i64 @tiej_wrap() {\nentry:\n  %r = call i64 @" + target +
+    return head + "  %r = call i64 @" + target +
         "(" + call_args + ")\n  ret i64 %r\n}\n"
 }

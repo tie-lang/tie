@@ -1,48 +1,83 @@
 type tie<logic>
-// src/backend_interp.tie —— 求值后端委托（interp 后端，现役默认）
-// --------------------------------------------------------------
-// REPL 求值内核**只对接不实现**：tie 表达式/脚本由本仓 lib/interp 求值。
-// 本模块薄委托，把求值后端隔离到单点，便于按配置切换为 JIT 后端。
-// 合仓后只依赖仓内 lib/，不再指向任何兄弟仓。
-
+// tools/tshell/src/backend_interp.tie —— 求值后端分发层
+// ============================================================
+// 调用点（command / repl / run / shlang）始终 import 本文件并调用
+// backend_interp.b_*，因此更换后端只需切换这里的分发目标，不必改调用点。
+// interp 为默认；jit 走 backend_jit.tie，两者实现同一组 b_* 契约。
 import "../../../lib/interp/interp.tie"
-
+import "./backend_jit.tie"
 namespace backend_interp {
 
-// 当前求值后端标识（interp 现役；trm 为配置位，p.9.3.5）。
+var g_backend: string = "interp"
+
+pub func set_backend(n: string) {
+    g_backend = n
+}
+
 pub func b_backend() -> string {
-    return "interp"
+    return g_backend
 }
 
 // 求值一段 tie 源码，返回结果文本（错误亦以文本返回）。
 pub func b_eval(src: string) -> string {
+    if g_backend == "jit" {
+        return backend_jit.b_eval(src)
+    }
     return interp::eval(src)
 }
 
-// 整文件脚本求值（tsh 角色，p.9.4）：整文件 parse + 顺序求值（函数跨行持久、
-// 多行块、条件 exit(n) 生效）。返回结果文本（错误亦以文本返回）。
+// 整文件脚本求值（函数跨行持久、多行块、条件 exit(n) 生效）。
 pub func b_eval_script(src: string) -> string {
+    if g_backend == "jit" {
+        return backend_jit.b_eval_script(src)
+    }
     return interp::eval_script(src)
 }
 
-// 注入脚本参数（跳过 -f <path> 前缀；脚本内 arg_count/arg_at 读取）。
 pub func b_set_script_args(t: table<string>) {
+    if g_backend == "jit" {
+        backend_jit.b_set_script_args(t)
+        return
+    }
     interp::set_script_args(t)
 }
 
-// 脚本是否请求退出（exit(n) 触发）。
 pub func b_exit_requested() -> bool {
+    if g_backend == "jit" {
+        return backend_jit.b_exit_requested()
+    }
     return interp::exit_requested()
 }
 
-// 脚本请求的退出码（exit(n)；主进程透传，缺省 0）。
 pub func b_exit_code() -> i64 {
+    if g_backend == "jit" {
+        return backend_jit.b_exit_code()
+    }
     return interp::exit_code_val()
 }
 
-// 重置求值会话（清空 interp 的 globals+funcs）。
 pub func b_reset() {
+    if g_backend == "jit" {
+        backend_jit.b_reset()
+        return
+    }
     interp::reset()
+}
+
+// 显式 JIT 调用：只有选择了 jit 后端才开放，避免误以为默认路径已改语义。
+pub func b_jit_call(path: string, fname: string, sig: table<string>,
+                    args: table<string>, ret: string) -> string {
+    if g_backend != "jit" {
+        return "ERR:请先 set eval-backend jit"
+    }
+    return backend_jit.b_jit_call(path, fname, sig, args, ret)
+}
+
+pub func b_jit_close() -> string {
+    if g_backend != "jit" {
+        return "ERR:当前不是 jit 后端"
+    }
+    return backend_jit.b_jit_close()
 }
 
 }   // namespace backend_interp

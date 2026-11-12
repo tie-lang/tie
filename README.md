@@ -137,7 +137,23 @@ build/hello.exe
 # JIT：编译并直接调用函数
 build/tiej.exe examples/hello.tie main
 build/tiej.exe --macro examples/hello.tie main
+
+# JIT 会话：同一进程装载多个单元、复用编译缓存、按单元卸载
+build/tiej.exe --repl
 ```
+
+`--repl` 从标准输入逐行读取，每行输出一条 `OK:` / `ERR:`。命令为
+`call <源文件> <函数> [实参...] [--sig ...] [--ret ...] [--macro]`、
+`drop <源文件> [函数]`、`list`、`stats`、`quit`；空行或 `quit` 退出并释放
+所有会话资源。同一单元重复调用命中进程内缓存，源码变化则按新单元重新编译。
+
+`tshell` 可以把求值后端切到 JIT：`set eval-backend jit` 后用
+`jit-call <源文件> <函数> [实参...] [--sig ...] [--ret ...]` 把标量函数交给
+同一进程内的 JIT 会话；表达式与整文件脚本仍由 `lib/interp` 求值（解释器
+`Value` 与 JIT 的 i64 槽之间的值表示边界尚未打通）。构建带 JIT 后端的 tsh
+时设置 `LLVM_PREFIX`，`tools/tshell/build.tsh.tie` 会自动附加
+`tiej_llvm.o`、运行时导出定义与 `-lLLVM-C`；不设置则构建为纯 interp 装配。
+tiej 本身不依赖 tshell，两种入口都可独立运行。
 
 `tiej` 用 `--sig i64,f64,bool --ret f64` 指定类型表与返回类型，省略时全部按
 `i64`。参数类型支持 `i64` / `bool` / `f64` / `ptr`，返回类型另支持 `void`；`--macro`

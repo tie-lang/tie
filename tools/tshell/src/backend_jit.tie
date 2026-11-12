@@ -1,0 +1,99 @@
+type tie<logic, unsafe:mem, unsafe:ext>
+// tools/tshell/src/backend_jit.tie —— JIT 求值后端
+// ============================================================
+// 与 backend_interp.tie 实现同一组 b_* 契约，由分发层按 set eval-backend 选择。
+//
+// 边界（如实说明）：表达式与整文件脚本仍委托 lib/interp 求值——解释器的
+// Value 结构与 JIT 的 i64 槽尚未打通，string/table 跨边界的所有权规则也未
+// 定义，强行把 b_eval 改成 JIT 会静默改变语义。本后端提供显式的 b_jit_call，
+// 让 tsh 脚本把标量函数交给进程内 JIT 会话执行；值表示打通属后续独立议题。
+import "../../../lib/interp/interp.tie"
+import "../../../lib/jit/session.tie"
+import "../../../lib/jit/unit.tie"
+import "../../../lib/compile/unit.tie"
+import "../../../lib/macro/reject.tie"
+import "../../../lib/support/text.tie"
+namespace backend_jit;
+
+// 命名空间函数不能作值传递，宏执行器以同文件裸名包装注入编译段。
+func ep(p: string) -> string {
+    return tie.macroreject::proto(p)
+}
+
+func em(n: string, a: table<string>) -> string {
+    return tie.macroreject::expand(n, a)
+}
+
+func eproc(n: string, a: table<string>) -> string {
+    return tie.macroreject::expand_proc(n, a)
+}
+
+pub func b_backend() -> string {
+    return "jit"
+}
+
+pub func b_eval(src: string) -> string {
+    return interp::eval(src)
+}
+
+pub func b_eval_script(src: string) -> string {
+    return interp::eval_script(src)
+}
+
+pub func b_set_script_args(t: table<string>) {
+    interp::set_script_args(t)
+}
+
+pub func b_exit_requested() -> bool {
+    return interp::exit_requested()
+}
+
+pub func b_exit_code() -> i64 {
+    return interp::exit_code_val()
+}
+
+pub func b_reset() {
+    interp::reset()
+}
+
+// 显式 JIT 调用：编译源文件里的函数到会话并调用，命中缓存时跳过重编。
+pub func b_jit_call(path: string, fname: string, sig: table<string>,
+                    args: table<string>, ret: string) -> string {
+    if tie.jitsession::open() == 0 {
+        return "ERR:LLVM-C 运行时不可用（ABI 版本或垫片缺失）"
+    }
+    var src = file_read(path)
+    if str_len(src) == 0 {
+        return "ERR:读取失败：" + path
+    }
+    var uid = tie.jitunit::unit_id(src, "bounds=1;macro=0", fname)
+    var prefix = tie.jitunit::prefix_for(uid)
+    var ll = ""
+    if !tie.jitsession::has(uid) {
+        var c = tie.compile::compile_source(path, fname, prefix, true, ep, em, eproc)
+        if !tie.support::has_prefix(c, "OK:") {
+            return c
+        }
+        ll = tie.support::slice(c, 3, str_len(c))
+    }
+    var lr = tie.jitsession::load(ll, uid, prefix, fname)
+    if !tie.support::has_prefix(lr, "OK:") {
+        return lr
+    }
+    var r = tie.jitsession::call(uid, sig, args, ret)
+    if !tie.support::has_prefix(r, "OK:") {
+        return r
+    }
+    var bits = to_i64(tie.support::slice(r, 3, str_len(r)))
+    if ret == "f64" {
+        return "OK:" + tie.jitsession::f64_text(bits)
+    }
+    if ret == "void" {
+        return "OK:(void)"
+    }
+    return "OK:" + to_string(bits)
+}
+
+pub func b_jit_close() -> string {
+    return tie.jitsession::close()
+}

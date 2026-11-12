@@ -86,6 +86,35 @@ def main() -> int:
             failed += 1
             print("[FAIL] %s: rc=%d (期望 %d) out=%r" % (name, p.returncode, want_rc, out[:160]))
 
+    # REPL 会话：缓存命中、多单元符号隔离、按单元卸载、退出释放。
+    repl_in = "\n".join([
+        "call tools/tiej/tests/add.tie add 3 4",
+        "call tools/tiej/tests/add.tie add 10 20",
+        "stats",
+        "call tools/tiej/tests/tbl.tie tblen",
+        "call tools/tiej/tests/multi.tie sum7 1 2 3 4 5 6 7",
+        "stats",
+        "drop tools/tiej/tests/add.tie",
+        "stats",
+        "quit",
+    ]) + "\n"
+    try:
+        rp = subprocess.run([str(exe), "--repl"], cwd=str(ROOT), env=env,
+                            input=repl_in.encode("utf-8"),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            timeout=180)
+        rout = rp.stdout.decode("utf-8", "replace")
+        want = ["OK:7", "OK:30", "units=1 hits=1 misses=1", "OK:4", "OK:28",
+                "units=3 hits=1 misses=3", "OK:dropped 1", "units=2", "OK:bye"]
+        if rp.returncode == 0 and all(x in rout for x in want):
+            print("[PASS] repl-session")
+        else:
+            failed += 1
+            print("[FAIL] repl-session: rc=%d out=%r" % (rp.returncode, rout[:300]))
+    except subprocess.TimeoutExpired:
+        failed += 1
+        print("[FAIL] repl-session: 超时")
+
     # 产物形态：静态链入垫片后不应再出现自研 DLL 名。
     if b"tiej_llvm.dll" in exe.read_bytes():
         failed += 1
@@ -93,7 +122,7 @@ def main() -> int:
     else:
         print("[PASS] 产物不含自研垫片名")
 
-    print("tiej 回归：%d 项，%d 失败" % (len(CASES) + 1, failed))
+    print("tiej 回归：%d 项，%d 失败" % (len(CASES) + 2, failed))
     return 1 if failed else 0
 
 

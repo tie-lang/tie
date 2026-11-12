@@ -15,11 +15,14 @@
 //   tj_abi_version()                     -> 整数（宿主启动时校验）
 //   tj_f64_ir / tj_f64_bits / tj_f64_text -> 十进制文本与位模式互换
 //
-// 能力（ABI 3）：
+// 能力（ABI 4）：
 //   - 会话挂**进程符号解析**：JIT 代码可直接调用宿主进程已链接的符号
 //     （libc、trm_lite 运行时），不必手工登记每个外部函数；
 //   - 调用编组交给 JIT 侧生成的包装函数（按 tie 签名逐参编组），
-//     垫片不再受「≤5 个标量参数」限制。
+//     垫片不再受「≤5 个标量参数」限制；
+//   - 每个编译单元持有独立 ResourceTracker：装载走
+//     LLVMOrcLLJITAddLLVMIRModuleWithRT，卸载走 ResourceTrackerRemove，
+//     替换一个单元不会波及其它单元，lookup 仍在 main JITDylib 上完成。
 //
 // 两种构建形态：
 //   1. 静态链入宿主（tiej 默认）：定义 TJ_STATIC，TJ_EXPORT 为空，编成 .o
@@ -60,7 +63,7 @@
 #define TJ_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define TJ_ABI_VERSION 3
+#define TJ_ABI_VERSION 4
 
 static _Thread_local char g_err[1024];
 
@@ -204,6 +207,76 @@ TJ_EXPORT const char *tj_f64_text(int64_t bits) {
     memcpy(&d, &bits, sizeof(d));
     snprintf(b, sizeof(b), "%.17g", d);
     return b;
+}
+
+// ---- 按单元 ResourceTracker（ABI 4）------------------------------------
+// 一个 LLJIT 会话里可以装载多个编译单元：每个单元一个 RT，卸载/替换只影响
+// 该 RT 追踪的模块。所有符号仍加在 main JITDylib，故 tj_rt_lookup 与
+// tj_jit_lookup 的查找路径完全一致。
+
+TJ_EXPORT int64_t tj_rt_create(int64_t jit) {
+    TJJit *j = (TJJit *)(intptr_t)jit;
+    if (!j || !j->jit) {
+        tj_err_set("tiej_llvm: rt_create 参数非法");
+        return 0;
+    }
+    LLVMOrcResourceTrackerRef rt =
+        LLVMOrcJITDylibCreateResourceTracker(LLVMOrcLLJITGetMainJITDylib(j->jit));
+    if (!rt) {
+        tj_err_set("tiej_llvm: 创建 ResourceTracker 失败");
+        return 0;
+    }
+    return (int64_t)(intptr_t)rt;
+}
+
+TJ_EXPORT int64_t tj_rt_add_ir(int64_t jit, int64_t rt, const char *ir, int64_t len) {
+    TJJit *j = (TJJit *)(intptr_t)jit;
+    LLVMOrcResourceTrackerRef r = (LLVMOrcResourceTrackerRef)(intptr_t)rt;
+    if (!j || !j->jit || !r || !ir || len <= 0) {
+        tj_err_set("tiej_llvm: rt_add_ir 参数非法");
+        return 1;
+    }
+    LLVMMemoryBufferRef buf = LLVMCreateMemoryBufferWithMemoryRangeCopy(
+        ir, (size_t)len, "tiej-unit");
+    if (!buf) {
+        tj_err_set("tiej_llvm: 创建内存缓冲失败");
+        return 2;
+    }
+    LLVMModuleRef m = NULL;
+    char *msg = NULL;
+    if (LLVMParseIRInContext(j->ctx, buf, &m, &msg)) {
+        tj_err_set(msg ? msg : "tiej_llvm: LLVM IR 解析失败");
+        if (msg) LLVMDisposeMessage(msg);
+        return 3;
+    }
+    LLVMOrcThreadSafeContextRef tsc = LLVMOrcCreateNewThreadSafeContext();
+    LLVMOrcThreadSafeModuleRef tsm = LLVMOrcCreateNewThreadSafeModule(m, tsc);
+    LLVMErrorRef e = LLVMOrcLLJITAddLLVMIRModuleWithRT(j->jit, r, tsm);
+    LLVMOrcDisposeThreadSafeContext(tsc);
+    if (e) {
+        tj_err_llvm(e);
+        return 4;
+    }
+    return 0;
+}
+
+TJ_EXPORT int64_t tj_rt_remove(int64_t rt) {
+    LLVMOrcResourceTrackerRef r = (LLVMOrcResourceTrackerRef)(intptr_t)rt;
+    if (!r) {
+        tj_err_set("tiej_llvm: rt_remove 参数非法");
+        return 1;
+    }
+    LLVMErrorRef e = LLVMOrcResourceTrackerRemove(r);
+    LLVMOrcReleaseResourceTracker(r);
+    if (e) {
+        tj_err_llvm(e);
+        return 2;
+    }
+    return 0;
+}
+
+TJ_EXPORT int64_t tj_rt_lookup(int64_t jit, const char *name) {
+    return tj_jit_lookup(jit, name);
 }
 
 TJ_EXPORT void tj_jit_close(int64_t jit) {

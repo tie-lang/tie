@@ -22,7 +22,8 @@ import "../front/parser.tie"
 import "../codegen/irgen.tie"
 namespace tie.compile;
 
-pub func compile_source(immut path: string, immut fname: string, check_bounds: bool,
+pub func compile_source(immut path: string, immut fname: string,
+                        immut symbol_prefix: string, check_bounds: bool,
                         ep: fn(string) -> string,
                         em: fn(string, table<string>) -> string,
                         eproc: fn(string, table<string>) -> string) -> string {
@@ -34,8 +35,16 @@ pub func compile_source(immut path: string, immut fname: string, check_bounds: b
     sstate.ctx_new()
     ir.ctx_new()
     irgen.unit_reset()
+    // 后端累加器（字符串池、函数行表、置位旗标等）同样必须按单元复位：
+    // 常驻会话连续编译多个单元时，漏掉会让 gen_func 读到上一单元的
+    // g_fn_inst_lo 而越界。对齐 tools/tiec 的 driver.unit_reset 纪律。
+    tie.backend::unit_reset()
     irgen.set_check_bounds(check_bounds)
+    // 单元自有函数的发射前缀：多个单元共用一个 LLJIT 会话时避免 external
+    // 同名符号冲突。空前缀表示普通单单元产物，发射结果与原先逐字节一致。
+    tie.backend::set_sym_prefix(symbol_prefix)
     // 目标函数列入导出白名单，否则未引用函数被根集合裁剪，JIT 查不到符号。
+    // 白名单按源码原名书写，backend 侧比较时会去掉单元前缀。
     irgen.set_dll_export(fname)
     if tie.front::parse(clean, 0, 0) < 0 {
         return "ERR:[parse] " + parser.ast_err_protocol()
