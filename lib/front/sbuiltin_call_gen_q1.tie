@@ -46,6 +46,20 @@ pub func builtin_call_b_int_to_ptr(fn_name: string, args: table<i64>, call_node:
         return types.ptr_of(types.named(TK_U8))
 }
 
+pub func builtin_call_b_ptr_to_table(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // 句柄重解释：把 i64 句柄还原成表值（与 int_to_ptr 同一条 inttoptr 指令，
+    // 差别只在静态类型）。返回裸 table，元素类型由赋值点（var t: table<T>）细化，
+    // 与 table_new_*/table_clone 同范式。
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "ptr_to_table() 期望 1 个参数（句柄整数），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_TABLE)
+}
+
 pub func builtin_call_b_alloc(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
     var nargs = len(args)
     // ---------- unsafe 指针/内存内置（固定返回类型部分） ----------

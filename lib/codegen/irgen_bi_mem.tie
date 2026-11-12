@@ -375,6 +375,27 @@ if nm == "int_to_ptr" {
 }
 
 // unsafe 指针/内存内置
+// 内置 `ptr_to_table`
+pub func bi_ptr_to_table(nm: string, id: i64) -> i64 {
+if nm == "ptr_to_table" {
+    // ptr_to_table(h) → 句柄整数还原成表值。LLVM 侧先做 inttoptr i64 → ptr
+    // （表值在 IR 里本就是指针，静态类型差由前端承担），再补一次 retain：
+    // 返回值持有该表的一份引用，调用方对原句柄的引用不被转移。缺这一次 retain
+    // 会被表变量的作用域释放当成独占引用，与原持有者双重释放（探针实测崩溃）。
+    var v = tig_expr(call_arg(id, 0))
+    if v < 0 {
+        return -1
+    }
+    var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))
+    ir.add_operand(ip, v, 0)
+    var pv = ir.get_value(ip)
+    tig_tbl_retain_call(pv)
+    g_builtin_res = pv
+    return 0
+}
+}
+
+// unsafe 指针/内存内置
 // 内置 `alloc`
 pub func bi_alloc(nm: string, id: i64) -> i64 {
 if nm == "alloc" {
