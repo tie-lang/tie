@@ -224,6 +224,21 @@ pub func from_host_string(s: string) -> Value {
 }
 
 // 宿主表 → 值：调用方交出句柄的一次所有权（本模块 retain 后持有）。
+pub func from_host_i64_table(t: table<i64>) -> Value {
+    // 把宿主侧 table<i64> 句柄内容转成本模块的表值（逐元素装箱成 Int）。
+    // 与 from_host_table 的分工：那个接管现成的 table<Value>，这个负责元素类型
+    // 不同（JIT 侧只能表达 i64）时的转换，故必须复制而不是共享句柄。
+    var n: table<Value> = {}
+    var i: i64 = 0
+    while i < len(t) {
+        table_push(n, Value.Int(t[i]))
+        i = i + 1
+    }
+    var w: table<Value> = {}
+    unsafe { w = wrap_table(n) }
+    return Value.Tbl(w)
+}
+
 pub func from_host_table(t: table<Value>) -> Value {
     var w: table<Value> = t
     unsafe {

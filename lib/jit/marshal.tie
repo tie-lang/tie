@@ -101,6 +101,7 @@ pub func kind_ok(k: string) -> bool {
     if k == "bool" { return true }
     if k == "f64" { return true }
     if k == "ptr" { return true }
+    if k == "tbl" { return true }
     return false
 }
 
@@ -109,6 +110,7 @@ pub func ret_ok(r: string) -> bool {
     if r == "bool" { return true }
     if r == "f64" { return true }
     if r == "ptr" { return true }
+    if r == "tbl" { return true }
     if r == "void" { return true }
     return false
 }
@@ -133,7 +135,7 @@ pub func arg_ir(kind: string, raw: string) -> string {
         }
         return "OK:i1 false"
     }
-    if kind == "ptr" {
+    if kind == "ptr" || kind == "tbl" {
         // call 实参必须是「类型 值」两段；漏掉前导 ptr 会让 LLVM 解析器
         // 在 inttoptr 处报 expected type（此前 ptr 实参从未被真正走到）。
         return "OK:ptr inttoptr (i64 " + to_string(to_i64(raw)) + " to ptr)"
@@ -148,7 +150,7 @@ func ty_llvm(k: string) -> string {
     if k == "bool" {
         return "i1"
     }
-    if k == "ptr" {
+    if k == "ptr" || k == "tbl" {
         return "ptr"
     }
     return "i64"
@@ -223,7 +225,7 @@ pub func wrapper_ir_named(target: string, sig: table<string>, args: table<string
         return head + "  %r = call i1 @" + target +
             "(" + call_args + ")\n  %z = zext i1 %r to i64\n  ret i64 %z\n}\n"
     }
-    if ret == "ptr" {
+    if ret == "ptr" || ret == "tbl" {
         return head + "  %r = call ptr @" + target +
             "(" + call_args + ")\n  %p = ptrtoint ptr %r to i64\n  ret i64 %p\n}\n"
     }

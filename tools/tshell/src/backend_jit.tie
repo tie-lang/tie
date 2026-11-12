@@ -28,6 +28,18 @@ func eproc(n: string, a: table<string>) -> string {
     return tie.macroreject::expand_proc(n, a)
 }
 
+// 最近一次 JIT 调用返回的复合值（表）——解释器值表示；标量仍走文本面。
+pub var w_jit_val: Value = Value.Nil;
+
+pub func b_jit_value() -> Value {
+    return w_jit_val
+}
+
+// 上一次 tbl 返回值的文本形式（REPL 的 jit-value 命令用）。
+pub func b_jit_value_text() -> string {
+    return vval.to_repl_string(w_jit_val)
+}
+
 pub func b_backend() -> string {
     return "jit"
 }
@@ -143,6 +155,15 @@ pub func b_jit_call(path: string, fname: string, sig: table<string>,
         var out = ""
         unsafe { out = str_of_ptr(bits) }
         return "OK:" + out
+    }
+    if ret == "tbl" {
+        // 表返回值：句柄按 ptr_to_table 还原成宿主表，再装箱成解释器值留在
+        // w_jit_val 槽里（供后续 b_jit_value 取用）；文本面只回报长度，
+        // 避免把表内容压成不可逆的字符串。
+        var ht: table<i64> = {}
+        unsafe { ht = ptr_to_table(bits) }
+        w_jit_val = vval.from_host_i64_table(ht)
+        return "OK:tbl:" + to_string(len(ht))
     }
     return "OK:" + to_string(bits)
 }

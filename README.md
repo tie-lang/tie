@@ -151,14 +151,18 @@ build/tiej.exe --repl
 `jit-call <源文件> <函数> [实参...] [--sig ...] [--ret ...]` 把标量函数交给
 同一进程内的 JIT 会话。实参类型与返回类型都支持 `str`：字符串按运行时数据
 指针传（两侧共用同一段内存，长度头在指针前 8 字节），返回时宿主按长度头重建
-`string`，因此 JIT 函数可以直接收发 tie 字符串。表达式与整文件脚本仍由
-`lib/interp` 求值（`Value` 的其它复合载荷尚差一层句柄重解释）。构建带 JIT 后端的 tsh
+`string`，因此 JIT 函数可以直接收发 tie 字符串。返回类型还支持 `tbl`：JIT 返回
+的表句柄经内置 `ptr_to_table` 还原成宿主表，再装箱为解释器值留在 `w_jit_val`
+槽里，`jit-value` 命令可打印它的文本形式（表按元素逐个复制，值语义）。表达式
+与整文件脚本仍由 `lib/interp` 求值。
+构建带 JIT 后端的 tsh
 时设置 `LLVM_PREFIX`，`tools/tshell/build.tsh.tie` 会自动附加
 `tiej_llvm.o`、运行时导出定义与 `-lLLVM-C`；不设置则构建为纯 interp 装配。
 tiej 本身不依赖 tshell，两种入口都可独立运行。
 
 `tiej` 用 `--sig i64,f64,bool --ret f64` 指定类型表与返回类型，省略时全部按
-`i64`。参数类型支持 `i64` / `bool` / `f64` / `ptr`，返回类型另支持 `void`；`--macro`
+`i64`。参数类型支持 `i64` / `bool` / `f64` / `ptr` / `tbl`，返回类型另支持 `void`
+与 `tbl`（表句柄在 LLVM 侧按 `ptr` 传递）；`--macro`
 允许编译期宏展开，默认显式拒绝。
 
 ## 其它工具

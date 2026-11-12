@@ -43,6 +43,7 @@ func builtin_names() -> table<string> {
     table_push(t, "rm")
     table_push(t, "set")
     table_push(t, "jit-call")
+    table_push(t, "jit-value")
     table_push(t, "source")
     table_push(t, "exec")
     table_push(t, "history")
@@ -487,6 +488,9 @@ pub func c_exec(toks: table<string>) -> string {
     if cmd == "jit-call" {
         return cmd_jit_call(args)
     }
+    if cmd == "jit-value" {
+        return backend_interp.b_jit_value_text()
+    }
     if cmd == "pwd" {
         return cwd_norm(g_cwd)
     }
@@ -583,6 +587,11 @@ func cmd_jit_call(args: table<string>) -> string {
         }
     }
     return backend_interp.b_jit_call(path, fname, sig, rest, ret)
+}
+
+// jit-value —— 打印上一次 jit-call 以 tbl 返回的复合值（表）。
+func cmd_jit_value(args: table<string>) -> string {
+    return backend_interp.b_jit_value_text()
 }
 
 func cmd_set(args: table<string>) -> string {
