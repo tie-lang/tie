@@ -37,8 +37,8 @@ type tie<class, unsafe:mem>
 //   故不改成宿主对象，保持既有语义与成本。
 //
 // # 命名与常量纪律
-//   顶层常量加 W_ 前缀（`ivalue` 的 T_* 与本模块 import 内联后同作用域，重名即
-//   重复定义报错——parity 探针会同时引入两者）；全局表加 w_ 前缀。
+//   顶层常量加 W_ 前缀（避免与共享同一命名空间的其它值模块顶层常量重名）；
+//   全局表加 w_ 前缀。
 //
 // # 调用约定
 //   import 后 vval.new_int(...) / vval.type_of(...)。
@@ -46,7 +46,7 @@ type tie<class, unsafe:mem>
 import "/std/utf.tie"
 import "../support/interner.tie"
 
-// ==================== 类型码常量（与 ivalue 的 T_* 逐值一致：对外契约） ====================
+// ==================== 类型码常量（对外契约，数值稳定） ====================
 pub const W_INT: i64 = 0;
 pub const W_FLOAT: i64 = 1;
 pub const W_BOOL: i64 = 2;
@@ -80,13 +80,12 @@ var w_kcnt: table<i64>;        // 段元素个数
 var w_mkeys: table<i64>;       // 键值表键（interner id，升序段）
 var w_mvals: table<Value>;     // 键值表值扁平表
 
-// 键值表写入的键槽（沿用 ivalue 的 g_ms_key 范式：混合实参嵌套调用会错位，
+// 键值表写入的键槽（范式固定：混合实参嵌套调用会错位，
 // 故键走全局槽、值走参数）。w_ms_key 由调用方在 map_set 前设置。
 pub var w_ms_key: i64 = 0;
 
-// 错误槽。**刻意不叫 g_err**：`ivalue`（value.tie）已有同名顶层变量，而本模块与它
-// 需在同一二进制内共存（parity 门禁同时引入两者），import 内联后同作用域重名即
-// 重复定义报错。
+// 错误槽。**刻意不叫 g_err**：同一进程里还可能有别的值模块持有同名顶层变量，
+// import 内联后同作用域重名即重复定义报错。
 pub var w_err: string = "";
 
 // 句柄字段偏移（与 lib/rt/src/tbl/tl_tbl.tie 的 48 字节句柄一致）
@@ -240,7 +239,7 @@ pub func to_host_string(v: Value) -> string {
 
 // ==================== 访问 ====================
 
-// 类型码（W_* 常量；与 ivalue.type_of 逐值一致）。
+// 类型码（W_* 常量；数值稳定，供协议与诊断共享）。
 pub func type_of(v: Value) -> i64 {
     // 只用标签判别，故 case 不绑定载荷（绑定而未用会被判「未声明的变量」）
     switch v {
@@ -269,7 +268,7 @@ pub func type_of(v: Value) -> i64 {
     }
 }
 
-// 类型名（错误提示用；文本与 ivalue.type_name 逐一对应）。
+// 类型名（错误提示用；文本稳定）。
 pub func type_name(v: Value) -> string {
     var t = type_of(v)
     if t == W_INT {
@@ -477,7 +476,7 @@ func map_find(mid: i64, key_id: i64) -> i64 {
     return -1
 }
 
-// 按键读取：命中返回值；未命中置 w_err 返回 Nil（文本对齐 ivalue.map_get）。
+// 按键读取：命中返回值；未命中置 w_err 返回 Nil。
 pub func map_get(mv: Value, key_id: i64) -> Value {
     switch mv {
         case Value.Map(mid):
@@ -512,7 +511,7 @@ func text_less(j: i64) -> bool {
 }
 
 // 写键值：返回新 map 值（键已存在 → 覆盖值；否则按文本字典序升序插入）。
-// 键取自 w_ms_key 槽（沿用 ivalue 的参数错位规避范式）；n 为调用方新建的空 map。
+// 键取自 w_ms_key 槽（参数错位规避范式）；n 为调用方新建的空 map。
 pub func map_set(n: Value, mv: Value, val: Value) -> Value {
     switch n {
         case Value.Map(nid):
@@ -586,7 +585,7 @@ pub func map_set(n: Value, mv: Value, val: Value) -> Value {
 
 // ==================== 字符串化 ====================
 
-// 打印格式（与 ivalue.to_print_string 逐字节一致）。
+// 打印格式（对外契约，逐字节稳定）。
 pub func to_print_string(v: Value) -> string {
     switch v {
         case Value.Int(x):
@@ -666,7 +665,7 @@ func map_print(k: i64) -> string {
     return out + "}"
 }
 
-// ==================== 字面量反转义（与 ivalue 同名同语义） ====================
+// ==================== 字面量反转义 ====================
 
 pub func unescape_str(raw: string) -> string {
     var n = str_len(raw)
