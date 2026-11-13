@@ -41,14 +41,16 @@ pub func b_jit_value_text() -> string {
 }
 
 // tbl 实参缓存槽：JIT 侧只能接受 ptr，故把文本实参（"1,2,3"）解析成宿主
-// table<i64> 后以句柄传入。该表存在模块级槽里，保证调用期间不被释放；
-// 每次调用重建它，故仅支持一个 tbl 实参。被调方若长期持有句柄需自行 retain。
-pub var w_call_args: table<i64> = {}
+// table<i64> 后以句柄传入。每次调用都重建整槽，槽由模块级持有，故调用期间
+// 不会被作用域释放；多个 tbl 实参各占一格，句柄互不覆盖。
+// 被调方若长期持有句柄，需自行 retain。
+pub var w_call_args: table<table<i64>> = []
 
-// 把最近一次 jit-call 的表返回值绑成解释器全局变量（REPL 表达式可直接引用）。
+// 把最近一次 jit-call 的返回值（标量、字符串或表）绑成解释器全局变量，
+// 之后的 REPL 表达式可直接引用该名。
 pub func b_bind_jit_value(name: string) -> string {
-    if vval.type_of(w_jit_val) != vval.W_TABLE {
-        return "ERR:没有可绑定的表值（先用 --ret tbl 调用）"
+    if vval.type_of(w_jit_val) == vval.W_VOID {
+        return "ERR:没有可绑定的值（先执行一次 jit-call）"
     }
     if str_len(name) == 0 {
         return "ERR:绑定名为空"
@@ -119,6 +121,8 @@ pub func b_jit_call(path: string, fname: string, sig: table<string>,
     if tie.jitsession::open() == 0 {
         return "ERR:LLVM-C 运行时不可用（ABI 版本或垫片缺失）"
     }
+    // 每次调用都先清空结果槽：调用失败时不得让上一次的值被 jit-bind 误绑。
+    w_jit_val = vval.new_void()
     var src = file_read(path)
     if str_len(src) == 0 {
         return "ERR:读取失败：" + path
@@ -141,7 +145,7 @@ pub func b_jit_call(path: string, fname: string, sig: table<string>,
     var jsig = table_new_string()
     var jargs = table_new_string()
     var ai: i64 = 0
-    var tbl_used = false
+    w_call_args = []
     while ai < len(sig) {
         if sig[ai] == "str" {
             table_push(jsig, "ptr")
@@ -149,23 +153,21 @@ pub func b_jit_call(path: string, fname: string, sig: table<string>,
             unsafe { sp = ptr_to_int(args[ai]) }
             table_push(jargs, to_string(sp))
         } else if sig[ai] == "tbl" {
-            if tbl_used {
-                return "ERR:仅支持一个 tbl 实参"
-            }
-            tbl_used = true
-            w_call_args = table_new_i64()
+            var one = table_new_i64()
             var parts = tie.support::split_char(args[ai], ",")
             var pi: i64 = 0
             while pi < len(parts) {
                 var pt = tie.support::trim(parts[pi])
                 if str_len(pt) > 0 {
-                    table_push(w_call_args, to_i64(pt))
+                    table_push(one, to_i64(pt))
                 }
                 pi = pi + 1
             }
+            table_push(w_call_args, one)
+            var kept = w_call_args[len(w_call_args) - 1]
             table_push(jsig, "ptr")
             var tp: i64 = 0
-            unsafe { tp = ptr_to_int(w_call_args) }
+            unsafe { tp = ptr_to_int(kept) }
             table_push(jargs, to_string(tp))
         } else {
             table_push(jsig, sig[ai])
@@ -183,14 +185,17 @@ pub func b_jit_call(path: string, fname: string, sig: table<string>,
     }
     var bits = to_i64(tie.support::slice(r, 3, str_len(r)))
     if ret == "f64" {
+        w_jit_val = vval.new_float(bitcast_i64_f64(bits))
         return "OK:" + tie.jitsession::f64_text(bits)
     }
     if ret == "void" {
+        w_jit_val = vval.new_void()
         return "OK:(void)"
     }
     if ret == "str" {
         var out = ""
         unsafe { out = str_of_ptr(bits) }
+        w_jit_val = vval.new_str(out)
         return "OK:" + out
     }
     if ret == "tbl" {
@@ -201,6 +206,11 @@ pub func b_jit_call(path: string, fname: string, sig: table<string>,
         unsafe { ht = ptr_to_table(bits) }
         w_jit_val = vval.from_host_i64_table(ht)
         return "OK:tbl:" + to_string(len(ht))
+    }
+    if ret == "bool" {
+        w_jit_val = vval.new_bool(bits != 0)
+    } else {
+        w_jit_val = vval.new_int(bits)
     }
     return "OK:" + to_string(bits)
 }
