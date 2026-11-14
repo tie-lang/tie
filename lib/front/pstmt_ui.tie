@@ -158,10 +158,12 @@ func ui_capture(stop_comma: bool) -> string {
                 break
             }
         }
-        if t == lex_lparen || t == lex_lbrace {
+        // 方括号也算一层：轨道表 `cols: [120, fill, 2fr]` 的逗号在括号内，
+        // 不加深就会被当成属性分隔符，值只剩半截。
+        if t == lex_lparen || t == lex_lbrace || t == lex_lbracket {
             depth = depth + 1
         }
-        if t == lex_rparen || t == lex_rbrace {
+        if t == lex_rparen || t == lex_rbrace || t == lex_rbracket {
             depth = depth - 1
         }
         acc = acc + putil.peek_lexeme()
