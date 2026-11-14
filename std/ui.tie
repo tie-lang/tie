@@ -19,7 +19,7 @@ import "./string.tie" as str
 // 四类值都以「词」书写，但在程序里是带类型的一等值：
 //   * Size —— 尺寸代数（hug / fill / px / pct / fr / em / pt / vw / vh / ratio）
 //   * Dist —— 轴分布词（start / center / end / space-* / stretch）
-//   * Overflow —— 溢出策略（clip / scroll / expand / error）
+//   * Overflow —— 溢出策略（clip / scroll / expand / error / ellipsis）
 //   * Anchor —— overlay 子项锚点（九点 + fill）
 // 解析器（lib/front/pstmt_ui.tie）把属性值降解为 `Size.fill()` / `Dist.center`
 // 这样的构造调用，再由 `ui.w(...)` 一类设置器写回**规范字符串**（§9 降级表）。
@@ -178,12 +178,13 @@ enum Dist {
     stretch
 }
 
-// 溢出策略。
+// 溢出策略。ellipsis 只对文本有意义（单行超宽时截断并补省略号）。
 enum Overflow {
     clip
     scroll
     expand
     err
+    ellipsis
 }
 
 // overlay 子项锚点。
@@ -872,6 +873,7 @@ pub func overflow_attr(o: Overflow) -> string {
     case Overflow.scroll: return "scroll"
     case Overflow.expand: return "expand"
     case Overflow.err: return "error"
+    case Overflow.ellipsis: return "ellipsis"
     }
     return "clip"
 }
