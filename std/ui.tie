@@ -1183,4 +1183,106 @@ pub func view_find(kind: string, name: string) -> i64 {
     }
     return -1
 }
+
+// ---------- 单元状态（view 形参的运行期取值通道，§14.6） ----------
+// view 体在声明处展开为语句序列，形参不是函数的参数列表而是一组「单元
+// 状态」：应用在渲染前用 view_state_set_* 推入，view 体开头注入的局部变量
+// 声明用 view_state_* 取回。键 = (kind, 单元名, 形参名)，故同名单元的不同
+// 实例共用一份状态（单元本身是单例）。
+var g_vs_key: table<string> = []
+var g_vs_i: table<i64> = []
+var g_vs_f: table<f64> = []
+var g_vs_s: table<string> = []
+var g_vs_soff: table<i64> = []
+var g_vs_sn: table<i64> = []
+var g_vs_ss: table<string> = []
+
+// 槽位分配：按 key 线性查找，缺则追加（单元数量极小，不做哈希）。
+func vs_slot(kind: string, unit: string, name: string) -> i64 {
+    ensure()
+    var k = kind + "/" + unit + "/" + name
+    var i: i64 = 0
+    while i < len(g_vs_key) {
+        if g_vs_key[i] == k {
+            return i
+        }
+        i = i + 1
+    }
+    table_push(g_vs_key, k)
+    table_push(g_vs_i, 0)
+    table_push(g_vs_f, 0.0)
+    table_push(g_vs_s, "")
+    table_push(g_vs_soff, 0)
+    table_push(g_vs_sn, 0)
+    return len(g_vs_key) - 1
+}
+
+pub func view_state_set_i64(kind: string, unit: string, name: string, v: i64) -> i64 {
+    g_vs_i[vs_slot(kind, unit, name)] = v
+    return v
+}
+
+pub func view_state_i64(kind: string, unit: string, name: string) -> i64 {
+    return g_vs_i[vs_slot(kind, unit, name)]
+}
+
+pub func view_state_set_bool(kind: string, unit: string, name: string, v: i64) -> i64 {
+    var b: i64 = 0
+    if v != 0 {
+        b = 1
+    }
+    g_vs_i[vs_slot(kind, unit, name)] = b
+    return b
+}
+
+pub func view_state_bool(kind: string, unit: string, name: string) -> i64 {
+    return g_vs_i[vs_slot(kind, unit, name)]
+}
+
+pub func view_state_set_f64(kind: string, unit: string, name: string, v: f64) -> f64 {
+    g_vs_f[vs_slot(kind, unit, name)] = v
+    return v
+}
+
+pub func view_state_f64(kind: string, unit: string, name: string) -> f64 {
+    return g_vs_f[vs_slot(kind, unit, name)]
+}
+
+pub func view_state_set_str(kind: string, unit: string, name: string, v: string) -> i64 {
+    g_vs_s[vs_slot(kind, unit, name)] = v
+    return 0
+}
+
+pub func view_state_str(kind: string, unit: string, name: string) -> string {
+    return g_vs_s[vs_slot(kind, unit, name)]
+}
+
+// 表形参（`history: table<string>`）：值存共享池，槽位记 (off, n)；
+// 取回时复制一份，避免视图侧改写影响宿主推入的原表。
+pub func view_state_set_strs(kind: string, unit: string, name: string, v: table<string>) -> i64 {
+    var s = vs_slot(kind, unit, name)
+    var off = len(g_vs_ss)
+    var n = len(v)
+    var i: i64 = 0
+    while i < n {
+        table_push(g_vs_ss, v[i])
+        i = i + 1
+    }
+    g_vs_soff[s] = off
+    g_vs_sn[s] = n
+    return n
+}
+
+pub func view_state_strs(kind: string, unit: string, name: string) -> table<string> {
+    var s = vs_slot(kind, unit, name)
+    var off = g_vs_soff[s]
+    var n = g_vs_sn[s]
+    var r: table<string> = table_new_string()
+    var i: i64 = 0
+    while i < n {
+        table_push(r, g_vs_ss[off + i])
+        i = i + 1
+    }
+    return r
+}
 }

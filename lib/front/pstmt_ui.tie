@@ -1264,6 +1264,108 @@ func ui_unit_kw(ref stmts: table<i64>) -> i64 {
     return 0
 }
 
+// ---------- view 形参的类型面 ----------
+
+func ui_has_prefix(s: string, pre: string) -> bool {
+    var n = str_len(pre)
+    if str_len(s) < n {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        if !(str_char(s, i) == str_char(pre, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func ui_mid(s: string, from: i64, to: i64) -> string {
+    var sb = string_builder()
+    var i: i64 = from
+    while i < to && i < str_len(s) {
+        sb_append(sb, str_char(s, i))
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// 去掉类型文本两端的空白与紧随其后的分隔符（`,` `)` `;`）——ui_capture
+// 取的是原文片段，末尾可能带这些字符。
+func ui_trim_type(s: string) -> string {
+    var b: i64 = 0
+    var e = str_len(s)
+    while b < e {
+        var c = str_char(s, b)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" {
+            b = b + 1
+        } else {
+            break
+        }
+    }
+    while e > b {
+        var c = str_char(s, e - 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == "," || c == ")" || c == ";" {
+            e = e - 1
+        } else {
+            break
+        }
+    }
+    return ui_mid(s, b, e)
+}
+
+// 形参类型文本 → 类型节点。view 形参的类型面只到「类型关键字 + table<T>」，
+// 更多形态（struct / 元组 / map）留给后续按需扩展；无法识别时返回 -1，
+// 调用方按「未标注」处理（不注入局部变量，保持旧行为）。
+func ui_type_node(s: string, line: i64, col: i64) -> i64 {
+    var t = ui_trim_type(s)
+    if str_len(t) == 0 {
+        return -1
+    }
+    if ui_has_prefix(t, "table<") {
+        var n = str_len(t)
+        var en = ui_type_node(ui_mid(t, 6, n - 1), line, col)
+        var tv = ast.new_node(N_TABLE_TYPE, -1, -1, -1, line, col)
+        var k: table<i64> = table_new_i64()
+        table_push(k, en)
+        ast.set_children(tv, k)
+        return tv
+    }
+    var idx = putil.typekw_index(t)
+    if idx < 0 {
+        return -1
+    }
+    return ast.new_node(N_NAMED_TYPE, interner.intern(t), idx, -1, line, col)
+}
+
+// 类型节点 → 单元状态取值函数名（std/ui.tie 的 view_state_* 族）。
+func ui_state_getter(tn: i64) -> string {
+    if tn < 0 {
+        return ""
+    }
+    if ast.tag(tn) == N_TABLE_TYPE {
+        return "view_state_strs"
+    }
+    var idx = ast.val(tn)
+    if idx >= 0 && idx <= 7 {
+        return "view_state_i64"
+    }
+    if idx == 21 || idx == 22 {
+        return "view_state_i64"
+    }
+    if idx == 8 || idx == 9 {
+        return "view_state_f64"
+    }
+    if idx == 10 || idx == 11 {
+        return "view_state_bool"
+    }
+    if idx == 13 || idx == 17 {
+        return "view_state_str"
+    }
+    return ""
+}
+
 // 视图/组件单元：`view Name(形参: 类型) -> (出端口: 类型) { 元素 }`。
 func ui_view_unit(ref stmts: table<i64>) -> i64 {
     var line = putil.peek_line()
@@ -1294,6 +1396,30 @@ func ui_view_unit(ref stmts: table<i64>) -> i64 {
                 pt = ui_capture(true)
             }
             ui_s2(stmts, "ui_view_param", pn, pt, pl, pc)
+            // 形参必须以真实局部变量的身份进入元素体（§14.6：`view
+            // Counter(count: i64)` 体内直接写 `count`）。view 体是在声明处
+            // 展开的语句序列，没有自己的栈帧，故形参从单元状态取值：
+            //   var count: i64 = ui.view_state_i64(kind, 单元名, "count")
+            // 值的来源是宿主/应用在渲染前调用的 view_state_set_*。
+            var tn = ui_type_node(pt, pl, pc)
+            if tn >= 0 {
+                var gf = ui_state_getter(tn)
+                if gf == "" {
+                    putil.set_err(pl, pc, "view 形参 '" + pn + "' 的类型 '" + pt + "' 暂不支持（可用 i64 族 / f64 / bool / string / table<string>）")
+                    return -1
+                }
+                var ga: table<i64> = table_new_i64()
+                table_push(ga, ui_strnode(kind, pl, pc))
+                table_push(ga, ui_strnode(nm, pl, pc))
+                table_push(ga, ui_strnode(pn, pl, pc))
+                var init = ui_nscall("ui", gf, ga, pl, pc)
+                var vd = ast.new_node(N_VAR_DECL, interner.intern(pn), 0, -1, pl, pc)
+                var vk: table<i64> = table_new_i64()
+                table_push(vk, tn)
+                table_push(vk, init)
+                ast.set_children(vd, vk)
+                table_push(stmts, vd)
+            }
             ui_skip_semi()
             if putil.peek_tag() == lex_comma {
                 putil.advance()
