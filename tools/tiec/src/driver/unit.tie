@@ -243,11 +243,13 @@ pub func run_unit() -> i64 {
         g_emit_ir = true
     }
     // 动态库模式：--shared 或输出扩展名 .dll/.so → 动态库。
-    // 要求 library 角色（class/type，无 main）；通知 irgen 标记导出面（dllexport）
+    // 要求 library 角色（lib/class/type，无 main）；通知 irgen 标记导出面（dllexport）
     // 并做边界检查（表/struct 不跨库）。
+    // 三者在角色注册表里走同一条库管线（role_output 均返回 "lib"），规范 1.2 也把
+    // lib 与 class 并列为库产物，动态库这条判据不应只放行后两者。
     if detect_shared_mode() {
-        if g_role != "class" && g_role != "type" {
-            dbg_txt(diagcode.render_error(-1, -1, "动态库模式错误: 要求 library 角色（type tie<class> / type tie<type>）"))
+        if g_role != "lib" && g_role != "class" && g_role != "type" {
+            dbg_txt(diagcode.render_error(-1, -1, "动态库模式错误: 要求 library 角色（type tie<lib> / type tie<class> / type tie<type>）"))
             return 1
         }
         // 置位 g_shared（.dll/.so 扩展名触发的动态库模式也要让后续分派识别）
