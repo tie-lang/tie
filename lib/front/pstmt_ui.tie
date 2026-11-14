@@ -810,9 +810,38 @@ func ui_attr_stmt_key(ref stmts: table<i64>, key: string, line: i64, col: i64) -
 // ---------- 元素 ----------
 
 // 元素名之后的实例名（可选字符串）与头部参数绑定。
+// 内容位判定（§14.7：字面量可省括号、其他表达式保留括号、`"前缀" + 表达式` 可拼接）。
+// 只有「字面量后接运算符」与「括号表达式（且不是绑定列表）」走内容位；
+// 单独的字面量仍是实例名，`@ panel "card0" (style: card)` 这类写法不变。
+func ui_content_ahead() -> bool {
+    var t = putil.peek_tag()
+    if t == lex_str {
+        var n1 = putil.peek_n(1)
+        if n1 == lex_plus || n1 == lex_minus || n1 == lex_star || n1 == lex_slash {
+            return true
+        }
+        return false
+    }
+    if t == lex_lparen {
+        // `(名字: 值, …)` 是绑定列表；`(表达式)` 是内容。
+        var a1 = putil.peek_n(1)
+        if (a1 == lex_ident || a1 == lex_typekw) && putil.peek_n(2) == lex_colon {
+            return false
+        }
+        return true
+    }
+    return false
+}
+
 func ui_element_head(ref stmts: table<i64>, kind: string, line: i64, col: i64) -> i64 {
     var nm: string = ""
-    if putil.peek_tag() == lex_str {
+    var content: i64 = -1
+    if ui_content_ahead() {
+        content = pexpr.parse_expr()
+        if content < 0 {
+            return -1
+        }
+    } else if putil.peek_tag() == lex_str {
         nm = putil.peek_lexeme()
         putil.advance()
     }
@@ -821,6 +850,23 @@ func ui_element_head(ref stmts: table<i64>, kind: string, line: i64, col: i64) -
         ui_s2(stmts, "ui_view_begin", kind, nm, line, col)
     } else {
         ui_s2(stmts, "ui_begin", kind, nm, line, col)
+    }
+    // 内容（§14.7）：`@Text(表达式)` / `@Text "前缀" + 表达式` 落在元素开始之后、
+    // 修饰与绑定之前，与 `ui.content` 的「作用于当前元素」语义一致。
+    if content >= 0 {
+        var ca: table<i64> = table_new_i64()
+        table_push(ca, content)
+        ui_emit(stmts, ui_call("ui_text", ca, line, col))
+    }
+    // 修饰链（§14.8）：`@Text "说明" .muted`、`@Button "+1" .lg`。外观钩子与语义
+    // 档位都只是名字，降解为 ui.modifier(名字)，含义留给样式表与组件库。
+    while putil.peek_tag() == lex_dot && putil.peek_n(1) == lex_ident {
+        var ml = putil.peek_line()
+        var mc = putil.peek_col()
+        putil.advance()
+        var mn = putil.peek_lexeme()
+        putil.advance()
+        ui_s1(stmts, "ui_mod", mn, ml, mc)
     }
     // 头部绑定：`(on_click: do_login, name: value, ...)`
     if putil.peek_tag() == lex_lparen {
@@ -873,8 +919,21 @@ func ui_element_head(ref stmts: table<i64>, kind: string, line: i64, col: i64) -
     // 其余元素上按事件绑定降解（保持「同一套写法」）。
     if putil.peek_tag() == lex_arrow {
         putil.advance()
+        if putil.peek_tag() == lex_ident {
+            // 元素箭头到动作（§14.8）：`@Button "+1" .lg -> Inc` 表示「被触发时
+            // 发出该动作」，降解为点击事件绑定；动作名由外部提供实现。
+            var an = putil.peek_lexeme()
+            var al2 = putil.peek_line()
+            var ac2 = putil.peek_col()
+            putil.advance()
+            var aa: table<i64> = table_new_i64()
+            table_push(aa, ui_strnode("click", al2, ac2))
+            table_push(aa, ui_strnode(an, al2, ac2))
+            ui_emit(stmts, ui_call("ui_on", aa, al2, ac2))
+            return 0
+        }
         if putil.peek_tag() != lex_lparen {
-            putil.set_err(putil.peek_line(), putil.peek_col(), "出端口契约写作 `-> (名字: 类型, ...)`")
+            putil.set_err(putil.peek_line(), putil.peek_col(), "出端口契约写作 `-> (名字: 类型, ...)`；元素上只写一个动作名 `-> 动作`")
             return -1
         }
         putil.advance()
@@ -1101,19 +1160,20 @@ func ui_graph(ref stmts: table<i64>, line: i64, col: i64) -> i64 {
             }
             var to = putil.peek_lexeme()
             putil.advance()
-            var wg: string = ""
-            if putil.peek_tag() == lex_ident && putil.peek_lexeme() == "when" {
-                putil.advance()
-                wg = ui_capture(true)
-            }
-            // 守卫：空守卫等价 true；单标识符按变量取值，其余暂不支持
-            // （规范 §14.5 的守卫是布尔表达式，表达式形态由降解器完善）。
             var wv: i64 = 0
-            if str_len(wg) == 0 {
-                wv = ast.new_node(N_BOOL_LIT, -1, 1, -1, fl, fc)
+            if putil.peek_tag() == lex_when || (putil.peek_tag() == lex_ident && putil.peek_lexeme() == "when") {
+                // 守卫是布尔表达式（§14.5）：直接按表达式解析，标识符、比较与
+                // 逻辑组合都能写，不必先把原文降级成变量名。
+                var gl2 = putil.peek_line()
+                var gc2 = putil.peek_col()
+                putil.advance()
+                wv = pexpr.parse_expr()
+                if wv < 0 {
+                    return -1
+                }
             } else {
-                wv = ast.new_node(N_VAR, interner.intern(wg), -1, -1, fl, fc)
-                ast.set_children(wv, table_new_i64())
+                // 空守卫等价 true。
+                wv = ast.new_node(N_BOOL_LIT, -1, 1, -1, fl, fc)
             }
             var ea: table<i64> = table_new_i64()
             table_push(ea, ui_strnode(from, fl, fc))
