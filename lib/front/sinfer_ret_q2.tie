@@ -560,6 +560,39 @@ pub func infer_call(id: i64) -> i64 {
             if x_ty < 0 {
                 return -1
             }
+            // port 元素（§7.4 接口作为运行期对象）：把实现了该 port 的具体类型
+            // 提升后推入。提升 = 取 data 地址 + 打包 vtable，属指针借用 ⇒ 与
+            // `var d: Drawable = 具体实例` 走同一条双锁（unsafe 上下文 + mem 域
+            // 凭据），判据与文案对齐 scheck_q3 的 check_var_decl。
+            if types.kind(elem) == K_PORT && types.kind(x_ty) == K_STRUCT {
+                var el_l = types.low(elem)
+                if g_unsafe_depth == 0 {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "table_push() 提升 '" + types.type_name(x_ty) + "' 到 port '" + types.type_name(elem) + "' 必须在 unsafe 块或 unsafe 函数中（接口对象借用具体对象，指针操作归 unsafe）"
+                    return -1
+                }
+                if (g_held_caps & 2) == 0 {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    var held_p2 = types.cap_set_name(g_held_caps)
+                    if str_len(held_p2) == 0 {
+                        held_p2 = "none"
+                    }
+                    sm_err_msg = "table_push() 提升到 port '" + types.type_name(elem) + "' 需要 mem 域凭据（当前作用域持：" + held_p2 + "）。持证方式：文件头 `type tie<角色, unsafe:mem>`、函数级 `#[unsafe.mem]`、或块级 `unsafe with(mem) { }` / `unsafe use g { }`"
+                    return -1
+                }
+                g_used_caps = g_used_caps | 2
+                if !stype.impl_has_ty(el_l, x_ty) {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "table_push() 推入的类型 '" + types.type_name(x_ty) + "' 未实现 port '" + types.type_name(elem) + "'，不能提升（请先写 impl " + types.type_name(elem) + " for " + types.type_name(x_ty) + "）"
+                    return -1
+                }
+                node_types[id] = types.named(TK_VOID)
+                g_typed = g_typed + 1
+                return types.named(TK_VOID)
+            }
             if !stype.types_match(elem, x_ty, args[1]) {
                 sm_err_line = s_lines[id]
                 sm_err_col = s_cols[id]

@@ -451,6 +451,19 @@ if nm == "table_push" {
     if x < 0 {
         return -1
     }
+    // port 元素（§7.4 接口作为运行期对象）：具体实例推入前先提升——
+    // 取 data 地址 + 打包 vtable，得到单个 ptr（槽宽 8，与 table<Port> 的元素尺寸一致）。
+    // 语义层已在 infer_call 的 table_push 分支验过 unsafe/凭据/impl 三项前置。
+    if types.kind(elem) == K_PORT {
+        var at_p = ast.node_type(call_arg(id, 1))
+        if at_p >= 0 && types.kind(at_p) == K_STRUCT {
+            var pc = tig_port_coerce(call_arg(id, 1), elem)
+            if pc < 0 {
+                return -1
+            }
+            x = pc
+        }
+    }
     // 嵌套表元素 retain——push 表值（如容器表 push 另一张表）→ 容器
     // 元素持有引用。容器 release 只释放 data 缓冲、不释放元素表，元素表由各自
     // 引用方负责释放——此处在 push 前 retain 保证元素表引用计数正确不悬垂。
@@ -471,8 +484,10 @@ if nm == "table_push" {
     var pty = types.named(TK_I64)
     var vt = ast.node_type(call_arg(id, 1))
     var ek = types.kind(elem)
-    if ek == K_STRUCT || ek == K_ENUM || ek == K_FN || ek == K_TUPLE || elem == types.named(TK_ANY) {
+    if ek == K_STRUCT || ek == K_ENUM || ek == K_FN || ek == K_TUPLE || ek == K_PORT || elem == types.named(TK_ANY) {
         // 复合元素：槽类型 = 元素类型 id（多字元素类型化 store）
+        // port 也在此列：槽是单个 ptr（{data, vtable} 打包对象），必须按 port 类型
+        // store，否则会落到 i64 桥发出 `store i64 <ptr>` 的类型错。
         pty = elem
     } else if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR)) {
         suffix = "string"
