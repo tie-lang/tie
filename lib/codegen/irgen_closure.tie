@@ -493,6 +493,21 @@ func clo_empty_env_val() -> i64 {
 }
 
 // ==================== 闭包 env 释放（A 方案，2026-10-02）====================
+// 初值是否**拥有**闭包 env（决定要不要在出口/回边释放它）。
+// 下标读（AST tag 13 = Index）只是从容器**借**一份值：env 的所有权仍在容器里，
+// 读方释放会把容器持有的 env 析构掉 ⇒ 第二次读同一元素即悬垂。实测缺陷：
+// 函数体内 `var fv = g_fns[i]`、该函数被调用两次 → 段错误（回边把 g_fns 里
+// 那份 env 释放了，第二轮读到已释放的 env 再解引用首字段）。
+func clo_init_owned(init: i64) -> i64 {
+    if init < 0 {
+        return 0
+    }
+    if ast.s_tag(init) == 13 {
+        return 0
+    }
+    return 1
+}
+
 // 闭包捕获数（0 = 无捕获 ⇒ env = null ⇒ 无需释放）
 func clo_cap_count(id: i64) -> i64 {
     var ci = closure_index(id)

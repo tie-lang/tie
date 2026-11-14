@@ -719,18 +719,20 @@ func tig_actor_wait_reent(ptr: i64, rec_val: i64) {
 }
 
 // `await`（规范 §10.6 结果的延后取得）：future<T> 凭据取值。
-// fut_val = record 句柄（i64 值 id，future 模式调用在发布后立即返回的凭据）。
-// 流程 = 等待 done@104（reentrant 方法内嵌套排空，与 gen_actor_sync_call 的
-// 等待点同一分流）→ 读 result@96（类型 ret_ty）→ fail@120 非 0 → raise
-//（错误与结果走同一条路径）→ 清门闩（下一个同步 RPC / future 方可进入）。
+// fut_val = **该消息的完成单元**句柄（future 模式调用在发布后立即返回；
+// 每槽一个单元，见 gen_actor_sync_call 的 future 分支）。
+// 流程 = 等待单元 done@8（reentrant 方法内嵌套排空，与同步 RPC 的等待点同一
+// 分流）→ 读 result@0（类型 ret_ty）→ fail@16 非 0 → raise → 释放单元。
+// 不再触碰 record 的 result/done/fail 与 mq_sync 门闩：future 从不占用门闩，
+// 因此同一 actor 的多条在途凭据各自独立（缺陷 B 的根因即「多凭据争一个门闩」）。
 func tig_await(fut_val: i64, ret_ty: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var P = types.named(TK_STR)
-    var rp = ir.new_inst(g_cur_block, 25, P)  // inttoptr handle → rec ptr
+    var rp = ir.new_inst(g_cur_block, 25, P)  // inttoptr handle → cell ptr
     ir.add_operand(rp, fut_val, 0)
     var rec_ptr = ir.get_value(rp)
-    var resp = s21_gep(rec_ptr, 96, true)
-    var donep = s21_gep(rec_ptr, 104, true)
+    var resp = s21_gep(rec_ptr, 0, true)
+    var donep = s21_gep(rec_ptr, 8, true)
     if g_cur_method_reent && g_cur_actor_recval >= 0 {
         tig_actor_wait_reent(donep, g_cur_actor_recval)
     } else {
@@ -738,16 +740,18 @@ func tig_await(fut_val: i64, ret_ty: i64) -> i64 {
     }
     var res = s21_load(resp, T64)
     if actor_ret_via_ptr(ret_ty) {
-        // ptr 表示返回——result@96 存 i64，inttoptr 还原（同
+        // ptr 表示返回——单元 @0 存 i64，inttoptr 还原（同
         // gen_actor_sync_call 的读取侧）
         var ptA = ir.new_inst(g_cur_block, 25, types.named(TK_STR))
         ir.add_operand(ptA, res, 0)
         res = ir.get_value(ptA)
     }
-    var failp = s21_gep(rec_ptr, 120, true)
+    var failp = s21_gep(rec_ptr, 16, true)
     var fv = s21_load(failp, T64)
-    var syncp = s21_gep(rec_ptr, 160, true)
-    s21_atomic_store64(syncp, tig_int_lit_ty(0, T64))
+    // 结果与失败标志都已读出，释放该消息的完成单元（每张凭据恰好一次）
+    var free_p = ir.new_inst(g_cur_block, 25, P)  // inttoptr
+    ir.add_operand(free_p, fut_val, 0)
+    tig_ext_call1("free", ir.get_value(free_p), P, -1)
     var fz = tig_int_lit_ty(0, T64)
     var isf = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne
     ir.add_operand(isf, fv, 0)
@@ -770,13 +774,17 @@ func tig_await(fut_val: i64, ret_ty: i64) -> i64 {
     return res
 }
 
-// 调用方同步 RPC 生成（.x /：per-actor 多槽队列 + 原子单飞）：
+// 调用方 RPC 生成（.x /：per-actor 多槽队列 + 原子单飞）：
 // `c.m(args...)` → 同步进门闩（mq_sync@160 CAS 抢占，至多一个同步 RPC 在途）
 // → 预留消息槽（tig_mq_reserve；队满背压限时等待空位）→ 写 mid/args 到
 // per-message 槽 + done=0 → 发布（mq_pub+=1）→ CAS 激活单飞标志，成功才 spawn
 // 消费者任务（actor_task）→ async 即返回（fire-and-forget，不依赖 pending 不
 // 等待）/ 同步等 done@104（tig_actor_wait）→ 读 result/fail → 清门闩（读完结果
 // 后释放）→ fail≠0 → raise。状态零锁：串行 dispatch 由单消费者保证。
+// **future 模式（async 非 void）不走门闩**：发布前在 mq_fut[slot] 登记一个
+// 独立完成单元（@0 result / @8 done / @16 fail），消费者把该消息的结果写进
+// **这个单元**，凭据即该单元句柄——同一 actor 因此可以同时有多条在途凭据，
+// 各自的 done/result 互不覆盖。
 func gen_actor_sync_call(rech: i64, mi: i64, args: table<i64>, argtys: table<i64>, ret_ty: i64, is_async: bool, future_mode: bool) -> i64 {
     g_used_trmlite = true
     var T64 = types.named(TK_I64)
@@ -785,14 +793,16 @@ func gen_actor_sync_call(rech: i64, mi: i64, args: table<i64>, argtys: table<i64
     ir.add_operand(rp, rech, 0)
     var rec_ptr = ir.get_value(rp)
     var is_void = (ret_ty == types.named(TK_VOID))
-    // ① 同步门闩（仅同步 RPC；async 直通不进门闩——per-message 槽独立）
-    if !is_async {
+    // ① 同步门闩（仅同步 RPC；async / future 直通不进门闩——per-message 槽
+    //    与 per-message 完成单元各自独立，同 actor 可有多条在途）
+    var sync_only = !is_async && !future_mode
+    if sync_only {
         tig_mq_sync_enter(rec_ptr)
     }
     // ② 预留消息槽（队满 → 背压限时等待空位；Go 阻塞 send 语义降级）
     var slot = tig_mq_reserve(rec_ptr)
-    // ③ done=0（同步专用；唯一在途同步 RPC 独占 done@104 语义）
-    if !is_async {
+    // ③ done=0（同步专用；unique 在途同步 RPC 独占 done@104 语义）
+    if sync_only {
         var donep0 = s21_gep(rec_ptr, 104, true)
         s21_store(donep0, tig_int_lit_ty(0, T64), T64)
     }
@@ -812,13 +822,33 @@ func gen_actor_sync_call(rech: i64, mi: i64, args: table<i64>, argtys: table<i64
         table_push(margtys, aty_m)
         mp0 = mp0 + 1
     }
-    tig_mq_publish(rec_ptr, slot, mi, args, margtys, syncf)
-    // future 模式（async 非 void，规范 §10.6）：凭据 = record 句柄。
-    // 步骤 ①③④ 与同步同形（门闩占用 ⇒ 同一 actor 至多一个未 await 凭据；
-    // syncf=1 ⇒ 消费者完成后写 result@96/done@104）；差异仅在不等待——
-    // `await f` 时再等 done/读 result/清门闩（tig_await，同一套尾部）。
+    // future：发布**之前**把完成单元登记进该消息槽（消费者看到消息时单元必然
+    // 已就位），随后发布。单元在 await 里释放。
+    var cellh: i64 = 0
     if future_mode {
-        return rech
+        var c24 = tig_int_lit_ty(24, T64)
+        // s21_raw_alloc_str 返回的是 ptr 值（TK_STR 类型），槽位里存 i64 句柄，
+        // 故只需一次 ptrtoint；单元内读写直接用该 ptr。
+        var cptrv = s21_raw_alloc_str(c24)
+        var cpi = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint → 句柄
+        ir.add_operand(cpi, cptrv, 0)
+        cellh = ir.get_value(cpi)
+        var zcell = tig_int_lit_ty(0, T64)
+        s21_store(s21_gep(cptrv, 0, true), zcell, T64)   // result
+        s21_store(s21_gep(cptrv, 8, true), zcell, T64)   // done
+        s21_store(s21_gep(cptrv, 16, true), zcell, T64)  // fail
+        var futbase = s21_gep(rec_ptr, 5288, true)
+        var c8 = tig_int_lit_ty(8, T64)
+        var foff = ir.new_inst(g_cur_block, 2, T64)  // mul slot*8
+        ir.add_operand(foff, slot, 0)
+        ir.add_operand(foff, c8, 0)
+        s21_store(s21_gep(futbase, ir.get_value(foff), false), cellh, T64)
+    }
+    tig_mq_publish(rec_ptr, slot, mi, args, margtys, syncf)
+    // future 模式（async 非 void，规范 §10.6）：凭据 = 该消息的完成单元句柄。
+    // 不等待；`await f` 时等单元 done/读 result/fail 并释放单元（tig_await）。
+    if future_mode {
+        return cellh
     }
     // async：投递即返回（fire-and-forget，不阻塞等 done）
     if is_async {

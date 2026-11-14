@@ -282,7 +282,7 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             // 释放点从 env 首字段读析构入口，无需知道是哪个闭包。
             // env 恒有效（无捕获 ⇒ 静态空 env，析构 no-op）⇒ 无需判空。
             // 逃逸者由 esc 分析排除（含 `var g = f` 的复制——裸变量读会 kill 源）。
-            if init >= 0 && types.is_fn(ast.node_type(init)) {
+            if init >= 0 && types.is_fn(ast.node_type(init)) && clo_init_owned(init) == 1 {
                 var cnid_c = interner.intern(sstate.name_str(id))
                 esc_cand(cnid_c)
                 table_push(g_clov_nids, cnid_c)
@@ -303,7 +303,7 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             // 无需知道是哪个闭包。
             // 哨兵语义：首次进入槽为零值 ⇒ select 成**静态空 env**（析构 no-op），
             // 故无需判空（env 恒有效）。
-            if g_cur_block != g_entry_block && init >= 0 && types.is_fn(ast.node_type(init)) {
+            if g_cur_block != g_entry_block && init >= 0 && types.is_fn(ast.node_type(init)) && clo_init_owned(init) == 1 {
                 tig_loopvar_crelease(av, ast.node_type(init))
             }
             if g_cur_block != g_entry_block && ivla >= 0 && types.is_table(ivla) && ty != types.named(TK_ANY) && !types.is_array(ty) {

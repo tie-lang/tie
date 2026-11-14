@@ -1,7 +1,11 @@
-type tie<class, unsafe, unsafe:share>
+type tie<class, unsafe, unsafe:share, unsafe:mem>
+
+unsafe extern fn malloc(n: i64) -> ptr<u8>;
+unsafe extern fn free(p: ptr<u8>);
 // ↑ 头部必须在文件最前（§2.1），故声明在前、说明在后。
 // 2026-10-07：本库的 spawn 需要【上下文】+【share 凭据】两把锁（规范 §11.6）。
-// `unsafe` 开「整个文件的不安全上下文」，`unsafe:share` 授 share 域凭据 ——
+// `unsafe` 开「整个文件的不安全上下文」，`unsafe:share` 授 share 域凭据，
+// `unsafe:mem` 授 mem 域凭据（并行结果槽要裸内存写：表不是并发容器）——
 // 二者缺一不可（只给凭据报 E00903，只开上下文报 E00904）。
 // 文件级声明只作用于本文件：调用方**无需**任何改动，`run_par` 的签名保持安全。
 // std/dataflow.tie —— 并行数据流图（最小内核）
@@ -264,17 +268,56 @@ pub func run(input: i64) -> table<i64> {
     return outs
 }
 
-// 单任务体（供 spawn）：求值 + 写自己的槽 + 屏障计数。
-// 只捕获 idx（实测闭包对循环变量的捕获是**每迭代独立**的：循环里 spawn 3 个
-// 闭包分别捕获到 0/1/2），数据从**模块级**波表读，避免捕获大表引发整表拷贝。
-// 注：必须定义在 `run_par` **之前**——tie 不解析闭包体内的前向引用（实测
-// `E00489 未定义的函数`，把本函数置于 run_par 之后即编译失败）。
-func one_task(idx: i64, wg: i64) {
-    var nd = df_w_node[idx]
-    var fv = df_fns[nd]
-    var rv = fv(df_w_val[idx])
-    df_slots[idx] = rv
-    wg_done(wg)
+// ---------- 并行结果槽（缺陷 C 修法）----------
+// 旧实现让每个任务写共享表 df_slots[t]：表头带引用计数与长度，写时复制头在
+// **多线程并发写**下非原子（宽度 4 实测 SIGSEGV，exit 139）。表不是并发容器，
+// 所以这里改用裸内存槽：主线程一次分配 m 格（每格 8 字节），任务只写**自己那一格**
+// 的地址，互不重叠；汇合（wg_wait，锁屏障）之后主线程统一读。
+// 对外仍是安全 API：worker 拿到的只是一个整数槽地址与自己的下标，越界由分配者
+// 保证（m = 本波任务数），不接受外部传入的下标。
+
+// 分配 m 格结果槽（返回基址；0 = 分配失败）。
+func slot_alloc(m: i64) -> i64 {
+    if m < 1 {
+        return 0
+    }
+    unsafe {
+        return ptr_to_int(malloc(m * 8 + 8))
+    }
+}
+
+// 写第 i 格（只写 8 字节；不同 i 的地址不重叠）。
+func slot_put(base: i64, i: i64, v: i64) {
+    var p = base + i * 8
+    var k: i64 = 0
+    unsafe {
+        while k < 8 {
+            deref_write(int_to_ptr(p + k), (v >> (k * 8)) & 255)
+            k = k + 1
+        }
+    }
+}
+
+// 读第 i 格（小端逐字节拼）。
+func slot_get(base: i64, i: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 7
+    unsafe {
+        while k >= 0 {
+            v = (v << 8) | deref(int_to_ptr(base + i * 8 + k))
+            k = k - 1
+        }
+    }
+    return v
+}
+
+func slot_free(base: i64) {
+    if base == 0 {
+        return
+    }
+    unsafe {
+        free(int_to_ptr(base))
+    }
 }
 
 // 并行波次 SDF：一波内全部节点用 trm-lite 的 spawn 并行、wg 汇合（任务隔离 +
@@ -294,13 +337,8 @@ pub func run_par(input: i64) -> table<i64> {
     var waves: i64 = 0
     while len(df_w_node) > 0 && waves < df_limit {
         var m: i64 = len(df_w_node)
-        // 预分配结果槽：每个任务只写自己的下标（不同下标写不同位置，无 push 竞态）
-        df_slots = table_new_i64()
-        var z: i64 = 0
-        while z < m {
-            table_push(df_slots, 0)
-            z = z + 1
-        }
+        // 结果槽用裸内存（见 slot_alloc 注释）：表在并发写下会因复制头竞态而崩。
+        var sbase = slot_alloc(m)
         var wg = wg_new()
         wg_add(wg, m)
         var t: i64 = 0
@@ -308,10 +346,25 @@ pub func run_par(input: i64) -> table<i64> {
             // 任务体**内联**在闭包里：实测闭包体内调用同命名空间的非 pub 函数会报
             // `E00489 未定义的函数`（即便该函数定义在闭包之前）——闭包体的名字解析
             // 不覆盖外层命名空间。内联后只用模块级表与捕获的 t/wg，无解析问题。
+            // 槽写入内联：闭包体不解析外层命名空间的函数（同下表注释），
+            // 故直接把 8 字节小端写展开在这里，只依赖内建 deref_write。
             spawn(func() -> i64 {
                 var nd = df_w_node[t]
                 var fv = df_fns[nd]
-                df_slots[t] = fv(df_w_val[t])
+                var rv = fv(df_w_val[t])
+                var addr = sbase + t * 8
+                // 闭包体是独立作用域：文件头的 unsafe / 凭据都不继承，
+                // 故「unsafe 上下文」与「mem 凭据」各持一层——外层给上下文，
+                // 内层 with(mem) 给凭据（实测缺一层分别报 E00066 / E00719）。
+                unsafe {
+                    unsafe with(mem) {
+                        var kk: i64 = 0
+                        while kk < 8 {
+                            deref_write(int_to_ptr(addr + kk), (rv >> (kk * 8)) & 255)
+                            kk = kk + 1
+                        }
+                    }
+                }
                 wg_done(wg)
                 return 0
             })
@@ -324,7 +377,7 @@ pub func run_par(input: i64) -> table<i64> {
         var i: i64 = 0
         while i < m {
             var nd = df_w_node[i]
-            var rv = df_slots[i]
+            var rv = slot_get(sbase, i)
             var sc = succs(nd)
             var bk = backs(nd)
             if len(sc) == 0 && len(bk) == 0 {
@@ -344,6 +397,7 @@ pub func run_par(input: i64) -> table<i64> {
             }
             i = i + 1
         }
+        slot_free(sbase)
         df_w_node = n_node
         df_w_val = n_val
         waves = waves + 1

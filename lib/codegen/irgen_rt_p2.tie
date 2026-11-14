@@ -166,9 +166,10 @@ func tig_actor_run(id: i64) -> i64 {
     // |@128 mq_head（原子，已消费计数）|@136 mq_resv（原子，槽预留计数）
     // |@144 mq_pub（原子，已发布计数）|@152 mq_act（原子，单飞标志 0/1）
     // |@160 mq_sync（原子，同步 RPC 门闩 0/1）|@168 mq_mid[64]|@680 mq_arg[64][8]
-    // |@4776 mq_syncf[64]|@5288 字段区起（scollect FIELD_BASE 同步）。
-    var FIELD_BASE = 5288
-    // record 大小 = 固定头 5288 + 字段区
+    // |@4776 mq_syncf[64]|@5288 mq_fut[64]（每槽 future 完成单元指针，0 = 同步/异步）
+    // |@5800 字段区起（scollect FIELD_BASE 同步）。
+    var FIELD_BASE = 5800
+    // record 大小 = 固定头 5800 + 字段区
     var recsz = FIELD_BASE + sstate.actor_field_bytes(aidx)
     var rec = s21_raw_alloc_str(tig_int_lit_ty(recsz, T64))
     if rec < 0 {
@@ -523,6 +524,71 @@ func tig_mq_publish(rec_ptr: i64, slot: i64, mi: i64, args: table<i64>, argtys: 
     g_cur_block = b_join
 }
 
+// 消息完成收尾（actor_task / actor_task_step 共用）：把一条消息的结果交回。
+// future 消息（发送侧在 mq_fut[slot] 登记了完成单元）写**该消息自己的单元**：
+// @0 result / @8 done / @16 fail，写完把槽指针清 0；其余消息（同步 RPC、
+// fire-and-forget）维持写 record 的 @96/@120，syncf != 0 时再置 @104 = 1。
+// 必须分流的原因：future 不占用 mq_sync 门闩（同一 actor 可有多条在途），而
+// record 只有一个 result 槽——不分流则后完成的消息会覆盖前一条尚未被 await
+// 取走的结果（静默错值）。
+func gen_actor_finish(recp: i64, slotv: i64, res: i64, failv: i64, sfv: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var z64 = tig_int_lit_ty(0, T64)
+    var o64 = tig_int_lit_ty(1, T64)
+    var c8 = tig_int_lit_ty(8, T64)
+    var futbase = s21_gep(recp, 5288, true)
+    var off = ir.new_inst(g_cur_block, 2, T64)  // mul slot*8
+    ir.add_operand(off, slotv, 0)
+    ir.add_operand(off, c8, 0)
+    var cellp = s21_gep(futbase, ir.get_value(off), false)
+    var cell = s21_load(cellp, T64)
+    var isnz = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne cell,0
+    ir.add_operand(isnz, cell, 0)
+    ir.add_operand(isnz, z64, 0)
+    ir.add_operand(isnz, 1, 2)
+    var b_cell = ir.new_block(g_cur_func, interner.intern("af.cell"))
+    var b_rec = ir.new_block(g_cur_func, interner.intern("af.rec"))
+    var b_join = ir.new_block(g_cur_func, interner.intern("af.jn"))
+    var cb0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb0, ir.get_value(isnz), 0)
+    ir.add_operand(cb0, b_cell, 1)
+    ir.add_operand(cb0, b_rec, 1)
+    // 单元分支：先写 result/fail，最后置 done（else await 可能读到半成品）
+    g_cur_block = b_cell
+    var cp = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
+    ir.add_operand(cp, cell, 0)
+    var cpv = ir.get_value(cp)
+    s21_store(s21_gep(cpv, 0, true), res, T64)
+    s21_store(s21_gep(cpv, 16, true), failv, T64)
+    s21_store(s21_gep(cpv, 8, true), o64, T64)
+    s21_store(cellp, z64, T64)
+    var bc = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bc, b_join, 1)
+    // record 分支：同步/异步消息的原有语义一字不变
+    g_cur_block = b_rec
+    s21_store(s21_gep(recp, 96, true), res, T64)
+    s21_store(s21_gep(recp, 120, true), failv, T64)
+    var isn = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne sfv,0
+    ir.add_operand(isn, sfv, 0)
+    ir.add_operand(isn, z64, 0)
+    ir.add_operand(isn, 1, 2)
+    var b_done = ir.new_block(g_cur_func, interner.intern("af.done"))
+    var b_skip = ir.new_block(g_cur_func, interner.intern("af.skp"))
+    var cb1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb1, ir.get_value(isn), 0)
+    ir.add_operand(cb1, b_done, 1)
+    ir.add_operand(cb1, b_skip, 1)
+    g_cur_block = b_done
+    s21_store(s21_gep(recp, 104, true), o64, T64)
+    var bd = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bd, b_skip, 1)
+    g_cur_block = b_skip
+    var bsj = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bsj, b_join, 1)
+    g_cur_block = b_join
+    return tig_int_lit_ty(0, T64)
+}
+
 // actor 消息任务 `actor_task` 生成（fn(ptr rec) -> i64）。**急切生成**：模块
 // 生成开始（tig_ast 内、任何用户函数之前）调用一次，避免指令编号交错。
 // .x 单消费者串行：本函数是 per-actor **唯一**消费者任务——单飞标志
@@ -690,28 +756,7 @@ func gen_actor_task_eager() {
     ir.add_operand(stA2, types.named(TK_BOOL), 2)
     ir.add_operand(stA2, fA0, 0)
     ir.add_operand(stA2, act_id, 3)
-    s21_store(resp, res, T64)
-    s21_store(failp, z64, T64)
-    // if syncf != 0: done@104 = 1
-    var is_sync = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne
-    ir.add_operand(is_sync, sfv, 0)
-    ir.add_operand(is_sync, z64, 0)
-    ir.add_operand(is_sync, 1, 2)
-    var b_done = ir.new_block(fid, interner.intern("at.done"))
-    var b_skip = ir.new_block(fid, interner.intern("at.skp"))
-    var b_join = ir.new_block(fid, interner.intern("at.jn"))
-    var cbd = ir.new_inst(g_cur_block, 31, -1)
-    ir.add_operand(cbd, ir.get_value(is_sync), 0)
-    ir.add_operand(cbd, b_done, 1)
-    ir.add_operand(cbd, b_skip, 1)
-    g_cur_block = b_done
-    s21_store(donep, o64, T64)
-    var bdj = ir.new_inst(g_cur_block, 30, -1)  // br join
-    ir.add_operand(bdj, b_join, 1)
-    g_cur_block = b_skip
-    var bsk = ir.new_inst(g_cur_block, 30, -1)  // br join
-    ir.add_operand(bsk, b_join, 1)
-    g_cur_block = b_join
+    gen_actor_finish(recp, slotv, res, z64, sfv)
     var bj = ir.new_inst(g_cur_block, 30, -1)  // br loop
     ir.add_operand(bj, loop, 1)
     // wcap：panic（longjmp 回）→ active=0 → result=0/fail=1 → 同步置 done → loop
@@ -721,27 +766,7 @@ func gen_actor_task_eager() {
     ir.add_operand(stA3, types.named(TK_BOOL), 2)
     ir.add_operand(stA3, fA1, 0)
     ir.add_operand(stA3, act_id, 3)
-    s21_store(resp, z64, T64)
-    s21_store(failp, o64, T64)
-    var is_sync2 = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne
-    ir.add_operand(is_sync2, sfv, 0)
-    ir.add_operand(is_sync2, z64, 0)
-    ir.add_operand(is_sync2, 1, 2)
-    var b_done2 = ir.new_block(fid, interner.intern("at.dn2"))
-    var b_skip2 = ir.new_block(fid, interner.intern("at.sk2"))
-    var b_join2 = ir.new_block(fid, interner.intern("at.jn2"))
-    var cbd2 = ir.new_inst(g_cur_block, 31, -1)
-    ir.add_operand(cbd2, ir.get_value(is_sync2), 0)
-    ir.add_operand(cbd2, b_done2, 1)
-    ir.add_operand(cbd2, b_skip2, 1)
-    g_cur_block = b_done2
-    s21_store(donep, o64, T64)
-    var bd2 = ir.new_inst(g_cur_block, 30, -1)  // br join2
-    ir.add_operand(bd2, b_join2, 1)
-    g_cur_block = b_skip2
-    var bs2 = ir.new_inst(g_cur_block, 30, -1)  // br join2
-    ir.add_operand(bs2, b_join2, 1)
-    g_cur_block = b_join2
+    gen_actor_finish(recp, slotv, z64, o64, sfv)
     var bj2 = ir.new_inst(g_cur_block, 30, -1)  // br loop
     ir.add_operand(bj2, loop, 1)
     // exit：ret 0
@@ -902,9 +927,8 @@ func gen_actor_task_step_eager() {
     ir.add_operand(stA2, types.named(TK_BOOL), 2)
     ir.add_operand(stA2, fA0, 0)
     ir.add_operand(stA2, act_id, 3)
-    s21_store(resp, res, T64)
-    s21_store(failp, z64, T64)
-    // ★ 不写 done@104：嵌套只处理异步消息（见函数头注释）
+    gen_actor_finish(recp, slotv, res, z64, z64)
+    // ★ 不写 done@104：嵌套只处理异步/future 消息（见函数头注释）
     var r0a = ir.new_inst(g_cur_block, 32, T64)  // ret 0
     ir.add_operand(r0a, z64, 0)
     // wcap：panic → active=0 → result=0/fail=1 → ret 0（同样不写 done）
@@ -914,8 +938,7 @@ func gen_actor_task_step_eager() {
     ir.add_operand(stA3, types.named(TK_BOOL), 2)
     ir.add_operand(stA3, fA1, 0)
     ir.add_operand(stA3, act_id, 3)
-    s21_store(resp, z64, T64)
-    s21_store(failp, o64, T64)
+    gen_actor_finish(recp, slotv, z64, o64, z64)
     var r0b = ir.new_inst(g_cur_block, 32, T64)
     ir.add_operand(r0b, z64, 0)
     g_cur_func = saved_func

@@ -468,29 +468,14 @@ func tig_agg_loopvar_release(av: i64, ty: i64) -> i64 {
 // （零值哨兵 + select 归零，不在回边分裂控制流块），差别只在释放动作是
 // 「调用闭包自己的 drop」而非「表 release」。
 func tig_loopvar_crelease(av: i64, fv_ty: i64) {
-    g_tf_ctr = g_tf_ctr + 1
-    var fn_san = str.clone(g_cur_fn_name)
-    var si: i64 = 0
-    while si < str_len(fn_san) {
-        if str_char(fn_san, si) == ":" {
-            fn_san = tie.support::slice(fn_san, 0, si) + "$" + tie.support::slice(fn_san, si + 2, str_len(fn_san))
-        }
-        si = si + 1
-    }
-    var fname = "tl_loopc_" + fn_san + "_" + to_string(g_tf_ctr)
-    llvmgen.global_scalar_reg(fname, types.named(TK_I64))
-    llvmgen.global_scalar_init(fname, 0)
-    var flag_addr = interner.intern("@" + fname)
-    var fl = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load 哨兵
-    ir.add_operand(fl, flag_addr, 3)
-    var condv = tig_cond_to_bool(ir.get_value(fl), types.named(TK_I64))
-    // 首次进入（哨兵 0）⇒ 守卫条件为假 ⇒ env 归零 ⇒ drop 内守卫立即返回。
-    tig_closure_release_slot_guarded(av, fv_ty, condv)
-    var one = tig_int_lit(1)
-    var fls = ir.new_inst(g_cur_block, 22, -1)  // store 哨兵 = 1
-    ir.add_operand(fls, types.named(TK_I64), 2)
-    ir.add_operand(fls, one, 0)
-    ir.add_operand(fls, flag_addr, 3)
+    // 2026-11-14 修（缺陷：段错误）：原实现用**全局哨兵** `tl_loopc_<函数>_<序号>`
+    // 标记「是否已进入过循环体」，该哨兵**从不复位**——同一函数第二次被调用时，
+    // 首个回边就以为「上一轮已有值」，于是去 drop 槽里的旧 env；而顶层函数的
+    // fn 值 env 为 null ⇒ `load ptr, ptr null` 段错误。
+    // 实测形状：函数体内 `var fv = g_tns[i]`，函数被调用两次即崩（与迭代次数无关）。
+    // variant C 已把全部 alloca 提升到 entry 并入口零初始化 ⇒ 槽初值确定，
+    // 直接改用判空版释放（null → 静态空 env，drop 为 no-op），哨兵与其全局状态一并删除。
+    tig_closure_release_slot_nonnull(av, fv_ty)
 }
 
 // 表下标赋值 t[i] = v → tie_table_set_<suffix> 桥（void）。

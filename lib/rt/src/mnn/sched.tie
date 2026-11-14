@@ -10,6 +10,10 @@ import "./tl_k32.tie"
 const TRM_LITE_SCHED_VERSION: string = "0.1.0"
 const S_SEG_CAP: i64 = 256     // S-deque 每 worker 段容量（任务槽）
 const S_SLICE_LIMIT: i64 = 8   // 时间片上限（p.6.7.10：worker 连续取任务数）
+// 池大小缺省/上限：缺省 8 路（桌面常见核数，12 逻辑核机器上已接近饱和），
+// 上限防手滑把环境变量写成天文数字而耗尽线程栈。
+const S_WORKERS_DEFAULT: i64 = 8
+const S_WORKERS_MAX: i64 = 64
 
 // ---------- 任务寄存器 ----------
 // 每个任务 = 寄存器行（任务 id 即下标）：{entry, env, retcode}（entry/env 为闭包
@@ -18,7 +22,10 @@ const S_SLICE_LIMIT: i64 = 8   // 时间片上限（p.6.7.10：worker 连续取�
 var g_sdq_regs_e: table<i64>;       // 任务入口指针（entry）
 var g_sdq_regs_v: table<i64>;       // 任务环境指针（env）
 var g_sdq_regs_r: table<i64>;       // 任务返回形态编码
-var g_worker: i64 = 2               // S-pool 池大小 P（set_workers → pool_workers）
+// 池大小 P（0 = 自动：首个 spawn 前由 pool_workers 解析环境变量/默认值）
+// 缺陷 A 修法：旧值硬编码 2 使 8 路吞吐卡在单路的 2 倍；现改为可配置，
+// 且默认值随机器核数级别给出（S_WORKERS_DEFAULT），不再需要改源码重编。
+var g_worker: i64 = 0
 
 // ---------- S-deque：per-worker 双端队列 + 溢出 ----------
 //   · 每 worker 段预分配 P×S_SEG_CAP 槽 g_items（段固定不重叠）；
@@ -109,14 +116,42 @@ func pp_dummy_void() {
 
 namespace trm_lite_sched {
 
+// 显式设池大小：只在首个 spawn 之前调用才生效（线程数在建池时定死）。
 pub func set_workers(m: i64) {
     if m < 1 {
         return
+    }
+    if m > S_WORKERS_MAX {
+        m = S_WORKERS_MAX
     }
     g_worker = m
 }
 pub func workers() -> i64 {
     return g_worker
+}
+
+// 环境变量取整数：未设/空/含非数字 → -1。用于 TIE_POOL_WORKERS 覆盖池大小，
+// 性能实验不必改源码重编（缺陷 A 的对外入口）。
+func env_i64(name: string) -> i64 {
+    var s = get_env(name)
+    var n = len(s)
+    if n <= 0 {
+        return 0 - 1
+    }
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < n {
+        var c = char_code(str_char(s, k))
+        if c < 48 || c > 57 {
+            return 0 - 1
+        }
+        v = v * 10 + (c - 48)
+        if v > 1000000 {
+            return 0 - 1
+        }
+        k = k + 1
+    }
+    return v
 }
 
 // 惰性建 CS/CV + S-deque 段表（幂等；tl_k32 纯声明源自持）。
@@ -258,7 +293,15 @@ pub func pool_try_start() -> i64 {
 // 池大小（编译器建线程数；set_workers 在首个 spawn 前设置生效）。
 pub func pool_workers() -> i64 {
     if g_worker < 1 {
-        return 4
+        var e = env_i64("TIE_POOL_WORKERS")
+        if e >= 1 {
+            g_worker = e
+        } else {
+            g_worker = S_WORKERS_DEFAULT
+        }
+        if g_worker > S_WORKERS_MAX {
+            g_worker = S_WORKERS_MAX
+        }
     }
     return g_worker
 }
