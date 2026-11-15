@@ -287,6 +287,12 @@ func gen_func(fid: i64) {
     if ir.func_inline(fid) == 1 {
         inl_kw = " alwaysinline"
     }
+    // 越界诊断函数必须留在冷路径：noinline 阻止它被内联回检查点（内联回来就等于
+    // 错误块又长在热循环体内，寄存器压力与展开成本估计全部复原），cold 让 LLVM 把
+    // 它排到函数末尾、并把调用点按「几乎不跳」处理。
+    if sym == "tie_oob_fail" {
+        inl_kw = " noinline cold noreturn"
+    }
     if g_uefi_mode {
         line("$" + sym + " = comdat any")
         sect = sect + " comdat($" + sym + ")"

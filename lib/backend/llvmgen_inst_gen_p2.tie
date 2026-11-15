@@ -293,6 +293,28 @@ pub func gen_inst_b_56_str_cat(inst_id: i64) {
         return
 }
 
+// unreachable：终结一个已被证明不可达的块。当前唯一用途是越界检查的失败分支
+// （`tig_array_bounds_check`）：调用带 noreturn 的 tie_oob_fail 之后控制流确实
+// 不会继续，写成 unreachable 而不是 `br <继续块>`。
+//
+// ★ 为什么这个终止符有性能意义：LLVM 的 LoopPredication 只把「失败路径以
+//   unreachable 收尾」的分支识别为可提升的 guard，才肯把循环体内的越界检查
+//   提升到循环外（进而让循环恢复可展开）。同样 IR 语义下写成 `br` 会被当成
+//   普通多出口分支，检查留在循环体内，循环永远不展开。
+pub func gen_inst_b_74_unreachable(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+        line("unreachable")
+        return
+}
+
 pub func gen_inst_b_30_br(inst_id: i64) {
     var op = ir.ins_op(inst_id)
     var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）

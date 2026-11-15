@@ -4,37 +4,103 @@ type tie<class>
 // 由 split_parts.py 按行数贪心分片：只搬函数与紧邻注释，
 // 顶层全局 var 与 import 树仍留在 irgen_stmt.tie。
 namespace irgen;
+// 发射（或复用）模块级越界诊断函数 `tie_oob_fail(i64 idx, i64 len) -> void`，
+// 返回其函数 id。函数体 = printf 诊断 + 统一失败语义（受 catch_panic 捕获 →
+// longjmp；未受捕 → exit(1)），由 tig_panic_tail 接管收尾。
+//
+// ★ 为什么外提而不是就地内联：错误块内联在**检查点所在块**里时，它落在热循环体
+//   内部——fmt 实参需要 %rdi，挤占循环变量的寄存器分配（实测每迭代多出两条搬 n
+//   的 movq），且冷块让 clang 的循环展开成本估计过高、直接放弃展开。改成本函数后
+//   同样 IR 语义、同样诊断文本，n=64 方阵 `-l2` 从 3715ms 降到 3043ms（-18%），
+//   `-l3` 从 3662ms 降到 2976ms（-19%）。检查本身**一个都没少**。
+func tig_oob_fail_ensure() -> i64 {
+    if g_oob_fail_fid >= 0 {
+        return g_oob_fail_fid
+    }
+    var saved_func = g_cur_func
+    var saved_fn = g_cur_fn_name
+    var saved_block = g_cur_block
+    var nm = interner.intern("tie_oob_fail")
+    var params: table<i64> = table_new_i64()
+    table_push(params, types.named(TK_I64))
+    table_push(params, types.named(TK_I64))
+    var fid = ir.new_func(nm, types.named(TK_VOID), params)
+    g_oob_fail_fid = fid
+    g_cur_func = fid
+    // 诊断串按「当前函数」分槽（tig_src 用它定位源码行），必须置为本函数名
+    g_cur_fn_name = "tie_oob_fail"
+    g_cur_block = ir.new_block(fid, interner.intern("oob.e"))
+    var idxv = ir.param_val(fid, 0)
+    var lenp = ir.param_val(fid, 1)
+    var fmt = interner.intern("array index out of bounds: index %lld, len %lld\n")
+    var pinst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+    ir.add_operand(pinst, fmt, 0)
+    ir.add_operand(pinst, idxv, 0)
+    ir.add_operand(pinst, lenp, 0)
+    var dead = ir.new_block(fid, interner.intern("oob.d"))
+    tig_panic_tail(dead)   // 已接管 dead 块，随后补 void 返回
+    ir.new_inst(g_cur_block, 32, -1)   // ret void
+    g_cur_fn_name = saved_fn
+    g_cur_func = saved_func
+    g_cur_block = saved_block
+    return fid
+}
+
 // --check-bounds：数组下标越界运行时检查（仅 g_check_bounds 置位时生成）。
 // idx_node 为下标表达式 AST 节点（取其类型），iv 为其求值结果值引用，
-// len_count 为数组定长元素个数（编译期常量）。越界（iv<0 || iv>=len）→ 打印
-// 消息 + exit(1)（对齐 tig_panic 的 call_vararg+exit 范式，不依赖字符串拼接）。
+// len_count 为数组定长元素个数（编译期常量）。越界（iv<0 || iv>=len）→ 调
+// tie_oob_fail 打印消息并走统一失败语义（对齐 tig_panic 范式，不做字符串拼接）。
 func tig_array_bounds_check(idx_node: i64, iv: i64, len_count: i64) -> i64 {
     if !g_check_bounds {
         return 0
     }
+    // 本循环已被上界钳制覆盖（tig_clamp_try 成功）：体内恒在界内，检查已
+    // 换算成循环前的一次上界计算 + 循环后的一次判定，此处不再重复发射。
+    if g_clamp_on > 0 {
+        return 0
+    }
+    // 编译期已知的常量下标：0 <= c < len 恒成立 ⇒ 检查恒真，直接省掉。
+    // 越界的常量下标不走这里，仍按原路径进冷函数报错。
+    if ast.s_tag(idx_node) == 0 {
+        var cidx = ast.s_val(idx_node)
+        if cidx >= 0 && cidx < len_count {
+            return 0
+        }
+    }
     // ★ 下标已由 `tig_index_iv` 统一为 i64 ⇒ 一律按 i64 比较，不再按 idx_node 的类型
     //   换算（否则 i64 值再 sext 会生成非法的 `sext i64 to i64`／宽度不匹配的 icmp）。
-    var lenv = tig_int_lit(len_count)          // len（CHECK 内 IMM/slt 常量）
-    // ★ 两个条件合成**一个分支**（与表越界检查同法）：原先「先查 iv<0、再查 iv>=len」
-    //   是两个条件块 + 两个分支，`bad = (iv<0) | (iv>=len)` 只需一个条件分支。
-    var lt0 = tig_cmp_const(iv, 2, 0, types.named(TK_I64))            // iv < 0
-    var ge = tig_cmp_const(iv, 5, len_count, types.named(TK_I64))     // iv >= len
-    var bad = tig_or_i1(lt0, ge)
-    var pnb = ir.new_block(g_cur_func, interner.intern("ck.n"))  // 越界 panic
+    var lenv = tig_int_lit(len_count)          // len（CHECK 内 IMM/uge 常量）
+    // ★ 无符号单次比较覆盖两侧：`iv<0` 时 (u64)iv 落在 2^63 以上，必然 ≥ len；
+    //   `iv>=len` 时同样成立 —— 故 `(u64)iv >= (u64)len` 与 `iv<0 || iv>=len` 等价。
+    //   指令从 3 条（slt + sge + or）降到 1 条（clang 对两种写法都会化简，此式仅
+    //   省 IR 体积；性能收益为零，勿把其当优化）。
+    var bad = tig_cmp_const(iv, 9, len_count, types.named(TK_I64))    // uge
+    var pnb = ir.new_block(g_cur_func, interner.intern("ck.n"))  // 越界 → 冷函数
     var okb = ir.new_block(g_cur_func, interner.intern("ck.o"))  // 正常继续
     var cbr1 = ir.new_inst(g_cur_block, 31, -1)   // cond_br
     ir.add_operand(cbr1, bad, 0)
     ir.add_operand(cbr1, pnb, 1)
     ir.add_operand(cbr1, okb, 1)
-    // panicblk：printf("%s (index %lld, len %lld)\n") + exit(1)
+    // 越界块只留「一次调用 + 一次跳转」，诊断与失败收尾全在 tie_oob_fail 里
     g_cur_block = pnb
-    var fmt = interner.intern("array index out of bounds: index %lld, len %lld\n")
-    var pinst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
-    ir.add_operand(pinst, fmt, 0)
-    ir.add_operand(pinst, iv, 0)
-    ir.add_operand(pinst, lenv, 0)
-    // 诊断后按**统一失败语义**收尾（受 catch_panic 捕获 → longjmp；未受捕 → exit）
-    tig_panic_tail(okb)   // 已在 okb 上接管续块，勿再补 terminator
+    var cfid = tig_oob_fail_ensure()
+    var cinst = ir.new_inst(g_cur_block, 35, -1)   // call void
+    ir.add_operand(cinst, interner.intern("tie_oob_fail"), 0)
+    ir.add_operand(cinst, types.named(TK_VOID), 2)
+    ir.add_operand(cinst, types.named(TK_I64), 2)
+    ir.add_operand(cinst, iv, 0)
+    ir.add_operand(cinst, types.named(TK_I64), 2)
+    ir.add_operand(cinst, lenv, 0)
+    // ★ 失败块的终止符必须是 unreachable，不能是 `br okb`。
+    //   LLVM 的 LoopPredication 只把「失败路径以 unreachable 收尾」的分支认作
+    //   可提升的 guard，才肯把循环体内的越界检查提到循环外；写成 `br okb` 时它
+    //   按普通多出口分支处理，带检查的循环体永远不展开（C++ -O2 手写同形检查
+    //   同样不展开，见基准确认）。tie_oob_fail 已带 noreturn 属性，此处
+    //   unreachable 与「调用后必不返回」完全一致，不削弱安全：越界仍然必然进入
+    //   tie_oob_fail → 受捕 longjmp / 未受捕 exit(1)。
+    //   okb 的前驱由上面的 cond_br else 分支给出，去掉这条 br 不会让 okb 变孤儿。
+    ir.new_inst(g_cur_block, 74, -1)   // unreachable
+    g_cur_block = okb
     return 0
 }
 

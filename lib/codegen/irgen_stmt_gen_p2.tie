@@ -41,28 +41,53 @@ pub func tig_stmt_b_106_While(id: i64) -> i64 {
             }
             ccix = ccix + 1
         }
+        // 循环上界钳制：能证明安全时把体内的越界检查换成循环前的一次上界计算。
+        // 返回 -1 表示本循环不适用，下面完全走旧路径（IR 与改动前一致）。
+        // 进入本层循环时先关掉外层的钳制：本层若不适用，它体内的检查必须照常发射。
+        var saved_clamp = g_clamp_on
+        g_clamp_on = 0
+        var kend = tig_clamp_try(cond, body)
         var cond_blk = ir.new_block(g_cur_func, interner.intern("while.cond"))
         var body_blk = ir.new_block(g_cur_func, interner.intern("while.body"))
         var exit_blk = ir.new_block(g_cur_func, interner.intern("while.exit"))
+        var chk_blk = -1
+        var false_blk = exit_blk
+        if kend >= 0 {
+            chk_blk = ir.new_block(g_cur_func, interner.intern("while.chk"))
+            false_blk = chk_blk
+        }
         loop_push(label, exit_blk, cond_blk)
         var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
         ir.add_operand(b0, cond_blk, 1)
-        // cond 块：条件 → body / exit
+        // cond 块：条件 → body / exit（钳制时条件换成 iv < kend）
         g_cur_block = cond_blk
-        var cv = tig_expr(cond)
-        if cv < 0 {
-            return -1
+        var cv = 0
+        if kend >= 0 {
+            var ivv = tig_expr(g_clamp_ivn)
+            if ivv < 0 {
+                return -1
+            }
+            cv = tig_icmp_c(ivv, kend, 2)   // iv < kend
+        } else {
+            cv = tig_expr(cond)
+            if cv < 0 {
+                return -1
+            }
+            // 条件归一化 i1（`while 1` / 整型条件 → icmp ne 0；
+            // 旧实现把 i64 直接喂 cond_br，LLVM 校验失败）
+            cv = tig_cond_to_bool(cv, ast.node_type(cond))
         }
-        // 条件归一化 i1（`while 1` / 整型条件 → icmp ne 0；
-        // 旧实现把 i64 直接喂 cond_br，LLVM 校验失败）
-        cv = tig_cond_to_bool(cv, ast.node_type(cond))
         var cb = ir.new_inst(g_cur_block, 31, -1)
         ir.add_operand(cb, cv, 0)
         ir.add_operand(cb, body_blk, 1)
-        ir.add_operand(cb, exit_blk, 1)
-        // body 块
+        ir.add_operand(cb, false_blk, 1)
+        // body 块（钳制期间体内不再发射越界检查）
         g_cur_block = body_blk
+        if kend >= 0 {
+            g_clamp_on = 1
+        }
         var bb = tig_block_stmts(body)
+        g_clamp_on = saved_clamp
         if bb < 0 {
             return -1
         }
@@ -107,6 +132,13 @@ pub func tig_stmt_b_106_While(id: i64) -> i64 {
                 cbs_remove(cid2)
             }
             cbx = cbx + 1
+        }
+        // 钳制收尾：填 while.chk（在 exit 块的 IR 之后填，块序无关）
+        if chk_blk >= 0 {
+            var crc = tig_clamp_chk(chk_blk, exit_blk)
+            if crc < 0 {
+                return -1
+            }
         }
         loop_pop()
         return 0
@@ -441,5 +473,364 @@ pub func tig_stmt_b_136_N_CODE_LIT(id: i64) -> i64 {
         sm_err_col = ast.s_col(id)
         sm_err_msg = "irgen 不支持 code 字面量作语句（tag=136，函数 " + g_cur_fn_name + "）"
         return -1
+}
+
+// ─────────────────────── 循环上界钳制（loop bound clamping）───────────────────────
+//
+// 问题：循环体内的定长数组越界检查让循环多出口，LLVM 因此放弃展开/向量化。
+// 实测同样语义的手写 C++ -O2 也不展开（3128ms vs 无检查 1380ms，2.3×），
+// 说明这不是 tie 独有的缺陷，而是「每迭代都要判一次」这个形态本身的代价。
+//
+// 做法：把「体内每迭代判一次」换成「循环前算一次上界 + 循环后判一次」。
+//   对循环 `while iv < ub`，体内每处定长数组访问的下标写成 `c*iv + d` 后，
+//   该访问允许的最大迭代数是 lim = floor((len-1-d)/c) + 1（c>0 时）。
+//   取 kend = min(ub, lim_1, ..., lim_n)，循环条件改成 `iv < kend`，体内不再判。
+//   循环结束后 iv == kend：
+//     * 若 iv >= ub —— 循环本来就是正常走完的，无事发生；
+//     * 否则 iv 正好卡在某个 lim_j 上，即第 j 处访问必然越界 —— 用与原实现
+//       完全相同的 tie_oob_fail(下标, 长度) 收尾。
+//   合法迭代的执行次数、副作用次数、越界时的报错内容都与原实现一致。
+//   c<=0 时下标随 iv 递减，上界在 iv=0 处的 d：d 合法则 lim=ub（不限制），
+//   否则 lim=0（第一次就失败）。
+//
+// 只在能完全证明安全时启用，任何一处拿不准就放弃（g_clamp_on 保持 0，
+// 生成的 IR 与改动前逐字节相同）：条件是简单 `iv < ub`／嵌套循环／break／
+// continue／下标无法分解成 c*iv + d／下标或上界含副作用（会被求值两次）。
+
+// 表达式子树里是否出现变量 ivnm。
+func tig_clamp_has(node: i64, ivnm: string) -> bool {
+    if node < 0 {
+        return false
+    }
+    var t = ast.s_tag(node)
+    if t == 6 {
+        return sstate.name_str(node) == ivnm
+    }
+    if t >= 100 {
+        return false
+    }
+    var kc = sstate.nchild(node)
+    var i: i64 = 0
+    while i < kc {
+        if tig_clamp_has(sstate.child(node, i), ivnm) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 是否为无副作用的纯表达式（字面量、变量、+-*/% 的组合）。钳制会把这些
+// 子表达式搬到循环外求值，若有副作用就会被求值次数改变，故一律拒绝。
+func tig_clamp_pure(node: i64) -> bool {
+    if node < 0 {
+        return true
+    }
+    var t = ast.s_tag(node)
+    if t == 0 || t == 6 {
+        return true
+    }
+    if t == 9 {
+        var op = ast.s_val(node)
+        if op != 0 && op != 1 && op != 2 && op != 3 && op != 4 {
+            return false
+        }
+        if !tig_clamp_pure(sstate.child(node, 0)) {
+            return false
+        }
+        return tig_clamp_pure(sstate.child(node, 1))
+    }
+    return false
+}
+
+// 把下标分解成 `c*iv + d`。
+//   c = -1 表示常量 1（下标就是 iv 本身），c = 0 表示不含 iv；
+//   d = -1 表示没有常数项。
+// ok = false 表示这个下标不是 iv 的仿射式，钳制必须放弃。
+func tig_clamp_split(node: i64, ivnm: string) -> (c: i64, d: i64, ok: bool) {
+    if node < 0 {
+        return (0, -1, false)
+    }
+    var t = ast.s_tag(node)
+    if t == 6 {
+        if sstate.name_str(node) == ivnm {
+            return (-1, -1, true)
+        }
+        return (0, node, true)
+    }
+    if t == 0 {
+        return (0, node, true)
+    }
+    if t == 9 {
+        var op = ast.s_val(node)
+        var l = sstate.child(node, 0)
+        var r = sstate.child(node, 1)
+        var lh = tig_clamp_has(l, ivnm)
+        var rh = tig_clamp_has(r, ivnm)
+        if !lh && !rh {
+            return (0, node, true)
+        }
+        if op == 2 {
+            // coef * iv
+            if lh && !rh {
+                return (r, -1, true)
+            }
+            if rh && !lh {
+                return (l, -1, true)
+            }
+            return (0, -1, false)
+        }
+        if op == 0 {
+            // coef*iv + d ；d 只能来自不参与 iv 的那一侧
+            if lh && !rh {
+                var (lc, ld, lok) = tig_clamp_split(l, ivnm)
+                if lok && ld < 0 {
+                    return (lc, r, true)
+                }
+                return (0, -1, false)
+            }
+            if rh && !lh {
+                var (rc, rd, rok) = tig_clamp_split(r, ivnm)
+                if rok && rd < 0 {
+                    return (rc, l, true)
+                }
+                return (0, -1, false)
+            }
+            return (0, -1, false)
+        }
+        return (0, -1, false)
+    }
+    if !tig_clamp_has(node, ivnm) {
+        return (0, node, true)
+    }
+    return (0, -1, false)
+}
+
+// 扫描循环体，把每处定长数组访问的 (c, d, len) 记进 g_clamp_cs/ds/ls。
+// 遇到任何无法完全覆盖的结构就整体放弃。
+func tig_clamp_scan(node: i64, ivnm: string) -> bool {
+    if node < 0 {
+        return true
+    }
+    var t = ast.s_tag(node)
+    // 嵌套循环会让「循环后仍在界内 ⇒ 走完整圈」失真；break/continue 同理
+    if t == 106 || t == 107 || t == 108 || t == 109 {
+        // 嵌套循环的循环变量与外层无关，break/continue 又会提前离开循环：
+        // 两者都让「循环后 iv 仍在界内 ⇒ 走完了整圈」失真，一律整体放弃。
+        // 放弃时 IR 与改动前逐字节相同（体内检查原样保留），故绝对安全。
+        return false
+    }
+    if t == 13 {
+        var base = sstate.child(node, 0)
+        if ast.s_tag(base) != 6 {
+            return false
+        }
+        var (aaddr, aaty) = tig_array_root(base)
+        if aaty < 0 || !types.is_array(aaty) {
+            return false
+        }
+        var idx = sstate.child(node, 1)
+        var (c, d, ok) = tig_clamp_split(idx, ivnm)
+        if !ok || c == 0 {
+            return false
+        }
+        if !tig_clamp_pure(c) || !tig_clamp_pure(d) {
+            return false
+        }
+        table_push(g_clamp_cs, c)
+        table_push(g_clamp_ds, d)
+        table_push(g_clamp_ls, types.array_len(aaty))
+    }
+    var kc = sstate.nchild(node)
+    var i: i64 = 0
+    while i < kc {
+        if !tig_clamp_scan(sstate.child(node, i), ivnm) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// i64 二元运算（0=add 1=sub 2=mul 3=sdiv），结果值引用。
+func tig_clamp_bin_ty(op: i64, a: i64, b: i64, ty: i64) -> i64 {
+    var bi = ir.new_inst(g_cur_block, op, ty)
+    ir.add_operand(bi, a, 0)
+    ir.add_operand(bi, b, 0)
+    return ir.get_value(bi)
+}
+
+func tig_clamp_bin(op: i64, a: i64, b: i64) -> i64 {
+    return tig_clamp_bin_ty(op, a, b, types.named(TK_I64))
+}
+
+// 尝试为 `while cond { body }` 建立上界钳制。成功返回 kend 值引用（调用方
+// 用它替换循环条件），并填好 g_clamp_ivn/ubv/lims；失败返回 -1，调用方
+// 必须原样走旧路径（此时生成的 IR 与改动前完全一致）。
+func tig_clamp_try(cond: i64, body: i64) -> i64 {
+    if !g_check_bounds {
+        return -1
+    }
+    if ast.s_tag(cond) != 9 {
+        return -1
+    }
+    var op = ast.s_val(cond)
+    var ivn: i64 = -1
+    var ubn: i64 = -1
+    if op == 7 {
+        ivn = sstate.child(cond, 0)
+        ubn = sstate.child(cond, 1)
+    } else if op == 8 {
+        ivn = sstate.child(cond, 1)
+        ubn = sstate.child(cond, 0)
+    } else {
+        return -1
+    }
+    if ivn < 0 || ubn < 0 {
+        return -1
+    }
+    if ast.s_tag(ivn) != 6 {
+        return -1
+    }
+    if !tig_clamp_pure(ubn) {
+        return -1
+    }
+    var ivnm = sstate.name_str(ivn)
+    if len(ivnm) == 0 {
+        return -1
+    }
+    if tig_clamp_has(ubn, ivnm) {
+        return -1
+    }
+    g_clamp_cs = table_new_i64()
+    g_clamp_ds = table_new_i64()
+    g_clamp_ls = table_new_i64()
+    var scok = tig_clamp_scan(body, ivnm)
+    if !scok {
+        return -1
+    }
+    var n = len(g_clamp_cs)
+    if n <= 0 {
+        return -1
+    }
+    // 循环前一次性求值：上界 + 每处访问的 lim。
+    // lim = c>0 ? (len-1-d)/c + 1 : (0<=d<len ? ub : 0)
+    var one = tig_int_lit(1)
+    var zc0 = tig_int_lit(0)
+    var i64ty = types.named(TK_I64)
+    var i1ty = types.named(TK_BOOL)
+    var ubv = tig_expr(ubn)
+    if ubv < 0 {
+        return -1
+    }
+    g_clamp_lims = table_new_i64()
+    var kend = ubv
+    var i: i64 = 0
+    while i < n {
+        var cn = g_clamp_cs[i]
+        var dn = g_clamp_ds[i]
+        var alen = g_clamp_ls[i]
+        var cval = one
+        if cn >= 0 {
+            cval = tig_expr(cn)
+            if cval < 0 {
+                return -1
+            }
+        }
+        var dval = zc0
+        if dn >= 0 {
+            dval = tig_expr(dn)
+            if dval < 0 {
+                return -1
+            }
+        }
+        var lenv = tig_int_lit(alen)
+        var cpos = tig_cmp_const(cval, 3, 0, i64ty)         // c > 0
+        var csafe = tig_select_i(cpos, cval, one, i64ty)    // 防除零
+        var nv = tig_clamp_bin(1, lenv, one)                // len - 1
+        nv = tig_clamp_bin(1, nv, dval)                     // len - 1 - d
+        var q = tig_clamp_bin(3, nv, csafe)                 // / c
+        var limPos = tig_clamp_bin(0, q, one)               // + 1
+        var dge = tig_cmp_const(dval, 5, 0, i64ty)          // d >= 0
+        var dlt = tig_cmp_const(dval, 2, alen, i64ty)       // d < len
+        var dok = tig_clamp_bin_ty(6, dge, dlt, i1ty)       // 二者同时成立
+        var limNeg = tig_select_i(dok, ubv, zc0, i64ty)    // c<=0：上界在 iv=0
+        var lim = tig_select_i(cpos, limPos, limNeg, i64ty)
+        table_push(g_clamp_lims, lim)
+        var ltk = tig_icmp_c(lim, kend, 2)                  // lim < kend
+        kend = tig_select_i(ltk, lim, kend, i64ty)
+        i = i + 1
+    }
+    g_clamp_ivn = ivn
+    g_clamp_ubv = ubv
+    g_clamp_ivnm = ivnm
+    return kend
+}
+
+// 填 while.chk 块：循环因钳制提前结束时，定位是哪一处访问越界，并走与原实现
+// 完全相同的失败路径。按代码顺序逐个判 `iv >= lim_j`，第一个命中者即原实现
+// 在那一轮迭代里最先越界的那处（因为 iv == min(lims)，至少有一处必然命中）。
+func tig_clamp_chk(chk_blk: i64, exit_blk: i64) -> i64 {
+    var saved_blk = g_cur_block
+    g_cur_block = chk_blk
+    var ivv = tig_expr(g_clamp_ivn)
+    if ivv < 0 {
+        g_cur_block = saved_blk
+        return -1
+    }
+    var n = len(g_clamp_cs)
+    var hits: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(hits, ir.new_block(g_cur_func, interner.intern("clamp.h")))
+        i = i + 1
+    }
+    var lt = tig_icmp_c(ivv, g_clamp_ubv, 2)      // iv < ub：钳制提前结束
+    var cbr = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbr, lt, 0)
+    ir.add_operand(cbr, hits[0], 1)
+    ir.add_operand(cbr, exit_blk, 1)
+    var one = tig_int_lit(1)
+    var zc0 = tig_int_lit(0)
+    i = 0
+    while i < n {
+        g_cur_block = hits[i]
+        var fblk = ir.new_block(g_cur_func, interner.intern("clamp.f"))
+        var nxt = exit_blk
+        if i + 1 < n {
+            nxt = hits[i + 1]
+        }
+        var hit = tig_icmp_c(ivv, g_clamp_lims[i], 5)     // iv >= lim
+        var cbr2 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cbr2, hit, 0)
+        ir.add_operand(cbr2, fblk, 1)
+        ir.add_operand(cbr2, nxt, 1)
+        g_cur_block = fblk
+        var cn = g_clamp_cs[i]
+        var dn = g_clamp_ds[i]
+        var cval = one
+        if cn >= 0 {
+            cval = tig_expr(cn)
+        }
+        var dval = zc0
+        if dn >= 0 {
+            dval = tig_expr(dn)
+        }
+        var idxv = tig_clamp_bin(2, cval, ivv)            // c*iv
+        idxv = tig_clamp_bin(0, idxv, dval)               // + d
+        var lenv = tig_int_lit(g_clamp_ls[i])
+        var cfid = tig_oob_fail_ensure()
+        var cinst = ir.new_inst(g_cur_block, 35, -1)
+        ir.add_operand(cinst, interner.intern("tie_oob_fail"), 0)
+        ir.add_operand(cinst, types.named(TK_VOID), 2)
+        ir.add_operand(cinst, types.named(TK_I64), 2)
+        ir.add_operand(cinst, idxv, 0)
+        ir.add_operand(cinst, types.named(TK_I64), 2)
+        ir.add_operand(cinst, lenv, 0)
+        ir.new_inst(g_cur_block, 74, -1)                  // unreachable
+        i = i + 1
+    }
+    g_cur_block = saved_blk
+    return 0
 }
 
