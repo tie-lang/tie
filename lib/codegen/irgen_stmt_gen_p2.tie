@@ -749,8 +749,14 @@ func tig_clamp_try(cond: i64, body: i64) -> i64 {
         var csafe = tig_select_i(cpos, cval, one, i64ty)    // 防除零
         var nv = tig_clamp_bin(1, lenv, one)                // len - 1
         nv = tig_clamp_bin(1, nv, dval)                     // len - 1 - d
+        // nv < 0（d >= len）时 sdiv 向零截断：nv == -1、c == 4 会得 q == 0、
+        // lim == 1，于是第 0 次迭代以 index == d >= len 无检查地越界。此处
+        // 显式拦成 lim = 0，失败仍由 while.chk 在 iv == 0 处按原实现报
+        // index == d 结束，与原实现的失败点一致。
         var q = tig_clamp_bin(3, nv, csafe)                 // / c
-        var limPos = tig_clamp_bin(0, q, one)               // + 1
+        var nneg = tig_cmp_const(nv, 5, 0, i64ty)           // nv >= 0
+        var q1 = tig_clamp_bin(0, q, one)                   // + 1
+        var limPos = tig_select_i(nneg, q1, zc0, i64ty)
         var dge = tig_cmp_const(dval, 5, 0, i64ty)          // d >= 0
         var dlt = tig_cmp_const(dval, 2, alen, i64ty)       // d < len
         var dok = tig_clamp_bin_ty(6, dge, dlt, i1ty)       // 二者同时成立
