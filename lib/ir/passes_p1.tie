@@ -620,7 +620,18 @@ func run_t2() -> i64 {
     // 物理压缩：compact_dead 已按「新指令落位序」重编块 id，并改写
     // br/cond_br/phi 的块引用，压缩后仍满足 llvmgen 按块 id 升序输出的
     // 前提；前置条件不满足（出现空块等）时返回负值，dce 保守成功。
-    return dce()
+    var rd = dce()
+    if rd != 0 {
+        return rd
+    }
+    // 循环展开（passes_unroll）：clang -O1 的流水线只有整循环展开，热循环
+    // 到 LLVM 手上永远是「一次一迭代」，同一份 IR 开到 -funroll-loops 才
+    // 有 4 连体。这一步在 tie-IR 上把单块循环体复制 4 份，把缺的那一步补
+    // 回来。放在物理压缩之后：展开是纯追加（新块与新指令都落在表尾、块区
+    // 间连续），不需要 dce 再收拾一遍，也不扰动它依赖的「块 id 升序 = 指令
+    // 落位序」前提。
+    unroll_loops()
+    return 0
 }
 
 // call(35) → 被调函数 id（符号名池 id 与函数名池 id 相等比较；-1 = 未找到）

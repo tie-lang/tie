@@ -746,20 +746,34 @@ func tig_clamp_try(cond: i64, body: i64) -> i64 {
         }
         var lenv = tig_int_lit(alen)
         var cpos = tig_cmp_const(cval, 3, 0, i64ty)         // c > 0
-        var csafe = tig_select_i(cpos, cval, one, i64ty)    // 防除零
-        var nv = tig_clamp_bin(1, lenv, one)                // len - 1
-        nv = tig_clamp_bin(1, nv, dval)                     // len - 1 - d
-        // nv < 0（d >= len）时 sdiv 向零截断：nv == -1、c == 4 会得 q == 0、
-        // lim == 1，于是第 0 次迭代以 index == d >= len 无检查地越界。此处
-        // 显式拦成 lim = 0，失败仍由 while.chk 在 iv == 0 处按原实现报
-        // index == d 结束，与原实现的失败点一致。
-        var q = tig_clamp_bin(3, nv, csafe)                 // / c
-        var nneg = tig_cmp_const(nv, 5, 0, i64ty)           // nv >= 0
-        var q1 = tig_clamp_bin(0, q, one)                   // + 1
-        var limPos = tig_select_i(nneg, q1, zc0, i64ty)
         var dge = tig_cmp_const(dval, 5, 0, i64ty)          // d >= 0
         var dlt = tig_cmp_const(dval, 2, alen, i64ty)       // d < len
-        var dok = tig_clamp_bin_ty(6, dge, dlt, i1ty)       // 二者同时成立
+        var dok = tig_clamp_bin_ty(6, dge, dlt, i1ty)       // 0 <= d < len
+        var limPos = zc0
+        if cn < 0 {
+            // 系数恒为 1（tig_clamp_split 的哨兵）：`(len-1-d)/1 + 1` 就是 `len - d`，
+            // 除法整条退化掉 —— 数值热循环里最后一处 sdiv 正来自这里，而 sdiv 因
+            // INT_MIN / -1 的陷阱语义无法被 LLVM 外提，只能由本层直接发减法。
+            var lnd = tig_clamp_bin(1, lenv, dval)          // len - d
+            limPos = tig_select_i(dok, lnd, zc0, i64ty)
+        } else {
+            var csafe = tig_select_i(cpos, cval, one, i64ty)    // 防除零
+            var nv = tig_clamp_bin(1, lenv, one)                // len - 1
+            nv = tig_clamp_bin(1, nv, dval)                     // len - 1 - d
+            // nv < 0（d >= len）时 sdiv 向零截断：nv == -1、c == 4 会得 q == 0、
+            // lim == 1，于是第 0 次迭代以 index == d >= len 无检查地越界。此处
+            // 显式拦成 lim = 0，失败仍由 while.chk 在 iv == 0 处按原实现报
+            // index == d 结束，与原实现的失败点一致。
+            var q = tig_clamp_bin(3, nv, csafe)                 // / c
+            var nneg = tig_cmp_const(nv, 5, 0, i64ty)           // nv >= 0
+            var q1 = tig_clamp_bin(0, q, one)                   // + 1
+            // d < 0（偏移本身为负，如 a[k + j] 且 k 运行期为负）时 `(len-1-d)/c + 1`
+            // 恒为正、把钳制上界放大到 ub，首轮 index == d 就以无检查的方式越界读。
+            // 故正系数分支也必须要求 d >= 0：不满足时 lim 取 0，循环体一次不执行，
+            // 由 while.chk 在 iv == 0 处按原实现报 index == d 结束（失败点与诊断一致）。
+            var okp = tig_clamp_bin_ty(6, nneg, dge, i1ty)      // nv >= 0 且 d >= 0
+            limPos = tig_select_i(okp, q1, zc0, i64ty)
+        }
         var limNeg = tig_select_i(dok, ubv, zc0, i64ty)    // c<=0：上界在 iv=0
         var lim = tig_select_i(cpos, limPos, limNeg, i64ty)
         table_push(g_clamp_lims, lim)

@@ -1,0 +1,367 @@
+type tie<class>
+// lib/ir/passes_unroll.tie —— 循环展开（t2 族 pass）
+// ============================================================
+// 为什么需要这一层：clang -O1 的流水线只有 LoopFullUnrollPass，没有部分展开
+// 器，所以 tie 生成的热循环到 LLVM 手上永远是「一次一迭代」的形态；同一份
+// IR 交给 clang -O2（-funroll-loops）立刻就能展开成 4 连体 + 加法树。
+// 本 pass 在 tie-IR 上先把循环体复制 4 份，把 LLVM 缺少的那一步补回来——
+// 换来的收益与 -funroll-loops 一致，但不依赖任何 clang 档位开关（-l/-t 映射
+// 保持不变）。
+//
+// 实测依据（n=64 outer=20000，同轮交替 min-of-4，等价 C++ -O2 为参照）：
+//   未展开 1980ms → 手工把同一份 tie-IR 的循环体复制 4 份 1450ms，
+//   与 clang -O1 -funroll-loops 的 1459ms 齐平（1.37× → 1.08×）。
+//   源级 4 连体写法反而更慢（2234ms），因为它让每个副本的数组访问各自
+//   生成一套钳制 lim 与检查；IR 层复制则检查代码保持单份，故必须做在 IR 上。
+//
+// 形状前提（任一不满足即放弃，IR 逐字节不变——保守优先）：
+//   1. 头块 H 以 cond_br 结尾，then 块 T 是单块循环体（T 末尾 br H），
+//      且 T 只有 H 一个前驱、H 只有 T 与另一个前驱 P 两个前驱；
+//   2. H 的条件是 icmp slt(load slot, bound)，bound 在 H 内定义则放弃
+//      （否则守卫块用不到它）；slot 来自 alloca；
+//   3. T 内不出现 alloca/phi/ret/br/cond_br/unreachable（复制栈槽或控制流
+//      会改变语义），且除末尾的「slot = slot + 1」外不得有别的 slot 写；
+//   4. T 的指令数 ≤ U_MAX_BODY（控制代码体积放大）。
+//
+// 变换（等价于把 for 循环切成「4 连体主循环 + 原单步循环作余数循环」）：
+//   P 的 br H → br G；G（新块）算守卫，成立进 U 否则回 H；U（新块）是 4 份
+//   循环体副本，末尾 br G。守卫用的是「剩余迭代数 ≥ 4」的免溢出写法：
+//     %c1  = icmp sge i64 bound, 4       ; 保证 bound - 4 不下溢
+//     %raw = sub i64 bound, 4
+//     %lim = select i1 %c1, i64 %raw, i64 0
+//     %c2  = icmp slt i64 slot, %lim
+//   bound < 4 时 %raw 会回绕，但 select 只在上界确实 ≥ 4 时取用它，回绕值
+//   永远不进入比较；LLVM 侧无 nsw/nuw 标记，回绕是定义行为，故不引入 UB。
+//   用 select 而不是「and(c1, c2)」：后者在机器码里会给循环尾多加一条
+//   `cmpq $4` 判断，select 形态没有。
+//
+// 确定性：遍历顺序固定（块 id 升序、指令 id 升序），新增值 id 由 new_value
+// 单调分配，无时间/地址/随机依赖。
+namespace passes;
+
+const U_FACTOR: i64 = 4;        // 展开倍数
+const U_MAX_BODY: i64 = 48;     // 循环体指令数上限（代码体积护栏）
+const U_MAX_LOOPS: i64 = 32;    // 每模块最多展开的循环数
+
+// opcode 字面量（与 lib/ir/ir.tie 的权威名表一致；常量跨文件不可见故本地定义）
+const U_ADD: i64 = 0;
+const U_SUB: i64 = 1;
+const U_SELECT: i64 = 34;
+const U_ICMP: i64 = 12;
+const U_ALLOCA: i64 = 20;
+const U_LOAD: i64 = 21;
+const U_STORE: i64 = 22;
+const U_BR: i64 = 30;
+const U_CBR: i64 = 31;
+const U_RET: i64 = 32;
+const U_PHI: i64 = 33;
+const U_CONST_I: i64 = 60;
+const U_UNREACH: i64 = 74;
+// 操作数类别 / 比较码
+const U_K_VAL: i64 = 0;
+const U_K_BLK: i64 = 1;
+const U_K_IMM: i64 = 2;
+const U_CC_LT: i64 = 2;
+const U_CC_GE: i64 = 5;
+
+// t2 钩子：返回展开的循环数（≥0）；不展开时不动任何表。
+pub func unroll_loops() -> i64 {
+    var nb0 = ir.block_count()
+    var nv = ir.value_count()
+    if nb0 <= 0 || nv <= 0 {
+        return 0
+    }
+    // 值 → 定义指令（-1 = 形参/全局等无定义指令的值）
+    var def = table_new_i64()
+    var i: i64 = 0
+    while i < nv {
+        table_push(def, 0 - 1)
+        i = i + 1
+    }
+    // 块引用计数：br/cond_br 的块操作数被引用的次数（= 前驱边数）
+    var refs = table_new_i64()
+    var bi: i64 = 0
+    while bi < nb0 {
+        table_push(refs, 0)
+        bi = bi + 1
+    }
+    bi = 0
+    while bi < nb0 {
+        var ii = ir.block_start(bi)
+        while ii < ir.block_end(bi) {
+            var v = ir.ins_val(ii)
+            if v >= 0 && v < nv {
+                def[v] = ii
+            }
+            var op = ir.ins_op(ii)
+            if op == U_BR || op == U_CBR {
+                var nc = ir.ins_ops_cnt(ii)
+                var k: i64 = 0
+                while k < nc {
+                    if ir.ins_opnd_kind(ii, k) == U_K_BLK {
+                        var tb = ir.ins_opnd(ii, k)
+                        if tb >= 0 && tb < nb0 {
+                            refs[tb] = refs[tb] + 1
+                        }
+                    }
+                    k = k + 1
+                }
+            }
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+    var done: i64 = 0
+    bi = 0
+    while bi < nb0 {
+        if done < U_MAX_LOOPS {
+            done = done + unroll_one(bi, def, refs, nv)
+        }
+        bi = bi + 1
+    }
+    return done
+}
+
+// 尝试展开一个以 H 为头块的循环；成功返回 1，放弃返回 0（不动任何表）。
+func unroll_one(h: i64, def: table<i64>, refs: table<i64>, nv: i64) -> i64 {
+    var hid = ir.block_func(h)
+    var hs = ir.block_start(h)
+    var he = ir.block_end(h)
+    if he - hs < 2 {
+        return 0
+    }
+    // ---------- 1. 头块条件与 then 块 ----------
+    var term = he - 1
+    if ir.ins_op(term) != U_CBR || ir.ins_ops_cnt(term) != 3 {
+        return 0
+    }
+    if ir.ins_opnd_kind(term, 1) != U_K_BLK || ir.ins_opnd_kind(term, 2) != U_K_BLK {
+        return 0
+    }
+    var t = ir.ins_opnd(term, 1)
+    var e = ir.ins_opnd(term, 2)
+    if t == h || e == h || t == e || ir.block_func(t) != hid {
+        return 0
+    }
+    if t < 0 || t >= len(refs) {
+        return 0
+    }
+    // then 块只能有 H 一个前驱；H 只能有 T 与另一前驱 P 两条入边
+    if refs[t] != 1 || refs[h] != 2 {
+        return 0
+    }
+    // ---------- 2. then 块必须是单块循环体（末尾 br H） ----------
+    var ts = ir.block_start(t)
+    var te = ir.block_end(t)
+    if te - ts < 2 {
+        return 0
+    }
+    var tterm = te - 1
+    if ir.ins_op(tterm) != U_BR || ir.ins_ops_cnt(tterm) != 1 {
+        return 0
+    }
+    if ir.ins_opnd_kind(tterm, 0) != U_K_BLK || ir.ins_opnd(tterm, 0) != h {
+        return 0
+    }
+    var body = te - ts - 1
+    if body <= 0 || body > U_MAX_BODY {
+        return 0
+    }
+    // ---------- 3. 条件形态：icmp slt(load slot, bound)，bound 在头块外 ----------
+    var condv = ir.ins_opnd(term, 0)
+    if condv < 0 || condv >= nv {
+        return 0
+    }
+    var ci = def[condv]
+    if ci < 0 || ir.ins_op(ci) != U_ICMP || ir.ins_ops_cnt(ci) != 3 {
+        return 0
+    }
+    if ir.ins_opnd_kind(ci, 0) != U_K_VAL || ir.ins_opnd_kind(ci, 1) != U_K_VAL {
+        return 0
+    }
+    if ir.ins_opnd_kind(ci, 2) != U_K_IMM || ir.ins_opnd(ci, 2) != U_CC_LT {
+        return 0
+    }
+    var lv = ir.ins_opnd(ci, 0)
+    if lv < 0 || lv >= nv {
+        return 0
+    }
+    var ld = def[lv]
+    if ld < 0 || ir.ins_op(ld) != U_LOAD || ir.ins_ops_cnt(ld) != 1 {
+        return 0
+    }
+    if ir.ins_opnd_kind(ld, 0) != U_K_VAL {
+        return 0
+    }
+    var slot = ir.ins_opnd(ld, 0)
+    if slot < 0 || slot >= nv {
+        return 0
+    }
+    var adef = def[slot]
+    if adef < 0 || ir.ins_op(adef) != U_ALLOCA {
+        return 0
+    }
+    var bv = ir.ins_opnd(ci, 1)
+    var bdef = def[bv]
+    if bdef >= hs && bdef < he {
+        return 0   // bound 在头块内求值 → 守卫块（P 的后继）用不到
+    }
+    // ---------- 4. 循环体自包含性 ----------
+    var ii = ts
+    while ii < tterm {
+        var op = ir.ins_op(ii)
+        if op == U_ALLOCA || op == U_PHI || op == U_RET || op == U_BR || op == U_CBR || op == U_UNREACH {
+            return 0
+        }
+        ii = ii + 1
+    }
+    // ---------- 5. 归纳变量：末尾 slot = slot + 1，且 slot 只此一处写 ----------
+    var lastb = tterm - 1
+    if ir.ins_op(lastb) != U_STORE || ir.ins_ops_cnt(lastb) != 3 {
+        return 0
+    }
+    if ir.ins_opnd_kind(lastb, 2) != U_K_VAL || ir.ins_opnd(lastb, 2) != slot {
+        return 0
+    }
+    var sv = ir.ins_opnd(lastb, 1)
+    if ir.ins_opnd_kind(lastb, 1) != U_K_VAL || sv < 0 || sv >= nv {
+        return 0
+    }
+    var ai = def[sv]
+    if ai < 0 || ir.ins_op(ai) != U_ADD || ir.ins_ops_cnt(ai) != 2 {
+        return 0
+    }
+    var lv2 = ir.ins_opnd(ai, 0)
+    var ov2 = ir.ins_opnd(ai, 1)
+    if lv2 < 0 || lv2 >= nv || ov2 < 0 || ov2 >= nv {
+        return 0
+    }
+    var ld2 = def[lv2]
+    if ld2 < 0 || ir.ins_op(ld2) != U_LOAD || ir.ins_ops_cnt(ld2) != 1 {
+        return 0
+    }
+    if ir.ins_opnd_kind(ld2, 0) != U_K_VAL || ir.ins_opnd(ld2, 0) != slot {
+        return 0
+    }
+    var oi = def[ov2]
+    if oi < 0 || ir.ins_op(oi) != U_CONST_I || ir.ins_ops_cnt(oi) != 1 {
+        return 0
+    }
+    if ir.ins_opnd_kind(oi, 0) != U_K_IMM || ir.ins_opnd(oi, 0) != 1 {
+        return 0
+    }
+    var nstore: i64 = 0
+    ii = ts
+    while ii < tterm {
+        if ir.ins_op(ii) == U_STORE {
+            if ir.ins_opnd_kind(ii, 2) == U_K_VAL && ir.ins_opnd(ii, 2) == slot {
+                nstore = nstore + 1
+            }
+        }
+        ii = ii + 1
+    }
+    if nstore != 1 {
+        return 0
+    }
+    // ---------- 6. 定位前驱 P（引用 H 且不是 T 的那条边） ----------
+    var nb = ir.block_count()
+    var p: i64 = 0 - 1
+    var pterm: i64 = 0 - 1
+    var popnd: i64 = 0 - 1
+    var pi: i64 = 0
+    while pi < nb && p < 0 {
+        var ps = ir.block_start(pi)
+        var pe = ir.block_end(pi)
+        var qi = ps
+        while qi < pe {
+            var op2 = ir.ins_op(qi)
+            if (op2 == U_BR || op2 == U_CBR) && pi != t {
+                var nc2 = ir.ins_ops_cnt(qi)
+                var k2: i64 = 0
+                while k2 < nc2 {
+                    if ir.ins_opnd_kind(qi, k2) == U_K_BLK && ir.ins_opnd(qi, k2) == h {
+                        p = pi
+                        pterm = qi
+                        popnd = k2
+                    }
+                    k2 = k2 + 1
+                }
+            }
+            qi = qi + 1
+        }
+        pi = pi + 1
+    }
+    if p < 0 || p == h || p == t || pterm < 0 {
+        return 0
+    }
+    // ---------- 7. 建块：两块都必须先建好再填（块区间按落位序连续） ----------
+    var g = ir.new_block(hid, interner.intern("unroll.guard"))
+    var u = ir.new_block(hid, interner.intern("unroll.body"))
+    var tyv = ir.ins_ty(ld)     // 归纳变量的元素类型
+    var xty = ir.ins_ty(ci)     // icmp 结果类型（i1）
+    // 守卫块 G
+    var nk = ir.new_inst(g, U_LOAD, tyv)
+    ir.add_operand(nk, slot, U_K_VAL)
+    var nfour = ir.new_inst(g, U_CONST_I, tyv)
+    ir.add_operand(nfour, U_FACTOR, U_K_IMM)
+    var nc1 = ir.new_inst(g, U_ICMP, xty)
+    ir.add_operand(nc1, bv, U_K_VAL)
+    ir.add_operand(nc1, ir.ins_val(nfour), U_K_VAL)
+    ir.add_operand(nc1, U_CC_GE, U_K_IMM)
+    var nraw = ir.new_inst(g, U_SUB, tyv)
+    ir.add_operand(nraw, bv, U_K_VAL)
+    ir.add_operand(nraw, ir.ins_val(nfour), U_K_VAL)
+    var nzero = ir.new_inst(g, U_CONST_I, tyv)
+    ir.add_operand(nzero, 0, U_K_IMM)
+    var nlim = ir.new_inst(g, U_SELECT, tyv)
+    ir.add_operand(nlim, ir.ins_val(nc1), U_K_VAL)
+    ir.add_operand(nlim, ir.ins_val(nraw), U_K_VAL)
+    ir.add_operand(nlim, ir.ins_val(nzero), U_K_VAL)
+    var nc2 = ir.new_inst(g, U_ICMP, xty)
+    ir.add_operand(nc2, ir.ins_val(nk), U_K_VAL)
+    ir.add_operand(nc2, ir.ins_val(nlim), U_K_VAL)
+    ir.add_operand(nc2, U_CC_LT, U_K_IMM)
+    var ng = ir.new_inst(g, U_CBR, 0 - 1)
+    ir.add_operand(ng, ir.ins_val(nc2), U_K_VAL)
+    ir.add_operand(ng, u, U_K_BLK)
+    ir.add_operand(ng, h, U_K_BLK)
+    // ---------- 8. 展开块 U：U_FACTOR 份循环体副本 + br G ----------
+    var tdef = table_new_i64()
+    var zi: i64 = 0
+    while zi < nv {
+        table_push(tdef, 0 - 1)
+        zi = zi + 1
+    }
+    var c: i64 = 0
+    while c < U_FACTOR {
+        var cj = ts
+        while cj < tterm {
+            var cop = ir.ins_op(cj)
+            var cty = ir.ins_ty(cj)
+            var nci = ir.new_inst(u, cop, cty)
+            var ccnt = ir.ins_ops_cnt(cj)
+            var ck: i64 = 0
+            while ck < ccnt {
+                var ckind = ir.ins_opnd_kind(cj, ck)
+                var coper = ir.ins_opnd(cj, ck)
+                if ckind == U_K_VAL && coper >= 0 && coper < nv && tdef[coper] >= 0 {
+                    ir.add_operand(nci, tdef[coper], U_K_VAL)
+                } else {
+                    ir.add_operand(nci, coper, ckind)
+                }
+                ck = ck + 1
+            }
+            var cv = ir.ins_val(cj)
+            if cv >= 0 && cv < nv {
+                tdef[cv] = ir.ins_val(nci)
+            }
+            cj = cj + 1
+        }
+        c = c + 1
+    }
+    var nbr = ir.new_inst(u, U_BR, 0 - 1)
+    ir.add_operand(nbr, g, U_K_BLK)
+    // ---------- 9. 前驱改道：P 的 br H → br G ----------
+    ir.set_opnd(pterm, popnd, g, U_K_BLK)
+    return 1
+}
