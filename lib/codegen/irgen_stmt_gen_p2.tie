@@ -664,24 +664,35 @@ func tig_clamp_bin(op: i64, a: i64, b: i64) -> i64 {
     return tig_clamp_bin_ty(op, a, b, types.named(TK_I64))
 }
 
-// 慢路径 lim：`(len-1-d)/c + 1`，带两处防越界的钳位。
-func tig_clamp_div_lim(cval: i64, dval: i64, lenv: i64, one: i64, zc0: i64, cpos: i64, dge: i64, i64ty: i64, i1ty: i64) -> i64 {
-    var csafe = tig_select_i(cpos, cval, one, i64ty)    // 防除零
-    var nv = tig_clamp_bin(1, lenv, one)                // len - 1
-    nv = tig_clamp_bin(1, nv, dval)                     // len - 1 - d
-    // nv < 0（d >= len）时 sdiv 向零截断：nv == -1、c == 4 会得 q == 0、
-    // lim == 1，于是第 0 次迭代以 index == d >= len 无检查地越界。此处
-    // 显式拦成 lim = 0，失败仍由 while.chk 在 iv == 0 处按原实现报
-    // index == d 结束，与原实现的失败点一致。
-    var q = tig_clamp_bin(3, nv, csafe)                 // / c
-    var nneg = tig_cmp_const(nv, 5, 0, i64ty)           // nv >= 0
-    var q1 = tig_clamp_bin(0, q, one)                   // + 1
-    // d < 0（偏移本身为负，如 a[k + j] 且 k 运行期为负）时 `(len-1-d)/c + 1`
-    // 恒为正、把钳制上界放大到 ub，首轮 index == d 就以无检查的方式越界读。
-    // 故正系数分支也必须要求 d >= 0：不满足时 lim 取 0，循环体一次不执行，
-    // 由 while.chk 在 iv == 0 处按原实现报 index == d 结束（失败点与诊断一致）。
-    var okp = tig_clamp_bin_ty(6, nneg, dge, i1ty)      // nv >= 0 且 d >= 0
-    return tig_select_i(okp, q1, zc0, i64ty)
+// |x| <= lim 的 i1 值。写成两次有符号比较，避免对 INT_MIN 取绝对值时回绕。
+func tig_clamp_mag(x: i64, lim: i64, i64ty: i64, i1ty: i64) -> i64 {
+    var hi = tig_cmp_const(x, 4, lim, i64ty)            // x <= lim
+    var lo = tig_cmp_const(x, 5, 0 - lim, i64ty)        // x >= -lim
+    return tig_clamp_bin_ty(6, hi, lo, i1ty)
+}
+
+// 慢路径 lim。下标随 iv 单调（c != 0）时，「第一个越界 iv」正是 while 的上界：
+//   c > 0：下标随 iv 递增，越界点是第一个使 c*iv+d > len-1 的 iv
+//           ⇒ hi = floor((len-1-d)/c)，lim = hi+1
+//   c < 0：下标随 iv 递减，越界点是第一个使 c*iv+d < 0 的 iv
+//           ⇒ hi = floor(d/(-c))，lim = hi+1
+//   c == 0：下标恒定，无约束，lim 取 ub。
+// 除法一律按 floor 归一（sdiv 向零截断，负被除数时再减一），否则 c<0 与负被除数
+// 都会把上界算大一格，那一格正好是无检查越界。
+func tig_clamp_slow_lim(cval: i64, dval: i64, lenv: i64, ubv: i64, one: i64, zc0: i64, cpos: i64, czero: i64, i64ty: i64) -> i64 {
+    var lm1 = tig_clamp_bin(1, lenv, one)               // len - 1
+    var lmd = tig_clamp_bin(1, lm1, dval)               // len - 1 - d
+    var negc = tig_clamp_bin(1, zc0, cval)              // -c
+    var absc0 = tig_select_i(cpos, cval, negc, i64ty)   // |c|
+    var absc = tig_select_i(czero, one, absc0, i64ty)   // 防除零
+    var numv = tig_select_i(cpos, lmd, dval, i64ty)     // 被除数按符号切换
+    var q = tig_clamp_bin(3, numv, absc)
+    var r = tig_clamp_bin(4, numv, absc)
+    var rneg = tig_cmp_const(r, 2, 0, i64ty)            // r < 0（除数为正）
+    var qm1 = tig_clamp_bin(1, q, one)
+    var qf = tig_select_i(rneg, qm1, q, i64ty)          // floor 归一
+    var lim = tig_clamp_bin(0, qf, one)                 // hi + 1
+    return tig_select_i(czero, ubv, lim, i64ty)
 }
 
 // 尝试为 `while cond { body }` 建立上界钳制。成功返回 kend 值引用（调用方
@@ -733,8 +744,7 @@ func tig_clamp_try(cond: i64, body: i64) -> i64 {
     if n <= 0 {
         return -1
     }
-    // 循环前一次性求值：上界 + 每处访问的 lim。
-    // lim = c>0 ? (len-1-d)/c + 1 : (0<=d<len ? ub : 0)
+    // 循环前一次性求值：上界 + 归纳变量当前值 + 每处访问的 lim。
     var one = tig_int_lit(1)
     var zc0 = tig_int_lit(0)
     var i64ty = types.named(TK_I64)
@@ -743,6 +753,15 @@ func tig_clamp_try(cond: i64, body: i64) -> i64 {
     if ubv < 0 {
         return -1
     }
+    // 归纳变量在循环入口的值。钳制的上界公式只管「上界一侧」：若首轮下标就已越界
+    // （iv 从负数起、或偏移为负），限住上界并不能阻止首轮越界读，故每处访问都要用
+    // 它算一次入口下标 idx0 单独判定。
+    var iv0v = tig_expr(ivn)
+    if iv0v < 0 {
+        return -1
+    }
+    var ubm1 = tig_clamp_bin(1, ubv, one)               // ub - 1
+    var ubm1ok = tig_clamp_mag(ubm1, 2000000000, i64ty, i1ty)
     g_clamp_lims = table_new_i64()
     var kend = ubv
     var i: i64 = 0
@@ -766,69 +785,55 @@ func tig_clamp_try(cond: i64, body: i64) -> i64 {
         }
         var lenv = tig_int_lit(alen)
         var cpos = tig_cmp_const(cval, 3, 0, i64ty)         // c > 0
-        var dge = tig_cmp_const(dval, 5, 0, i64ty)          // d >= 0
-        var dlt = tig_cmp_const(dval, 2, alen, i64ty)       // d < len
-        var dok = tig_clamp_bin_ty(6, dge, dlt, i1ty)       // 0 <= d < len
-        var limPos = zc0
-        if cn < 0 {
-            // 系数恒为 1（tig_clamp_split 的哨兵）：`(len-1-d)/1 + 1` 就是 `len - d`，
-            // 除法整条退化掉 —— 数值热循环里最后一处 sdiv 正来自这里，而 sdiv 因
-            // INT_MIN / -1 的陷阱语义无法被 LLVM 外提，只能由本层直接发减法。
-            var lnd = tig_clamp_bin(1, lenv, dval)          // len - d
-            limPos = tig_select_i(dok, lnd, zc0, i64ty)
-        } else {
-            // 免除法快路径：若能在运行期证明「本访问在这段循环里整个都在界内」，
-            // 上界直接取 ub，sdiv 一次都不执行。证明式（c>0、iv 从 0 步长 1）：
-            //     c * (ub - 1) + d <= len - 1
-            // 各因子先被 c <= len、0 <= ub-1 <= len、0 <= d < len 夹住，故乘积与和
-            // 都不会溢出（len <= 2e9 的前提在下面用 alensafe 静态保证）。
-            // 证不出来（含 c<0、d<0、ub<=0）就走原来的 sdiv 慢路径，语义与之逐位相同。
-            var alensafe = alen <= 2000000000
-            var fastv: i64 = -1
-            if alensafe {
-                var ubm1 = tig_clamp_bin(1, ubv, one)               // ub - 1
-                var ubpos = tig_cmp_const(ubv, 3, 0, i64ty)         // ub > 0
-                var ubsm = tig_cmp_const(ubm1, 4, alen, i64ty)      // ub - 1 <= len
-                var csm = tig_cmp_const(cval, 4, alen, i64ty)       // c <= len
-                var prod = tig_clamp_bin(2, cval, ubm1)             // c * (ub - 1)
-                prod = tig_clamp_bin(0, prod, dval)                 // + d
-                var prok = tig_cmp_const(prod, 4, alen - 1, i64ty)  // <= len - 1
-                fastv = tig_clamp_bin_ty(6, cpos, dge, i1ty)
-                fastv = tig_clamp_bin_ty(6, fastv, dlt, i1ty)
-                fastv = tig_clamp_bin_ty(6, fastv, csm, i1ty)
-                fastv = tig_clamp_bin_ty(6, fastv, ubpos, i1ty)
-                fastv = tig_clamp_bin_ty(6, fastv, ubsm, i1ty)
-                fastv = tig_clamp_bin_ty(6, fastv, prok, i1ty)
-            }
-            if fastv < 0 {
-                limPos = tig_clamp_div_lim(cval, dval, lenv, one, zc0, cpos, dge, i64ty, i1ty)
-            } else {
-                // 快/慢两分支各写一次槽，join 处读回，保证支配关系正确。
-                var slot = tig_slot64(zc0)
-                var fblk = ir.new_block(g_cur_func, interner.intern("clamp.f"))
-                var sblk = ir.new_block(g_cur_func, interner.intern("clamp.s"))
-                var jblk = ir.new_block(g_cur_func, interner.intern("clamp.j"))
-                var cb = ir.new_inst(g_cur_block, 31, -1)            // cond_br
-                ir.add_operand(cb, fastv, 0)
-                ir.add_operand(cb, fblk, 1)
-                ir.add_operand(cb, sblk, 1)
-                g_cur_block = fblk
-                s21_store(slot, ubv, i64ty)                          // 整段在界内 ⇒ 上界就是 ub
-                var fbr = ir.new_inst(g_cur_block, 30, -1)
-                ir.add_operand(fbr, jblk, 1)
-                g_cur_block = sblk
-                s21_store(slot, tig_clamp_div_lim(cval, dval, lenv, one, zc0, cpos, dge, i64ty, i1ty), i64ty)
-                var sbr = ir.new_inst(g_cur_block, 30, -1)
-                ir.add_operand(sbr, jblk, 1)
-                g_cur_block = jblk
-                limPos = s21_load(slot, i64ty)
-            }
-        }
-        var limNeg = tig_select_i(dok, ubv, zc0, i64ty)    // c<=0：上界在 iv=0
-        var lim = tig_select_i(cpos, limPos, limNeg, i64ty)
-        table_push(g_clamp_lims, lim)
-        var ltk = tig_icmp_c(lim, kend, 2)                  // lim < kend
-        kend = tig_select_i(ltk, lim, kend, i64ty)
+        var czero = tig_cmp_const(cval, 0, 0, i64ty)        // c == 0
+        // 入口下标 idx0 = c*iv0 + d。uge 一次比较同时覆盖「负下标」与「超上界」，
+        // 与原实现 tig_array_bounds_check 的判定完全相同。
+        var idx0 = tig_clamp_bin(2, cval, iv0v)             // c * iv0
+        idx0 = tig_clamp_bin(0, idx0, dval)                 // + d
+        var bad0 = tig_cmp_const(idx0, 9, alen, i64ty)      // (u64)idx0 >= len
+        var ok0 = tig_select_i(bad0, zc0, one, i1ty)        // 首轮在界内 = 1
+        // 末轮下标 idxT = c*(ub-1) + d。两个端点都在界内且下标随 iv 单调，则整段
+        // 循环都在界内，lim 直接取 ub、sdiv 一次都不执行。
+        var idxT = tig_clamp_bin(2, cval, ubm1)             // c * (ub-1)
+        idxT = tig_clamp_bin(0, idxT, dval)                 // + d
+        var badT = tig_cmp_const(idxT, 9, alen, i64ty)
+        var okT = tig_select_i(badT, zc0, one, i1ty)
+        // 数值域守卫：四个因子都 <= 2e9 时，c*iv0 与 c*(ub-1) 的乘加都不会回绕，
+        // 上面两处的越界判定与下面的除法才可信（数组长度本身也由 scan 卡在 2e9）。
+        var sane = tig_clamp_mag(cval, 2000000000, i64ty, i1ty)
+        sane = tig_clamp_bin_ty(6, sane, ubm1ok, i1ty)
+        sane = tig_clamp_bin_ty(6, sane, tig_clamp_mag(iv0v, 2000000000, i64ty, i1ty), i1ty)
+        sane = tig_clamp_bin_ty(6, sane, tig_clamp_mag(dval, 2000000000, i64ty, i1ty), i1ty)
+        var fastv = tig_clamp_bin_ty(6, sane, ok0, i1ty)
+        fastv = tig_clamp_bin_ty(6, fastv, okT, i1ty)       // 整段在界内 ⇒ lim = ub
+        // 快/慢两分支各写一次槽，join 处读回，保证支配关系正确；sdiv 只在证不出
+        // 「整段在界内」时才执行（数值热循环里它曾是每 (row,col) 一次 26 周期）。
+        var slot = tig_slot64(zc0)
+        var fblk = ir.new_block(g_cur_func, interner.intern("clamp.f"))
+        var sblk = ir.new_block(g_cur_func, interner.intern("clamp.s"))
+        var jblk = ir.new_block(g_cur_func, interner.intern("clamp.j"))
+        var cb = ir.new_inst(g_cur_block, 31, -1)            // cond_br
+        ir.add_operand(cb, fastv, 0)
+        ir.add_operand(cb, fblk, 1)
+        ir.add_operand(cb, sblk, 1)
+        g_cur_block = fblk
+        s21_store(slot, ubv, i64ty)                          // 整段在界内 ⇒ 上界就是 ub
+        var fbr = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(fbr, jblk, 1)
+        g_cur_block = sblk
+        s21_store(slot, tig_clamp_slow_lim(cval, dval, lenv, ubv, one, zc0, cpos, czero, i64ty), i64ty)
+        var sbr = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(sbr, jblk, 1)
+        g_cur_block = jblk
+        var limv = s21_load(slot, i64ty)
+        // 首轮下标越界（或数值域外的病态实参）时把 lim 压到 iv0：本循环一次都不
+        // 执行，while.chk 的 `iv >= lim` 随即命中并走同一失败路径，打印的正是首轮
+        // 下标 —— 与原实现「首轮第一次访问就报错」等价。
+        var okall = tig_clamp_bin_ty(6, sane, ok0, i1ty)
+        limv = tig_select_i(okall, limv, iv0v, i64ty)
+        table_push(g_clamp_lims, limv)
+        var ltk = tig_icmp_c(limv, kend, 2)                 // lim < kend
+        kend = tig_select_i(ltk, limv, kend, i64ty)
         i = i + 1
     }
     g_clamp_ivn = ivn

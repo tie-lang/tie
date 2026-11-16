@@ -25,15 +25,14 @@ type tie<class>
 //
 // 变换（等价于把 for 循环切成「4 连体主循环 + 原单步循环作余数循环」）：
 //   P 的 br H → br G；G（新块）算守卫，成立进 U 否则回 H；U（新块）是 4 份
-//   循环体副本，末尾 br G。守卫用的是「剩余迭代数 ≥ 4」的免溢出写法：
-//     %c1  = icmp sge i64 bound, 4       ; 保证 bound - 4 不下溢
-//     %raw = sub i64 bound, 4
-//     %lim = select i1 %c1, i64 %raw, i64 0
-//     %c2  = icmp slt i64 slot, %lim
-//   bound < 4 时 %raw 会回绕，但 select 只在上界确实 ≥ 4 时取用它，回绕值
-//   永远不进入比较；LLVM 侧无 nsw/nuw 标记，回绕是定义行为，故不引入 UB。
-//   用 select 而不是「and(c1, c2)」：后者在机器码里会给循环尾多加一条
-//   `cmpq $4` 判断，select 形态没有。
+//   循环体副本，末尾 br G。守卫问的是「剩余迭代数 ≥ U_FACTOR」，写成免回绕式：
+//     %dif = sub  i64 bound, %k          ; %k = load slot
+//     %c0  = icmp sgt i64 bound, %k      ; 挡住「循环已结束」
+//     %cf  = icmp uge i64 %dif, 4        ; bound >= k 时 %dif 就是真差值
+//     br i1 and(%c0, %cf), U, H
+//   不用 `k < bound - 4` 那种「上界绝对值」写法：归纳变量可以从负数起步，上界也
+//   可能被钳制压到 iv0，此时 `bound >= 4` 与 `bound - 4` 都失去意义 —— 实测曾在
+//   kend < 0 的循环上多跑 4 次不带检查的迭代（越界读）。差值式对两者符号都成立。
 //
 // 确定性：遍历顺序固定（块 id 升序、指令 id 升序），新增值 id 由 new_value
 // 单调分配，无时间/地址/随机依赖。
@@ -46,6 +45,7 @@ const U_MAX_LOOPS: i64 = 32;    // 每模块最多展开的循环数
 // opcode 字面量（与 lib/ir/ir.tie 的权威名表一致；常量跨文件不可见故本地定义）
 const U_ADD: i64 = 0;
 const U_SUB: i64 = 1;
+const U_AND: i64 = 6;
 const U_SELECT: i64 = 34;
 const U_ICMP: i64 = 12;
 const U_ALLOCA: i64 = 20;
@@ -62,7 +62,9 @@ const U_K_VAL: i64 = 0;
 const U_K_BLK: i64 = 1;
 const U_K_IMM: i64 = 2;
 const U_CC_LT: i64 = 2;
+const U_CC_GT: i64 = 3;
 const U_CC_GE: i64 = 5;
+const U_CC_UGE: i64 = 9;
 
 // t2 钩子：返回展开的循环数（≥0）；不展开时不动任何表。
 pub func unroll_loops() -> i64 {
@@ -299,30 +301,32 @@ func unroll_one(h: i64, def: table<i64>, refs: table<i64>, nv: i64) -> i64 {
     var u = ir.new_block(hid, interner.intern("unroll.body"))
     var tyv = ir.ins_ty(ld)     // 归纳变量的元素类型
     var xty = ir.ins_ty(ci)     // icmp 结果类型（i1）
-    // 守卫块 G
+    // 守卫块 G：只有「剩余迭代 >= U_FACTOR」时才走 4 连体，否则交给原单步循环。
+    // 判定用 kend - k 的无符号比较，而不是 k < kend - 4：
+    //   * 归纳变量可以从任意值（含负数）起步，`kend >= 4` 这类「上界绝对值」前提不成立
+    //     —— 曾因此在 kend < 0 的循环上多跑 4 次不带检查的迭代（越界读）。
+    //   * 先用有符号 kend > k 挡掉循环已结束的情形，再对差值做无符号 >= 4：kend >= k
+    //     时差值的 64 位补码表示恰为真差值，不会因 2^64 回绕而误判。
     var nk = ir.new_inst(g, U_LOAD, tyv)
     ir.add_operand(nk, slot, U_K_VAL)
+    var ndif = ir.new_inst(g, U_SUB, tyv)
+    ir.add_operand(ndif, bv, U_K_VAL)
+    ir.add_operand(ndif, ir.ins_val(nk), U_K_VAL)
+    var nc0 = ir.new_inst(g, U_ICMP, xty)
+    ir.add_operand(nc0, bv, U_K_VAL)
+    ir.add_operand(nc0, ir.ins_val(nk), U_K_VAL)
+    ir.add_operand(nc0, U_CC_GT, U_K_IMM)
     var nfour = ir.new_inst(g, U_CONST_I, tyv)
     ir.add_operand(nfour, U_FACTOR, U_K_IMM)
-    var nc1 = ir.new_inst(g, U_ICMP, xty)
-    ir.add_operand(nc1, bv, U_K_VAL)
-    ir.add_operand(nc1, ir.ins_val(nfour), U_K_VAL)
-    ir.add_operand(nc1, U_CC_GE, U_K_IMM)
-    var nraw = ir.new_inst(g, U_SUB, tyv)
-    ir.add_operand(nraw, bv, U_K_VAL)
-    ir.add_operand(nraw, ir.ins_val(nfour), U_K_VAL)
-    var nzero = ir.new_inst(g, U_CONST_I, tyv)
-    ir.add_operand(nzero, 0, U_K_IMM)
-    var nlim = ir.new_inst(g, U_SELECT, tyv)
-    ir.add_operand(nlim, ir.ins_val(nc1), U_K_VAL)
-    ir.add_operand(nlim, ir.ins_val(nraw), U_K_VAL)
-    ir.add_operand(nlim, ir.ins_val(nzero), U_K_VAL)
-    var nc2 = ir.new_inst(g, U_ICMP, xty)
-    ir.add_operand(nc2, ir.ins_val(nk), U_K_VAL)
-    ir.add_operand(nc2, ir.ins_val(nlim), U_K_VAL)
-    ir.add_operand(nc2, U_CC_LT, U_K_IMM)
+    var ncf = ir.new_inst(g, U_ICMP, xty)
+    ir.add_operand(ncf, ir.ins_val(ndif), U_K_VAL)
+    ir.add_operand(ncf, ir.ins_val(nfour), U_K_VAL)
+    ir.add_operand(ncf, U_CC_UGE, U_K_IMM)
+    var ngc = ir.new_inst(g, U_AND, xty)
+    ir.add_operand(ngc, ir.ins_val(nc0), U_K_VAL)
+    ir.add_operand(ngc, ir.ins_val(ncf), U_K_VAL)
     var ng = ir.new_inst(g, U_CBR, 0 - 1)
-    ir.add_operand(ng, ir.ins_val(nc2), U_K_VAL)
+    ir.add_operand(ng, ir.ins_val(ngc), U_K_VAL)
     ir.add_operand(ng, u, U_K_BLK)
     ir.add_operand(ng, h, U_K_BLK)
     // ---------- 8. 展开块 U：U_FACTOR 份循环体副本 + br G ----------
