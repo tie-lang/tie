@@ -664,6 +664,26 @@ func tig_clamp_bin(op: i64, a: i64, b: i64) -> i64 {
     return tig_clamp_bin_ty(op, a, b, types.named(TK_I64))
 }
 
+// 慢路径 lim：`(len-1-d)/c + 1`，带两处防越界的钳位。
+func tig_clamp_div_lim(cval: i64, dval: i64, lenv: i64, one: i64, zc0: i64, cpos: i64, dge: i64, i64ty: i64, i1ty: i64) -> i64 {
+    var csafe = tig_select_i(cpos, cval, one, i64ty)    // 防除零
+    var nv = tig_clamp_bin(1, lenv, one)                // len - 1
+    nv = tig_clamp_bin(1, nv, dval)                     // len - 1 - d
+    // nv < 0（d >= len）时 sdiv 向零截断：nv == -1、c == 4 会得 q == 0、
+    // lim == 1，于是第 0 次迭代以 index == d >= len 无检查地越界。此处
+    // 显式拦成 lim = 0，失败仍由 while.chk 在 iv == 0 处按原实现报
+    // index == d 结束，与原实现的失败点一致。
+    var q = tig_clamp_bin(3, nv, csafe)                 // / c
+    var nneg = tig_cmp_const(nv, 5, 0, i64ty)           // nv >= 0
+    var q1 = tig_clamp_bin(0, q, one)                   // + 1
+    // d < 0（偏移本身为负，如 a[k + j] 且 k 运行期为负）时 `(len-1-d)/c + 1`
+    // 恒为正、把钳制上界放大到 ub，首轮 index == d 就以无检查的方式越界读。
+    // 故正系数分支也必须要求 d >= 0：不满足时 lim 取 0，循环体一次不执行，
+    // 由 while.chk 在 iv == 0 处按原实现报 index == d 结束（失败点与诊断一致）。
+    var okp = tig_clamp_bin_ty(6, nneg, dge, i1ty)      // nv >= 0 且 d >= 0
+    return tig_select_i(okp, q1, zc0, i64ty)
+}
+
 // 尝试为 `while cond { body }` 建立上界钳制。成功返回 kend 值引用（调用方
 // 用它替换循环条件），并填好 g_clamp_ivn/ubv/lims；失败返回 -1，调用方
 // 必须原样走旧路径（此时生成的 IR 与改动前完全一致）。
@@ -757,22 +777,52 @@ func tig_clamp_try(cond: i64, body: i64) -> i64 {
             var lnd = tig_clamp_bin(1, lenv, dval)          // len - d
             limPos = tig_select_i(dok, lnd, zc0, i64ty)
         } else {
-            var csafe = tig_select_i(cpos, cval, one, i64ty)    // 防除零
-            var nv = tig_clamp_bin(1, lenv, one)                // len - 1
-            nv = tig_clamp_bin(1, nv, dval)                     // len - 1 - d
-            // nv < 0（d >= len）时 sdiv 向零截断：nv == -1、c == 4 会得 q == 0、
-            // lim == 1，于是第 0 次迭代以 index == d >= len 无检查地越界。此处
-            // 显式拦成 lim = 0，失败仍由 while.chk 在 iv == 0 处按原实现报
-            // index == d 结束，与原实现的失败点一致。
-            var q = tig_clamp_bin(3, nv, csafe)                 // / c
-            var nneg = tig_cmp_const(nv, 5, 0, i64ty)           // nv >= 0
-            var q1 = tig_clamp_bin(0, q, one)                   // + 1
-            // d < 0（偏移本身为负，如 a[k + j] 且 k 运行期为负）时 `(len-1-d)/c + 1`
-            // 恒为正、把钳制上界放大到 ub，首轮 index == d 就以无检查的方式越界读。
-            // 故正系数分支也必须要求 d >= 0：不满足时 lim 取 0，循环体一次不执行，
-            // 由 while.chk 在 iv == 0 处按原实现报 index == d 结束（失败点与诊断一致）。
-            var okp = tig_clamp_bin_ty(6, nneg, dge, i1ty)      // nv >= 0 且 d >= 0
-            limPos = tig_select_i(okp, q1, zc0, i64ty)
+            // 免除法快路径：若能在运行期证明「本访问在这段循环里整个都在界内」，
+            // 上界直接取 ub，sdiv 一次都不执行。证明式（c>0、iv 从 0 步长 1）：
+            //     c * (ub - 1) + d <= len - 1
+            // 各因子先被 c <= len、0 <= ub-1 <= len、0 <= d < len 夹住，故乘积与和
+            // 都不会溢出（len <= 2e9 的前提在下面用 alensafe 静态保证）。
+            // 证不出来（含 c<0、d<0、ub<=0）就走原来的 sdiv 慢路径，语义与之逐位相同。
+            var alensafe = alen <= 2000000000
+            var fastv: i64 = -1
+            if alensafe {
+                var ubm1 = tig_clamp_bin(1, ubv, one)               // ub - 1
+                var ubpos = tig_cmp_const(ubv, 3, 0, i64ty)         // ub > 0
+                var ubsm = tig_cmp_const(ubm1, 4, alen, i64ty)      // ub - 1 <= len
+                var csm = tig_cmp_const(cval, 4, alen, i64ty)       // c <= len
+                var prod = tig_clamp_bin(2, cval, ubm1)             // c * (ub - 1)
+                prod = tig_clamp_bin(0, prod, dval)                 // + d
+                var prok = tig_cmp_const(prod, 4, alen - 1, i64ty)  // <= len - 1
+                fastv = tig_clamp_bin_ty(6, cpos, dge, i1ty)
+                fastv = tig_clamp_bin_ty(6, fastv, dlt, i1ty)
+                fastv = tig_clamp_bin_ty(6, fastv, csm, i1ty)
+                fastv = tig_clamp_bin_ty(6, fastv, ubpos, i1ty)
+                fastv = tig_clamp_bin_ty(6, fastv, ubsm, i1ty)
+                fastv = tig_clamp_bin_ty(6, fastv, prok, i1ty)
+            }
+            if fastv < 0 {
+                limPos = tig_clamp_div_lim(cval, dval, lenv, one, zc0, cpos, dge, i64ty, i1ty)
+            } else {
+                // 快/慢两分支各写一次槽，join 处读回，保证支配关系正确。
+                var slot = tig_slot64(zc0)
+                var fblk = ir.new_block(g_cur_func, interner.intern("clamp.f"))
+                var sblk = ir.new_block(g_cur_func, interner.intern("clamp.s"))
+                var jblk = ir.new_block(g_cur_func, interner.intern("clamp.j"))
+                var cb = ir.new_inst(g_cur_block, 31, -1)            // cond_br
+                ir.add_operand(cb, fastv, 0)
+                ir.add_operand(cb, fblk, 1)
+                ir.add_operand(cb, sblk, 1)
+                g_cur_block = fblk
+                s21_store(slot, ubv, i64ty)                          // 整段在界内 ⇒ 上界就是 ub
+                var fbr = ir.new_inst(g_cur_block, 30, -1)
+                ir.add_operand(fbr, jblk, 1)
+                g_cur_block = sblk
+                s21_store(slot, tig_clamp_div_lim(cval, dval, lenv, one, zc0, cpos, dge, i64ty, i1ty), i64ty)
+                var sbr = ir.new_inst(g_cur_block, 30, -1)
+                ir.add_operand(sbr, jblk, 1)
+                g_cur_block = jblk
+                limPos = s21_load(slot, i64ty)
+            }
         }
         var limNeg = tig_select_i(dok, ubv, zc0, i64ty)    // c<=0：上界在 iv=0
         var lim = tig_select_i(cpos, limPos, limNeg, i64ty)
