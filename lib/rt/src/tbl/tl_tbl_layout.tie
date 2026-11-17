@@ -1,0 +1,78 @@
+type tie<class, unsafe:mem>
+// core/tbl/tl_tbl.tie —— trm-lite 字节层表容器（命名空间 tl_tbl）。
+// ============================================================
+// 供 tiec 表运行时内置（table<T>）**静态链接**：容器 = 48 字节句柄
+//   {cap@0, len@8, data@16, esz@24, lock@32, refcount@40}（cap/len/esz/refcount
+//   为 i64，data 为原始字节缓冲指针，lock 为 kernel32 CRITICAL_SECTION 缓冲指针，
+//   均以 i64 承载）。tiec 以 extern 符号调用 tl_tbl$tbl_*。
+// 纯 unsafe/ptr 裸内存实现（**零 table<T> 依赖**）——保证 trm_lite.a 可被
+// 任意表 codegen 的 tiec 重建而无自引用环（tbl_at 若用 table<i64> 记账会
+// 在「新表 codegen」下自调自身形成无限递归）。
+// 用户程序无需 import 本库——tiec 检测到表内置时自动链接。
+// 扩容语义对齐编译器旧内联 s21_table_grow：newcap = cap==0 ? max(8,need)
+//   : max(cap+cap/2, need)；新缓冲 alloc(newcap*esz) + memcpy 旧 len*esz 字节。
+// 并发安全：句柄携带每表锁（kernel32 CS，本文件自持单一声明源，
+//   不 import tl_sync——tl_sync 会被复杂形态内联进调用方，tl_tbl 再 import 会
+//   使 tl_runtime.o 捆绑 tl_sync$* 与内联方链接期多重定义；自持后 tl_tbl.o
+//   仅含 tl_tbl$*，可被任意形态按需提取）；
+//   `tbl_push` 单步锁内完成 len/ensure/memcpy/set_len（表追加的并发竞态根治，
+//   对齐 Go「容器并发不安全，append 由运行时锁保护」）；tbl_at/tbl_set 持锁
+//   防与扩容 realloc 并发；tbl_ensure 保留（编译器编译期路径，同线程）。
+// 引用计数：句柄 @40 refcount——tbl_new 置 1；tbl_retain 增（拷贝句柄
+//   到新槽）；tbl_release 减（归零 → free data+lock+句柄）。编译器在表变量
+//   赋值/返回/作用域出口插桩 retain/release，使表内存可回收（tie 无自动回收）。
+
+// 锁原语自持 kernel32 extern（不 import tl_sync）——tl_sync 会被
+// 复杂形态（sched_ws/chan）内联进调用方，若 tl_tbl 再 import，tl_runtime.o
+// 将捆绑 tl_sync$* 与内联方链接期多重定义；自持后 tl_tbl.o 仅含 tl_tbl$*，
+// 可被任意形态程序按需提取而不撞符号。x64 ABI：CS 缓冲地址以 i64 传。
+// extern 声明改为共用 tl_k32 纯声明源（同单元不重名；不产生符号）。
+
+// 深表标记：esz 高比特位（bit 62；bit 63 已被 map 哈希模式占用）。
+// 深表 = 元素为表句柄（table<T> 嵌套表，元素宽 8）——tbl_release 对深表
+// 逐元素释放（元素自身是表，递归处理嵌套深度）；元素为标量/字符串/any 盒的
+// 普通表保持既有行为（数据缓冲整体释放，不逐元素）。标记随元素宽存 esz 字段，
+// 分配/拷贝尺寸一律按掩码后的纯 esz 计算。
+pub const TBL_DEEP: i64 = 4611686018427387904   // 1 << 62
+pub const TBL_MASK: i64 = 4611686018427387903   // 掩掉 bit62 保留低位尺寸
+namespace tl_tbl;
+import "../mnn/tl_k32.tie"
+
+// ---------- 句柄 i64 字段逐字节读写 ----------
+// deref/deref_write 对 ptr<u8> 是单字节存取，i64 字段须 8 字节组装。
+pub unsafe fn w_i64(p: ptr<u8>, off: i64, v: i64) {
+    var k: i64 = 0
+    while k < 8 {
+        deref_write(int_to_ptr(ptr_to_int(p) + off + k), (v >> (k * 8)) & 255)
+        k = k + 1
+    }
+}
+
+pub unsafe fn r_i64(p: ptr<u8>, off: i64) -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 8 {
+        var b = deref(int_to_ptr(ptr_to_int(p) + off + k))
+        v = v | (b << (k * 8))
+        k = k + 1
+    }
+    return v
+}
+
+// 每表锁：句柄 @32 存 CRITICAL_SECTION 缓冲地址（tbl_new 时 alloc+init）。
+// 自持 extern 后 tl_tbl.o 仅含 tl_tbl$*，任意形态程序按需提取不撞符号。
+pub unsafe fn lock_of(h: i64) -> i64 {
+    return r_i64(int_to_ptr(h), 32)
+}
+pub unsafe fn lock_enter(h: i64) {
+    unsafe {
+        EnterCriticalSection(lock_of(h));
+    }
+}
+pub unsafe fn lock_leave(h: i64) {
+    unsafe {
+        LeaveCriticalSection(lock_of(h));
+    }
+}
+
+// 建空表：esz = 元素字节大小。返回句柄（i64 = 48 字节块指针）。

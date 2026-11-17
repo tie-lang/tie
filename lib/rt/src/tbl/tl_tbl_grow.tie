@@ -1,0 +1,71 @@
+type tie<class, unsafe:mem>
+namespace tl_tbl;
+pub unsafe fn tbl_grow_pure(cap: i64, len: i64, data: i64, esz: i64, need: i64, out_cap: i64) -> i64 {
+    if need <= cap {
+        w_i64(int_to_ptr(out_cap), 0, cap)
+        return data
+    }
+    var newcap: i64 = 8
+    if cap > 0 {
+        newcap = cap * 2
+    }
+    if newcap < need {
+        newcap = need
+    }
+    var nd = alloc(newcap * esz)
+    if data != 0 {
+        memcpy(nd, int_to_ptr(data), len * esz)
+        free(int_to_ptr(data))
+    }
+    w_i64(int_to_ptr(out_cap), 0, newcap)
+    return ptr_to_int(nd)
+}
+
+// 扩容（调用方已持锁）：读字段后委托 grow。保留给 tbl_ensure 等非热路径。
+unsafe fn ensure_locked(h: i64, need: i64) -> i64 {
+    var p = int_to_ptr(h)
+    return grow(p, r_i64(p, 0), r_i64(p, 8), r_i64(p, 16), r_i64(p, 24) & TBL_MASK, need)
+}
+
+// 公共扩容：持锁调用 ensure_locked（编译器编译期路径；对用户并发路径安全）。
+pub unsafe fn tbl_ensure(h: i64, need: i64) -> i64 {
+    lock_enter(h)
+    var d = ensure_locked(h, need)
+    lock_leave(h)
+    return d
+}
+
+// 提交新长度（push 后调用）。公共路径持锁；tbl_push 锁内直写。
+pub unsafe fn tbl_set_len(h: i64, n: i64) {
+    lock_enter(h)
+    w_i64(int_to_ptr(h), 8, n)
+    lock_leave(h)
+}
+
+// 表追加（单步原子）：len/ensure/memcpy/set_len 全程持锁——多线程并发
+// push 不会互相覆盖/丢元素。src = 元素字节指针（esz 字节）。
+// 热路径优化：锁地址**只读一次**（原 lock_enter + lock_leave 各调一次
+// lock_of = 每次 push 白读 16 次字节）；扩容改用已读字段调 grow，不再重读句柄。
+// **并发语义完全不变**——同一临界区、同一 len 提交、同一扩容规则。
+
+pub unsafe fn tbl_reserve_p(h: i64, need: i64) {
+    tbl_reserve(h, need)
+}
+
+pub unsafe fn tbl_reserve(h: i64, need: i64) {
+    var p = int_to_ptr(h)
+    var lk = r_i64(p, 32)
+    unsafe {
+        EnterCriticalSection(lk);
+    }
+    var len = r_i64(p, 8)
+    var esz = r_i64(p, 24) & TBL_MASK
+    var d = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    unsafe {
+        LeaveCriticalSection(lk);
+    }
+}
+
+// 表下标读：越界 → 写零 out（esz 字节）返回 0；否则拷 data+i*esz → out 返回 1。
+// 持锁（防与并发扩容 realloc 冲突）。锁地址只读一次。
+

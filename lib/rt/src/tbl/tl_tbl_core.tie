@@ -1,0 +1,146 @@
+type tie<class, unsafe:mem>
+namespace tl_tbl;
+pub unsafe fn tbl_new(esz: i64) -> i64 {
+    var h = alloc(48)
+    w_i64(h, 0, 0)     // cap = 0
+    w_i64(h, 8, 0)     // len = 0
+    w_i64(h, 16, 0)    // data = null
+    w_i64(h, 24, esz)  // esz = 元素字节大小
+    w_i64(h, 40, 1)    // refcount = 1（新建表由创建者持有）
+    var lk = alloc(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk));
+    }
+    w_i64(h, 32, ptr_to_int(lk))   // lock = CS 缓冲地址
+    return ptr_to_int(h)
+}
+
+// 建表锁：只分配并初始化 CRITICAL_SECTION 缓冲，不接触表句柄。
+// codegen 内联建表时调用——句柄的 48 字节块由调用方 malloc，本函数只产锁。
+pub unsafe fn lock_new() -> i64 {
+    var lk = alloc(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk))
+    }
+    return ptr_to_int(lk)
+}
+
+// 建深表：元素为表句柄（table<T> 嵌套表，元素宽 8）——tbl_release
+// 释放时逐元素释放内层表。esz 字段写入深表标记位（分配尺寸按掩码后计算）。
+pub unsafe fn tbl_new_deep(esz: i64) -> i64 {
+    var hp = alloc(48)
+    w_i64(hp, 0, 0)
+    w_i64(hp, 8, 0)
+    w_i64(hp, 16, 0)
+    w_i64(hp, 24, esz | TBL_DEEP)
+    w_i64(hp, 40, 1)
+    var lk = alloc(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk));
+    }
+    w_i64(hp, 32, ptr_to_int(lk))
+    return ptr_to_int(hp)
+}
+
+// 引用计数 +1：句柄被拷贝到新槽（变量赋值/参数传递/返回值接管）时调用。
+pub unsafe fn tbl_retain(h: i64) {
+    var p = int_to_ptr(h)
+    var rc = r_i64(p, 40)
+    w_i64(p, 40, rc + 1)
+}
+
+// 引用计数 -1：归零则释放表内存（深表先逐元素释放内层表句柄，再释放
+// data 缓冲 + lock CS + 句柄块）。空句柄（0/null 槽未初始化）安全跳过——
+// 编译器插桩的旧值释放前无需判空。释放前不再加锁（归零 = 唯一所有权已断，
+// 无并发读者；并发场景由调用方保证同一句柄的最后 release 不再被其它线程
+// 使用——与 Go 容器并发不安全同纪律）。
+// 释放入口（指针形参）：句柄以 ptr 传入、由 LLVM 标记 nocapture，表对象因此
+// 不被判定捕获，表头字段得以提升为 SSA（i64 形参要先 ptrtoint，捕获不可消除）。
+// 实现复用 tbl_release，语义完全一致。
+pub unsafe fn tbl_release_p(h: i64) -> i64 {
+    return tbl_release(h)
+}
+
+pub unsafe fn tbl_release(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    var p = int_to_ptr(h)
+    var rc = r_i64(p, 40)
+    if rc <= 1 {
+        // 深表逐元素释放——元素为 8 字节表句柄，递归释放（嵌套深度
+        // 任意层）；元素表由容器 release 与各自引用方 release 守恒（push 时
+        // 瞬态值已转移所有权 / 别名值已 retain）。
+        var esz = r_i64(p, 24)
+        if (esz & TBL_DEEP) != 0 {
+            var n = r_i64(p, 8)
+            var data = r_i64(p, 16)
+            var i: i64 = 0
+            while i < n {
+                var eh = r_i64(int_to_ptr(data + i * 8), 0)
+                if eh != 0 {
+                    tbl_release(eh)
+                }
+                i = i + 1
+            }
+        }
+        var data = r_i64(p, 16)
+        if data != 0 {
+            free(int_to_ptr(data))
+        }
+        var lk = r_i64(p, 32)
+        if lk != 0 {
+            unsafe {
+                DeleteCriticalSection(lk);
+            }
+            free(int_to_ptr(lk))
+        }
+        free(p)
+        return 0
+    }
+    w_i64(p, 40, rc - 1)
+    return rc - 1
+}
+
+// 表长度：len(t) = [h+8]（无锁读；并发 push 场景下 len 由 tbl_push 锁内提交）。
+pub unsafe fn tbl_len(h: i64) -> i64 {
+    return r_i64(int_to_ptr(h), 8)
+}
+
+// 元素字节大小（容器内部 at/set/ensure 用；tiec 侧用编译期尺寸）。
+pub unsafe fn tbl_esz(h: i64) -> i64 {
+    return r_i64(int_to_ptr(h), 24)
+}
+
+// 扩容核心（调用方**已持锁**，且把 cap/len/data/esz 读入并传入）：need > cap 时
+// 增长（cap=0→8，否则翻倍，至少 need），返回新 data（i64）；缓冲可能换址。
+// **不重读句柄字段**——句柄字段走 r_i64 = 8 次逐字节读，热路径上重复读纯属浪费。
+// 原 ensure_locked 内部重读 cap/len/data/esz（32 次字节访问），而
+// tbl_push 每元素调一次 → 冗余显著；抽出参数化版本供 push/append/reserve 复用。
+unsafe fn grow(p: ptr<u8>, cap: i64, len: i64, data: i64, esz: i64, need: i64) -> i64 {
+    if need <= cap {
+        return data
+    }
+    var newcap: i64 = 8
+    if cap > 0 {
+        newcap = cap * 2
+    }
+    if newcap < need {
+        newcap = need
+    }
+    var nd = alloc(newcap * esz)
+    if data != 0 {
+        memcpy(nd, int_to_ptr(data), len * esz)   // nd 已是 ptr；data 为 i64
+        free(int_to_ptr(data))
+    }
+    w_i64(p, 16, ptr_to_int(nd))
+    w_i64(p, 0, newcap)
+    return ptr_to_int(nd)
+}
+
+// 纯增长入口——**只接收值参数，不接收表句柄**。动机：inline push 的慢
+// 路径原先把表句柄整体交给 tl_tbl$tbl_push_nl，LLVM 据此判定表对象逃逸，表头
+// cap/len/data 无法跨循环提升，push 循环每轮重载三个字段（实测占 push 总耗时
+// 约 17%）。本入口把「增长」与「提交」拆开：由调用方（codegen 内联序列）负责
+// 把新 data/新 cap 写回表头，运行时侧看不到表对象。
+
