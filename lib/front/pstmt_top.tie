@@ -84,12 +84,11 @@ pub func parse_program() -> i64 {
         // 判定，不再嗅探词素文本。语法位置：紧跟 import 或 var/const（顶层），其余
         // 位置留给声明解析处报错——保留字不得当标识符用。
         g_pending_var_mod = 0
-        // module namespace：module 仍是上下文关键字，只在顶层且紧跟 namespace 时
-        // 识别（本轮未升级，另案处理）。
+        // 模块命名空间：module 是保留字（规范 1.6），只在顶层且紧跟 namespace 时
+        // 构成模块前缀；出现在别处按保留字误用处理，由声明解析处报错。
         var is_mod_ns = false
-        if putil.peek_tag() == lex_ident {
-            var lx = putil.peek_lexeme()
-            if lx == "module" && putil.peek_n(1) == lex_namespace {
+        if putil.peek_tag() == lex_module {
+            if putil.peek_n(1) == lex_namespace {
                 putil.advance()
                 is_mod_ns = true
             }
