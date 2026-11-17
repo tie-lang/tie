@@ -35,11 +35,11 @@ unsafe fn tbl_clone_body(h: i64) -> i64 {
     var esz = r_i64(p, 24)             // 含深表标记位
     var pure = esz & TBL_MASK
     var isdeep = (esz & TBL_DEEP) != 0
-    var nh = alloc(48)                 // nh 已是 ptr（同 tbl_new 的 h）
+    var nh = ack(48)                 // nh 已是 ptr（同 tbl_new 的 h）
     var ncap: i64 = 0
     var ndata: i64 = 0
     if len > 0 {
-        var ndp = alloc(len * pure)
+        var ndp = ack(len * pure)
         ndata = ptr_to_int(ndp)
         memcpy(ndp, int_to_ptr(r_i64(p, 16)), len * pure)
         ncap = len
@@ -49,7 +49,7 @@ unsafe fn tbl_clone_body(h: i64) -> i64 {
     w_i64(nh, 16, ndata)
     w_i64(nh, 24, esz)                 // 原样保留深表标记
     w_i64(nh, 40, 1)
-    var lk = alloc(64)
+    var lk = ack(64)
     unsafe {
         InitializeCriticalSection(ptr_to_int(lk));
     }
@@ -79,11 +79,11 @@ unsafe fn tbl_clone_deep_body(h: i64) -> i64 {
     var esz = r_i64(p, 24)
     var pure = esz & TBL_MASK
     var isdeep = (esz & TBL_DEEP) != 0
-    var nh = alloc(48)
+    var nh = ack(48)
     var ncap: i64 = 0
     var ndata: i64 = 0
     if len > 0 {
-        var ndp = alloc(len * pure)
+        var ndp = ack(len * pure)
         ndata = ptr_to_int(ndp)
         memcpy(ndp, int_to_ptr(r_i64(p, 16)), len * pure)
         ncap = len
@@ -93,7 +93,7 @@ unsafe fn tbl_clone_deep_body(h: i64) -> i64 {
     w_i64(nh, 16, ndata)
     w_i64(nh, 24, esz)
     w_i64(nh, 40, 1)
-    var lk = alloc(64)
+    var lk = ack(64)
     unsafe {
         InitializeCriticalSection(ptr_to_int(lk));
     }

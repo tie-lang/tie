@@ -46,6 +46,46 @@ func tig_oob_fail_ensure() -> i64 {
     return fid
 }
 
+// 发射（或复用）模块级 OOM 失败函数 `tie_oom_fail(i64 need) -> void`，返回其函数 id。
+// 运行库（`lib/rt/src/tbl`）在 `alloc(n)` 返回 0 时调用它——分配失败必须是**可见失败**
+// 而不是带着 null 继续跑：函数体 = printf 诊断 + 统一失败语义（受 catch_panic 捕获 →
+// longjmp；未受捕 → exit(1)），与 `tie_oob_fail` 完全同构，只换诊断文本与参数个数。
+// 无条件在 `tig_src` 里发射（见 irgen.tie 的 `g_oom_fail_fid` 注释）：trm_lite.a 是单
+// 成员归档，用到表就会把本符号的引用整块带进链接单元。
+func tig_oom_fail_ensure() -> i64 {
+    // 只有可执行单元（logic 角色）定义该失败入口；库单元（class/type/lib）只引用。
+    // 否则运行库自己的归档里也会带一份定义，程序链接时报重复符号。
+    if g_file_role != "logic" {
+        return -1
+    }
+    if g_oom_fail_fid >= 0 {
+        return g_oom_fail_fid
+    }
+    var saved_func = g_cur_func
+    var saved_fn = g_cur_fn_name
+    var saved_block = g_cur_block
+    var nm = interner.intern("tie_oom_fail")
+    var params: table<i64> = table_new_i64()
+    table_push(params, types.named(TK_I64))
+    var fid = ir.new_func(nm, types.named(TK_VOID), params)
+    g_oom_fail_fid = fid
+    g_cur_func = fid
+    g_cur_fn_name = "tie_oom_fail"
+    g_cur_block = ir.new_block(fid, interner.intern("oom.e"))
+    var need = ir.param_val(fid, 0)
+    var fmt = interner.intern("out of memory: cannot allocate %lld bytes\n")
+    var pinst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+    ir.add_operand(pinst, fmt, 0)
+    ir.add_operand(pinst, need, 0)
+    var dead = ir.new_block(fid, interner.intern("oom.d"))
+    tig_panic_tail(dead)   // 已接管 dead 块，随后补 void 返回
+    ir.new_inst(g_cur_block, 32, -1)   // ret void
+    g_cur_fn_name = saved_fn
+    g_cur_func = saved_func
+    g_cur_block = saved_block
+    return fid
+}
+
 // --check-bounds：数组下标越界运行时检查（仅 g_check_bounds 置位时生成）。
 // idx_node 为下标表达式 AST 节点（取其类型），iv 为其求值结果值引用，
 // len_count 为数组定长元素个数（编译期常量）。越界（iv<0 || iv>=len）→ 调

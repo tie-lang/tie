@@ -1,4 +1,9 @@
 type tie<class, unsafe:mem>
+// 分配失败入口：由 codegen 在每个编译单元发射（printf 诊断 + catchable panic 收尾）。
+// 运行库自身**没有** printf/exit 通道（panic 一律由 codegen 就地发射），所以这里只声明、
+// 由 tiec 生成定义；trm_lite.a 是单成员归档，用到表的程序必然带上该引用。
+// void 桥按 i64 返回声明（x64 ABI 下调用方忽略返回值）。
+unsafe extern fn tie_oom_fail(need: i64) -> i64
 // core/tbl/tl_tbl.tie —— trm-lite 字节层表容器（命名空间 tl_tbl）。
 // ============================================================
 // 供 tiec 表运行时内置（table<T>）**静态链接**：容器 = 48 字节句柄
@@ -57,6 +62,17 @@ pub unsafe fn r_i64(p: ptr<u8>, off: i64) -> i64 {
         k = k + 1
     }
     return v
+}
+
+// 带检查的分配：`alloc` 返回 0 表示 OOM，此时走 tie_oom_fail —— 分配失败必须是**可见
+// 失败**（诊断 + panic 收尾），不允许 null 句柄继续传播成下游的野指针崩溃。
+// 运行库内部所有 alloc 一律改走这里。
+pub unsafe fn ack(n: i64) -> ptr<u8> {
+    var p = alloc(n)
+    if ptr_to_int(p) == 0 {
+        tie_oom_fail(n)
+    }
+    return p
 }
 
 // 每表锁：句柄 @32 存 CRITICAL_SECTION 缓冲地址（tbl_new 时 alloc+init）。

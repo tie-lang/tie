@@ -158,6 +158,11 @@ pub var g_gen_elem: i64 = -1;
 // 降到 3043ms（-18%），错误路径外提为 `noinline cold` 函数后同样 IR 语义不变。
 // 检查本身**保留**：仍是打印下标/长度后按统一失败语义收尾，只是不再内联。
 pub var g_oob_fail_fid: i64 = -1;
+// 运行库 OOM 失败入口 `tie_oom_fail(i64 need) -> void` 的函数 id（发射一次复用）。
+// 表运行时（trm_lite.a）在 malloc 返回 0 时调用它：运行库自身没有 printf/exit 通道，
+// panic 一律由 codegen 就地发射，所以失败入口只能由编译单元提供，且必须**无条件发射**
+// ——trm_lite.a 是单成员归档，任何用到表的程序都会把引用整个带进来。
+pub var g_oom_fail_fid: i64 = -1;
 // 循环上界钳制（loop bound clamping）：把「循环体内的定长数组越界检查」换算成
 // 「循环前一次上界计算」，循环体因此不含检查、单出口，clang 才肯展开/向量化。
 // 语义等价：kend = min(原上界, 每处访问各自允许的最大迭代数)，体内恒不越界；
@@ -446,6 +451,7 @@ pub func unit_reset() {
     g_rng_reg_done = 0
     g_cur_fn_name = ""
     g_oob_fail_fid = -1
+    g_oom_fail_fid = -1
     g_cur_func = 0
     g_cur_block = 0
     g_asm_target = ""
@@ -470,6 +476,8 @@ pub func tig_ast() -> i64 {
     g_msg_reg_done = 0
     g_rng_reg_done = 0
     ir.new_module()
+    // OOM 失败入口无条件发射（运行库 trm_lite.a 是单成员归档，用到表即带入该引用）
+    tig_oom_fail_ensure()
     // 一期并发 A4：actor 工作循环 thunk 急切生成（任何用户函数之前，避免指令
     // 编号交错——llvmgen 逐函数重编号要求函数指令连续）
     gen_actor_task_eager()
@@ -648,6 +656,8 @@ pub func tig_src(src: string, base_dir: string) -> i64 {
     g_msg_reg_done = 0
     g_rng_reg_done = 0
     ir.new_module()
+    // OOM 失败入口无条件发射（运行库 trm_lite.a 是单成员归档，用到表即带入该引用）
+    tig_oom_fail_ensure()
     // 一期并发 A4：actor 工作循环 thunk 急切生成（任何用户函数之前，避免指令
     // 编号交错——llvmgen 逐函数重编号要求函数指令连续）
     gen_actor_task_eager()

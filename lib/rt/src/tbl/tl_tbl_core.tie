@@ -1,13 +1,13 @@
 type tie<class, unsafe:mem>
 namespace tl_tbl;
 pub unsafe fn tbl_new(esz: i64) -> i64 {
-    var h = alloc(48)
+    var h = ack(48)
     w_i64(h, 0, 0)     // cap = 0
     w_i64(h, 8, 0)     // len = 0
     w_i64(h, 16, 0)    // data = null
     w_i64(h, 24, esz)  // esz = 元素字节大小
     w_i64(h, 40, 1)    // refcount = 1（新建表由创建者持有）
-    var lk = alloc(64)
+    var lk = ack(64)
     unsafe {
         InitializeCriticalSection(ptr_to_int(lk));
     }
@@ -18,7 +18,7 @@ pub unsafe fn tbl_new(esz: i64) -> i64 {
 // 建表锁：只分配并初始化 CRITICAL_SECTION 缓冲，不接触表句柄。
 // codegen 内联建表时调用——句柄的 48 字节块由调用方 malloc，本函数只产锁。
 pub unsafe fn lock_new() -> i64 {
-    var lk = alloc(64)
+    var lk = ack(64)
     unsafe {
         InitializeCriticalSection(ptr_to_int(lk))
     }
@@ -28,13 +28,13 @@ pub unsafe fn lock_new() -> i64 {
 // 建深表：元素为表句柄（table<T> 嵌套表，元素宽 8）——tbl_release
 // 释放时逐元素释放内层表。esz 字段写入深表标记位（分配尺寸按掩码后计算）。
 pub unsafe fn tbl_new_deep(esz: i64) -> i64 {
-    var hp = alloc(48)
+    var hp = ack(48)
     w_i64(hp, 0, 0)
     w_i64(hp, 8, 0)
     w_i64(hp, 16, 0)
     w_i64(hp, 24, esz | TBL_DEEP)
     w_i64(hp, 40, 1)
-    var lk = alloc(64)
+    var lk = ack(64)
     unsafe {
         InitializeCriticalSection(ptr_to_int(lk));
     }
@@ -128,7 +128,7 @@ unsafe fn grow(p: ptr<u8>, cap: i64, len: i64, data: i64, esz: i64, need: i64) -
     if newcap < need {
         newcap = need
     }
-    var nd = alloc(newcap * esz)
+    var nd = ack(newcap * esz)
     if data != 0 {
         memcpy(nd, int_to_ptr(data), len * esz)   // nd 已是 ptr；data 为 i64
         free(int_to_ptr(data))
