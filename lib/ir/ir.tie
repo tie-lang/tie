@@ -110,6 +110,7 @@ pub var ir_blocks_start: table<i64> = [];       // 块表：指令段起始（�
 pub var ir_blocks_end: table<i64> = [];         // 块表：指令段结束（不含）
 pub var ir_insts_op: table<i64> = [];           // 指令表：opcode
 pub var ir_insts_ty: table<i64> = [];           // 指令表：结果类型（无结果 -1）
+pub var ir_insts_blk: table<i64> = [];          // 指令表：所属块 id（权威归属）
 pub var ir_insts_val: table<i64> = [];          // 指令表：结果值 id（单调；无结果 -1）
 pub var ir_insts_ops_off: table<i64> = [];      // 指令表：操作数段偏移
 pub var ir_insts_ops_cnt: table<i64> = [];      // 指令表：操作数个数
@@ -286,6 +287,7 @@ pub func new_module() -> i64 {
     table_trunc(ir_blocks_end, 0)
     table_trunc(ir_insts_op, 0)
     table_trunc(ir_insts_ty, 0)
+    table_trunc(ir_insts_blk, 0)
     table_trunc(ir_insts_val, 0)
     table_trunc(ir_insts_ops_off, 0)
     table_trunc(ir_insts_ops_cnt, 0)
@@ -351,6 +353,7 @@ pub func new_inst(block_id: i64, opcode: i64, ty: i64) -> i64 {
     var iid = len(ir_insts_op)
     table_push(ir_insts_op, opcode)
     table_push(ir_insts_ty, ty)
+    table_push(ir_insts_blk, block_id)
     if ty < 0 {
         table_push(ir_insts_val, -1)
     } else {
@@ -549,6 +552,13 @@ pub func ins_op(inst_id: i64) -> i64 {
 pub func ins_ty(inst_id: i64) -> i64 {
     return ir_insts_ty[inst_id]
 }
+// 指令所属块 id——唯一权威归属。块区间（start/end）只是「首条/末条 +1」的
+// 提示值，irgen 会先建块后落位指令，跨块交错落位时区间会重叠，任何 pass
+// 都不得把 [start,end) 当作「本块指令集合」（2026-11-17 RCA：t2 的块内 CSE
+// 因区间重叠跨块合并 inttoptr，产生 uses-before-dominate 的非法 IR）。
+pub func inst_block(inst_id: i64) -> i64 {
+    return ir_insts_blk[inst_id]
+}
 // 指令结果值 id（无结果指令 -1）。llvmgen 直读生成寄存器名，无需 renumber。
 pub func ins_val(inst_id: i64) -> i64 {
     return ir_insts_val[inst_id]
@@ -627,48 +637,35 @@ pub func rewrite_to_const(inst_id: i64, opcode: i64, imm: i64) {
 }
 
 // DCE 物理压缩：移除 dead[inst_id]=true 的指令，重建指令表/操作数段/块区间/
-// 函数 inst_total。返回移除数；前提被破坏（指令不在任何块区间内，即存在孤儿
-// 指令）返回 -1 且不动任何表——调用方据此放弃 DCE（保守降级，绝不丢指令）。
+// 函数 inst_total。返回移除数；归属非法（块 id 越界）返回 -1 且不动任何表——
+// 调用方据此放弃 DCE（保守降级，绝不丢指令）。
 pub func compact_dead(dead: table<bool>) -> i64 {
     var total = len(ir_insts_op)
-    // 前提校验：块区间必须无缝覆盖 [0, total)
     var nb = len(ir_blocks_func)
-    var cover: i64 = 0
-    var bi: i64 = 0
-    while bi < nb {
-        cover = cover + (ir_blocks_end[bi] - ir_blocks_start[bi])
-        bi = bi + 1
-    }
-    if cover != total {
-        return 0 - 1
-    }
     var n_op = table_new_i64()
     var n_ty = table_new_i64()
+    var n_blk = table_new_i64()
     var n_val = table_new_i64()
     var n_off = table_new_i64()
     var n_cnt = table_new_i64()
     var n_ops = table_new_i64()
     var n_opsk = table_new_i64()
     var removed: i64 = 0
-    // 归属表：指令 -> 块 / 函数（块区间无缝覆盖，任意序填写均无冲突）
+    var bi: i64 = 0
+    // 归属表：指令 -> 块 / 函数。唯一权威来源是 ir_insts_blk——块区间会因
+    // 先建块后落位而重叠，不能再由区间反推归属（2026-11-17 RCA）。
     var inst_blk = table_new_i64()
     var inst_fn = table_new_i64()
     var fill: i64 = 0
     while fill < total {
-        table_push(inst_blk, 0 - 1)
-        table_push(inst_fn, 0 - 1)
-        fill = fill + 1
-    }
-    bi = 0
-    while bi < nb {
-        var s0 = ir_blocks_start[bi]
-        var ii0 = s0
-        while ii0 < ir_blocks_end[bi] {
-            inst_blk[ii0] = bi
-            inst_fn[ii0] = ir_blocks_func[bi]
-            ii0 = ii0 + 1
+        var b0 = ir_insts_blk[fill]
+        table_push(inst_blk, b0)
+        if b0 >= 0 && b0 < nb {
+            table_push(inst_fn, ir_blocks_func[b0])
+        } else {
+            table_push(inst_fn, 0 - 1)
         }
-        bi = bi + 1
+        fill = fill + 1
     }
     // 参数段与指令段在 ir_ops 内交错分布（irgen 逐函数：先 push 参数、再生成
     // 该函数指令），params_off 指向 ir_ops 绝对下标——重建时必须按「函数参数段
@@ -710,6 +707,7 @@ pub func compact_dead(dead: table<bool>) -> i64 {
         if !dead[ii] {
             table_push(n_op, ir_insts_op[ii])
             table_push(n_ty, ir_insts_ty[ii])
+            table_push(n_blk, inst_blk[ii])
             table_push(n_val, ir_insts_val[ii])
             table_push(n_off, len(n_ops))
             table_push(n_cnt, ir_insts_ops_cnt[ii])
@@ -804,6 +802,7 @@ pub func compact_dead(dead: table<bool>) -> i64 {
     }
     ir_insts_op = n_op
     ir_insts_ty = n_ty
+    ir_insts_blk = n_blk
     ir_insts_val = n_val
     ir_insts_ops_off = n_off
     ir_insts_ops_cnt = n_cnt

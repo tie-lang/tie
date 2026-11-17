@@ -115,15 +115,18 @@ func is_sym_slot(op: i64, k: i64) -> bool {
 // 与 cse_blockwise 的分工：CSE 只合并纯指令（is_pure_op），load 依赖内存状态不在其列。
 func redundant_load(ref repl: table<i64>, nvals: i64) {
     var nb = ir.block_count()
+    var off = table_new_i64()
+    var flat = table_new_i64()
+    blk_index(off, flat)
     var bi: i64 = 0
     while bi < nb {
-        var s = ir.block_start(bi)
-        var e = ir.block_end(bi)
+        var iend = blk_end(off, flat, bi)
         var addr = table_new_i64()
         var res = table_new_i64()
         var rty = table_new_i64()
-        var ii = s
-        while ii < e {
+        var qi = off[bi]
+        while qi < iend {
+            var ii = flat[qi]
             var op = ir.ins_op(ii)
             if op == P_STORE {
                 table_trunc(addr, 0)
@@ -153,7 +156,7 @@ func redundant_load(ref repl: table<i64>, nvals: i64) {
                     }
                 }
             }
-            ii = ii + 1
+            qi = qi + 1
         }
         bi = bi + 1
     }
@@ -190,16 +193,19 @@ func blk_stored(ref k_addr: table<i64>, ref k_val: table<i64>, a: i64) -> i64 {
 // 比对），跨块定义的值一律不转发，保守优先。
 func fwd_store_load(ref repl: table<i64>, nvals: i64) {
     var nblk = ir.block_count()
+    var off = table_new_i64()
+    var flat = table_new_i64()
+    blk_index(off, flat)
     var bi: i64 = 0
     while bi < nblk {
-        var a = ir.block_start(bi)
-        var e = ir.block_end(bi)
+        var iend = blk_end(off, flat, bi)
         var k_addr = table_new_i64()
         var k_val = table_new_i64()
         var d_val = table_new_i64()
         var d_ty = table_new_i64()
-        var ii = a
-        while ii < e {
+        var qi = off[bi]
+        while qi < iend {
+            var ii = flat[qi]
             var op = ir.ins_op(ii)
             var rv = ir.ins_val(ii)
             var cnt = ir.ins_ops_cnt(ii)
@@ -232,7 +238,7 @@ func fwd_store_load(ref repl: table<i64>, nvals: i64) {
                 table_push(d_val, rv)
                 table_push(d_ty, ir.ins_ty(ii))
             }
-            ii = ii + 1
+            qi = qi + 1
         }
         bi = bi + 1
     }
@@ -528,14 +534,76 @@ func mark_dead_values() -> i64 {
 }
 
 // 块内 CSE：重复纯指令的结果值替代为首次出现者。返回替代登记数。
+// 按块归集指令 id（桶排序一次成形）。块区间只是提示值：irgen 会先建块、后落位
+// 指令，跨块交错落位使 [start,end) 互相重叠，归属一律以 ir.inst_block 为准。
+// off[bi] = 该块在 flat 中的起始下标；块 bi 的指令是 flat[off[bi] .. off[bi+1])，
+// 末块到 len(flat)。所有块级 pass 都必须走这张索引，不得再用块区间。
+func blk_index(ref off: table<i64>, ref flat: table<i64>) {
+    var nb = ir.block_count()
+    var nt = ir.inst_count()
+    var k: i64 = 0
+    while k < nb {
+        table_push(off, 0)
+        k = k + 1
+    }
+    var ii: i64 = 0
+    while ii < nt {
+        var b = ir.inst_block(ii)
+        if b >= 0 && b < nb {
+            off[b] = off[b] + 1
+        }
+        ii = ii + 1
+    }
+    var acc: i64 = 0
+    k = 0
+    while k < nb {
+        var c = off[k]
+        off[k] = acc
+        acc = acc + c
+        k = k + 1
+    }
+    var t: i64 = 0
+    while t < nt {
+        table_push(flat, 0 - 1)
+        t = t + 1
+    }
+    var cur = table_new_i64()
+    k = 0
+    while k < nb {
+        table_push(cur, off[k])
+        k = k + 1
+    }
+    ii = 0
+    while ii < nt {
+        var b2 = ir.inst_block(ii)
+        if b2 >= 0 && b2 < nb {
+            var p = cur[b2]
+            flat[p] = ii
+            cur[b2] = p + 1
+        }
+        ii = ii + 1
+    }
+}
+
+// 块 bi 的指令列表终止下标
+func blk_end(ref off: table<i64>, ref flat: table<i64>, bi: i64) -> i64 {
+    var nb = len(off)
+    if bi + 1 < nb {
+        return off[bi + 1]
+    }
+    return len(flat)
+}
+
 func cse_blockwise(ref repl: table<i64>, nvals: i64) -> i64 {
     var merged: i64 = 0
     var nb = ir.block_count()
+    var off = table_new_i64()
+    var flat = table_new_i64()
+    blk_index(off, flat)
     var bi: i64 = 0
     while bi < nb {
-        var s = ir.block_start(bi)
-        var e = ir.block_end(bi)
-        var n = e - s
+        var iend = blk_end(off, flat, bi)
+        var n = iend - off[bi]
         if n > 1 {
             // 块内开放寻址哈希表（容量 2 的幂，负载 < 1/2）
             var cap = 64
@@ -550,8 +618,9 @@ func cse_blockwise(ref repl: table<i64>, nvals: i64) -> i64 {
                 table_push(hinst, 0 - 1)
                 i = i + 1
             }
-            var ii = s
-            while ii < e {
+            var qi = off[bi]
+            while qi < iend {
+                var ii = flat[qi]
                 var op = ir.ins_op(ii)
                 var rv = ir.ins_val(ii)
                 if rv >= 0 && rv < nvals && is_pure_op(op) {
@@ -582,7 +651,7 @@ func cse_blockwise(ref repl: table<i64>, nvals: i64) -> i64 {
                     }
                     // 探测耗尽（表满，负载 < 1/2 不可能）：放弃该指令
                 }
-                ii = ii + 1
+                qi = qi + 1
             }
         }
         bi = bi + 1
