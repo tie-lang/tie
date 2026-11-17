@@ -20,9 +20,9 @@ pub var g_pending_attr_sec: i64 = 0;
 // 驱动/固件声明属性位集：1 no_mangle / 2 used / 4 export_name / 8 link_section
 pub var g_pending_attr_bits: i64 = 0;
 
-// 导入时机前缀（上下文关键字，不进保留字表）：1 = lazy / 2 = eager。
-// 只在「顶层 import 前」按词素文本识别，其余位置 lazy/eager 仍是普通标识符，
-// 避免把生态里已有的同名局部变量（如 std/regex.tie）升成保留字。
+// 导入时机前缀（保留字 lazy / eager，tag 122/123）：1 = lazy / 2 = eager。
+// 只在「顶层 import 前」消费；出现在 var/const 前时由本模块与 pstmt_flow
+// 分别处理（顶层 / 函数内），其余位置一律按语法错误处理。
 // 由 parse_import 消费后写进 N_IMPORT 的 val 高位并清零。
 pub var g_pending_import_mod: i64 = 0;
 
@@ -80,12 +80,12 @@ pub func parse_program() -> i64 {
     while !done {
         // 每轮先清：前缀只作用于紧随其后那一条 import，绝不跨语句残留。
         g_pending_import_mod = 0
-        // 时机前缀：只在「lazy/eager 紧跟 import 或 var/const」时按词素文本
-        // 识别为修饰符。用 lex_ident 而非新保留字，保证同名标识符（局部变量、
-        // 函数参数等）在其它位置继续可用——上下文关键字不侵占用户命名空间。
+        // 时机前缀：lazy/eager 已升为保留字（lex_lazy=123 / lex_eager=122），按 tag
+        // 判定，不再嗅探词素文本。语法位置：紧跟 import 或 var/const（顶层），其余
+        // 位置留给声明解析处报错——保留字不得当标识符用。
         g_pending_var_mod = 0
-        // module namespace：与 lazy/eager 同为上下文关键字，不进保留字表，
-        // 只在顶层且紧跟 namespace 时升级，避免侵占同名标识符。
+        // module namespace：module 仍是上下文关键字，只在顶层且紧跟 namespace 时
+        // 识别（本轮未升级，另案处理）。
         var is_mod_ns = false
         if putil.peek_tag() == lex_ident {
             var lx = putil.peek_lexeme()
@@ -93,22 +93,19 @@ pub func parse_program() -> i64 {
                 putil.advance()
                 is_mod_ns = true
             }
-            if lx == "lazy" || lx == "eager" {
-                var nxt = putil.peek_n(1)
-                var is_imp = nxt == lex_import
-                var is_var = nxt == lex_var || nxt == lex_const
-                if is_imp || is_var {
-                    var md: i64 = 1
-                    if lx == "eager" {
-                        md = 2
-                    }
-                    if is_imp {
-                        g_pending_import_mod = md
-                    } else {
-                        g_pending_var_mod = md
-                    }
-                    putil.advance()
-                }
+        }
+        if putil.peek_tag() == lex_lazy || putil.peek_tag() == lex_eager {
+            var md: i64 = 1
+            if putil.peek_tag() == lex_eager {
+                md = 2
+            }
+            var nxt = putil.peek_n(1)
+            if nxt == lex_import {
+                g_pending_import_mod = md
+                putil.advance()
+            } else if nxt == lex_var || nxt == lex_const {
+                g_pending_var_mod = md
+                putil.advance()
             }
         }
         var tag = putil.peek_tag()

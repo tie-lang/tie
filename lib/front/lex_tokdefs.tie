@@ -135,6 +135,15 @@ pub const lex_reentrant: i64 = 120;        // `reentrant` actor 方法重入修�
 // `await`（tag 121，规范 §10.6 结果的延后取得）：`var f = w.compute(x)`
 // 产生 future<T> 凭据，`var r = await f` 需要时取值（等待 + 结果 + 错误同路径）。
 pub const lex_await: i64 = 121;            // `await` future 取值前缀
+// `lazy` / `eager`（tag 122/123，求值时机前缀）：由「上下文关键字」升级为**保留字**。
+// 升级理由：上下文关键字的识别规则只存在于实现里（此前靠 `peek_lexeme()=="lazy"` 的
+// 词素嗅探，且只在「紧跟 import 或 var/const」时命中），规范无从表述 ⇒ 第三方实现
+// 必然分叉。升级后词法侧一律发关键字 tag，解析器只按 tag 判定，不再看词素文本。
+// 语法位置（规范 9.x「求值时机前缀」）：`lazy`/`eager` + `var`/`const` 声明（顶层与
+// 局部）、`lazy`/`eager` + `import`；其余位置一律报错。缺省为 `eager`。
+// 取号依据：本文件此前最大值 121（上一行）；已按上方 RCA 纪律做全文重号扫描（无重复）。
+pub const lex_eager: i64 = 122;            // `eager` 立即求值 / 立即导入（缺省时机）
+pub const lex_lazy: i64 = 123;             // `lazy` 首次读取时才求值
 // checked 幂 `**?`（tag 112）：与 `**` 同级；int 族溢出即运行期报错
 //（对齐 的 `+?`/`-?`/`*?` 族）。符号表排序 `**` < `**?` < `*=`。
 pub const lex_starstarq: i64 = 112;       // `**?` checked 幂

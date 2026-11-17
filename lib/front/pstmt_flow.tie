@@ -12,6 +12,14 @@ namespace pstmt_flow {
 
 pub func parse_stmt() -> i64 {
     var tag = putil.peek_tag()
+    // 求值时机前缀（lazy / eager，保留字 lex_lazy=123 / lex_eager=122）：只有顶层
+    // 声明真正生效——惰性物化由全局 init 函数承担，局部变量没有对应的物化路径。
+    // 局部位置直接报错而不是静默按 eager 处理：静默会让 `lazy var x = f()` 的
+    // 初始化时机与规范不符，而且看起来"能跑"。
+    if tag == lex_lazy || tag == lex_eager {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "求值时机前缀目前只支持顶层声明；局部变量请把初值写成按需计算的表达式")
+        return -1
+    }
     if tag == lex_var {
         return pstmt.parse_var_decl(0)
     }
