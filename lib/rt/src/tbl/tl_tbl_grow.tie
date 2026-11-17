@@ -2,7 +2,7 @@ type tie<class, unsafe:mem>
 namespace tl_tbl;
 pub unsafe fn tbl_grow_pure(cap: i64, len: i64, data: i64, esz: i64, need: i64, out_cap: i64) -> i64 {
     if need <= cap {
-        set_cap_v(int_to_ptr(out_cap), cap)
+        raw_write(int_to_ptr(out_cap), 0, cap)
         return data
     }
     var newcap: i64 = 8
@@ -17,7 +17,7 @@ pub unsafe fn tbl_grow_pure(cap: i64, len: i64, data: i64, esz: i64, need: i64, 
         memcpy(nd, int_to_ptr(data), len * esz)
         free(int_to_ptr(data))
     }
-    set_cap_v(int_to_ptr(out_cap), newcap)
+    raw_write(int_to_ptr(out_cap), 0, newcap)
     return ptr_to_int(nd)
 }
 

@@ -83,6 +83,15 @@ pub unsafe fn refc_v(p: ptr<u8>) -> i64 {
 pub unsafe fn set_refc_v(p: ptr<u8>, v: i64) {
     w_i64(p, 40, v)
 }
+
+// 裸槽读写：p 是**任意 i64 槽地址**（out 形参、元素槽、配对栈），与句柄无关。
+// 这类访问不能借用句柄访问器——句柄访问器的偏移随布局变化，裸槽永远是槽首。
+pub unsafe fn raw_read(p: ptr<u8>, off: i64) -> i64 {
+    return r_i64(p, off)
+}
+pub unsafe fn raw_write(p: ptr<u8>, off: i64, v: i64) {
+    w_i64(p, off, v)
+}
 import "../mnn/tl_k32.tie"
 
 // ---------- 句柄 i64 字段逐字节读写 ----------
