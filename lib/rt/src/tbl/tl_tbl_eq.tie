@@ -8,7 +8,7 @@ pub unsafe fn eq_mark(l: i64, r: i64) -> i64 {
     var i: i64 = 0
     while i < eq_len {
         var base = eq_stk + i * 16
-        if r_i64(int_to_ptr(base), 0) == l && r_i64(int_to_ptr(base), 8) == r {
+        if cap_v(int_to_ptr(base)) == l && len_v(int_to_ptr(base)) == r {
             return 1
         }
         i = i + 1
@@ -27,8 +27,8 @@ pub unsafe fn eq_mark(l: i64, r: i64) -> i64 {
         eq_cap = ncap
     }
     var slot = eq_stk + eq_len * 16
-    w_i64(int_to_ptr(slot), 0, l)
-    w_i64(int_to_ptr(slot), 8, r)
+    set_cap_v(int_to_ptr(slot), l)
+    set_len_v(int_to_ptr(slot), r)
     eq_len = eq_len + 1
     return 0
 }

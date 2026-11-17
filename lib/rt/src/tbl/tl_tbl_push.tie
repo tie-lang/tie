@@ -2,16 +2,16 @@ type tie<class, unsafe:mem>
 namespace tl_tbl;
 pub unsafe fn tbl_push(h: i64, src: i64) {
     var p = int_to_ptr(h)
-    var lk = r_i64(p, 32)
+    var lk = lock_v(p)
     unsafe {
         EnterCriticalSection(lk);
     }
-    var len = r_i64(p, 8)
-    var esz = r_i64(p, 24) & TBL_MASK   // 掩掉深表标记位（拷贝宽度用纯 esz）
+    var len = len_v(p)
+    var esz = esz_v(p) & TBL_MASK   // 掩掉深表标记位（拷贝宽度用纯 esz）
     var need = len + 1
-    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    var data = grow(p, cap_v(p), len, data_v(p), esz, need)
     memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), esz)
-    w_i64(p, 8, need)
+    set_len_v(p, need)
     unsafe {
         LeaveCriticalSection(lk);
     }
@@ -24,33 +24,33 @@ pub unsafe fn tbl_push(h: i64, src: i64) {
 // 临界区。返回追加后的新长度。
 pub unsafe fn tbl_append_nl(h: i64, src: i64, n: i64) -> i64 {
     var p = int_to_ptr(h)
-    var len = r_i64(p, 8)
+    var len = len_v(p)
     if n <= 0 {
         return len
     }
-    var esz = r_i64(p, 24) & TBL_MASK
+    var esz = esz_v(p) & TBL_MASK
     var need = len + n
-    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    var data = grow(p, cap_v(p), len, data_v(p), esz, need)
     memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), n * esz)
-    w_i64(p, 8, need)
+    set_len_v(p, need)
     return need
 }
 
 pub unsafe fn tbl_append(h: i64, src: i64, n: i64) -> i64 {
     if n <= 0 {
-        return r_i64(int_to_ptr(h), 8)
+        return len_v(int_to_ptr(h))
     }
     var p = int_to_ptr(h)
-    var lk = r_i64(p, 32)
+    var lk = lock_v(p)
     unsafe {
         EnterCriticalSection(lk);
     }
-    var len = r_i64(p, 8)
-    var esz = r_i64(p, 24) & TBL_MASK
+    var len = len_v(p)
+    var esz = esz_v(p) & TBL_MASK
     var need = len + n
-    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    var data = grow(p, cap_v(p), len, data_v(p), esz, need)
     memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), n * esz)
-    w_i64(p, 8, need)
+    set_len_v(p, need)
     unsafe {
         LeaveCriticalSection(lk);
     }
@@ -63,12 +63,12 @@ pub unsafe fn tbl_append(h: i64, src: i64, n: i64) -> i64 {
 
 pub unsafe fn tbl_push_nl(h: i64, src: i64) {
     var p = int_to_ptr(h)
-    var len = r_i64(p, 8)
-    var esz = r_i64(p, 24) & TBL_MASK
+    var len = len_v(p)
+    var esz = esz_v(p) & TBL_MASK
     var need = len + 1
-    var data = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    var data = grow(p, cap_v(p), len, data_v(p), esz, need)
     memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), esz)
-    w_i64(p, 8, need)
+    set_len_v(p, need)
 }
 
 // ==================== 批量追加（appfuse 融合 pass 与 `table_append` 内置的底座） ====================

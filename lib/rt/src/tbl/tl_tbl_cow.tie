@@ -31,8 +31,8 @@ namespace tl_tbl;
 // refcount 且不可变（见 smove.is_owned 注释），共享只读缓冲没有别名写风险。
 unsafe fn tbl_clone_body(h: i64) -> i64 {
     var p = int_to_ptr(h)
-    var len = r_i64(p, 8)
-    var esz = r_i64(p, 24)             // 含深表标记位
+    var len = len_v(p)
+    var esz = esz_v(p)             // 含深表标记位
     var pure = esz & TBL_MASK
     var isdeep = (esz & TBL_DEEP) != 0
     var nh = ack(48)                 // nh 已是 ptr（同 tbl_new 的 h）
@@ -41,23 +41,23 @@ unsafe fn tbl_clone_body(h: i64) -> i64 {
     if len > 0 {
         var ndp = ack(len * pure)
         ndata = ptr_to_int(ndp)
-        memcpy(ndp, int_to_ptr(r_i64(p, 16)), len * pure)
+        memcpy(ndp, int_to_ptr(data_v(p)), len * pure)
         ncap = len
     }
-    w_i64(nh, 0, ncap)
-    w_i64(nh, 8, len)
-    w_i64(nh, 16, ndata)
-    w_i64(nh, 24, esz)                 // 原样保留深表标记
-    w_i64(nh, 40, 1)
+    set_cap_v(nh, ncap)
+    set_len_v(nh, len)
+    set_data_v(nh, ndata)
+    set_esz_v(nh, esz)                 // 原样保留深表标记
+    set_refc_v(nh, 1)
     var lk = ack(64)
     unsafe {
         InitializeCriticalSection(ptr_to_int(lk));
     }
-    w_i64(nh, 32, ptr_to_int(lk))
+    set_lock_v(nh, ptr_to_int(lk))
     if isdeep {
         var i: i64 = 0
         while i < len {
-            var eh = r_i64(int_to_ptr(ndata + i * 8), 0)
+            var eh = cap_v(int_to_ptr(ndata + i * 8))
             if eh != 0 {
                 tbl_retain(eh)
             }
@@ -75,8 +75,8 @@ unsafe fn tbl_clone_body(h: i64) -> i64 {
 // 终止性：tie 的类型系统不允许递归类型，嵌套深度由类型决定必然有限，递归必终止。
 unsafe fn tbl_clone_deep_body(h: i64) -> i64 {
     var p = int_to_ptr(h)
-    var len = r_i64(p, 8)
-    var esz = r_i64(p, 24)
+    var len = len_v(p)
+    var esz = esz_v(p)
     var pure = esz & TBL_MASK
     var isdeep = (esz & TBL_DEEP) != 0
     var nh = ack(48)
@@ -85,26 +85,26 @@ unsafe fn tbl_clone_deep_body(h: i64) -> i64 {
     if len > 0 {
         var ndp = ack(len * pure)
         ndata = ptr_to_int(ndp)
-        memcpy(ndp, int_to_ptr(r_i64(p, 16)), len * pure)
+        memcpy(ndp, int_to_ptr(data_v(p)), len * pure)
         ncap = len
     }
-    w_i64(nh, 0, ncap)
-    w_i64(nh, 8, len)
-    w_i64(nh, 16, ndata)
-    w_i64(nh, 24, esz)
-    w_i64(nh, 40, 1)
+    set_cap_v(nh, ncap)
+    set_len_v(nh, len)
+    set_data_v(nh, ndata)
+    set_esz_v(nh, esz)
+    set_refc_v(nh, 1)
     var lk = ack(64)
     unsafe {
         InitializeCriticalSection(ptr_to_int(lk));
     }
-    w_i64(nh, 32, ptr_to_int(lk))
+    set_lock_v(nh, ptr_to_int(lk))
     if isdeep {
         var i: i64 = 0
         while i < len {
             var slot = int_to_ptr(ndata + i * 8)
-            var eh = r_i64(slot, 0)
+            var eh = cap_v(slot)
             if eh != 0 {
-                w_i64(slot, 0, tbl_clone_deep_body(eh))
+                set_cap_v(slot, tbl_clone_deep_body(eh))
             }
             i = i + 1
         }
@@ -144,7 +144,7 @@ pub unsafe fn tbl_cow(h: i64) -> i64 {
     if h == 0 {
         return 0
     }
-    if r_i64(int_to_ptr(h), 40) <= 1 {
+    if refc_v(int_to_ptr(h)) <= 1 {
         return h                      // 独占：无需分离
     }
     var nh = tbl_clone_body(h)

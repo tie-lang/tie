@@ -2,7 +2,7 @@ type tie<class, unsafe:mem>
 namespace tl_tbl;
 pub unsafe fn tbl_grow_pure(cap: i64, len: i64, data: i64, esz: i64, need: i64, out_cap: i64) -> i64 {
     if need <= cap {
-        w_i64(int_to_ptr(out_cap), 0, cap)
+        set_cap_v(int_to_ptr(out_cap), cap)
         return data
     }
     var newcap: i64 = 8
@@ -17,14 +17,14 @@ pub unsafe fn tbl_grow_pure(cap: i64, len: i64, data: i64, esz: i64, need: i64, 
         memcpy(nd, int_to_ptr(data), len * esz)
         free(int_to_ptr(data))
     }
-    w_i64(int_to_ptr(out_cap), 0, newcap)
+    set_cap_v(int_to_ptr(out_cap), newcap)
     return ptr_to_int(nd)
 }
 
 // 扩容（调用方已持锁）：读字段后委托 grow。保留给 tbl_ensure 等非热路径。
 unsafe fn ensure_locked(h: i64, need: i64) -> i64 {
     var p = int_to_ptr(h)
-    return grow(p, r_i64(p, 0), r_i64(p, 8), r_i64(p, 16), r_i64(p, 24) & TBL_MASK, need)
+    return grow(p, cap_v(p), len_v(p), data_v(p), esz_v(p) & TBL_MASK, need)
 }
 
 // 公共扩容：持锁调用 ensure_locked（编译器编译期路径；对用户并发路径安全）。
@@ -38,7 +38,7 @@ pub unsafe fn tbl_ensure(h: i64, need: i64) -> i64 {
 // 提交新长度（push 后调用）。公共路径持锁；tbl_push 锁内直写。
 pub unsafe fn tbl_set_len(h: i64, n: i64) {
     lock_enter(h)
-    w_i64(int_to_ptr(h), 8, n)
+    set_len_v(int_to_ptr(h), n)
     lock_leave(h)
 }
 
@@ -54,13 +54,13 @@ pub unsafe fn tbl_reserve_p(h: i64, need: i64) {
 
 pub unsafe fn tbl_reserve(h: i64, need: i64) {
     var p = int_to_ptr(h)
-    var lk = r_i64(p, 32)
+    var lk = lock_v(p)
     unsafe {
         EnterCriticalSection(lk);
     }
-    var len = r_i64(p, 8)
-    var esz = r_i64(p, 24) & TBL_MASK
-    var d = grow(p, r_i64(p, 0), len, r_i64(p, 16), esz, need)
+    var len = len_v(p)
+    var esz = esz_v(p) & TBL_MASK
+    var d = grow(p, cap_v(p), len, data_v(p), esz, need)
     unsafe {
         LeaveCriticalSection(lk);
     }
