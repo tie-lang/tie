@@ -15,6 +15,17 @@ pub unsafe fn tbl_new(esz: i64) -> i64 {
     return ptr_to_int(h)
 }
 
+// 采纳预建数据缓冲：建一个合法句柄后把 cap/len/data 覆盖为调用方的缓冲区。
+// codegen 关闭句柄内联时用它替代手排偏移（s21_tbl_adopt）。
+pub unsafe fn tbl_adopt(esz: i64, cap: i64, lenn: i64, dat: i64) -> i64 {
+    var h = tbl_new(esz)
+    var p = int_to_ptr(h)
+    set_cap_v(p, cap)
+    set_len_v(p, lenn)
+    set_data_v(p, dat)
+    return h
+}
+
 // 建表锁：只分配并初始化 CRITICAL_SECTION 缓冲，不接触表句柄。
 // codegen 内联建表时调用——句柄的 48 字节块由调用方 malloc，本函数只产锁。
 pub unsafe fn lock_new() -> i64 {

@@ -732,6 +732,21 @@ func tl_i64_3(sym: string, v1: i64, v2: i64, v3: i64) -> i64 {
     return tig_trmlite_call(sym, ats, avs, types.named(TK_I64))
 }
 
+// 四参 i64 调用——供运行时 tbl_adopt(esz, cap, len, data) 使用。
+func tl_i64_4(sym: string, v1: i64, v2: i64, v3: i64, v4: i64) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v1)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v2)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v3)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v4)
+    return tig_trmlite_call(sym, ats, avs, types.named(TK_I64))
+}
+
 // 六参 i64 调用——供纯增长入口 tbl_grow_pure 使用。
 func tl_i64_6(sym: string, v1: i64, v2: i64, v3: i64, v4: i64, v5: i64, v6: i64) -> i64 {
     var ats: table<i64> = table_new_i64()
@@ -803,7 +818,18 @@ func tl_i64_0(sym: string) -> i64 {
 // 表对象无法被当作新分配分析，push 循环里表头 cap/len/data 提升不成 SSA，
 // 每轮都要重新访存（对照实验量化约占 table push 的 13%）。
 // 内联后分配点对 LLVM 可见；深表仍走 tl_tbl$tbl_new_deep（形态少、非热路径）。
+// 句柄创建是否内联（1 = 内联，默认；0 = 全部走运行时调用）。
+// 内联会把 RT_TBL_OFF_* 偏移写进每个程序（也包括 tiec 自身），于是编译器二进制
+// 与它运行时链接的 trm_lite.a 必须同布局。切换布局时先把本函数返回 0 重建 tiec，
+// 用这个不含偏移的编译器产出新布局运行库，再在新运行库上恢复 1 重建，即完成过渡。
+func tbl_inline_enabled() -> i64 {
+    return 1
+}
+
 func s21_table_new_inl(esz_v: i64) -> i64 {
+    if tbl_inline_enabled() == 0 {
+        return t21_intp(tl_i64_1("tl_tbl$tbl_new", esz_v))
+    }
     var T64 = types.named(TK_I64)
     var h = s21_raw_alloc_str(tig_int_lit(48))
     if h < 0 {
@@ -862,6 +888,9 @@ func s21_table_new_deep(esz_v: i64) -> i64 {
 // refcount=1、esz 已置），再就地覆盖 cap/len/data 三字段采纳调用方预建的 data 缓冲
 // （stdlib32 级 O(1)，不逐元素 push）。data 须为 malloc 块（tbl_release 用 free 收）。
 func s21_tbl_adopt(esz_v: i64, cap_v: i64, lenn_v: i64, dat: i64) -> i64 {
+    if tbl_inline_enabled() == 0 {
+        return t21_intp(tl_i64_4("tl_tbl$tbl_adopt", esz_v, cap_v, lenn_v, dat))
+    }
     var T64 = types.named(TK_I64)
     var h = s21_table_new(esz_v)
     s21_store(s21_gep(h, 0, true), cap_v, T64)
