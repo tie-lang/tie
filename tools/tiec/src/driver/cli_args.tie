@@ -232,6 +232,9 @@ pub func parse_args() -> i64 {
             // 已在预扫描应用（此处仅消费参数，不重复赋值）
         } else if a == "--no-cache" {
             g_no_cache = true
+        } else if tie.support::has_prefix(a, "--lang=") {
+            // 诊断消息语言：--lang=zh-CN / --lang=en-US。只改消息文本，不改诊断码。
+            diagcode.set_lang(str.slice(a, 7, str_len(a)))
         } else if a == "--diag-format=json" {
             // 诊断输出改单行 JSON（code/line/col/message），供编辑器与 CI 解析。
             diagcode.set_diag_json(1)

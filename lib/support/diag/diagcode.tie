@@ -287,6 +287,20 @@ pub func set_diag_json(v: i64) {
     g_diag_json = v
 }
 
+// 诊断消息语言（BCP 47 风格码）。默认中文简体；CLI --lang=<code> 可改。
+// 语言只影响消息文本，不影响码——码已由调用点显式登记或按目录查表决定。
+pub var g_lang: string = "zh-CN"
+
+pub func set_lang(v: string) {
+    if len(v) > 0 {
+        g_lang = v
+    }
+}
+
+pub func cur_lang() -> string {
+    return g_lang
+}
+
 // 两位数小写十六进制（b 取 0..255）。
 func hex2(b: i64) -> string {
     var d = "0123456789abcdef"
@@ -332,7 +346,8 @@ pub func render_error_cc(cc: string, line: i64, col: i64, msg: string) -> string
         }
         var j = "{\"code\":\"" + cc + "\",\"line\":" + to_string(line)
         j = j + ",\"col\":" + to_string(col)
-        j = j + ",\"message\":\"" + json_esc(body) + "\"}"
+        j = j + ",\"message\":\"" + json_esc(body) + "\""
+        j = j + ",\"lang\":\"" + g_lang + "\"}"
         return j
     }
     var out = "error[" + cc + "]"
