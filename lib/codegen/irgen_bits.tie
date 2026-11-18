@@ -95,7 +95,7 @@ func tig_byte_write(p: i64, t: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I8 = types.named(TK_I8)
     var P8 = types.ptr_of(I8)
-    var len = s21_load(s21_gep(t, 8, true), T64)
+    var len = s21_load(s21_gep(t, RT_TBL_OFF_LEN, true), T64)
     var data = t21_data(t)
     var esz = t21_esz(t)
     // i64 元素 → u8 连续缓冲（低字节 & 0xFF 截断）。运行时循环（槽 + 回边），
@@ -162,7 +162,7 @@ func tig_byte_write(p: i64, t: i64) -> i64 {
 // 越界（pos<0 或 pos/8 ≥ 表长）→ 0（std/bytes 文档语义；避免越界加载）。
 func tig_bit_read(t: i64, pos: i64) -> i64 {
     var T64 = types.named(TK_I64)
-    var len = s21_load(s21_gep(t, 8, true), T64)
+    var len = s21_load(s21_gep(t, RT_TBL_OFF_LEN, true), T64)
     var e8 = tig_int_lit(8)
     var bidx = s21_bin(3, pos, e8)  // sdiv pos/8
     var pneg = tig_icmp_c(pos, tig_int_lit(0), 2)  // pos < 0
@@ -204,7 +204,7 @@ func tig_bit_read(t: i64, pos: i64) -> i64 {
 func tig_bit_write(t: i64, pos: i64, bit: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var I8 = types.named(TK_I8)
-    var len = s21_load(s21_gep(t, 8, true), T64)
+    var len = s21_load(s21_gep(t, RT_TBL_OFF_LEN, true), T64)
     var e8 = tig_int_lit(8)
     var bidx = s21_bin(3, pos, e8)
     var pneg = tig_icmp_c(pos, tig_int_lit(0), 2)
@@ -250,8 +250,8 @@ func tig_bit_write(t: i64, pos: i64, bit: i64) -> i64 {
 // 纯内存：新数据缓冲 = malloc((len_a+len_b)*esz) + 两段 memcpy；零外部依赖。
 func tig_byte_concat(a: i64, b: i64) -> i64 {
     var T64 = types.named(TK_I64)
-    var la = s21_load(s21_gep(a, 8, true), T64)
-    var lb = s21_load(s21_gep(b, 8, true), T64)
+    var la = s21_load(s21_gep(a, RT_TBL_OFF_LEN, true), T64)
+    var lb = s21_load(s21_gep(b, RT_TBL_OFF_LEN, true), T64)
     var da = t21_data(a)
     var db = t21_data(b)
     var esz = t21_esz(a)
