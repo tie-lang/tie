@@ -1,0 +1,111 @@
+type tie<class, unsafe:mem>
+// util/tl_vec.tie —— 运行库内部裸向量（命名空间 tl_vec）
+// ============================================================
+// 为什么运行库不能用 table<T>：`table<T>` 的字段偏移由 tiec codegen 内联成常量
+// （lib/codegen/rt_abi.tie 的 RT_TBL_OFF_*，经 s21_table_new_inl / s21_tbl_adopt
+// 落进调用方自己的指令里）。运行库源一旦写表，trm_lite.a 就与「产出它的那个
+// 编译器」的表布局绑定：换布局时新 tl_tbl 按新偏移读、库内表却由旧编译器按旧
+// 偏移写，必然错位（实测 0xC0000005，修 lock_of 后 0xC0000374 堆损坏），
+// 自举环因此无法打破。
+// 本模块自带布局，偏移只出现在本文件（24 字节句柄 {len@0, cap@8, data@16}，
+// 元素一律 8 字节宽），运行库便可以被任意表布局的 tiec 重建。副产品是更省：
+// 没有每表锁、引用计数与写时复制——rt 内部数组是短生命周期结构，并发由调用方
+// 自持的锁兜住（sched/chan 都有自己的临界区）。
+import "../tbl/tl_tbl_layout.tie"
+
+const VEC_HDR: i64 = 24        // 句柄字节数
+const VEC_MIN_CAP: i64 = 8     // 首次扩容下限（与 tl_tbl 一致）
+const VEC_ESZ: i64 = 8         // 元素宽度：一律 i64（指针以 i64 承载）
+
+namespace tl_vec;
+
+// 新建空向量，返回句柄（i64 = 句柄块地址）。
+pub unsafe fn vec_new() -> i64 {
+    var p = tl_tbl.ack(VEC_HDR)
+    tl_tbl.w_i64(p, 0, 0)
+    tl_tbl.w_i64(p, 8, 0)
+    tl_tbl.w_i64(p, 16, 0)
+    return ptr_to_int(p)
+}
+
+pub unsafe fn vec_len(h: i64) -> i64 {
+    return tl_tbl.r_i64(int_to_ptr(h), 0)
+}
+
+pub unsafe fn vec_cap(h: i64) -> i64 {
+    return tl_tbl.r_i64(int_to_ptr(h), 8)
+}
+
+pub unsafe fn vec_data(h: i64) -> i64 {
+    return tl_tbl.r_i64(int_to_ptr(h), 16)
+}
+
+pub unsafe fn vec_set_len(h: i64, n: i64) {
+    tl_tbl.w_i64(int_to_ptr(h), 0, n)
+}
+
+// 保证容量 >= need（1.5 倍增长，与 tl_tbl 同策略）。
+pub unsafe fn vec_reserve(h: i64, need: i64) {
+    var p = int_to_ptr(h)
+    var cap = tl_tbl.r_i64(p, 8)
+    if need <= cap {
+        return
+    }
+    var nc: i64 = VEC_MIN_CAP
+    if cap > 0 {
+        nc = cap + cap / 2
+    }
+    if nc < need {
+        nc = need
+    }
+    var nd = tl_tbl.ack(nc * VEC_ESZ)
+    var old = tl_tbl.r_i64(p, 16)
+    if old != 0 {
+        memcpy(nd, int_to_ptr(old), cap * VEC_ESZ)
+        free(int_to_ptr(old))
+    }
+    tl_tbl.w_i64(p, 8, nc)
+    tl_tbl.w_i64(p, 16, ptr_to_int(nd))
+}
+
+// 尾部追加（不检查并发，调用方自持锁）。
+pub unsafe fn vec_push(h: i64, v: i64) {
+    var p = int_to_ptr(h)
+    var n = tl_tbl.r_i64(p, 0)
+    vec_reserve(h, n + 1)
+    tl_tbl.w_i64(int_to_ptr(tl_tbl.r_i64(p, 16)), n * VEC_ESZ, v)
+    tl_tbl.w_i64(p, 0, n + 1)
+}
+
+pub unsafe fn vec_at(h: i64, i: i64) -> i64 {
+    return tl_tbl.r_i64(int_to_ptr(tl_tbl.r_i64(int_to_ptr(h), 16)), i * VEC_ESZ)
+}
+
+pub unsafe fn vec_set(h: i64, i: i64, v: i64) {
+    tl_tbl.w_i64(int_to_ptr(tl_tbl.r_i64(int_to_ptr(h), 16)), i * VEC_ESZ, v)
+}
+
+// 长度置为 n 并用 v 填满 [0, n)（等价 table 的扩容补零语义）。
+pub unsafe fn vec_fill(h: i64, n: i64, v: i64) {
+    vec_reserve(h, n)
+    var p = int_to_ptr(h)
+    var d = int_to_ptr(tl_tbl.r_i64(p, 16))
+    var i: i64 = 0
+    while i < n {
+        tl_tbl.w_i64(d, i * VEC_ESZ, v)
+        i = i + 1
+    }
+    tl_tbl.w_i64(p, 0, n)
+}
+
+pub unsafe fn vec_free(h: i64) {
+    if h == 0 {
+        return
+    }
+    var p = int_to_ptr(h)
+    var d = tl_tbl.r_i64(p, 16)
+    if d != 0 {
+        free(int_to_ptr(d))
+    }
+    free(p)
+}
