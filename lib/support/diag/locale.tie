@@ -347,13 +347,67 @@ pub func help_for(dc: string) -> string {
         }
         return "E00561 · 具体类型没有该 port 的 impl，不能提升——先写 `impl P for T`"
     }
+    if dc == "E00112" {
+        if en {
+            return "E00112 · impl method parameter count differs from the port signature — mirror the port's parameter list"
+        }
+        if tw {
+            return "E00112 · impl 方法參數個數與 port 簽名不符——照 port 的參數列表寫"
+        }
+        return "E00112 · impl 方法参数个数与 port 签名不符——照 port 的参数列表写"
+    }
+    if dc == "E00113" {
+        if en {
+            return "E00113 · impl method parameter type differs from the port signature — make the types identical"
+        }
+        if tw {
+            return "E00113 · impl 方法參數類型與 port 簽名不符——型別必須完全一致"
+        }
+        return "E00113 · impl 方法参数类型与 port 签名不符——类型必须完全一致"
+    }
+    if dc == "E00114" {
+        if en {
+            return "E00114 · impl method has no self receiver — write `func name(self, ...)`"
+        }
+        if tw {
+            return "E00114 · impl 方法缺 self 接收者——寫成 `func name(self, ...)`"
+        }
+        return "E00114 · impl 方法缺 self 接收者——写成 `func name(self, ...)`"
+    }
+    if dc == "E00118" {
+        if en {
+            return "E00118 · the first parameter of an impl method must be named self"
+        }
+        if tw {
+            return "E00118 · impl 方法的第一參數必須命名為 self"
+        }
+        return "E00118 · impl 方法的第一参数必须命名为 self"
+    }
+    if dc == "E00120" {
+        if en {
+            return "E00120 · impl method return type differs from the port signature — align the return types"
+        }
+        if tw {
+            return "E00120 · impl 方法回傳類型與 port 簽名不符——對齊回傳型別"
+        }
+        return "E00120 · impl 方法返回类型与 port 签名不符——对齐返回类型"
+    }
+    if dc == "E00210" {
+        if en {
+            return "E00210 · the impl block is missing a method the port requires — every port method must be implemented"
+        }
+        if tw {
+            return "E00210 · impl 區塊漏掉 port 要求的方法——port 方法必須全部實作"
+        }
+        return "E00210 · impl 区块漏掉 port 要求的方法——port 方法必须全部实现"
+    }
     if en {
-        return "unknown diagnostic code '" + dc + "'; documented codes: E00357 E00360 E00361 E00377 E00406 E00456 E00489 E00554 E00556 E00557 E00560 E00561 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
+        return "unknown diagnostic code '" + dc + "'; documented codes: E00112 E00113 E00114 E00118 E00120 E00210 E00357 E00360 E00361 E00377 E00406 E00456 E00489 E00554 E00556 E00557 E00560 E00561 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
     }
     if tw {
-        return "未知的診斷碼 '" + dc + "'；已有說明的碼：E00357 E00360 E00361 E00377 E00406 E00456 E00489 E00554 E00556 E00557 E00560 E00561 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
+        return "未知的診斷碼 '" + dc + "'；已有說明的碼：E00112 E00113 E00114 E00118 E00120 E00210 E00357 E00360 E00361 E00377 E00406 E00456 E00489 E00554 E00556 E00557 E00560 E00561 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
     }
-    return "未知的诊断码 '" + dc + "'；已有说明的码：E00357 E00360 E00361 E00377 E00406 E00456 E00489 E00554 E00556 E00557 E00560 E00561 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
+    return "未知的诊断码 '" + dc + "'；已有说明的码：E00112 E00113 E00114 E00118 E00120 E00210 E00357 E00360 E00361 E00377 E00406 E00456 E00489 E00554 E00556 E00557 E00560 E00561 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
 }
 
 // 提升到 port/interface 对象需要 unsafe/mem 凭据（E00456）。
@@ -453,4 +507,70 @@ pub func msg_generic_port(sname: string, pname: string) -> string {
         return "類型 '" + sname + "' 未實作 port '" + pname + "'（泛型約束不符）"
     }
     return "类型 '" + sname + "' 未实现 port '" + pname + "'（泛型约束不满足）"
+}
+
+// 方法缺 self 接收者（E00114）：kind 取 "port" / "interface" / "impl"。
+pub func msg_method_needs_self(kind: string, mname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return kind + " method '" + mname + "' must take self as its first parameter"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return kind + " 方法 '" + mname + "' 必須有 self 接收者（第一參數）"
+    }
+    return kind + " 方法 '" + mname + "' 必须有 self 接收者（第一参数）"
+}
+
+// 方法第一参数名不是 self（E00118）：kind 取 "port" / "interface" / "impl"。
+pub func msg_method_first_param_self(kind: string, mname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "the first parameter of " + kind + " method '" + mname + "' must be self"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return kind + " 方法 '" + mname + "' 的第一參數必須是 self"
+    }
+    return kind + " 方法 '" + mname + "' 的第一参数必须是 self"
+}
+
+// impl 缺少 port 要求的方法（E00210）。
+pub func msg_impl_missing_method(pname: string, sname: string, mname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "impl '" + pname + " for " + sname + "' is missing method '" + mname + "' (every port method must be implemented)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "impl '" + pname + " for " + sname + "' 缺少方法 '" + mname + "'（port 方法必須全部實作）"
+    }
+    return "impl '" + pname + " for " + sname + "' 缺少方法 '" + mname + "'（port 方法必须全部实现）"
+}
+
+// impl 方法参数个数与 port 签名不符（E00112）。
+pub func msg_impl_arity(mname: string, want: string, got: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "impl method '" + mname + "' has a mismatched parameter count: expected " + want + ", got " + got
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "impl 方法 '" + mname + "' 參數個數與 port 簽名不符：期望 " + want + "，實際 " + got
+    }
+    return "impl 方法 '" + mname + "' 参数个数与 port 签名不匹配：期望 " + want + "，实际 " + got
+}
+
+// impl 方法参数类型与 port 签名不符（E00113）。
+pub func msg_impl_param_type(mname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "impl method '" + mname + "' has a mismatched parameter type (port method parameters must keep the same types)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "impl 方法 '" + mname + "' 參數類型與 port 簽名不符（port 方法參數必須型別一致）"
+    }
+    return "impl 方法 '" + mname + "' 参数类型与 port 签名不匹配（port 方法参数必须类型一致）"
+}
+
+// impl 方法返回类型与 port 签名不符（E00120）。
+pub func msg_impl_ret_type(mname: string, want: string, got: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "impl method '" + mname + "' has a mismatched return type: expected " + want + ", got " + got
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "impl 方法 '" + mname + "' 回傳類型與 port 簽名不符：期望 " + want + "，實際 " + got
+    }
+    return "impl 方法 '" + mname + "' 返回类型与 port 签名不匹配：期望 " + want + "，实际 " + got
 }

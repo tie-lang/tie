@@ -76,14 +76,16 @@ func collect_port(s: i64) -> i64 {
         if nparams < 1 {
             sm_err_line = s_lines[m]
             sm_err_col = s_cols[m]
-            sm_err_msg = kword_m + " '" + mname + "' 必须有 self 接收者（第一参数）"
+            sm_err_code = "E00114"
+            sm_err_msg = locale.msg_method_needs_self(kword, mname)
             return -1
         }
         var p0 = sstate.child(m, sstate.slot_off(m) + 1)
         if sstate.name_str(p0) != "self" {
             sm_err_line = s_lines[m]
             sm_err_col = s_cols[m]
-            sm_err_msg = kword_m + " '" + mname + "' 的第一参数必须是 self"
+            sm_err_code = "E00118"
+            sm_err_msg = locale.msg_method_first_param_self(kword, mname)
             return -1
         }
         // 无函数体（默认实现暂不支持，第一版 port/interface 只声明签名）
@@ -187,14 +189,16 @@ func collect_impl_one(im: i64) -> i64 {
         if nparams < 1 {
             sm_err_line = s_lines[m]
             sm_err_col = s_cols[m]
-            sm_err_msg = "impl 方法 '" + mname + "' 必须有 self 接收者（第一参数）"
+            sm_err_code = "E00114"
+            sm_err_msg = locale.msg_method_needs_self("impl", mname)
             return -1
         }
         var p0 = sstate.child(m, sstate.slot_off(m) + 1)
         if sstate.name_str(p0) != "self" {
             sm_err_line = s_lines[m]
             sm_err_col = s_cols[m]
-            sm_err_msg = "impl 方法 '" + mname + "' 的第一参数必须是 self"
+            sm_err_code = "E00118"
+            sm_err_msg = locale.msg_method_first_param_self("impl", mname)
             return -1
         }
         // self 参数类型节点改写：占位（name="self"）→ struct 类型节点。
@@ -235,7 +239,8 @@ func collect_impl_one(im: i64) -> i64 {
         if mnames[mi2] < 0 {
             sm_err_line = s_lines[im]
             sm_err_col = s_cols[im]
-            sm_err_msg = "impl '" + pname + " for " + sname + "' 缺少方法 '" + sstate.port_method_name(pi, mi2) + "'（port 方法必须全部实现）"
+            sm_err_code = "E00210"
+            sm_err_msg = locale.msg_impl_missing_method(pname, sname, sstate.port_method_name(pi, mi2))
             return -1
         }
         mi2 = mi2 + 1
@@ -256,7 +261,8 @@ func collect_impl_one(im: i64) -> i64 {
         if fnp != pnp {
             sm_err_line = s_lines[im]
             sm_err_col = s_cols[im]
-            sm_err_msg = "impl 方法 '" + sstate.port_method_name(pi, mi3) + "' 参数个数与 port 签名不匹配：期望 " + to_string(pnp) + "，实际 " + to_string(fnp)
+            sm_err_code = "E00112"
+            sm_err_msg = locale.msg_impl_arity(sstate.port_method_name(pi, mi3), to_string(pnp), to_string(fnp))
             return -1
         }
         // 参数类型逐项匹配（self 槽跳过；其余精确相等——第一版不做隐式转换）
@@ -274,14 +280,16 @@ func collect_impl_one(im: i64) -> i64 {
         if !sig_ok {
             sm_err_line = s_lines[im]
             sm_err_col = s_cols[im]
-            sm_err_msg = "impl 方法 '" + sstate.port_method_name(pi, mi3) + "' 参数类型与 port 签名不匹配（port 方法参数必须类型一致）"
+            sm_err_code = "E00113"
+            sm_err_msg = locale.msg_impl_param_type(sstate.port_method_name(pi, mi3))
             return -1
         }
         var want_ret = sstate.port_method_ret(pi, mi3)
         if sg_ret[sig] != want_ret {
             sm_err_line = s_lines[im]
             sm_err_col = s_cols[im]
-            sm_err_msg = "impl 方法 '" + sstate.port_method_name(pi, mi3) + "' 返回类型与 port 签名不匹配：期望 " + types.type_name(want_ret) + "，实际 " + types.type_name(sg_ret[sig])
+            sm_err_code = "E00120"
+            sm_err_msg = locale.msg_impl_ret_type(sstate.port_method_name(pi, mi3), types.type_name(want_ret), types.type_name(sg_ret[sig]))
             return -1
         }
         mi3 = mi3 + 1
