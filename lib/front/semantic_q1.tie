@@ -3,6 +3,17 @@ type tie<class>
 // ============================================================
 // 只搬函数与紧邻注释；顶层全局 var 与 import 树仍留在 semantic.tie。
 // 顶层函数保持顶层身份（跨 ns 裸调依赖），ns 内函数按上下文包 namespace。
+// 语义错误的 ERR 协议成形：若消息旁登记了显式码，就用 ERR:E#####:行 列 消息 形态，
+// 消息措辞与翻译就不再影响码；未登记时沿用无码形态，由渲染端按文本推导（历史行为）。
+func err_proto_cur() -> string {
+    var pc = sm_err_code
+    sm_err_code = ""
+    if len(pc) > 0 {
+        return "ERR:" + pc + ":" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+}
+
 // 清空警告通道（每次语义检查入口调用）。
 pub func sm_warn_reset() {
     sm_warn_lines = table_new_i64()
@@ -257,18 +268,18 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     // import 展开（主文件顶层进 g_extra_tops，import 文件递归合并）
     var er = expand_imports()
     if er < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     var r = scollect.collect_top()
     if r < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // impl 块统一处理（struct/port 全部登记后：方法改名 + 签名登记 +
     // 完整性/签名检查 + impl 记录）。须在 expand_generics 之前——泛型约束
     // 校验（instantiate_fn/struct）依赖 impl 表就绪。
     var ifr = scollect.collect_impl_fns()
     if ifr < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // 泛型单态化预扫描展开：遍历模板 → 扫描调用点 → 展开 → 去重 →
     // 递归处理新实例化（展开产物进入 fn_keys/st_keys 后由后续阶段覆盖）。
@@ -276,35 +287,35 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     // instantiate_struct 即时完成，主流程再遍历 st_keys 时 cls_done 跳过
     var ge = expand_generics()
     if ge < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // 泛型字段类型预实例化：字段类型中的模板 struct 引用（如
     // `A<i64>`）在此先行实例化，避免 collect_all_struct_fields 拍平时实例化
     // 副作用顶偏 cls_fldoff（详见 scollect.pre_instantiate_field_types 注释）
     var pr = scollect.pre_instantiate_field_types()
     if pr < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // struct 字段拍平收集（含继承；须在逐函数检查前完成）
     var r3 = scollect.collect_all_struct_fields()
     if r3 < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // enum 变体收集（须在 struct 字段拍平之后——payload 类型可能引用 struct）
     var r5 = scollect.collect_all_enums()
     if r5 < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // 缺陷 #4a：延迟的全局标量初始化类型检查（须在 enum 变体收集后——
     // enum 变体常量初始化器依赖 en_vnames 变体表）
     var r6 = scollect.check_deferred_global_inits()
     if r6 < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // 返回表元素预扫描（先于逐函数 check）
     var r4 = scollect.collect_all_return_tables()
     if r4 < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // 逐函数检查（稳定化：检查期间 infer_call 会触发展开新实例化 → fn_keys
     // 增长，循环重扫直到无新函数——防 sorted_insert 把新签名插到游标之前被跳过）
@@ -334,7 +345,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
                 sstate.lv_moved_reset()
                 var r2 = scheck.check_fn_walk(fname)
                 if r2 < 0 {
-                    return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+                    return err_proto_cur()
                 }
                 // 移动语义独立 pass：类型检查后遍历函数体，跟踪 live/moved
                 // （复用已重置的 lv_moved；内置/原语调用借用，用户函数按值堆参数移动）。
@@ -343,7 +354,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
                 // 「不可变值」移出跟踪范围），`TIE_MOVE_CHECK=0` 可显式关闭。
                 var r_mv = smove.check_fn_walk(fname)
                 if r_mv < 0 {
-                    return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+                    return err_proto_cur()
                 }
             }
             i = i + 1
@@ -353,7 +364,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     // （闭包体用登记时 lv 快照重建独立作用域，不影响外层函数）
     var rc = scheck.check_pending_closures()
     if rc < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // W00030 文件粒度收尾：整个文件都没用到文件级授权的域 ⇒ 挂空告警。
     scheck.cap_idle_flush()
@@ -388,7 +399,7 @@ pub func check_ast(base_dir: string, ep: fn(string) -> string, em: fn(string, ta
     // 供 mexpand 做宏可见性判定）。
     var er = expand_imports()
     if er < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     unsafe {
         var smc3 = GetTickCount()
@@ -397,7 +408,7 @@ pub func check_ast(base_dir: string, ep: fn(string) -> string, em: fn(string, ta
     // 宏展开 pass（跨文件宏：g_extra_tops 收集全部文件顶层宏定义；
     // 展开结果参与类型检查）。失败返回与后续同格式的 ERR 协议文本。
     if mexpand.expand_sstate(ep, em, eproc) < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     unsafe {
         var smc2 = GetTickCount()
@@ -405,7 +416,7 @@ pub func check_ast(base_dir: string, ep: fn(string) -> string, em: fn(string, ta
     sm_t_mexp = smc2 - smc3
     var r = scollect.collect_top()
     if r < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     unsafe {
         var smc4 = GetTickCount()
@@ -416,7 +427,7 @@ pub func check_ast(base_dir: string, ep: fn(string) -> string, em: fn(string, ta
     // impl 表就绪）
     var ifr = scollect.collect_impl_fns()
     if ifr < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     unsafe {
         var smc5 = GetTickCount()
@@ -425,7 +436,7 @@ pub func check_ast(base_dir: string, ep: fn(string) -> string, em: fn(string, ta
     // 泛型单态化预扫描展开：同 check_impl（见其注释）
     var ge = expand_generics()
     if ge < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     unsafe {
         var smc6 = GetTickCount()
@@ -436,12 +447,12 @@ pub func check_ast(base_dir: string, ep: fn(string) -> string, em: fn(string, ta
     // 副作用顶偏 cls_fldoff（详见 scollect.pre_instantiate_field_types 注释）
     var pr = scollect.pre_instantiate_field_types()
     if pr < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // struct 字段拍平收集（含继承；须在逐函数检查前完成）
     var r3 = scollect.collect_all_struct_fields()
     if r3 < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     unsafe {
         var smc7 = GetTickCount()
@@ -450,18 +461,18 @@ pub func check_ast(base_dir: string, ep: fn(string) -> string, em: fn(string, ta
     // enum 变体收集（须在 struct 字段拍平之后——payload 类型可能引用 struct）
     var r5 = scollect.collect_all_enums()
     if r5 < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // 缺陷 #4a：延迟的全局标量初始化类型检查（须在 enum 变体收集后——
     // enum 变体常量初始化器依赖 en_vnames 变体表）
     var r6 = scollect.check_deferred_global_inits()
     if r6 < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // 返回表元素预扫描（先于逐函数 check）
     var r4 = scollect.collect_all_return_tables()
     if r4 < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // 逐函数检查（稳定化，同 check_impl）
     // 性能重构：checked 改直索引表（checked[sig] = 1；sig 稠密 0..N-1）——
@@ -488,12 +499,12 @@ pub func check_ast(base_dir: string, ep: fn(string) -> string, em: fn(string, ta
                 sstate.lv_moved_reset()
                 var r2 = scheck.check_fn_walk(fname)
                 if r2 < 0 {
-                    return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+                    return err_proto_cur()
                 }
                 // 移动语义独立 pass（同 check_impl；门控在 smove 内部两层）
                 var r_mv = smove.check_fn_walk(fname)
                 if r_mv < 0 {
-                    return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+                    return err_proto_cur()
                 }
             }
             i = i + 1
@@ -503,7 +514,7 @@ pub func check_ast(base_dir: string, ep: fn(string) -> string, em: fn(string, ta
     // （闭包体用登记时 lv 快照重建独立作用域，不影响外层函数）
     var rc = scheck.check_pending_closures()
     if rc < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        return err_proto_cur()
     }
     // W00030 文件粒度收尾：整个文件都没用到文件级授权的域 ⇒ 挂空告警。
     scheck.cap_idle_flush()
