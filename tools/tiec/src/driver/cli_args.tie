@@ -44,6 +44,7 @@ pub func usage() -> i64 {
     dbg_txt("  --jobs <N>       编译并发度")
     dbg_txt("  --no-cache       关闭编译缓存")
     dbg_txt("  --lang=<code>    诊断消息语言：zh-CN / zh-TW / en-US（未给时读 TIEC_LANG，再退默认 zh-CN）")
+    dbg_txt("  --explain=<code>   打印诊断码说明（如 --explain=E00406），不编译")
     dbg_txt("  --diag-format=<f>  诊断输出格式：text（默认） / json")
     dbg_txt("  --no-warn        跳过警告检查")
     dbg_txt("  -w, --warn       开启前端警告检查")
@@ -266,6 +267,9 @@ pub func parse_args() -> i64 {
             // 已在预扫描应用（此处仅消费参数，不重复赋值）
         } else if a == "--no-cache" {
             g_no_cache = true
+        } else if tie.support::has_prefix(a, "--explain=") {
+            // 诊断码说明：--explain=E00406 打印该码的成因与修法（受 --lang 影响）。
+            g_explain = str.slice(a, 10, str_len(a))
         } else if tie.support::has_prefix(a, "--lang=") {
             // 诊断消息语言：--lang=zh-CN / --lang=en-US。只改消息文本，不改诊断码。
             diagcode.set_lang(norm_lang(str.slice(a, 7, str_len(a))))
@@ -460,9 +464,9 @@ pub func parse_args() -> i64 {
         }
         i = i + 1
     }
-    if !input_set && !g_tink_serve && !g_serve_compile {
+    if !input_set && !g_tink_serve && !g_serve_compile && str_len(g_explain) == 0 {
         // 常驻服务（--tink-serve 分析 / --serve-compile 编译）不吃命令行输入文件
-        // ——参数经请求帧传入。
+        // ——参数经请求帧传入。--explain 只查码表，同样不需要输入文件。
         return -1
     }
     return 0

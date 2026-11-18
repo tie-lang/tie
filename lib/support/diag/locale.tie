@@ -71,3 +71,62 @@ pub func msg_undef_type(nm: string) -> string {
     }
     return "类型 '" + nm + "' 未定义"
 }
+
+// 诊断码说明（--explain=<code>）：成因 + 修法各一句，随 --lang 切换。
+// 未知码返回可用码清单，便于脚本探测本版本支持哪些说明。
+pub func help_for(dc: string) -> string {
+    var en = diagcode.cur_lang() == "en-US"
+    var tw = diagcode.cur_lang() == "zh-TW"
+    if dc == "E00377" {
+        if en {
+            return "E00377 · type mismatch in a variable or array initializer — the declared type and the inferred type differ; align the annotation with the expression."
+        }
+        if tw {
+            return "E00377 · 變數或陣列初始化的類型不符——標註類型與運算式推導類型不一致；使兩者一致。"
+        }
+        return "E00377 · 变量或数组初始化的类型不匹配——标注类型与表达式推导类型不一致；使两者一致。"
+    }
+    if dc == "E00406" {
+        if en {
+            return "E00406 · compound assignment type mismatch — the target and the expression must share a type; convert one side explicitly."
+        }
+        if tw {
+            return "E00406 · 複合指派類型不符——目標與運算式必須同型；先顯式轉換一側。"
+        }
+        return "E00406 · 复合赋值类型不匹配——目标与表达式必须同型；先显式转换一侧。"
+    }
+    if dc == "E00489" {
+        if en {
+            return "E00489 · undefined function — the name has no declaration in scope; check spelling, imports and namespaces."
+        }
+        if tw {
+            return "E00489 · 未定義的函式——該名稱在此作用域無宣告；檢查拼寫、import 與命名空間。"
+        }
+        return "E00489 · 未定义的函数——该名字在此作用域没有声明；检查拼写、import 与命名空间。"
+    }
+    if dc == "E00554" {
+        if en {
+            return "E00554 · undefined type — the annotation names a type that is not declared; check spelling or define it."
+        }
+        if tw {
+            return "E00554 · 未定義的類型——標註引用了未宣告的型別；檢查拼寫或補上定義。"
+        }
+        return "E00554 · 类型未定义——标注引用了未声明的类型；检查拼写或补上定义。"
+    }
+    if dc == "E00588" {
+        if en {
+            return "E00588 · argument type mismatch in a call — an argument disagrees with the parameter type; pass the declared type."
+        }
+        if tw {
+            return "E00588 · 呼叫引數類型不符——引數與形參型別不一致；依簽章傳參。"
+        }
+        return "E00588 · 调用实参类型不匹配——实参形参类型不一致；按签名传参。"
+    }
+    if en {
+        return "unknown diagnostic code '" + dc + "'; documented codes: E00377 E00406 E00489 E00554 E00588"
+    }
+    if tw {
+        return "未知的診斷碼 '" + dc + "'；已有說明的碼：E00377 E00406 E00489 E00554 E00588"
+    }
+    return "未知的诊断码 '" + dc + "'；已有说明的码：E00377 E00406 E00489 E00554 E00588"
+}
