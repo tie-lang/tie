@@ -1,5 +1,6 @@
 type tie<logic>
 import "../../../lib/backend/render.tie"
+import "../../../lib/support/diag/diagcode.tie"
 // compiler/driver-lite.tie —— ：临时编译器入口（tiec 雏形）
 // ============================================================
 // 说明：把语义分析与代码生成接到一起，
@@ -268,6 +269,8 @@ func main() -> i64 {
         return 1
     }
     var src = file_read(g_input)
+    // 诊断区间只核对主文件：把这份源码交给诊断层，导入库里的错误不会给出 fix。
+    diagcode.set_main_src(src)
 
     // 2) 前端：词法 + 语法（parse_src 内部完成，出错返回 ERR 协议）
     var ast = parser.parse_src(src)

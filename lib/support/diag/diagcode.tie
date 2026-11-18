@@ -290,6 +290,35 @@ pub func set_diag_json(v: i64) {
 // 诊断消息语言（BCP 47 风格码）。默认中文简体；CLI --lang=<code> 可改。
 // 语言只影响消息文本，不影响码——码已由调用点显式登记或按目录查表决定。
 pub var g_lang: string = "zh-CN"
+// 主文件源码由 driver 在读取输入时登记。诊断区间只在这份文本上核对字节，
+// 导入库里的错误对不上就不给 fix——宁可不出，也不给出错位区间。
+pub var g_main_src: string = ""
+pub var g_diag_beg: i64 = -1
+pub var g_diag_end: i64 = -1
+pub func set_main_src(s: string) {
+    if len(g_main_src) == 0 && len(s) > 0 {
+        g_main_src = s
+    }
+}
+pub func main_src() -> string { return g_main_src }
+// 十进制数串转 i64（区间前缀专用，非法字符返回 -1）。
+pub func dg_int(s: string) -> i64 {
+    var n = len(s)
+    if n <= 0 {
+        return -1
+    }
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var c = str_byte(s, i) - 48
+        if c < 0 || c > 9 {
+            return -1
+        }
+        v = v * 10 + c
+        i = i + 1
+    }
+    return v
+}
 
 pub func set_lang(v: string) {
     if len(v) > 0 {
@@ -347,6 +376,9 @@ pub func render_error_cc(cc: string, line: i64, col: i64, msg: string) -> string
         var j = "{\"code\":\"" + cc + "\",\"line\":" + to_string(line)
         j = j + ",\"col\":" + to_string(col)
         j = j + ",\"message\":\"" + json_esc(body) + "\""
+        if g_diag_beg >= 0 && g_diag_end > g_diag_beg {
+            j = j + ",\"fix\":{\"beg\":" + to_string(g_diag_beg) + ",\"end\":" + to_string(g_diag_end) + "}"
+        }
         j = j + ",\"lang\":\"" + g_lang + "\"}"
         return j
     }
@@ -376,6 +408,18 @@ pub func render_err_proto(proto: string) -> string {
         if cp > 1 {
             excode = dg_slice(rest, 0, cp)
             rest = dg_slice(rest, cp + 1, len(rest))
+        }
+    }
+    // 可选区间前缀 B<beg>,<end>: —— 前端逐字节核对过的源码区间，供 --diag-format=json 的 fix 采用。
+    g_diag_beg = -1
+    g_diag_end = -1
+    if len(rest) > 1 && str_byte(rest, 0) == 66 {
+        var bc1 = dg_find(rest, ",")
+        var bc2 = dg_find(rest, ":")
+        if bc1 > 1 && bc2 > bc1 {
+            g_diag_beg = dg_int(dg_slice(rest, 1, bc1))
+            g_diag_end = dg_int(dg_slice(rest, bc1 + 1, bc2))
+            rest = dg_slice(rest, bc2 + 1, len(rest))
         }
     }
     var sp1 = dg_find(rest, " ")

@@ -7,11 +7,76 @@ type tie<class>
 // 消息措辞与翻译就不再影响码；未登记时沿用无码形态，由渲染端按文本推导（历史行为）。
 func err_proto_cur() -> string {
     var pc = sm_err_code
+    var pb = sm_err_beg
+    var pe = sm_err_end
     sm_err_code = ""
+    sm_err_beg = -1
+    sm_err_end = -1
     if len(pc) > 0 {
+        if pb >= 0 && pe > pb {
+            return "ERR:" + pc + ":B" + to_string(pb) + "," + to_string(pe) + ":" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        }
         return "ERR:" + pc + ":" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+}
+
+// 把 (行, 列, 词形) 换算成主文件源码的字节区间并登记到 sm_err_beg/end。
+// 只认主文件那一段源码：核对不上（例如错误来自导入库）就返回 -1，调用点据此不登记区间。
+pub func span_of(line: i64, col: i64, needle: string) -> i64 {
+    if line <= 0 || col <= 0 {
+        return -1
+    }
+    var nn = len(needle)
+    if nn <= 0 {
+        return -1
+    }
+    var src = diagcode.main_src()
+    var sn = len(src)
+    if sn <= 0 {
+        return -1
+    }
+    // 第 line 行的字节起点：直接扫主源码里的换行，不依赖词法期被覆盖的行起点表。
+    var bs: i64 = 0
+    var ln: i64 = 1
+    while ln < line && bs < sn {
+        if str_byte(src, bs) == 10 {
+            ln = ln + 1
+        }
+        bs = bs + 1
+    }
+    if ln < line {
+        return -1
+    }
+    // 行内按码点推进 col-1 次，换成字节偏移（诊断列号是码点列）。
+    var off = bs
+    var cp: i64 = 1
+    while cp < col && off < sn {
+        var b = str_byte(src, off)
+        if b < 128 {
+            off = off + 1
+        } else if b < 224 {
+            off = off + 2
+        } else if b < 240 {
+            off = off + 3
+        } else {
+            off = off + 4
+        }
+        cp = cp + 1
+    }
+    if off + nn > sn {
+        return -1
+    }
+    var i: i64 = 0
+    while i < nn {
+        if str_byte(src, off + i) != str_byte(needle, i) {
+            return -1
+        }
+        i = i + 1
+    }
+    sm_err_beg = off
+    sm_err_end = off + nn
+    return 0
 }
 
 // 清空警告通道（每次语义检查入口调用）。

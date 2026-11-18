@@ -1,4 +1,5 @@
 type tie<class>
+import "../../../../lib/support/diag/diagcode.tie"
 // compiler/driver/unit.tie —— 单编译单元执行体（CLI 与服务模式共用）
 // ============================================================
 // 自 driver.tie 的 main() 抽出：参数解析 / 子命令 / --tink-serve 分派留在 main，
@@ -98,6 +99,8 @@ pub func run_unit() -> i64 {
         dbg_txt("读取源码失败: " + g_input)
         return 1
     }
+    // 诊断区间只核对主文件：把这份源码交给诊断层，导入库里的错误不会给出 fix。
+    diagcode.set_main_src(src)
     // 自定义角色注册表需先于头部扫描可用（config.data.tie roles 段）。 
     // 分层合并：无配置文件时返回内置默认根；config 语法错误 → 报错退出。
     if !g_cfg_loaded {
