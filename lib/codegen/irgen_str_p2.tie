@@ -122,6 +122,16 @@ func s21_index_raise(next_blk: i64) {
 // 共享表越界写诊断：i >= len 且该表**被别名共享**（rc>1）→ 运行时诊断，
 // 打印后 exit(1)。独占表的越界写照旧自动扩容（保留），不走本函数。
 // noreturn；next_blk 供死 br 收尾（LLVM 要求块有 terminator；opt 会 DCE 死 br）。
+// 规则 C 的越界写诊断：i > len（中间留洞）一律拒绝，i == len 才允许追加。
+// 空洞补零会把 len 推到 i+1，等于用户只写一个元素就改了表的长度。
+func s21_oob_gap_raise(next_blk: i64) {
+    var msg = tig_str_lit(interner.intern("\"运行时错误: 表下标越界——只能在末尾追加（i == len）；中间留洞请先 table_resize\""))
+    tig_print_str_line(msg, true)
+    tig_ext_call1("exit", tig_int_lit_ty(1, types.named(TK_I32)), types.named(TK_I32), -1)
+    var db = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(db, next_blk, 1)
+}
+
 func s21_oob_raise(next_blk: i64) {
     var msg = tig_str_lit(interner.intern("\"运行时错误: 表下标越界——该表被别名共享，写越界会改变所有别名看到的长度；如需扩容请先 clone 出独立副本\""))
     tig_print_str_line(msg, true)  // 控制台编码契约：宽写 / 原 printf 分派
@@ -412,9 +422,10 @@ func tig_agg_release_fields(slot: i64, ty: i64) -> i64 {
     return 0
 }
 
-// 表下标写（越界自动扩容，杜绝静默丢弃）：
+// 表下标写（规则 C）：
 //   - 负下标(i<0) → 运行时诊断（不得静默/不得越界写）；
-//   - i >= len → 按元素零值逐槽 push 扩容 need = max(len, i+1) 后写 target；
+//   - i == len → 末尾追加（独占表补零值后写入；别名表拒绝并诊断）；
+//   - i >  len → 运行时诊断（中间留洞会隐性改表长，请先 table_resize）；
 //   - 否则直接 tl_tbl$tbl_set(t, i, src)。
 // 值先落槽再传指针整数。编译期 IR 发射层展开，零改运行期 tbl_set（自举不动点
 // 只随 tiec 源码变化）。用 tbl_push 零值逐个追加（string 槽得有效 "" 而非 null）。
@@ -450,18 +461,29 @@ func s21_table_set_ex(t: i64, i: i64, elem_llvm_ty: i64, v: i64, excl: bool) {
     //   `len(a)` 也变成 101。用户只写了一个元素，却无声改变了**另一个变量**的形状。
     //   这正是「非 unsafe 区写不出危险代码」要杜绝的一类。
     //
-    // ★ 但**独占表的扩容是无害的**：没有别人看得到。故按句柄 @40 的真实引用计数
-    //   分流（tbl_retain/tbl_release 已在维护，不引入新状态）：
-    //     rc == 1（唯一持有者）⇒ 照旧自动扩容 —— 语义**保留**。
-    //       这一支是必需的：编译器自举依赖它（实测「struct + namespace 方法」路径
-    //       会做越界写，改为一律报错会直接让自举不收敛）。
-    //     rc  > 1（存在别名）⇒ 拒绝并诊断 —— 形状改变会让别名跟着变，属危险。
+    // ★ 规则 C 已把 i > len（中间留洞）在上方一律拒绝；走到这里的只有 i == len
+    //   （末尾追加）。追加仍按句柄 @40 的真实引用计数分流（tbl_retain/tbl_release
+    //   已在维护，不引入新状态）：
+    //     rc == 1（唯一持有者）⇒ 补一个零值再写 —— 等价于 append，语义保留。
+    //     rc  > 1（存在别名）⇒ 拒绝并诊断 —— len 改变会让别名跟着变，属危险。
     //
     // ★ 这**不**改变 push/pop 的共享语义：那些是显式操作，共享可见是 tie 的既有
     //   惯用法（tiu 有 73 处依赖「struct 按值传参 + 表字段共享」累积结果）。
     //   显式扩容（想让别名也看到）请先 table_resize/table_reserve 再写。
     var lenv = s21_table_len(t)
     var need = s21_bin(0, i, tig_int_lit(1))  // i+1
+    // 规则 C：只有 i == len（末尾追加）允许隐式扩容；i > len 会留下空洞，
+    // 一律运行时诊断——空洞补零会让 len 变成 i+1，是**隐性改变表形状**。
+    var gapc = tig_icmp_c(i, lenv, 3)         // sgt：i > len
+    var gb = ir.new_block(g_cur_func, interner.intern("ts.gp"))
+    var ga = ir.new_block(g_cur_func, interner.intern("ts.gk"))
+    var cbg = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbg, gapc, 0)
+    ir.add_operand(cbg, gb, 1)
+    ir.add_operand(cbg, ga, 1)
+    g_cur_block = gb
+    s21_oob_gap_raise(ga)
+    g_cur_block = ga
     var growc = tig_icmp_c(need, lenv, 3)     // sgt
     var gt = ir.new_block(g_cur_func, interner.intern("ts.gt"))
     var ge = ir.new_block(g_cur_func, interner.intern("ts.ge"))
