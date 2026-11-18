@@ -69,7 +69,7 @@ pub func span_of(line: i64, col: i64, needle: string) -> i64 {
     while le < sn && str_byte(src, le) != 10 {
         le = le + 1
     }
-    // 先按列号定位处逐字节核对；列号指在语句起始时退回「整行唯一命中」。
+    // 先在列号处逐字节核对；列号指在语句起始时再按下面的规则兜底。
     if off + nn <= le {
         var i: i64 = 0
         var ok = 1
@@ -86,9 +86,9 @@ pub func span_of(line: i64, col: i64, needle: string) -> i64 {
             return 0
         }
     }
-    // 列号之后的范围内找 needle：必须是唯一命中，否则放弃（不猜）。
-    var hit: i64 = -1
-    var cnt: i64 = 0
+    // 依次尝试三个范围，每个范围都必须唯一命中：列号之后 → 整行 → 整行里紧跟在 func 之后。
+    var wc: i64 = 0
+    var wh: i64 = -1
     var j = off
     while j + nn <= le {
         var k: i64 = 0
@@ -101,17 +101,67 @@ pub func span_of(line: i64, col: i64, needle: string) -> i64 {
             k = k + 1
         }
         if same == 1 {
-            hit = j
-            cnt = cnt + 1
+            wh = j
+            wc = wc + 1
         }
         j = j + 1
     }
-    if cnt != 1 {
-        return -1
+    if wc == 1 {
+        sm_err_beg = wh
+        sm_err_end = wh + nn
+        return 0
     }
-    sm_err_beg = hit
-    sm_err_end = hit + nn
-    return 0
+    var lc: i64 = 0
+    var lh: i64 = -1
+    j = bs
+    while j + nn <= le {
+        var k2: i64 = 0
+        var same2 = 1
+        while k2 < nn {
+            if str_byte(src, j + k2) != str_byte(needle, k2) {
+                same2 = 0
+                break
+            }
+            k2 = k2 + 1
+        }
+        if same2 == 1 {
+            lh = j
+            lc = lc + 1
+        }
+        j = j + 1
+    }
+    if lc == 1 {
+        sm_err_beg = lh
+        sm_err_end = lh + nn
+        return 0
+    }
+    if lc > 1 {
+        var fc: i64 = 0
+        var fh: i64 = -1
+        j = bs
+        while j + nn <= le {
+            var k3: i64 = 0
+            var same3 = 1
+            while k3 < nn {
+                if str_byte(src, j + k3) != str_byte(needle, k3) {
+                    same3 = 0
+                    break
+                }
+                k3 = k3 + 1
+            }
+            if same3 == 1 && j - 5 >= bs && str_byte(src, j - 1) == 32 && str_byte(src, j - 2) == 99 && str_byte(src, j - 3) == 110 && str_byte(src, j - 4) == 117 && str_byte(src, j - 5) == 102 {
+                fh = j
+                fc = fc + 1
+            }
+            j = j + 1
+        }
+        if fc == 1 {
+            sm_err_beg = fh
+            sm_err_end = fh + nn
+            return 0
+        }
+    }
+    return -1
 }
 
 // 清空警告通道（每次语义检查入口调用）。
