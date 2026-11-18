@@ -284,6 +284,10 @@ func main() -> i64 {
     }
     // 诊断码说明（--explain=<code>）：查表打印后直接结束，不进入编译流程。
     if str_len(g_explain) > 0 {
+        // --lib-root 给定即从该仓根找语言包，使 --explain 不依赖当前工作目录。
+        if str_len(g_lib_root_cli) > 0 {
+            locale.set_pack_dir(g_lib_root_cli + "/data/locale")
+        }
         var hx = locale.help_for(g_explain)
         if diagcode.diag_json_enabled() != 0 {
             dbg_txt(diagcode.explain_json(g_explain, hx))
