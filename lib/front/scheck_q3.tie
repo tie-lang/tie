@@ -48,7 +48,8 @@ pub func check_var_decl(s: i64) -> i64 {
                 if g_unsafe_depth == 0 {
                     sm_err_line = s_lines[s]
                     sm_err_col = s_cols[s]
-                    sm_err_msg = "提升 '" + types.type_name(it_p) + "' 到 port '" + types.type_name(ty) + "' 必须在 unsafe 块或 unsafe 函数中（接口对象借用具体对象，指针操作归 unsafe）"
+                    sm_err_code = "E00456"
+                    sm_err_msg = locale.msg_promote_needs_unsafe(types.type_name(it_p), types.type_name(ty))
                     return -1
                 }
                 // 2026-10-01 域标签：port 提升 = 取具体对象地址并借用 ⇒ 归 **mem** 域
@@ -77,15 +78,19 @@ pub func check_var_decl(s: i64) -> i64 {
                         if vio2 >= 0 {
                             var vname2 = sstate.port_method_name(pi_l, vio2)
                             if stype.iface_vio_missing() {
-                                sm_err_msg = "类型 '" + types.type_name(it_p) + "' 未实现 interface '" + types.type_name(ty) + "'，不能提升（缺少方法 '" + vname2 + "'）"
+                                sm_err_code = "E00560"
+                                sm_err_msg = locale.msg_iface_promote_missing(types.type_name(it_p), types.type_name(ty), vname2)
                             } else {
-                                sm_err_msg = "类型 '" + types.type_name(it_p) + "' 未实现 interface '" + types.type_name(ty) + "'，不能提升（方法 '" + vname2 + "' 签名不匹配）"
+                                sm_err_code = "E00560"
+                                sm_err_msg = locale.msg_iface_promote_sig(types.type_name(it_p), types.type_name(ty), vname2)
                             }
                         } else {
-                            sm_err_msg = "类型 '" + types.type_name(it_p) + "' 未实现 interface '" + types.type_name(ty) + "'，不能提升"
+                            sm_err_code = "E00560"
+                            sm_err_msg = locale.msg_iface_promote_plain(types.type_name(it_p), types.type_name(ty))
                         }
                     } else {
-                        sm_err_msg = "类型 '" + types.type_name(it_p) + "' 未实现 port '" + types.type_name(ty) + "'，不能提升（请先写 impl " + types.type_name(ty) + " for " + types.type_name(it_p) + "）"
+                        sm_err_code = "E00561"
+                        sm_err_msg = locale.msg_port_promote_missing(types.type_name(it_p), types.type_name(ty))
                     }
                     return -1
                 }

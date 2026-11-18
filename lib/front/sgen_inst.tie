@@ -53,15 +53,19 @@ pub func check_generic_constraints(gti: i64, args: table<i64>, line: i64, col: i
                     if vio >= 0 {
                         var vname = sstate.port_method_name(pi, vio)
                         if stype.iface_vio_missing() {
-                            sm_err_msg = "类型 '" + types.type_name(at) + "' 未实现 interface '" + pname + "'（缺少方法 '" + vname + "'）"
+                            sm_err_code = "E00557"
+                            sm_err_msg = locale.msg_generic_iface_missing(types.type_name(at), pname, vname)
                         } else {
-                            sm_err_msg = "类型 '" + types.type_name(at) + "' 未实现 interface '" + pname + "'（方法 '" + vname + "' 签名不匹配）"
+                            sm_err_code = "E00557"
+                            sm_err_msg = locale.msg_generic_iface_sig(types.type_name(at), pname, vname)
                         }
                     } else {
-                        sm_err_msg = "类型 '" + types.type_name(at) + "' 未实现 interface '" + pname + "'（泛型约束不满足）"
+                        sm_err_code = "E00557"
+                        sm_err_msg = locale.msg_generic_iface_plain(types.type_name(at), pname)
                     }
                 } else {
-                    sm_err_msg = "类型 '" + types.type_name(at) + "' 未实现 port '" + pname + "'（泛型约束不满足）"
+                    sm_err_code = "E00556"
+                    sm_err_msg = locale.msg_generic_port(types.type_name(at), pname)
                 }
                 return -1
             }

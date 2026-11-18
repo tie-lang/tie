@@ -302,11 +302,155 @@ pub func help_for(dc: string) -> string {
         }
         return "E00914 · 参数默认值必须是字面量或编译期常量——不可含调用或运行期依赖"
     }
+    if dc == "E00456" {
+        if en {
+            return "E00456 · promoting a value to a port/interface object needs an unsafe block or function — the object borrows the concrete value"
+        }
+        if tw {
+            return "E00456 · 提升到 port/interface 物件需在 unsafe 區塊或函式內——物件借用具體值"
+        }
+        return "E00456 · 提升到 port/interface 对象需在 unsafe 块或函数内——对象借用具体值"
+    }
+    if dc == "E00556" {
+        if en {
+            return "E00556 · the type argument does not implement the port the generic bound requires — add `impl P for T`"
+        }
+        if tw {
+            return "E00556 · 型別實參未實作泛型約束要求的 port——補寫 `impl P for T`"
+        }
+        return "E00556 · 类型实参未实现泛型约束要求的 port——补写 `impl P for T`"
+    }
+    if dc == "E00557" {
+        if en {
+            return "E00557 · the type argument does not implement the interface the generic bound requires — add the missing methods in an impl block"
+        }
+        if tw {
+            return "E00557 · 型別實參未實作泛型約束要求的 interface——在 impl 區塊補齊缺少的方法"
+        }
+        return "E00557 · 类型实参未实现泛型约束要求的 interface——在 impl 块补齐缺少的方法"
+    }
+    if dc == "E00560" {
+        if en {
+            return "E00560 · the concrete type does not satisfy the interface, so it cannot be promoted — implement the missing method or fix its signature"
+        }
+        if tw {
+            return "E00560 · 具體型別不滿足 interface，不能提升——實作缺少的方法或修正簽名"
+        }
+        return "E00560 · 具体类型不满足 interface，不能提升——实现缺少的方法或修正签名"
+    }
+    if dc == "E00561" {
+        if en {
+            return "E00561 · the concrete type has no impl for this port, so it cannot be promoted — write `impl P for T` first"
+        }
+        if tw {
+            return "E00561 · 具體型別沒有該 port 的 impl，不能提升——先寫 `impl P for T`"
+        }
+        return "E00561 · 具体类型没有该 port 的 impl，不能提升——先写 `impl P for T`"
+    }
     if en {
-        return "unknown diagnostic code '" + dc + "'; documented codes: E00357 E00360 E00361 E00377 E00406 E00489 E00554 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
+        return "unknown diagnostic code '" + dc + "'; documented codes: E00357 E00360 E00361 E00377 E00406 E00456 E00489 E00554 E00556 E00557 E00560 E00561 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
     }
     if tw {
-        return "未知的診斷碼 '" + dc + "'；已有說明的碼：E00357 E00360 E00361 E00377 E00406 E00489 E00554 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
+        return "未知的診斷碼 '" + dc + "'；已有說明的碼：E00357 E00360 E00361 E00377 E00406 E00456 E00489 E00554 E00556 E00557 E00560 E00561 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
     }
-    return "未知的诊断码 '" + dc + "'；已有说明的码：E00357 E00360 E00361 E00377 E00406 E00489 E00554 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
+    return "未知的诊断码 '" + dc + "'；已有说明的码：E00357 E00360 E00361 E00377 E00406 E00456 E00489 E00554 E00556 E00557 E00560 E00561 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
+}
+
+// 提升到 port/interface 对象需要 unsafe/mem 凭据（E00456）。
+pub func msg_promote_needs_unsafe(sname: string, pname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "promoting '" + sname + "' to port '" + pname + "' requires an unsafe block or an unsafe function (an interface object borrows the concrete object, so pointer operations count as unsafe)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "提升 '" + sname + "' 到 port '" + pname + "' 必須在 unsafe 區塊或 unsafe 函式中（介面物件借用具體物件，指標操作歸 unsafe）"
+    }
+    return "提升 '" + sname + "' 到 port '" + pname + "' 必须在 unsafe 块或 unsafe 函数中（接口对象借用具体对象，指针操作归 unsafe）"
+}
+
+// interface 约束不满足导致不能提升：缺少方法（E00560）。
+pub func msg_iface_promote_missing(sname: string, iname: string, mname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "type '" + sname + "' does not implement interface '" + iname + "', so it cannot be promoted (missing method '" + mname + "')"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "類型 '" + sname + "' 未實作 interface '" + iname + "'，不能提升（缺少方法 '" + mname + "'）"
+    }
+    return "类型 '" + sname + "' 未实现 interface '" + iname + "'，不能提升（缺少方法 '" + mname + "'）"
+}
+
+// interface 约束不满足导致不能提升：方法签名不匹配（E00560）。
+pub func msg_iface_promote_sig(sname: string, iname: string, mname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "type '" + sname + "' does not implement interface '" + iname + "', so it cannot be promoted (method '" + mname + "' has a mismatched signature)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "類型 '" + sname + "' 未實作 interface '" + iname + "'，不能提升（方法 '" + mname + "' 簽名不符）"
+    }
+    return "类型 '" + sname + "' 未实现 interface '" + iname + "'，不能提升（方法 '" + mname + "' 签名不匹配）"
+}
+
+// interface 约束不满足导致不能提升：无方法级细节（E00560）。
+pub func msg_iface_promote_plain(sname: string, iname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "type '" + sname + "' does not implement interface '" + iname + "', so it cannot be promoted"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "類型 '" + sname + "' 未實作 interface '" + iname + "'，不能提升"
+    }
+    return "类型 '" + sname + "' 未实现 interface '" + iname + "'，不能提升"
+}
+
+// port 约束不满足导致不能提升（E00561）。
+pub func msg_port_promote_missing(sname: string, pname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "type '" + sname + "' does not implement port '" + pname + "', so it cannot be promoted (write `impl " + pname + " for " + sname + "` first)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "類型 '" + sname + "' 未實作 port '" + pname + "'，不能提升（請先寫 impl " + pname + " for " + sname + "）"
+    }
+    return "类型 '" + sname + "' 未实现 port '" + pname + "'，不能提升（请先写 impl " + pname + " for " + sname + "）"
+}
+
+// 泛型约束（interface）不满足：缺少方法（E00557）。
+pub func msg_generic_iface_missing(sname: string, iname: string, mname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "type '" + sname + "' does not implement interface '" + iname + "' (missing method '" + mname + "')"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "類型 '" + sname + "' 未實作 interface '" + iname + "'（缺少方法 '" + mname + "'）"
+    }
+    return "类型 '" + sname + "' 未实现 interface '" + iname + "'（缺少方法 '" + mname + "'）"
+}
+
+// 泛型约束（interface）不满足：方法签名不匹配（E00557）。
+pub func msg_generic_iface_sig(sname: string, iname: string, mname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "type '" + sname + "' does not implement interface '" + iname + "' (method '" + mname + "' has a mismatched signature)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "類型 '" + sname + "' 未實作 interface '" + iname + "'（方法 '" + mname + "' 簽名不符）"
+    }
+    return "类型 '" + sname + "' 未实现 interface '" + iname + "'（方法 '" + mname + "' 签名不匹配）"
+}
+
+// 泛型约束（interface）不满足：无方法级细节（E00557）。
+pub func msg_generic_iface_plain(sname: string, iname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "type '" + sname + "' does not implement interface '" + iname + "' (generic constraint not satisfied)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "類型 '" + sname + "' 未實作 interface '" + iname + "'（泛型約束不符）"
+    }
+    return "类型 '" + sname + "' 未实现 interface '" + iname + "'（泛型约束不满足）"
+}
+
+// 泛型约束（port）不满足（E00556）。
+pub func msg_generic_port(sname: string, pname: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "type '" + sname + "' does not implement port '" + pname + "' (generic constraint not satisfied)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "類型 '" + sname + "' 未實作 port '" + pname + "'（泛型約束不符）"
+    }
+    return "类型 '" + sname + "' 未实现 port '" + pname + "'（泛型约束不满足）"
 }
