@@ -1,5 +1,5 @@
 type tie<class>
-// compiler/support/diag/locdata.tie —— 语言包数据文件读取（命名空间 locdata）
+// compiler/support/diag/locdata.tie —— 语言包数据文件解析（命名空间 locdata）
 // ============================================================
 // 定位：把 `type tie<data>` 形态的扁平语言包（`data/locale/<tag>.td`）在**编译器
 // 运行时**读进内存，供 lib/support/diag/locale.tie 取消息模板。
@@ -7,26 +7,19 @@ type tie<class>
 // 支持的形态（刻意只做这一种，够语言包用，出错可诊断）：
 //   [
 //       "E00554.msg": "类型 '<nm>' 未定义。",
-//       "E00554.msg.en-US": "undefined type '<nm>'.",
+//       "E00377.msg": "变量 '<nm>' 类型不匹配：标注 <ann>，表达式推导为 <got>。",
 //   ]
 // 即「字符串键 → 字符串值」的扁平表；条目间逗号可省略，允许尾逗号与 // 行注释。
 // 不支持嵌套表/数组/数字/转义（语言包不需要；遇到即报错，不静默猜）。
 //
+// 本文件**不持有任何状态**：键表与值表由调用方传入并持有。原因见账本——
+// 模块级全局表在「同文件自用」没问题，但一句话都别指望跨文件共享状态。
+//
 // 索引一律按**码点**（`str_len`/`str_char`/`str.slice` 的语义），不要混用字节接口。
-// 读取失败返回负值：-2 无表字面量、-3 键不是字符串、-4 缺冒号、-5 值不是字符串、
-// -6 缺收尾 ']'。调用方据此回落到内置消息，绝不让缺文件打断编译。
+// 读取失败返回负值：-1 无文件、-2 无表字面量、-3 键不是字符串、-4 缺冒号、
+// -5 值不是字符串、-6 缺收尾 ']'。调用方据此回落到内置消息。
 
 namespace locdata;
-
-pub var g_keys: table<string> = [];
-pub var g_vals: table<string> = [];
-
-pub unsafe fn pad_blank() {
-    if len(g_keys) == 0 {
-        table_push(g_keys, "");
-        table_push(g_vals, "");
-    }
-}
 
 // 第 i 个码点（越界返回空串）。
 unsafe func ch(s: string, i: i64) -> string {
@@ -86,11 +79,11 @@ func substr(s: string, a: i64, b: i64) -> string {
     if b <= a {
         return "";
     }
-    return str.slice(s, a, b);
+    return str.slice(s, a, b)
 }
 
-// 解析整篇文本。成功 0；失败返回负码（见文件头）。
-pub unsafe fn load_text(s: string) -> i64 {
+// 解析整篇文本，键追加到 ks、值追加到 vs（调用方负责先清空）。成功 0。
+pub unsafe fn parse_into(s: string, ref ks: table<string>, ref vs: table<string>) -> i64 {
     var n = str_len(s);
     // 跳过 `type tie<data>` 头与前置注释，定位到第一个 '['（表字面量起点）。
     var i = 0;
@@ -101,8 +94,6 @@ pub unsafe fn load_text(s: string) -> i64 {
         return -2;
     }
     i = skip_gap(s, i + 1);
-    var ks: table<string> = [];
-    var vs: table<string> = [];
     while i < n && ch(s, i) != "]" {
         var k1 = read_str(s, i);
         if k1 < 0 {
@@ -126,19 +117,11 @@ pub unsafe fn load_text(s: string) -> i64 {
     if i >= n || ch(s, i) != "]" {
         return -6;
     }
-    pad_blank();
-    var m = len(ks);
-    var j = 0;
-    while j < m {
-        table_push(g_keys, ks[j]);
-        table_push(g_vals, vs[j]);
-        j = j + 1;
-    }
     return 0;
 }
 
 // 读文件并解析。成功 0，失败 -1（文件不存在）或解析负码。
-pub unsafe fn load_file(path: string) -> i64 {
+pub unsafe fn load_into(path: string, ref ks: table<string>, ref vs: table<string>) -> i64 {
     var ex = false
     unsafe { ex = file_exists(path) }
     if !ex {
@@ -147,31 +130,19 @@ pub unsafe fn load_file(path: string) -> i64 {
     var txt = ""
     unsafe { txt = file_read(path) }
     var rc = 0
-    unsafe { rc = load_text(txt) }
+    unsafe { rc = parse_into(txt, ks, vs) }
     return rc
 }
 
-// 取键对应的值；不存在返回空串（调用方据此回落内置消息）。
-pub unsafe fn get(key: string) -> string {
-    pad_blank();
-    var m = len(g_keys);
-    var j = 1;
+// 在解析结果里按键查值；未命中返回空串（调用方据此回落内置消息）。
+pub unsafe fn lookup(ref ks: table<string>, ref vs: table<string>, key: string) -> string {
+    var m = len(ks)
+    var j = 0
     while j < m {
-        if g_keys[j] == key {
-            return g_vals[j];
+        if ks[j] == key {
+            return vs[j]
         }
-        j = j + 1;
+        j = j + 1
     }
-    return "";
-}
-
-pub unsafe fn count() -> i64 {
-    pad_blank();
-    return len(g_keys) - 1;
-}
-
-pub unsafe fn clear() {
-    g_keys = [];
-    g_vals = [];
-    return
+    return ""
 }

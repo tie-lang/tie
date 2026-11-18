@@ -7,9 +7,75 @@ type tie<class>
 //
 // 新增语言的做法：在对应函数里加一个分支，而不是复制整个消息目录。
 import "./diagcode.tie"
+import "./locdata.tie"
+
+// 语言包目录（data/locale 的父级解析结果），由 driver 在解析参数后登记；
+// 未登记时只在 "data/locale" 上尝试，读不到就整体回落内置消息。
+// 键表/值表由本文件持有（locdata 无状态，只做解析与查表）。
+pub var g_pack_dir: string = ""
+pub var g_pack_lang: string = ""
+pub var g_pack_rc: i64 = -1
+var g_pack_keys: table<string> = []
+var g_pack_vals: table<string> = []
+
+pub func set_pack_dir(d: string) -> i64 {
+    g_pack_dir = d
+    g_pack_lang = ""
+    return 0
+}
+
+// 把模板里的 <名字> 占位符换成实参（只做字面替换，不做转义）。
+func fill_tok(t: string, k: string, v: string) -> string {
+    var out = ""
+    var n = str_len(t)
+    var i = 0
+    var pat = "<" + k + ">"
+    var m = str_len(pat)
+    while i < n {
+        if i + m <= n && str.slice(t, i, i + m) == pat {
+            out = out + v
+            i = i + m
+        } else {
+            out = out + str_char(t, i)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// 按当前语言惰性载入语言包；语言变化即重载。载入码留在 g_pack_rc。
+unsafe func ensure_pack() {
+    var l = diagcode.cur_lang()
+    if l == g_pack_lang {
+        return
+    }
+    g_pack_lang = l
+    g_pack_rc = -1
+    g_pack_keys = []
+    g_pack_vals = []
+    if str_len(g_pack_dir) > 0 {
+        g_pack_rc = locdata.load_into(g_pack_dir + "/" + l + ".td", g_pack_keys, g_pack_vals)
+        if g_pack_rc == 0 {
+            return
+        }
+    }
+    g_pack_rc = locdata.load_into("data/locale/" + l + ".td", g_pack_keys, g_pack_vals)
+}
+
+// 取语言包模板（未命中返回空串，调用方回落内置消息）。
+func pack_msg(key: string) -> string {
+    unsafe { ensure_pack() }
+    var t = ""
+    unsafe { t = locdata.lookup(g_pack_keys, g_pack_vals, key) }
+    return t
+}
 
 // 变量初始化类型不匹配（E00377）。
 pub func msg_var_type_mismatch(nm: string, ann: string, got: string) -> string {
+    var pt = pack_msg("E00377.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(fill_tok(pt, "nm", nm), "ann", ann), "got", got)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "variable '" + nm + "' type mismatch: annotated " + ann + ", but the expression infers " + got
     }
@@ -63,6 +129,10 @@ pub func msg_compound_assign_mismatch(target: string, expr: string) -> string {
 
 // 类型未定义（E00554）。
 pub func msg_undef_type(nm: string) -> string {
+    var pt = pack_msg("E00554.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(pt, "nm", nm)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "undefined type '" + nm + "'"
     }

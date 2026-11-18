@@ -268,6 +268,9 @@ func main() -> i64 {
     if !file_exists(g_input) {
         return 1
     }
+    // 语言包目录：先按输入文件所在目录找 data/locale，找不到时由 locale 层
+    // 回落当前工作目录下的 data/locale（两条都读不到则用内置消息）。
+    locale.set_pack_dir(base_dir + "/data/locale")
     var src = file_read(g_input)
     // 诊断区间只核对主文件：把这份源码交给诊断层，导入库里的错误不会给出 fix。
     diagcode.set_main_src(src)
