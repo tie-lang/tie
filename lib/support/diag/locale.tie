@@ -1,0 +1,25 @@
+type tie<class>
+// lib/support/diag/locale.tie —— 诊断消息的语言切换层
+// ============================================================
+// 消息文本按「诊断族」集中成函数：调用点只传结构化参数（名字、类型名、个数），
+// 语言选择由 diagcode.cur_lang() 决定（CLI: --lang=<code>）。
+// 码与文本彻底解耦：码由调用点显式登记（ERR:E#####:…），本文件只产出文本。
+//
+// 新增语言的做法：在对应函数里加一个分支，而不是复制整个消息目录。
+import "./diagcode.tie"
+
+// 变量初始化类型不匹配（E00377）。
+pub func msg_var_type_mismatch(nm: string, ann: string, got: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "variable '" + nm + "' type mismatch: annotated " + ann + ", but the expression infers " + got
+    }
+    return "变量 '" + nm + "' 类型不匹配：标注 " + ann + "，表达式推导为 " + got
+}
+
+// 数组字面量元素个数/元素类型与标注不符（同属 E00377 族）。
+pub func msg_var_array_mismatch(nm: string, ann: string, need: string, actual: string, elemt: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "variable '" + nm + "' type mismatch: annotated " + ann + "; an array literal needs " + need + " elements (got " + actual + "), each of type " + elemt
+    }
+    return "变量 '" + nm + "' 类型不匹配：标注 " + ann + "；数组字面量元素个数必须为 " + need + "（实际 " + actual + "），且元素类型必须与 " + elemt + " 一致"
+}

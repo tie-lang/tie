@@ -243,10 +243,10 @@ pub func check_var_decl(s: i64) -> i64 {
                 sm_err_col = s_cols[s]
                 if types.kind(ty) == K_ARRAY && s_tags[init] == S_N_TABLE_LIT {
                     sm_err_code = "E00377"
-                    sm_err_msg = "变量 '" + nm + "' 类型不匹配：标注 " + types.type_name(ty) + "；数组字面量元素个数必须为 " + to_string(types.array_len(ty)) + "（实际 " + to_string(sstate.nchild(init)) + "），且元素类型必须与 " + types.type_name(types.array_elem(ty)) + " 一致"
+                    sm_err_msg = locale.msg_var_array_mismatch(nm, types.type_name(ty), to_string(types.array_len(ty)), to_string(sstate.nchild(init)), types.type_name(types.array_elem(ty)))
                 } else {
                     sm_err_code = "E00377"
-                    sm_err_msg = "变量 '" + nm + "' 类型不匹配：标注 " + types.type_name(ty) + "，表达式推导为 " + types.type_name(it)
+                    sm_err_msg = locale.msg_var_type_mismatch(nm, types.type_name(ty), types.type_name(it))
                 }
                 return -1
             }
