@@ -19,4 +19,13 @@ type tie<data>
     "E00557.help": "E00557 · the type argument does not implement the interface the generic bound requires — add the missing methods in an impl block",
     "E00560.help": "E00560 · the concrete type does not satisfy the interface, so it cannot be promoted — implement the missing method or fix its signature",
     "E00561.help": "E00561 · the concrete type has no impl for this port, so it cannot be promoted — write `impl P for T` first",
+  "E00357.help": "E00357 · a ref parameter cannot carry a default value — pass the argument at every call",
+  "E00360.help": "E00360 · a required parameter follows an optional one — move every defaulted parameter to the end",
+  "E00361.help": "E00361 · a parameter default disagrees with the annotated type — give a literal of that type",
+  "E00690.help": "E00690 · immut and ref are mutually exclusive — pick read-only or mutable borrowing",
+  "E00691.help": "E00691 · move cannot be combined with ref/immut — ownership is transferred, so nothing is left to borrow",
+  "E00692.help": "E00692 · ref only applies to table parameters or fixed arrays — drop ref or change the parameter type",
+  "E00693.help": "E00693 · a passing-convention modifier repeats — each of ref/immut/move/deep/shared may appear once",
+  "E00905.help": "E00905 · shared and deep are mutually exclusive — sharing one copy and copying on entry contradict",
+  "E00914.help": "E00914 · a parameter default must be a literal or a compile-time constant — no calls, no runtime input",
 ]
