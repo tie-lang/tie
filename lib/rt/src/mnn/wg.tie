@@ -1,4 +1,42 @@
 type tie<class, unsafe:mem>
+
+// 内部数组访问：tl_vec 是裸指针实现（unsafe），包成安全函数，
+// 免得每个调用点散落 unsafe 块；句柄是 tl_vec 私有布局的 i64。
+func wv_new() -> i64 {
+    var r: i64 = 0
+    unsafe {
+        r = tl_vec.vec_new()
+    }
+    return r
+}
+func wv_len(h: i64) -> i64 {
+    var r: i64 = 0
+    unsafe {
+        r = tl_vec.vec_len(h)
+    }
+    return r
+}
+func wv_get(h: i64, i: i64) -> i64 {
+    var r: i64 = 0
+    unsafe {
+        r = tl_vec.vec_at(h, i)
+    }
+    return r
+}
+func wv_set(h: i64, i: i64, v: i64) {
+    unsafe {
+        // 与原 table 的越界写语义一致：扩容补零后再写
+        if i >= tl_vec.vec_len(h) {
+            tl_vec.vec_fill(h, i + 1, 0)
+        }
+        tl_vec.vec_set(h, i, v)
+    }
+}
+func wv_push(h: i64, v: i64) {
+    unsafe {
+        tl_vec.vec_push(h, v)
+    }
+}
 // core/mnn/wg.tie —— trm-lite WaitGroup 结构化并发（命名空间 trm_lite_wg）
 // 语义对标 Go sync.WaitGroup：
 //   · wg_new() -> i64：新组句柄（1 起；每组合 CS/CV 缓冲 + 计数槽）
@@ -9,15 +47,16 @@ type tie<class, unsafe:mem>
 //     （句柄序号 + 平行数组追加复合临界区）
 // 承载：平行数组（句柄 = 下标+1），CS/CV 缓冲 alloc + tl_k32 声明源自持。
 import "./tl_k32.tie"
+import "../util/tl_vec.tie"
 
 const WG_MAX: i64 = 256        // 组数上限
 const WG_WAIT_MS: i64 = 50     // wg_wait 限时重新谓词间隔
 
 var g_wg_next: i64 = 0         // 下一个组句柄（1 起）
 var g_wg_alloc_cs: i64 = 0     // 全局分配锁（句柄序号 + 平行数组复合临界区）
-var g_wg_cs: table<i64> = []   // 每组合锁缓冲地址
-var g_wg_cv: table<i64> = []   // 每组条件变量缓冲地址
-var g_wg_cnt: table<i64> = []  // 每组计数
+var g_wg_cs: i64 = 0   // 每组合锁缓冲地址
+var g_wg_cv: i64 = 0   // 每组条件变量缓冲地址
+var g_wg_cnt: i64 = 0  // 每组计数
 var g_wg_init: i64 = 0
 
 namespace trm_lite_wg;
@@ -29,9 +68,9 @@ pub func ensure() {
             g_wg_alloc_cs = ptr_to_int(alloc(64))
             InitializeCriticalSection(g_wg_alloc_cs)
         }
-        g_wg_cs = table_new_i64()
-        g_wg_cv = table_new_i64()
-        g_wg_cnt = table_new_i64()
+        g_wg_cs = wv_new()
+        g_wg_cv = wv_new()
+        g_wg_cnt = wv_new()
         g_wg_init = 1
     }
 }
@@ -58,9 +97,9 @@ pub func wg_new() -> i64 {
         }
         g_wg_next = g_wg_next + 1
         h = g_wg_next
-        table_push(g_wg_cs, cs)
-        table_push(g_wg_cv, cv)
-        table_push(g_wg_cnt, 0)
+        wv_push(g_wg_cs, cs)
+        wv_push(g_wg_cv, cv)
+        wv_push(g_wg_cnt, 0)
         LeaveCriticalSection(g_wg_alloc_cs)
     }
     return h
@@ -69,12 +108,12 @@ pub func wg_new() -> i64 {
 // wg_lock/wg_unlock（每组合锁）。
 func wg_lock(h: i64) {
     unsafe {
-        EnterCriticalSection(g_wg_cs[h - 1])
+        EnterCriticalSection(wv_get(g_wg_cs, h - 1))
     }
 }
 func wg_unlock(h: i64) {
     unsafe {
-        LeaveCriticalSection(g_wg_cs[h - 1])
+        LeaveCriticalSection(wv_get(g_wg_cs, h - 1))
     }
 }
 
@@ -85,7 +124,7 @@ pub func wg_add(h: i64, n: i64) {
         return
     }
     wg_lock(h)
-    g_wg_cnt[h - 1] = g_wg_cnt[h - 1] + n
+    wv_set(g_wg_cnt, h - 1, wv_get(g_wg_cnt, h - 1) + n)
     wg_unlock(h)
 }
 
@@ -96,11 +135,11 @@ pub func wg_done(h: i64) {
         return
     }
     wg_lock(h)
-    g_wg_cnt[h - 1] = g_wg_cnt[h - 1] - 1
-    if g_wg_cnt[h - 1] <= 0 {
-        g_wg_cnt[h - 1] = 0
+    wv_set(g_wg_cnt, h - 1, wv_get(g_wg_cnt, h - 1) - 1)
+    if wv_get(g_wg_cnt, h - 1) <= 0 {
+        wv_set(g_wg_cnt, h - 1, 0)
         unsafe {
-            WakeConditionVariable(g_wg_cv[h - 1])
+            WakeConditionVariable(wv_get(g_wg_cv, h - 1))
         }
     }
     wg_unlock(h)
@@ -113,9 +152,9 @@ pub func wg_wait(h: i64) {
         return
     }
     wg_lock(h)
-    while g_wg_cnt[h - 1] > 0 {
+    while wv_get(g_wg_cnt, h - 1) > 0 {
         unsafe {
-            SleepConditionVariableCS(g_wg_cv[h - 1], g_wg_cs[h - 1], WG_WAIT_MS)
+            SleepConditionVariableCS(wv_get(g_wg_cv, h - 1), wv_get(g_wg_cs, h - 1), WG_WAIT_MS)
         }
     }
     wg_unlock(h)
@@ -126,7 +165,7 @@ pub func wg_count(h: i64) -> i64 {
     if h < 1 || h > g_wg_next {
         return 0
     }
-    return g_wg_cnt[h - 1]
+    return wv_get(g_wg_cnt, h - 1)
 }
 
 // 运行时清理（进程收尾）：销毁各组锁 + 全局分配锁。
@@ -135,7 +174,7 @@ pub func shutdown() {
         var i: i64 = 0
         while i < g_wg_next {
             unsafe {
-                DeleteCriticalSection(g_wg_cs[i])
+                DeleteCriticalSection(wv_get(g_wg_cs, i))
             }
             i = i + 1
         }
