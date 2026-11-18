@@ -165,9 +165,12 @@ func collect_impl_one(im: i64) -> i64 {
     // 方法全名表（按 port 方法声明序；-1 = 缺实现）
     var nport_m = pm_n[pi]
     var mnames: table<i64> = table_new_i64()
+    // 与 mnames 平行的方法节点表：报签名不匹配时定位到方法本身（而不是 impl 头）。
+    var mnodes: table<i64> = table_new_i64()
     var mi: i64 = 0
     while mi < nport_m {
         table_push(mnames, -1)
+        table_push(mnodes, -1)
         mi = mi + 1
     }
     var nc = sstate.nchild(im)
@@ -228,6 +231,7 @@ func collect_impl_one(im: i64) -> i64 {
         if pmi >= 0 {
             if mnames[pmi] < 0 {
                 mnames[pmi] = intern.intern(full)
+                mnodes[pmi] = m
             } else {
                 sm_err_line = s_lines[m]
                 sm_err_col = s_cols[m]
@@ -264,8 +268,12 @@ func collect_impl_one(im: i64) -> i64 {
         var pnp = sstate.port_method_nparams(pi, mi3)  // 含 self
         var fnp = sg_nparams[sig]
         if fnp != pnp {
-            sm_err_line = s_lines[im]
-            sm_err_col = s_cols[im]
+            var mnode = mnodes[mi3]
+            if mnode < 0 {
+                mnode = im
+            }
+            sm_err_line = s_lines[mnode]
+            sm_err_col = s_cols[mnode]
             sm_err_code = "E00112"
             span_of(sm_err_line, sm_err_col, sstate.port_method_name(pi, mi3))
             sm_err_msg = locale.msg_impl_arity(sstate.port_method_name(pi, mi3), to_string(pnp), to_string(fnp))
@@ -284,8 +292,12 @@ func collect_impl_one(im: i64) -> i64 {
             j = j + 1
         }
         if !sig_ok {
-            sm_err_line = s_lines[im]
-            sm_err_col = s_cols[im]
+            var mnode = mnodes[mi3]
+            if mnode < 0 {
+                mnode = im
+            }
+            sm_err_line = s_lines[mnode]
+            sm_err_col = s_cols[mnode]
             sm_err_code = "E00113"
             span_of(sm_err_line, sm_err_col, sstate.port_method_name(pi, mi3))
             sm_err_msg = locale.msg_impl_param_type(sstate.port_method_name(pi, mi3))
@@ -293,8 +305,12 @@ func collect_impl_one(im: i64) -> i64 {
         }
         var want_ret = sstate.port_method_ret(pi, mi3)
         if sg_ret[sig] != want_ret {
-            sm_err_line = s_lines[im]
-            sm_err_col = s_cols[im]
+            var mnode = mnodes[mi3]
+            if mnode < 0 {
+                mnode = im
+            }
+            sm_err_line = s_lines[mnode]
+            sm_err_col = s_cols[mnode]
             sm_err_code = "E00120"
             span_of(sm_err_line, sm_err_col, sstate.port_method_name(pi, mi3))
             sm_err_msg = locale.msg_impl_ret_type(sstate.port_method_name(pi, mi3), types.type_name(want_ret), types.type_name(sg_ret[sig]))
