@@ -35,7 +35,7 @@ unsafe fn tbl_clone_body(h: i64) -> i64 {
     var esz = esz_v(p)             // 含深表标记位
     var pure = esz & TBL_MASK
     var isdeep = (esz & TBL_DEEP) != 0
-    var nh = ack(56)                 // nh 已是 ptr（同 tbl_new 的 h）
+    var nh = ack(120)                 // 24 句柄 + 32 表头 + 64 锁
     var ncap: i64 = 0
     var ndata: i64 = 0
     if len > 0 {
@@ -49,11 +49,7 @@ unsafe fn tbl_clone_body(h: i64) -> i64 {
     set_data_v(nh, ndata)
     set_esz_v(nh, esz)                 // 原样保留深表标记
     set_refc_v(nh, 1)
-    var lk = ack(64)
-    unsafe {
-        InitializeCriticalSection(ptr_to_int(lk));
-    }
-    set_lock_v(nh, ptr_to_int(lk))
+    init_lock(nh)
     if isdeep {
         var i: i64 = 0
         while i < len {
@@ -79,7 +75,7 @@ unsafe fn tbl_clone_deep_body(h: i64) -> i64 {
     var esz = esz_v(p)
     var pure = esz & TBL_MASK
     var isdeep = (esz & TBL_DEEP) != 0
-    var nh = ack(56)
+    var nh = ack(120)                 // 24 句柄 + 32 表头 + 64 锁
     var ncap: i64 = 0
     var ndata: i64 = 0
     if len > 0 {
@@ -93,11 +89,7 @@ unsafe fn tbl_clone_deep_body(h: i64) -> i64 {
     set_data_v(nh, ndata)
     set_esz_v(nh, esz)
     set_refc_v(nh, 1)
-    var lk = ack(64)
-    unsafe {
-        InitializeCriticalSection(ptr_to_int(lk));
-    }
-    set_lock_v(nh, ptr_to_int(lk))
+    init_lock(nh)
     if isdeep {
         var i: i64 = 0
         while i < len {

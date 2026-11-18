@@ -147,4 +147,16 @@ pub unsafe fn lock_leave(h: i64) {
     }
 }
 
-// 建空表：esz = 元素字节大小。返回句柄（i64 = 48 字节块指针）。
+// 就地初始化每表锁：句柄块尾部（24 句柄 + 32 表头 = 56）紧跟 64 字节
+// CRITICAL_SECTION 缓冲，不再单独 malloc —— 建表从 3 次分配降到 2 次，
+// 释放也只需一次 free。lock 字段记自身地址，锁与句柄同生共死。
+pub unsafe fn init_lock(p: ptr<u8>) -> i64 {
+    var base = ptr_to_int(p) + 56
+    unsafe {
+        InitializeCriticalSection(base)
+    }
+    set_lock_v(p, base)
+    return base
+}
+
+// 建空表：esz = 元素字节大小。返回句柄（i64 = 指向 120 字节块的指针）。
