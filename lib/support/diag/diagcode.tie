@@ -743,6 +743,18 @@ pub func warn_tip_of(core: string) -> string {
 // warning[W#####] @行:列: 消息名；潜在影响与处理建议。 （line < 0 省略位置段）
 pub func render_warning(line: i64, col: i64, core: string) -> string {
     var cc = warn_code_of(core)
+    if g_diag_json != 0 {
+        var jo = "{\"severity\":\"warning\",\"code\":\"" + json_esc(cc) + "\""
+        if line >= 0 {
+            jo = jo + ",\"line\":" + to_string(line) + ",\"col\":" + to_string(col)
+        }
+        jo = jo + ",\"message\":\"" + json_esc(warn_name_of(core)) + "\""
+        var jtp = warn_tip_of(core)
+        if len(jtp) > 0 {
+            jo = jo + ",\"tip\":\"" + json_esc(jtp) + "\""
+        }
+        return jo + ",\"lang\":\"" + json_esc(g_lang) + "\"}"
+    }
     var out = "warning[" + cc + "]"
     if line >= 0 {
         out = out + " @" + to_string(line) + ":" + to_string(col)
