@@ -8,6 +8,21 @@ type tie<class>
 // 主文件顶层 main() 以 driver.<名>() 调用。
 namespace driver;
 // 打印用法（--help）。返回 0。
+// 语言标签归一：接受 BCP 47 大小写与下划线变体，收敛到编译器内部的两个规范码。
+// 未知标签原样返回（渲染端只会命中已翻译的分支，其余回落到默认中文）。
+func norm_lang(v: string) -> string {
+    var s = str.to_lower(v)
+    if s == "en" || s == "en-us" || s == "en_us" {
+        return "en-US"
+    }
+    if s == "zh" || s == "zh-cn" || s == "zh_cn" || s == "zh-hans" {
+        return "zh-CN"
+    }
+    if s == "zh-tw" || s == "zh_tw" || s == "zh-hk" || s == "zh-hant" {
+        return "zh-TW"
+    }
+    return v
+}
 pub func usage() -> i64 {
     dbg_txt("tiec —— tie 编译器")
     dbg_txt("用法: tiec <input.tie> [选项]")
@@ -80,7 +95,7 @@ pub func parse_args() -> i64 {
     // ---- 语言：环境层先于参数层 ----
     // 优先级：--lang=<code>（参数循环内覆盖）> TIEC_LANG > 默认 zh-CN。
     // get_env 是语言内置，不需要引入 sys/win32 的平台依赖。
-    diagcode.set_lang(get_env("TIEC_LANG"))
+    diagcode.set_lang(norm_lang(get_env("TIEC_LANG")))
     var i: i64 = 0
     var input_set: bool = false
     // ---- 构建模式预扫描（--develop / --release）----
@@ -238,7 +253,7 @@ pub func parse_args() -> i64 {
             g_no_cache = true
         } else if tie.support::has_prefix(a, "--lang=") {
             // 诊断消息语言：--lang=zh-CN / --lang=en-US。只改消息文本，不改诊断码。
-            diagcode.set_lang(str.slice(a, 7, str_len(a)))
+            diagcode.set_lang(norm_lang(str.slice(a, 7, str_len(a))))
         } else if a == "--diag-format=json" {
             // 诊断输出改单行 JSON（code/line/col/message），供编辑器与 CI 解析。
             diagcode.set_diag_json(1)
