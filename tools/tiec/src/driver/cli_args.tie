@@ -77,6 +77,10 @@ pub func parse_opt_level(s: string) -> i64 {
 // 解析参数：返回 0 正常 / 2 请求帮助 / -1 参数错误。g_* 填充解析结果。
 pub func parse_args() -> i64 {
     var n: i64 = arg_count()
+    // ---- 语言：环境层先于参数层 ----
+    // 优先级：--lang=<code>（参数循环内覆盖）> TIEC_LANG > 默认 zh-CN。
+    // get_env 是语言内置，不需要引入 sys/win32 的平台依赖。
+    diagcode.set_lang(get_env("TIEC_LANG"))
     var i: i64 = 0
     var input_set: bool = false
     // ---- 构建模式预扫描（--develop / --release）----
