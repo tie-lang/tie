@@ -278,9 +278,59 @@ func tail_fix(t: string) -> string {
 
 // ---------- 输出渲染 ----------
 
+// ---------- 结构化输出 ----------
+// 诊断行默认是人类可读文本。调用 set_diag_json(1)（CLI: --diag-format=json）后
+// render_error 改输单行 JSON，供编辑器与 CI 解析；code 字段永远存在。
+pub var g_diag_json: i64 = 0
+
+pub func set_diag_json(v: i64) {
+    g_diag_json = v
+}
+
+// 两位数小写十六进制（b 取 0..255）。
+func hex2(b: i64) -> string {
+    var d = "0123456789abcdef"
+    var hi = b / 16
+    var lo = b % 16
+    return dg_slice(d, hi, hi + 1) + dg_slice(d, lo, lo + 1)
+}
+
+// JSON 字符串转义：引号、反斜杠与控制字符（后者写成 \u00XX）。
+func json_esc(s: string) -> string {
+    var sb = string_builder()
+    var n: i64 = len(s)
+    var i: i64 = 0
+    while i < n {
+        var b = str_byte(s, i)
+        if b == 34 {
+            sb_append(sb, "\\\"")
+        } else if b == 92 {
+            sb_append(sb, "\\\\")
+        } else if b < 32 {
+            sb_append(sb, "\\u00")
+            sb_append(sb, hex2(b))
+        } else {
+            sb_append_byte(sb, b)
+        }
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
 // error[E#####] @行:列: 消息名；期望 x；实际 y。 （line < 0 时省略位置段）
 pub func render_error(line: i64, col: i64, msg: string) -> string {
     var cc = code_of(msg)
+    if g_diag_json != 0 {
+        var body = name_of(msg)
+        var jt = tail_of(msg)
+        if len(jt) > 0 {
+            body = body + "；" + jt
+        }
+        var j = "{\"code\":\"" + cc + "\",\"line\":" + to_string(line)
+        j = j + ",\"col\":" + to_string(col)
+        j = j + ",\"message\":\"" + json_esc(body) + "\"}"
+        return j
+    }
     var out = "error[" + cc + "]"
     if line >= 0 {
         out = out + " @" + to_string(line) + ":" + to_string(col)
