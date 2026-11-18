@@ -11,7 +11,13 @@ namespace driver;
 // 语言标签归一：接受 BCP 47 大小写与下划线变体，收敛到编译器内部的两个规范码。
 // 未知标签原样返回（渲染端只会命中已翻译的分支，其余回落到默认中文）。
 func norm_lang(v: string) -> string {
-    var s = str.to_lower(v)
+    var raw = str.to_lower(v)
+    // LANG/LC_ALL 常见写法 en_US.UTF-8：丢掉「.」之后的编码段再归一。
+    var dot = str.find(raw, ".")
+    var s = raw
+    if dot >= 0 {
+        s = str.slice(raw, 0, dot)
+    }
     if s == "en" || s == "en-us" || s == "en_us" {
         return "en-US"
     }
@@ -95,9 +101,16 @@ pub func parse_opt_level(s: string) -> i64 {
 pub func parse_args() -> i64 {
     var n: i64 = arg_count()
     // ---- 语言：环境层先于参数层 ----
-    // 优先级：--lang=<code>（参数循环内覆盖）> TIEC_LANG > 默认 zh-CN。
+    // 优先级：--lang=<code>（参数循环内覆盖）> TIEC_LANG > LC_ALL > LANG > 默认 zh-CN。
     // get_env 是语言内置，不需要引入 sys/win32 的平台依赖。
-    diagcode.set_lang(norm_lang(get_env("TIEC_LANG")))
+    var envl = get_env("TIEC_LANG")
+    if str_len(envl) == 0 {
+        envl = get_env("LC_ALL")
+    }
+    if str_len(envl) == 0 {
+        envl = get_env("LANG")
+    }
+    diagcode.set_lang(norm_lang(envl))
     var i: i64 = 0
     var input_set: bool = false
     // ---- 构建模式预扫描（--develop / --release）----
