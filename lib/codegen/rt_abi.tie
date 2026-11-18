@@ -15,11 +15,12 @@ type tie<class>
 // 内联快路径的静态前提（irgen 侧判据，见 rt_elem_inline_ok）：
 //   * 元素是标量/字符串/布尔（LLVM 一等值；聚合与 any 一律回退调用路径）；
 //   * 元素宽度与运行期 esz 同源（同一 `elem_size` 决定建表实参）。
-pub const RT_TBL_OFF_CAP: i64 = 0;    // 容量（元素数）
-pub const RT_TBL_OFF_LEN: i64 = 8;    // 长度（元素数）
-pub const RT_TBL_OFF_DATA: i64 = 16;  // 数据缓冲区地址
-pub const RT_TBL_OFF_ESZ: i64 = 24;   // 元素宽度（低 62 位；bit62 = 深表）
-pub const RT_TBL_OFF_RC: i64 = 40;    // 引用计数（越界写分流用）
+pub const RT_TBL_OFF_CAP: i64 = 8;    // 容量（元素数）
+pub const RT_TBL_OFF_LEN: i64 = 0;    // 长度（元素数）
+pub const RT_TBL_OFF_DATA: i64 = 48;  // 数据缓冲区地址
+pub const RT_TBL_OFF_ESZ: i64 = 32;   // 元素宽度（低 62 位；bit62 = 深表）
+pub const RT_TBL_OFF_RC: i64 = 24;    // 引用计数（越界写分流用）
+pub const RT_TBL_OFF_LOCK: i64 = 40;  // 每表 CRITICAL_SECTION 缓冲地址（表头内）
 
 // 内联快路径元素宽度：标量/字符串 8，布尔 1；其余 -1（回退调用路径）。
 // 与 `elem_size`（建表实参同源）保持一致：i64/f64/string/ptr 族 → 8，bool → 1。

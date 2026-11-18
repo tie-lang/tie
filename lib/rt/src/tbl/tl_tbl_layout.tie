@@ -45,43 +45,48 @@ namespace tl_tbl;
 // 句柄字段访问器（值形态，全 i64）：形参是字段块基址 ptr<u8>，返回值一律 i64。
 // 分片里的裸 r_i64(p, 偏移)/w_i64(p, 偏移, v) 逐处替换成 cap_v/len_v/data_v/esz_v/lock_v/refc_v
 // 与对应 set_*，句柄布局只在这一层表达；换布局时改这里，不动调用点。
-// 现有布局：{cap@0, len@8, data@16, esz@24, lock@32, refcount@40}。
+// 现有布局：24 字节句柄 {len@0, cap@8, 保留@16}，表头紧随其后（基址 = 句柄 + 24）：
+// {refcount@24, esz@32, lock@40, data@48}。句柄与表头同块分配，tbl_release 只 free 一次；
+// 元素缓冲仍独立分配。
 // esz 高位带「深表」标记位，读取方自己按 TBL_MASK 掩（与旧写法一致）。
-pub unsafe fn cap_v(p: ptr<u8>) -> i64 {
-    return r_i64(p, 0)
-}
-pub unsafe fn set_cap_v(p: ptr<u8>, v: i64) {
-    w_i64(p, 0, v)
+pub unsafe fn hdr_v(p: ptr<u8>) -> ptr<u8> {
+    return int_to_ptr(ptr_to_int(p) + 24)
 }
 pub unsafe fn len_v(p: ptr<u8>) -> i64 {
-    return r_i64(p, 8)
+    return r_i64(p, 0)
 }
 pub unsafe fn set_len_v(p: ptr<u8>, v: i64) {
+    w_i64(p, 0, v)
+}
+pub unsafe fn cap_v(p: ptr<u8>) -> i64 {
+    return r_i64(p, 8)
+}
+pub unsafe fn set_cap_v(p: ptr<u8>, v: i64) {
     w_i64(p, 8, v)
 }
-pub unsafe fn data_v(p: ptr<u8>) -> i64 {
-    return r_i64(p, 16)
-}
-pub unsafe fn set_data_v(p: ptr<u8>, v: i64) {
-    w_i64(p, 16, v)
-}
-pub unsafe fn esz_v(p: ptr<u8>) -> i64 {
-    return r_i64(p, 24)
-}
-pub unsafe fn set_esz_v(p: ptr<u8>, v: i64) {
-    w_i64(p, 24, v)
-}
-pub unsafe fn lock_v(p: ptr<u8>) -> i64 {
-    return r_i64(p, 32)
-}
-pub unsafe fn set_lock_v(p: ptr<u8>, v: i64) {
-    w_i64(p, 32, v)
-}
 pub unsafe fn refc_v(p: ptr<u8>) -> i64 {
-    return r_i64(p, 40)
+    return r_i64(hdr_v(p), 0)
 }
 pub unsafe fn set_refc_v(p: ptr<u8>, v: i64) {
-    w_i64(p, 40, v)
+    w_i64(hdr_v(p), 0, v)
+}
+pub unsafe fn esz_v(p: ptr<u8>) -> i64 {
+    return r_i64(hdr_v(p), 8)
+}
+pub unsafe fn set_esz_v(p: ptr<u8>, v: i64) {
+    w_i64(hdr_v(p), 8, v)
+}
+pub unsafe fn lock_v(p: ptr<u8>) -> i64 {
+    return r_i64(hdr_v(p), 16)
+}
+pub unsafe fn set_lock_v(p: ptr<u8>, v: i64) {
+    w_i64(hdr_v(p), 16, v)
+}
+pub unsafe fn data_v(p: ptr<u8>) -> i64 {
+    return r_i64(hdr_v(p), 24)
+}
+pub unsafe fn set_data_v(p: ptr<u8>, v: i64) {
+    w_i64(hdr_v(p), 24, v)
 }
 
 // 裸槽读写：p 是**任意 i64 槽地址**（out 形参、元素槽、配对栈），与句柄无关。
@@ -129,7 +134,7 @@ pub unsafe fn ack(n: i64) -> ptr<u8> {
 // 每表锁：句柄 @32 存 CRITICAL_SECTION 缓冲地址（tbl_new 时 alloc+init）。
 // 自持 extern 后 tl_tbl.o 仅含 tl_tbl$*，任意形态程序按需提取不撞符号。
 pub unsafe fn lock_of(h: i64) -> i64 {
-    return r_i64(int_to_ptr(h), 32)
+    return lock_v(int_to_ptr(h))
 }
 pub unsafe fn lock_enter(h: i64) {
     unsafe {

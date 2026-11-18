@@ -747,6 +747,21 @@ func tl_i64_4(sym: string, v1: i64, v2: i64, v3: i64, v4: i64) -> i64 {
     return tig_trmlite_call(sym, ats, avs, types.named(TK_I64))
 }
 
+// 四参调用：末参是 ptr（数据缓冲地址），其余 i64 —— 供 tl_tbl$tbl_adopt。
+func tl_str_i64_4(sym: string, v1: i64, v2: i64, v3: i64, v4: i64) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v1)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v2)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v3)
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, v4)
+    return tig_trmlite_call(sym, ats, avs, types.named(TK_I64))
+}
+
 // 六参 i64 调用——供纯增长入口 tbl_grow_pure 使用。
 func tl_i64_6(sym: string, v1: i64, v2: i64, v3: i64, v4: i64, v5: i64, v6: i64) -> i64 {
     var ats: table<i64> = table_new_i64()
@@ -831,7 +846,7 @@ func s21_table_new_inl(esz_v: i64) -> i64 {
         return t21_intp(tl_i64_1("tl_tbl$tbl_new", esz_v))
     }
     var T64 = types.named(TK_I64)
-    var h = s21_raw_alloc_str(tig_int_lit(48))
+    var h = s21_raw_alloc_str(tig_int_lit(56))
     if h < 0 {
         return -1
     }
@@ -843,7 +858,7 @@ func s21_table_new_inl(esz_v: i64) -> i64 {
     s21_store(s21_gep(h, RT_TBL_OFF_ESZ, true), esz_v, T64)
     s21_store(s21_gep(h, RT_TBL_OFF_RC, true), tig_int_lit(1), T64)
     var lk = tl_i64_0("tl_tbl$lock_new")
-    s21_store(s21_gep(h, 32, true), lk, T64)
+    s21_store(s21_gep(h, RT_TBL_OFF_LOCK, true), lk, T64)
     return h
 }
 
@@ -889,13 +904,13 @@ func s21_table_new_deep(esz_v: i64) -> i64 {
 // （stdlib32 级 O(1)，不逐元素 push）。data 须为 malloc 块（tbl_release 用 free 收）。
 func s21_tbl_adopt(esz_v: i64, cap_v: i64, lenn_v: i64, dat: i64) -> i64 {
     if tbl_inline_enabled() == 0 {
-        return t21_intp(tl_i64_4("tl_tbl$tbl_adopt", esz_v, cap_v, lenn_v, dat))
+        return t21_intp(tl_str_i64_4("tl_tbl$tbl_adopt", esz_v, cap_v, lenn_v, dat))
     }
     var T64 = types.named(TK_I64)
     var h = s21_table_new(esz_v)
-    s21_store(s21_gep(h, 0, true), cap_v, T64)
-    s21_store(s21_gep(h, 8, true), lenn_v, T64)
-    s21_store(s21_gep(h, 16, true), dat, types.named(TK_STR))
+    s21_store(s21_gep(h, RT_TBL_OFF_CAP, true), cap_v, T64)
+    s21_store(s21_gep(h, RT_TBL_OFF_LEN, true), lenn_v, T64)
+    s21_store(s21_gep(h, RT_TBL_OFF_DATA, true), dat, types.named(TK_STR))
     return h
 }
 

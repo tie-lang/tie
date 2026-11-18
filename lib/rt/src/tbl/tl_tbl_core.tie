@@ -1,7 +1,7 @@
 type tie<class, unsafe:mem>
 namespace tl_tbl;
 pub unsafe fn tbl_new(esz: i64) -> i64 {
-    var h = ack(48)
+    var h = ack(56)
     set_cap_v(h, 0)     // cap = 0
     set_len_v(h, 0)     // len = 0
     set_data_v(h, 0)    // data = null
@@ -17,12 +17,12 @@ pub unsafe fn tbl_new(esz: i64) -> i64 {
 
 // 采纳预建数据缓冲：建一个合法句柄后把 cap/len/data 覆盖为调用方的缓冲区。
 // codegen 关闭句柄内联时用它替代手排偏移（s21_tbl_adopt）。
-pub unsafe fn tbl_adopt(esz: i64, cap: i64, lenn: i64, dat: i64) -> i64 {
+pub unsafe fn tbl_adopt(esz: i64, cap: i64, lenn: i64, dat: ptr<u8>) -> i64 {
     var h = tbl_new(esz)
     var p = int_to_ptr(h)
     set_cap_v(p, cap)
     set_len_v(p, lenn)
-    set_data_v(p, dat)
+    set_data_v(p, ptr_to_int(dat))
     return h
 }
 
@@ -39,7 +39,7 @@ pub unsafe fn lock_new() -> i64 {
 // 建深表：元素为表句柄（table<T> 嵌套表，元素宽 8）——tbl_release
 // 释放时逐元素释放内层表。esz 字段写入深表标记位（分配尺寸按掩码后计算）。
 pub unsafe fn tbl_new_deep(esz: i64) -> i64 {
-    var hp = ack(48)
+    var hp = ack(56)
     set_cap_v(hp, 0)
     set_len_v(hp, 0)
     set_data_v(hp, 0)
