@@ -244,6 +244,11 @@ pub func msg_param_default_type(nm: string, want: string, got: string) -> string
 // 诊断码说明（--explain=<code>）：成因 + 修法各一句，随 --lang 切换。
 // 未知码返回可用码清单，便于脚本探测本版本支持哪些说明。
 pub func help_for(dc: string) -> string {
+    // 语言包优先：键形如 "E00406.help"；包里有就用包，没有才走内置分支。
+    var pt = pack_msg(dc + ".help")
+    if str_len(pt) > 0 {
+        return pt
+    }
     var en = diagcode.cur_lang() == "en-US"
     var tw = diagcode.cur_lang() == "zh-TW"
     if dc == "E00377" {
