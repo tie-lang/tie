@@ -339,6 +339,16 @@ func hex2(b: i64) -> string {
 }
 
 // JSON 字符串转义：引号、反斜杠与控制字符（后者写成 \u00XX）。
+// --explain=<code> 的 JSON 形态：码、说明文本与语言一并给出，供编辑器与脚本消费。
+// 是否启用机读诊断（跨文件读 g_diag_json 用访问器，模块变量不对外暴露）。
+pub func diag_json_enabled() -> i64 {
+    return g_diag_json
+}
+
+pub func explain_json(dc: string, body: string) -> string {
+    return "{\"code\":\"" + json_esc(dc) + "\",\"message\":\"" + json_esc(body) + "\",\"lang\":\"" + json_esc(g_lang) + "\"}"
+}
+
 func json_esc(s: string) -> string {
     var sb = string_builder()
     var n: i64 = len(s)

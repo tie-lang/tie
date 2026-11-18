@@ -284,7 +284,12 @@ func main() -> i64 {
     }
     // 诊断码说明（--explain=<code>）：查表打印后直接结束，不进入编译流程。
     if str_len(g_explain) > 0 {
-        dbg_txt(locale.help_for(g_explain))
+        var hx = locale.help_for(g_explain)
+        if diagcode.diag_json_enabled() != 0 {
+            dbg_txt(diagcode.explain_json(g_explain, hx))
+        } else {
+            dbg_txt(hx)
+        }
         return 0
     }
     // tinker 接收入口（--tink-in / --tink-in-file）：编译前先消费输入帧。
