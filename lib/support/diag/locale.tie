@@ -72,6 +72,105 @@ pub func msg_undef_type(nm: string) -> string {
     return "类型 '" + nm + "' 未定义"
 }
 
+// 参数传递约定修饰重复（E00693）。
+pub func msg_param_dup_conv(nm: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "parameter '" + nm + "' repeats a passing-convention modifier (ref/immut/move/deep/shared: at most once each)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "參數 '" + nm + "' 的傳遞約定修飾重複出現（ref/immut/move/deep/shared 各至多一次）"
+    }
+    return "参数 '" + nm + "' 的传递约定修饰重复出现（ref/immut/move/deep/shared 各至多一次）"
+}
+
+// immut 与 ref 互斥（E00690）。
+pub func msg_param_immut_ref(nm: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "parameter '" + nm + "' cannot be both immut and ref (a read-only and a mutable borrow are exclusive)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "參數 '" + nm + "' 不能同時標註 immut 與 ref（唯讀借用與可寫借用互斥）"
+    }
+    return "参数 '" + nm + "' 不能同时标注 immut 与 ref（只读借用与可写借用互斥）"
+}
+
+// move 与 ref/immut 互斥（E00691）。
+pub func msg_param_move_ref(nm: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "parameter '" + nm + "' cannot be move together with ref/immut (ownership is transferred, so nothing is left to borrow)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "參數 '" + nm + "' 不能同時標註 move 與 ref/immut（所有權已移交，無從借用）"
+    }
+    return "参数 '" + nm + "' 不能同时标注 move 与 ref/immut（所有权已移交，无从借用）"
+}
+
+// shared 与 deep 互斥（E00905）。
+pub func msg_param_shared_deep(nm: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "parameter '" + nm + "' cannot be both shared and deep (sharing the same copy and copying on entry are exclusive)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "參數 '" + nm + "' 不能同時標註 shared 與 deep（共享與值拷貝互斥）"
+    }
+    return "参数 '" + nm + "' 不能同时标注 shared 与 deep（共享与值拷贝互斥）"
+}
+
+// ref 参数不能带默认值（E00357）。
+pub func msg_param_ref_default(nm: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "parameter '" + nm + "' is ref, so it cannot have a default value (pass the argument at every call)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "參數 '" + nm + "' 的 ref 參數不能有預設值（必須在呼叫點傳實參）"
+    }
+    return "参数 '" + nm + "' 的 ref 参数不能有默认值（必须在调用点传实参）"
+}
+
+// ref 修饰只支持表与定长数组（E00692）。
+pub func msg_param_ref_kind(nm: string, got: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "parameter '" + nm + "' uses ref, which only applies to table parameters (table/table<T>) or fixed arrays (array<T, N>); it is " + got
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "參數 '" + nm + "' 的 ref 修飾僅支援表參數（table/table<T>）或定長陣列（array<T, N>），實際是 " + got
+    }
+    return "参数 '" + nm + "' 的 ref 修饰仅支持表参数（table/table<T>）或定长数组（array<T, N>），实际是 " + got
+}
+
+// 可选参数必须连续排在必选参数之后（E00360）。
+pub func msg_param_optional_order(nm: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "parameter '" + nm + "' lacks a default value; optional parameters (with defaults) must come after every required one"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "參數 '" + nm + "' 缺少預設值；可選參數（帶預設值）必須連續排在必選參數之後"
+    }
+    return "参数 '" + nm + "' 缺少默认值：可选参数（带默认值）必须连续排在必选参数之后"
+}
+
+// 默认值必须是字面量或编译期常量（E00914）。
+pub func msg_param_default_const(nm: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "parameter '" + nm + "' needs a literal or compile-time constant default (a const reference or constant arithmetic; no calls and no runtime input)"
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "參數 '" + nm + "' 的預設值必須是字面量或編譯期常數運算式（const 引用／常數算術；不可含呼叫或執行期依賴）"
+    }
+    return "参数 '" + nm + "' 的默认值必须是字面量或编译期常量表达式（const 引用/常量算术；不可含调用或运行期依赖）"
+}
+
+// 默认值类型不匹配（E00361）。
+pub func msg_param_default_type(nm: string, want: string, got: string) -> string {
+    if diagcode.cur_lang() == "en-US" {
+        return "parameter '" + nm + "' default type mismatch: expected " + want + ", got " + got
+    }
+    if diagcode.cur_lang() == "zh-TW" {
+        return "參數 '" + nm + "' 預設值類型不符：期望 " + want + "，實際 " + got
+    }
+    return "参数 '" + nm + "' 默认值类型不匹配：期望 " + want + "，实际 " + got
+}
+
 // 诊断码说明（--explain=<code>）：成因 + 修法各一句，随 --lang 切换。
 // 未知码返回可用码清单，便于脚本探测本版本支持哪些说明。
 pub func help_for(dc: string) -> string {
@@ -122,11 +221,92 @@ pub func help_for(dc: string) -> string {
         }
         return "E00588 · 调用实参类型不匹配——实参形参类型不一致；按签名传参。"
     }
+    if dc == "E00357" {
+        if en {
+            return "E00357 · a ref parameter cannot carry a default value — pass the argument at every call"
+        }
+        if tw {
+            return "E00357 · ref 參數不能有預設值——每次呼叫都要傳實參"
+        }
+        return "E00357 · ref 参数不能有默认值——每次调用都要传实参"
+    }
+    if dc == "E00360" {
+        if en {
+            return "E00360 · a required parameter follows an optional one — move every defaulted parameter to the end"
+        }
+        if tw {
+            return "E00360 · 必選參數排在可選參數之後——把帶預設值的參數集中到最後"
+        }
+        return "E00360 · 必选参数排在可选参数之后——把带默认值的参数集中到最后"
+    }
+    if dc == "E00361" {
+        if en {
+            return "E00361 · a parameter default disagrees with the annotated type — give a literal of that type"
+        }
+        if tw {
+            return "E00361 · 參數預設值與標註型別不符——改用該型別的字面量"
+        }
+        return "E00361 · 参数默认值与标注类型不符——改用该类型的字面量"
+    }
+    if dc == "E00690" {
+        if en {
+            return "E00690 · immut and ref are mutually exclusive — pick read-only or mutable borrowing"
+        }
+        if tw {
+            return "E00690 · immut 與 ref 互斥——只保留唯讀借用或可寫借用之一"
+        }
+        return "E00690 · immut 与 ref 互斥——只保留只读借用或可写借用之一"
+    }
+    if dc == "E00691" {
+        if en {
+            return "E00691 · move cannot be combined with ref/immut — ownership is transferred, so nothing is left to borrow"
+        }
+        if tw {
+            return "E00691 · move 不能與 ref/immut 併用——所有權已移交，無從借用"
+        }
+        return "E00691 · move 不能与 ref/immut 并用——所有权已移交，无从借用"
+    }
+    if dc == "E00692" {
+        if en {
+            return "E00692 · ref only applies to table parameters or fixed arrays — drop ref or change the parameter type"
+        }
+        if tw {
+            return "E00692 · ref 僅適用於表參數或定長陣列——去掉 ref 或改用這兩種型別"
+        }
+        return "E00692 · ref 仅适用于表参数或定长数组——去掉 ref 或改用这两种类型"
+    }
+    if dc == "E00693" {
+        if en {
+            return "E00693 · a passing-convention modifier repeats — each of ref/immut/move/deep/shared may appear once"
+        }
+        if tw {
+            return "E00693 · 傳遞約定修飾重複——ref/immut/move/deep/shared 各只能出現一次"
+        }
+        return "E00693 · 传递约定修饰重复——ref/immut/move/deep/shared 各只能出现一次"
+    }
+    if dc == "E00905" {
+        if en {
+            return "E00905 · shared and deep are mutually exclusive — sharing one copy and copying on entry contradict"
+        }
+        if tw {
+            return "E00905 · shared 與 deep 互斥——共享同一份與入口深拷貝語意對立"
+        }
+        return "E00905 · shared 与 deep 互斥——共享同一份与入口深拷贝语义对立"
+    }
+    if dc == "E00914" {
+        if en {
+            return "E00914 · a parameter default must be a literal or a compile-time constant — no calls, no runtime input"
+        }
+        if tw {
+            return "E00914 · 參數預設值必須是字面量或編譯期常數——不可含呼叫或執行期依賴"
+        }
+        return "E00914 · 参数默认值必须是字面量或编译期常量——不可含调用或运行期依赖"
+    }
     if en {
-        return "unknown diagnostic code '" + dc + "'; documented codes: E00377 E00406 E00489 E00554 E00588"
+        return "unknown diagnostic code '" + dc + "'; documented codes: E00357 E00360 E00361 E00377 E00406 E00489 E00554 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
     }
     if tw {
-        return "未知的診斷碼 '" + dc + "'；已有說明的碼：E00377 E00406 E00489 E00554 E00588"
+        return "未知的診斷碼 '" + dc + "'；已有說明的碼：E00357 E00360 E00361 E00377 E00406 E00489 E00554 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
     }
-    return "未知的诊断码 '" + dc + "'；已有说明的码：E00377 E00406 E00489 E00554 E00588"
+    return "未知的诊断码 '" + dc + "'；已有说明的码：E00357 E00360 E00361 E00377 E00406 E00489 E00554 E00588 E00690 E00691 E00692 E00693 E00905 E00914"
 }

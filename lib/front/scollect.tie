@@ -277,19 +277,22 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         if is_dup_p == 1 {
             sm_err_line = s_lines[p]
             sm_err_col = s_cols[p]
-            sm_err_msg = "参数 '" + sstate.name_str(p) + "' 的传递约定修饰重复出现（ref/immut/move/deep/shared 各至多一次）"
+            sm_err_code = "E00693"
+            sm_err_msg = locale.msg_param_dup_conv(sstate.name_str(p))
             return -1
         }
         if is_immut_p == 1 && is_ref == 1 {
             sm_err_line = s_lines[p]
             sm_err_col = s_cols[p]
-            sm_err_msg = "参数 '" + sstate.name_str(p) + "' 不能同时标注 immut 与 ref（只读借用与可写借用互斥）"
+            sm_err_code = "E00690"
+            sm_err_msg = locale.msg_param_immut_ref(sstate.name_str(p))
             return -1
         }
         if is_move_p == 1 && (is_ref == 1 || is_immut_p == 1) {
             sm_err_line = s_lines[p]
             sm_err_col = s_cols[p]
-            sm_err_msg = "参数 '" + sstate.name_str(p) + "' 不能同时标注 move 与 ref/immut（所有权已移交，无从借用）"
+            sm_err_code = "E00691"
+            sm_err_msg = locale.msg_param_move_ref(sstate.name_str(p))
             return -1
         }
         // ★ `shared` × `deep` 互斥：一个声明「不复制、共享同一份」，
@@ -297,7 +300,8 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         if is_shared_p == 1 && is_deep_p == 1 {
             sm_err_line = s_lines[p]
             sm_err_col = s_cols[p]
-            sm_err_msg = "参数 '" + sstate.name_str(p) + "' 不能同时标注 shared 与 deep（共享与值拷贝互斥）"
+            sm_err_code = "E00905"
+            sm_err_msg = locale.msg_param_shared_deep(sstate.name_str(p))
             return -1
         }
         var is_var = s_aux[p]   // 变参标志（`name: ...T`，parser 写入 aux）
@@ -343,7 +347,8 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         if is_ref == 1 && has_def == 1 {
             sm_err_line = s_lines[p]
             sm_err_col = s_cols[p]
-            sm_err_msg = "参数 '" + sstate.name_str(p) + "' 的 ref 参数不能有默认值（必须在调用点传实参）"
+            sm_err_code = "E00357"
+            sm_err_msg = locale.msg_param_ref_default(sstate.name_str(p))
             return -1
         }
         // ref 形参仅支持表/定长数组参数（对齐 Rust：标量/字符串/struct 形参引用无实义）
@@ -352,7 +357,8 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         if is_ref == 1 && !types.is_table(pt) && !types.is_array(pt) {
             sm_err_line = s_lines[p]
             sm_err_col = s_cols[p]
-            sm_err_msg = "参数 '" + sstate.name_str(p) + "' 的 ref 修饰仅支持表参数（table/table<T>）或定长数组（array<T, N>），实际是 " + types.type_name(pt)
+            sm_err_code = "E00692"
+            sm_err_msg = locale.msg_param_ref_kind(sstate.name_str(p), types.type_name(pt))
             return -1
         }
         // 可选参数（带默认值）必须连续排在必选参数之后
@@ -362,7 +368,8 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         } else if seen_default && is_var == 0 {
             sm_err_line = s_lines[p]
             sm_err_col = s_cols[p]
-            sm_err_msg = "参数 '" + sstate.name_str(p) + "' 缺少默认值：可选参数（带默认值）必须连续排在必选参数之后"
+            sm_err_code = "E00360"
+            sm_err_msg = locale.msg_param_optional_order(sstate.name_str(p))
             return -1
         }
         // 默认值白名单（-L.3）：字面量（数/布尔/字符/字符串/空表 []）或
@@ -384,7 +391,8 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
             if !is_ok {
                 sm_err_line = s_lines[p]
                 sm_err_col = s_cols[p]
-                sm_err_msg = "参数 '" + sstate.name_str(p) + "' 的默认值必须是字面量或编译期常量表达式（const 引用/常量算术；不可含调用或运行期依赖）"
+                sm_err_code = "E00914"
+                sm_err_msg = locale.msg_param_default_const(sstate.name_str(p))
                 return -1
             }
             // 默认值类型匹配：默认值推导类型必须与参数类型兼容
@@ -403,7 +411,8 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
                 if !stype.types_match(pt, dt_ty, dt) {
                     sm_err_line = s_lines[p]
                     sm_err_col = s_cols[p]
-                    sm_err_msg = "参数 '" + sstate.name_str(p) + "' 默认值类型不匹配：期望 " + types.type_name(pt) + "，实际 " + types.type_name(dt_ty)
+                    sm_err_code = "E00361"
+                    sm_err_msg = locale.msg_param_default_type(sstate.name_str(p), types.type_name(pt), types.type_name(dt_ty))
                     return -1
                 }
             }
