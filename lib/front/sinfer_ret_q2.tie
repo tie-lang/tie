@@ -803,7 +803,8 @@ pub func infer_call(id: i64) -> i64 {
                     !stype.types_narrow_int(want, at, args[kf]) {
                     sm_err_line = s_lines[id]
                     sm_err_col = s_cols[id]
-                    sm_err_msg = "函数值调用 '" + fnm + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+                    sm_err_code = "E00588"
+                    sm_err_msg = locale.msg_call_arg_mismatch(fnm, types.type_name(want), types.type_name(at))
                     return -1
                 }
                 kf = kf + 1
@@ -815,7 +816,8 @@ pub func infer_call(id: i64) -> i64 {
         }
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
-        sm_err_msg = "未定义的函数 '" + fnm + "'"
+        sm_err_code = "E00489"
+        sm_err_msg = locale.msg_undef_func(fnm)
         return -1
     }
     // 可见性校验
@@ -967,7 +969,8 @@ pub func infer_call(id: i64) -> i64 {
             if !(want_is_tbl && at_is_tbl) {
                 sm_err_line = s_lines[id]
                 sm_err_col = s_cols[id]
-                sm_err_msg = "调用 '" + fnm + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+                sm_err_code = "E00588"
+                sm_err_msg = locale.msg_call_arg_mismatch(fnm, types.type_name(want), types.type_name(at))
                 return -1
             }
         }
