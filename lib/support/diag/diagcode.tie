@@ -319,7 +319,11 @@ func json_esc(s: string) -> string {
 
 // error[E#####] @行:列: 消息名；期望 x；实际 y。 （line < 0 时省略位置段）
 pub func render_error(line: i64, col: i64, msg: string) -> string {
-    var cc = code_of(msg)
+    return render_error_cc(code_of(msg), line, col, msg)
+}
+
+// 显式给码渲染：码由调用点决定，文本与 json 两种输出版本共用同一份砌法。
+pub func render_error_cc(cc: string, line: i64, col: i64, msg: string) -> string {
     if g_diag_json != 0 {
         var body = name_of(msg)
         var jt = tail_of(msg)
@@ -349,6 +353,16 @@ pub func render_err_proto(proto: string) -> string {
         return proto
     }
     var rest = dg_slice(proto, 4, len(proto))
+    // 可选显式码前缀：ERR:E00377:3 5 消息。给出后直接用该码，不再按消息文本推导，
+    // 翻译消息就不会把码一起改掉；未给出时退回 code_of（历史协议向后兼容）。
+    var excode = ""
+    if len(rest) > 1 && str_byte(rest, 0) == 69 {
+        var cp = dg_find(rest, ":")
+        if cp > 1 {
+            excode = dg_slice(rest, 0, cp)
+            rest = dg_slice(rest, cp + 1, len(rest))
+        }
+    }
     var sp1 = dg_find(rest, " ")
     if sp1 < 0 {
         return proto
@@ -379,6 +393,9 @@ pub func render_err_proto(proto: string) -> string {
         j = j + 1
     }
     var msg = dg_slice(rest, sp2 + 1, rn)
+    if len(excode) > 0 {
+        return render_error_cc(excode, lv, cv, msg)
+    }
     return render_error(lv, cv, msg)
 }
 
