@@ -295,6 +295,8 @@ pub var g_lang: string = "zh-CN"
 pub var g_main_src: string = ""
 pub var g_diag_beg: i64 = -1
 pub var g_diag_end: i64 = -1
+// 可机器应用的替换文本（空串 = 不提供）。由 ERR 协议的 F<文本>: 段带过来。
+pub var g_diag_fix: string = ""
 pub func set_main_src(s: string) {
     if len(g_main_src) == 0 && len(s) > 0 {
         g_main_src = s
@@ -389,7 +391,13 @@ pub func render_error_cc(cc: string, line: i64, col: i64, msg: string) -> string
         // fix 槽位契约：beg/end 是前端核对过的源码字节区间，可直接用于高亮；
         // applicability 明确「暂不提供替换文本」——消费者不得把空区间当删除建议。
         if g_diag_beg >= 0 && g_diag_end > g_diag_beg {
-            j = j + ",\"fix\":{\"beg\":" + to_string(g_diag_beg) + ",\"end\":" + to_string(g_diag_end) + ",\"applicability\":\"unspecified\"}"
+            var ap = "unspecified"
+            var nt = ""
+            if len(g_diag_fix) > 0 {
+                ap = "exact"
+                nt = ",\"new_text\":\"" + json_esc(g_diag_fix) + "\""
+            }
+            j = j + ",\"fix\":{\"beg\":" + to_string(g_diag_beg) + ",\"end\":" + to_string(g_diag_end) + nt + ",\"applicability\":\"" + ap + "\"}"
         }
         j = j + ",\"lang\":\"" + g_lang + "\"}"
         return j
@@ -425,6 +433,7 @@ pub func render_err_proto(proto: string) -> string {
     // 可选区间前缀 B<beg>,<end>: —— 前端逐字节核对过的源码区间，供 --diag-format=json 的 fix 采用。
     g_diag_beg = -1
     g_diag_end = -1
+    g_diag_fix = ""
     if len(rest) > 1 && str_byte(rest, 0) == 66 {
         var bc1 = dg_find(rest, ",")
         var bc2 = dg_find(rest, ":")
@@ -432,6 +441,14 @@ pub func render_err_proto(proto: string) -> string {
             g_diag_beg = dg_int(dg_slice(rest, 1, bc1))
             g_diag_end = dg_int(dg_slice(rest, bc1 + 1, bc2))
             rest = dg_slice(rest, bc2 + 1, len(rest))
+        }
+    }
+    // 可选替换文本前缀 F<文本>:（紧跟区间段；只含标识符字符，不含冒号）。
+    if len(rest) > 2 && str_byte(rest, 0) == 70 {
+        var fc = dg_find(rest, ":")
+        if fc > 1 {
+            g_diag_fix = dg_slice(rest, 1, fc)
+            rest = dg_slice(rest, fc + 1, len(rest))
         }
     }
     var sp1 = dg_find(rest, " ")

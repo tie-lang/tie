@@ -127,6 +127,100 @@ pub func fn_def_node(full_name: string) -> i64 {
     return fn_def_nodes[idx]
 }
 
+// 编辑距离恰为 1 时的唯一函数名候选（供「未定义函数」的可机器应用建议）。
+// 只在「同长度差一个字符」「长度差一且是插入/删除一个字符」两种情形给建议；
+// 候选含命名空间分隔符或尖括号（泛型 mangled 名）时跳过：不能直接替换成那段文本。
+func fn_dist1(a: string, b: string) -> i64 {
+    var la = len(a)
+    var lb = len(b)
+    if la == lb {
+        var i: i64 = 0
+        var n: i64 = 0
+        while i < la {
+            if !(str_char(a, i) == str_char(b, i)) {
+                n = n + 1
+            }
+            i = i + 1
+        }
+        if n == 0 {
+            return 0
+        }
+        if n == 1 {
+            return 1
+        }
+        return 2
+    }
+    if la + 1 == lb {
+        return fn_skip1(b, a)
+    }
+    if lb + 1 == la {
+        return fn_skip1(a, b)
+    }
+    return 2
+}
+
+// longer 比 shorter 恰多一个字符（且其余逐字相同）返回 1，否则 2。
+func fn_skip1(longer: string, shorter: string) -> i64 {
+    var i: i64 = 0
+    var j: i64 = 0
+    var skipped: i64 = 0
+    var nl = len(longer)
+    var ns = len(shorter)
+    while i < nl && j < ns {
+        if str_char(longer, i) == str_char(shorter, j) {
+            i = i + 1
+            j = j + 1
+        } else {
+            skipped = skipped + 1
+            if skipped > 1 {
+                return 2
+            }
+            i = i + 1
+        }
+    }
+    return 1
+}
+
+// 名字里出现这些字符就不作为建议候选（命名空间分隔、泛型 mangled）。
+func fn_plain(s: string) -> i64 {
+    var i: i64 = 0
+    var n = len(s)
+    while i < n {
+        var b = str_byte(s, i)
+        if b == 46 || b == 60 || b == 40 || b == 35 {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+pub func fn_near(name: string) -> string {
+    var nn = len(name)
+    if nn <= 0 {
+        return ""
+    }
+    if fn_plain(name) == 0 {
+        return ""
+    }
+    var best = ""
+    var hits: i64 = 0
+    var i: i64 = 0
+    var nk = len(fn_keys)
+    while i < nk {
+        var cand = interner.name_str(fn_keys[i])
+        if fn_plain(cand) == 1 && fn_dist1(name, cand) == 1 {
+            hits = hits + 1
+            best = cand
+        }
+        i = i + 1
+    }
+    if hits == 1 {
+        return best
+    }
+    return ""
+}
+
 // 查函数签名 id（未定义返回 -1）
 pub func fn_sig(full_name: string) -> i64 {
     var nid = intern.intern(full_name)

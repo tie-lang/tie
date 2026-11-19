@@ -9,12 +9,19 @@ func err_proto_cur() -> string {
     var pc = sm_err_code
     var pb = sm_err_beg
     var pe = sm_err_end
+    var pf = sm_err_fix
     sm_err_code = ""
     sm_err_beg = -1
     sm_err_end = -1
+    sm_err_fix = ""
     if len(pc) > 0 {
         if pb >= 0 && pe > pb {
-            return "ERR:" + pc + ":B" + to_string(pb) + "," + to_string(pe) + ":" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+            // 可选替换文本前缀 F<文本>: —— 仅在区间之后、行列之前，文本由前端生成（标识符形态，无冒号）。
+            var fx = ""
+            if len(pf) > 0 {
+                fx = ":F" + pf
+            }
+            return "ERR:" + pc + ":B" + to_string(pb) + "," + to_string(pe) + fx + ":" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
         }
         return "ERR:" + pc + ":" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
