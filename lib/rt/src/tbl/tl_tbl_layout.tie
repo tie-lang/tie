@@ -160,15 +160,38 @@ pub unsafe fn ack(n: i64) -> ptr<u8> {
 pub unsafe fn lock_of(h: i64) -> i64 {
     return lock_v(int_to_ptr(h))
 }
+// 锁可选：非 `shared` 表不装锁（句柄 @40 为 0），此时加解锁是空操作。
+// 判据在生成代码侧（编译期「是否可能被另一执行流访问」），运行库只按句柄
+// 里有没有锁决定做不做——没有锁不等于漏锁，因为判定发生在编译期。
 pub unsafe fn lock_enter(h: i64) {
-    unsafe {
-        EnterCriticalSection(lock_of(h));
+    var lk = lock_of(h)
+    if lk != 0 {
+        unsafe {
+            EnterCriticalSection(lk);
+        }
     }
 }
 pub unsafe fn lock_leave(h: i64) {
-    unsafe {
-        LeaveCriticalSection(lock_of(h));
+    var lk = lock_of(h)
+    if lk != 0 {
+        unsafe {
+            LeaveCriticalSection(lk);
+        }
     }
+}
+// 给已有句柄补装一把锁（独立分配 64 字节 CS 缓冲并回写 @40）。
+// 生成代码在「该表可能跨执行流访问」时才调用；句柄块因此可以只有 56 字节。
+pub unsafe fn lock_attach(h: i64) -> i64 {
+    var p = int_to_ptr(h)
+    if lock_v(p) != 0 {
+        return 0
+    }
+    var lk = ack(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk));
+    }
+    set_lock_v(p, ptr_to_int(lk))
+    return 0
 }
 
 // 就地初始化每表锁：句柄块尾部（24 句柄 + 32 表头 = 56）紧跟 64 字节
