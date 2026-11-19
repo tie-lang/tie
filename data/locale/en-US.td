@@ -57,4 +57,13 @@ type tie<data>
   "W00031.help": "W00031 · rebinding a field of a by-value table parameter — by-value passing copies only the handle, so reassigning the field is invisible to the caller (self-assignment is a no-op); return a new value or mutate through the handle.",
   "E00377.help": "E00377 · type mismatch in a variable or array initializer — the declared type and the inferred type differ; align the annotation with the expression.",
   "E00554.help": "E00554 · undefined type — the annotation names a type that is not declared; check spelling or define it.",
+    "E00693.msg": "parameter '<nm>' repeats a passing-convention modifier (ref/immut/move/deep/shared: at most once each)",
+    "E00690.msg": "parameter '<nm>' cannot be both immut and ref (a read-only and a mutable borrow are exclusive)",
+    "E00691.msg": "parameter '<nm>' cannot be move together with ref/immut (ownership is transferred, so nothing is left to borrow)",
+    "E00905.msg": "parameter '<nm>' cannot be both shared and deep (sharing the same copy and copying on entry are exclusive)",
+    "E00357.msg": "parameter '<nm>' is ref, so it cannot have a default value (pass the argument at every call)",
+    "E00692.msg": "parameter '<nm>' uses ref, which only applies to table parameters (table/table<T>) or fixed arrays (array<T, N>); it is <got>",
+    "E00360.msg": "parameter '<nm>' lacks a default value; optional parameters (with defaults) must come after every required one",
+    "E00914.msg": "parameter '<nm>' needs a literal or compile-time constant default (a const reference or constant arithmetic; no calls and no runtime input)",
+    "E00361.msg": "parameter '<nm>' default type mismatch: expected <want>, got <got>",
 ]
