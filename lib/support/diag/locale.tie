@@ -96,6 +96,10 @@ pub func msg_var_type_mismatch(nm: string, ann: string, got: string) -> string {
 
 // 数组字面量元素个数/元素类型与标注不符（同属 E00377 族）。
 pub func msg_var_array_mismatch(nm: string, ann: string, need: string, actual: string, elemt: string) -> string {
+    var pt = pack_msg("E00377.array")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(fill_tok(fill_tok(fill_tok(pt, "nm", nm), "ann", ann), "need", need), "actual", actual), "elemt", elemt)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "variable '" + nm + "' type mismatch: annotated " + ann + "; an array literal needs " + need + " elements (got " + actual + "), each of type " + elemt
     }
@@ -106,6 +110,10 @@ pub func msg_var_array_mismatch(nm: string, ann: string, need: string, actual: s
 }
 // 未定义函数（E00489）。
 pub func msg_undef_func(nm: string) -> string {
+    var pt = pack_msg("E00489.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(pt, "nm", nm)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "undefined function '" + nm + "'"
     }
@@ -117,6 +125,10 @@ pub func msg_undef_func(nm: string) -> string {
 
 // 调用实参类型不匹配（E00588）。
 pub func msg_call_arg_mismatch(nm: string, want: string, got: string) -> string {
+    var pt = pack_msg("E00588.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(fill_tok(pt, "nm", nm), "want", want), "got", got)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "call to '" + nm + "' has a mismatched argument type: expected " + want + ", got " + got
     }
@@ -127,6 +139,10 @@ pub func msg_call_arg_mismatch(nm: string, want: string, got: string) -> string 
 }
 // 复合赋值类型不匹配（E00406）。
 pub func msg_compound_assign_mismatch(target: string, expr: string) -> string {
+    var pt = pack_msg("E00406.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(pt, "target", target), "expr", expr)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "compound assignment type mismatch: target is " + target + ", expression is " + expr
     }
@@ -330,6 +346,10 @@ pub func help_for(dc: string) -> string {
 
 // 提升到 port/interface 对象需要 unsafe/mem 凭据（E00456）。
 pub func msg_promote_needs_unsafe(sname: string, pname: string) -> string {
+    var pt = pack_msg("E00456.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(pt, "sname", sname), "pname", pname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "promoting '" + sname + "' to port '" + pname + "' requires an unsafe block or an unsafe function (an interface object borrows the concrete object, so pointer operations count as unsafe)"
     }
@@ -341,6 +361,10 @@ pub func msg_promote_needs_unsafe(sname: string, pname: string) -> string {
 
 // interface 约束不满足导致不能提升：缺少方法（E00560）。
 pub func msg_iface_promote_missing(sname: string, iname: string, mname: string) -> string {
+    var pt = pack_msg("E00560.missing")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(fill_tok(pt, "sname", sname), "iname", iname), "mname", mname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "type '" + sname + "' does not implement interface '" + iname + "', so it cannot be promoted (missing method '" + mname + "')"
     }
@@ -352,6 +376,10 @@ pub func msg_iface_promote_missing(sname: string, iname: string, mname: string) 
 
 // interface 约束不满足导致不能提升：方法签名不匹配（E00560）。
 pub func msg_iface_promote_sig(sname: string, iname: string, mname: string) -> string {
+    var pt = pack_msg("E00560.sig")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(fill_tok(pt, "sname", sname), "iname", iname), "mname", mname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "type '" + sname + "' does not implement interface '" + iname + "', so it cannot be promoted (method '" + mname + "' has a mismatched signature)"
     }
@@ -363,6 +391,10 @@ pub func msg_iface_promote_sig(sname: string, iname: string, mname: string) -> s
 
 // interface 约束不满足导致不能提升：无方法级细节（E00560）。
 pub func msg_iface_promote_plain(sname: string, iname: string) -> string {
+    var pt = pack_msg("E00560.plain")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(pt, "sname", sname), "iname", iname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "type '" + sname + "' does not implement interface '" + iname + "', so it cannot be promoted"
     }
@@ -374,6 +406,10 @@ pub func msg_iface_promote_plain(sname: string, iname: string) -> string {
 
 // port 约束不满足导致不能提升（E00561）。
 pub func msg_port_promote_missing(sname: string, pname: string) -> string {
+    var pt = pack_msg("E00561.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(pt, "sname", sname), "pname", pname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "type '" + sname + "' does not implement port '" + pname + "', so it cannot be promoted (write `impl " + pname + " for " + sname + "` first)"
     }
@@ -385,6 +421,10 @@ pub func msg_port_promote_missing(sname: string, pname: string) -> string {
 
 // 泛型约束（interface）不满足：缺少方法（E00557）。
 pub func msg_generic_iface_missing(sname: string, iname: string, mname: string) -> string {
+    var pt = pack_msg("E00557.missing")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(fill_tok(pt, "sname", sname), "iname", iname), "mname", mname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "type '" + sname + "' does not implement interface '" + iname + "' (missing method '" + mname + "')"
     }
@@ -396,6 +436,10 @@ pub func msg_generic_iface_missing(sname: string, iname: string, mname: string) 
 
 // 泛型约束（interface）不满足：方法签名不匹配（E00557）。
 pub func msg_generic_iface_sig(sname: string, iname: string, mname: string) -> string {
+    var pt = pack_msg("E00557.sig")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(fill_tok(pt, "sname", sname), "iname", iname), "mname", mname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "type '" + sname + "' does not implement interface '" + iname + "' (method '" + mname + "' has a mismatched signature)"
     }
@@ -407,6 +451,10 @@ pub func msg_generic_iface_sig(sname: string, iname: string, mname: string) -> s
 
 // 泛型约束（interface）不满足：无方法级细节（E00557）。
 pub func msg_generic_iface_plain(sname: string, iname: string) -> string {
+    var pt = pack_msg("E00557.plain")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(pt, "sname", sname), "iname", iname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "type '" + sname + "' does not implement interface '" + iname + "' (generic constraint not satisfied)"
     }
@@ -418,6 +466,10 @@ pub func msg_generic_iface_plain(sname: string, iname: string) -> string {
 
 // 泛型约束（port）不满足（E00556）。
 pub func msg_generic_port(sname: string, pname: string) -> string {
+    var pt = pack_msg("E00556.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(pt, "sname", sname), "pname", pname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "type '" + sname + "' does not implement port '" + pname + "' (generic constraint not satisfied)"
     }
@@ -429,6 +481,10 @@ pub func msg_generic_port(sname: string, pname: string) -> string {
 
 // 方法缺 self 接收者（E00114）：kind 取 "port" / "interface" / "impl"。
 pub func msg_method_needs_self(kind: string, mname: string) -> string {
+    var pt = pack_msg("E00114.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(pt, "kind", kind), "mname", mname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return kind + " method '" + mname + "' must take self as its first parameter"
     }
@@ -440,6 +496,10 @@ pub func msg_method_needs_self(kind: string, mname: string) -> string {
 
 // 方法第一参数名不是 self（E00118）：kind 取 "port" / "interface" / "impl"。
 pub func msg_method_first_param_self(kind: string, mname: string) -> string {
+    var pt = pack_msg("E00118.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(pt, "kind", kind), "mname", mname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "the first parameter of " + kind + " method '" + mname + "' must be self"
     }
@@ -451,6 +511,10 @@ pub func msg_method_first_param_self(kind: string, mname: string) -> string {
 
 // impl 缺少 port 要求的方法（E00210）。
 pub func msg_impl_missing_method(pname: string, sname: string, mname: string) -> string {
+    var pt = pack_msg("E00210.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(fill_tok(pt, "pname", pname), "sname", sname), "mname", mname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "impl '" + pname + " for " + sname + "' is missing method '" + mname + "' (every port method must be implemented)"
     }
@@ -462,6 +526,10 @@ pub func msg_impl_missing_method(pname: string, sname: string, mname: string) ->
 
 // impl 方法参数个数与 port 签名不符（E00112）。
 pub func msg_impl_arity(mname: string, want: string, got: string) -> string {
+    var pt = pack_msg("E00112.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(fill_tok(pt, "mname", mname), "want", want), "got", got)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "impl method '" + mname + "' has a mismatched parameter count: expected " + want + ", got " + got
     }
@@ -473,6 +541,10 @@ pub func msg_impl_arity(mname: string, want: string, got: string) -> string {
 
 // impl 方法参数类型与 port 签名不符（E00113）。
 pub func msg_impl_param_type(mname: string) -> string {
+    var pt = pack_msg("E00113.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(pt, "mname", mname)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "impl method '" + mname + "' has a mismatched parameter type (port method parameters must keep the same types)"
     }
@@ -484,6 +556,10 @@ pub func msg_impl_param_type(mname: string) -> string {
 
 // impl 方法返回类型与 port 签名不符（E00120）。
 pub func msg_impl_ret_type(mname: string, want: string, got: string) -> string {
+    var pt = pack_msg("E00120.msg")
+    if str_len(pt) > 0 {
+        return fill_tok(fill_tok(fill_tok(pt, "mname", mname), "want", want), "got", got)
+    }
     if diagcode.cur_lang() == "en-US" {
         return "impl method '" + mname + "' has a mismatched return type: expected " + want + ", got " + got
     }
