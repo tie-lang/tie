@@ -388,7 +388,9 @@ pub func infer_call(id: i64) -> i64 {
             g_typed = g_typed + 1
             return types.named(TK_VOID)
         }
-        // table_reserve(t, n) → void：首参须为表（容量预留，不动 len）。
+        // table_reserve(t, n) → 表自身：首参须为表（容量预留，不动 len）。
+        // 返回表使得 `table<T,N>` 的声明点 desugar（table_reserve(init, N)）能
+        // 直接当初始化表达式；语句位置丢弃返回值，行为与原先的 void 一致。
         if fnm == "table_reserve" {
             var ta = infer_expr(args[0])
             if ta < 0 { return -1 }
@@ -399,9 +401,9 @@ pub func infer_call(id: i64) -> i64 {
             }
             var tb2 = infer_expr(args[1])
             if tb2 < 0 { return -1 }
-            node_types[id] = types.named(TK_VOID)
+            node_types[id] = ta
             g_typed = g_typed + 1
-            return types.named(TK_VOID)
+            return ta
         }
         // table_clone(t) → table：首参须为表；返回独立副本（裸 table，由赋值点细化元素类型）。
         if fnm == "table_clone" {

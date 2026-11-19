@@ -27,12 +27,38 @@ pub func parse_type() -> i64 {
                 if elem < 0 {
                     return -1
                 }
+                // 容量提示：table<T, N>（N = 整数字面量或常量名）。
+                // N 不进类型标识（table<T,N> 与 table<T> 同型），只在**声明点**
+                // 被 desugar 成一次等价 table_reserve 调用（见 pstmt.parse_var_decl）。
+                var capnode: i64 = -1
+                if putil.eat(lex_comma) {
+                    var cline = putil.peek_line()
+                    var ccol = putil.peek_col()
+                    if putil.peek_tag() == lex_int {
+                        if putil.int_lit_overflow(putil.peek_lexeme()) {
+                            putil.set_err(cline, ccol, "表容量提示超出 i64 可表示范围")
+                            return -1
+                        }
+                        var capn = putil.parse_int_lit(putil.peek_lexeme())
+                        putil.advance()
+                        capnode = ast.new_node(N_INT_LIT, -1, capn, -1, cline, ccol)
+                    } else if putil.peek_tag() == lex_ident {
+                        var cid = putil.expect_ident()
+                        capnode = ast.new_node(N_VAR, cid, -1, -1, cline, ccol)
+                    } else {
+                        putil.set_err(cline, ccol, "表容量提示必须是整数字面量或常量名（table<T, N>）")
+                        return -1
+                    }
+                }
                 if !putil.expect_type_gt("表元素类型后需 '>'") {
                     return -1
                 }
                 var t = ast.new_node(N_TABLE_TYPE, -1, -1, -1, line, col)
                 var kids: table<i64> = table_new_i64()
                 table_push(kids, elem)
+                if capnode >= 0 {
+                    table_push(kids, capnode)
+                }
                 ast.set_children(t, kids)
                 return t
             }

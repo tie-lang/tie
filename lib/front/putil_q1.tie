@@ -743,3 +743,38 @@ pub func is_assign_op_tag(tag: i64) -> bool {
     return false
 }
 
+
+// ---------- 容量提示待补发语句（table<T, N>） ----------
+// N 不进类型标识（table<T,N> 与 table<T> 同型），只在声明点追加一条等价语句
+// table_reserve(名, N)。解析期不直接插兄弟节点（语句收集器的契约是「一个语句节点」），
+// 先登记到待补发表，由语句列表构建方在收集完该声明后立刻 flush。
+var g_resv_names: table<i64> = []
+var g_resv_caps: table<i64> = []
+
+// 登记一条容量提示：name = 变量名 id，capnode = N_INT_LIT | N_VAR 节点
+pub func push_reserve(name: i64, capnode: i64) {
+    table_push(g_resv_names, name)
+    table_push(g_resv_caps, capnode)
+}
+
+// 把已登记的容量提示展开成 table_reserve(名, 容量) 表达式语句追加到 stmts 末尾
+pub func flush_reserves(stmts: ref table<i64>) {
+    var i: i64 = 0
+    while i < len(g_resv_names) {
+        var tgt = ast.new_node(N_VAR, g_resv_names[i], -1, -1, 0, 0)
+        var call = ast.new_node(N_CALL, interner.intern("table_reserve"), -1, -1, 0, 0)
+        var ck: table<i64> = table_new_i64()
+        table_push(ck, -1)
+        table_push(ck, tgt)
+        table_push(ck, g_resv_caps[i])
+        ast.set_children(call, ck)
+        var st = ast.new_node(N_EXPR_STMT, -1, -1, -1, 0, 0)
+        var sk: table<i64> = table_new_i64()
+        table_push(sk, call)
+        ast.set_children(st, sk)
+        table_push(stmts, st)
+        i = i + 1
+    }
+    g_resv_names = table_new_i64()
+    g_resv_caps = table_new_i64()
+}

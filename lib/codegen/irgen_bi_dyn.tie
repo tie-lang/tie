@@ -650,7 +650,9 @@ if nm == "table_reserve" {
         return -1
     }
     tl_void_2p("tl_tbl$tbl_reserve_p", t, nv)
-    g_builtin_res = tig_int_lit(0)
+    // 返回表自身：`table<T,N>` 的声明点 desugar 用 table_reserve(init, N) 当初始化
+    // 表达式；语句位置丢弃结果，与原先的 void 行为一致。
+    g_builtin_res = t
     return 0
 }
 }
