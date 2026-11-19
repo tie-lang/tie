@@ -386,8 +386,10 @@ pub func render_error_cc(cc: string, line: i64, col: i64, msg: string) -> string
         var j = "{\"code\":\"" + cc + "\",\"line\":" + to_string(line)
         j = j + ",\"col\":" + to_string(col)
         j = j + ",\"message\":\"" + json_esc(body) + "\""
+        // fix 槽位契约：beg/end 是前端核对过的源码字节区间，可直接用于高亮；
+        // applicability 明确「暂不提供替换文本」——消费者不得把空区间当删除建议。
         if g_diag_beg >= 0 && g_diag_end > g_diag_beg {
-            j = j + ",\"fix\":{\"beg\":" + to_string(g_diag_beg) + ",\"end\":" + to_string(g_diag_end) + "}"
+            j = j + ",\"fix\":{\"beg\":" + to_string(g_diag_beg) + ",\"end\":" + to_string(g_diag_end) + ",\"applicability\":\"unspecified\"}"
         }
         j = j + ",\"lang\":\"" + g_lang + "\"}"
         return j
