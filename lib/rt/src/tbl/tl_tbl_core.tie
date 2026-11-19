@@ -1,16 +1,33 @@
 type tie<class, unsafe:mem>
 namespace tl_tbl;
 // 固定容量越限入口（codegen 按 logic 角色发射定义；运行库只声明、调用）。
-pub unsafe fn tbl_new(esz: i64) -> i64 {
-    var h = ack(120)    // 24 句柄 + 32 表头 + 64 锁，一次分配
+// 建表：sh != 0 时块内预留 64 字节 CS（120 B 块，一次分配、随块释放）；
+// sh == 0 时块只有 24 句柄 + 32 表头（56 B），lock 字段写 0——运行库的
+// 加解锁入口对 lock == 0 是空操作，热路径守卫由 lock_enter_lk/lock_leave_lk
+// 负责。装不装锁是编译期判据（独占性）的结果，不是运行期探测。
+pub unsafe fn tbl_new_sh(esz: i64, sh: i64) -> i64 {
+    var bs: i64 = 120
+    if sh == 0 {
+        bs = 56
+    }
+    var h = ack(bs)
     set_cap_v(h, 0)     // cap = 0
     set_len_v(h, 0)     // len = 0
     set_data_v(h, 0)    // data = null
     set_esz_v(h, esz)  // esz = 元素字节大小
     set_refc_v(h, 1)    // refcount = 1（新建表由创建者持有）
     set_fix_v(h, 0)     // 无固定上限（table<T, N, fixed> 的声明点会覆盖）
-    init_lock(h)        // lock = 块内 CS 缓冲（h+56）
+    if sh != 0 {
+        init_lock(h)             // lock = 块内 CS 缓冲（h+56）
+    } else {
+        set_lock_v(h, 0)         // 无锁表：所有加解锁入口按空操作处理
+    }
     return ptr_to_int(h)
+}
+
+// 建表（默认装锁）：保持历史行为，供未接判据的调用方使用。
+pub unsafe fn tbl_new(esz: i64) -> i64 {
+    return tbl_new_sh(esz, 1)
 }
 
 // 采纳预建数据缓冲：建一个合法句柄后把 cap/len/data 覆盖为调用方的缓冲区。
@@ -44,16 +61,31 @@ pub unsafe fn lock_init(p: ptr<u8>) -> i64 {
 
 // 建深表：元素为表句柄（table<T> 嵌套表，元素宽 8）——tbl_release
 // 释放时逐元素释放内层表。esz 字段写入深表标记位（分配尺寸按掩码后计算）。
-pub unsafe fn tbl_new_deep(esz: i64) -> i64 {
-    var hp = ack(120)
+// 建深表：与 tbl_new_sh 同一布局策略（sh != 0 → 120 B 带块内锁；否则 56 B
+// 无锁）。esz 字段写入深表标记位（分配尺寸按掩码后计算）。
+pub unsafe fn tbl_new_deep_sh(esz: i64, sh: i64) -> i64 {
+    var bs: i64 = 120
+    if sh == 0 {
+        bs = 56
+    }
+    var hp = ack(bs)
     set_cap_v(hp, 0)
     set_len_v(hp, 0)
     set_data_v(hp, 0)
     set_esz_v(hp, esz | TBL_DEEP)
     set_fix_v(hp, 0)    // 无固定上限
     set_refc_v(hp, 1)
-    init_lock(hp)
+    if sh != 0 {
+        init_lock(hp)
+    } else {
+        set_lock_v(hp, 0)
+    }
     return ptr_to_int(hp)
+}
+
+// 建深表（默认装锁）：保持历史行为。
+pub unsafe fn tbl_new_deep(esz: i64) -> i64 {
+    return tbl_new_deep_sh(esz, 1)
 }
 
 // 引用计数 +1：句柄被拷贝到新槽（变量赋值/参数传递/返回值接管）时调用。
