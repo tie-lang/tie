@@ -4,6 +4,8 @@ type tie<class, unsafe:mem>
 // 由 tiec 生成定义；trm_lite.a 是单成员归档，用到表的程序必然带上该引用。
 // void 桥按 i64 返回声明（x64 ABI 下调用方忽略返回值）。
 unsafe extern fn tie_oom_fail(need: i64) -> i64
+// 固定容量越限入口：table<T, N, fixed> 写超过 N 时由 codegen 发射定义（printf 诊断 +
+// 统一失败语义），与 tie_oom_fail 同构；运行库只声明、调用。
 // core/tbl/tl_tbl.tie —— trm-lite 字节层表容器（命名空间 tl_tbl）。
 // ============================================================
 // 供 tiec 表运行时内置（table<T>）**静态链接**：容器 = 48 字节句柄
@@ -63,6 +65,28 @@ pub unsafe fn cap_v(p: ptr<u8>) -> i64 {
 }
 pub unsafe fn set_cap_v(p: ptr<u8>, v: i64) {
     w_i64(p, 8, v)
+}
+// 固定容量上限（table<T, N, fixed>）：句柄 @16 存 `limit * 65536 + 65535`。
+// 低 16 位是标记：只有 set_fix_v 写过的槽才被认作上限，未初始化/其它用途的
+// 堆垃圾不会被误判（旧一代 codegen 不写该槽时仍然安全）。普通表为 0。
+// 上限只由 tbl_fix_p 在声明点写入，之后任何增长企图（need > limit）都走失败入口。
+pub unsafe fn fix_v(p: ptr<u8>) -> i64 {
+    var w = r_i64(p, 16)
+    if w <= 0 {
+        return 0
+    }
+    var q = w / 65536
+    if w - q * 65536 != 65535 {
+        return 0
+    }
+    return q
+}
+pub unsafe fn set_fix_v(p: ptr<u8>, v: i64) {
+    w_i64(p, 16, v * 65536 + 65535)
+}
+// 以 i64 句柄为参数的包装（codegen 侧按 i64 调用，避免 ptr/i64 形参类型不匹配）。
+pub unsafe fn tbl_fix_lim(h: i64) -> i64 {
+    return fix_v(int_to_ptr(h))
 }
 pub unsafe fn refc_v(p: ptr<u8>) -> i64 {
     return r_i64(hdr_v(p), 0)
@@ -156,6 +180,7 @@ pub unsafe fn init_lock(p: ptr<u8>) -> i64 {
         InitializeCriticalSection(base)
     }
     set_lock_v(p, base)
+    w_i64(p, 16, 0)
     return base
 }
 

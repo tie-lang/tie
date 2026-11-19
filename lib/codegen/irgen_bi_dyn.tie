@@ -657,6 +657,25 @@ if nm == "table_reserve" {
 }
 }
 
+// 内置 `table_fix`（固定容量上限：把 cap 钉到 n 并记录上限；之后增长即失败）
+pub func bi_table_fix(nm: string, id: i64) -> i64 {
+if nm == "table_fix" {
+    g_used_trmlite = true
+    var t = tig_expr(call_arg(id, 0))
+    if t < 0 {
+        return -1
+    }
+    var nv = tig_expr(call_arg(id, 1))
+    if nv < 0 {
+        return -1
+    }
+    tl_void_2p("tl_tbl$tbl_fix_p", t, nv)
+    // 返回表自身：与 table_reserve 一致，供声明点 desugar 当初始化表达式。
+    g_builtin_res = t
+    return 0
+}
+}
+
 // 内置 `table_clone`（独立副本：新表 + 拷贝 len 个元素；深表连同内层表递归深克隆）
 // 语义见规范 §13.5 克隆：副本与源完全独立（数据缓冲、锁各自一份），改副本不影响源。
 // 走指针形参入口 tbl_clone_p：nocapture 使源表句柄不被判为逃逸。

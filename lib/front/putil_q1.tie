@@ -750,11 +750,15 @@ pub func is_assign_op_tag(tag: i64) -> bool {
 // 先登记到待补发表，由语句列表构建方在收集完该声明后立刻 flush。
 var g_resv_names: table<i64> = []
 var g_resv_caps: table<i64> = []
+// 硬上限标记：1 = 该声明是 table<T, N, fixed>（追加 table_fix 语句）。
+var g_resv_fix: table<i64> = []
 
-// 登记一条容量提示：name = 变量名 id，capnode = N_INT_LIT | N_VAR 节点
-pub func push_reserve(name: i64, capnode: i64) {
+// 登记一条容量提示：name = 变量名 id，capnode = N_INT_LIT | N_VAR 节点，
+// fixedf = 1 表示还要钉硬上限（table<T, N, fixed>）
+pub func push_reserve(name: i64, capnode: i64, fixedf: i64) {
     table_push(g_resv_names, name)
     table_push(g_resv_caps, capnode)
+    table_push(g_resv_fix, fixedf)
 }
 
 // 把已登记的容量提示展开成 table_reserve(名, 容量) 表达式语句追加到 stmts 末尾
@@ -773,8 +777,24 @@ pub func flush_reserves(stmts: ref table<i64>) {
         table_push(sk, call)
         ast.set_children(st, sk)
         table_push(stmts, st)
+        // table<T, N, fixed>：再补一条 table_fix(名, N) 把容量钉成硬上限。
+        if g_resv_fix[i] != 0 {
+            var tgt2 = ast.new_node(N_VAR, g_resv_names[i], -1, -1, 0, 0)
+            var call2 = ast.new_node(N_CALL, interner.intern("table_fix"), -1, -1, 0, 0)
+            var ck2: table<i64> = table_new_i64()
+            table_push(ck2, -1)
+            table_push(ck2, tgt2)
+            table_push(ck2, g_resv_caps[i])
+            ast.set_children(call2, ck2)
+            var st2 = ast.new_node(N_EXPR_STMT, -1, -1, -1, 0, 0)
+            var sk2: table<i64> = table_new_i64()
+            table_push(sk2, call2)
+            ast.set_children(st2, sk2)
+            table_push(stmts, st2)
+        }
         i = i + 1
     }
     g_resv_names = table_new_i64()
     g_resv_caps = table_new_i64()
+    g_resv_fix = table_new_i64()
 }

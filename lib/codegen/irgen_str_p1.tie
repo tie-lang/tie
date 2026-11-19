@@ -789,6 +789,27 @@ func tl_i64_6(sym: string, v1: i64, v2: i64, v3: i64, v4: i64, v5: i64, v6: i64)
     return tig_trmlite_call(sym, ats, avs, types.named(TK_I64))
 }
 
+// 七参 i64 调用——供 tbl_grow_pure（含固定容量上限）使用。
+func tl_i64_7(sym: string, v1: i64, v2: i64, v3: i64, v4: i64, v5: i64, v6: i64, v7: i64) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v1)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v2)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v3)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v4)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v5)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v6)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, v7)
+    return tig_trmlite_call(sym, ats, avs, types.named(TK_I64))
+}
+
 func tl_void_2(sym: string, v1: i64, v2: i64) {
     var ats: table<i64> = table_new_i64()
     var avs: table<i64> = table_new_i64()
@@ -823,7 +844,7 @@ func tl_void_3(sym: string, v1: i64, v2: i64, v3: i64) {
 }
 
 // 句柄 ptr → i64（ptrtoint，opcode 24）
-func t21_ptri(t: i64) -> i64 {
+pub func t21_ptri(t: i64) -> i64 {
     var pi = ir.new_inst(g_cur_block, 24, types.named(TK_I64))
     ir.add_operand(pi, t, 0)
     return ir.get_value(pi)
@@ -864,6 +885,7 @@ func s21_table_new_inl(esz_v: i64) -> i64 {
     s21_store(s21_gep(h, RT_TBL_OFF_LEN, true), z0, T64)
     s21_store(s21_gep(h, RT_TBL_OFF_DATA, true), t21_intp(z0), types.named(TK_STR))
     s21_store(s21_gep(h, RT_TBL_OFF_ESZ, true), esz_v, T64)
+    s21_store(s21_gep(h, RT_TBL_OFF_FIX, true), z0, T64)   // 无固定容量上限
     s21_store(s21_gep(h, RT_TBL_OFF_RC, true), tig_int_lit(1), T64)
     var lki = tl_str_i64_1("tl_tbl$lock_init", h)
     return h

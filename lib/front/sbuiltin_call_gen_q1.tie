@@ -799,6 +799,18 @@ pub func builtin_call_b_table_reserve_p(fn_name: string, args: table<i64>, call_
         return types.named(TK_VOID)
 }
 
+pub func builtin_call_b_table_fix_p(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // 固定容量上限：table_fix(t, n) → 把容量钉到 n 并记录上限（声明点 desugar 发出）
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "table_fix() 期望 2 个参数（目标表, 容量上限），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+}
+
 pub func builtin_call_b_table_clone(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
     var nargs = len(args)
     // 独立副本：table_clone(t) → 与 t 同内容的新表（独立数据缓冲与锁；深表连同

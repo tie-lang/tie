@@ -405,6 +405,21 @@ pub func infer_call(id: i64) -> i64 {
             g_typed = g_typed + 1
             return ta
         }
+        // table_fix(t, n) → 表自身：把容量钉到 n 并记录硬上限（声明点 desugar 发出）。
+        if fnm == "table_fix" {
+            var tfx = infer_expr(args[0])
+            if tfx < 0 { return -1 }
+            if !types.is_table(tfx) {
+                sm_err_line = s_lines[id]; sm_err_col = s_cols[id]
+                sm_err_msg = "table_fix() 第 1 个参数必须是表，实际是 " + types.type_name(tfx)
+                return -1
+            }
+            var tfn = infer_expr(args[1])
+            if tfn < 0 { return -1 }
+            node_types[id] = tfx
+            g_typed = g_typed + 1
+            return tfx
+        }
         // table_clone(t) → table：首参须为表；返回独立副本（裸 table，由赋值点细化元素类型）。
         if fnm == "table_clone" {
             var ta3 = infer_expr(args[0])

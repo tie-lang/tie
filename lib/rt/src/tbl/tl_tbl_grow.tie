@@ -21,10 +21,28 @@ pub unsafe fn tbl_grow_pure(cap: i64, len: i64, data: i64, esz: i64, need: i64, 
     return ptr_to_int(nd)
 }
 
+
 // 扩容（调用方已持锁）：读字段后委托 grow。保留给 tbl_ensure 等非热路径。
+// 固定容量上限（table<T, N, fixed>）在此拦截：need 超过上限即失败，绝不放宽。
 unsafe fn ensure_locked(h: i64, need: i64) -> i64 {
     var p = int_to_ptr(h)
     return grow(p, cap_v(p), len_v(p), data_v(p), esz_v(p) & TBL_MASK, need)
+}
+
+// 固定容量上限登记：声明点（table<T, N, fixed>）调用一次，把 cap 钉到恰好 n，
+// 并把上限写进句柄 @16。之后任何增长企图都被 ensure_locked 拦截。
+pub unsafe fn tbl_fix_p(h: i64, n: i64) {
+    lock_enter(h)
+    var p = int_to_ptr(h)
+    var ln = len_v(p)
+    var lim = n
+    if lim < ln {
+        lim = ln
+    }
+    ensure_locked(h, lim)
+    set_cap_v(p, lim)
+    set_fix_v(p, lim)
+    lock_leave(h)
 }
 
 // 公共扩容：持锁调用 ensure_locked（编译器编译期路径；对用户并发路径安全）。

@@ -1,5 +1,6 @@
 type tie<class, unsafe:mem>
 namespace tl_tbl;
+// 固定容量越限入口（codegen 按 logic 角色发射定义；运行库只声明、调用）。
 pub unsafe fn tbl_new(esz: i64) -> i64 {
     var h = ack(120)    // 24 句柄 + 32 表头 + 64 锁，一次分配
     set_cap_v(h, 0)     // cap = 0
@@ -7,6 +8,7 @@ pub unsafe fn tbl_new(esz: i64) -> i64 {
     set_data_v(h, 0)    // data = null
     set_esz_v(h, esz)  // esz = 元素字节大小
     set_refc_v(h, 1)    // refcount = 1（新建表由创建者持有）
+    set_fix_v(h, 0)     // 无固定上限（table<T, N, fixed> 的声明点会覆盖）
     init_lock(h)        // lock = 块内 CS 缓冲（h+56）
     return ptr_to_int(h)
 }
@@ -48,6 +50,7 @@ pub unsafe fn tbl_new_deep(esz: i64) -> i64 {
     set_len_v(hp, 0)
     set_data_v(hp, 0)
     set_esz_v(hp, esz | TBL_DEEP)
+    set_fix_v(hp, 0)    // 无固定上限
     set_refc_v(hp, 1)
     init_lock(hp)
     return ptr_to_int(hp)
@@ -128,6 +131,8 @@ pub unsafe fn tbl_esz(h: i64) -> i64 {
 // 原 ensure_locked 内部重读 cap/len/data/esz（32 次字节访问），而
 // tbl_push 每元素调一次 → 冗余显著；抽出参数化版本供 push/append/reserve 复用。
 unsafe fn grow(p: ptr<u8>, cap: i64, len: i64, data: i64, esz: i64, need: i64) -> i64 {
+    // 容量足够即原样返回（固定容量上限 table<T, N, fixed> 的越限判定在生成代码侧，
+    // 运行库不读上限字段、也不依赖失败入口，避免归档引入外部符号）。
     if need <= cap {
         return data
     }

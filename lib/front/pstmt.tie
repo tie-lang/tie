@@ -145,7 +145,11 @@ pub func parse_var_decl(is_const: i64) -> i64 {
     // 容量提示 table<T, N>：登记成声明后紧跟的一条 table_reserve(名, N)。
     // 语句列表构建方收集完本声明后立刻 flush（见 putil.flush_reserves）。
     if ty >= 0 && ast.tag(ty) == N_TABLE_TYPE && ast.child_count(ty) > 1 {
-        putil.push_reserve(name, ast.child_at(ty, 1))
+        var fixf: i64 = 0
+        if ast.child_count(ty) > 2 {
+            fixf = 1
+        }
+        putil.push_reserve(name, ast.child_at(ty, 1), fixf)
     }
     var v = ast.new_node(N_VAR_DECL, name, is_const, vmod, line, col)
     var kids: table<i64> = table_new_i64()

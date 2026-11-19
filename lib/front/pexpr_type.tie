@@ -50,6 +50,18 @@ pub func parse_type() -> i64 {
                         return -1
                     }
                 }
+                // 硬上限标记：table<T, N, fixed>（N 必须有，fixed 不能单独出现）。
+                // 标记以一个哨兵子节点（N_INT_LIT 1）记在 children[2]，声明点据此
+                // 额外补发 table_fix(名, N)（见 putil.flush_reserves）。
+                var fixedf: i64 = 0
+                if capnode >= 0 && putil.eat(lex_comma) {
+                    if putil.peek_tag() != lex_fixed {
+                        putil.set_err(putil.peek_line(), putil.peek_col(), "表容量上限标记必须是 fixed（table<T, N, fixed>）")
+                        return -1
+                    }
+                    putil.advance()
+                    fixedf = 1
+                }
                 if !putil.expect_type_gt("表元素类型后需 '>'") {
                     return -1
                 }
@@ -58,6 +70,10 @@ pub func parse_type() -> i64 {
                 table_push(kids, elem)
                 if capnode >= 0 {
                     table_push(kids, capnode)
+                }
+                if fixedf != 0 {
+                    var mk = ast.new_node(N_INT_LIT, -1, 1, -1, line, col)
+                    table_push(kids, mk)
                 }
                 ast.set_children(t, kids)
                 return t
