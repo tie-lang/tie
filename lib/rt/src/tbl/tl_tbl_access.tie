@@ -4,7 +4,7 @@ pub unsafe fn tbl_at(h: i64, i: i64, out: i64) -> i64 {
     var p = int_to_ptr(h)
     var lk = lock_v(p)
     unsafe {
-        EnterCriticalSection(lk);
+        lock_enter_lk(lk);
     }
     var len = len_v(p)
     var esz = esz_v(p) & TBL_MASK   // 掩掉深表标记位
@@ -17,7 +17,7 @@ pub unsafe fn tbl_at(h: i64, i: i64, out: i64) -> i64 {
         memset(int_to_ptr(out), 0, esz)
     }
     unsafe {
-        LeaveCriticalSection(lk);
+        lock_leave_lk(lk);
     }
     return ok
 }
@@ -28,7 +28,7 @@ pub unsafe fn tbl_set(h: i64, i: i64, src: i64) -> i64 {
     var p = int_to_ptr(h)
     var lk = lock_v(p)
     unsafe {
-        EnterCriticalSection(lk);
+        lock_enter_lk(lk);
     }
     var len = len_v(p)
     var esz = esz_v(p) & TBL_MASK   // 掩掉深表标记位
@@ -39,7 +39,7 @@ pub unsafe fn tbl_set(h: i64, i: i64, src: i64) -> i64 {
         ok = 1
     }
     unsafe {
-        LeaveCriticalSection(lk);
+        lock_leave_lk(lk);
     }
     return ok
 }

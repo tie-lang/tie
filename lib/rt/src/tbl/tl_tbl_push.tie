@@ -4,7 +4,7 @@ pub unsafe fn tbl_push(h: i64, src: i64) {
     var p = int_to_ptr(h)
     var lk = lock_v(p)
     unsafe {
-        EnterCriticalSection(lk);
+        lock_enter_lk(lk);
     }
     var len = len_v(p)
     var esz = esz_v(p) & TBL_MASK   // 掩掉深表标记位（拷贝宽度用纯 esz）
@@ -13,7 +13,7 @@ pub unsafe fn tbl_push(h: i64, src: i64) {
     memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), esz)
     set_len_v(p, need)
     unsafe {
-        LeaveCriticalSection(lk);
+        lock_leave_lk(lk);
     }
 }
 
@@ -43,7 +43,7 @@ pub unsafe fn tbl_append(h: i64, src: i64, n: i64) -> i64 {
     var p = int_to_ptr(h)
     var lk = lock_v(p)
     unsafe {
-        EnterCriticalSection(lk);
+        lock_enter_lk(lk);
     }
     var len = len_v(p)
     var esz = esz_v(p) & TBL_MASK
@@ -52,7 +52,7 @@ pub unsafe fn tbl_append(h: i64, src: i64, n: i64) -> i64 {
     memcpy(int_to_ptr(data + len * esz), int_to_ptr(src), n * esz)
     set_len_v(p, need)
     unsafe {
-        LeaveCriticalSection(lk);
+        lock_leave_lk(lk);
     }
     return need
 }

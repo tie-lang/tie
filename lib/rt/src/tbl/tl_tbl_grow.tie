@@ -74,13 +74,13 @@ pub unsafe fn tbl_reserve(h: i64, need: i64) {
     var p = int_to_ptr(h)
     var lk = lock_v(p)
     unsafe {
-        EnterCriticalSection(lk);
+        lock_enter_lk(lk);
     }
     var len = len_v(p)
     var esz = esz_v(p) & TBL_MASK
     var d = grow(p, cap_v(p), len, data_v(p), esz, need)
     unsafe {
-        LeaveCriticalSection(lk);
+        lock_leave_lk(lk);
     }
 }
 

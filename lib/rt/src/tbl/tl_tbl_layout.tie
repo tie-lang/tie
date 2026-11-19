@@ -179,6 +179,23 @@ pub unsafe fn lock_leave(h: i64) {
         }
     }
 }
+// 按**裸锁指针**加解锁：热路径只读一次句柄（`var lk = lock_v(p)`）后直接调这里，
+// 省掉第二次访存。lk == 0 表示该表没有锁（非 shared 表），此时是空操作——
+// 这些路径必须走带守卫的包装，直接调 Win32 会让零锁表当场崩。
+pub unsafe fn lock_enter_lk(lk: i64) {
+    if lk != 0 {
+        unsafe {
+            EnterCriticalSection(lk);
+        }
+    }
+}
+pub unsafe fn lock_leave_lk(lk: i64) {
+    if lk != 0 {
+        unsafe {
+            LeaveCriticalSection(lk);
+        }
+    }
+}
 // 给已有句柄补装一把锁（独立分配 64 字节 CS 缓冲并回写 @40）。
 // 生成代码在「该表可能跨执行流访问」时才调用；句柄块因此可以只有 56 字节。
 pub unsafe fn lock_attach(h: i64) -> i64 {
