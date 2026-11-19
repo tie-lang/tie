@@ -85,13 +85,11 @@ pub func msg_var_type_mismatch(nm: string, ann: string, got: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(fill_tok(pt, "nm", nm), "ann", ann), "got", got)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "variable '" + nm + "' type mismatch: annotated " + ann + ", but the expression infers " + got
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "變數 '" + nm + "' 類型不符：標註 " + ann + "，運算式推導為 " + got
-    }
-    return "变量 '" + nm + "' 类型不匹配：标注 " + ann + "，表达式推导为 " + got
+    return "message template \"E00377.msg\" missing from the language pack / 语言包缺少消息模板 'E00377.msg'"
 }
 
 // 数组字面量元素个数/元素类型与标注不符（同属 E00377 族）。
@@ -100,13 +98,11 @@ pub func msg_var_array_mismatch(nm: string, ann: string, need: string, actual: s
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(fill_tok(fill_tok(fill_tok(pt, "nm", nm), "ann", ann), "need", need), "actual", actual), "elemt", elemt)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "variable '" + nm + "' type mismatch: annotated " + ann + "; an array literal needs " + need + " elements (got " + actual + "), each of type " + elemt
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "變數 '" + nm + "' 類型不符：標註 " + ann + "；陣列常值元素個數必須為 " + need + "（實際 " + actual + "），且元素類型必須與 " + elemt + " 一致"
-    }
-    return "变量 '" + nm + "' 类型不匹配：标注 " + ann + "；数组字面量元素个数必须为 " + need + "（实际 " + actual + "），且元素类型必须与 " + elemt + " 一致"
+    return "message template \"E00377.array\" missing from the language pack / 语言包缺少消息模板 'E00377.array'"
 }
 // 未定义函数（E00489）。
 pub func msg_undef_func(nm: string) -> string {
@@ -114,13 +110,11 @@ pub func msg_undef_func(nm: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(pt, "nm", nm)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "undefined function '" + nm + "'"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "未定義的函式 '" + nm + "'"
-    }
-    return "未定义的函数 '" + nm + "'"
+    return "message template \"E00489.msg\" missing from the language pack / 语言包缺少消息模板 'E00489.msg'"
 }
 
 // 调用实参类型不匹配（E00588）。
@@ -129,13 +123,11 @@ pub func msg_call_arg_mismatch(nm: string, want: string, got: string) -> string 
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(fill_tok(pt, "nm", nm), "want", want), "got", got)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "call to '" + nm + "' has a mismatched argument type: expected " + want + ", got " + got
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "呼叫 '" + nm + "' 參數類型不符：期望 " + want + "，實際 " + got
-    }
-    return "调用 '" + nm + "' 参数类型不匹配：期望 " + want + "，实际 " + got
+    return "message template \"E00588.msg\" missing from the language pack / 语言包缺少消息模板 'E00588.msg'"
 }
 // 复合赋值类型不匹配（E00406）。
 pub func msg_compound_assign_mismatch(target: string, expr: string) -> string {
@@ -143,13 +135,11 @@ pub func msg_compound_assign_mismatch(target: string, expr: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(pt, "target", target), "expr", expr)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "compound assignment type mismatch: target is " + target + ", expression is " + expr
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "複合指派類型不符：目標類型 " + target + " 與運算式 " + expr
-    }
-    return "复合赋值类型不匹配：目标类型 " + target + " 与表达式 " + expr
+    return "message template \"E00406.msg\" missing from the language pack / 语言包缺少消息模板 'E00406.msg'"
 }
 
 // 类型未定义（E00554）。
@@ -158,13 +148,11 @@ pub func msg_undef_type(nm: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(pt, "nm", nm)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "undefined type '" + nm + "'"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "未定義的類型 '" + nm + "'"
-    }
-    return "类型 '" + nm + "' 未定义"
+    return "message template \"E00554.msg\" missing from the language pack / 语言包缺少消息模板 'E00554.msg'"
 }
 
 // 参数传递约定修饰重复（E00693）。
@@ -174,13 +162,11 @@ pub func msg_param_dup_conv(nm: string) -> string {
         var t_nm = fill_tok(pt, "nm", nm)
         return t_nm
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "parameter '" + nm + "' repeats a passing-convention modifier (ref/immut/move/deep/shared: at most once each)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "參數 '" + nm + "' 的傳遞約定修飾重複出現（ref/immut/move/deep/shared 各至多一次）"
-    }
-    return "参数 '" + nm + "' 的传递约定修饰重复出现（ref/immut/move/deep/shared 各至多一次）"
+    return "message template \"E00693.msg\" missing from the language pack / 语言包缺少消息模板 'E00693.msg'"
 }
 
 // immut 与 ref 互斥（E00690）。
@@ -190,13 +176,11 @@ pub func msg_param_immut_ref(nm: string) -> string {
         var t_nm = fill_tok(pt, "nm", nm)
         return t_nm
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "parameter '" + nm + "' cannot be both immut and ref (a read-only and a mutable borrow are exclusive)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "參數 '" + nm + "' 不能同時標註 immut 與 ref（唯讀借用與可寫借用互斥）"
-    }
-    return "参数 '" + nm + "' 不能同时标注 immut 与 ref（只读借用与可写借用互斥）"
+    return "message template \"E00690.msg\" missing from the language pack / 语言包缺少消息模板 'E00690.msg'"
 }
 
 // move 与 ref/immut 互斥（E00691）。
@@ -206,13 +190,11 @@ pub func msg_param_move_ref(nm: string) -> string {
         var t_nm = fill_tok(pt, "nm", nm)
         return t_nm
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "parameter '" + nm + "' cannot be move together with ref/immut (ownership is transferred, so nothing is left to borrow)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "參數 '" + nm + "' 不能同時標註 move 與 ref/immut（所有權已移交，無從借用）"
-    }
-    return "参数 '" + nm + "' 不能同时标注 move 与 ref/immut（所有权已移交，无从借用）"
+    return "message template \"E00691.msg\" missing from the language pack / 语言包缺少消息模板 'E00691.msg'"
 }
 
 // shared 与 deep 互斥（E00905）。
@@ -222,13 +204,11 @@ pub func msg_param_shared_deep(nm: string) -> string {
         var t_nm = fill_tok(pt, "nm", nm)
         return t_nm
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "parameter '" + nm + "' cannot be both shared and deep (sharing the same copy and copying on entry are exclusive)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "參數 '" + nm + "' 不能同時標註 shared 與 deep（共享與值拷貝互斥）"
-    }
-    return "参数 '" + nm + "' 不能同时标注 shared 与 deep（共享与值拷贝互斥）"
+    return "message template \"E00905.msg\" missing from the language pack / 语言包缺少消息模板 'E00905.msg'"
 }
 
 // ref 参数不能带默认值（E00357）。
@@ -238,13 +218,11 @@ pub func msg_param_ref_default(nm: string) -> string {
         var t_nm = fill_tok(pt, "nm", nm)
         return t_nm
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "parameter '" + nm + "' is ref, so it cannot have a default value (pass the argument at every call)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "參數 '" + nm + "' 的 ref 參數不能有預設值（必須在呼叫點傳實參）"
-    }
-    return "参数 '" + nm + "' 的 ref 参数不能有默认值（必须在调用点传实参）"
+    return "message template \"E00357.msg\" missing from the language pack / 语言包缺少消息模板 'E00357.msg'"
 }
 
 // ref 修饰只支持表与定长数组（E00692）。
@@ -255,13 +233,11 @@ pub func msg_param_ref_kind(nm: string, got: string) -> string {
         var t_got = fill_tok(t_nm, "got", got)
         return t_got
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "parameter '" + nm + "' uses ref, which only applies to table parameters (table/table<T>) or fixed arrays (array<T, N>); it is " + got
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "參數 '" + nm + "' 的 ref 修飾僅支援表參數（table/table<T>）或定長陣列（array<T, N>），實際是 " + got
-    }
-    return "参数 '" + nm + "' 的 ref 修饰仅支持表参数（table/table<T>）或定长数组（array<T, N>），实际是 " + got
+    return "message template \"E00692.msg\" missing from the language pack / 语言包缺少消息模板 'E00692.msg'"
 }
 
 // 可选参数必须连续排在必选参数之后（E00360）。
@@ -271,13 +247,11 @@ pub func msg_param_optional_order(nm: string) -> string {
         var t_nm = fill_tok(pt, "nm", nm)
         return t_nm
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "parameter '" + nm + "' lacks a default value; optional parameters (with defaults) must come after every required one"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "參數 '" + nm + "' 缺少預設值；可選參數（帶預設值）必須連續排在必選參數之後"
-    }
-    return "参数 '" + nm + "' 缺少默认值：可选参数（带默认值）必须连续排在必选参数之后"
+    return "message template \"E00360.msg\" missing from the language pack / 语言包缺少消息模板 'E00360.msg'"
 }
 
 // 默认值必须是字面量或编译期常量（E00914）。
@@ -287,13 +261,11 @@ pub func msg_param_default_const(nm: string) -> string {
         var t_nm = fill_tok(pt, "nm", nm)
         return t_nm
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "parameter '" + nm + "' needs a literal or compile-time constant default (a const reference or constant arithmetic; no calls and no runtime input)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "參數 '" + nm + "' 的預設值必須是字面量或編譯期常數運算式（const 引用／常數算術；不可含呼叫或執行期依賴）"
-    }
-    return "参数 '" + nm + "' 的默认值必须是字面量或编译期常量表达式（const 引用/常量算术；不可含调用或运行期依赖）"
+    return "message template \"E00914.msg\" missing from the language pack / 语言包缺少消息模板 'E00914.msg'"
 }
 
 // 默认值类型不匹配（E00361）。
@@ -305,13 +277,11 @@ pub func msg_param_default_type(nm: string, want: string, got: string) -> string
         var t_got = fill_tok(t_want, "got", got)
         return t_got
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "parameter '" + nm + "' default type mismatch: expected " + want + ", got " + got
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "參數 '" + nm + "' 預設值類型不符：期望 " + want + "，實際 " + got
-    }
-    return "参数 '" + nm + "' 默认值类型不匹配：期望 " + want + "，实际 " + got
+    return "message template \"E00361.msg\" missing from the language pack / 语言包缺少消息模板 'E00361.msg'"
 }
 
 // 诊断码说明（--explain=<code>）：成因 + 修法各一句，随 --lang 切换。
@@ -350,13 +320,11 @@ pub func msg_promote_needs_unsafe(sname: string, pname: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(pt, "sname", sname), "pname", pname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "promoting '" + sname + "' to port '" + pname + "' requires an unsafe block or an unsafe function (an interface object borrows the concrete object, so pointer operations count as unsafe)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "提升 '" + sname + "' 到 port '" + pname + "' 必須在 unsafe 區塊或 unsafe 函式中（介面物件借用具體物件，指標操作歸 unsafe）"
-    }
-    return "提升 '" + sname + "' 到 port '" + pname + "' 必须在 unsafe 块或 unsafe 函数中（接口对象借用具体对象，指针操作归 unsafe）"
+    return "message template \"E00456.msg\" missing from the language pack / 语言包缺少消息模板 'E00456.msg'"
 }
 
 // interface 约束不满足导致不能提升：缺少方法（E00560）。
@@ -365,13 +333,11 @@ pub func msg_iface_promote_missing(sname: string, iname: string, mname: string) 
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(fill_tok(pt, "sname", sname), "iname", iname), "mname", mname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "type '" + sname + "' does not implement interface '" + iname + "', so it cannot be promoted (missing method '" + mname + "')"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "類型 '" + sname + "' 未實作 interface '" + iname + "'，不能提升（缺少方法 '" + mname + "'）"
-    }
-    return "类型 '" + sname + "' 未实现 interface '" + iname + "'，不能提升（缺少方法 '" + mname + "'）"
+    return "message template \"E00560.missing\" missing from the language pack / 语言包缺少消息模板 'E00560.missing'"
 }
 
 // interface 约束不满足导致不能提升：方法签名不匹配（E00560）。
@@ -380,13 +346,11 @@ pub func msg_iface_promote_sig(sname: string, iname: string, mname: string) -> s
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(fill_tok(pt, "sname", sname), "iname", iname), "mname", mname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "type '" + sname + "' does not implement interface '" + iname + "', so it cannot be promoted (method '" + mname + "' has a mismatched signature)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "類型 '" + sname + "' 未實作 interface '" + iname + "'，不能提升（方法 '" + mname + "' 簽名不符）"
-    }
-    return "类型 '" + sname + "' 未实现 interface '" + iname + "'，不能提升（方法 '" + mname + "' 签名不匹配）"
+    return "message template \"E00560.sig\" missing from the language pack / 语言包缺少消息模板 'E00560.sig'"
 }
 
 // interface 约束不满足导致不能提升：无方法级细节（E00560）。
@@ -395,13 +359,11 @@ pub func msg_iface_promote_plain(sname: string, iname: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(pt, "sname", sname), "iname", iname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "type '" + sname + "' does not implement interface '" + iname + "', so it cannot be promoted"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "類型 '" + sname + "' 未實作 interface '" + iname + "'，不能提升"
-    }
-    return "类型 '" + sname + "' 未实现 interface '" + iname + "'，不能提升"
+    return "message template \"E00560.plain\" missing from the language pack / 语言包缺少消息模板 'E00560.plain'"
 }
 
 // port 约束不满足导致不能提升（E00561）。
@@ -410,13 +372,11 @@ pub func msg_port_promote_missing(sname: string, pname: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(pt, "sname", sname), "pname", pname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "type '" + sname + "' does not implement port '" + pname + "', so it cannot be promoted (write `impl " + pname + " for " + sname + "` first)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "類型 '" + sname + "' 未實作 port '" + pname + "'，不能提升（請先寫 impl " + pname + " for " + sname + "）"
-    }
-    return "类型 '" + sname + "' 未实现 port '" + pname + "'，不能提升（请先写 impl " + pname + " for " + sname + "）"
+    return "message template \"E00561.msg\" missing from the language pack / 语言包缺少消息模板 'E00561.msg'"
 }
 
 // 泛型约束（interface）不满足：缺少方法（E00557）。
@@ -425,13 +385,11 @@ pub func msg_generic_iface_missing(sname: string, iname: string, mname: string) 
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(fill_tok(pt, "sname", sname), "iname", iname), "mname", mname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "type '" + sname + "' does not implement interface '" + iname + "' (missing method '" + mname + "')"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "類型 '" + sname + "' 未實作 interface '" + iname + "'（缺少方法 '" + mname + "'）"
-    }
-    return "类型 '" + sname + "' 未实现 interface '" + iname + "'（缺少方法 '" + mname + "'）"
+    return "message template \"E00557.missing\" missing from the language pack / 语言包缺少消息模板 'E00557.missing'"
 }
 
 // 泛型约束（interface）不满足：方法签名不匹配（E00557）。
@@ -440,13 +398,11 @@ pub func msg_generic_iface_sig(sname: string, iname: string, mname: string) -> s
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(fill_tok(pt, "sname", sname), "iname", iname), "mname", mname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "type '" + sname + "' does not implement interface '" + iname + "' (method '" + mname + "' has a mismatched signature)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "類型 '" + sname + "' 未實作 interface '" + iname + "'（方法 '" + mname + "' 簽名不符）"
-    }
-    return "类型 '" + sname + "' 未实现 interface '" + iname + "'（方法 '" + mname + "' 签名不匹配）"
+    return "message template \"E00557.sig\" missing from the language pack / 语言包缺少消息模板 'E00557.sig'"
 }
 
 // 泛型约束（interface）不满足：无方法级细节（E00557）。
@@ -455,13 +411,11 @@ pub func msg_generic_iface_plain(sname: string, iname: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(pt, "sname", sname), "iname", iname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "type '" + sname + "' does not implement interface '" + iname + "' (generic constraint not satisfied)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "類型 '" + sname + "' 未實作 interface '" + iname + "'（泛型約束不符）"
-    }
-    return "类型 '" + sname + "' 未实现 interface '" + iname + "'（泛型约束不满足）"
+    return "message template \"E00557.plain\" missing from the language pack / 语言包缺少消息模板 'E00557.plain'"
 }
 
 // 泛型约束（port）不满足（E00556）。
@@ -470,13 +424,11 @@ pub func msg_generic_port(sname: string, pname: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(pt, "sname", sname), "pname", pname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "type '" + sname + "' does not implement port '" + pname + "' (generic constraint not satisfied)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "類型 '" + sname + "' 未實作 port '" + pname + "'（泛型約束不符）"
-    }
-    return "类型 '" + sname + "' 未实现 port '" + pname + "'（泛型约束不满足）"
+    return "message template \"E00556.msg\" missing from the language pack / 语言包缺少消息模板 'E00556.msg'"
 }
 
 // 方法缺 self 接收者（E00114）：kind 取 "port" / "interface" / "impl"。
@@ -485,13 +437,11 @@ pub func msg_method_needs_self(kind: string, mname: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(pt, "kind", kind), "mname", mname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return kind + " method '" + mname + "' must take self as its first parameter"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return kind + " 方法 '" + mname + "' 必須有 self 接收者（第一參數）"
-    }
-    return kind + " 方法 '" + mname + "' 必须有 self 接收者（第一参数）"
+    return "message template \"E00114.msg\" missing from the language pack / 语言包缺少消息模板 'E00114.msg'"
 }
 
 // 方法第一参数名不是 self（E00118）：kind 取 "port" / "interface" / "impl"。
@@ -500,13 +450,11 @@ pub func msg_method_first_param_self(kind: string, mname: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(pt, "kind", kind), "mname", mname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "the first parameter of " + kind + " method '" + mname + "' must be self"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return kind + " 方法 '" + mname + "' 的第一參數必須是 self"
-    }
-    return kind + " 方法 '" + mname + "' 的第一参数必须是 self"
+    return "message template \"E00118.msg\" missing from the language pack / 语言包缺少消息模板 'E00118.msg'"
 }
 
 // impl 缺少 port 要求的方法（E00210）。
@@ -515,13 +463,11 @@ pub func msg_impl_missing_method(pname: string, sname: string, mname: string) ->
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(fill_tok(pt, "pname", pname), "sname", sname), "mname", mname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "impl '" + pname + " for " + sname + "' is missing method '" + mname + "' (every port method must be implemented)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "impl '" + pname + " for " + sname + "' 缺少方法 '" + mname + "'（port 方法必須全部實作）"
-    }
-    return "impl '" + pname + " for " + sname + "' 缺少方法 '" + mname + "'（port 方法必须全部实现）"
+    return "message template \"E00210.msg\" missing from the language pack / 语言包缺少消息模板 'E00210.msg'"
 }
 
 // impl 方法参数个数与 port 签名不符（E00112）。
@@ -530,13 +476,11 @@ pub func msg_impl_arity(mname: string, want: string, got: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(fill_tok(pt, "mname", mname), "want", want), "got", got)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "impl method '" + mname + "' has a mismatched parameter count: expected " + want + ", got " + got
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "impl 方法 '" + mname + "' 參數個數與 port 簽名不符：期望 " + want + "，實際 " + got
-    }
-    return "impl 方法 '" + mname + "' 参数个数与 port 签名不匹配：期望 " + want + "，实际 " + got
+    return "message template \"E00112.msg\" missing from the language pack / 语言包缺少消息模板 'E00112.msg'"
 }
 
 // impl 方法参数类型与 port 签名不符（E00113）。
@@ -545,13 +489,11 @@ pub func msg_impl_param_type(mname: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(pt, "mname", mname)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "impl method '" + mname + "' has a mismatched parameter type (port method parameters must keep the same types)"
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "impl 方法 '" + mname + "' 參數類型與 port 簽名不符（port 方法參數必須型別一致）"
-    }
-    return "impl 方法 '" + mname + "' 参数类型与 port 签名不匹配（port 方法参数必须类型一致）"
+    return "message template \"E00113.msg\" missing from the language pack / 语言包缺少消息模板 'E00113.msg'"
 }
 
 // impl 方法返回类型与 port 签名不符（E00120）。
@@ -560,11 +502,9 @@ pub func msg_impl_ret_type(mname: string, want: string, got: string) -> string {
     if str_len(pt) > 0 {
         return fill_tok(fill_tok(fill_tok(pt, "mname", mname), "want", want), "got", got)
     }
-    if diagcode.cur_lang() == "en-US" {
-        return "impl method '" + mname + "' has a mismatched return type: expected " + want + ", got " + got
+    // 兜底已删除：语言包缺失或键缺失时给出显式失败，绝不静默换语言或返回空串。
+    if pack_ok() == 0 {
+        return "diagnostic language pack not loaded (data/locale/*.td); run tiec from the repository root or pass --lib-root / 诊断语言包未载入；请在仓库根目录运行 tiec，或指定 --lib-root"
     }
-    if diagcode.cur_lang() == "zh-TW" {
-        return "impl 方法 '" + mname + "' 回傳類型與 port 簽名不符：期望 " + want + "，實際 " + got
-    }
-    return "impl 方法 '" + mname + "' 返回类型与 port 签名不匹配：期望 " + want + "，实际 " + got
+    return "message template \"E00120.msg\" missing from the language pack / 语言包缺少消息模板 'E00120.msg'"
 }
