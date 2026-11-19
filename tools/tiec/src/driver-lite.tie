@@ -314,7 +314,12 @@ func main() -> i64 {
         if !file_write(ll_out, ll) {
             return 1
         }
-        println("已生成 LLVM IR: " + ll_out)
+        // JSON 诊断模式下 stdout 必须是纯 NDJSON，人读状态行改道 stderr。
+        if diagcode.diag_json_enabled() == 0 {
+            println("已生成 LLVM IR: " + ll_out)
+        } else {
+            print_err("已生成 LLVM IR: " + ll_out + "\n")
+        }
         return 0
     }
 
