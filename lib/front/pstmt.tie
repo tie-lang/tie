@@ -145,11 +145,27 @@ pub func parse_var_decl(is_const: i64) -> i64 {
     // 容量提示 table<T, N>：登记成声明后紧跟的一条 table_reserve(名, N)。
     // 语句列表构建方收集完本声明后立刻 flush（见 putil.flush_reserves）。
     if ty >= 0 && ast.tag(ty) == N_TABLE_TYPE && ast.child_count(ty) > 1 {
+        // 类型子节点里除元素类型外还有两类**哨兵**（N_INT_LIT，按 aux 区分：
+        // aux=1 表示 `, fixed` 硬上限标记、aux=2 表示 `shared` 前缀）与一个
+        // 容量提示（cap，aux=-1）。按 aux 判定而不是按子节点个数，否则
+        // `shared table<i64, 8>` 会被误当成 fixed。
+        var capn: i64 = -1
         var fixf: i64 = 0
-        if ast.child_count(ty) > 2 {
-            fixf = 1
+        var cn = ast.child_count(ty)
+        var ci: i64 = 1
+        while ci < cn {
+            var cd = ast.child_at(ty, ci)
+            var ca = ast.aux(cd)
+            if ca == 1 {
+                fixf = 1
+            } else if ca != 2 && capn < 0 {
+                capn = cd
+            }
+            ci = ci + 1
         }
-        putil.push_reserve(name, ast.child_at(ty, 1), fixf)
+        if capn >= 0 {
+            putil.push_reserve(name, capn, fixf)
+        }
     }
     var v = ast.new_node(N_VAR_DECL, name, is_const, vmod, line, col)
     var kids: table<i64> = table_new_i64()

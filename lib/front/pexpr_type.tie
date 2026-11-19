@@ -17,6 +17,30 @@ pub func parse_type() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
     var tag = putil.peek_tag()
+    // 显式共享前缀：`shared table<T>`。只允许修饰表类型（表是引用语义、可跨线程
+    // 共享的唯一容器）；标记以哨兵子节点（N_INT_LIT 2）追加在 N_TABLE_TYPE 的
+    // children 末尾，供语义层/代码生成判定是否装载每表锁。
+    if tag == lex_shared {
+        putil.advance()
+        var inner = parse_type()
+        if inner < 0 {
+            return -1
+        }
+        if ast.tag(inner) != N_TABLE_TYPE {
+            putil.set_err(line, col, "shared 只能修饰表类型（shared table<T>）")
+            return -1
+        }
+        var kn = ast.child_count(inner)
+        var nk: table<i64> = table_new_i64()
+        var ki: i64 = 0
+        while ki < kn {
+            table_push(nk, ast.child_at(inner, ki))
+            ki = ki + 1
+        }
+        table_push(nk, ast.new_node(N_INT_LIT, -1, 2, 2, line, col))
+        ast.set_children(inner, nk)
+        return inner
+    }
     if tag == lex_typekw {
         var lex = putil.peek_lexeme()
         var tk = putil.typekw_index(lex)
@@ -72,7 +96,7 @@ pub func parse_type() -> i64 {
                     table_push(kids, capnode)
                 }
                 if fixedf != 0 {
-                    var mk = ast.new_node(N_INT_LIT, -1, 1, -1, line, col)
+                    var mk = ast.new_node(N_INT_LIT, -1, 1, 1, line, col)
                     table_push(kids, mk)
                 }
                 ast.set_children(t, kids)
