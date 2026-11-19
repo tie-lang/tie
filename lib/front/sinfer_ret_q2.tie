@@ -405,6 +405,22 @@ pub func infer_call(id: i64) -> i64 {
             g_typed = g_typed + 1
             return ta
         }
+        // table_shared(t) → 表自身：把刚建出的无锁表换成块内锁布局（声明点 desugar 发出）。
+        if fnm == "table_shared" {
+            var tsh = infer_expr(args[0])
+            if tsh < 0 {
+                return -1
+            }
+            if !types.is_table(tsh) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "table_shared() 第 1 个参数必须是表，实际是 " + types.type_name(tsh)
+                return -1
+            }
+            node_types[id] = tsh
+            g_typed = g_typed + 1
+            return tsh
+        }
         // table_fix(t, n) → 表自身：把容量钉到 n 并记录硬上限（声明点 desugar 发出）。
         if fnm == "table_fix" {
             var tfx = infer_expr(args[0])

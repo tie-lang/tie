@@ -191,3 +191,26 @@ unsafe fn grow(p: ptr<u8>, cap: i64, len: i64, data: i64, esz: i64, need: i64) -
 // 约 17%）。本入口把「增长」与「提交」拆开：由调用方（codegen 内联序列）负责
 // 把新 data/新 cap 写回表头，运行时侧看不到表对象。
 
+// shared 表：把刚建出的无锁表换成 120 B 块内锁布局（声明点 desugar 的 table_shared 调用）。
+// 只在句柄尚未外泄的建表瞬间调用，故可直接换块；旧 56 B 块随 free 释放，数据缓冲原样转移。
+pub unsafe fn tbl_share_new(h: i64) -> i64 {
+    unsafe {
+        var p = int_to_ptr(h)
+        if ptr_to_int(p) == 0 {
+            return h
+        }
+        if lock_v(p) != 0 {
+            return h
+        }
+        var np = ack(120)
+        set_len_v(np, len_v(p))
+        set_cap_v(np, cap_v(p))
+        set_data_v(np, data_v(p))
+        set_esz_v(np, esz_v(p))
+        set_refc_v(np, refc_v(p))
+        set_fix_v(np, fix_v(p))
+        init_lock(np)
+        free(p)
+        return ptr_to_int(np)
+    }
+}

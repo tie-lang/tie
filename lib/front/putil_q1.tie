@@ -794,7 +794,31 @@ pub func flush_reserves(stmts: ref table<i64>) {
         }
         i = i + 1
     }
+    // shared 表：换成块内锁布局（`名 = table_shared(名)`，声明之后立即执行）。
+    var si: i64 = 0
+    while si < len(g_sh_names) {
+        var tgt4 = ast.new_node(N_VAR, g_sh_names[si], -1, -1, 0, 0)
+        var call4 = ast.new_node(N_CALL, interner.intern("table_shared"), -1, -1, 0, 0)
+        var ck4: table<i64> = table_new_i64()
+        table_push(ck4, -1)
+        table_push(ck4, tgt4)
+        ast.set_children(call4, ck4)
+        var as4 = ast.new_node(N_ASSIGN, g_sh_names[si], -1, -1, 0, 0)
+        var ak4: table<i64> = table_new_i64()
+        table_push(ak4, call4)
+        ast.set_children(as4, ak4)
+        table_push(stmts, as4)
+        si = si + 1
+    }
+    g_sh_names = table_new_i64()
     g_resv_names = table_new_i64()
     g_resv_caps = table_new_i64()
     g_resv_fix = table_new_i64()
+}
+
+// shared 表：声明点登记，flush 时补一条 `名 = table_shared(名)`（原地换成块内锁布局）。
+pub var g_sh_names: table<i64> = []
+
+pub func push_shared(name: i64) {
+    table_push(g_sh_names, name)
 }

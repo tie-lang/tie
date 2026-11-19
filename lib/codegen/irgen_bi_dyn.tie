@@ -676,6 +676,22 @@ if nm == "table_fix" {
 }
 }
 
+pub func bi_table_shared(nm: string, id: i64) -> i64 {
+if nm == "table_shared" {
+    g_used_trmlite = true
+    var t = tig_expr(call_arg(id, 0))
+    if t < 0 {
+        return -1
+    }
+    var ti = t21_ptri(t)
+    var r = tl_i64_1("tl_tbl$tbl_share_new", ti)
+    if r < 0 {
+        return -1
+    }
+    g_builtin_res = t21_intp(r)
+    return 0
+}
+}
 // 内置 `table_clone`（独立副本：新表 + 拷贝 len 个元素；深表连同内层表递归深克隆）
 // 语义见规范 §13.5 克隆：副本与源完全独立（数据缓冲、锁各自一份），改副本不影响源。
 // 走指针形参入口 tbl_clone_p：nocapture 使源表句柄不被判为逃逸。

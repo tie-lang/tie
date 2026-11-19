@@ -151,6 +151,7 @@ pub func parse_var_decl(is_const: i64) -> i64 {
         // `shared table<i64, 8>` 会被误当成 fixed。
         var capn: i64 = -1
         var fixf: i64 = 0
+        var shf: i64 = 0
         var cn = ast.child_count(ty)
         var ci: i64 = 1
         while ci < cn {
@@ -158,13 +159,18 @@ pub func parse_var_decl(is_const: i64) -> i64 {
             var ca = ast.aux(cd)
             if ca == 1 {
                 fixf = 1
-            } else if ca != 2 && capn < 0 {
+            } else if ca == 2 {
+                shf = 1
+            } else if capn < 0 {
                 capn = cd
             }
             ci = ci + 1
         }
         if capn >= 0 {
             putil.push_reserve(name, capn, fixf)
+        }
+        if shf != 0 {
+            // shared 换块路径暂不生效（tbl_share_new 运行期堆损坏待修）
         }
     }
     var v = ast.new_node(N_VAR_DECL, name, is_const, vmod, line, col)
