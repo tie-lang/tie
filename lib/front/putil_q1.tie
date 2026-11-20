@@ -867,3 +867,136 @@ pub func tbl_uses_safe(nd: i64, nm_aux: i64) -> i64 {
     }
     return 1
 }
+
+pub func callee_nm(nd2: i64) -> string {
+    var cv2 = ast.child_at(nd2, 0)
+    if cv2 >= 0 && cv2 < ast.count() {
+        var tg2 = ast.tag(cv2)
+        if tg2 == N_VAR || tg2 == N_PATH {
+            return interner.name_str(ast.name(cv2))
+        }
+    }
+    var cn2 = ast.name(nd2)
+    if cn2 >= 0 {
+        return interner.name_str(cn2)
+    }
+    return ""
+}
+
+// 使用扫描：子槽可能存符号 id（非节点 id），必须先按池上界裁剪。
+pub func use_ok3(nd: i64, nm_aux: i64) -> i64 {
+    if nd < 0 || nd >= ast.count() {
+        return 1
+    }
+    var t = ast.tag(nd)
+    if t == N_VAR || t == N_PATH {
+        if ast.name(nd) == nm_aux {
+            return 0
+        }
+        return 1
+    }
+    if t == N_INT_LIT || t == N_FLOAT_LIT {
+        return 1
+    }
+    if t == N_CALL && callee_nm(nd) == "len" {
+        var a0 = ast.child_at(nd, 1)
+        if a0 >= 0 && a0 < ast.count() {
+            var ta0 = ast.tag(a0)
+            if (ta0 == N_VAR || ta0 == N_PATH) && ast.name(a0) == nm_aux {
+                return 1
+            }
+        }
+    }
+    var c = ast.child_count(nd)
+    var i: i64 = 0
+    while i < c {
+        var ch = ast.child_at(nd, i)
+        if ch >= ast.count() {
+            ch = -1
+        }
+        if (t == N_INDEX && i != 0) || (t != N_INDEX && t != N_VAR_DECL) {
+            if use_ok3(ch, nm_aux) == 0 {
+                return 0
+            }
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+pub func try_rep3(d: i64, scope: i64) -> i64 {
+    if scope < 0 || d < 0 || d >= ast.count() {
+        return 0
+    }
+    if ast.tag(d) != N_VAR_DECL || ast.child_count(d) < 2 {
+        return 0
+    }
+    var ty = ast.child_at(d, 0)
+    var init = ast.child_at(d, 1)
+    if ty < 0 || init < 0 || ty >= ast.count() || init >= ast.count() {
+        return 0
+    }
+    if ast.tag(ty) != N_TABLE_TYPE || ast.child_count(ty) != 1 {
+        return 0
+    }
+    if ast.tag(init) != N_TABLE_LIT {
+        return 0
+    }
+    var nc = ast.child_count(init)
+    if nc <= 0 {
+        return 0
+    }
+    var ei: i64 = 0
+    while ei < nc {
+        var el = ast.child_at(init, ei)
+        if el < 0 || el >= ast.count() {
+            return 0
+        }
+        var k0 = ast.child_at(el, 0)
+        if k0 >= 0 && k0 < ast.count() {
+            return 0
+        }
+        ei = ei + 1
+    }
+    if use_ok3(scope, ast.name(d)) == 0 {
+        return 0
+    }
+    var at = ast.new_node(N_ARRAY_TYPE, -1, -1, -1, 0, 0)
+    var lenv = ast.new_node(N_INT_LIT, -1, nc, -1, 0, 0)
+    var ak: table<i64> = table_new_i64()
+    table_push(ak, ast.child_at(ty, 0))
+    table_push(ak, lenv)
+    ast.set_children(at, ak)
+    var dk: table<i64> = table_new_i64()
+    table_push(dk, at)
+    table_push(dk, init)
+    ast.set_children(d, dk)
+    return 1
+}
+
+pub func rep_walk3(nd: i64, scope: i64) -> i64 {
+    if nd < 0 || nd >= ast.count() {
+        return 0
+    }
+    var t = ast.tag(nd)
+    if t == N_FN_DEF || t == N_FN_LIT {
+        scope = nd
+    }
+    var n: i64 = 0
+    if t == N_VAR_DECL {
+        n = n + try_rep3(nd, scope)
+    }
+    if t == N_VAR || t == N_PATH || t == N_INT_LIT {
+        return n
+    }
+    var c = ast.child_count(nd)
+    var i: i64 = 0
+    while i < c {
+        var ch = ast.child_at(nd, i)
+        if ch >= 0 && ch < ast.count() {
+            n = n + rep_walk3(ch, scope)
+        }
+        i = i + 1
+    }
+    return n
+}
