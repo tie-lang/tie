@@ -399,6 +399,7 @@ func tig_closure_lit(id: i64) -> i64 {
             var cty = cl_capvals[capoff + j]
             if types.is_table(cty) || types.is_map(cty) {
                 tig_tbl_retain_call(cv)
+                var tlk = tl_str_i64_1("tl_tbl$lock_on", cv)   // 闭包捕获的表按需装锁（可能被 spawn 跨线程持有）
             }
             var gp = ir.new_inst(g_cur_block, 27, cap_ty)  // agg_gep 字段 j+1（0 是 drop）
             ir.add_operand(gp, env_v, 0)
