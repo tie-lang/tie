@@ -192,29 +192,38 @@ unsafe fn grow(p: ptr<u8>, cap: i64, len: i64, data: i64, esz: i64, need: i64) -
 // 把新 data/新 cap 写回表头，运行时侧看不到表对象。
 
 // shared 表：把刚建出的无锁表换成 120 B 块内锁布局（声明点 desugar 的 table_shared 调用）。
-// 只在句柄尚未外泄的建表瞬间调用，故可直接换块；旧 56 B 块随 free 释放，数据缓冲原样转移。
+
+// shared 表：把无锁表复制成一张带块内锁的表（声明点 desugar 的 table_shared 调用）。
+// 视图语义不可行（两张句柄共享 data 会在 release 时双重释放），故取复制语义：
+// 原表保持独立、不被掏空，因此同一张表转换多次或与多个变量共享都安全。
 pub unsafe fn tbl_share_new(h: i64) -> i64 {
     unsafe {
         var p = int_to_ptr(h)
         if ptr_to_int(p) == 0 {
             return h
         }
-        if lock_v(p) != 0 {
+        var esz = esz_v(p)
+        if (esz & TBL_DEEP) != 0 {
+            // 深表不转换：元素是子表句柄，浅拷贝会破坏引用计数守恒。
             return h
         }
+        var ncap = cap_v(p)
+        var nlen = len_v(p)
         var np = ack(120)
-        set_len_v(np, len_v(p))
-        set_cap_v(np, cap_v(p))
-        set_data_v(np, data_v(p))
-        set_esz_v(np, esz_v(p))
-        set_refc_v(np, refc_v(p))
+        set_len_v(np, nlen)
+        set_cap_v(np, ncap)
+        set_esz_v(np, esz)
+        set_refc_v(np, 1)
         set_fix_v(np, fix_v(p))
         init_lock(np)
-        set_len_v(p, 0)
-        set_cap_v(p, 0)
-        set_data_v(p, 0)
-        set_esz_v(p, 0)
-        set_refc_v(p, 1)
+        var nd: i64 = 0
+        if ncap > 0 {
+            nd = ptr_to_int(ack(ncap * esz))
+            if nlen > 0 {
+                memcpy(int_to_ptr(nd), int_to_ptr(data_v(p)), nlen * esz)
+            }
+        }
+        set_data_v(np, nd)
         return ptr_to_int(np)
     }
 }
