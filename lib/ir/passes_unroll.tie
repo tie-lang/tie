@@ -217,6 +217,25 @@ func unroll_one(h: i64, def: table<i64>, refs: table<i64>, nv: i64) -> i64 {
         }
         ii = ii + 1
     }
+    // ---------- 4b. 循环体不得引用头块内定义的值 ----------
+    // 复制体落入新块后，头块不再是它的支配者：一旦体里用到头块产出的值，
+    // 复制体就会引用一个不支配自己的定义（LLVM: Instruction does not dominate all uses）。
+    ii = ts
+    while ii < tterm {
+        var nob = ir.ins_ops_cnt(ii)
+        var oi3: i64 = 0
+        while oi3 < nob {
+            if ir.ins_opnd_kind(ii, oi3) == U_K_VAL {
+                var dv3 = ir.ins_opnd(ii, oi3)
+                if dv3 >= 0 && dv3 < nv {
+                    var dd3 = def[dv3]
+                    if dd3 >= 0 { if ir.inst_block(dd3) == h { return 0 } }
+                }
+            }
+            oi3 = oi3 + 1
+        }
+        ii = ii + 1
+    }
     // ---------- 5. 归纳变量：末尾 slot = slot + 1，且 slot 只此一处写 ----------
     var lastb = tterm - 1
     if ir.ins_op(lastb) != U_STORE || ir.ins_ops_cnt(lastb) != 3 {
