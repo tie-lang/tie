@@ -450,12 +450,18 @@ pub func count() -> i64 {
 
 // 第 id 个节点的 tag（判别键，switch 分派用）。
 pub func tag(id: i64) -> i64 {
+    if id < 0 || id >= len(node_tags) {
+        return -1
+    }
     return node_tags[id]
 }
 
 // 第 id 个节点的名字字段（字符串池 id，-1 = 无名字；
 // 文本取 interner.name_str(node_names[id])）。
 pub func name(id: i64) -> i64 {
+    if id < 0 || id >= len(node_names) {
+        return -1
+    }
     return node_names[id]
 }
 
@@ -513,11 +519,17 @@ pub func set_val(node: i64, v: i64) {
 
 // 子节点个数（无子节点返回 0）。
 pub func child_count(id: i64) -> i64 {
+    if id < 0 || id >= len(node_nchild) {
+        return 0
+    }
     return node_nchild[id]
 }
 
 // 第 i 个子节点 id（段偏移读取；越界返回 -1 哨兵）。
 pub func child_at(id: i64, i: i64) -> i64 {
+    if id < 0 || id >= len(node_child_off) {
+        return -1
+    }
     var off = node_child_off[id]
     var n = node_nchild[id]
     if i < 0 {
