@@ -751,10 +751,47 @@ func make_tuple2(v0: i64, t0: i64, v1: i64, t1: i64, agg: i64) -> i64 {
     return ir.get_value(ld)
 }
 
-// slice<T> 聚合构造：(指针, 长度) → slice 类型聚合值。元素类型仅语义信息
-// （LLVM 类型固定 {ptr, i64}）。
+// 三元组聚合构造：(v0, v1, v2) → alloca 聚合 + 逐字段 agg_gep/store + load
+func make_tuple3(v0: i64, t0: i64, v1: i64, t1: i64, v2: i64, t2: i64, agg: i64) -> i64 {
+    var alloca = ir.new_inst(g_cur_block, 20, agg)
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    var g0 = ir.new_inst(g_cur_block, 27, agg)
+    ir.add_operand(g0, ap, 0)
+    ir.add_operand(g0, 0, 2)
+    var s0 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(s0, t0, 2)
+    ir.add_operand(s0, v0, 0)
+    ir.add_operand(s0, ir.get_value(g0), 0)
+    var g1 = ir.new_inst(g_cur_block, 27, agg)
+    ir.add_operand(g1, ap, 0)
+    ir.add_operand(g1, 1, 2)
+    var s1 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(s1, t1, 2)
+    ir.add_operand(s1, v1, 0)
+    ir.add_operand(s1, ir.get_value(g1), 0)
+    var g2 = ir.new_inst(g_cur_block, 27, agg)
+    ir.add_operand(g2, ap, 0)
+    ir.add_operand(g2, 2, 2)
+    var s2 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(s2, t2, 2)
+    ir.add_operand(s2, v2, 0)
+    ir.add_operand(s2, ir.get_value(g2), 0)
+    var ld = ir.new_inst(g_cur_block, 21, agg)
+    ir.add_operand(ld, ap, 0)
+    return ir.get_value(ld)
+}
+
+// slice<T> 聚合构造：(指针, 长度, 源表句柄) → 24 字节 {ptr, i64, i64}。
+// 第三字段是**已保留**的源表句柄；字符串切片的源表句柄填 0。
+func make_slice3(p: i64, len: i64, src: i64, elem_ty: i64) -> i64 {
+    return make_tuple3(p, types.named(TK_STR), len, types.named(TK_I64), src, types.named(TK_I64), types.slice_of(elem_ty))
+}
+
+// 两参数形态（字符串路径）：源表句柄填 0
 func make_slice2(p: i64, len: i64, elem_ty: i64) -> i64 {
-    return make_tuple2(p, types.named(TK_STR), len, types.named(TK_I64), types.slice_of(elem_ty))
+    var z = tig_int_lit_ty(0, types.named(TK_I64))
+    return make_slice3(p, len, z, elem_ty)
 }
 
 // slice<T> 字段提取：0 = 指针，1 = 长度（聚合值先落内存 → agg_gep + load）
