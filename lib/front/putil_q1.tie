@@ -822,3 +822,36 @@ pub var g_sh_names: table<i64> = []
 pub func push_shared(name: i64) {
     table_push(g_sh_names, name)
 }
+
+// 表示推导用：判断变量 nm_aux 在子树 nd 里是否只出现在「安全位置」——
+// 允许：下标表达式的基座（N_INDEX 的第 0 个子节点）、自身声明初始化式位（N_VAR_DECL 的第 1 个子节点）。
+// 其余任何出现（方法调用、赋值左侧、实参、返回值、闭包体内）一律视为不安全。
+// 返回 1 = 安全（可降级为定长数组），0 = 不安全。
+pub func tbl_uses_safe(nd: i64, nm_aux: i64) -> i64 {
+    if nd < 0 {
+        return 1
+    }
+    var t = ast.tag(nd)
+    var nc = ast.child_count(nd)
+    var i: i64 = 0
+    while i < nc {
+        var c = ast.child_at(nd, i)
+        if c >= 0 {
+            if ast.tag(c) == N_VAR && ast.aux(c) == nm_aux {
+                if t == N_INDEX && i == 0 {
+                    // 下标基座：t[i] / t[i] = v 都安全（定长数组同样支持）
+                } else if t == N_VAR_DECL && i == 1 {
+                    // 自身初始化式位（字面量），此处不会出现 N_VAR
+                } else {
+                    return 0
+                }
+            } else {
+                if tbl_uses_safe(c, nm_aux) == 0 {
+                    return 0
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 1
+}
