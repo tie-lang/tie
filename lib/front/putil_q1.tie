@@ -837,12 +837,24 @@ pub func tbl_uses_safe(nd: i64, nm_aux: i64) -> i64 {
     while i < nc {
         var c = ast.child_at(nd, i)
         if c >= 0 {
-            if ast.tag(c) == N_VAR && ast.aux(c) == nm_aux {
+            if ast.tag(c) == N_VAR && ast.name(c) == nm_aux {
+                var okv: i64 = 0
                 if t == N_INDEX && i == 0 {
                     // 下标基座：t[i] / t[i] = v 都安全（定长数组同样支持）
+                    okv = 1
                 } else if t == N_VAR_DECL && i == 1 {
                     // 自身初始化式位（字面量），此处不会出现 N_VAR
-                } else {
+                    okv = 1
+                } else if t == N_CALL && i == 1 && ast.child_count(nd) == 2 {
+                    var cv = ast.child_at(nd, 0)
+                    if cv >= 0 && ast.tag(cv) == N_VAR {
+                        if interner.name_str(ast.name(cv)) == "len" {
+                            // len(t)：定长数组同样支持
+                            okv = 1
+                        }
+                    }
+                }
+                if okv == 0 {
                     return 0
                 }
             } else {
