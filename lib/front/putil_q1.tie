@@ -837,7 +837,7 @@ pub func tbl_uses_safe(nd: i64, nm_aux: i64) -> i64 {
     while i < nc {
         var c = ast.child_at(nd, i)
         if c >= 0 {
-            if ast.tag(c) == N_VAR && ast.name(c) == nm_aux {
+            if ast.tag(c) == N_VAR && ast.aux(c) == nm_aux {
                 if t == N_INDEX && i == 0 {
                     // 下标基座：t[i] / t[i] = v 都安全（定长数组同样支持）
                 } else if t == N_VAR_DECL && i == 1 {
@@ -850,67 +850,6 @@ pub func tbl_uses_safe(nd: i64, nm_aux: i64) -> i64 {
                     return 0
                 }
             }
-        }
-        i = i + 1
-    }
-    return 1
-}
-
-// 表示推导第 2 步：把「经证明」的 table 声明改写成定长数组声明。
-// 判据：类型是 N_TABLE_TYPE、初始化式是表字面量且每元素槽无显式键（child 0 == -1）、
-// 非空、且变量在整块语句里只出现在下标基座（tbl_uses_safe）。
-// 命中时把声明节点的类型子节点换成 array<T, N>（N_ARRAY_TYPE children = [元素类型, N_INT_LIT]）。
-pub func rewrite_table_reps(stmts: table<i64>) -> i64 {
-    var i: i64 = 0
-    var n: i64 = len(stmts)
-    while i < n {
-        var d = stmts[i]
-        if d >= 0 && ast.tag(d) == N_VAR_DECL && ast.child_count(d) > 1 {
-            var ty = ast.child_at(d, 0)
-            var init = ast.child_at(d, 1)
-            if ty >= 0 && ast.tag(ty) == N_TABLE_TYPE && ast.child_count(ty) == 1 && init >= 0 && ast.tag(init) == N_TABLE_LIT {
-                var nc: i64 = ast.child_count(init)
-                var ok: i64 = 1
-                if nc <= 0 {
-                    ok = 0
-                }
-                var k: i64 = 0
-                while k < nc && ok == 1 {
-                    var e = ast.child_at(init, k)
-                    if e < 0 || ast.child_count(e) <= 0 || ast.child_at(e, 0) >= 0 {
-                        ok = 0
-                    }
-                    k = k + 1
-                }
-                if ok == 1 && stmts_use_safe(stmts, ast.name(d)) == 1 {
-                    var elem = ast.child_at(ty, 0)
-                    if elem >= 0 {
-                        var cnt = ast.new_node(N_INT_LIT, -1, nc, -1, ast.line(d), ast.col(d))
-                        var na = ast.new_node(N_ARRAY_TYPE, -1, -1, -1, ast.line(d), ast.col(d))
-                        var kids: table<i64> = table_new_i64()
-                        table_push(kids, elem)
-                        table_push(kids, cnt)
-                        ast.set_children(na, kids)
-                        var dk: table<i64> = table_new_i64()
-                        table_push(dk, na)
-                        table_push(dk, init)
-                        ast.set_children(d, dk)
-                    }
-                }
-            }
-        }
-        i = i + 1
-    }
-    return 0
-}
-
-// 语句表级别的使用扫描：任一语句子树里出现不安全引用即判不安全。
-pub func stmts_use_safe(stmts: table<i64>, nm_aux: i64) -> i64 {
-    var i: i64 = 0
-    var n: i64 = len(stmts)
-    while i < n {
-        if tbl_uses_safe(stmts[i], nm_aux) == 0 {
-            return 0
         }
         i = i + 1
     }
