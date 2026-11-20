@@ -225,3 +225,20 @@ pub unsafe fn init_lock(p: ptr<u8>) -> i64 {
 }
 
 // 建空表：esz = 元素字节大小。返回句柄（i64 = 指向 120 字节块的指针）。
+pub const TBL_LOCKB: i64 = 2305843009213693952   // 1<<61：锁块由 lock_on 单独分配，release 需 free
+pub unsafe fn lock_on(h: i64) -> i64 {
+    if h == 0 {
+        return 0
+    }
+    var p = int_to_ptr(h)
+    if lock_v(p) != 0 {
+        return 0
+    }
+    var lk = ack(64)
+    unsafe {
+        InitializeCriticalSection(ptr_to_int(lk));
+    }
+    set_lock_v(p, ptr_to_int(lk))
+    set_esz_v(p, esz_v(p) | TBL_LOCKB)
+    return 0
+}
