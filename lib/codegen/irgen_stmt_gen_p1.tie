@@ -277,6 +277,12 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
             if cand_tbl {
                 table_push(g_tblcand_allocas, av)
             }
+            // 切片局部的源表析构候选：`slice<T>` 聚合值的第三字段是构造时 retain
+            // 过的源表句柄，槽被覆盖/函数出口时须释放一次（否则每个切片泄漏一份
+            // 表引用）。释放动作见 tig_slice_slot_release（按第三字段取值）。
+            if types.kind(ty) == K_SLICE {
+                table_push(g_slc_allocas, av)
+            }
             // 闭包 env 释放候选（(b) 方案）：**任何 fn 类型初值**都登记 —— 不再只收
             // 闭包字面量，故 `var f = mk()`（工厂形态，由函数返回闭包）也被覆盖：
             // 释放点从 env 首字段读析构入口，无需知道是哪个闭包。
@@ -320,6 +326,10 @@ pub func tig_stmt_b_100_VarDecl(id: i64) -> i64 {
                 // 主源）。RCA-5 的出口 release 仍守恒最终值（单次释放，无双重释放——
                 // 回边由哨兵逐次减，最终值由出口减）。
                 tig_loopvar_release(av)
+            }
+            // 切片局部的回边释放（同上语义，动作改为释放聚合值第三字段的源表）。
+            if g_cur_block != g_entry_block && types.kind(ty) == K_SLICE {
+                tig_loopvar_slice_release(av)
             }
             // 聚合局部的回边释放（同上语义，动作改为递归释放各表字段）。
             // 条件同表路径：**非 entry 块**声明（entry 级的槽不跨迭代重写，由出口析构收尾）。

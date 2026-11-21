@@ -493,6 +493,32 @@ func tig_tbl_release_call(hv: i64) -> i64 {
     return tig_trmlite_call("tl_tbl$tbl_release_p", atys, avs, -1)
 }
 
+// 切片聚合值（`slice<T>` = {ptr,len,src}）的源表释放：把槽内聚合值取出第三字段
+// （src，指向源表的 ptr，切片构造时已 retain）转 i64 后调 tbl_release_p。
+// 空 src（字符串切片、或未初始化槽）由 tbl_release 的空句柄守卫跳过。
+func tig_slice_src_ptr(sv: i64) -> i64 {
+    var srcv = slice_field(sv, 2)
+    var srcp = ir.new_inst(g_cur_block, 25, types.named(TK_STR))
+    ir.add_operand(srcp, srcv, 0)
+    return ir.get_value(srcp)
+}
+
+func tig_slice_release_call(sv: i64) -> i64 {
+    return tig_tbl_release_call(tig_slice_src_ptr(sv))
+}
+// 切片值的源表 retain：别名赋值/别名声明（`var b = a`）时两侧各持一份引用。
+
+func tig_slice_retain_call(sv: i64) -> i64 {
+    return tig_tbl_retain_call(tig_slice_src_ptr(sv))
+}
+
+// 从槽地址读出切片聚合值再释放其源表（出口/覆盖路径用）。
+func tig_slice_slot_release(av: i64, ty: i64) -> i64 {
+    var ld = ir.new_inst(g_cur_block, 21, ty)  // load 聚合值
+    ir.add_operand(ld, av, 0)
+    return tig_slice_release_call(ir.get_value(ld))
+}
+
 // 名称是否登记为参数（表参数借用语义：不析构、覆盖不 release——所有权在调用方）。
 func tig_is_param(nid: i64) -> bool {
     var i: i64 = 0
@@ -529,6 +555,12 @@ func tig_tbl_exit_release() {
     while _ai < len(g_aggcand_allocas) {
         tig_agg_release_fields(g_aggcand_allocas[_ai], g_aggcand_tys[_ai])
         _ai = _ai + 1
+    }
+    // 切片局部源表释放——与构造处的 retain 成对（槽在覆盖/出口被丢弃时 -1）。
+    var _si: i64 = 0
+    while _si < len(g_slc_allocas) {
+        tig_slice_slot_release(g_slc_allocas[_si], types.slice_of(types.named(TK_I64)))
+        _si = _si + 1
     }
     // 闭包 env 释放（A 方案）：与表同一出口时机（本函数是唯一出口析构入口，
     // 挂在此处即覆盖全部调用点——普通函数尾与 return 语句）。
@@ -574,6 +606,38 @@ func tig_loopvar_release(av: i64) {
     ir.add_operand(fls, types.named(TK_I64), 2)
     ir.add_operand(fls, one, 0)
     ir.add_operand(fls, flag_addr, 3)
+}
+
+// 切片局部的**回边释放**：与 tig_loopvar_release 同构（零值全局哨兵 + select 归零，
+// 不分裂控制流块），差别只在释放对象是聚合值第三字段（源表句柄）。缺它则循环内
+// 声明的切片逐轮 retain 源表而只在出口释放最终值 ⇒ 每轮泄漏一份表引用。
+func tig_loopvar_slice_release(av: i64) {
+    g_tf_ctr = g_tf_ctr + 1
+    var fn_san2 = str.clone(g_cur_fn_name)
+    var si2: i64 = 0
+    while si2 < str_len(fn_san2) {
+        if str_char(fn_san2, si2) == ":" {
+            fn_san2 = tie.support::slice(fn_san2, 0, si2) + "$" + tie.support::slice(fn_san2, si2 + 2, str_len(fn_san2))
+        }
+        si2 = si2 + 1
+    }
+    var fname2 = "tl_loopf_" + fn_san2 + "_" + to_string(g_tf_ctr)
+    llvmgen.global_scalar_reg(fname2, types.named(TK_I64))
+    llvmgen.global_scalar_init(fname2, 0)
+    var flag_addr2 = interner.intern("@" + fname2)
+    var fl2 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+    ir.add_operand(fl2, flag_addr2, 3)
+    var condv2 = tig_cond_to_bool(ir.get_value(fl2), types.named(TK_I64))
+    var slot2 = ir.new_inst(g_cur_block, 21, types.slice_of(types.named(TK_I64)))
+    ir.add_operand(slot2, av, 0)
+    var srcp2 = tig_slice_src_ptr(ir.get_value(slot2))
+    var doomed2 = tig_select_i(condv2, srcp2, tig_null_ptr(), types.named(TK_STR))
+    tig_tbl_release_call(doomed2)
+    var one2 = tig_int_lit(1)
+    var fls2 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(fls2, types.named(TK_I64), 2)
+    ir.add_operand(fls2, one2, 0)
+    ir.add_operand(fls2, flag_addr2, 3)
 }
 
 // 聚合局部的**回边释放**：与 tig_loopvar_release 同构（零值哨兵 + select 归零，

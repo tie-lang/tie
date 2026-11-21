@@ -249,6 +249,11 @@ pub var g_tblcand_allocas: table<i64>;
 // 出口按类型递归 release 各表字段，与绑定处的 tig_agg_retain_bound 成对。
 pub var g_aggcand_allocas: table<i64>;
 pub var g_aggcand_tys: table<i64>;
+// **切片（slice<T>）**局部析构候选——槽地址清单。切片的聚合值第三字段是
+// **已 retain 的源表句柄**（`{ptr,len,src}`）；槽被覆盖或函数出口时须按该字段
+// 释放一次，否则每个切片泄漏一份表的引用。与表候选分离：表候选的释放动作是
+// 直接把槽当表句柄 release，切片要先取第三字段。
+pub var g_slc_allocas: table<i64>;
 // 闭包 env 释放候选（A 方案，2026-10-02）：初值为**闭包字面量**、且该闭包确有捕获的
 // 局部变量。三张平行表：变量名 id（查 esc 不逃逸）/ fn 值槽地址 / fn 类型 id。
 // 出口按 esc_is_live 判定——未逃逸才发 drop（保守：逃逸者不释放，残余泄漏但安全）。
